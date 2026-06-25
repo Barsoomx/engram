@@ -170,7 +170,8 @@ class BackendComposeContractTests(unittest.TestCase):
         script = (ROOT / 'scripts/e2e_golden_path.py').read_text(encoding='utf-8')
 
         self.assertNotIn('engram_process_observation_outbox', script)
-        self.assertIn('engram_promote_memory_candidate', script)
+        self.assertNotIn('engram_promote_memory_candidate', script)
+        self.assertIn('Waiting for worker-created retrieval document', script)
 
 
 if __name__ == '__main__':

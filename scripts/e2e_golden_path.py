@@ -19,9 +19,10 @@ SERVER_URL = 'http://127.0.0.1:8000'
 MEMORY_TITLE = 'Hook ingest replay handling is stable'
 MEMORY_BODY = 'The hook ingest path reuses accepted replay rows and keeps request ids idempotent.'
 MEMORY_FILE = 'apps/backend/engram/hooks/services.py'
-NO_PROMOTABLE_CANDIDATE_ERROR = 'No proposed memory candidate found for project'
-PROMOTION_TIMEOUT_SECONDS = 120.0
-PROMOTION_POLL_INTERVAL_SECONDS = 2.0
+WORKER_MEMORY_NOT_READY_ERROR = 'worker-created retrieval document not ready'
+WORKER_MEMORY_TIMEOUT_SECONDS = 120.0
+WORKER_MEMORY_POLL_INTERVAL_SECONDS = 2.0
+CONTEXT_AUDIT_NOT_READY_ERROR = 'context audit evidence not ready'
 
 
 @dataclass(frozen=True)
@@ -112,10 +113,11 @@ def main() -> int:
             assert_equal(post_tool_use.get('status'), 'accepted', 'post-tool-use status')
             assert_secret_absent('post-tool-use response', json.dumps(post_tool_use), api_key)
 
-            progress('Waiting for relayed memory candidate promotion')
-            promotion = wait_for_promotion(project_id, api_key)
-            required_string(promotion, 'memory_id')
-            required_string(promotion, 'retrieval_document_id')
+            progress('Waiting for worker-created retrieval document')
+            worker_memory = wait_for_worker_memory(project_id, api_key)
+            required_string(worker_memory, 'memory_id')
+            required_string(worker_memory, 'memory_version_id')
+            retrieval_document_id = required_string(worker_memory, 'retrieval_document_id')
 
             progress('Requesting future session context')
             context = run_json(
@@ -134,6 +136,16 @@ def main() -> int:
                 secret=api_key,
             )
             assert_context_response(context)
+            context_bundle_id = required_string(context, 'context_bundle_id')
+            request_id = required_string(context, 'request_id')
+            audit_evidence = assert_context_audit_evidence(
+                context_bundle_id=context_bundle_id,
+                retrieval_document_id=retrieval_document_id,
+                request_id=request_id,
+                secret=api_key,
+            )
+            required_string(audit_evidence, 'context_bundle_item_id')
+            required_string(audit_evidence, 'audit_event_id')
             assert_secret_absent('context response', json.dumps(context), api_key)
 
         progress('Compose golden path passed')
@@ -199,9 +211,9 @@ def pythonpath_env() -> dict[str, str]:
     return env
 
 
-def wait_for_promotion(project_id: str, secret: str) -> dict[str, object]:
-    deadline = time.monotonic() + PROMOTION_TIMEOUT_SECONDS
-    last_error = 'promotion was not attempted'
+def wait_for_worker_memory(project_id: str, secret: str) -> dict[str, object]:
+    deadline = time.monotonic() + WORKER_MEMORY_TIMEOUT_SECONDS
+    last_error = 'worker-created retrieval document was not observed'
     while time.monotonic() < deadline:
         try:
             return run_json(
@@ -210,29 +222,121 @@ def wait_for_promotion(project_id: str, secret: str) -> dict[str, object]:
                     'compose',
                     'exec',
                     '-T',
-                    'worker',
+                    'api',
                     'python',
                     'manage.py',
-                    'engram_promote_memory_candidate',
-                    '--project-id',
-                    project_id,
-                    '--latest',
-                    '--json',
+                    'shell',
+                    '-c',
+                    worker_memory_query(project_id),
                 ],
                 cwd=COMPOSE_DIR,
                 secret=secret,
             )
         except E2EError as error:
             last_error = str(error)
-            if NO_PROMOTABLE_CANDIDATE_ERROR not in last_error:
+            if WORKER_MEMORY_NOT_READY_ERROR not in last_error:
                 raise
 
-            time.sleep(PROMOTION_POLL_INTERVAL_SECONDS)
+            time.sleep(WORKER_MEMORY_POLL_INTERVAL_SECONDS)
 
     raise E2EError(
-        'Timed out waiting for a relayed memory candidate to become promotable. '
+        'Timed out waiting for worker-created approved memory and retrieval document. '
         f'Last error: {last_error}'
     )
+
+
+def worker_memory_query(project_id: str) -> str:
+    return f"""
+import json
+from engram.core.models import Memory, MemoryStatus, MemoryVersion, RetrievalDocument
+
+memory = (
+    Memory.objects.filter(
+        project_id={json.dumps(project_id)},
+        title={json.dumps(MEMORY_TITLE)},
+        status=MemoryStatus.APPROVED,
+    )
+    .order_by('-created_at')
+    .first()
+)
+if memory is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
+version = MemoryVersion.objects.filter(memory=memory, version=memory.current_version).first()
+if version is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
+document = RetrievalDocument.objects.filter(
+    project_id={json.dumps(project_id)},
+    memory=memory,
+    memory_version=version,
+).first()
+if document is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
+print(json.dumps({{
+    'memory_id': str(memory.id),
+    'memory_version_id': str(version.id),
+    'retrieval_document_id': str(document.id),
+}}))
+"""
+
+
+def assert_context_audit_evidence(
+    *,
+    context_bundle_id: str,
+    retrieval_document_id: str,
+    request_id: str,
+    secret: str,
+) -> dict[str, object]:
+    return run_json(
+        [
+            'docker',
+            'compose',
+            'exec',
+            '-T',
+            'api',
+            'python',
+            'manage.py',
+            'shell',
+            '-c',
+            context_audit_query(context_bundle_id, retrieval_document_id, request_id),
+        ],
+        cwd=COMPOSE_DIR,
+        secret=secret,
+    )
+
+
+def context_audit_query(context_bundle_id: str, retrieval_document_id: str, request_id: str) -> str:
+    return f"""
+import json
+from engram.core.models import AuditEvent, ContextBundleItem
+
+item = ContextBundleItem.objects.filter(
+    bundle_id={json.dumps(context_bundle_id)},
+    retrieval_document_id={json.dumps(retrieval_document_id)},
+).first()
+if item is None:
+    raise SystemExit({json.dumps(CONTEXT_AUDIT_NOT_READY_ERROR)})
+
+audit = (
+    AuditEvent.objects.filter(
+        event_type='MemoryRetrieved',
+        target_type='context_bundle',
+        target_id={json.dumps(context_bundle_id)},
+        request_id={json.dumps(request_id)},
+    )
+    .order_by('-created_at')
+    .first()
+)
+if audit is None or {json.dumps(retrieval_document_id)} not in audit.metadata.get('retrieval_document_ids', []):
+    raise SystemExit({json.dumps(CONTEXT_AUDIT_NOT_READY_ERROR)})
+
+print(json.dumps({{
+    'context_bundle_item_id': str(item.id),
+    'audit_event_id': str(audit.id),
+}}))
+"""
 
 
 def run_json(
@@ -300,7 +404,7 @@ def assert_context_response(response: dict[str, object]) -> None:
     assert_equal(first_item.get('body'), MEMORY_BODY, 'memory body')
     rendered_context = required_string(response, 'rendered_context')
     if MEMORY_TITLE not in rendered_context or MEMORY_BODY not in rendered_context:
-        raise E2EError('Rendered context does not contain promoted memory')
+        raise E2EError('Rendered context does not contain approved memory')
     hook_output = response.get('hook_specific_output')
     if not isinstance(hook_output, dict):
         raise E2EError('Context response missing hook-specific output')
