@@ -72,6 +72,7 @@ The model names are stable enough for the first end-to-end loop:
 - `AgentSession`
 - `RawEventEnvelope`
 - `Observation`
+- `ObservationSource`
 - `MemoryCandidate`
 - `Memory`
 - `MemoryVersion`
@@ -122,7 +123,12 @@ occurred time, received time, sequence number, and resolved scope.
 
 `Observation` stores normalized evidence extracted from events or imports:
 type, title, subtitle, facts, narrative, concepts, files read/modified,
-generated model metadata, content hash, source metadata, and timestamps.
+prompt number, generated model metadata, content hash, generation key,
+redaction metadata, source metadata, and timestamps.
+
+`ObservationSource` preserves source/provenance links for citations and future
+migration/import compatibility. It records source type, source id, optional raw
+event, citation label, and metadata, with uniqueness per observation/source.
 
 Duplicate client events are scoped by organization, project, session, and client
 event id. Duplicate observations collapse by organization, project, session,
@@ -193,7 +199,7 @@ Required local commands:
 - `cd apps/backend && poetry run ruff check .`
 - `cd apps/backend && poetry run ruff format --check .`
 - `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run`
-- `cd apps/backend && poetry run python manage.py migrate --check`
+- `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings`
 - `cd apps/backend && poetry check`
 - `git diff --check HEAD`
 

@@ -1,0 +1,628 @@
+from __future__ import annotations
+
+import uuid
+
+from django.core.exceptions import ValidationError
+from django.db import models
+
+
+class TimestampedModel(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        abstract = True
+
+
+class Runtime(models.TextChoices):
+    CLAUDE_CODE = 'claude_code', 'Claude Code'
+    CODEX = 'codex', 'Codex'
+    UNKNOWN = 'unknown', 'Unknown'
+
+
+class SessionStatus(models.TextChoices):
+    ACTIVE = 'active', 'Active'
+    ENDED = 'ended', 'Ended'
+    ERRORED = 'errored', 'Errored'
+
+
+class VisibilityScope(models.TextChoices):
+    SESSION = 'session', 'Session'
+    PROJECT = 'project', 'Project'
+    TEAM = 'team', 'Team'
+    ORGANIZATION = 'organization', 'Organization'
+
+
+class CandidateStatus(models.TextChoices):
+    PROPOSED = 'proposed', 'Proposed'
+    PROMOTED = 'promoted', 'Promoted'
+    REJECTED = 'rejected', 'Rejected'
+
+
+class MemoryStatus(models.TextChoices):
+    APPROVED = 'approved', 'Approved'
+    ARCHIVED = 'archived', 'Archived'
+    REFUTED = 'refuted', 'Refuted'
+    CONFLICT = 'conflict', 'Conflict'
+
+
+class ContextBundleStatus(models.TextChoices):
+    CREATED = 'created', 'Created'
+    INJECTED = 'injected', 'Injected'
+    SKIPPED = 'skipped', 'Skipped'
+
+
+class AuditResult(models.TextChoices):
+    ALLOWED = 'allowed', 'Allowed'
+    DENIED = 'denied', 'Denied'
+    RECORDED = 'recorded', 'Recorded'
+
+
+class OutboxStatus(models.TextChoices):
+    PENDING = 'pending', 'Pending'
+    PROCESSING = 'processing', 'Processing'
+    DONE = 'done', 'Done'
+    FAILED = 'failed', 'Failed'
+    DEAD_LETTER = 'dead_letter', 'Dead letter'
+
+
+class Organization(TimestampedModel):
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=120, unique=True)
+
+    class Meta:
+        ordering = ['slug']
+
+    def __str__(self) -> str:
+        return self.slug
+
+
+class Team(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='teams')
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=120)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'slug'], name='core_team_unique_slug_per_org'),
+        ]
+        ordering = ['organization_id', 'slug']
+
+    def __str__(self) -> str:
+        return f'{self.organization.slug}/{self.slug}'
+
+
+class Project(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='projects')
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=120)
+    repository_url = models.TextField(blank=True)
+    repository_root = models.TextField(blank=True)
+    default_branch = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['organization', 'slug'], name='core_project_unique_slug_per_org'),
+        ]
+        ordering = ['organization_id', 'slug']
+
+    def __str__(self) -> str:
+        return f'{self.organization.slug}/{self.slug}'
+
+
+class ProjectTeam(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='project_team_links')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='team_links')
+    team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name='project_links')
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['project', 'team'], name='core_project_team_unique_pair'),
+        ]
+
+    def __str__(self) -> str:
+        return f'{self.project_id}:{self.team_id}'
+
+
+class Agent(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='agents')
+    runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
+    external_id = models.CharField(max_length=255)
+    display_name = models.CharField(max_length=255, blank=True)
+    version = models.CharField(max_length=80, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'runtime', 'external_id'],
+                name='core_agent_unique_external_id_per_runtime',
+            ),
+        ]
+        ordering = ['organization_id', 'runtime', 'external_id']
+
+    def __str__(self) -> str:
+        return f'{self.runtime}:{self.external_id}'
+
+
+class AgentSession(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='sessions')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='sessions')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='sessions', null=True, blank=True)
+    agent = models.ForeignKey(Agent, on_delete=models.PROTECT, related_name='sessions')
+    external_session_id = models.CharField(max_length=255)
+    content_session_id = models.CharField(max_length=255, blank=True)
+    memory_session_id = models.CharField(max_length=255, blank=True)
+    runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
+    platform_source = models.CharField(max_length=80, blank=True)
+    repository_url = models.TextField(blank=True)
+    repository_root = models.TextField(blank=True)
+    branch = models.CharField(max_length=255, blank=True)
+    cwd = models.TextField(blank=True)
+    status = models.CharField(max_length=40, choices=SessionStatus.choices, default=SessionStatus.ACTIVE)
+    prompt_counter = models.PositiveIntegerField(default=0)
+    metadata = models.JSONField(default=dict, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'external_session_id'],
+                name='core_session_unique_external_id_per_project',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'content_session_id'],
+                condition=~models.Q(content_session_id=''),
+                name='core_session_unique_content_id_per_project',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'status']),
+        ]
+        ordering = ['organization_id', 'project_id', 'external_session_id']
+
+    def __str__(self) -> str:
+        return f'{self.runtime}:{self.external_session_id}'
+
+
+class RawEventEnvelope(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='raw_events')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='raw_events')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='raw_events', null=True, blank=True)
+    agent = models.ForeignKey(Agent, on_delete=models.PROTECT, related_name='raw_events')
+    session = models.ForeignKey(AgentSession, on_delete=models.CASCADE, related_name='raw_events')
+    event_type = models.CharField(max_length=120)
+    source_adapter = models.CharField(max_length=80, blank=True)
+    client_event_id = models.CharField(max_length=255)
+    idempotency_key = models.CharField(max_length=255)
+    content_hash = models.CharField(max_length=128)
+    runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
+    payload_schema_version = models.CharField(max_length=40, default='v1')
+    sequence_number = models.BigIntegerField(null=True, blank=True)
+    occurred_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+    payload = models.JSONField(default=dict)
+    headers = models.JSONField(default=dict, blank=True)
+    request_id = models.CharField(max_length=255, blank=True)
+    correlation_id = models.CharField(max_length=255, blank=True)
+    trace_id = models.CharField(max_length=255, blank=True)
+    actor_type = models.CharField(max_length=80, blank=True)
+    actor_id = models.CharField(max_length=255, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'session', 'client_event_id'],
+                name='core_raw_event_unique_client_event_per_session',
+            ),
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'idempotency_key'],
+                name='core_raw_event_unique_idempotency_key_per_project',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'event_type']),
+            models.Index(fields=['organization', 'project', 'content_hash']),
+        ]
+        ordering = ['organization_id', 'project_id', 'received_at']
+
+    def __str__(self) -> str:
+        return f'{self.event_type}:{self.client_event_id}'
+
+
+class Observation(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='observations')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='observations')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='observations', null=True, blank=True)
+    agent = models.ForeignKey(Agent, on_delete=models.PROTECT, related_name='observations')
+    session = models.ForeignKey(AgentSession, on_delete=models.CASCADE, related_name='observations')
+    raw_event = models.ForeignKey(
+        RawEventEnvelope,
+        on_delete=models.SET_NULL,
+        related_name='observations',
+        null=True,
+        blank=True,
+    )
+    observation_type = models.CharField(max_length=80)
+    title = models.CharField(max_length=255)
+    subtitle = models.CharField(max_length=255, blank=True)
+    body = models.TextField(blank=True)
+    facts = models.JSONField(default=list, blank=True)
+    narrative = models.TextField(blank=True)
+    concepts = models.JSONField(default=list, blank=True)
+    files_read = models.JSONField(default=list, blank=True)
+    files_modified = models.JSONField(default=list, blank=True)
+    prompt_number = models.PositiveIntegerField(null=True, blank=True)
+    content_hash = models.CharField(max_length=128)
+    generation_key = models.CharField(max_length=255, blank=True)
+    generated_model = models.CharField(max_length=120, blank=True)
+    redaction_metadata = models.JSONField(default=dict, blank=True)
+    source_metadata = models.JSONField(default=dict, blank=True)
+    observed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'session', 'content_hash'],
+                name='core_observation_unique_content_hash_per_session',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'observation_type']),
+            models.Index(fields=['organization', 'project', 'content_hash']),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class ObservationSource(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='observation_sources')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='observation_sources')
+    observation = models.ForeignKey(Observation, on_delete=models.CASCADE, related_name='sources')
+    raw_event = models.ForeignKey(
+        RawEventEnvelope,
+        on_delete=models.SET_NULL,
+        related_name='observation_sources',
+        null=True,
+        blank=True,
+    )
+    source_type = models.CharField(max_length=80)
+    source_id = models.CharField(max_length=255)
+    citation = models.CharField(max_length=80, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['observation', 'source_type', 'source_id'],
+                name='core_observation_source_unique_source',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'source_type']),
+        ]
+        ordering = ['organization_id', 'project_id', 'source_type', 'source_id']
+
+    def clean(self) -> None:
+        errors = {}
+        if self.observation_id and self.observation.organization_id != self.organization_id:
+            errors['observation'] = 'observation organization must match source organization'
+        if self.observation_id and self.observation.project_id != self.project_id:
+            errors['observation'] = 'observation project must match source project'
+        if self.raw_event_id and self.raw_event.organization_id != self.organization_id:
+            errors['raw_event'] = 'raw event organization must match source organization'
+        if self.raw_event_id and self.raw_event.project_id != self.project_id:
+            errors['raw_event'] = 'raw event project must match source project'
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self) -> str:
+        return f'{self.source_type}:{self.source_id}'
+
+
+class MemoryCandidate(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_candidates')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_candidates')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='memory_candidates', null=True, blank=True)
+    source_observation = models.ForeignKey(
+        Observation,
+        on_delete=models.SET_NULL,
+        related_name='memory_candidates',
+        null=True,
+        blank=True,
+    )
+    promoted_memory = models.ForeignKey(
+        'Memory',
+        on_delete=models.SET_NULL,
+        related_name='source_candidates',
+        null=True,
+        blank=True,
+    )
+    title = models.CharField(max_length=255)
+    body = models.TextField()
+    status = models.CharField(max_length=40, choices=CandidateStatus.choices, default=CandidateStatus.PROPOSED)
+    visibility_scope = models.CharField(
+        max_length=40,
+        choices=VisibilityScope.choices,
+        default=VisibilityScope.PROJECT,
+    )
+    evidence = models.JSONField(default=list, blank=True)
+    content_hash = models.CharField(max_length=128)
+    confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'content_hash'],
+                name='core_memory_candidate_unique_content_hash_per_project',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'status']),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class Memory(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memories')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memories')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='memories', null=True, blank=True)
+    title = models.CharField(max_length=255)
+    body = models.TextField()
+    status = models.CharField(max_length=40, choices=MemoryStatus.choices, default=MemoryStatus.APPROVED)
+    visibility_scope = models.CharField(
+        max_length=40,
+        choices=VisibilityScope.choices,
+        default=VisibilityScope.PROJECT,
+    )
+    current_version = models.PositiveIntegerField(default=1)
+    confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    stale = models.BooleanField(default=False)
+    refuted = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'project', 'status']),
+            models.Index(fields=['organization', 'project', 'visibility_scope']),
+        ]
+        ordering = ['organization_id', 'project_id', 'title']
+
+    def __str__(self) -> str:
+        return self.title
+
+
+class MemoryVersion(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_versions')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_versions')
+    memory = models.ForeignKey(Memory, on_delete=models.CASCADE, related_name='versions')
+    source_observation = models.ForeignKey(
+        Observation,
+        on_delete=models.SET_NULL,
+        related_name='memory_versions',
+        null=True,
+        blank=True,
+    )
+    version = models.PositiveIntegerField()
+    body = models.TextField()
+    content_hash = models.CharField(max_length=128)
+    source_metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['memory', 'version'], name='core_memory_version_unique_version'),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'content_hash']),
+        ]
+        ordering = ['memory_id', 'version']
+
+    def __str__(self) -> str:
+        return f'{self.memory_id}:v{self.version}'
+
+
+class RetrievalDocument(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='retrieval_documents')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='retrieval_documents')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='retrieval_documents',
+        null=True,
+        blank=True,
+    )
+    memory = models.ForeignKey(Memory, on_delete=models.CASCADE, related_name='retrieval_documents')
+    memory_version = models.OneToOneField(
+        MemoryVersion,
+        on_delete=models.CASCADE,
+        related_name='retrieval_document',
+    )
+    visibility_scope = models.CharField(
+        max_length=40,
+        choices=VisibilityScope.choices,
+        default=VisibilityScope.PROJECT,
+    )
+    source_observation_ids = models.JSONField(default=list, blank=True)
+    file_paths = models.JSONField(default=list, blank=True)
+    symbols = models.JSONField(default=list, blank=True)
+    exact_terms = models.JSONField(default=list, blank=True)
+    full_text = models.TextField()
+    embedding_reference = models.CharField(max_length=255, blank=True)
+    stale = models.BooleanField(default=False)
+    refuted = models.BooleanField(default=False)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'project', 'visibility_scope']),
+            models.Index(fields=['organization', 'project', 'stale', 'refuted']),
+        ]
+        ordering = ['organization_id', 'project_id', 'memory_id']
+
+    def clean(self) -> None:
+        errors = {}
+        if self.memory_id and self.memory.organization_id != self.organization_id:
+            errors['memory'] = 'memory organization must match retrieval document organization'
+        if self.memory_id and self.memory.project_id != self.project_id:
+            errors['memory'] = 'memory project must match retrieval document project'
+        if self.memory_version_id and self.memory_version.organization_id != self.organization_id:
+            errors['memory_version'] = 'memory version organization must match retrieval document organization'
+        if self.memory_version_id and self.memory_version.project_id != self.project_id:
+            errors['memory_version'] = 'memory version project must match retrieval document project'
+        if self.memory_version_id and self.memory_id and self.memory_version.memory_id != self.memory_id:
+            errors['memory_version'] = 'memory version must belong to retrieval document memory'
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self) -> str:
+        return f'{self.memory_id}:{self.memory_version_id}'
+
+
+class ContextBundle(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='context_bundles')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='context_bundles')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='context_bundles', null=True, blank=True)
+    agent = models.ForeignKey(Agent, on_delete=models.PROTECT, related_name='context_bundles')
+    session = models.ForeignKey(AgentSession, on_delete=models.CASCADE, related_name='context_bundles')
+    request_id = models.CharField(max_length=255)
+    purpose = models.CharField(max_length=80)
+    query_text = models.TextField(blank=True)
+    rendered_text = models.TextField(blank=True)
+    authorization_scope = models.JSONField(default=dict, blank=True)
+    token_budget = models.PositiveIntegerField(null=True, blank=True)
+    selected_count = models.PositiveIntegerField(default=0)
+    status = models.CharField(max_length=40, choices=ContextBundleStatus.choices, default=ContextBundleStatus.CREATED)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'request_id'],
+                name='core_context_bundle_unique_request_per_project',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'purpose']),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def __str__(self) -> str:
+        return self.request_id
+
+
+class ContextBundleItem(TimestampedModel):
+    bundle = models.ForeignKey(ContextBundle, on_delete=models.CASCADE, related_name='items')
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='context_bundle_items')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='context_bundle_items')
+    memory = models.ForeignKey(Memory, on_delete=models.PROTECT, related_name='context_bundle_items')
+    retrieval_document = models.ForeignKey(
+        RetrievalDocument,
+        on_delete=models.PROTECT,
+        related_name='context_bundle_items',
+    )
+    rank = models.PositiveIntegerField()
+    citation = models.CharField(max_length=80)
+    inclusion_reason = models.TextField(blank=True)
+    scope_evidence = models.JSONField(default=dict, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['bundle', 'rank'], name='core_context_bundle_item_unique_rank'),
+            models.UniqueConstraint(fields=['bundle', 'memory'], name='core_context_bundle_item_unique_memory'),
+        ]
+        ordering = ['bundle_id', 'rank']
+
+    def clean(self) -> None:
+        errors = {}
+        if self.bundle_id and self.bundle.organization_id != self.organization_id:
+            errors['bundle'] = 'bundle organization must match item organization'
+        if self.bundle_id and self.bundle.project_id != self.project_id:
+            errors['bundle'] = 'bundle project must match item project'
+        if self.memory_id and self.memory.organization_id != self.organization_id:
+            errors['memory'] = 'memory organization must match item organization'
+        if self.memory_id and self.memory.project_id != self.project_id:
+            errors['memory'] = 'memory project must match item project'
+        if self.retrieval_document_id and self.retrieval_document.organization_id != self.organization_id:
+            errors['retrieval_document'] = 'retrieval document organization must match item organization'
+        if self.retrieval_document_id and self.retrieval_document.project_id != self.project_id:
+            errors['retrieval_document'] = 'retrieval document project must match item project'
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self) -> str:
+        return f'{self.bundle_id}:{self.citation}'
+
+
+class AuditEvent(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='audit_events')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='audit_events', null=True, blank=True)
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='audit_events', null=True, blank=True)
+    event_type = models.CharField(max_length=120)
+    actor_type = models.CharField(max_length=80)
+    actor_id = models.CharField(max_length=255, blank=True)
+    target_type = models.CharField(max_length=80, blank=True)
+    target_id = models.CharField(max_length=255, blank=True)
+    capability = models.CharField(max_length=120, blank=True)
+    result = models.CharField(max_length=40, choices=AuditResult.choices, default=AuditResult.RECORDED)
+    request_id = models.CharField(max_length=255, blank=True)
+    correlation_id = models.CharField(max_length=255, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'project', 'event_type']),
+            models.Index(fields=['organization', 'result']),
+        ]
+        ordering = ['organization_id', 'created_at']
+
+    def __str__(self) -> str:
+        return f'{self.event_type}:{self.result}'
+
+
+class OutboxEvent(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='outbox_events')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='outbox_events', null=True, blank=True)
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='outbox_events', null=True, blank=True)
+    aggregate_type = models.CharField(max_length=120)
+    aggregate_id = models.CharField(max_length=255)
+    event_type = models.CharField(max_length=120)
+    payload_version = models.PositiveIntegerField(default=1)
+    payload = models.JSONField(default=dict)
+    idempotency_key = models.CharField(max_length=255)
+    actor_type = models.CharField(max_length=80, blank=True)
+    actor_id = models.CharField(max_length=255, blank=True)
+    correlation_id = models.CharField(max_length=255, blank=True)
+    trace_id = models.CharField(max_length=255, blank=True)
+    status = models.CharField(max_length=40, choices=OutboxStatus.choices, default=OutboxStatus.PENDING)
+    attempts = models.PositiveIntegerField(default=0)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    locked_by = models.CharField(max_length=255, blank=True)
+    locked_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.TextField(blank=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'event_type', 'idempotency_key'],
+                name='core_outbox_unique_idempotency_key_per_event',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['status', 'next_retry_at']),
+            models.Index(fields=['organization', 'project', 'event_type']),
+            models.Index(fields=['organization', 'aggregate_type', 'aggregate_id']),
+        ]
+        ordering = ['status', 'next_retry_at', 'created_at']
+
+    def __str__(self) -> str:
+        return f'{self.event_type}:{self.idempotency_key}'
