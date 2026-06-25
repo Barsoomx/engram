@@ -189,11 +189,23 @@ class BackendComposeContractTests(unittest.TestCase):
         compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')
         readme = (ROOT / 'deploy/compose/README.md').read_text(encoding='utf-8')
 
-        for service_name in ('api:', 'relay:', 'worker:', 'postgres:', 'redis:', 'rabbitmq:'):
+        for service_name in (
+            'api:',
+            'relay:',
+            'worker-realtime:',
+            'worker-near-realtime:',
+            'worker-batch:',
+            'worker-highmemory:',
+            'worker-domain-events:',
+            'postgres:',
+            'redis:',
+            'rabbitmq:',
+        ):
             self.assertIn(service_name, compose)
 
         self.assertIn('RabbitMQ broker', readme)
         self.assertIn('Redis result/cache backend', readme)
+        self.assertIn('queue-specific Celery workers', readme)
         self.assertNotIn('Redis-compatible broker', readme)
 
     def test_compose_uses_healthchecks_relay_and_real_worker(self) -> None:
@@ -207,6 +219,29 @@ class BackendComposeContractTests(unittest.TestCase):
         self.assertIn('amqp://engram:engram@rabbitmq:5672/engram', compose)
         self.assertIn('python manage.py celery_outbox_relay', compose)
         self.assertIn('celery -A engram.celery_app worker', compose)
+
+    def test_compose_routes_workers_to_engram_sla_queues(self) -> None:
+        compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')
+        worker_queues = {
+            'worker-realtime': 'engram-realtime',
+            'worker-near-realtime': 'engram-near-realtime',
+            'worker-batch': 'engram-batch',
+            'worker-highmemory': 'engram-highmemory',
+            'worker-domain-events': 'engram-domain-events',
+        }
+
+        for service_name, queue_name in worker_queues.items():
+            self.assertIn(f'  {service_name}:', compose)
+            self.assertIn(
+                f'celery -A engram.celery_app worker --loglevel=info -Q {queue_name}',
+                compose,
+            )
+            self.assertEqual(1, compose.count(f'-Q {queue_name}'))
+
+        self.assertNotIn(
+            'celery -A engram.celery_app worker --loglevel=info"',
+            compose,
+        )
 
     def test_compose_relay_is_package_transport_not_domain_outbox_processing(self) -> None:
         compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')

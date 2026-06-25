@@ -874,3 +874,38 @@ developer-style `memories:read` keys are denied. Audit inspection requires
 | repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
 | whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
 | focused security review | Independent read-only security review plus fix re-review recorded in `docs/security/reviews/2026-06-25-admin-inspection-api.md` | none | yes | pass | Initial review found weak capability gate, identifier redaction gaps, and audit-listing self-noise. Fix re-review verified code-level findings resolved; stale doc statuses were updated before commit. |
+
+## 2026-06-25: Celery SLA Compose Topology
+
+Branch: `chore/celery-sla-compose-topology`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `deploy/compose/docker-compose.yml`
+- `deploy/compose/README.md`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/security/reviews/2026-06-25-celery-sla-compose-topology.md`
+- `docs/superpowers/specs/2026-06-25-celery-sla-compose-topology-design.md`
+- `docs/superpowers/plans/2026-06-25-celery-sla-compose-topology.md`
+- `docs/verification-matrix.md`
+
+This checkpoint keeps the existing Engram Celery foundation and makes Compose
+consume its SLA queues explicitly. Compose now runs dedicated workers for
+`engram-realtime`, `engram-near-realtime`, `engram-batch`,
+`engram-highmemory`, and `engram-domain-events`; the package relay remains a
+separate `python manage.py celery_outbox_relay` service.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| delegated RED repository contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 before implementation. The new contract failed against the old single generic worker because `worker-realtime` and queue routing were missing. |
+| repository runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 15 tests OK. |
+| Compose service graph | `docker compose -f deploy/compose/docker-compose.yml config --quiet` | Compose E2E | yes | pass | Exit 0 with no output. |
+| backend Celery foundation tests | `cd apps/backend && poetry run pytest engram/core/celery_foundation_tests.py -v` | Backend | yes | pass | Exit 0. Reported 7 passed. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality | yes | pass | Exit 0. Reported 31 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included worker-created retrieval document, future context injection, Compose golden path passed, and stopped Compose services. |
+| focused security review | Independent read-only review plus command evidence recorded in `docs/security/reviews/2026-06-25-celery-sla-compose-topology.md` | none | yes | pass | Reviewer reported no Critical, Important, or Minor findings. Verified queue coverage, separate relay, unchanged broker/result configuration, no public-doc private reference leakage, and sufficient Compose/E2E evidence. |
