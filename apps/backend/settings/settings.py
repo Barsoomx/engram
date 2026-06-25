@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'engram.core',
+    'engram.access',
     'engram.health',
 ]
 
