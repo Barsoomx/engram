@@ -1,0 +1,55 @@
+name: Backend
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: python3 -m pip install poetry==1.8.2
+
+      - name: Install backend dependencies
+        working-directory: apps/backend
+        run: poetry install --no-interaction
+
+      - name: Check backend Poetry config
+        working-directory: apps/backend
+        run: poetry check
+
+      - name: Run backend Ruff
+        working-directory: apps/backend
+        run: poetry run ruff check .
+
+      - name: Check backend format
+        working-directory: apps/backend
+        run: poetry run ruff format --check .
+
+      - name: Run backend tests
+        working-directory: apps/backend
+        run: poetry run pytest -v
+
+      - name: Check repository layout
+        run: python3 scripts/repository_layout.py
+
+      - name: Check repository text quality
+        run: python3 scripts/repository_quality.py
+
+      - name: Run repository tests
+        run: python3 -m unittest discover -s tests -v
