@@ -12,6 +12,8 @@ from engram.context.context_api_tests import auth_headers, create_project_scope,
 from engram.core.models import AuditEvent, Team
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
+    EMBEDDING_DIMENSION,
+    EmbeddingCallInput,
     FakeProviderGateway,
     ModelPolicyError,
     ProviderCallInput,
@@ -19,6 +21,7 @@ from engram.model_policy.services import (
     ResolveModelPolicy,
     ResolveModelPolicyInput,
     encryption_key,
+    generated_embedding,
 )
 
 POLICY_RAW_KEY = 'egk_test_model_policy_admin_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -663,3 +666,128 @@ def test_fake_provider_gateway_returns_deterministic_generated_candidate_content
     assert result.generated_body == expected_generated_body(prompt)
     assert 'pytest failure fixed' not in result.generated_title
     assert 'pytest failed on missing memory worker' not in result.generated_body
+
+
+def test_generated_embedding_is_deterministic_and_normalized() -> None:
+    first = generated_embedding('authorization before ranking protects context bundles')
+    second = generated_embedding('authorization before ranking protects context bundles')
+
+    assert len(first) == EMBEDDING_DIMENSION
+    assert first == second
+    norm = sum(component * component for component in first) ** 0.5
+    assert norm == pytest.approx(1.0, abs=1e-3)
+
+
+def test_generated_embedding_returns_zero_vector_for_short_text() -> None:
+    assert generated_embedding('') == [0.0] * EMBEDDING_DIMENSION
+    assert generated_embedding('   ') == [0.0] * EMBEDDING_DIMENSION
+    assert generated_embedding('ab') == [0.0] * EMBEDDING_DIMENSION
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_embed_reuses_call_and_redacts_input() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
+    data = EmbeddingCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='memory-indexer:embedding-1:embedding',
+        trace_id='trace-embedding-1',
+        text=f'embedding prompt with {RAW_PROVIDER_SECRET}',
+    )
+
+    first = FakeProviderGateway().embed(data)
+    second = FakeProviderGateway().embed(data)
+
+    assert first.provider == 'openai'
+    assert first.model == 'text-embedding-3-small'
+    assert len(first.embedding) == EMBEDDING_DIMENSION
+    assert second.call_record_id == first.call_record_id
+    record = ProviderCallRecord.objects.get(id=first.call_record_id)
+    assert record.task_type == 'embedding'
+    assert record.redaction_state == 'redacted'
+    assert record.token_usage['input_tokens'] > 0
+    assert RAW_PROVIDER_SECRET not in str(record.__dict__)
+    assert RAW_PROVIDER_SECRET not in str(first.embedding)
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_embed_refuses_disabled_secret() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+        active=False,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
+
+    with pytest.raises(ProviderSecretError, match='provider secret is disabled'):
+        FakeProviderGateway().embed(
+            EmbeddingCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team.id,
+                policy=policy,
+                request_id='memory-indexer:embedding-disabled:embedding',
+                trace_id='trace-embedding-disabled',
+                text='text',
+            ),
+        )

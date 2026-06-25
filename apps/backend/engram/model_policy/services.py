@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import math
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -470,8 +472,113 @@ class FakeProviderGateway:
             generated_body=generated_body,
         )
 
+    def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
+        policy = data.policy
+        secret = policy.secret
+        if not secret.active:
+            raise ProviderSecretError('provider secret is disabled')
+        if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
+            raise ProviderSecretError('provider secret has no active envelope')
+
+        existing_record = (
+            ProviderCallRecord.objects.filter(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                task_type=policy.task_type,
+                request_id=data.request_id,
+            )
+            .order_by('created_at')
+            .first()
+        )
+        redacted_text = redact_value(data.text)
+        embedding = tuple(generated_embedding(str(redacted_text.value)))
+        if existing_record is not None:
+            return EmbeddingCallResult(
+                provider=existing_record.provider,
+                model=existing_record.model,
+                call_record_id=existing_record.id,
+                redaction_state=existing_record.redaction_state,
+                embedding=embedding,
+            )
+
+        text_was_redacted = redacted_text.redacted or '[REDACTED]' in data.text
+        token_count = len(_embedding_grams(str(redacted_text.value)))
+        record = ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=data.trace_id,
+            redaction_state='redacted' if text_was_redacted else 'clean',
+            token_usage={'input_tokens': token_count, 'output_tokens': 0},
+            latency_ms=0,
+            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            result=AuditResult.RECORDED,
+            metadata={'prompt_retained': False},
+        )
+
+        return EmbeddingCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state=record.redaction_state,
+            embedding=embedding,
+        )
+
 
 def generated_candidate_content(prompt: str) -> tuple[str, str]:
     digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
 
     return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'
+
+
+EMBEDDING_DIMENSION = 64
+
+
+@dataclass(frozen=True)
+class EmbeddingCallInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    policy: ModelPolicy
+    request_id: str
+    trace_id: str
+    text: str
+
+
+@dataclass(frozen=True)
+class EmbeddingCallResult:
+    provider: str
+    model: str
+    call_record_id: uuid.UUID
+    redaction_state: str
+    embedding: tuple[float, ...]
+
+
+def _embedding_grams(text: str) -> tuple[str, ...]:
+    cleaned = re.sub(r'[^a-z0-9]+', '', text.lower())
+    if len(cleaned) < 3:
+        return ()
+
+    return tuple(cleaned[i : i + 3] for i in range(len(cleaned) - 2))
+
+
+def generated_embedding(text: str) -> list[float]:
+    vector = [0.0] * EMBEDDING_DIMENSION
+    for gram in _embedding_grams(text):
+        digest = hashlib.sha256(gram.encode()).digest()
+        dim_index = int.from_bytes(digest[:8], 'big') % EMBEDDING_DIMENSION
+        sign = 1.0 if digest[8] % 2 == 0 else -1.0
+        vector[dim_index] += sign
+
+    norm = math.sqrt(sum(component * component for component in vector))
+    if norm == 0:
+        return [0.0] * EMBEDDING_DIMENSION
+
+    return [round(component / norm, 6) for component in vector]
