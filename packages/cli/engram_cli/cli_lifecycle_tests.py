@@ -69,11 +69,12 @@ class CliLifecycleTests(unittest.TestCase):
         self,
         argv: list[str],
         transport: FakeTransport,
+        stdin: io.StringIO | None = None,
     ) -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        exit_code = main.main(argv, stdout=stdout, stderr=stderr, transport=transport)
+        exit_code = main.main(argv, stdin=stdin, stdout=stdout, stderr=stderr, transport=transport)
 
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
@@ -417,6 +418,149 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn('invalid_key', stderr)
             self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_post_tool_use_posts_connected_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            'status': 'accepted',
+                            'duplicate': False,
+                            'request_id': 'hook-request-1',
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        'session_id': 'session-1',
+                        'event_id': 'event-1',
+                        'request_id': 'hook-request-1',
+                        'payload': {
+                            'tool_name': 'bash',
+                            'tool_input': {'command': 'pytest'},
+                            'tool_response': {'exit_code': 0},
+                        },
+                        'observation': {
+                            'type': 'tool_use',
+                            'title': 'pytest passed',
+                            'body': 'hook ingest tests passed',
+                            'files_read': ['apps/backend/engram/hooks/services.py'],
+                            'files_modified': [],
+                        },
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ['hook', 'post-tool-use', '--config-dir', str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            self.assertEqual(1, len(transport.calls))
+            call = transport.calls[0]
+            payload = call['payload']
+            self.assertEqual('POST', call['method'])
+            self.assertEqual('https://engram.example/v1/hooks/post-tool-use', call['url'])
+            self.assertEqual(f'Bearer {RAW_KEY}', call['headers']['Authorization'])
+            self.assertEqual(PROJECT_ID, payload['project_id'])
+            self.assertEqual(TEAM_ID, payload['team_id'])
+            self.assertEqual('codex', payload['agent_runtime'])
+            self.assertEqual('post_tool_use', payload['event_type'])
+            self.assertEqual('v1', payload['payload_schema_version'])
+            self.assertEqual('event-1', payload['idempotency_key'])
+            self.assertTrue(payload['content_hash'])
+            body = json.loads(stdout)
+            self.assertEqual('accepted', body['status'])
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_session_start_requests_context_with_connected_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        200,
+                        {
+                            'status': 'created',
+                            'purpose': 'session_start',
+                            'items': [{'citation': 'M1'}],
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        'session_id': 'future-session',
+                        'request_id': 'context-request-1',
+                        'query': 'hook ingest replay handling',
+                        'file_paths': ['apps/backend/engram/hooks/services.py'],
+                        'symbols': ['IngestHookEvent'],
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ['hook', 'session-start', '--config-dir', str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            call = transport.calls[0]
+            payload = call['payload']
+            self.assertEqual('POST', call['method'])
+            self.assertEqual('https://engram.example/v1/context/session-start', call['url'])
+            self.assertEqual(PROJECT_ID, payload['project_id'])
+            self.assertEqual(TEAM_ID, payload['team_id'])
+            self.assertEqual('codex', payload['agent_runtime'])
+            self.assertEqual('context-request-1', payload['request_id'])
+            self.assertEqual(['apps/backend/engram/hooks/services.py'], payload['file_paths'])
+            body = json.loads(stdout)
+            self.assertEqual('created', body['status'])
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_rejects_invalid_json_without_transport_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([])
+
+            exit_code, stdout, stderr = self.run_cli(
+                ['hook', 'post-tool-use', '--config-dir', str(config_dir)],
+                transport,
+                stdin=io.StringIO('{not-json'),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual('', stdout)
+            self.assertIn('invalid_response', stderr)
+            self.assertEqual([], transport.calls)
+
+    def test_hook_reports_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            exit_code, stdout, stderr = self.run_cli(
+                ['hook', 'session-start', '--config-dir', tmp],
+                FakeTransport([]),
+                stdin=io.StringIO('{}'),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual('', stdout)
+            self.assertIn('missing_config', stderr)
 
     def test_disconnect_removes_only_engram_owned_state_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

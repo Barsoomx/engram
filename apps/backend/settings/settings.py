@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'django_celery_outbox',
     'engram.core',
     'engram.access',
     'engram.hooks',
@@ -92,6 +93,7 @@ ENGRAM_REDIS_URL = os.environ.get('ENGRAM_REDIS_URL', 'redis://redis:6379/0')
 CELERY_BROKER_URL = os.environ.get('ENGRAM_CELERY_BROKER_URL', ENGRAM_REDIS_URL)
 CELERY_RESULT_BACKEND = os.environ.get('ENGRAM_CELERY_RESULT_BACKEND', ENGRAM_REDIS_URL)
 CELERY_TASK_IGNORE_RESULT = True
+CELERY_OUTBOX_APP = 'engram.celery_app.app'
 
 LOGGING = {
     'version': 1,

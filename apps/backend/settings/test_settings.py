@@ -1,3 +1,5 @@
+import os
+
 from .settings import *  # noqa: F401,F403
 
 SECRET_KEY = 'engram-test-secret'
@@ -7,8 +9,9 @@ PASSWORD_HASHERS = [
 ]
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+        **database_config(os.environ.get('ENGRAM_DATABASE_URL', 'sqlite:///:memory:')),  # noqa: F405
+        'CONN_MAX_AGE': 0,
+        'CONN_HEALTH_CHECKS': False,
     },
 }
 LOGGING = {

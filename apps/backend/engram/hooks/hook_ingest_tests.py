@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from django_celery_outbox.models import CeleryOutbox
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -255,6 +256,50 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_outbox() -> None
     assert outbox.payload['raw_event_id'] == str(raw_event.id)
     assert outbox.payload['observation_id'] == str(observation.id)
     assert RAW_KEY not in str(outbox.payload)
+
+
+@pytest.mark.django_db
+def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    provider_secret = 'sk-test-secret123456789'
+
+    response = client.post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(
+            project,
+            team,
+            payload={
+                'tool_name': 'bash',
+                'authorization': f'Bearer {RAW_KEY}',
+                'tool_input': {
+                    'api_key': provider_secret,
+                    'command': f'echo {provider_secret}',
+                },
+                'tool_response': {'stdout': f'token={RAW_KEY}'},
+            },
+            observation={
+                'type': 'tool_use',
+                'title': 'bash printed a token',
+                'body': f'output contained {provider_secret} and {RAW_KEY}',
+                'files_read': [],
+                'files_modified': [],
+            },
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    queued = CeleryOutbox.objects.get()
+
+    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
+    assert queued.args == [body['outbox_event_id']]
+    assert queued.kwargs == {}
+    transport_payload = f'{queued.args} {queued.kwargs} {queued.options}'
+    assert RAW_KEY not in transport_payload
+    assert provider_secret not in transport_payload
 
 
 @pytest.mark.django_db

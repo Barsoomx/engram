@@ -8,6 +8,8 @@ Current command surface:
 ```bash
 python -m engram_cli connect --server URL --api-key KEY --project PROJECT
 python -m engram_cli doctor
+python -m engram_cli hook post-tool-use < hook.json
+python -m engram_cli hook session-start < context.json
 python -m engram_cli disconnect
 ```
 
@@ -16,6 +18,9 @@ The package also declares an `engram` console script in `pyproject.toml`.
 Local state defaults to `$ENGRAM_HOME` when set, otherwise `~/.engram`.
 `connect` writes only Engram-owned config, credential, and hook-manifest files.
 `doctor` is read-only. `disconnect` removes only Engram-owned files.
+Hook commands read one JSON object from stdin, merge the connected project,
+team, runtime, and credential metadata, call the Engram server, and print the
+server JSON response.
 
 The CLI must not introduce a persistent local memory service, local database,
 provider secrets, embeddings, cached memory bundles, durable event queue, or

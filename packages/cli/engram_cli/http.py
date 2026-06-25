@@ -79,6 +79,24 @@ def post_dry_run(
     )
 
 
+def post_json(
+    *,
+    transport: Transport,
+    server_url: str,
+    path: str,
+    api_key: str,
+    payload: dict[str, object],
+    timeout: float = 2.0,
+) -> tuple[int, dict[str, object]]:
+    return transport(
+        'POST',
+        f'{server_url}{path}',
+        {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        payload,
+        timeout,
+    )
+
+
 def get_health(
     *,
     transport: Transport,

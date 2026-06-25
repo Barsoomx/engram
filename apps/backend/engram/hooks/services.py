@@ -20,6 +20,7 @@ from engram.core.models import (
     Team,
 )
 from engram.core.redaction import RedactionResult, redact_value
+from engram.memory.tasks import process_observation_recorded_outbox
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,7 @@ class IngestHookEvent:
                     observation,
                     data,
                 )
+                process_observation_recorded_outbox.delay(str(outbox_event.id))
 
                 return HookIngestResult(
                     request_id=data.request_id,

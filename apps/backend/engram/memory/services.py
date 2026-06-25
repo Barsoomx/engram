@@ -12,12 +12,17 @@ from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     CandidateStatus,
+    Memory,
     MemoryCandidate,
+    MemoryStatus,
+    MemoryVersion,
     Observation,
     OutboxEvent,
     OutboxStatus,
+    RetrievalDocument,
     VisibilityScope,
 )
 
@@ -42,6 +47,20 @@ class MemoryCandidateWorkerResult:
 
 class MemoryWorkerError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class PromoteMemoryCandidateInput:
+    candidate_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class PromoteMemoryCandidateResult:
+    candidate: MemoryCandidate
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
+    duplicate: bool
 
 
 class ProcessObservationRecorded:
@@ -252,3 +271,80 @@ def redact_text(value: str) -> str:
 
 def redact_error(message: str) -> str:
     return redact_text(message)
+
+
+class PromoteMemoryCandidate:
+    def execute(self, data: PromoteMemoryCandidateInput) -> PromoteMemoryCandidateResult:
+        with transaction.atomic():
+            candidate = self._lock_candidate(data.candidate_id)
+            if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
+                return self._existing_result(candidate)
+            if candidate.status != CandidateStatus.PROPOSED:
+                raise MemoryWorkerError('Only proposed memory candidates can be promoted')
+
+            memory = Memory.objects.create(
+                organization=candidate.organization,
+                project=candidate.project,
+                team=candidate.team,
+                title=candidate.title,
+                body=candidate.body,
+                status=MemoryStatus.APPROVED,
+                visibility_scope=candidate.visibility_scope,
+                confidence=candidate.confidence,
+                metadata=self._memory_metadata(candidate),
+            )
+            version = MemoryVersion.objects.create(
+                organization=candidate.organization,
+                project=candidate.project,
+                memory=memory,
+                source_observation=candidate.source_observation,
+                version=1,
+                body=candidate.body,
+                content_hash=candidate.content_hash,
+            )
+            candidate.status = CandidateStatus.PROMOTED
+            candidate.promoted_memory = memory
+            candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+            index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+            return PromoteMemoryCandidateResult(
+                candidate=candidate,
+                memory=memory,
+                memory_version=version,
+                retrieval_document=index_result.retrieval_document,
+                duplicate=False,
+            )
+
+    def _lock_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
+        try:
+            return MemoryCandidate.objects.select_for_update().get(id=candidate_id)
+        except MemoryCandidate.DoesNotExist as error:
+            raise MemoryWorkerError('memory candidate not found') from error
+
+    def _existing_result(self, candidate: MemoryCandidate) -> PromoteMemoryCandidateResult:
+        memory = candidate.promoted_memory
+        version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
+        index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+        return PromoteMemoryCandidateResult(
+            candidate=candidate,
+            memory=memory,
+            memory_version=version,
+            retrieval_document=index_result.retrieval_document,
+            duplicate=True,
+        )
+
+    def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
+        return {
+            'source': 'memory_candidate',
+            'memory_candidate_id': str(candidate.id),
+            'evidence': candidate.evidence,
+            'file_paths': self._candidate_file_paths(candidate),
+        }
+
+    def _candidate_file_paths(self, candidate: MemoryCandidate) -> list[str]:
+        observation = candidate.source_observation
+        if observation is None:
+            return []
+
+        return [*observation.files_read, *observation.files_modified]
