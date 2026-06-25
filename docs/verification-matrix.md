@@ -20,6 +20,23 @@ Code commits in slice:
 - `c8767724 fix: redact auto-promoted memory evidence`
 - `da06e17f test: prove worker-created memory in e2e`
 
+Final review blocker correction after reviewed head
+`38b5e5b591bca1aa9769db329f7512b5beffcf54`:
+
+- The correction fixes the stale Compose DB acceptance gap in
+  `scripts/e2e_golden_path.py`.
+- Root cause: the previous golden path could pass against stale Compose
+  volumes because it used deterministic hook/context ids, looked up approved
+  memory only by project/title, and did not prove the `RetrievalDocument` came
+  from the current hook observation.
+- Fix: the golden path now clears Compose volumes before startup, generates a
+  per-run id, uses that id in hook and context identities, queries by
+  project/per-run memory title, verifies the source raw event's
+  `client_event_id` and `request_id`, verifies
+  `RetrievalDocument.source_observation_ids`, and asserts context against the
+  per-run title/body.
+- Residual risks after this correction: none for this focused checkpoint.
+
 Scope:
 
 - `apps/backend/engram/memory/services.py`
@@ -47,6 +64,15 @@ Scope:
 | Compose cleanup | `docker compose -f deploy/compose/docker-compose.yml ps --format json` | none | yes | pass | Exit 0 with no output. |
 | focused security review | manual review recorded in `docs/security/reviews/2026-06-25-worker-auto-promotes-memory.md` | Security Review | yes | pass | Covers task payload secrecy, candidate/memory/retrieval redaction, tenant/project scoping, duplicate delivery idempotency, and context audit evidence. No open Critical or Important findings. |
 | task reviews | read-only Task 1 and Task 2 reviews | Review | yes | pass | Task 2 review approved. Task 1 worker scope was clean after valid findings were fixed, and its remaining blocker was Task 2 golden path, now resolved. |
+| final review stale-state RED | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 after adding the freshness contract. Expected failure: `run_id = secrets.token_hex(8)` was missing from the golden path script. |
+| final review generated-query RED | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 after tightening the contract for generated shell constants. Expected failure: `client_event_id = {json.dumps(client_event_id)}` was missing from the generated worker-memory query. |
+| final review syntax gate | `python3 -m py_compile scripts/e2e_golden_path.py` | Repository Quality | yes | pass | Exit 0 with no output after the stale-state correction. |
+| final review repository contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 12 tests passed, including the new freshness guard contract. |
+| final review Compose golden path first rerun | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | fixed | Exit 1. First decisive failure was a generated Django shell `NameError: name 'client_event_id' is not defined`; the query compared against constants that had not been emitted into the shell snippet. |
+| final review Compose golden path source-bound rerun | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| final review repository quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output after docs update. |
+| final review whitespace | `git diff --check` | Repository Quality | yes | pass | Exit 0 with no output after docs update. |
+| final review final Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 after docs update. Output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
 
 Task 3 verification-command contract:
 
@@ -61,6 +87,11 @@ Task 3 verification-command contract:
 | `git diff --check` | Rerun for the Task 3 docs/evidence correction. Exit 0. The original main-agent final whitespace command was `git diff --check HEAD`, exit 0. |
 
 Residual risks: none for this focused checkpoint.
+
+Final review blocker fixed: stale Compose state can no longer satisfy the
+acceptance gate because the E2E clears volumes before startup and requires the
+current run's hook raw event and source observation to match the retrieval
+document used for context.
 
 First decisive failures fixed during the TDD/debug loop:
 

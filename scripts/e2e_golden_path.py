@@ -16,8 +16,8 @@ from typing import Sequence
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_DIR = ROOT / 'deploy/compose'
 SERVER_URL = 'http://127.0.0.1:8000'
-MEMORY_TITLE = 'Hook ingest replay handling is stable'
-MEMORY_BODY = 'The hook ingest path reuses accepted replay rows and keeps request ids idempotent.'
+MEMORY_TITLE_PREFIX = 'Hook ingest replay handling is stable'
+MEMORY_BODY_PREFIX = 'The hook ingest path reuses accepted replay rows and keeps request ids idempotent.'
 MEMORY_FILE = 'apps/backend/engram/hooks/services.py'
 WORKER_MEMORY_NOT_READY_ERROR = 'worker-created retrieval document not ready'
 WORKER_MEMORY_TIMEOUT_SECONDS = 120.0
@@ -39,8 +39,11 @@ class E2EError(Exception):
 
 def main() -> int:
     api_key = f'egk_e2e_{secrets.token_urlsafe(32)}'
+    run_id = secrets.token_hex(8)
     try:
         ensure_compose_env()
+        progress('Clearing Compose state')
+        run(['docker', 'compose', 'down', '-v'], cwd=COMPOSE_DIR, secret=api_key)
         progress('Starting Compose services')
         run(['docker', 'compose', 'up', '-d', '--build', '--wait'], cwd=COMPOSE_DIR, secret=api_key)
         with tempfile.TemporaryDirectory(prefix='engram-e2e-') as config_dir:
@@ -107,14 +110,14 @@ def main() -> int:
                 ],
                 cwd=ROOT,
                 env=cli_env,
-                input_text=json.dumps(post_tool_use_payload()),
+                input_text=json.dumps(post_tool_use_payload(run_id)),
                 secret=api_key,
             )
             assert_equal(post_tool_use.get('status'), 'accepted', 'post-tool-use status')
             assert_secret_absent('post-tool-use response', json.dumps(post_tool_use), api_key)
 
             progress('Waiting for worker-created retrieval document')
-            worker_memory = wait_for_worker_memory(project_id, api_key)
+            worker_memory = wait_for_worker_memory(project_id, run_id, api_key)
             required_string(worker_memory, 'memory_id')
             required_string(worker_memory, 'memory_version_id')
             retrieval_document_id = required_string(worker_memory, 'retrieval_document_id')
@@ -132,10 +135,10 @@ def main() -> int:
                 ],
                 cwd=ROOT,
                 env=cli_env,
-                input_text=json.dumps(session_start_payload()),
+                input_text=json.dumps(session_start_payload(run_id)),
                 secret=api_key,
             )
-            assert_context_response(context)
+            assert_context_response(context, run_id)
             context_bundle_id = required_string(context, 'context_bundle_id')
             request_id = required_string(context, 'request_id')
             audit_evidence = assert_context_audit_evidence(
@@ -165,12 +168,20 @@ def ensure_compose_env() -> None:
     progress('Created deploy/compose/.env from .env.example')
 
 
-def post_tool_use_payload() -> dict[str, object]:
+def memory_title(run_id: str) -> str:
+    return f'{MEMORY_TITLE_PREFIX} [{run_id}]'
+
+
+def memory_body(run_id: str) -> str:
+    return f'{MEMORY_BODY_PREFIX} Run id: {run_id}.'
+
+
+def post_tool_use_payload(run_id: str) -> dict[str, object]:
     return {
-        'session_id': 'e2e-session-observation',
-        'event_id': 'e2e-hook-event-1',
-        'idempotency_key': 'e2e-hook-idempotency-1',
-        'request_id': 'e2e-hook-request-1',
+        'session_id': f'e2e-session-observation-{run_id}',
+        'event_id': f'e2e-hook-event-{run_id}',
+        'idempotency_key': f'e2e-hook-idempotency-{run_id}',
+        'request_id': f'e2e-hook-request-{run_id}',
         'payload': {
             'tool_name': 'bash',
             'tool_input': {'command': 'pytest engram/hooks/hook_ingest_tests.py -v'},
@@ -178,8 +189,8 @@ def post_tool_use_payload() -> dict[str, object]:
         },
         'observation': {
             'type': 'tool_use',
-            'title': MEMORY_TITLE,
-            'body': MEMORY_BODY,
+            'title': memory_title(run_id),
+            'body': memory_body(run_id),
             'files_read': [MEMORY_FILE],
             'files_modified': [],
         },
@@ -189,11 +200,11 @@ def post_tool_use_payload() -> dict[str, object]:
     }
 
 
-def session_start_payload() -> dict[str, object]:
+def session_start_payload(run_id: str) -> dict[str, object]:
     return {
-        'session_id': 'e2e-session-context',
-        'request_id': 'e2e-context-request-1',
-        'query': 'hook ingest replay handling stable',
+        'session_id': f'e2e-session-context-{run_id}',
+        'request_id': f'e2e-context-request-{run_id}',
+        'query': memory_title(run_id),
         'file_paths': [MEMORY_FILE],
         'symbols': ['IngestHookEvent'],
         'limit': 5,
@@ -211,7 +222,7 @@ def pythonpath_env() -> dict[str, str]:
     return env
 
 
-def wait_for_worker_memory(project_id: str, secret: str) -> dict[str, object]:
+def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[str, object]:
     deadline = time.monotonic() + WORKER_MEMORY_TIMEOUT_SECONDS
     last_error = 'worker-created retrieval document was not observed'
     while time.monotonic() < deadline:
@@ -227,7 +238,7 @@ def wait_for_worker_memory(project_id: str, secret: str) -> dict[str, object]:
                     'manage.py',
                     'shell',
                     '-c',
-                    worker_memory_query(project_id),
+                    worker_memory_query(project_id, run_id),
                 ],
                 cwd=COMPOSE_DIR,
                 secret=secret,
@@ -245,25 +256,43 @@ def wait_for_worker_memory(project_id: str, secret: str) -> dict[str, object]:
     )
 
 
-def worker_memory_query(project_id: str) -> str:
+def worker_memory_query(project_id: str, run_id: str) -> str:
+    title = memory_title(run_id)
+    client_event_id = f'e2e-hook-event-{run_id}'
+    request_id = f'e2e-hook-request-{run_id}'
+
     return f"""
 import json
 from engram.core.models import Memory, MemoryStatus, MemoryVersion, RetrievalDocument
 
-memory = (
-    Memory.objects.filter(
+client_event_id = {json.dumps(client_event_id)}
+request_id = {json.dumps(request_id)}
+
+version = (
+    MemoryVersion.objects.select_related('memory', 'source_observation__raw_event')
+    .filter(
         project_id={json.dumps(project_id)},
-        title={json.dumps(MEMORY_TITLE)},
-        status=MemoryStatus.APPROVED,
+        memory__project_id={json.dumps(project_id)},
+        memory__title={json.dumps(title)},
+        memory__status=MemoryStatus.APPROVED,
     )
     .order_by('-created_at')
     .first()
 )
-if memory is None:
+if version is None:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
 
-version = MemoryVersion.objects.filter(memory=memory, version=memory.current_version).first()
-if version is None:
+memory = version.memory
+if version.version != memory.current_version:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
+if version.source_observation is None or version.source_observation.raw_event is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
+raw_event = version.source_observation.raw_event
+if raw_event.client_event_id != client_event_id:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+if raw_event.request_id != request_id:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
 
 document = RetrievalDocument.objects.filter(
@@ -274,10 +303,14 @@ document = RetrievalDocument.objects.filter(
 if document is None:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
 
+if str(version.source_observation_id) not in document.source_observation_ids:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)})
+
 print(json.dumps({{
     'memory_id': str(memory.id),
     'memory_version_id': str(version.id),
     'retrieval_document_id': str(document.id),
+    'source_observation_id': str(version.source_observation_id),
 }}))
 """
 
@@ -390,7 +423,7 @@ def run(
     return result
 
 
-def assert_context_response(response: dict[str, object]) -> None:
+def assert_context_response(response: dict[str, object], run_id: str) -> None:
     assert_equal(response.get('status'), 'created', 'context status')
     assert_equal(response.get('purpose'), 'session_start', 'context purpose')
     items = response.get('items')
@@ -400,10 +433,12 @@ def assert_context_response(response: dict[str, object]) -> None:
     if not isinstance(first_item, dict):
         raise E2EError('Context response item is not an object')
     assert_equal(first_item.get('citation'), 'M1', 'first context citation')
-    assert_equal(first_item.get('title'), MEMORY_TITLE, 'memory title')
-    assert_equal(first_item.get('body'), MEMORY_BODY, 'memory body')
+    title = memory_title(run_id)
+    body = memory_body(run_id)
+    assert_equal(first_item.get('title'), title, 'memory title')
+    assert_equal(first_item.get('body'), body, 'memory body')
     rendered_context = required_string(response, 'rendered_context')
-    if MEMORY_TITLE not in rendered_context or MEMORY_BODY not in rendered_context:
+    if title not in rendered_context or body not in rendered_context:
         raise E2EError('Rendered context does not contain approved memory')
     hook_output = response.get('hook_specific_output')
     if not isinstance(hook_output, dict):

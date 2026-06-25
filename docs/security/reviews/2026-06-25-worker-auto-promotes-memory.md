@@ -10,6 +10,15 @@ Evidence/docs head before this correction: `4a911ebfc3a3f693de4665465a2af9fa4612
 
 Result: SECURITY APPROVED for the worker auto-promotion checkpoint.
 
+Final review correction after reviewed head
+`38b5e5b591bca1aa9769db329f7512b5beffcf54`: the original E2E acceptance
+gate had a stale Compose database proof gap. A previous killed run could leave
+approved memory, retrieval, context, or audit rows that matched the next run's
+deterministic project/title-only checks even if relay or worker processing was
+broken. The correction makes the E2E clear Compose volumes before startup and
+prove the current hook observation produced the retrieval document used by the
+future-session context.
+
 ## Scope Reviewed
 
 - `apps/backend/engram/memory/services.py`
@@ -46,6 +55,15 @@ future semantic retrieval work.
 | repository checks | Exit 0 for `python3 -m unittest discover -s tests -v` with 27 tests passed; `python3 scripts/repository_layout.py` with no output; `python3 scripts/repository_quality.py` with no output; `git diff --check HEAD` with no output. |
 | final Compose golden path rerun | Exit 0. `python3 scripts/e2e_golden_path.py` completed through the same worker-created retrieval-document wait path. |
 | Compose cleanup | Exit 0. `docker compose -f deploy/compose/docker-compose.yml ps --format json` returned no output. |
+| final review stale-state RED | Exit 1. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` failed as expected after adding the freshness contract because `run_id = secrets.token_hex(8)` was missing from the golden path script. |
+| final review generated-query RED | Exit 1. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` failed as expected after tightening the contract because `client_event_id = {json.dumps(client_event_id)}` was missing from the generated worker-memory query. |
+| final review syntax gate | Exit 0. `python3 -m py_compile scripts/e2e_golden_path.py` produced no output after the correction. |
+| final review repository contract | Exit 0. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` reported 12 tests passed. |
+| final review Compose golden path first rerun | Exit 1. `python3 scripts/e2e_golden_path.py` failed with generated Django shell `NameError: name 'client_event_id' is not defined`; this was fixed by emitting the current run's expected raw-event ids into the query snippet. |
+| final review Compose golden path source-bound rerun | Exit 0. `python3 scripts/e2e_golden_path.py` output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| final review repository quality | Exit 0. `python3 scripts/repository_quality.py` produced no output after docs update. |
+| final review whitespace | Exit 0. `git diff --check` produced no output after docs update. |
+| final review final Compose golden path | Exit 0. `python3 scripts/e2e_golden_path.py` ran after docs update and output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
 
 ## Task 3 Verification-Command Contract
 
@@ -74,6 +92,15 @@ None.
 ### IMPORTANT
 
 None open.
+
+Resolved during final review: the Compose golden path could pass against stale
+state because it started Compose without a pre-run volume reset, reused
+deterministic hook/context ids, and accepted any approved memory matching only
+project/title. The fixed script now uses a per-run id for hook and context
+identities, clears Compose volumes before startup, queries by per-run memory
+title, verifies `MemoryVersion.source_observation.raw_event.client_event_id`
+and `request_id`, verifies the retrieval document contains the current source
+observation id, and asserts context against the per-run title/body.
 
 Resolved during the slice: token-shaped values leaked through persisted
 memory/retrieval file paths during the redaction RED. Candidate title/body and
@@ -104,6 +131,10 @@ None.
 - Context audit evidence: E2E verifies `ContextBundleItem` and
   `MemoryRetrieved` `AuditEvent` records for the returned context bundle,
   request, and retrieval document.
+- Freshness against stale Compose state: E2E now performs a pre-start
+  `docker compose down -v`, uses per-run hook/session/request identities, and
+  requires the approved memory version and retrieval document to trace back to
+  the current run's hook raw event and source observation.
 
 ## Fixes Applied
 
@@ -116,6 +147,11 @@ None.
   verifies future-session context and audit evidence.
 - Repository runtime contract proves the golden path no longer uses manual
   promotion.
+- Final review correction: the E2E golden path no longer accepts stale Compose
+  state. It clears volumes before startup, makes hook/context identities unique
+  per run, verifies the source raw event's `client_event_id` and `request_id`,
+  and requires `RetrievalDocument.source_observation_ids` to include the
+  current source observation id.
 
 ## Regression Tests Added
 
@@ -130,6 +166,9 @@ None.
   `duplicate true` with stable ids.
 - Compose golden path proves worker-created retrieval state reaches future
   session context and audit records.
+- Repository runtime contract now proves the stale-state freshness guards:
+  pre-run Compose volume reset, per-run ids, source raw-event verification,
+  retrieval document source-observation verification, and no manual promotion.
 
 ## Accepted Risk
 
@@ -140,3 +179,6 @@ Residual risks: none for this focused checkpoint.
 Task 2 review approved the golden path. Task 1 worker scope was clean after
 valid findings were fixed, and its remaining blocker was Task 2 golden path,
 now resolved.
+
+Final review blocker fixed. Residual risks after the stale-state correction:
+none for this focused checkpoint.
