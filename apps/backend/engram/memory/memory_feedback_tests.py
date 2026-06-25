@@ -273,6 +273,41 @@ def test_memory_feedback_denies_wrong_project_without_mutating_memory() -> None:
 
 
 @pytest.mark.django_db
+def test_memory_feedback_denies_team_visible_memory_outside_reviewer_team() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Infrastructure', slug='infrastructure')
+    ProjectTeam.objects.create(organization=organization, team=other_team, project=project)
+    memory, _version, document = create_approved_memory_document(
+        organization,
+        other_team,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(
+            project,
+            team,
+            request_id='request-memory-feedback-wrong-team',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    document.refresh_from_db()
+    assert response.status_code == 403
+    assert response.json()['code'] == 'team_scope_denied'
+    assert memory.stale is False
+    assert memory.refuted is False
+    assert document.stale is False
+    assert document.refuted is False
+    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+
+
+@pytest.mark.django_db
 def test_memory_feedback_rejects_oversized_reason_before_mutating_memory() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     memory, _version, document = create_approved_memory_document(organization, team, project)
@@ -285,6 +320,61 @@ def test_memory_feedback_rejects_oversized_reason_before_mutating_memory() -> No
             team,
             reason='x' * 2001,
             request_id='request-memory-feedback-oversized',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    document.refresh_from_db()
+    assert response.status_code == 400
+    assert memory.stale is False
+    assert memory.refuted is False
+    assert document.stale is False
+    assert document.refuted is False
+    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+
+
+@pytest.mark.django_db
+def test_memory_feedback_rejects_oversized_request_id_before_mutating_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(
+            project,
+            team,
+            request_id='r' * 256,
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    document.refresh_from_db()
+    assert response.status_code == 400
+    assert memory.stale is False
+    assert memory.refuted is False
+    assert document.stale is False
+    assert document.refuted is False
+    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+
+
+@pytest.mark.django_db
+def test_memory_feedback_rejects_oversized_correlation_id_before_mutating_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(
+            project,
+            team,
+            request_id='request-memory-feedback-oversized-correlation',
+            correlation_id='c' * 256,
         ),
         format='json',
         **auth_headers(),
