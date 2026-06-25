@@ -35,6 +35,9 @@ class MemoryCandidateWorkerInput:
 @dataclass(frozen=True)
 class MemoryCandidateWorkerResult:
     candidate: MemoryCandidate
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
     duplicate: bool
 
 
@@ -201,10 +204,16 @@ class ProcessObservationRecorded:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation)
+            promotion = PromoteMemoryCandidate().execute(
+                PromoteMemoryCandidateInput(candidate_id=candidate.id),
+            )
 
             return MemoryCandidateWorkerResult(
-                candidate=candidate,
-                duplicate=not candidate_created,
+                candidate=promotion.candidate,
+                memory=promotion.memory,
+                memory_version=promotion.memory_version,
+                retrieval_document=promotion.retrieval_document,
+                duplicate=not candidate_created or promotion.duplicate,
             )
 
     def _lock_observation(self, observation_id: uuid.UUID) -> Observation:
