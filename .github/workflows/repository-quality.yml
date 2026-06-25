@@ -43,6 +43,7 @@ jobs:
 
       - name: Check required docs
         run: |
+          test -f docs/north-star.md
           test -f docs/product-requirements.md
           test -f docs/v1-scope.md
           test -f docs/architecture.md

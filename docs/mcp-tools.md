@@ -2,10 +2,10 @@
 
 ## Goal
 
-`claudex-teams` needs an MCP server for local agent and team-lead workflows.
-This MCP server is not a local memory worker. It is a thin authenticated client
-that exposes server-side memory operations to Claude Code, Codex, and local
-operator sessions.
+Engram needs an MCP server for local agent and team-lead workflows. This MCP
+server is not a local memory worker. It is a thin authenticated client that
+exposes server-side memory operations to Claude Code, Codex, and local operator
+sessions.
 
 Developers should get seamless memory search and update tools. Leads and
 responsible owners should get tools for the AI-generated memory workflow: inspect

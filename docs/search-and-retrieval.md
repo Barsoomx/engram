@@ -1,11 +1,15 @@
-# Search And Retrieval
+# Search And Context Assembly
 
 ## Principle
 
-Search must combine exact/grep-style retrieval with semantic retrieval in V1.
-Exact search is the authority for names, paths, symbols, ticket ids, commands,
-and error strings. Semantic search is required for recall across paraphrases and
-related decisions. Neither path is sufficient alone.
+The product goal is context assembly, not search results. Search is an internal
+capability used to build the smallest useful context bundle for a concrete agent
+task.
+
+Retrieval must combine exact/grep-style matching with semantic retrieval in V1.
+Exact matching is the authority for names, paths, symbols, ticket ids, commands,
+and error strings. Semantic retrieval is required for recall across paraphrases
+and related decisions. Neither path is sufficient alone.
 
 Agent memory needs reliable answers to questions like "what did we decide about
 this file?", "where did this error happen?", and "which review found this bug?"
@@ -43,7 +47,7 @@ Later:
 - Qdrant adapter for customers that need separate vector scaling;
 - model reranking.
 
-## Retrieval Pipeline
+## Context Assembly Pipeline
 
 1. Parse request intent and context.
 2. Resolve actor and effective scope.
@@ -51,8 +55,8 @@ Later:
 4. Run exact, full-text, trigram, and vector retrieval.
 5. Fuse candidates deterministically, with exact matches allowed to dominate
    when filenames, symbols, ticket ids, commands, or error strings match.
-6. Pack context with citations, confidence, source references, and stale/conflict
-   warnings.
+6. Pack the context bundle with citations, confidence, source references, and
+   stale/conflict warnings.
 7. Audit the final injected memory set.
 
 ## Result Types
@@ -67,7 +71,7 @@ Later:
 
 ## Explainability
 
-Every response to an agent should be explainable:
+Every context bundle sent to an agent should be explainable:
 
 - matched exact terms;
 - semantic neighbors used and embedding model/version;

@@ -3,8 +3,8 @@
 ## Integration Goal
 
 Claude Code and Codex should connect through hooks that call the server. Hooks
-capture observations, retrieve memory, and return guidance. They must not start
-local memory workers or depend on local databases.
+capture observations, request context bundles, and return guidance. They must
+not start local memory workers or depend on local databases.
 
 ## Supported Agent Families
 
@@ -12,6 +12,10 @@ local memory workers or depend on local databases.
   tools for explicit memory operations.
 - Codex: hook events and managed/trusted hook configuration for session, prompt,
   and tool-use integration.
+
+The architecture is LLM-agnostic. Gemini CLI, Cursor, OpenAI Agents, and future
+agent runtimes should be added by implementing thin adapters over the same
+server memory and context APIs, not by creating separate memory stores.
 
 The hook adapters should be separate thin packages that share the same server
 API schema. Agent-specific differences belong at the adapter boundary.
@@ -26,7 +30,7 @@ The target installer is a client connector, not a worker bootstrapper. The V1
 golden path is explicit:
 
 ```bash
-npx claudex-teams connect --server URL --api-key KEY --project PROJECT
+engram connect --server URL --api-key KEY --project PROJECT
 ```
 
 It writes hook configuration for Claude Code and/or Codex, then calls the dry-run
@@ -59,7 +63,7 @@ Session start:
 - identify agent family and version;
 - resolve local workspace, repository, branch, and project;
 - call `/v1/context/session-start`;
-- inject memory bundle and citations into the agent context.
+- inject the context bundle and citations into the agent context.
 
 Prompt submit:
 

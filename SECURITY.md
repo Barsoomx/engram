@@ -1,7 +1,7 @@
 # Security Policy
 
-`claudex-teams` is being redesigned as a server-only enterprise memory product.
-The protected security boundary is the company server, not a developer-machine
+Engram is being redesigned as a server-only engineering memory product. The
+protected security boundary is the company server, not a developer-machine
 worker.
 
 ## Supported Branches

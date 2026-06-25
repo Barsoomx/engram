@@ -1,7 +1,7 @@
-# claudex-teams development notes
+# Engram development notes
 
 This repository is moving from an inherited local-worker memory tool toward a
-server-only enterprise memory product for Claude Code and Codex teams.
+server-only engineering memory product for AI coding agents.
 
 When suggesting changes:
 

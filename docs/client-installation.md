@@ -4,8 +4,8 @@
 
 The inherited `npx claude-mem install` flow does too much for the target
 product. It installs local runtime dependencies, prepares a worker, writes local
-settings, and registers hooks. That is the opposite of the `claudex-teams`
-server-only goal.
+settings, and registers hooks. That is the opposite of Engram's server-only
+direction.
 
 For this fork, server deployment and agent connection are separate jobs:
 
@@ -16,16 +16,17 @@ For this fork, server deployment and agent connection are separate jobs:
 
 ## Target Command Shape
 
-The client command should be renamed and narrowed. Candidate names:
+The client command should be renamed and narrowed around the `engram` binary.
+Target command shape:
 
-- `npx claudex-teams connect`
-- `npx claudex-teams hooks install`
-- `npx claudex-teams agent connect`
+- `engram connect`
+- `engram hooks install`
+- `engram agent connect`
 
 The V1 golden path is non-interactive and scriptable:
 
 ```bash
-npx claudex-teams connect --server URL --api-key KEY --project PROJECT
+engram connect --server URL --api-key KEY --project PROJECT
 ```
 
 The interactive wizard can wrap the same fields later:
@@ -68,7 +69,7 @@ Enterprise admins should be able to avoid per-developer wizard work:
 In managed mode, the local command becomes a verifier:
 
 ```bash
-npx claudex-teams doctor
+engram doctor
 ```
 
 It checks hook files, trust state, server reachability, identity resolution, and
