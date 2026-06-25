@@ -1,16 +1,22 @@
 from __future__ import annotations
 
+import io
+import json
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from django.core.management import call_command
 from django.utils import timezone
 
 from engram.core.models import (
     Agent,
     AgentSession,
     CandidateStatus,
+    Memory,
     MemoryCandidate,
+    MemoryStatus,
+    MemoryVersion,
     Observation,
     ObservationSource,
     Organization,
@@ -18,6 +24,7 @@ from engram.core.models import (
     OutboxStatus,
     Project,
     RawEventEnvelope,
+    RetrievalDocument,
     Runtime,
     Team,
     VisibilityScope,
@@ -26,6 +33,8 @@ from engram.memory.services import (
     MemoryCandidateWorkerInput,
     MemoryWorkerError,
     ProcessObservationRecorded,
+    PromoteMemoryCandidate,
+    PromoteMemoryCandidateInput,
     memory_candidate_content_hash,
 )
 from engram.memory.tasks import process_observation_recorded_outbox
@@ -35,10 +44,12 @@ RAW_KEY = 'egk_test_memory_worker_0123456789abcdefghijklmnopqrstuvwxyz'
 
 def create_observation_recorded_scope(
     *,
+    suffix: str = '1',
     outbox_event_type: str = 'ObservationRecorded',
     outbox_payload: dict[str, Any] | None = None,
 ) -> tuple[Organization, Team, Project, AgentSession, RawEventEnvelope, Observation, OutboxEvent]:
-    organization = Organization.objects.create(name='Engram', slug='engram')
+    slug_suffix = '' if suffix == '1' else f'-{suffix}'
+    organization = Organization.objects.create(name=f'Engram {suffix}', slug=f'engram{slug_suffix}')
     team = Team.objects.create(organization=organization, name='Platform', slug='platform')
     project = Project.objects.create(
         organization=organization,
@@ -50,7 +61,7 @@ def create_observation_recorded_scope(
     agent = Agent.objects.create(
         organization=organization,
         runtime=Runtime.CODEX,
-        external_id='codex-local',
+        external_id=f'codex-local-{suffix}',
         version='0.1.0',
     )
     session = AgentSession.objects.create(
@@ -58,7 +69,7 @@ def create_observation_recorded_scope(
         project=project,
         team=team,
         agent=agent,
-        external_session_id='session-1',
+        external_session_id=f'session-{suffix}',
         runtime=Runtime.CODEX,
         repository_url='https://example.test/engram.git',
         repository_root='/workspace/engram',
@@ -73,9 +84,9 @@ def create_observation_recorded_scope(
         session=session,
         event_type='post_tool_use',
         source_adapter=Runtime.CODEX,
-        client_event_id='event-1',
-        idempotency_key='idem-1',
-        content_hash='hash-event-1',
+        client_event_id=f'event-{suffix}',
+        idempotency_key=f'idem-{suffix}',
+        content_hash=f'hash-event-{suffix}',
         runtime=Runtime.CODEX,
         payload_schema_version='v1',
         payload={
@@ -84,9 +95,9 @@ def create_observation_recorded_scope(
             'tool_response': {'stdout': RAW_KEY},
         },
         headers={},
-        request_id='request-event-1',
+        request_id=f'request-event-{suffix}',
         actor_type='api_key',
-        actor_id='api-key-1',
+        actor_id=f'api-key-{suffix}',
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -100,7 +111,7 @@ def create_observation_recorded_scope(
         body='pytest failed on missing memory worker and now exits 0',
         files_read=['apps/backend/engram/core/models.py'],
         files_modified=['apps/backend/engram/memory/services.py'],
-        content_hash='hash-observation-1',
+        content_hash=f'hash-observation-{suffix}',
         redaction_metadata={'redacted': True},
         source_metadata={'event_type': 'post_tool_use'},
         observed_at=timezone.now(),
@@ -111,8 +122,8 @@ def create_observation_recorded_scope(
         observation=observation,
         raw_event=raw_event,
         source_type='hook_event',
-        source_id='event-1',
-        citation='event-1',
+        source_id=f'event-{suffix}',
+        citation=f'event-{suffix}',
         metadata={'event_type': 'post_tool_use'},
     )
     payload = (
@@ -138,9 +149,9 @@ def create_observation_recorded_scope(
         payload=payload,
         idempotency_key=raw_event.idempotency_key,
         actor_type='api_key',
-        actor_id='api-key-1',
-        correlation_id='correlation-1',
-        trace_id='trace-1',
+        actor_id=f'api-key-{suffix}',
+        correlation_id=f'correlation-{suffix}',
+        trace_id=f'trace-{suffix}',
     )
 
     return organization, team, project, session, raw_event, observation, outbox
@@ -364,3 +375,110 @@ def test_process_observation_recorded_outbox_task_delegates_by_outbox_id() -> No
 
     assert candidate_id == str(candidate.id)
     assert outbox.status == OutboxStatus.DONE
+
+
+@pytest.mark.django_db
+def test_process_observation_recorded_outbox_command_processes_pending_events() -> None:
+    _organization, _team, _project, _session, _raw_event, _observation, first_outbox = (
+        create_observation_recorded_scope()
+    )
+    _other_org, _other_team, _other_project, _other_session, _other_raw, _other_observation, second_outbox = (
+        create_observation_recorded_scope(suffix='2')
+    )
+    stdout = io.StringIO()
+
+    call_command('engram_process_observation_outbox', '--limit', '10', '--json', stdout=stdout)
+
+    body = json.loads(stdout.getvalue())
+    first_outbox.refresh_from_db()
+    second_outbox.refresh_from_db()
+
+    assert body['processed'] == 2
+    assert body['failed'] == 0
+    assert first_outbox.status == OutboxStatus.DONE
+    assert second_outbox.status == OutboxStatus.DONE
+    assert MemoryCandidate.objects.count() == 2
+    assert OutboxEvent.objects.filter(event_type='MemoryCandidateCreated').count() == 2
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_creates_memory_version_and_retrieval_document() -> None:
+    _organization, team, project, _session, _raw_event, observation, outbox = create_observation_recorded_scope()
+    candidate = execute_worker(outbox).candidate
+
+    result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    memory = Memory.objects.get()
+    version = MemoryVersion.objects.get()
+    document = RetrievalDocument.objects.get()
+
+    assert result.duplicate is False
+    assert result.candidate.id == candidate.id
+    assert result.memory.id == memory.id
+    assert result.memory_version.id == version.id
+    assert result.retrieval_document.id == document.id
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == memory.id
+    assert memory.organization_id == project.organization_id
+    assert memory.project_id == project.id
+    assert memory.team_id == team.id
+    assert memory.title == candidate.title
+    assert memory.body == candidate.body
+    assert memory.status == MemoryStatus.APPROVED
+    assert memory.visibility_scope == candidate.visibility_scope
+    assert memory.confidence == candidate.confidence
+    assert memory.metadata == {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+        'file_paths': observation.files_read + observation.files_modified,
+    }
+    assert version.memory_id == memory.id
+    assert version.version == 1
+    assert version.body == candidate.body
+    assert version.content_hash == candidate.content_hash
+    assert version.source_observation_id == observation.id
+    assert document.memory_id == memory.id
+    assert document.memory_version_id == version.id
+    assert document.file_paths == observation.files_read + observation.files_modified
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_is_idempotent() -> None:
+    _organization, _team, _project, _session, _raw_event, _observation, outbox = create_observation_recorded_scope()
+    candidate = execute_worker(outbox).candidate
+    first = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    second = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert second.duplicate is True
+    assert second.memory.id == first.memory.id
+    assert second.memory_version.id == first.memory_version.id
+    assert second.retrieval_document.id == first.retrieval_document.id
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_command_outputs_json_ids() -> None:
+    _organization, _team, _project, _session, _raw_event, _observation, outbox = create_observation_recorded_scope()
+    candidate = execute_worker(outbox).candidate
+    stdout = io.StringIO()
+
+    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=stdout)
+
+    body = json.loads(stdout.getvalue())
+    candidate.refresh_from_db()
+    memory = candidate.promoted_memory
+    version = MemoryVersion.objects.get(memory=memory)
+    document = RetrievalDocument.objects.get(memory=memory)
+
+    assert body == {
+        'candidate_id': str(candidate.id),
+        'memory_id': str(memory.id),
+        'memory_version_id': str(version.id),
+        'retrieval_document_id': str(document.id),
+        'duplicate': False,
+    }
