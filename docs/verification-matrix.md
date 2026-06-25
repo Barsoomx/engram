@@ -119,6 +119,7 @@ Scope:
 
 - `apps/backend/engram/core/models.py`
 - `apps/backend/engram/core/migrations/0001_initial.py`
+- `apps/backend/engram/core/migrations/0002_remove_outboxevent_core_outbox_unique_idempotency_key_per_event_and_more.py`
 - `apps/backend/engram/core/core_models_tests.py`
 - `apps/backend/settings/settings.py`
 - `.github/workflows/backend.yml`
@@ -134,12 +135,12 @@ Scope:
 | repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. Core model and initial migration paths are required. |
 | repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
 | repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
-| core model tests | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py -v` | Backend | yes | pass | Exit 0. Ran 8 tests for scoped ids, event replay, observation dedupe, source provenance, retrieval scope, context citations, and outbox idempotency. |
-| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 11 backend tests. |
+| core model tests | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py -v` | Backend | yes | pass | Exit 0. Ran 22 tests for scoped uniqueness, event replay, observation dedupe, source provenance, save-time cross-scope rejection, retrieval scope, context citations, and source-scoped outbox idempotency. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 25 backend tests. |
 | backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
 | backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. |
 | migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
-| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied Django auth/contenttypes/core/sessions migrations against the test database. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied Django auth/contenttypes/core/sessions migrations, including core 0001 and 0002, against the test database. |
 | backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
 | whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
 | live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
@@ -156,6 +157,12 @@ First decisive failures fixed during the TDD loop:
   did not run migration freshness or migration apply commands.
 - `cd apps/backend && poetry run python manage.py migrate --check
   --settings=settings.test_settings` exited 1 on a fresh database because it
-  detects unapplied migrations rather than applying them; the gate now uses
+  detects unapplied migrations rather than applying them; the gate uses
   `migrate --noinput --settings=settings.test_settings` to prove the migration
   applies cleanly.
+- Review pass found that model `clean()` methods did not run on normal saves;
+  cross-scope `objects.create()` regression tests now cover the tenant/project
+  consistency paths.
+- Review pass found outbox idempotency lacked an explicit source dimension;
+  `OutboxEvent` now carries `source_type` and `source_id`, and the uniqueness
+  constraint includes event type, source, and idempotency key.

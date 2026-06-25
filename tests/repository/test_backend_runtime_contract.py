@@ -17,6 +17,7 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/settings/urls.py',
         'apps/backend/engram/core/models.py',
         'apps/backend/engram/core/migrations/0001_initial.py',
+        'apps/backend/engram/core/migrations/0002_remove_outboxevent_core_outbox_unique_idempotency_key_per_event_and_more.py',
         'apps/backend/engram/health/views.py',
         'apps/backend/Dockerfile',
         'deploy/compose/docker-compose.yml',

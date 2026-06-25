@@ -14,6 +14,11 @@ class TimestampedModel(models.Model):
     class Meta:
         abstract = True
 
+    def save(self, *args: object, **kwargs: object) -> None:
+        self.full_clean(validate_unique=False, validate_constraints=False)
+
+        super().save(*args, **kwargs)
+
 
 class Runtime(models.TextChoices):
     CLAUDE_CODE = 'claude_code', 'Claude Code'
@@ -65,6 +70,47 @@ class OutboxStatus(models.TextChoices):
     DONE = 'done', 'Done'
     FAILED = 'failed', 'Failed'
     DEAD_LETTER = 'dead_letter', 'Dead letter'
+
+
+def add_scope_error(errors: dict[str, list[str]], field: str, message: str) -> None:
+    errors.setdefault(field, []).append(message)
+
+
+def check_organization_scope(
+    errors: dict[str, list[str]],
+    field: str,
+    related: object,
+    organization_id: uuid.UUID | None,
+) -> None:
+    if related is not None and related.organization_id != organization_id:
+        add_scope_error(errors, field, f'{field} organization must match record organization')
+
+
+def check_project_scope(
+    errors: dict[str, list[str]],
+    field: str,
+    related: object,
+    organization_id: uuid.UUID | None,
+    project_id: uuid.UUID | None,
+) -> None:
+    check_organization_scope(errors, field, related, organization_id)
+    if related is not None and related.project_id != project_id:
+        add_scope_error(errors, field, f'{field} project must match record project')
+
+
+def check_project_organization(
+    errors: dict[str, list[str]],
+    field: str,
+    project: object,
+    organization_id: uuid.UUID | None,
+) -> None:
+    if project is not None and project.organization_id != organization_id:
+        add_scope_error(errors, field, f'{field} organization must match record organization')
+
+
+def raise_scope_errors(errors: dict[str, list[str]]) -> None:
+    if errors:
+        raise ValidationError(errors)
 
 
 class Organization(TimestampedModel):
@@ -120,6 +166,14 @@ class ProjectTeam(TimestampedModel):
         constraints = [
             models.UniqueConstraint(fields=['project', 'team'], name='core_project_team_unique_pair'),
         ]
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.project_id}:{self.team_id}'
@@ -183,6 +237,16 @@ class AgentSession(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'external_session_id']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.agent_id:
+            check_organization_scope(errors, 'agent', self.agent, self.organization_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return f'{self.runtime}:{self.external_session_id}'
 
@@ -228,6 +292,18 @@ class RawEventEnvelope(TimestampedModel):
             models.Index(fields=['organization', 'project', 'content_hash']),
         ]
         ordering = ['organization_id', 'project_id', 'received_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.agent_id:
+            check_organization_scope(errors, 'agent', self.agent, self.organization_id)
+        if self.session_id:
+            check_project_scope(errors, 'session', self.session, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.event_type}:{self.client_event_id}'
@@ -276,6 +352,20 @@ class Observation(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.agent_id:
+            check_organization_scope(errors, 'agent', self.agent, self.organization_id)
+        if self.session_id:
+            check_project_scope(errors, 'session', self.session, self.organization_id, self.project_id)
+        if self.raw_event_id:
+            check_project_scope(errors, 'raw_event', self.raw_event, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return self.title
 
@@ -309,17 +399,14 @@ class ObservationSource(TimestampedModel):
         ordering = ['organization_id', 'project_id', 'source_type', 'source_id']
 
     def clean(self) -> None:
-        errors = {}
-        if self.observation_id and self.observation.organization_id != self.organization_id:
-            errors['observation'] = 'observation organization must match source organization'
-        if self.observation_id and self.observation.project_id != self.project_id:
-            errors['observation'] = 'observation project must match source project'
-        if self.raw_event_id and self.raw_event.organization_id != self.organization_id:
-            errors['raw_event'] = 'raw event organization must match source organization'
-        if self.raw_event_id and self.raw_event.project_id != self.project_id:
-            errors['raw_event'] = 'raw event project must match source project'
-        if errors:
-            raise ValidationError(errors)
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.observation_id:
+            check_project_scope(errors, 'observation', self.observation, self.organization_id, self.project_id)
+        if self.raw_event_id:
+            check_project_scope(errors, 'raw_event', self.raw_event, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.source_type}:{self.source_id}'
@@ -367,6 +454,24 @@ class MemoryCandidate(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.source_observation_id:
+            check_project_scope(
+                errors,
+                'source_observation',
+                self.source_observation,
+                self.organization_id,
+                self.project_id,
+            )
+        if self.promoted_memory_id:
+            check_project_scope(errors, 'promoted_memory', self.promoted_memory, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return self.title
 
@@ -396,6 +501,14 @@ class Memory(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'title']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return self.title
 
@@ -424,6 +537,22 @@ class MemoryVersion(TimestampedModel):
             models.Index(fields=['organization', 'project', 'content_hash']),
         ]
         ordering = ['memory_id', 'version']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.memory_id:
+            check_project_scope(errors, 'memory', self.memory, self.organization_id, self.project_id)
+        if self.source_observation_id:
+            check_project_scope(
+                errors,
+                'source_observation',
+                self.source_observation,
+                self.organization_id,
+                self.project_id,
+            )
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.memory_id}:v{self.version}'
@@ -468,19 +597,18 @@ class RetrievalDocument(TimestampedModel):
         ordering = ['organization_id', 'project_id', 'memory_id']
 
     def clean(self) -> None:
-        errors = {}
-        if self.memory_id and self.memory.organization_id != self.organization_id:
-            errors['memory'] = 'memory organization must match retrieval document organization'
-        if self.memory_id and self.memory.project_id != self.project_id:
-            errors['memory'] = 'memory project must match retrieval document project'
-        if self.memory_version_id and self.memory_version.organization_id != self.organization_id:
-            errors['memory_version'] = 'memory version organization must match retrieval document organization'
-        if self.memory_version_id and self.memory_version.project_id != self.project_id:
-            errors['memory_version'] = 'memory version project must match retrieval document project'
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.memory_id:
+            check_project_scope(errors, 'memory', self.memory, self.organization_id, self.project_id)
+        if self.memory_version_id:
+            check_project_scope(errors, 'memory_version', self.memory_version, self.organization_id, self.project_id)
         if self.memory_version_id and self.memory_id and self.memory_version.memory_id != self.memory_id:
-            errors['memory_version'] = 'memory version must belong to retrieval document memory'
-        if errors:
-            raise ValidationError(errors)
+            add_scope_error(errors, 'memory_version', 'memory version must belong to retrieval document memory')
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.memory_id}:{self.memory_version_id}'
@@ -514,6 +642,18 @@ class ContextBundle(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.agent_id:
+            check_organization_scope(errors, 'agent', self.agent, self.organization_id)
+        if self.session_id:
+            check_project_scope(errors, 'session', self.session, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return self.request_id
 
@@ -542,21 +682,22 @@ class ContextBundleItem(TimestampedModel):
         ordering = ['bundle_id', 'rank']
 
     def clean(self) -> None:
-        errors = {}
-        if self.bundle_id and self.bundle.organization_id != self.organization_id:
-            errors['bundle'] = 'bundle organization must match item organization'
-        if self.bundle_id and self.bundle.project_id != self.project_id:
-            errors['bundle'] = 'bundle project must match item project'
-        if self.memory_id and self.memory.organization_id != self.organization_id:
-            errors['memory'] = 'memory organization must match item organization'
-        if self.memory_id and self.memory.project_id != self.project_id:
-            errors['memory'] = 'memory project must match item project'
-        if self.retrieval_document_id and self.retrieval_document.organization_id != self.organization_id:
-            errors['retrieval_document'] = 'retrieval document organization must match item organization'
-        if self.retrieval_document_id and self.retrieval_document.project_id != self.project_id:
-            errors['retrieval_document'] = 'retrieval document project must match item project'
-        if errors:
-            raise ValidationError(errors)
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.bundle_id:
+            check_project_scope(errors, 'bundle', self.bundle, self.organization_id, self.project_id)
+        if self.memory_id:
+            check_project_scope(errors, 'memory', self.memory, self.organization_id, self.project_id)
+        if self.retrieval_document_id:
+            check_project_scope(
+                errors,
+                'retrieval_document',
+                self.retrieval_document,
+                self.organization_id,
+                self.project_id,
+            )
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.bundle_id}:{self.citation}'
@@ -584,6 +725,14 @@ class AuditEvent(TimestampedModel):
         ]
         ordering = ['organization_id', 'created_at']
 
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
+
     def __str__(self) -> str:
         return f'{self.event_type}:{self.result}'
 
@@ -594,6 +743,8 @@ class OutboxEvent(TimestampedModel):
     team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='outbox_events', null=True, blank=True)
     aggregate_type = models.CharField(max_length=120)
     aggregate_id = models.CharField(max_length=255)
+    source_type = models.CharField(max_length=120, blank=True)
+    source_id = models.CharField(max_length=255, blank=True)
     event_type = models.CharField(max_length=120)
     payload_version = models.PositiveIntegerField(default=1)
     payload = models.JSONField(default=dict)
@@ -613,7 +764,7 @@ class OutboxEvent(TimestampedModel):
     class Meta:
         constraints = [
             models.UniqueConstraint(
-                fields=['organization', 'event_type', 'idempotency_key'],
+                fields=['organization', 'event_type', 'source_type', 'source_id', 'idempotency_key'],
                 name='core_outbox_unique_idempotency_key_per_event',
             ),
         ]
@@ -623,6 +774,14 @@ class OutboxEvent(TimestampedModel):
             models.Index(fields=['organization', 'aggregate_type', 'aggregate_id']),
         ]
         ordering = ['status', 'next_retry_at', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
 
     def __str__(self) -> str:
         return f'{self.event_type}:{self.idempotency_key}'
