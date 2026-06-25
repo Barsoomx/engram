@@ -12,8 +12,11 @@ from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 
+from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
+    AuditEvent,
+    AuditResult,
     CandidateStatus,
     Memory,
     MemoryCandidate,
@@ -61,6 +64,142 @@ class PromoteMemoryCandidateResult:
     memory_version: MemoryVersion
     retrieval_document: RetrievalDocument
     duplicate: bool
+
+
+@dataclass(frozen=True)
+class MemoryFeedbackInput:
+    raw_key: str
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    action: str
+    reason: str
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class MemoryFeedbackResult:
+    memory: Memory
+    action: str
+    retrieval_documents_updated: int
+    already_applied: bool
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'project_id': str(self.memory.project_id),
+            'team_id': str(self.memory.team_id) if self.memory.team_id else '',
+            'action': self.action,
+            'stale': self.memory.stale,
+            'refuted': self.memory.refuted,
+            'retrieval_documents_updated': self.retrieval_documents_updated,
+            'already_applied': self.already_applied,
+        }
+
+
+class MemoryFeedbackError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class RecordMemoryFeedback:
+    def execute(self, data: MemoryFeedbackInput) -> MemoryFeedbackResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='memories:review',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='memory',
+            target_id=str(data.memory_id),
+        )
+        with transaction.atomic():
+            memory = self._lock_memory(data, scope)
+            self._ensure_team_scope(memory, scope)
+            already_applied = self._already_applied(memory, data.action)
+            self._apply(memory, data.action)
+            updated = self._sync_retrieval_documents(memory, data.action)
+            self._audit(memory, scope, data, updated, already_applied)
+
+        return MemoryFeedbackResult(
+            memory=memory,
+            action=data.action,
+            retrieval_documents_updated=updated,
+            already_applied=already_applied,
+        )
+
+    def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
+        memory = (
+            Memory.objects.select_for_update()
+            .filter(
+                organization_id=scope.organization_id,
+                project_id=data.project_id,
+                id=data.memory_id,
+            )
+            .first()
+        )
+        if memory is None:
+            raise MemoryFeedbackError('memory_not_found', 'Memory was not found')
+
+        return memory
+
+    def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
+        if memory.team_id is not None and memory.team_id not in scope.team_ids:
+            raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+    def _already_applied(self, memory: Memory, action: str) -> bool:
+        return bool(getattr(memory, action))
+
+    def _apply(self, memory: Memory, action: str) -> None:
+        if getattr(memory, action):
+            return
+
+        setattr(memory, action, True)
+        memory.save(update_fields=[action, 'updated_at'])
+
+    def _sync_retrieval_documents(self, memory: Memory, action: str) -> int:
+        return RetrievalDocument.objects.filter(
+            organization=memory.organization,
+            project=memory.project,
+            memory=memory,
+        ).update(**{action: True})
+
+    def _audit(
+        self,
+        memory: Memory,
+        scope: EffectiveScope,
+        data: MemoryFeedbackInput,
+        updated: int,
+        already_applied: bool,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryFeedbackRecorded',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory',
+            target_id=str(memory.id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'action': data.action,
+                'reason': redact_text(data.reason),
+                'retrieval_documents_updated': updated,
+                'already_applied': already_applied,
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )
 
 
 class ProcessObservationRecorded:
