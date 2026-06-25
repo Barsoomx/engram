@@ -48,6 +48,20 @@ Scope:
 | focused security review | manual review recorded in `docs/security/reviews/2026-06-25-worker-auto-promotes-memory.md` | Security Review | yes | pass | Covers task payload secrecy, candidate/memory/retrieval redaction, tenant/project scoping, duplicate delivery idempotency, and context audit evidence. No open Critical or Important findings. |
 | task reviews | read-only Task 1 and Task 2 reviews | Review | yes | pass | Task 2 review approved. Task 1 worker scope was clean after valid findings were fixed, and its remaining blocker was Task 2 golden path, now resolved. |
 
+Task 3 verification-command contract:
+
+| Brief command | Recorded result |
+| --- | --- |
+| `python3 -m unittest discover -s tests -v` | Run directly. Exit 0. Reported 27 tests passed. |
+| `cd apps/backend && poetry run pytest -v` | Not run directly in final verification because local `AGENTS.md` requires backend verification inside Docker Compose once Compose exists. Superseded by `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."`: exit 0, pytest 133 passed. |
+| `cd apps/backend && poetry run ruff check .` | Not run directly in final verification for the same Compose policy. Superseded by the full Compose backend/lint/format command: exit 0, `All checks passed!`. |
+| `cd apps/backend && poetry run ruff format --check .` | Not run directly in final verification for the same Compose policy. Superseded by the full Compose backend/lint/format command: exit 0, `68 files already formatted`. |
+| `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --skip-checks --settings=settings.test_settings` | Not run directly in final verification for the same Compose policy. Superseded by `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"`: exit 0, `No changes detected`. |
+| `python3 scripts/e2e_golden_path.py` | Run directly. Exit 0. Final rerun completed through the worker-created retrieval-document wait path. |
+| `git diff --check` | Rerun for the Task 3 docs/evidence correction. Exit 0. The original main-agent final whitespace command was `git diff --check HEAD`, exit 0. |
+
+Residual risks: none for this focused checkpoint.
+
 First decisive failures fixed during the TDD/debug loop:
 
 - Worker auto-promotion RED failed before implementation: status stayed

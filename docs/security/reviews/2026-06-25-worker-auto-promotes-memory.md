@@ -4,7 +4,9 @@ Date: 2026-06-25
 
 Branch: `feat/worker-auto-promotes-memory`
 
-Reviewed head: `da06e17f10a75acd483182a3ad36934a9e67b01e`
+Reviewed code head: `da06e17f10a75acd483182a3ad36934a9e67b01e`
+
+Evidence/docs head before this correction: `4a911ebfc3a3f693de4665465a2af9fa4612d4d8`
 
 Result: SECURITY APPROVED for the worker auto-promotion checkpoint.
 
@@ -44,6 +46,24 @@ future semantic retrieval work.
 | repository checks | Exit 0 for `python3 -m unittest discover -s tests -v` with 27 tests passed; `python3 scripts/repository_layout.py` with no output; `python3 scripts/repository_quality.py` with no output; `git diff --check HEAD` with no output. |
 | final Compose golden path rerun | Exit 0. `python3 scripts/e2e_golden_path.py` completed through the same worker-created retrieval-document wait path. |
 | Compose cleanup | Exit 0. `docker compose -f deploy/compose/docker-compose.yml ps --format json` returned no output. |
+
+## Task 3 Verification-Command Contract
+
+The Task 3 brief listed host-side backend verification commands. Final backend
+verification was not run directly on the host because local `AGENTS.md`
+requires backend tests and management commands to run inside Docker Compose
+once Compose exists. The exact command contract is mapped below without
+inventing unrun host results.
+
+| Brief command | Recorded result |
+| --- | --- |
+| `python3 -m unittest discover -s tests -v` | Run directly. Exit 0. Reported 27 tests passed. |
+| `cd apps/backend && poetry run pytest -v` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; pytest 133 passed. |
+| `cd apps/backend && poetry run ruff check .` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; `All checks passed!`. |
+| `cd apps/backend && poetry run ruff format --check .` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; `68 files already formatted`. |
+| `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --skip-checks --settings=settings.test_settings` | Not run directly in final verification; superseded by the Compose migration freshness command. Exit 0; `No changes detected`. |
+| `python3 scripts/e2e_golden_path.py` | Run directly. Exit 0. |
+| `git diff --check` | Rerun for this Task 3 docs/evidence correction. Exit 0. The original main-agent final whitespace command was `git diff --check HEAD`, exit 0. |
 
 ## Findings By Severity
 
@@ -114,6 +134,8 @@ None.
 ## Accepted Risk
 
 No accepted security risk remains for this focused checkpoint.
+
+Residual risks: none for this focused checkpoint.
 
 Task 2 review approved the golden path. Task 1 worker scope was clean after
 valid findings were fixed, and its remaining blocker was Task 2 golden path,
