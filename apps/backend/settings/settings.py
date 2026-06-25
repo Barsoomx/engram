@@ -71,6 +71,7 @@ INSTALLED_APPS = [
     'engram.imports',
     'engram.memory',
     'engram.context',
+    'engram.inspection',
     'engram.health',
 ]
 

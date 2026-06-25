@@ -825,3 +825,52 @@ coverage only for the currently implemented Engram hook events:
 | repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
 | whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
 | focused security review | Independent read-only security review plus command evidence recorded in `docs/security/reviews/2026-06-25-claude-code-client.md` | none | yes | pass | SECURITY APPROVED. CRITICAL none, IMPORTANT none, MINOR none. Live Claude Code plugin install was not run; this checkpoint validates manifest and CLI contracts only. |
+
+## 2026-06-25: Admin Inspection API
+
+Branch: `feat/admin-inspection-api`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/inspection/__init__.py`
+- `apps/backend/engram/inspection/apps.py`
+- `apps/backend/engram/inspection/serializers.py`
+- `apps/backend/engram/inspection/services.py`
+- `apps/backend/engram/inspection/views.py`
+- `apps/backend/engram/inspection/urls.py`
+- `apps/backend/engram/inspection/inspection_api_tests.py`
+- `apps/backend/settings/settings.py`
+- `apps/backend/settings/urls.py`
+- `docs/security/reviews/2026-06-25-admin-inspection-api.md`
+- `docs/superpowers/specs/2026-06-25-admin-inspection-api-design.md`
+- `docs/superpowers/plans/2026-06-25-admin-inspection-api.md`
+- `scripts/repository_layout.py`
+
+This checkpoint proves the minimal V1 operational inspection API:
+read-only memory inspection, context-bundle inspection, and audit-event
+inspection through `/v1/inspection/*`. It does not add a custom frontend, MCP
+bridge, semantic retrieval, provider/model-policy code, or memory mutation
+beyond the existing feedback endpoint.
+
+Memory and context-bundle inspection require `memories:admin`; regular
+developer-style `memories:read` keys are denied. Audit inspection requires
+`audit:read`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD red inspection tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | none | yes | pass | Exit 1 before implementation. All four tests failed with 404 because `/v1/inspection/*` routes did not exist. |
+| string redaction RED tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py::test_memory_inspection_lists_authorized_memories_and_redacts_detail_metadata engram/inspection/inspection_api_tests.py::test_context_bundle_inspection_returns_items_and_hides_other_team_bundles -v` | none | yes | pass | Exit 1 after initial implementation. Failures proved raw token-shaped values leaked through memory title/body and context `rendered_text`; output redaction was expanded before green. |
+| security-fix RED tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | none | yes | pass | Exit 1 after independent review. Failures proved regular `memories:read` keys could inspect memory/context data and audit identifiers were returned raw. |
+| focused inspection tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | Backend equivalent | yes | pass | Exit 0 after security fixes. Reported 4 passed. |
+| adjacent access/context/memory tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py engram/access/access_scope_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py -v` | Backend equivalent | yes | pass | Exit 0 after security fixes. Reported 50 passed. |
+| host manage.py check | `cd apps/backend && poetry run python manage.py check` | none | yes | fixed | Exit 1 because the host process cannot resolve the Compose-only `postgres` hostname. Reran inside Compose after migration. |
+| Compose migrate and manage.py check | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check"` | Backend equivalent | yes | pass | Exit 0. Fresh Compose DB migrated and system check reported no issues. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v"` | Backend | yes | pass | Exit 0. Reported 159 passed. |
+| backend lint and format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Ruff check passed; format check reported 101 files already formatted. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| focused security review | Independent read-only security review plus fix re-review recorded in `docs/security/reviews/2026-06-25-admin-inspection-api.md` | none | yes | pass | Initial review found weak capability gate, identifier redaction gaps, and audit-listing self-noise. Fix re-review verified code-level findings resolved; stale doc statuses were updated before commit. |
