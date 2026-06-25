@@ -19,19 +19,19 @@ def urllib_transport(
     payload: dict[str, object] | None,
     timeout: float,
 ) -> tuple[int, dict[str, object]]:
-    request_headers = dict(headers)
-    body = None
-    if payload is not None:
-        body = json.dumps(payload).encode()
-        request_headers.setdefault('Content-Type', 'application/json')
-    request_headers.setdefault('Accept', 'application/json')
-    request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
     try:
+        request_headers = dict(headers)
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode()
+            request_headers.setdefault('Content-Type', 'application/json')
+        request_headers.setdefault('Accept', 'application/json')
+        request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return response.status, parse_json_body(response.read())
     except urllib.error.HTTPError as error:
         return error.code, parse_json_body(error.read())
-    except (OSError, TimeoutError, urllib.error.URLError):
+    except (OSError, TimeoutError, urllib.error.URLError, ValueError):
         return 503, {'code': 'server_unavailable', 'detail': 'Server is unavailable'}
 
 

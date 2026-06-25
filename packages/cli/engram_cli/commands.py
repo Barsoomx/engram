@@ -6,6 +6,7 @@ from argparse import Namespace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import urlparse
 
 from engram_cli.config import (
     as_string,
@@ -136,7 +137,7 @@ def run_doctor(
             )
         checks.append(('ok', 'hook_config', ', '.join(runtimes)))
         active_transport = transport or urllib_transport
-        server_url = as_string(config.get('server_url'))
+        server_url = normalize_server_url(as_string(config.get('server_url')))
         status, body = get_health(transport=active_transport, server_url=server_url)
         if status != 200 or body.get('status') != 'ok':
             raise CliError('server_unavailable', 'Engram server health check failed', remediation_for('server_unavailable'))
@@ -191,6 +192,13 @@ def normalize_server_url(value: str | None) -> str:
     server_url = required_value(value, 'missing_server_url', 'Server URL is required').rstrip('/')
     if not server_url:
         raise CliError('missing_server_url', 'Server URL is required', remediation_for('missing_server_url'))
+    parsed = urlparse(server_url)
+    if parsed.scheme not in {'http', 'https'} or not parsed.netloc:
+        raise CliError(
+            'server_unavailable',
+            'Server URL must start with http:// or https:// and include a host',
+            remediation_for('server_unavailable'),
+        )
 
     return server_url
 
