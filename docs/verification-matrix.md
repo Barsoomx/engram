@@ -166,3 +166,56 @@ First decisive failures fixed during the TDD loop:
 - Review pass found outbox idempotency lacked an explicit source dimension;
   `OutboxEvent` now carries `source_type` and `source_id`, and the uniqueness
   constraint includes event type, source, and idempotency key.
+
+## 2026-06-25: Auth Scope And API Keys
+
+Branch: `feat/parity-05-auth-scope`
+
+Scope:
+
+- `apps/backend/engram/access/models.py`
+- `apps/backend/engram/access/services.py`
+- `apps/backend/engram/access/access_scope_tests.py`
+- `apps/backend/engram/access/migrations/0001_initial.py`
+- `apps/backend/engram/access/migrations/0002_seed_default_roles.py`
+- `apps/backend/settings/settings.py`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/superpowers/specs/2026-06-25-auth-scope-design.md`
+- `docs/superpowers/plans/2026-06-25-auth-scope.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-05-auth-scope` plus pre-existing unstaged `.gitignore` edit. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. Access model, service, tests, and migrations are required paths. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
+| access scope tests | `cd apps/backend && poetry run pytest engram/access/access_scope_tests.py -v` | Backend | yes | pass | Exit 0. Ran 18 tests for seed roles/capabilities, hash-only API-key storage, prefix collisions, capability narrowing, project/team/org denial, resolved scope filters, unusable key states, and cross-scope FK rejection. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 43 backend tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. |
+| migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied core, access, Django auth/contenttypes, and sessions migrations against the test database. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Exit 1. Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
+
+First decisive failures fixed during the TDD and review loop:
+
+- Access scope test first failed with `ModuleNotFoundError: No module named
+  'engram.access.models'`.
+- Denial audits first disappeared because audit rows were written inside a
+  transaction that rolled back when `AccessDeniedError` was raised.
+- Focused lint first failed on import sorting, lambda argument names, and the
+  domain exception class name.
+- Local review found `key_prefix` was incorrectly unique and lookup used
+  `.first()`; prefix collisions are now allowed and hash-verified.
+- Security review found unbound API keys could use owner project-admin
+  capability without the key carrying `projects:*` or `policy:admin`; unbound
+  project expansion now requires effective key capability.
+- Security review found unbound keys trusted client-supplied team ids; team
+  hints now require effective team capability and same-organization project/team
+  linkage.
+- Security review found audit rows lacked resolved scope filters; allow/deny
+  metadata now records resolved `organization_id`, `project_ids`, and
+  `team_ids`, and single-project/team allows populate audit FK fields.
