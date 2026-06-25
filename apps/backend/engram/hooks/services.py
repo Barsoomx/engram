@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 import uuid
 from dataclasses import dataclass
 
@@ -20,21 +19,7 @@ from engram.core.models import (
     SessionStatus,
     Team,
 )
-
-REDACTED_VALUE = '[REDACTED]'
-SENSITIVE_KEY_MARKERS = (
-    'apikey',
-    'authorization',
-    'accesskey',
-    'password',
-    'privatekey',
-    'providerkey',
-    'secret',
-    'token',
-)
-SECRET_STRING_RE = re.compile(
-    r'(?i)(sk-[a-z0-9][a-z0-9_-]{8,}|egk_[a-z0-9][a-z0-9_-]{8,}|bearer\s+[a-z0-9._~+/=-]{12,})',
-)
+from engram.core.redaction import RedactionResult, redact_value
 
 
 @dataclass(frozen=True)
@@ -88,12 +73,6 @@ class HookIngestResult:
     outbox_event: OutboxEvent
     session: AgentSession
     duplicate: bool
-
-
-@dataclass(frozen=True)
-class RedactionResult:
-    value: object
-    redacted: bool
 
 
 class VerifyHookDryRun:
@@ -446,40 +425,4 @@ class IngestHookEvent:
 
 
 def redact_hook_value(value: object) -> RedactionResult:
-    if isinstance(value, dict):
-        redacted = False
-        cleaned = {}
-        for key, item in value.items():
-            if is_sensitive_key(key):
-                cleaned[key] = REDACTED_VALUE
-                redacted = True
-                continue
-
-            item_result = redact_hook_value(item)
-            cleaned[key] = item_result.value
-            redacted = redacted or item_result.redacted
-
-        return RedactionResult(value=cleaned, redacted=redacted)
-
-    if isinstance(value, list | tuple):
-        redacted = False
-        cleaned = []
-        for item in value:
-            item_result = redact_hook_value(item)
-            cleaned.append(item_result.value)
-            redacted = redacted or item_result.redacted
-
-        return RedactionResult(value=cleaned, redacted=redacted)
-
-    if isinstance(value, str):
-        cleaned = SECRET_STRING_RE.sub(REDACTED_VALUE, value)
-
-        return RedactionResult(value=cleaned, redacted=cleaned != value)
-
-    return RedactionResult(value=value, redacted=False)
-
-
-def is_sensitive_key(key: object) -> bool:
-    normalized = re.sub(r'[^a-z0-9]', '', str(key).lower())
-
-    return any(marker in normalized for marker in SENSITIVE_KEY_MARKERS)
+    return redact_value(value)

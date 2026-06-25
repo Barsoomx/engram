@@ -61,6 +61,7 @@ INSTALLED_APPS = [
     'engram.access',
     'engram.hooks',
     'engram.memory',
+    'engram.context',
     'engram.health',
 ]
 
