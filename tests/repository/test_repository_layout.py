@@ -15,6 +15,8 @@ class RepositoryLayoutTests(unittest.TestCase):
         expected = {
             'apps/backend/README.md',
             'apps/frontend/README.md',
+            '.github/workflows/compose-e2e.yml',
+            'scripts/e2e_golden_path.py',
             'packages/cli/README.md',
             'packages/cli/pyproject.toml',
             'packages/cli/engram_cli/main.py',

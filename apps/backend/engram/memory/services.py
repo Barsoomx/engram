@@ -317,17 +317,7 @@ class PromoteMemoryCandidate:
 
     def _lock_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
         try:
-            return (
-                MemoryCandidate.objects.select_related(
-                    'organization',
-                    'project',
-                    'team',
-                    'source_observation',
-                    'promoted_memory',
-                )
-                .select_for_update()
-                .get(id=candidate_id)
-            )
+            return MemoryCandidate.objects.select_for_update().get(id=candidate_id)
         except MemoryCandidate.DoesNotExist as error:
             raise MemoryWorkerError('memory candidate not found') from error
 

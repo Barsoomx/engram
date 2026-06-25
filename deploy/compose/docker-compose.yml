@@ -34,8 +34,23 @@ services:
 
   worker:
     <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     command: >
       sh -ec "celery -A engram.celery_app worker --loglevel=info"
+
+  relay:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -ec "python manage.py celery_outbox_relay"
 
   postgres:
     image: postgres:16-alpine

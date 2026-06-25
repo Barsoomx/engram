@@ -7,6 +7,8 @@ from typing import Any
 
 import pytest
 from django.core.management import call_command
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from engram.core.models import (
@@ -402,6 +404,22 @@ def test_process_observation_recorded_outbox_command_processes_pending_events() 
 
 
 @pytest.mark.django_db
+def test_promote_memory_candidate_lock_query_locks_candidate_row_without_related_joins() -> None:
+    _organization, _team, _project, _session, _raw_event, _observation, outbox = create_observation_recorded_scope()
+    candidate = execute_worker(outbox).candidate
+
+    with CaptureQueriesContext(connection) as queries:
+        locked = PromoteMemoryCandidate()._lock_candidate(candidate.id)
+
+    lock_sql = next(
+        query['sql'] for query in queries.captured_queries if 'core_memorycandidate' in query['sql'].lower()
+    )
+
+    assert locked.id == candidate.id
+    assert 'JOIN' not in lock_sql.upper()
+
+
+@pytest.mark.django_db
 def test_promote_memory_candidate_creates_memory_version_and_retrieval_document() -> None:
     _organization, team, project, _session, _raw_event, observation, outbox = create_observation_recorded_scope()
     candidate = execute_worker(outbox).candidate
@@ -482,3 +500,49 @@ def test_promote_memory_candidate_command_outputs_json_ids() -> None:
         'retrieval_document_id': str(document.id),
         'duplicate': False,
     }
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_command_accepts_candidate_id_option() -> None:
+    _organization, _team, _project, _session, _raw_event, _observation, outbox = create_observation_recorded_scope()
+    candidate = execute_worker(outbox).candidate
+    stdout = io.StringIO()
+
+    call_command('engram_promote_memory_candidate', '--candidate-id', str(candidate.id), '--json', stdout=stdout)
+
+    body = json.loads(stdout.getvalue())
+
+    assert body['candidate_id'] == str(candidate.id)
+    assert body['duplicate'] is False
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_command_can_promote_latest_project_candidate() -> None:
+    _organization, _team, project, _session, _raw_event, _observation, first_outbox = (
+        create_observation_recorded_scope()
+    )
+    first_candidate = execute_worker(first_outbox).candidate
+    _other_org, _other_team, other_project, _other_session, _other_raw, _other_observation, other_outbox = (
+        create_observation_recorded_scope(suffix='2')
+    )
+    other_candidate = execute_worker(other_outbox).candidate
+    stdout = io.StringIO()
+
+    call_command(
+        'engram_promote_memory_candidate',
+        '--project-id',
+        str(project.id),
+        '--latest',
+        '--json',
+        stdout=stdout,
+    )
+
+    body = json.loads(stdout.getvalue())
+
+    assert body['candidate_id'] == str(first_candidate.id)
+    assert body['duplicate'] is False
+    first_candidate.refresh_from_db()
+    other_candidate.refresh_from_db()
+    assert first_candidate.status == CandidateStatus.PROMOTED
+    assert other_candidate.status == CandidateStatus.PROPOSED
+    assert other_project.id != project.id

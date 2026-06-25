@@ -13,6 +13,22 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: engram
+          POSTGRES_USER: engram
+          POSTGRES_PASSWORD: engram
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U engram -d engram"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ENGRAM_DATABASE_URL: postgresql://engram:engram@localhost:5432/engram
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,13 +57,13 @@ jobs:
         working-directory: apps/backend
         run: poetry run ruff format --check .
 
-      - name: Check backend migrations are current
-        working-directory: apps/backend
-        run: poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings
-
       - name: Apply backend migrations
         working-directory: apps/backend
         run: poetry run python manage.py migrate --noinput --settings=settings.test_settings
+
+      - name: Check backend migrations are current
+        working-directory: apps/backend
+        run: poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings
 
       - name: Run backend tests
         working-directory: apps/backend
