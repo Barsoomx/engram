@@ -104,7 +104,6 @@ class HookIngestView(APIView):
                 'request_id': result.request_id,
                 'raw_event_id': str(result.raw_event.id),
                 'observation_id': str(result.observation.id),
-                'outbox_event_id': str(result.outbox_event.id),
                 'agent_session_id': str(result.session.id),
             },
             status=status.HTTP_202_ACCEPTED,

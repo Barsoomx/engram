@@ -15,7 +15,7 @@ V1 stack:
 - Redis-compatible broker for background jobs.
 - Celery worker pools for ingestion follow-up, digest generation, memory
   curation, indexing, and retention tasks.
-- Durable outbox for domain events and integration fan-out.
+- Transaction-safe Celery enqueueing through `django-celery-outbox`.
 - OpenTelemetry traces, structured logs, metrics, and error reporting.
 - Admin frontend as a dense operational console.
 
@@ -47,38 +47,26 @@ All local-worker responsibilities move behind authenticated server APIs.
    key grants.
 4. The domain service validates the event and stores a normalized observation or
    retrieval request.
-5. Domain events are written to the outbox in the same database transaction.
+5. Follow-up work is queued through `django-celery-outbox` in the same database
+   transaction.
 6. Background workers distill observations, update indexes, generate team
    digests, curate memory candidates, and mark conflicts or stale memories.
 7. Context APIs filter candidates by authorization before ranking and context
    packing.
 8. Hook response returns compact guidance, citations, and debug metadata.
 
-## Domain Events
+## Async Work
 
-Events are first-class because memory generation is asynchronous and must be
-replayable.
+Memory generation is asynchronous and must be replayable. Current V1 models the
+live transport as id-only Celery tasks persisted by `django-celery-outbox`.
 
-Core events:
+Current task signals:
 
-- `HookEventReceived`
-- `ObservationRecorded`
-- `ObservationClassified`
-- `MemoryCandidateCreated`
-- `MemoryApproved`
-- `MemorySuperseded`
-- `MemoryConflictDetected`
-- `MemoryRefuted`
-- `TeamDigestGenerated`
-- `MemoryCuratorActionRecorded`
-- `MemoryRetrieved`
-- `SecretUsed`
-- `ModelPolicyResolved`
-- `ApiKeyRotated`
-- `ScopeGrantChanged`
+- `engram.memory.process_observation_recorded`
 
-Each event carries tenant id, actor id, correlation id, trace id, source hook,
-and idempotency key.
+The queued payload carries the observation id. Workers reload tenant, project,
+team, actor, source hook, correlation, and trace context from authoritative
+domain rows. Future domain-event expansion requires a separate decision record.
 
 ## Persistence
 
@@ -90,7 +78,7 @@ PostgreSQL stores all authoritative state:
 - normalized observations;
 - memory versions and source references;
 - search documents and exact indexes;
-- audit log and outbox.
+- audit log and `django-celery-outbox` transport rows.
 
 Vector storage starts as a replaceable adapter. `pgvector` is the simplest
 default for on-premise deployments. Qdrant is a later adapter when customers
@@ -128,7 +116,8 @@ There should be no hidden local-only API path.
 - Context assembly must be explainable: why this memory, why this scope, why
   this source, why this model.
 - Background work is idempotent and retryable.
-- Every cross-domain side effect goes through the outbox.
+- Every asynchronous side effect goes through the approved transaction-safe
+  Celery transport.
 
-See [Backend contracts](backend-contracts.md) for the domain service, durable
-outbox, RBAC, observability, and vault contracts required by implementation.
+See [Backend contracts](backend-contracts.md) for the domain service, async
+transport, RBAC, observability, and vault contracts required by implementation.

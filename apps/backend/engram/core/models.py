@@ -64,14 +64,6 @@ class AuditResult(models.TextChoices):
     RECORDED = 'recorded', 'Recorded'
 
 
-class OutboxStatus(models.TextChoices):
-    PENDING = 'pending', 'Pending'
-    PROCESSING = 'processing', 'Processing'
-    DONE = 'done', 'Done'
-    FAILED = 'failed', 'Failed'
-    DEAD_LETTER = 'dead_letter', 'Dead letter'
-
-
 def add_scope_error(errors: dict[str, list[str]], field: str, message: str) -> None:
     errors.setdefault(field, []).append(message)
 
@@ -735,53 +727,3 @@ class AuditEvent(TimestampedModel):
 
     def __str__(self) -> str:
         return f'{self.event_type}:{self.result}'
-
-
-class OutboxEvent(TimestampedModel):
-    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='outbox_events')
-    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='outbox_events', null=True, blank=True)
-    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='outbox_events', null=True, blank=True)
-    aggregate_type = models.CharField(max_length=120)
-    aggregate_id = models.CharField(max_length=255)
-    source_type = models.CharField(max_length=120, blank=True)
-    source_id = models.CharField(max_length=255, blank=True)
-    event_type = models.CharField(max_length=120)
-    payload_version = models.PositiveIntegerField(default=1)
-    payload = models.JSONField(default=dict)
-    idempotency_key = models.CharField(max_length=255)
-    actor_type = models.CharField(max_length=80, blank=True)
-    actor_id = models.CharField(max_length=255, blank=True)
-    correlation_id = models.CharField(max_length=255, blank=True)
-    trace_id = models.CharField(max_length=255, blank=True)
-    status = models.CharField(max_length=40, choices=OutboxStatus.choices, default=OutboxStatus.PENDING)
-    attempts = models.PositiveIntegerField(default=0)
-    next_retry_at = models.DateTimeField(null=True, blank=True)
-    locked_by = models.CharField(max_length=255, blank=True)
-    locked_at = models.DateTimeField(null=True, blank=True)
-    last_error = models.TextField(blank=True)
-    processed_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(
-                fields=['organization', 'event_type', 'source_type', 'source_id', 'idempotency_key'],
-                name='core_outbox_unique_idempotency_key_per_event',
-            ),
-        ]
-        indexes = [
-            models.Index(fields=['status', 'next_retry_at']),
-            models.Index(fields=['organization', 'project', 'event_type']),
-            models.Index(fields=['organization', 'aggregate_type', 'aggregate_id']),
-        ]
-        ordering = ['status', 'next_retry_at', 'created_at']
-
-    def clean(self) -> None:
-        errors: dict[str, list[str]] = {}
-        if self.project_id:
-            check_project_organization(errors, 'project', self.project, self.organization_id)
-        if self.team_id:
-            check_organization_scope(errors, 'team', self.team, self.organization_id)
-        raise_scope_errors(errors)
-
-    def __str__(self) -> str:
-        return f'{self.event_type}:{self.idempotency_key}'

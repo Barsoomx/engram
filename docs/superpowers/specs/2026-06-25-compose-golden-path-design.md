@@ -1,5 +1,13 @@
 # Compose Golden Path Design
 
+Supersession note (2026-06-25): this historical design described a manual
+Engram outbox-processing command. The live contract now uses
+`django-celery-outbox package transport`; hook ingest queues
+`engram.memory.process_observation_recorded` with the observation id through
+the Celery task `.delay(...)` call. The Compose `relay` service is the
+package-owned `python manage.py celery_outbox_relay`, not Engram domain outbox
+processing.
+
 ## Goal
 
 Prove the rewritten `claude-mem` product loop through Docker Compose:

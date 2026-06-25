@@ -1,5 +1,13 @@
 # Memory Candidate Worker Design
 
+Supersession note (2026-06-25): this historical design described an
+Engram-owned domain outbox worker. The live contract now uses
+`django-celery-outbox package transport`; hook ingest queues
+`engram.memory.process_observation_recorded` with the observation id through
+the Celery task `.delay(...)` call. The package-owned relay may run
+`python manage.py celery_outbox_relay`, but Engram no longer requires a custom
+`OutboxEvent` worker command or outbox migration gate.
+
 ## Goal
 
 Add the first server-side worker slice for the parity loop: consume durable

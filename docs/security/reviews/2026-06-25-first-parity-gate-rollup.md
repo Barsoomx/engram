@@ -2,6 +2,11 @@
 
 Date: 2026-06-25
 
+Current outbox contract: Engram uses `django-celery-outbox package transport`.
+Hook ingest queues `engram.memory.process_observation_recorded` with the
+observation id through the Celery task `.delay(...)` call. The Compose relay is
+the package transport relay, not an Engram domain outbox processor.
+
 Scope:
 
 - access/API-key/RBAC scope resolution;

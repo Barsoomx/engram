@@ -13,14 +13,13 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
-    OutboxEvent,
     Project,
     RawEventEnvelope,
     SessionStatus,
     Team,
 )
 from engram.core.redaction import RedactionResult, redact_value
-from engram.memory.tasks import process_observation_recorded_outbox
+from engram.memory.tasks import process_observation_recorded
 
 
 @dataclass(frozen=True)
@@ -71,7 +70,6 @@ class HookIngestResult:
     request_id: str
     raw_event: RawEventEnvelope
     observation: Observation
-    outbox_event: OutboxEvent
     session: AgentSession
     duplicate: bool
 
@@ -164,22 +162,12 @@ class IngestHookEvent:
                     source_id=data.event_id,
                     defaults={'citation': data.event_id, 'metadata': {'event_type': data.event_type}},
                 )
-                outbox_event = self._get_or_create_outbox(
-                    organization,
-                    project,
-                    team,
-                    scope,
-                    raw_event,
-                    observation,
-                    data,
-                )
-                process_observation_recorded_outbox.delay(str(outbox_event.id))
+                process_observation_recorded.delay(str(observation.id))
 
                 return HookIngestResult(
                     request_id=data.request_id,
                     raw_event=raw_event,
                     observation=observation,
-                    outbox_event=outbox_event,
                     session=session,
                     duplicate=False,
                 )
@@ -254,20 +242,11 @@ class IngestHookEvent:
                 session=raw_event.session,
                 content_hash=raw_event.content_hash,
             )
-        outbox_event = OutboxEvent.objects.get(
-            organization=raw_event.organization,
-            project=raw_event.project,
-            event_type='ObservationRecorded',
-            source_type='hook_event',
-            source_id=raw_event.client_event_id,
-            idempotency_key=raw_event.idempotency_key,
-        )
 
         return HookIngestResult(
             request_id=raw_event.request_id,
             raw_event=raw_event,
             observation=observation,
-            outbox_event=outbox_event,
             session=raw_event.session,
             duplicate=True,
         )
@@ -387,43 +366,6 @@ class IngestHookEvent:
             return f'{data.event_type}: {tool_name}'
 
         return data.event_type
-
-    def _get_or_create_outbox(
-        self,
-        organization: Organization,
-        project: Project,
-        team: Team | None,
-        scope: EffectiveScope,
-        raw_event: RawEventEnvelope,
-        observation: Observation,
-        data: HookEventInput,
-    ) -> OutboxEvent:
-        outbox_event, _created = OutboxEvent.objects.get_or_create(
-            organization=organization,
-            event_type='ObservationRecorded',
-            source_type='hook_event',
-            source_id=data.event_id,
-            idempotency_key=data.idempotency_key,
-            defaults={
-                'project': project,
-                'team': team,
-                'aggregate_type': 'observation',
-                'aggregate_id': str(observation.id),
-                'payload_version': 1,
-                'payload': {
-                    'raw_event_id': str(raw_event.id),
-                    'observation_id': str(observation.id),
-                    'agent_session_id': str(raw_event.session_id),
-                    'event_type': data.event_type,
-                },
-                'actor_type': scope.actor_type,
-                'actor_id': scope.actor_id,
-                'correlation_id': data.correlation_id,
-                'trace_id': data.trace_id,
-            },
-        )
-
-        return outbox_event
 
 
 def redact_hook_value(value: object) -> RedactionResult:

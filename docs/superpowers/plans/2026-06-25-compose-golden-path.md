@@ -1,5 +1,13 @@
 # Compose Golden Path Implementation Plan
 
+Supersession note (2026-06-25): this historical plan described a manual Engram
+outbox-processing command. The live contract now uses
+`django-celery-outbox package transport`; hook ingest queues
+`engram.memory.process_observation_recorded` with the observation id through
+the Celery task `.delay(...)` call. The Compose `relay` service is the
+package-owned `python manage.py celery_outbox_relay`, not Engram domain outbox
+processing.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use

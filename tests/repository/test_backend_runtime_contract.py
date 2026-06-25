@@ -25,7 +25,6 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/engram/core/models.py',
         'apps/backend/engram/core/golden_path_tests.py',
         'apps/backend/engram/core/migrations/0001_initial.py',
-        'apps/backend/engram/core/migrations/0002_remove_outboxevent_core_outbox_unique_idempotency_key_per_event_and_more.py',
         'apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py',
         'apps/backend/engram/hooks/apps.py',
         'apps/backend/engram/hooks/serializers.py',
@@ -67,6 +66,14 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         self.assertNotIn(
             'apps/backend/engram/memory/management/commands/engram_process_observation_outbox.py',
             REQUIRED_PATHS,
+        )
+        self.assertFalse(
+            [
+                path
+                for path in REQUIRED_PATHS
+                if path.startswith('apps/backend/engram/core/migrations/')
+                and 'outboxevent' in path.lower()
+            ],
         )
 
     def test_import_app_is_installed(self) -> None:
@@ -134,6 +141,12 @@ class BackendComposeContractTests(unittest.TestCase):
         self.assertIn('redis-cli', compose)
         self.assertIn('python manage.py celery_outbox_relay', compose)
         self.assertIn('celery -A engram.celery_app worker', compose)
+
+    def test_compose_relay_is_package_transport_not_domain_outbox_processing(self) -> None:
+        compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')
+
+        self.assertIn('python manage.py celery_outbox_relay', compose)
+        self.assertNotIn('engram_process_observation_outbox', compose)
 
     def test_backend_dockerfile_uses_poetry_and_backend_project(self) -> None:
         dockerfile = (ROOT / 'apps/backend/Dockerfile').read_text(encoding='utf-8')
