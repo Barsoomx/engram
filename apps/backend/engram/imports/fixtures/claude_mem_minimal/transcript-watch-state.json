@@ -1,0 +1,9 @@
+{
+  "watched": [
+    {
+      "path": "/workspace/example-repo/.agent/transcripts/content-session-fixture-001.jsonl",
+      "offset": 128,
+      "status": "deferred"
+    }
+  ]
+}

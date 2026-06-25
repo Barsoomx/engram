@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "runtime": {
+    "platformSource": "codex",
+    "model": "fake-provider/fake-model"
+  },
+  "paths": {
+    "workspace": "/workspace/example-repo"
+  },
+  "redaction": {
+    "sample": "[REDACTED]"
+  }
+}
