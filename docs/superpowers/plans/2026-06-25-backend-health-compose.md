@@ -77,37 +77,40 @@
 from pathlib import Path
 import unittest
 
-from scripts.repository_layout import missing_paths
+from scripts.repository_layout import REQUIRED_PATHS, missing_paths
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 class BackendRuntimeLayoutTests(unittest.TestCase):
-    def test_backend_runtime_paths_exist(self) -> None:
-        expected = {
-            'apps/backend/manage.py',
-            'apps/backend/pyproject.toml',
-            'apps/backend/pytest.ini',
-            'apps/backend/settings/settings.py',
-            'apps/backend/settings/test_settings.py',
-            'apps/backend/settings/urls.py',
-            'apps/backend/engram/health/views.py',
-            'apps/backend/Dockerfile',
-            'deploy/compose/docker-compose.yml',
-            'deploy/compose/.env.example',
-        }
+    expected = {
+        'apps/backend/manage.py',
+        'apps/backend/pyproject.toml',
+        'apps/backend/pytest.ini',
+        'apps/backend/settings/settings.py',
+        'apps/backend/settings/test_settings.py',
+        'apps/backend/settings/urls.py',
+        'apps/backend/engram/health/views.py',
+        'apps/backend/Dockerfile',
+        'deploy/compose/docker-compose.yml',
+        'deploy/compose/.env.example',
+    }
 
+    def test_backend_runtime_paths_are_layout_requirements(self) -> None:
+        self.assertTrue(self.expected.issubset(set(REQUIRED_PATHS)))
+
+    def test_backend_runtime_paths_exist(self) -> None:
         missing = set(missing_paths(ROOT))
 
-        self.assertFalse(expected & missing)
+        self.assertFalse(self.expected & missing)
 ```
 
 - [ ] **Step 2: Run and verify red**
 
 Run: `python3 -m unittest tests.repository.test_backend_runtime_contract -v`
 
-Expected: fail because backend runtime files are missing.
+Expected: fail because backend runtime files are not registered layout requirements yet.
 
 - [ ] **Step 3: Extend `scripts/repository_layout.py`**
 
