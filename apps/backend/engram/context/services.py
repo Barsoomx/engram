@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from django.db import transaction
 from django.utils import timezone
 
-from engram.access.services import EffectiveScope, ResolveApiKeyScope
+from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -106,8 +106,8 @@ class ContextBundleResult:
             'memory_id': str(memory.id),
             'memory_version_id': str(document.memory_version_id),
             'retrieval_document_id': str(document.id),
-            'title': memory.title,
-            'body': memory.body,
+            'title': redact_text(memory.title),
+            'body': redact_text(memory.body),
             'inclusion_reason': match.inclusion_reason,
             'scope_evidence': self._scope_evidence(document),
             'matched_terms': list(match.matched_terms),
@@ -177,6 +177,10 @@ def unique_text_values(*groups: object) -> list[str]:
     return values
 
 
+def redact_text(value: object) -> str:
+    return str(redact_value(value).value)
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -186,7 +190,7 @@ class IndexMemoryVersion:
             'project',
         ).get(id=data.memory_version_id)
         memory = version.memory
-        if memory.status != MemoryStatus.APPROVED:
+        if memory.status != MemoryStatus.APPROVED or memory.stale or memory.refuted:
             raise ContextIndexError('Only approved memory can be indexed')
 
         observation = version.source_observation
@@ -246,6 +250,9 @@ class BuildContextBundle:
         project = Project.objects.get(organization=organization, id=data.project_id)
         existing_bundle = self._existing_bundle(organization, project, data.request_id)
         if existing_bundle is not None:
+            if not self._bundle_authorized_for_scope(existing_bundle, scope):
+                raise AccessDeniedError('team_scope_denied', 'Context bundle is outside effective team scope')
+
             return self._result_from_bundle(existing_bundle)
 
         team = self._resolve_team(organization, data.team_id, scope)
@@ -319,6 +326,22 @@ class BuildContextBundle:
             )
 
         return ContextBundleResult(bundle=bundle, matches=tuple(matches))
+
+    def _bundle_authorized_for_scope(self, bundle: ContextBundle, scope: EffectiveScope) -> bool:
+        allowed_team_ids = set(scope.team_ids)
+        if bundle.team_id is not None and bundle.team_id not in allowed_team_ids:
+            return False
+
+        for item in bundle.items.select_related('retrieval_document'):
+            document = item.retrieval_document
+            if document.visibility_scope == VisibilityScope.PROJECT:
+                continue
+            if document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
+                continue
+
+            return False
+
+        return True
 
     def _resolve_team(
         self,
@@ -514,11 +537,11 @@ class BuildContextBundle:
                 retrieval_document=match.document,
                 rank=index,
                 citation=citation,
-                inclusion_reason=match.inclusion_reason,
+                inclusion_reason=redact_text(match.inclusion_reason),
                 scope_evidence=scope_evidence(match.document),
                 metadata={
                     'score': match.score,
-                    'matched_terms': list(match.matched_terms),
+                    'matched_terms': [redact_text(term) for term in match.matched_terms],
                 },
             )
             persisted.append(match)
@@ -532,8 +555,8 @@ class BuildContextBundle:
         lines = ['# Engram context', '']
         for index, match in enumerate(matches, start=1):
             memory = match.document.memory
-            lines.append(f'- [M{index}] {memory.title}')
-            lines.append(f'  {memory.body}')
+            lines.append(f'- [M{index}] {redact_text(memory.title)}')
+            lines.append(f'  {redact_text(memory.body)}')
 
         return '\n'.join(lines)
 
