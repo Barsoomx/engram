@@ -65,6 +65,10 @@ jobs:
         working-directory: apps/backend
         run: poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings
 
+      - name: Run upstream import tests
+        working-directory: apps/backend
+        run: poetry run pytest engram/imports/upstream_import_tests.py -v
+
       - name: Run backend tests
         working-directory: apps/backend
         run: poetry run pytest -v

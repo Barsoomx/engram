@@ -84,6 +84,7 @@ class ClaudeMemImporter:
         'chroma-db': 'vector_store_import_deferred',
         '.chroma': 'vector_store_import_deferred',
         '.env': 'source_secret_file_not_read',
+        'settings.json': 'settings_secret_file_not_read',
     }
     _count_queries = {
         'sdk_sessions': 'SELECT COUNT(*) FROM sdk_sessions',
@@ -116,6 +117,11 @@ class ClaudeMemImporter:
         'audit_log': 'SELECT id FROM audit_log ORDER BY id',
         'schema_versions': 'SELECT id FROM schema_versions ORDER BY id',
     }
+    _project_queries = {
+        'sdk_sessions': 'SELECT DISTINCT project FROM sdk_sessions WHERE project IS NOT NULL',
+        'observations': 'SELECT DISTINCT project FROM observations WHERE project IS NOT NULL',
+        'session_summaries': 'SELECT DISTINCT project FROM session_summaries WHERE project IS NOT NULL',
+    }
 
     def execute(self, import_input: ClaudeMemImportInput) -> ImportReport:
         self._validate_target(import_input)
@@ -139,6 +145,7 @@ class ClaudeMemImporter:
             schema_versions = self._schema_versions(connection, detected_tables)
             counts = self._count_tables(connection, detected_tables)
             unsupported = self._unsupported_tables(connection, all_tables)
+            self._validate_single_source_project(connection, detected_tables)
             import_rows = self._import_rows(connection, detected_tables) if import_input.apply else {}
 
         report['source'] = {
@@ -318,6 +325,22 @@ class ClaudeMemImporter:
         cursor = connection.execute(query)
 
         return int(cursor.fetchone()[0])
+
+    def _validate_single_source_project(
+        self,
+        connection: sqlite3.Connection,
+        detected_tables: list[str],
+    ) -> None:
+        projects: set[str] = set()
+        for table in ('sdk_sessions', 'observations', 'session_summaries'):
+            if table not in detected_tables:
+                continue
+
+            cursor = connection.execute(self._project_queries[table])
+            projects.update(str(row[0]).strip() for row in cursor.fetchall() if str(row[0]).strip())
+
+        if len(projects) > 1:
+            raise ClaudeMemImportError('source contains multiple projects')
 
     def _import_rows(
         self,

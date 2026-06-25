@@ -15,7 +15,14 @@ SENSITIVE_KEY_MARKERS = (
     'token',
 )
 SECRET_STRING_RE = re.compile(
-    r'(?i)(sk-[a-z0-9][a-z0-9_-]{8,}|egk_[a-z0-9][a-z0-9_-]{8,}|bearer\s+[a-z0-9._~+/=-]{12,})',
+    r'(?i)('
+    r'sk-[a-z0-9][a-z0-9_-]{8,}'
+    r'|egk_[a-z0-9][a-z0-9_-]{8,}'
+    r'|bearer\s+[a-z0-9._~+/=-]{12,}'
+    r'|AIza[a-z0-9_-]{20,}'
+    r'|\b\d{6,}:[a-z0-9_-]{20,}\b'
+    r'|xox[baprs]-[a-z0-9-]{20,}'
+    r')',
 )
 
 

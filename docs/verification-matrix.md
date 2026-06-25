@@ -368,3 +368,48 @@ First decisive failures fixed during the TDD loop:
 - Independent review found malformed server URLs could reach transport and
   escape as Python exceptions; connect and doctor now validate server URLs
   before health or dry-run calls.
+
+## 2026-06-25: Upstream Migration Import
+
+Branch: `feat/parity-13-upstream-migration-import`
+
+Scope:
+
+- `apps/backend/engram/imports/management/__init__.py`
+- `apps/backend/engram/imports/management/commands/__init__.py`
+- `apps/backend/engram/imports/management/commands/engram_import_claude_mem.py`
+- `apps/backend/engram/imports/services.py`
+- `apps/backend/engram/imports/upstream_import_tests.py`
+- `apps/backend/engram/core/redaction.py`
+- `.github/workflows/backend.yml`
+- `tests/repository/test_backend_workflow.py`
+- `docs/security/reviews/2026-06-25-upstream-migration-import.md`
+- `docs/verification-matrix.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-13-upstream-migration-import` with Task 5 implementation files modified by other workers. |
+| command and CI review | Review over `.superpowers/sdd/task-5-workingtree-review.diff` | Backend | yes | pass | SPEC APPROVED / QUALITY APPROVED; no blocking findings. |
+| repository workflow contract | `python3 -m unittest tests.repository.test_backend_workflow -v` | Backend and Repository Quality | yes | pass | Exit 0. Ran 4 tests OK. |
+| stale container image check | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "poetry install --with dev --no-interaction && pytest engram/imports/upstream_import_tests.py -v && ruff check engram/imports engram/core/redaction.py && ruff format --check engram/imports engram/core/redaction.py"` | none | no | fixed | Exit 4. First decisive failure: `ERROR: file or directory not found: engram/imports/upstream_import_tests.py`; fixed by rerunning with `--build`. |
+| focused importer container gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --with dev --no-interaction && pytest engram/imports/upstream_import_tests.py -v && ruff check engram/imports engram/core/redaction.py && ruff format --check engram/imports engram/core/redaction.py"` | Backend equivalent | yes | pass | Exit 0. Importer pytest reported 15 passed; ruff check and format check were clean. |
+| focused security review | Initial review, security fixes, and security re-review recorded in `docs/security/reviews/2026-06-25-upstream-migration-import.md` | none | yes | pass | Initial SECURITY CHANGES_REQUIRED findings were fixed; re-review SECURITY APPROVED with CRITICAL none, IMPORTANT none, MINOR none. |
+| evidence docs quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 after evidence files were written. |
+| whitespace | `git diff --check` | Repository Quality whitespace step | yes | pass | Exit 0 after security fixes. |
+
+First decisive failures fixed during the Task 5 loop:
+
+- Management-command red test first failed with
+  `django.core.management.base.CommandError: Unknown command:
+  'engram_import_claude_mem'`.
+- Repository workflow test first failed because `.github/workflows/backend.yml`
+  did not run `poetry run pytest engram/imports/upstream_import_tests.py -v`.
+- Security red tests first failed because `settings.json` was not reported,
+  mixed upstream projects did not raise `ClaudeMemImportError`, and Gemini,
+  Telegram, and Slack token shapes could persist in imported records.
+- The first container verification run used a stale image and exited 4 with
+  `ERROR: file or directory not found:
+  engram/imports/upstream_import_tests.py`; rerunning with `--build` passed.
+- Evidence docs verification passed with `python3 scripts/repository_quality.py`
+  exit 0 and `git diff --check` exit 0 after the security artifact, verification
+  matrix entry, and evidence report were written.

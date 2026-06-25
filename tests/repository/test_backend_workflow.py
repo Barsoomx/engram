@@ -15,6 +15,7 @@ class BackendWorkflowTests(unittest.TestCase):
         self.assertIn('poetry run ruff format --check .', workflow)
         self.assertIn('poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings', workflow)
         self.assertIn('poetry run python manage.py migrate --noinput --settings=settings.test_settings', workflow)
+        self.assertIn('poetry run pytest engram/imports/upstream_import_tests.py -v', workflow)
         self.assertIn('poetry run pytest -v', workflow)
         self.assertIn("PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v", workflow)
         self.assertIn('python3 scripts/repository_layout.py', workflow)

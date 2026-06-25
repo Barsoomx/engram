@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
 import shutil
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from django.core.management import call_command
 
 from engram.core.models import (
     AgentSession,
@@ -74,6 +77,28 @@ def f_claude_mem_fixture(tmp_path: Path) -> Path:
             shutil.copy2(source, target)
 
     return source_root
+
+
+@pytest.mark.django_db
+def test_claude_mem_import_command_emits_sanitized_json_report(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    out = io.StringIO()
+    call_command(
+        'engram_import_claude_mem',
+        str(f_claude_mem_fixture),
+        organization_id=str(f_import_scope.organization.id),
+        project_id=str(f_import_scope.project.id),
+        team_id=str(f_import_scope.team.id),
+        source_store_id='fixture-store',
+        dry_run=True,
+        as_json=True,
+        stdout=out,
+    )
+    payload = json.loads(out.getvalue())
+    assert payload['mode'] == 'dry_run'
+    assert 'sk-test_fake_import_token' not in out.getvalue()
 
 
 @pytest.mark.django_db
@@ -206,6 +231,74 @@ def test_claude_mem_importer_reports_deferred_artifacts_and_housekeeping_sources
     assert ('schema_versions', 'schema_versions:1', 'schema_housekeeping_table') in unsupported
     assert ('observations_fts', 'observations_fts', 'sqlite_fts_housekeeping_table') in unsupported
     assert 'sk-test_secret_not_reported' not in str(report)
+
+
+@pytest.mark.django_db
+def test_claude_mem_importer_reports_settings_json_without_reading_secret_values(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    fake_secret = 'AIzaSySettingsSecretNotReported1234567890'
+    (f_claude_mem_fixture / 'settings.json').write_text(
+        json.dumps({'providerApiKey': fake_secret}),
+    )
+
+    report = ClaudeMemImporter().execute(
+        ClaudeMemImportInput(
+            source_root=f_claude_mem_fixture,
+            organization_id=f_import_scope.organization.id,
+            project_id=f_import_scope.project.id,
+            team_id=f_import_scope.team.id,
+            source_store_id='fixture-store',
+            apply=False,
+        ),
+    )
+
+    assert {
+        'source_type': 'source_artifact',
+        'source_id': 'settings.json',
+        'reason': 'settings_secret_file_not_read',
+    } in report['unsupported']
+    assert fake_secret not in str(report)
+
+
+@pytest.mark.django_db
+def test_claude_mem_importer_rejects_mixed_upstream_projects_before_writes(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    with sqlite3.connect(f_claude_mem_fixture / 'claude-mem.db') as connection:
+        connection.execute(
+            'INSERT INTO observations '
+            '(memory_session_id, project, text, type, title, created_at, created_at_epoch) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                'memory-session-fixture-001',
+                '/workspace/other-repo',
+                'Mixed upstream project should not be imported.',
+                'discovery',
+                'Mixed project observation',
+                '2026-06-25T09:03:00Z',
+                1782378180000,
+            ),
+        )
+
+    with pytest.raises(ClaudeMemImportError, match='source contains multiple projects'):
+        ClaudeMemImporter().execute(
+            ClaudeMemImportInput(
+                source_root=f_claude_mem_fixture,
+                organization_id=f_import_scope.organization.id,
+                project_id=f_import_scope.project.id,
+                team_id=f_import_scope.team.id,
+                source_store_id='fixture-store',
+                apply=True,
+            ),
+        )
+
+    assert AgentSession.objects.count() == 0
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert Memory.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -465,6 +558,59 @@ def test_claude_mem_importer_redacts_token_shaped_values_before_persisting_or_re
     assert '[REDACTED]' in RawEventEnvelope.objects.get(event_type='claude_mem.user_prompt').payload['prompt_text']
     assert '[REDACTED]' in Observation.objects.get(observation_type='discovery').title
     assert '[REDACTED]' in Memory.objects.get(title__startswith='Fixture import mapping').body
+
+
+@pytest.mark.django_db
+def test_claude_mem_import_command_redacts_provider_token_shapes_before_persisting_or_reporting(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    fake_gemini_token = 'AIzaSyGeminiFakeImportToken123456789012345'
+    fake_telegram_token = '123456789:AAFakeTelegramBotToken1234567890123'
+    fake_slack_token = '-'.join(
+        ('xoxb', '123456789012', '123456789012', 'fakeSlackImportToken'),
+    )
+    token_text = f'{fake_gemini_token} {fake_telegram_token} {fake_slack_token}'
+    with sqlite3.connect(f_claude_mem_fixture / 'claude-mem.db') as connection:
+        connection.execute(
+            'UPDATE user_prompts SET prompt_text = prompt_text || ? WHERE id = 1',
+            (f' {token_text}',),
+        )
+        connection.execute(
+            'UPDATE observations SET text = text || ?, title = title || ? WHERE id = 1',
+            (f' {token_text}', f' {token_text}'),
+        )
+        connection.execute(
+            'UPDATE session_summaries SET learned = learned || ? WHERE id = 1',
+            (f' {token_text}',),
+        )
+
+    out = io.StringIO()
+    call_command(
+        'engram_import_claude_mem',
+        str(f_claude_mem_fixture),
+        organization_id=str(f_import_scope.organization.id),
+        project_id=str(f_import_scope.project.id),
+        team_id=str(f_import_scope.team.id),
+        source_store_id='fixture-store',
+        apply=True,
+        as_json=True,
+        stdout=out,
+    )
+    report = json.loads(out.getvalue())
+
+    assert report['redactions'] == {'redacted': True}
+    persisted_values = ' '.join(
+        [
+            str(list(RawEventEnvelope.objects.values('payload', 'metadata'))),
+            str(list(Observation.objects.values('title', 'body', 'source_metadata'))),
+            str(list(Memory.objects.values('title', 'body', 'metadata'))),
+        ],
+    )
+    for fake_token in (fake_gemini_token, fake_telegram_token, fake_slack_token):
+        assert fake_token not in out.getvalue()
+        assert fake_token not in persisted_values
+    assert '[REDACTED]' in persisted_values
 
 
 @pytest.mark.django_db
