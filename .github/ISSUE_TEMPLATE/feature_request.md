@@ -1,26 +1,24 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Suggest a product or architecture improvement
 title: ''
 labels: feature-request
 assignees: ''
-
 ---
 
-## Before submitting
+## Problem
 
-- [ ] I searched [existing issues](https://github.com/thedotmack/claude-mem/issues) and confirmed this is not a duplicate
+What user or operator problem does this solve?
 
----
+## Proposed Behavior
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+What should the product do?
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+## Scope
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+Which area is affected: hooks, observations, memory, search, RBAC, secrets,
+model policy, admin UI, deployment, or audit?
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+## Tradeoffs
+
+What should stay simple in the first version?

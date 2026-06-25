@@ -1,5 +1,17 @@
 # Security Policy
 
+`claudex-teams` is being redesigned as a server-only enterprise memory product.
+Security-sensitive design work should preserve these invariants:
+
+- no provider secrets in hooks, prompts, observations, memory content, or logs;
+- no local worker as a required security boundary;
+- API keys can narrow, never expand, owner permissions;
+- authorization filters apply before retrieval response construction;
+- every memory read, write, secret use, and model policy decision is auditable.
+
+The inherited upstream security notes below are retained only where they remain
+compatible with the target runtime.
+
 ## Supported Versions
 
 Only the latest released version of `claude-mem` receives security updates. Please upgrade to the latest version before reporting a vulnerability.

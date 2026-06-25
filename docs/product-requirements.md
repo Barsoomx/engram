@@ -1,0 +1,106 @@
+# Product Requirements
+
+## Vision
+
+`claudex-teams` is the enterprise memory layer for teams using Claude Code and
+Codex. It gives agents shared, scoped, auditable memory without asking each
+developer laptop or WSL instance to run a local worker. Companies can run it in
+their own infrastructure, connect agent hooks, and let teams share useful
+observations while keeping access boundaries clear.
+
+The product should feel closer to Sentry than to a large cloud IAM suite:
+organizations, teams, projects, users, API keys, clear scopes, useful defaults,
+and enough policy control to be safe without forcing every company to design a
+governance framework before first use.
+
+## Primary Users
+
+- Developer: wants agent sessions to remember project decisions, incident
+  lessons, local conventions, and review outcomes without manual copy-paste.
+- Team lead: wants shared project memory, stale-memory cleanup, and visibility
+  into what agents are using.
+- Platform admin: wants on-premise deployment, provider key control, RBAC, audit
+  logs, and simple rollout across Claude Code and Codex.
+- Security admin: wants no secrets in memory, scoped API keys, retention rules,
+  review queues, and an answer to "who could see this memory?"
+- Memory curator: wants to review proposed observations, merge duplicates,
+  resolve conflicts, and promote durable knowledge.
+- Auditor: wants immutable evidence for memory reads, writes, policy decisions,
+  and secret access.
+
+## Core Jobs
+
+1. Capture observations from agent lifecycle hooks.
+2. Generate durable memories from observations.
+3. Retrieve relevant memory at session start, before tool use, after important
+   tool use, and on explicit search.
+4. Update memory when the agent discovers a changed fact, a resolved issue, or a
+   new project convention.
+5. Enforce tenant/team/project access before any memory is retrieved or written.
+6. Keep model provider secrets server-side and scoped to the owning organization
+   or team.
+7. Give admins a clear operational surface for access, configuration, review,
+   audit, and deployment.
+
+## Hook-Centric Behavior
+
+Hooks are not an optional notification channel. They are the deterministic
+transport and control plane for the memory product.
+
+Required hook responsibilities:
+
+- Session start: resolve identity, tenant, team, project, repository, branch,
+  and working directory; inject the initial memory bundle with citations.
+- Pre-tool use: optionally retrieve focused memory, run secret/path guards, and
+  attach guidance before high-risk operations.
+- Post-tool use: capture observations, command outcomes, file references, error
+  signatures, and review decisions.
+- User prompt submit: expand prompt context when the user asks about prior work,
+  recurring bugs, architecture, or conventions.
+- Stop/session end: summarize unresolved findings, create candidate memories,
+  mark stale context, and schedule background distillation.
+- Explicit tools: expose memory search, observation lookup, memory update, and
+  memory feedback as agent-callable commands.
+
+Policy enforcement is a mode that uses the same hook surfaces. Memory hooks must
+not pretend to be the only security boundary; server authorization, audit, and
+policy decisions remain authoritative.
+
+## Business Capabilities
+
+- Multi-tenant SaaS and single-tenant on-premise operation.
+- Organization and team management.
+- Project and repository binding.
+- User invitations, service accounts, and scoped API keys.
+- Team-owned AI provider secrets and model routing.
+- Memory review workflow: proposed, approved, stale, conflicted, archived.
+- Memory visibility: private user memory, team memory, project memory,
+  organization memory, shared packs, and policy packs.
+- Exact and semantic retrieval with permission filtering before response.
+- Admin audit trail for reads, writes, retrieval decisions, hook calls, and
+  secret usage.
+- Export, retention, legal hold, and delete workflows suitable for enterprise
+  customers.
+
+## Non-Goals For The First Rewrite
+
+- Local memory worker runtime.
+- Desktop-only viewer as the primary operational UI.
+- Agent-specific business logic duplicated outside the server.
+- Complex cloud-style conditional access language.
+- Vector-only retrieval.
+- Multi-region active-active control plane.
+
+## Success Criteria
+
+- A developer can install Claude Code and Codex hooks that only call the company
+  server; no local worker starts.
+- A team can configure provider keys and model policy without exposing raw
+  secrets to agents.
+- A single-team developer cannot read another team's memory unless a shared
+  project, memory pack, or explicit grant allows it.
+- Every injected memory has provenance, scope, and audit evidence.
+- Operators can deploy the stack on-premise with PostgreSQL and a queue, then
+  scale retrieval and distillation independently.
+- The first implementation remains small enough to reason about: few domain
+  concepts, explicit contracts, and boring operational dependencies.

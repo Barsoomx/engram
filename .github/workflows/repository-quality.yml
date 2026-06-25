@@ -1,0 +1,38 @@
+name: Repository Quality
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  repository-quality:
+    name: Repository Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check whitespace
+        run: git diff --check
+
+      - name: Check forbidden internal brand terms
+        run: |
+          ! grep -RInE --exclude=repository-quality.yml 'Altyn|altyn|Алтын|алтын' README.md docs .github CONTRIBUTING.md SECURITY.md CODEOWNERS
+
+      - name: Check required docs
+        run: |
+          test -f docs/product-requirements.md
+          test -f docs/architecture.md
+          test -f docs/rbac-and-scopes.md
+          test -f docs/agent-integrations.md
+          test -f docs/secrets-and-model-config.md
+          test -f docs/search-and-retrieval.md
+          test -f docs/operations-and-deployment.md
+          test -f docs/repository-governance.md
+          test -f docs/upstream-fork-boundary.md
+          test -f docs/research-notes.md
