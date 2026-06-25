@@ -231,17 +231,22 @@ def test_observation_recorded_worker_redacts_candidate_content_and_evidence() ->
     observation.title = f'Bearer {RAW_KEY}'
     observation.body = f'command printed {RAW_KEY}'
     observation.files_read = [f'apps/backend/{RAW_KEY}.txt']
-    observation.save(update_fields=['title', 'body', 'files_read', 'updated_at'])
+    observation.files_modified = [f'apps/backend/{RAW_KEY}-modified.py']
+    observation.save(update_fields=['title', 'body', 'files_read', 'files_modified', 'updated_at'])
 
     execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    persisted = f'{candidate.title} {candidate.body} {candidate.evidence}'
+    memory = Memory.objects.get()
+    document = RetrievalDocument.objects.get()
+    persisted = f'{candidate.title} {candidate.body} {candidate.evidence} {memory.metadata} {document.file_paths}'
 
     assert RAW_KEY not in persisted
     assert '[REDACTED]' in candidate.title
     assert '[REDACTED]' in candidate.body
     assert '[REDACTED]' in str(candidate.evidence)
+    assert '[REDACTED]' in str(memory.metadata['file_paths'])
+    assert '[REDACTED]' in str(document.file_paths)
 
 
 @pytest.mark.django_db
@@ -427,6 +432,30 @@ def test_promote_memory_candidate_command_outputs_json_ids() -> None:
         'retrieval_document_id': str(document.id),
         'duplicate': False,
     }
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_command_is_idempotent_for_duplicate_candidate() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    candidate = create_memory_candidate(observation)
+    first_stdout = io.StringIO()
+    second_stdout = io.StringIO()
+
+    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=first_stdout)
+    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=second_stdout)
+
+    first = json.loads(first_stdout.getvalue())
+    second = json.loads(second_stdout.getvalue())
+
+    assert first['duplicate'] is False
+    assert second['duplicate'] is True
+    assert second['candidate_id'] == first['candidate_id']
+    assert second['memory_id'] == first['memory_id']
+    assert second['memory_version_id'] == first['memory_version_id']
+    assert second['retrieval_document_id'] == first['retrieval_document_id']
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
 
 
 @pytest.mark.django_db
