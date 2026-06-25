@@ -63,10 +63,11 @@ fallbacks, and inspectable behavior:
 
 ## Current Status
 
-This branch is a docs-first architecture branch. The inherited implementation is
-still present while the rewrite is planned, but it is not the target runtime. The
-target runtime is a server-side Python application with PostgreSQL-backed state,
-optional vector search, and no developer-machine memory worker.
+This branch is a docs-first architecture branch. The inherited implementation
+has been removed from `master`; the source snapshot is preserved on the
+`upstream` branch for reference. The target runtime is a server-side Python
+application with PostgreSQL-backed state, hybrid search, and no
+developer-machine memory worker.
 
 ## License
 
