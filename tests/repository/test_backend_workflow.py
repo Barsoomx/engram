@@ -13,6 +13,8 @@ class BackendWorkflowTests(unittest.TestCase):
         self.assertIn('poetry install --no-interaction', workflow)
         self.assertIn('poetry run ruff check .', workflow)
         self.assertIn('poetry run ruff format --check .', workflow)
+        self.assertIn('poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings', workflow)
+        self.assertIn('poetry run python manage.py migrate --noinput --settings=settings.test_settings', workflow)
         self.assertIn('poetry run pytest -v', workflow)
         self.assertIn('python3 scripts/repository_layout.py', workflow)
         self.assertIn('python3 scripts/repository_quality.py', workflow)

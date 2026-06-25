@@ -110,3 +110,52 @@ First decisive failures fixed during the TDD loop:
   missing.
 - Backend workflow test first failed because `.github/workflows/backend.yml`
   was missing.
+
+## 2026-06-25: Core Models And Migrations
+
+Branch: `feat/parity-04-core-models`
+
+Scope:
+
+- `apps/backend/engram/core/models.py`
+- `apps/backend/engram/core/migrations/0001_initial.py`
+- `apps/backend/engram/core/core_models_tests.py`
+- `apps/backend/settings/settings.py`
+- `.github/workflows/backend.yml`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `tests/repository/test_backend_workflow.py`
+- `docs/superpowers/specs/2026-06-25-core-models-design.md`
+- `docs/superpowers/plans/2026-06-25-core-models.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-04-core-models` plus pre-existing unstaged `.gitignore` edit. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. Core model and initial migration paths are required. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
+| core model tests | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py -v` | Backend | yes | pass | Exit 0. Ran 8 tests for scoped ids, event replay, observation dedupe, source provenance, retrieval scope, context citations, and outbox idempotency. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 11 backend tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. |
+| migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied Django auth/contenttypes/core/sessions migrations against the test database. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
+
+First decisive failures fixed during the TDD loop:
+
+- Core model test first failed with `ModuleNotFoundError: No module named
+  'engram.core.models'`.
+- Observation source provenance test first failed because `ObservationSource`
+  did not exist.
+- Repository gate tests first failed because the core model/migration paths were
+  not listed in `scripts/repository_layout.py`.
+- Backend workflow test first failed because `.github/workflows/backend.yml`
+  did not run migration freshness or migration apply commands.
+- `cd apps/backend && poetry run python manage.py migrate --check
+  --settings=settings.test_settings` exited 1 on a fresh database because it
+  detects unapplied migrations rather than applying them; the gate now uses
+  `migrate --noinput --settings=settings.test_settings` to prove the migration
+  applies cleanly.
