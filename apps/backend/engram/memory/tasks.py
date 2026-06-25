@@ -7,10 +7,10 @@ from engram.memory.services import MemoryCandidateWorkerInput, MemoryWorkerError
 
 
 @app.task(name='engram.memory.process_observation_recorded')
-def process_observation_recorded(observation_id: str) -> str:
+def process_observation_recorded(observation_id: object) -> str:
     try:
         parsed_observation_id = uuid.UUID(observation_id)
-    except ValueError as error:
+    except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed observation id') from error
 
     result = ProcessObservationRecorded().execute(

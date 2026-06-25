@@ -256,9 +256,12 @@ def test_process_observation_recorded_task_delegates_by_observation_id() -> None
 
 
 @pytest.mark.django_db
-def test_process_observation_recorded_task_rejects_malformed_observation_id() -> None:
+@pytest.mark.parametrize('malformed_observation_id', ['not-a-uuid', None, [], {}, b'abc'])
+def test_process_observation_recorded_task_rejects_malformed_observation_id(
+    malformed_observation_id: object,
+) -> None:
     with pytest.raises(MemoryWorkerError, match='malformed observation id'):
-        process_observation_recorded.run('not-a-uuid')
+        process_observation_recorded.run(malformed_observation_id)
 
     assert MemoryCandidate.objects.count() == 0
 
