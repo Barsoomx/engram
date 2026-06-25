@@ -375,6 +375,23 @@ def build_generic_hook_payload(
     return request_payload
 
 
+def build_session_start_hook_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+) -> dict[str, object]:
+    payload = dict_value(input_payload.get('payload'))
+    if payload:
+        return build_generic_hook_payload(config, runtime, input_payload, 'session_start')
+
+    lifecycle_input_payload = dict(input_payload)
+    lifecycle_payload: dict[str, object] = {'trigger': 'session_start'}
+    copy_optional_strings(lifecycle_payload, input_payload, ('repository_root', 'branch', 'cwd'))
+    lifecycle_input_payload['payload'] = lifecycle_payload
+
+    return build_generic_hook_payload(config, runtime, lifecycle_input_payload, 'session_start')
+
+
 def send_hook_event(
     transport: Transport,
     *,
@@ -386,12 +403,17 @@ def send_hook_event(
     path: str,
     event_type: str,
 ) -> tuple[int, dict[str, object]]:
+    if event_type == 'session_start':
+        payload = build_session_start_hook_payload(config, runtime, input_payload)
+    else:
+        payload = build_generic_hook_payload(config, runtime, input_payload, event_type)
+
     return post_json(
         transport=transport,
         server_url=server_url,
         path=path,
         api_key=api_key,
-        payload=build_generic_hook_payload(config, runtime, input_payload, event_type),
+        payload=payload,
     )
 
 

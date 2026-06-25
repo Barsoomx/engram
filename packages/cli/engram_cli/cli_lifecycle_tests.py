@@ -669,6 +669,79 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_hook_session_start_posts_non_empty_lifecycle_payload_without_input_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            'status': 'accepted',
+                            'duplicate': False,
+                            'request_id': 'session-event-request-1',
+                        },
+                    ),
+                    (
+                        200,
+                        {
+                            'status': 'created',
+                            'purpose': 'session_start',
+                            'items': [{'citation': 'M1'}],
+                        },
+                    ),
+                ],
+            )
+            stdin_payload = {
+                'session_id': 'future-session',
+                'event_id': 'session-event-1',
+                'request_id': 'context-request-1',
+                'query': 'hook ingest replay handling',
+                'file_paths': ['apps/backend/engram/hooks/services.py'],
+                'symbols': ['IngestHookEvent'],
+                'repository_root': '/workspace/engram',
+                'branch': 'feat/parity-14-hook-event-coverage',
+                'cwd': '/workspace/engram/packages/cli',
+            }
+
+            exit_code, stdout, stderr = self.run_cli(
+                ['hook', 'session-start', '--config-dir', str(config_dir)],
+                transport,
+                stdin=io.StringIO(json.dumps(stdin_payload)),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            self.assertEqual(2, len(transport.calls))
+            hook_call = transport.calls[0]
+            hook_payload = hook_call['payload']
+            context_call = transport.calls[1]
+            context_payload = context_call['payload']
+            self.assertEqual('POST', hook_call['method'])
+            self.assertEqual('https://engram.example/v1/hooks/session-start', hook_call['url'])
+            self.assertEqual('session_start', hook_payload['event_type'])
+            self.assertEqual(
+                {
+                    'trigger': 'session_start',
+                    'repository_root': '/workspace/engram',
+                    'branch': 'feat/parity-14-hook-event-coverage',
+                    'cwd': '/workspace/engram/packages/cli',
+                },
+                hook_payload['payload'],
+            )
+            self.assertEqual('POST', context_call['method'])
+            self.assertEqual('https://engram.example/v1/context/session-start', context_call['url'])
+            self.assertEqual('context-request-1', context_payload['request_id'])
+            self.assertEqual('hook ingest replay handling', context_payload['query'])
+            self.assertEqual(['apps/backend/engram/hooks/services.py'], context_payload['file_paths'])
+            self.assertEqual(['IngestHookEvent'], context_payload['symbols'])
+            self.assertNotIn('payload', context_payload)
+            body = json.loads(stdout)
+            self.assertEqual('created', body['status'])
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
     def test_hook_session_start_codex_response_format_emits_hook_specific_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
