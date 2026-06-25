@@ -1,9 +1,7 @@
 # Codex Plugin
 
-Owns the future native Codex plugin package and hook manifests.
+Package-local contract fixture for Codex hook integration.
 
-This directory is inactive in the skeleton checkpoint. It must not introduce a
-local worker, local database, provider secret storage, or product naming outside
-agent-integration boundaries.
-
-Activation gate: Codex hook/client parity slice.
+The hooks call the thin Python CLI and require `engram connect` to have
+written local server credentials first. This package is not published by this
+checkpoint and does not install itself into a user profile.

@@ -1,0 +1,14 @@
+{
+  "name": "engram",
+  "version": "0.1.0",
+  "description": "Thin Engram hook adapter for Codex.",
+  "hooks": "../plugin/hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "Engram",
+    "shortDescription": "Shared engineering memory for AI coding agents.",
+    "longDescription": "Engram captures coding-session activity and injects relevant server-backed context into future agent sessions.",
+    "developerName": "Engram",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"]
+  }
+}
