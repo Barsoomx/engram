@@ -4,7 +4,7 @@
 
 **Goal:** Add the first Django model and migration surface for Engram's parity-loop persistence.
 
-**Architecture:** Create one `engram.core` Django app with explicit UUID-based models for tenant scope, agent sessions, raw events, observations, memory candidates, memories, retrieval documents, context bundle audit, audit events, and durable outbox entries. Keep API, auth, worker execution, retrieval ranking, and provider calls out of this checkpoint.
+**Architecture:** Create one `engram.core` Django app with explicit UUID-based models for tenant scope, agent sessions, raw events, observations, observation source links, memory candidates, memories, retrieval documents, context bundle audit, audit events, and durable outbox entries. Keep API, auth, worker execution, retrieval ranking, and provider calls out of this checkpoint.
 
 **Tech Stack:** Django 5.2, Django REST Framework, PostgreSQL target with sqlite test database, Poetry, pytest-django, Ruff.
 
@@ -48,6 +48,7 @@ from engram.core.models import (
     Memory,
     MemoryVersion,
     Observation,
+    ObservationSource,
     Organization,
     OutboxEvent,
     Project,
@@ -148,13 +149,14 @@ Implement `Organization`, `Team`, `Project`, `ProjectTeam`, `Agent`, and
 
 - [ ] **Step 4: Implement event and observation models**
 
-Implement `RawEventEnvelope` and `Observation` with:
+Implement `RawEventEnvelope`, `Observation`, and `ObservationSource` with:
 
 - resolved organization/project/team/agent/session scope;
 - event ids and idempotency keys;
 - JSON payload/source fields;
 - content hash;
 - schema version;
+- source/provenance links for citation and migration compatibility;
 - scoped duplicate prevention.
 
 - [ ] **Step 5: Implement memory, retrieval, context, audit, and outbox models**
@@ -241,7 +243,7 @@ Run:
 
 ```bash
 cd apps/backend && poetry run python manage.py makemigrations --check --dry-run
-cd apps/backend && poetry run python manage.py migrate --check
+cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings
 ```
 
 Expected: both commands exit 0.
@@ -281,7 +283,7 @@ cd apps/backend && poetry run pytest -v
 cd apps/backend && poetry run ruff check .
 cd apps/backend && poetry run ruff format --check .
 cd apps/backend && poetry run python manage.py makemigrations --check --dry-run
-cd apps/backend && poetry run python manage.py migrate --check
+cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings
 cd apps/backend && poetry check
 git diff --check HEAD
 docker compose version
@@ -315,5 +317,5 @@ Then re-run the non-Docker verification commands on `master`.
 
 - Spec coverage: every model required by the design has an implementation task.
 - Placeholder scan: no unfinished markers or vague implementation steps remain.
-- Type consistency: model names in tests, implementation, and repository gates match.
+- Type consistency: model names in tests, implementation, and repository gates match, including `ObservationSource`.
 - Scope check: auth, API, workers, CLI, frontend, MCP, and provider adapters remain deferred.
