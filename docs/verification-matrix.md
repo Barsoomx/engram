@@ -62,3 +62,51 @@ First decisive failures fixed during the TDD loop:
   `python3 -m unittest discover -s tests -v` run the repository tests.
 - Workflow test first failed because the workflow did not call the new scripts
   and still contained `grep -RInE`.
+
+## 2026-06-25: Backend Health And Compose Runtime
+
+Branch: `feat/parity-03-backend-health-compose`
+
+Scope:
+
+- `apps/backend/manage.py`
+- `apps/backend/pyproject.toml`
+- `apps/backend/poetry.lock`
+- `apps/backend/pytest.ini`
+- `apps/backend/settings/*`
+- `apps/backend/engram/health/*`
+- `apps/backend/engram/celery_app.py`
+- `apps/backend/Dockerfile`
+- `deploy/compose/docker-compose.yml`
+- `deploy/compose/.env.example`
+- `.github/workflows/backend.yml`
+- `tests/repository/test_backend_runtime_contract.py`
+- `tests/repository/test_backend_workflow.py`
+- `docs/superpowers/specs/2026-06-25-backend-health-compose-design.md`
+- `docs/superpowers/plans/2026-06-25-backend-health-compose.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-03-backend-health-compose` plus pre-existing unstaged `.gitignore` edit. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 3 health endpoint tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Exit 1. `docker` command is not available in this WSL distro, so live `docker compose up -d --build --wait` was not run. |
+
+First decisive failures fixed during the TDD loop:
+
+- Backend runtime layout test first failed because backend paths were not
+  registered in `scripts/repository_layout.py`.
+- Health endpoint tests first failed with HTTP 404 for `/-/healthz/`,
+  `/-/readyz/`, and `/-/startup/`.
+- Ruff first failed because lint quote configuration did not match the
+  formatter's single-quote style.
+- Compose contract tests first failed because Dockerfile and Compose files were
+  missing.
+- Backend workflow test first failed because `.github/workflows/backend.yml`
+  was missing.
