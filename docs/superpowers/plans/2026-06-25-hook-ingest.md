@@ -32,6 +32,10 @@ test database, Poetry, pytest-django, Ruff.
   duplicate observations or outbox events.
 - Raw API keys must not be persisted in models, audit metadata, outbox payloads,
   logs, or responses.
+- Hook payload and observation content must redact obvious secret-bearing keys
+  and token-shaped values before persistence.
+- Request signatures and managed hook trust signing are deferred for a later
+  hook/CLI trust checkpoint; this slice is bearer-token authenticated only.
 - Docker Compose live checks are recorded as blocked while Docker is unavailable
   in this WSL distro.
 
@@ -119,6 +123,11 @@ Add tests that post to `/v1/hooks/post-tool-use` and assert:
 - raw event fields preserve runtime, client event id, idempotency key, payload,
   request id, actor, repository metadata, and content hash;
 - observation fields preserve normalized title/body/files;
+- thin hook payloads without `observation` create deterministic observation
+  title/type server-side;
+- secret-shaped payload and observation values are redacted before persistence;
+- omitted `team_id` still persists the key-bound team when the API key is
+  team-scoped;
 - outbox payload references ids only and does not contain the raw API key.
 
 - [ ] **Step 4: Add replay and denial tests**
@@ -128,8 +137,11 @@ Add tests for:
 - duplicate idempotency returns `duplicate: true` and does not increase durable
   row counts;
 - same session/event id replay returns `duplicate: true`;
+- a replay insert race that reaches the database constraint returns existing
+  rows instead of HTTP 500;
 - cross-project request returns HTTP 403 and creates no raw events;
-- malformed payload missing `content_hash` returns HTTP 400.
+- malformed payload missing `content_hash` returns HTTP 400;
+- non-object `payload` returns HTTP 400.
 
 - [ ] **Step 5: Add session-end test**
 
@@ -175,9 +187,10 @@ Add `HooksConfig`, install `engram.hooks`, and include `engram.hooks.urls` at
 
 Implement serializers for dry-run and hook event request fields. Require:
 `project_id`, `agent_runtime`, `session_id`, `event_id`, `idempotency_key`,
-`event_type`, `payload_schema_version`, `content_hash`, `payload`, and
-`observation` for ingest. Allow optional `team_id`, `sequence_number`,
-`occurred_at`, repository metadata, branch, cwd, and request id.
+`event_type`, `payload_schema_version`, `content_hash`, and `payload` for
+ingest. Validate `payload` as a JSON object. Allow optional `observation`,
+`team_id`, `sequence_number`, `occurred_at`, repository metadata, branch, cwd,
+and request id.
 
 - [ ] **Step 3: Add credential extraction and error mapping**
 
@@ -195,14 +208,18 @@ and returns scope data.
 
 `IngestHookEvent.execute()` resolves API-key scope, creates or loads agent and
 session, writes raw event, observation, source, and outbox inside
-`transaction.atomic()`, and returns `HookIngestResult`.
+`transaction.atomic()`, creates a deterministic observation shell when the hook
+payload has no normalized `observation`, redacts secret-shaped persisted
+content, derives omitted key-bound team scope, and returns `HookIngestResult`.
 
 - [ ] **Step 6: Implement replay handling**
 
 Before inserting new rows, look up existing `RawEventEnvelope` by
 organization/project/idempotency key or organization/project/session/event id.
 If found, return existing raw event, first linked observation, first matching
-outbox, and `duplicate=True`.
+outbox, and `duplicate=True`. If a concurrent duplicate insert raises
+`IntegrityError`, reload the matching duplicate and return it; re-raise only if
+the conflict cannot be tied to an existing duplicate hook event.
 
 - [ ] **Step 7: Run focused tests**
 
@@ -260,7 +277,8 @@ failures.
 - [ ] **Step 1: Run focused security review**
 
 Check credential redaction, authorization before writes, duplicate replay,
-outbox payload safety, and cross-project/team denial.
+outbox payload safety, non-object payload denial, replay race handling, scoped
+team persistence, and cross-project/team denial.
 
 - [ ] **Step 2: Run full verification**
 

@@ -219,3 +219,52 @@ First decisive failures fixed during the TDD and review loop:
 - Security review found audit rows lacked resolved scope filters; allow/deny
   metadata now records resolved `organization_id`, `project_ids`, and
   `team_ids`, and single-project/team allows populate audit FK fields.
+
+## 2026-06-25: Hook Dry-Run And Observation Ingest
+
+Branch: `feat/parity-06-hook-ingest`
+
+Scope:
+
+- `apps/backend/engram/hooks/*`
+- `apps/backend/settings/settings.py`
+- `apps/backend/settings/urls.py`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/superpowers/specs/2026-06-25-hook-ingest-design.md`
+- `docs/superpowers/plans/2026-06-25-hook-ingest.md`
+- `docs/verification-matrix.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-06-hook-ingest` plus pre-existing unstaged `.gitignore` edit. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. Hook app config, serializers, services, URLs, views, and tests are required paths. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
+| backend runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 5 tests requiring hook app paths. |
+| hook ingest tests | `cd apps/backend && poetry run pytest engram/hooks/hook_ingest_tests.py -v` | Backend | yes | pass | Exit 0. Ran 14 tests for dry-run, scope denial, ingest writes, thin payload normalization, redaction, key-bound team persistence, replay, race handling, validation, and session-end. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 57 tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. `36 files already formatted`. |
+| migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied core, access, Django auth/contenttypes, and sessions migrations against the test database. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. `All set!`. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| focused security review | Independent review agent plus local diff/readback | none yet | yes | pass | Review findings fixed: persisted secret redaction, key-bound team persistence, replay race handling, non-object payload validation, and request-signature deferral documentation. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Exit 1. Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
+
+First decisive failures fixed during the TDD and review loop:
+
+- Hook API tests first failed before implementation because `engram.hooks`
+  endpoints and app files were missing.
+- Review-driven red test first failed because raw hook payload and observation
+  text persisted token-shaped values and secret-bearing keys.
+- Review-driven red test first failed because a team-scoped API key could create
+  teamless session/raw-event/observation/outbox rows when the request omitted
+  `team_id`.
+- Review-driven red test first failed because non-object JSON `payload` values
+  were accepted instead of returning HTTP 400.
+- Review-driven red test first failed because a replay insert race raised an
+  uncaught `IntegrityError` on the raw-event uniqueness constraint.
+- Focused lint first failed on import ordering in
+  `engram/hooks/hook_ingest_tests.py`.
