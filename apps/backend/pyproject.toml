@@ -16,6 +16,7 @@ structlog = "^25.2.0"
 structlog-sentry = "^2.2.1"
 django-structlog = "^9.1.1"
 django-redis = "^7.0.0"
+cryptography = "^49.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.0"

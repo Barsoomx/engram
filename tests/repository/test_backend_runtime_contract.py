@@ -68,6 +68,14 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/engram/memory/tasks.py',
         'apps/backend/engram/memory/memory_worker_tests.py',
         'apps/backend/engram/memory/management/commands/engram_promote_memory_candidate.py',
+        'apps/backend/engram/model_policy/apps.py',
+        'apps/backend/engram/model_policy/models.py',
+        'apps/backend/engram/model_policy/serializers.py',
+        'apps/backend/engram/model_policy/services.py',
+        'apps/backend/engram/model_policy/urls.py',
+        'apps/backend/engram/model_policy/views.py',
+        'apps/backend/engram/model_policy/model_policy_tests.py',
+        'apps/backend/engram/model_policy/migrations/0001_initial.py',
         'apps/backend/engram/health/views.py',
         'apps/backend/Dockerfile',
         'deploy/compose/docker-compose.yml',
@@ -118,6 +126,8 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         self.assertIn("'LOCATION': ENGRAM_REDIS_URL", settings)
         self.assertIn('send_default_pii=False', logs)
         self.assertIn('django-redis', pyproject)
+        self.assertIn('cryptography', pyproject)
+        self.assertIn("'engram.model_policy'", settings)
 
     def test_celery_foundation_uses_sla_queues_and_confirm_publish(self) -> None:
         celeryconfig = (ROOT / 'apps/backend/engram/celeryconfig.py').read_text(encoding='utf-8')

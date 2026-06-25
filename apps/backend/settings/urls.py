@@ -9,4 +9,5 @@ urlpatterns = [
     path('v1/hooks/', include('engram.hooks.urls')),
     path('v1/inspection/', include('engram.inspection.urls')),
     path('v1/memories/', include('engram.memory.urls')),
+    path('v1/model-policy/', include('engram.model_policy.urls')),
 ]

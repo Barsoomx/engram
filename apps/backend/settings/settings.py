@@ -48,6 +48,7 @@ def database_config(url: str) -> dict[str, str]:
 
 
 SECRET_KEY = os.environ.get('ENGRAM_SECRET_KEY', 'engram-development-secret')
+ENGRAM_SECRET_ENCRYPTION_KEY = os.environ.get('ENGRAM_SECRET_ENCRYPTION_KEY', '')
 DEBUG = to_bool(os.environ.get('ENGRAM_DEBUG', 'false'))
 ENVIRONMENT = os.environ.get('ENGRAM_ENVIRONMENT', 'dev')
 ALLOWED_HOSTS = csv(os.environ.get('ENGRAM_ALLOWED_HOSTS', 'localhost,127.0.0.1,0.0.0.0'), default=('localhost',))
@@ -72,6 +73,7 @@ INSTALLED_APPS = [
     'engram.memory',
     'engram.context',
     'engram.inspection',
+    'engram.model_policy',
     'engram.health',
 ]
 

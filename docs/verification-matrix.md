@@ -909,3 +909,53 @@ separate `python manage.py celery_outbox_relay` service.
 | whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
 | Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included worker-created retrieval document, future context injection, Compose golden path passed, and stopped Compose services. |
 | focused security review | Independent read-only review plus command evidence recorded in `docs/security/reviews/2026-06-25-celery-sla-compose-topology.md` | none | yes | pass | Reviewer reported no Critical, Important, or Minor findings. Verified queue coverage, separate relay, unchanged broker/result configuration, no public-doc private reference leakage, and sufficient Compose/E2E evidence. |
+
+## 2026-06-25: Model Policy Secrets Foundation
+
+Branch: `feat/model-policy-secrets`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/model_policy/__init__.py`
+- `apps/backend/engram/model_policy/apps.py`
+- `apps/backend/engram/model_policy/models.py`
+- `apps/backend/engram/model_policy/migrations/0001_initial.py`
+- `apps/backend/engram/model_policy/serializers.py`
+- `apps/backend/engram/model_policy/services.py`
+- `apps/backend/engram/model_policy/views.py`
+- `apps/backend/engram/model_policy/urls.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/settings/settings.py`
+- `apps/backend/settings/urls.py`
+- `apps/backend/pyproject.toml`
+- `apps/backend/poetry.lock`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/security/reviews/2026-06-25-model-policy-secrets.md`
+- `docs/superpowers/specs/2026-06-25-model-policy-secrets-design.md`
+- `docs/superpowers/plans/2026-06-25-model-policy-secrets.md`
+
+This checkpoint adds the first backend provider secret and model policy
+foundation. It supports organization/team provider secret references, encrypted
+database envelopes, project/team/organization model policy resolution, fake
+provider adapter selection, and provider call audit records. It does not add
+real provider network calls, semantic retrieval, frontend/admin UI, MCP tools,
+or AI workflow jobs.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| initial RED focused test | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | fixed | Exit 2 before implementation. Failure: `ModuleNotFoundError: No module named 'engram.model_policy.models'`. |
+| cross-team secret RED regression | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py::test_provider_secret_detail_and_rotation_hide_other_team_secret -v` | Backend | yes | fixed | Exit 1 after initial implementation. Detail returned `200` for another team's provider secret; scoped secret filtering now returns 404 and rotate returns `secret_scope_denied`. |
+| team-bound project policy RED regression | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py::test_model_policy_resolution_prefers_project_then_team_then_organization_and_rejects_cross_scope -v` | Backend | yes | fixed | Exit 1 after initial resolver. Another team received a project policy bound to the first team's secret; resolver now skips team-bound project policies for other teams. |
+| focused model-policy tests | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | pass | Exit 0. Reported 7 passed. |
+| focused model-policy lint/format | `cd apps/backend && poetry run ruff check engram/model_policy && poetry run ruff format --check engram/model_policy` | Backend | yes | pass | Exit 0. All checks passed; 10 files already formatted. |
+| adjacent access/context/memory/inspection tests | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py engram/access/access_scope_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py engram/inspection/inspection_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 57 passed. |
+| migration drift | `cd apps/backend && DJANGO_SETTINGS_MODULE=settings.test_settings poetry run python manage.py makemigrations --check --dry-run` | Backend | yes | pass | Exit 0. Reported no changes detected. |
+| repository runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 15 tests OK. |
+| poetry lock check | `cd apps/backend && poetry check --lock` | Backend | yes | pass | Exit 0. Reported all set. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| independent security review | Independent read-only security review plus fix verification recorded in `docs/security/reviews/2026-06-25-model-policy-secrets.md` | none | yes | pass | Initial `CHANGES_REQUIRED`; fix verification `PASS`. Resolved org-secret mutation by team-scoped `secrets:*`, disabled-secret resolver candidates, and production encryption-key fail-closed behavior. |
+| Karpathy simplicity/scope re-review | Independent read-only Karpathy-style review agent | none | yes | pass | Initial `CHANGES_REQUIRED`; code findings resolved. Schema placeholder surface accepted as non-blocking for this checkpoint. |
+| final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. No pending migrations, system check clean, 166 passed, Ruff clean, 111 files already formatted. |
