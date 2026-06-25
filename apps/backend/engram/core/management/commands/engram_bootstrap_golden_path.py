@@ -18,8 +18,11 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import Organization, Project, ProjectTeam, Team
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import SECRET_KEY_VERSION, encrypt_secret, secret_fingerprint, secret_hmac
 
 GOLDEN_PATH_CAPABILITIES = ('memories:read', 'observations:write')
+GOLDEN_PATH_PROVIDER_SECRET = 'sk-engram_golden_path_local_provider_secret_1234567890'
 
 
 class Command(BaseCommand):
@@ -107,6 +110,47 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
         for capability in Capability.objects.filter(code__in=GOLDEN_PATH_CAPABILITIES):
             ApiKeyCapability.objects.get_or_create(api_key=api_key, capability=capability)
 
+        provider_secret, _created = ProviderSecret.objects.update_or_create(
+            organization=organization,
+            team=team,
+            name='Golden path OpenAI',
+            provider='openai',
+            scope='team',
+            defaults={
+                'current_version': 1,
+                'active': True,
+                'rotation_state': 'active',
+                'secret_fingerprint': secret_fingerprint(GOLDEN_PATH_PROVIDER_SECRET),
+            },
+        )
+        ProviderSecretEnvelope.objects.get_or_create(
+            organization=organization,
+            team=team,
+            secret=provider_secret,
+            version=1,
+            defaults={
+                'key_version': SECRET_KEY_VERSION,
+                'ciphertext': encrypt_secret(GOLDEN_PATH_PROVIDER_SECRET),
+                'hmac_digest': secret_hmac(GOLDEN_PATH_PROVIDER_SECRET),
+                'active': True,
+            },
+        )
+        generation_policy, _created = ModelPolicy.objects.update_or_create(
+            organization=organization,
+            team=team,
+            project=project,
+            task_type='generation',
+            scope='project',
+            defaults={
+                'name': 'Golden path generation',
+                'provider': 'openai',
+                'model': 'gpt-4.1-mini',
+                'secret': provider_secret,
+                'version': 1,
+                'active': True,
+            },
+        )
+
         return {
             'organization_id': str(organization.id),
             'team_id': str(team.id),
@@ -115,4 +159,6 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
             'api_key_id': str(api_key.id),
             'api_key_fingerprint': api_key.key_fingerprint,
             'capabilities': list(GOLDEN_PATH_CAPABILITIES),
+            'provider_secret_id': str(provider_secret.id),
+            'generation_policy_id': str(generation_policy.id),
         }

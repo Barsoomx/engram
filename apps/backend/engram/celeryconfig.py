@@ -8,6 +8,8 @@ from django.db.models import Model
 from kombu import Exchange, Queue
 from kombu.utils.json import register_type
 
+from engram.core.redis_sentinel import REDIS_PASS, REDIS_RETRY_KWARGS, REDIS_SENTINELS, REDIS_USE_SENTINEL
+
 HEARTBEAT_FILE = Path('/tmp/engram_celery_worker_heartbeat')  # noqa: S108
 READINESS_FILE = Path('/tmp/engram_celery_ready')  # noqa: S108
 
@@ -28,9 +30,24 @@ CELERY_BROKER_CONNECTION_STRING = '{schema}://{user}:{password}@{host}:{port}/{v
 
 broker_url = os.environ.get('ENGRAM_CELERY_BROKER_URL', CELERY_BROKER_CONNECTION_STRING)
 broker_pool_limit = 10
-result_backend = os.environ.get(
-    'ENGRAM_CELERY_RESULT_BACKEND', os.environ.get('ENGRAM_REDIS_URL', 'redis://redis:6379/1')
-)
+CELERY_RESULT_BACKEND_DB = int(os.getenv('ENGRAM_CELERY_RESULT_BACKEND_DB', '1'))
+
+if REDIS_USE_SENTINEL and 'ENGRAM_CELERY_RESULT_BACKEND' not in os.environ:
+    result_backend = ';'.join(
+        f'sentinel://:{REDIS_PASS}@{host}:{port}/{CELERY_RESULT_BACKEND_DB}' for host, port in REDIS_SENTINELS
+    )
+    result_backend_transport_options = {
+        'master_name': 'mymaster',
+        'sentinel_kwargs': {
+            'password': REDIS_PASS,
+            **REDIS_RETRY_KWARGS,
+        },
+    }
+else:
+    result_backend = os.environ.get(
+        'ENGRAM_CELERY_RESULT_BACKEND',
+        os.environ.get('ENGRAM_REDIS_URL', 'redis://redis:6379/1'),
+    )
 result_expires = 3600
 
 QUEUE_REALTIME = 'engram-realtime'

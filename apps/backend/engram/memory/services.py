@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -22,8 +21,15 @@ from engram.core.models import (
     RetrievalDocument,
     VisibilityScope,
 )
-
-TOKEN_RE = re.compile(r'(?i)(sk-[a-z0-9][a-z0-9_-]{8,}|egk_[a-z0-9][a-z0-9_-]{8,}|bearer\s+[a-z0-9._~+/=-]{12,})')
+from engram.core.redaction import redact_value as core_redact_value
+from engram.model_policy.services import (
+    FakeProviderGateway,
+    ModelPolicyError,
+    ProviderCallInput,
+    ProviderSecretError,
+    ResolveModelPolicy,
+    ResolveModelPolicyInput,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,13 @@ class MemoryCandidateWorkerResult:
 
 class MemoryWorkerError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class GeneratedMemoryCandidate:
+    title: str
+    body: str
+    evidence: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -203,7 +216,8 @@ class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
-            candidate, candidate_created = self._get_or_create_candidate(observation)
+            generated = self._generate_candidate(observation)
+            candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             promotion = PromoteMemoryCandidate().execute(
                 PromoteMemoryCandidateInput(candidate_id=candidate.id),
             )
@@ -229,24 +243,85 @@ class ProcessObservationRecorded:
     def _get_or_create_candidate(
         self,
         observation: Observation,
+        generated: GeneratedMemoryCandidate,
     ) -> tuple[MemoryCandidate, bool]:
         candidate_hash = memory_candidate_content_hash(observation)
-
-        return MemoryCandidate.objects.get_or_create(
+        candidate = MemoryCandidate.objects.filter(
             organization=observation.organization,
             project=observation.project,
             content_hash=candidate_hash,
-            defaults={
-                'team': observation.team,
-                'source_observation': observation,
-                'title': candidate_title(observation),
-                'body': candidate_body(observation),
-                'status': CandidateStatus.PROPOSED,
-                'visibility_scope': VisibilityScope.PROJECT,
-                'evidence': candidate_evidence(observation),
-                'confidence': Decimal('0.500'),
-            },
+        ).first()
+        if candidate is not None:
+            if not self._has_provider_provenance(candidate):
+                candidate.title = generated.title
+                candidate.body = generated.body
+                candidate.evidence = generated.evidence
+                candidate.save(update_fields=['title', 'body', 'evidence', 'updated_at'])
+
+            return candidate, False
+
+        candidate = MemoryCandidate.objects.create(
+            organization=observation.organization,
+            project=observation.project,
+            team=observation.team,
+            source_observation=observation,
+            title=generated.title,
+            body=generated.body,
+            status=CandidateStatus.PROPOSED,
+            visibility_scope=VisibilityScope.PROJECT,
+            evidence=generated.evidence,
+            content_hash=candidate_hash,
+            confidence=Decimal('0.500'),
         )
+
+        return candidate, True
+
+    def _generate_candidate(self, observation: Observation) -> GeneratedMemoryCandidate:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=observation.organization_id,
+                    project_id=observation.project_id,
+                    team_id=observation.team_id,
+                    task_type='generation',
+                ),
+            )
+            provider_result = FakeProviderGateway().call(
+                ProviderCallInput(
+                    organization_id=observation.organization_id,
+                    project_id=observation.project_id,
+                    team_id=observation.team_id,
+                    policy=resolved.policy,
+                    request_id=f'memory-worker:{observation.id}:generation',
+                    trace_id=f'memory-worker:{observation.id}',
+                    prompt=provider_prompt(observation),
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError) as error:
+            raise MemoryWorkerError(redact_error(str(error))) from error
+
+        provenance = {
+            'provider_call_id': str(provider_result.call_record_id),
+            'provider': provider_result.provider,
+            'model': provider_result.model,
+            'policy_id': str(resolved.policy.id),
+            'policy_version': resolved.policy.version,
+            'task_type': resolved.policy.task_type,
+            'redaction_state': provider_result.redaction_state,
+        }
+
+        return GeneratedMemoryCandidate(
+            title=provider_result.generated_title,
+            body=provider_result.generated_body,
+            evidence=candidate_evidence(observation, provider_result.generated_title, provenance),
+        )
+
+    def _has_provider_provenance(self, candidate: MemoryCandidate) -> bool:
+        if not candidate.evidence:
+            return False
+        evidence = candidate.evidence[0]
+
+        return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
 
 
 def memory_candidate_content_hash(observation: Observation) -> str:
@@ -267,32 +342,45 @@ def candidate_body(observation: Observation) -> str:
     return redact_text(observation.title)
 
 
-def candidate_evidence(observation: Observation) -> list[dict[str, object]]:
+def candidate_evidence(
+    observation: Observation,
+    title: str | None = None,
+    provenance: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    evidence = {
+        'observation_id': str(observation.id),
+        'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
+        'event_type': observation.source_metadata.get('event_type', observation.observation_type),
+        'title': redact_text(title or observation.title),
+        'files_read': redact_value(observation.files_read),
+        'files_modified': redact_value(observation.files_modified),
+    }
+    if provenance:
+        evidence.update(redact_value(provenance))
+
     return [
-        {
-            'observation_id': str(observation.id),
-            'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
-            'event_type': observation.source_metadata.get('event_type', observation.observation_type),
-            'title': redact_text(observation.title),
-            'files_read': redact_value(observation.files_read),
-            'files_modified': redact_value(observation.files_modified),
-        },
+        evidence,
     ]
 
 
-def redact_value(value: object) -> object:
-    if isinstance(value, dict):
-        return {key: redact_value(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [redact_value(item) for item in value]
-    if isinstance(value, str):
-        return redact_text(value)
+def provider_prompt(observation: Observation) -> str:
+    return '\n'.join(
+        [
+            f'Title: {redact_text(observation.title)}',
+            f'Body: {redact_text(observation.body)}',
+            f'Files read: {redact_value(observation.files_read)}',
+            f'Files modified: {redact_value(observation.files_modified)}',
+            f'Source metadata: {redact_value(observation.source_metadata)}',
+        ],
+    )
 
-    return value
+
+def redact_value(value: object) -> object:
+    return core_redact_value(value).value
 
 
 def redact_text(value: str) -> str:
-    return TOKEN_RE.sub('[REDACTED]', value)
+    return str(redact_value(value))
 
 
 def redact_error(message: str) -> str:
@@ -373,11 +461,35 @@ class PromoteMemoryCandidate:
         return document
 
     def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
-        return {
+        metadata = {
             'source': 'memory_candidate',
             'memory_candidate_id': str(candidate.id),
             'evidence': candidate.evidence,
             'file_paths': self._candidate_file_paths(candidate),
+        }
+        metadata.update(self._provider_provenance(candidate))
+
+        return metadata
+
+    def _provider_provenance(self, candidate: MemoryCandidate) -> dict[str, object]:
+        if not candidate.evidence:
+            return {}
+        evidence = candidate.evidence[0]
+        if not isinstance(evidence, dict) or 'provider_call_id' not in evidence:
+            return {}
+
+        return {
+            key: evidence[key]
+            for key in (
+                'provider_call_id',
+                'provider',
+                'model',
+                'policy_id',
+                'policy_version',
+                'task_type',
+                'redaction_state',
+            )
+            if key in evidence
         }
 
     def _candidate_file_paths(self, candidate: MemoryCandidate) -> list[str]:

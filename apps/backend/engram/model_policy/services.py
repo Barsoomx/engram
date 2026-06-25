@@ -120,6 +120,9 @@ class ProviderCallResult:
     provider: str
     model: str
     call_record_id: uuid.UUID
+    redaction_state: str
+    generated_title: str
+    generated_body: str
 
 
 def encryption_key() -> bytes:
@@ -411,7 +414,32 @@ class FakeProviderGateway:
         if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
             raise ProviderSecretError('provider secret has no active envelope')
 
+        existing_record = (
+            ProviderCallRecord.objects.filter(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                task_type=policy.task_type,
+                request_id=data.request_id,
+            )
+            .order_by('created_at')
+            .first()
+        )
+        if existing_record is not None:
+            redacted_prompt = redact_value(data.prompt)
+            generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+
+            return ProviderCallResult(
+                provider=existing_record.provider,
+                model=existing_record.model,
+                call_record_id=existing_record.id,
+                redaction_state=existing_record.redaction_state,
+                generated_title=generated_title,
+                generated_body=generated_body,
+            )
+
         redacted_prompt = redact_value(data.prompt)
+        generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+        prompt_was_redacted = redacted_prompt.redacted or '[REDACTED]' in data.prompt
         token_count = len(data.prompt.split())
         record = ProviderCallRecord.objects.create(
             organization_id=data.organization_id,
@@ -425,7 +453,7 @@ class FakeProviderGateway:
             policy_version=policy.version,
             request_id=data.request_id,
             trace_id=data.trace_id,
-            redaction_state='redacted' if redacted_prompt.redacted else 'clean',
+            redaction_state='redacted' if prompt_was_redacted else 'clean',
             token_usage={'input_tokens': token_count, 'output_tokens': 0},
             latency_ms=0,
             cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
@@ -433,4 +461,17 @@ class FakeProviderGateway:
             metadata={'prompt_retained': False},
         )
 
-        return ProviderCallResult(provider=policy.provider, model=policy.model, call_record_id=record.id)
+        return ProviderCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state=record.redaction_state,
+            generated_title=generated_title,
+            generated_body=generated_body,
+        )
+
+
+def generated_candidate_content(prompt: str) -> tuple[str, str]:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+
+    return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'

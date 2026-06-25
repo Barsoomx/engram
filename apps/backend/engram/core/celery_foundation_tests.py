@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 from collections.abc import Callable
 from unittest.mock import Mock, patch
 
@@ -10,6 +11,7 @@ from django_celery_outbox.app import OutboxCelery
 from engram import celeryconfig
 from engram.celery_app import app as celery_app
 from engram.celery_bootsteps import LivenessProbe
+from engram.core import redis_sentinel
 from engram.core.domain.event_dispatcher import QUEUE_DOMAIN_EVENTS, CeleryEventDispatcher
 from engram.core.domain.events import DomainEvent
 from engram.core.redis_sentinel import REDIS_DB_CACHE, DynamicRedisConnectionFactory
@@ -53,6 +55,43 @@ def test_celeryconfig_uses_confirm_publish_and_quorum_delivery() -> None:
     assert celeryconfig.broker_connection_retry_on_startup is False
     assert celeryconfig.broker_connection_retry is False
     assert celeryconfig.worker_soft_shutdown_timeout == 60
+
+
+def test_celeryconfig_uses_sentinel_result_backend_when_enabled() -> None:
+    env = {
+        'REDIS_USE_SENTINEL': '1',
+        'REDIS_SENTINEL_NODE': 'redis-a:26379,redis-b:26379',
+        'REDIS_PASS': 'secret',
+        'ENGRAM_CELERY_RESULT_BACKEND_DB': '5',
+    }
+    tracked_env = set(env) | {'ENGRAM_CELERY_RESULT_BACKEND', 'ENGRAM_REDIS_URL'}
+    original_env = {key: os.environ.get(key) for key in tracked_env}
+
+    try:
+        os.environ.update(env)
+        os.environ.pop('ENGRAM_CELERY_RESULT_BACKEND', None)
+        os.environ.pop('ENGRAM_REDIS_URL', None)
+        reloaded_redis_sentinel = importlib.reload(redis_sentinel)
+        reloaded_celeryconfig = importlib.reload(celeryconfig)
+
+        assert reloaded_celeryconfig.CELERY_RESULT_BACKEND_DB == 5
+        assert reloaded_celeryconfig.result_backend == (
+            'sentinel://:secret@redis-a:26379/5;sentinel://:secret@redis-b:26379/5'
+        )
+        assert reloaded_celeryconfig.result_backend_transport_options['master_name'] == 'mymaster'
+        assert reloaded_celeryconfig.result_backend_transport_options['sentinel_kwargs']['password'] == 'secret'
+        assert (
+            reloaded_celeryconfig.result_backend_transport_options['sentinel_kwargs']['retry']
+            is reloaded_redis_sentinel.REDIS_RETRY_KWARGS['retry']
+        )
+    finally:
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        importlib.reload(redis_sentinel)
+        importlib.reload(celeryconfig)
 
 
 def test_celeryconfig_uses_json_and_eager_result_contract() -> None:

@@ -959,3 +959,46 @@ or AI workflow jobs.
 | independent security review | Independent read-only security review plus fix verification recorded in `docs/security/reviews/2026-06-25-model-policy-secrets.md` | none | yes | pass | Initial `CHANGES_REQUIRED`; fix verification `PASS`. Resolved org-secret mutation by team-scoped `secrets:*`, disabled-secret resolver candidates, and production encryption-key fail-closed behavior. |
 | Karpathy simplicity/scope re-review | Independent read-only Karpathy-style review agent | none | yes | pass | Initial `CHANGES_REQUIRED`; code findings resolved. Schema placeholder surface accepted as non-blocking for this checkpoint. |
 | final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. No pending migrations, system check clean, 166 passed, Ruff clean, 111 files already formatted. |
+
+## 2026-06-26: Provider Memory Worker
+
+Branch: `feat/provider-memory-worker`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/memory/services.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `apps/backend/engram/model_policy/services.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py`
+- `apps/backend/engram/core/golden_path_tests.py`
+- `apps/backend/engram/celeryconfig.py`
+- `apps/backend/engram/core/celery_foundation_tests.py`
+- `scripts/e2e_golden_path.py`
+- `docs/security/reviews/2026-06-26-provider-memory-worker.md`
+- `docs/superpowers/specs/2026-06-26-provider-memory-worker-design.md`
+- `docs/superpowers/plans/2026-06-26-provider-memory-worker.md`
+- `docs/verification-matrix.md`
+
+This checkpoint makes the memory worker use model-policy-resolved provider
+generation before creating memory candidates. It keeps exact retrieval,
+semantic retrieval, embeddings, frontend/admin UI, MCP tools, and digest
+scheduling out of scope. It also applies the reference-backend Celery Redis Sentinel
+result-backend pattern while preserving Engram SLA queues, confirm-publish, and
+the package outbox transport.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD RED focused tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py engram/model_policy/model_policy_tests.py -v` | Backend | yes | fixed | Initial RED exited 1 with 5 failures for missing provider call/provenance and missing policy fallback. Fix RED exited 1 with 3 failures for xoxb redaction and existing-candidate policy bypass. Karpathy-fix RED exited 1 with 4 failures for local candidate text, missing generated fields, and missing existing-candidate provenance update. |
+| focused memory/model-policy/Celery/golden-path tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py engram/model_policy/model_policy_tests.py engram/core/golden_path_tests.py engram/core/celery_foundation_tests.py -v` | Backend | yes | pass | Exit 0. Reported 41 passed. |
+| full backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Reported 172 passed. |
+| focused lint/format | `cd apps/backend && poetry run ruff check engram/celeryconfig.py engram/core/celery_foundation_tests.py engram/memory/services.py engram/memory/memory_worker_tests.py engram/model_policy/services.py engram/model_policy/model_policy_tests.py engram/core/management/commands/engram_bootstrap_golden_path.py engram/core/golden_path_tests.py && poetry run ruff format --check engram/celeryconfig.py engram/core/celery_foundation_tests.py engram/memory/services.py engram/memory/memory_worker_tests.py engram/model_policy/services.py engram/model_policy/model_policy_tests.py engram/core/management/commands/engram_bootstrap_golden_path.py engram/core/golden_path_tests.py` | Backend | yes | pass | Exit 0. All checks passed; 8 files already formatted. |
+| adjacent hook/context/memory feedback/Celery tests | `cd apps/backend && poetry run pytest engram/hooks/hook_ingest_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py engram/core/celery_foundation_tests.py engram/core/golden_path_tests.py -v` | Backend | yes | pass | Exit 0. Reported 63 passed before the Karpathy fix; covered adjacent queue/context/feedback/Celery behavior. |
+| migration drift | `cd apps/backend && DJANGO_SETTINGS_MODULE=settings.test_settings poetry run python manage.py makemigrations --check --dry-run` | Backend | yes | pass | Exit 0. Reported no changes detected. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0. Repository unittest suite reported 31 tests OK; layout and quality scripts exited with no output. |
+| Compose golden path E2E | `python3 scripts/e2e_golden_path.py` | Backend | yes | fixed | Exit 1 after provider-generated titles landed because the E2E still searched by the old observation title. Updated the script to find memory by source raw event and assert provider-generated title/body; rerun exited 0. |
+| independent security review | Independent read-only security review and re-review recorded in `docs/security/reviews/2026-06-26-provider-memory-worker.md` | none | yes | pass | Initial review PASS; re-review after generated provider output PASS. Residual non-blocking hardening note: add DB uniqueness before real provider network side effects. |
+| Karpathy simplicity/scope review | Independent read-only Karpathy-style review agent plus re-review | none | yes | pass | Initial `CHANGES_REQUIRED`; fixed provider-generated title/body consumption and existing-candidate provenance update. Re-review `PASS_CODE`. |
+| final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Applied migrations, system check clean, 172 passed, Ruff clean, 111 files already formatted. |

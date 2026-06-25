@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.test import override_settings
@@ -21,6 +23,18 @@ from engram.model_policy.services import (
 
 POLICY_RAW_KEY = 'egk_test_model_policy_admin_0123456789abcdefghijklmnopqrstuvwxyz'
 RAW_PROVIDER_SECRET = 'sk-test_model_policy_secret_1234567890abcdef'
+
+
+def expected_generated_title(prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+
+    return f'Provider-generated memory {digest}'
+
+
+def expected_generated_body(prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+
+    return f'Provider-generated candidate body {digest}'
 
 
 def create_policy_admin_key(project_team_scope: tuple[object, Team, object, object, object]) -> None:
@@ -544,3 +558,108 @@ def test_fake_provider_gateway_records_redacted_provider_call_without_raw_secret
     assert record.redaction_state == 'redacted'
     assert record.token_usage == {'input_tokens': 4, 'output_tokens': 0}
     assert RAW_PROVIDER_SECRET not in str(record.__dict__)
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_reuses_provider_call_for_stable_request_id() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Generation policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='memory-worker:observation-1:generation',
+        trace_id='trace-provider-call-duplicate-1',
+        prompt='generate memory',
+    )
+
+    first = FakeProviderGateway().call(data)
+    second = FakeProviderGateway().call(data)
+
+    assert second.call_record_id == first.call_record_id
+    assert ProviderCallRecord.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_returns_deterministic_generated_candidate_content() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Generation policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    prompt = 'Title: pytest failure fixed\nBody: pytest failed on missing memory worker and now exits 0'
+
+    result = FakeProviderGateway().call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+            policy=policy,
+            request_id='memory-worker:observation-2:generation',
+            trace_id='trace-provider-call-generation-1',
+            prompt=prompt,
+        ),
+    )
+
+    assert result.generated_title == expected_generated_title(prompt)
+    assert result.generated_body == expected_generated_body(prompt)
+    assert 'pytest failure fixed' not in result.generated_title
+    assert 'pytest failed on missing memory worker' not in result.generated_body
