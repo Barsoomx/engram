@@ -2,21 +2,18 @@
 
 ## Vision
 
-`claudex-teams` is the enterprise memory layer for teams using Claude Code and
-Codex. It gives agents shared, scoped, auditable memory without asking each
-developer laptop or WSL instance to run a local worker. Companies can run it in
-their own infrastructure, connect agent hooks, and let teams share useful
-observations while keeping access boundaries clear.
+The product vision is defined by [North Star](north-star.md). This document
+turns that vision into product requirements for the first server-side rewrite.
 
-The product should feel closer to Sentry than to a large cloud IAM suite:
-organizations, teams, projects, users, API keys, clear scopes, useful defaults,
-and enough policy control to be safe without forcing every company to design a
-governance framework before first use.
+Engram is the memory layer between codebases and AI development agents.
+V1 should make daily agent work faster by reducing repeated project re-learning,
+not by becoming a broad knowledge-base platform.
 
 ## Primary Users
 
 - Developer: wants agent sessions to remember project decisions, incident
   lessons, local conventions, and review outcomes without manual copy-paste.
+- Agent: needs a compact, task-relevant context bundle before changing code.
 - Team lead: wants a daily AI-generated summary of what changed, what is
   blocked, and what memory changed, without manually reviewing raw observations.
 - Platform admin: wants on-premise deployment, provider key control, RBAC, audit
@@ -33,11 +30,12 @@ governance framework before first use.
 
 1. Capture observations from agent lifecycle hooks.
 2. Generate durable memories from observations.
-3. Retrieve relevant memory at session start, before tool use, after important
-   tool use, and on explicit search.
+3. Assemble compact context bundles at session start, before tool use, after
+   important tool use, and on explicit agent request.
 4. Update memory when the agent discovers a changed fact, a resolved issue, or a
    new project convention.
-5. Enforce tenant/team/project access before any memory is retrieved or written.
+5. Enforce tenant/team/project access before any memory is read, written, or
+   packed into context.
 6. Keep model provider secrets server-side and scoped to the owning organization
    or team.
 7. Give admins a clear operational surface for access, configuration, review,
@@ -65,7 +63,7 @@ Required hook responsibilities:
 - Stop/session end: summarize unresolved findings, create candidate memories,
   mark stale context, and schedule background distillation.
 - Explicit tools: expose memory search, observation lookup, memory update, and
-  memory feedback as agent-callable commands.
+  context feedback as agent-callable commands.
 
 Policy enforcement is a mode that uses the same hook surfaces. Memory hooks must
 not pretend to be the only security boundary; server authorization, audit, and
@@ -82,7 +80,8 @@ policy decisions remain authoritative.
   conflicted, archived, escalated.
 - Memory visibility: private user memory, team memory, project memory,
   organization memory, shared packs, and policy packs.
-- Exact and semantic retrieval with permission filtering before response.
+- Exact and semantic retrieval with permission filtering before context packing.
+- Context bundle generation as the primary agent-facing output.
 - Admin audit trail for reads, writes, retrieval decisions, hook calls, and
   secret usage.
 - Export, retention, legal hold, and delete workflows suitable for enterprise
@@ -95,6 +94,8 @@ policy decisions remain authoritative.
 - Agent-specific business logic duplicated outside the server.
 - Complex cloud-style conditional access language.
 - Vector-only retrieval.
+- Search results as the main product output.
+- Knowledge-base workflows that do not feed agent context.
 - Multi-region active-active control plane.
 - Manual review of every observation or memory proposal.
 
@@ -109,6 +110,8 @@ policy decisions remain authoritative.
 - A single-team developer cannot read another team's memory unless a shared
   project, memory pack, or explicit grant allows it.
 - Every injected memory has provenance, scope, and audit evidence.
+- Every context bundle is explainable: why each memory was included, which scope
+  allowed it, and which source supports it.
 - Operators can deploy the stack on-premise with PostgreSQL and a queue, then
   scale retrieval and distillation independently.
 - The first implementation remains small enough to reason about: few domain

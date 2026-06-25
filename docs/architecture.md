@@ -2,9 +2,11 @@
 
 ## Target Shape
 
-`claudex-teams` is a server-side Python application. Agent hooks are thin
-clients. The server owns identity, authorization, observation ingestion, memory
-generation, search, model routing, secret access, audit, and background work.
+Engram is the engineering memory layer described in [North Star](north-star.md).
+The backend is a server-side Python application. Agent hooks and local tools
+are thin clients. The server owns identity,
+authorization, observation ingestion, memory generation, context assembly, model
+routing, secret access, audit, and background work.
 
 V1 stack:
 
@@ -25,10 +27,11 @@ All local-worker responsibilities move behind authenticated server APIs.
 - Identity: organizations, teams, users, memberships, invitations, sessions.
 - Access: roles, scopes, grants, API keys, service accounts.
 - Projects: repositories, paths, branches, environments, integration metadata.
-- Agent integrations: hook registrations, agent identities, event schemas.
+- Agents: agent identities, runtime families, hook registrations, event schemas.
 - Observations: raw hook events, normalized observations, source references.
 - Memory: candidate memories, approved memories, versions, conflicts, expiry.
-- Retrieval: exact search, semantic search, ranking, context packing.
+- Context: context requests, exact retrieval, semantic retrieval, ranking,
+  context packing, citations.
 - AI workflows: scheduled team digests and autonomous memory curation.
 - Secrets: provider keys, signing keys, webhook secrets, encryption metadata.
 - Model policy: provider/model selection per organization, team, project, task.
@@ -47,7 +50,7 @@ All local-worker responsibilities move behind authenticated server APIs.
 5. Domain events are written to the outbox in the same database transaction.
 6. Background workers distill observations, update indexes, generate team
    digests, curate memory candidates, and mark conflicts or stale memories.
-7. Retrieval APIs filter candidates by authorization before ranking and context
+7. Context APIs filter candidates by authorization before ranking and context
    packing.
 8. Hook response returns compact guidance, citations, and debug metadata.
 
@@ -93,6 +96,10 @@ Vector storage starts as a replaceable adapter. `pgvector` is the simplest
 default for on-premise deployments. Qdrant is a later adapter when customers
 need independent vector scaling or operational separation.
 
+The authoritative data model is LLM-agnostic. Models and agent runtimes are
+metadata on events, memories, and context bundles, not owners of the memory
+schema.
+
 ## API Surface
 
 Public server APIs:
@@ -118,7 +125,8 @@ There should be no hidden local-only API path.
 - Prefer one explicit scope model over separate permission systems per domain.
 - API keys can narrow privileges, never expand them beyond the owning principal.
 - Memory state transitions are finite and visible.
-- Retrieval must be explainable: why this memory, why this scope, why this model.
+- Context assembly must be explainable: why this memory, why this scope, why
+  this source, why this model.
 - Background work is idempotent and retryable.
 - Every cross-domain side effect goes through the outbox.
 

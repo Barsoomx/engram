@@ -82,7 +82,7 @@ them.
 5. Apply resource filters before retrieval, ranking, or response construction.
 6. Log the decision input and result to audit.
 
-Authorization must run before search results are returned and before memory
+Authorization must run before context bundles are assembled and before memory
 content is passed into a model prompt.
 
 ## Write Authorization
