@@ -16,10 +16,11 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import create_approved_memory_document, valid_context_payload
-from engram.core.models import AuditEvent, Organization, Project, ProjectTeam, Team
+from engram.core.models import AuditEvent, Organization, Project, ProjectTeam, Team, VisibilityScope
 
 RAW_KEY = 'egk_test_memory_feedback_0123456789abcdefghijklmnopqrstuvwxyz'
 READ_ONLY_RAW_KEY = 'egk_test_memory_feedback_read_0123456789abcdefghijklmnopqrstuvwxyz'
+PROJECT_RAW_KEY = 'egk_test_memory_feedback_project_0123456789abcdefghijklmnopqrstuvwxyz'
 
 
 def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKey]:
@@ -165,7 +166,7 @@ def test_memory_feedback_refuted_removes_memory_from_future_context() -> None:
 @pytest.mark.django_db
 def test_memory_feedback_requires_memories_review_capability() -> None:
     organization, team, project, owner, _api_key = create_project_scope()
-    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    memory, _version, document = create_approved_memory_document(organization, team, project)
     create_scoped_api_key(
         organization,
         team,
@@ -184,11 +185,54 @@ def test_memory_feedback_requires_memories_review_capability() -> None:
     )
 
     memory.refresh_from_db()
+    document.refresh_from_db()
     assert response.status_code == 403
     assert response.json()['code'] == 'missing_capability'
     assert memory.stale is False
     assert memory.refuted is False
+    assert document.stale is False
+    assert document.refuted is False
     assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+
+
+@pytest.mark.django_db
+def test_project_bound_reviewer_can_mark_project_visible_memory_with_team() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    memory, _version, document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    create_scoped_api_key(
+        organization,
+        None,
+        project,
+        owner,
+        raw_key=PROJECT_RAW_KEY,
+        capabilities=('memories:review',),
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(
+            project,
+            team,
+            team_id=None,
+            request_id='request-memory-feedback-project-visible-team',
+        ),
+        format='json',
+        **auth_headers(PROJECT_RAW_KEY),
+    )
+
+    memory.refresh_from_db()
+    document.refresh_from_db()
+    assert response.status_code == 200
+    assert memory.stale is True
+    assert memory.refuted is False
+    assert document.stale is True
+    assert document.refuted is False
 
 
 @pytest.mark.django_db

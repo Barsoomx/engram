@@ -147,7 +147,11 @@ class RecordMemoryFeedback:
         return memory
 
     def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
-        if memory.team_id is not None and memory.team_id not in scope.team_ids:
+        if (
+            memory.visibility_scope == VisibilityScope.TEAM
+            and memory.team_id is not None
+            and memory.team_id not in scope.team_ids
+        ):
             raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
 
     def _already_applied(self, memory: Memory, action: str) -> bool:
