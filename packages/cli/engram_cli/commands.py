@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from argparse import Namespace
@@ -18,7 +19,7 @@ from engram_cli.config import (
     write_json,
     write_secret_json,
 )
-from engram_cli.http import Transport, get_health, post_dry_run, urllib_transport
+from engram_cli.http import Transport, get_health, post_dry_run, post_json, urllib_transport
 
 
 class CliError(Exception):
@@ -43,6 +44,7 @@ ERROR_REMEDIATION: dict[str, str] = {
     'expired_key': 'Rotate the API key and run `engram connect` again.',
     'missing_capability': 'Use a key with observations:write for hook dry-run.',
     'project_scope_denied': 'Use a key scoped to the requested project.',
+    'team_scope_denied': 'Use a key scoped to the requested team.',
 }
 
 
@@ -188,6 +190,51 @@ def run_disconnect(args: Namespace, stdout: TextIO, _stderr: TextIO) -> int:
     return 0
 
 
+def run_hook(
+    args: Namespace,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        paths = local_paths(args.config_dir)
+        config = load_required_json(paths.config, 'missing_config', 'Engram config is missing')
+        credentials = load_required_json(paths.credentials, 'missing_credential', 'Engram credential is missing')
+        api_key = as_string(credentials.get('api_key'))
+        if not api_key:
+            raise CliError('missing_credential', 'Engram credential is missing', remediation_for('missing_credential'))
+        server_url = normalize_server_url(as_string(config.get('server_url')))
+        runtime = selected_runtime(args.agent, as_string_list(config.get('agent_runtimes')))
+        input_payload = read_stdin_json(stdin)
+        if args.hook_command == 'post-tool-use':
+            path = '/v1/hooks/post-tool-use'
+            request_payload = build_post_tool_use_payload(config, runtime, input_payload)
+        elif args.hook_command == 'session-start':
+            path = '/v1/context/session-start'
+            request_payload = build_session_start_payload(config, runtime, input_payload)
+        else:
+            raise CliError('invalid_response', 'Unsupported hook command', remediation_for('invalid_response'))
+
+        status, body = post_json(
+            transport=transport or urllib_transport,
+            server_url=server_url,
+            path=path,
+            api_key=api_key,
+            payload=request_payload,
+        )
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback='http_error')
+        stdout.write(json.dumps(body, sort_keys=True) + '\n')
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
 def normalize_server_url(value: str | None) -> str:
     server_url = required_value(value, 'missing_server_url', 'Server URL is required').rstrip('/')
     if not server_url:
@@ -220,6 +267,159 @@ def normalize_runtimes(value: str | None) -> tuple[str, ...]:
         return (runtime,)
 
     raise CliError('invalid_response', f'Unsupported agent runtime {runtime}', remediation_for('invalid_response'))
+
+
+def selected_runtime(value: str | None, configured_runtimes: list[str]) -> str:
+    if not configured_runtimes:
+        raise CliError('missing_hook_config', 'No hook manifests are configured', remediation_for('missing_hook_config'))
+    if value is None:
+        return configured_runtimes[0]
+    runtime = normalize_runtimes(value)[0]
+    if runtime not in configured_runtimes:
+        raise CliError('missing_hook_config', f'Hook manifest for {runtime} is missing', remediation_for('missing_hook_config'))
+
+    return runtime
+
+
+def read_stdin_json(stdin: TextIO) -> dict[str, object]:
+    try:
+        payload = json.loads(stdin.read() or '{}')
+    except json.JSONDecodeError as error:
+        raise CliError('invalid_response', f'Hook input must be a JSON object: {error.msg}', remediation_for('invalid_response')) from error
+    if not isinstance(payload, dict):
+        raise CliError('invalid_response', 'Hook input must be a JSON object', remediation_for('invalid_response'))
+
+    return payload
+
+
+def build_post_tool_use_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+) -> dict[str, object]:
+    event_id = payload_string(input_payload, 'event_id') or f'engram-cli-{uuid.uuid4()}'
+    payload = dict_value(input_payload.get('payload'))
+    observation = dict_value(input_payload.get('observation'))
+    request_payload = base_hook_payload(config, runtime, input_payload)
+    request_payload.update(
+        {
+            'session_id': required_payload_string(input_payload, 'session_id'),
+            'event_id': event_id,
+            'idempotency_key': payload_string(input_payload, 'idempotency_key') or event_id,
+            'event_type': 'post_tool_use',
+            'payload_schema_version': payload_string(input_payload, 'payload_schema_version') or 'v1',
+            'content_hash': payload_string(input_payload, 'content_hash')
+            or stable_content_hash({'payload': payload, 'observation': observation, 'event_id': event_id}),
+            'request_id': payload_string(input_payload, 'request_id') or event_id,
+            'payload': payload,
+        },
+    )
+    if observation:
+        request_payload['observation'] = observation
+    copy_optional_strings(
+        request_payload,
+        input_payload,
+        ('agent_external_id', 'correlation_id', 'trace_id', 'repository_url', 'repository_root', 'branch', 'cwd'),
+    )
+
+    return request_payload
+
+
+def build_session_start_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+) -> dict[str, object]:
+    request_payload = base_hook_payload(config, runtime, input_payload)
+    request_payload.update(
+        {
+            'session_id': required_payload_string(input_payload, 'session_id'),
+            'request_id': payload_string(input_payload, 'request_id') or f'engram-cli-{uuid.uuid4()}',
+            'query': payload_string(input_payload, 'query'),
+            'file_paths': list_value(input_payload.get('file_paths')),
+            'symbols': list_value(input_payload.get('symbols')),
+        },
+    )
+    for field in ('limit', 'token_budget'):
+        value = input_payload.get(field)
+        if isinstance(value, int):
+            request_payload[field] = value
+    copy_optional_strings(
+        request_payload,
+        input_payload,
+        ('agent_external_id', 'correlation_id', 'trace_id', 'repository_url', 'repository_root', 'branch', 'cwd'),
+    )
+
+    return request_payload
+
+
+def base_hook_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+) -> dict[str, object]:
+    payload = {
+        'project_id': as_string(config.get('project_id')),
+        'agent_runtime': runtime,
+        'agent_version': as_string(config.get('agent_version')),
+    }
+    team_id = as_string(config.get('team_id'))
+    if team_id:
+        payload['team_id'] = team_id
+    if not payload['project_id']:
+        raise CliError('missing_project', 'Project id is missing from local config', remediation_for('missing_project'))
+    input_team_id = payload_string(input_payload, 'team_id')
+    if input_team_id and input_team_id != team_id:
+        raise CliError('team_scope_denied', 'Hook input team does not match connected team', remediation_for('team_scope_denied'))
+
+    return payload
+
+
+def payload_string(payload: dict[str, object], field: str) -> str:
+    return as_string(payload.get(field)).strip()
+
+
+def required_payload_string(payload: dict[str, object], field: str) -> str:
+    value = payload_string(payload, field)
+    if not value:
+        raise CliError('invalid_response', f'Hook input missing {field}', remediation_for('invalid_response'))
+
+    return value
+
+
+def dict_value(value: object) -> dict[str, object]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+
+    raise CliError('invalid_response', 'Hook payload fields must be JSON objects', remediation_for('invalid_response'))
+
+
+def list_value(value: object) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CliError('invalid_response', 'Hook list fields must be arrays', remediation_for('invalid_response'))
+
+    return [item for item in value if isinstance(item, str)]
+
+
+def copy_optional_strings(
+    target: dict[str, object],
+    source: dict[str, object],
+    fields: tuple[str, ...],
+) -> None:
+    for field in fields:
+        value = payload_string(source, field)
+        if value:
+            target[field] = value
+
+
+def stable_content_hash(payload: dict[str, object]) -> str:
+    data = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+
+    return hashlib.sha256(data.encode()).hexdigest()
 
 
 def require_dry_run_ok(
