@@ -25,17 +25,12 @@ not already have.
 
 ## Roles
 
-Suggested default roles:
+V1 default roles:
 
 - Organization Owner: full organization control.
 - Organization Admin: members, teams, projects, integrations, model policy.
-- Security Admin: secrets, audit, retention, policy packs, incident response.
-- Team Admin: team members, team projects, team model config, team API keys.
-- Project Admin: project memory, integrations, repository bindings.
-- Memory Curator: review, approve, archive, merge, and supersede memories.
 - Developer: read allowed memory, submit observations, suggest updates.
 - Auditor: read audit and configuration, no write access.
-- Service Account: explicit machine-scoped permissions only.
 
 Roles are presets over capabilities. The implementation should store capability
 grants explicitly so customers can add custom roles later without a migration of
@@ -66,13 +61,12 @@ filters are enough for the first enterprise-grade version.
 
 Memory scope types:
 
-- `user_private`: visible only to the user unless explicitly shared.
 - `team`: visible to members of one team.
 - `project`: visible to project participants and configured teams.
-- `repository`: visible to authorized users for a repository binding.
-- `organization`: visible across the tenant according to role.
-- `memory_pack`: curated shared memory attached to teams or projects.
-- `policy_pack`: operational guidance and guardrails attached by admins.
+- `repository`: later refinement for path/repo-specific memory.
+- `organization`: later broad-scope memory requiring human approval.
+- `memory_pack`: later curated shared bundle.
+- `policy_pack`: later policy guidance bundle.
 
 Cross-team collaboration is explicit. A project can include multiple teams, or a
 memory pack can be shared with multiple teams. A developer who belongs only to
@@ -90,3 +84,18 @@ them.
 
 Authorization must run before search results are returned and before memory
 content is passed into a model prompt.
+
+## Write Authorization
+
+Hook writes derive target scope from server-side bindings:
+
+1. Resolve actor from API key or agent token.
+2. Resolve organization, team, project, and repository binding from the key and
+   server configuration.
+3. Treat client-supplied scope fields as hints only; they cannot expand access.
+4. Allow `observations:write` only inside the resolved team/project binding.
+5. Allow `memories:propose` only for candidate memory in the resolved binding.
+6. Require Admin or Owner approval for organization scope, shared packs, policy
+   packs, and high-impact contradictions.
+7. Audit both accepted and denied writes with the resolved scope and checked
+   capability.

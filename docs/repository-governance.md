@@ -21,7 +21,7 @@ The repository default branch should be `master`.
 
 The docs-first phase should keep CI small and honest:
 
-- repository quality: whitespace checks and forbidden internal-brand scan;
+- repository quality: whitespace checks and forbidden sensitive-term scan;
 - CodeQL once the Python/TypeScript source tree stabilizes;
 - Dependabot for GitHub Actions and later Python package manifests.
 
@@ -43,6 +43,24 @@ the old package runtime.
 - Each hook adapter has contract tests against saved payload fixtures.
 - Authorization tests cover organization, team, project, user, service account,
   and API key narrowing.
-- Retrieval tests include exact search, semantic expansion, permission filtering,
-  stale memory, and conflict handling.
+- Retrieval tests include exact search, permission filtering, stale memory, and
+  conflict handling. Semantic expansion tests are required when that adapter is
+  enabled.
 - Secret tests prove redaction and API-key non-exportability.
+
+## Implementation Test Rules
+
+- TDD is required for implementation changes: add the failing test first.
+- Test files use `*_tests.py` for Python implementation.
+- Domain services have service-boundary tests.
+- Hook adapters have fixture-based contract tests per agent/event.
+- RBAC, outbox, and seed-data migrations have migration tests.
+- Transactional/race tests are marked and run separately when they require
+  sequential execution.
+- CI must run Ruff, type checks, and pytest once the Python scaffold exists.
+
+## Sensitive-Term Scan
+
+Repository quality CI owns the forbidden sensitive-term regex. The scan covers
+README, docs, governance files, and workflow definitions. Failures should point
+to the exact file and line and must be reviewed by the repository owner.

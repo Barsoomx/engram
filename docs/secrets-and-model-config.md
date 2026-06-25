@@ -27,10 +27,13 @@ Both modes expose the same domain API:
 
 ## Secret Scope
 
-Secrets can belong to:
+V1 secrets can belong to:
 
 - organization;
 - team;
+
+Later secrets can belong to:
+
 - project;
 - service account.
 
@@ -64,6 +67,21 @@ Sentry project settings:
 Developers should not need to understand provider wiring. They choose a project
 or team context; the server resolves policy.
 
+V1 provider support:
+
+- Anthropic models for teams that want Claude-quality generation.
+- OpenAI models for cost-aware memory generation, digesting, curation, and
+  embeddings.
+- Task-level routing so an organization can use a cheaper OpenAI model for
+  routine observation distillation and reserve a stronger model for
+  contradiction resolution or high-impact summaries.
+- Provider health and cost metadata visible to admins before they choose a
+  default.
+
+The product must support multiple generation backends. Provider selection is an
+organization/team setting, and every generated memory records the provider,
+model, policy version, and cost metadata when available.
+
 ## Safety Requirements
 
 - Secrets are redacted before logs, traces, observations, and audit details.
@@ -77,6 +95,10 @@ or team context; the server resolves policy.
 
 ## Simple First Version
 
-Start with organization and team secrets, plus project-level model overrides.
-Avoid per-file, per-branch, or arbitrary condition expressions until customer
-use proves they are needed.
+Start with organization and team secrets, plus project-level model-policy
+overrides that select existing secrets. Project and service-account owned raw
+secrets are later. Avoid per-file, per-branch, or arbitrary condition
+expressions until customer use proves they are needed.
+
+See [Backend contracts](backend-contracts.md) for vault adapter and envelope
+encryption invariants.

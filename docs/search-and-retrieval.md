@@ -2,8 +2,10 @@
 
 ## Principle
 
-Exact search is the baseline. Semantic search is recall expansion, not the
-source of truth.
+Search must combine exact/grep-style retrieval with semantic retrieval in V1.
+Exact search is the authority for names, paths, symbols, ticket ids, commands,
+and error strings. Semantic search is required for recall across paraphrases and
+related decisions. Neither path is sufficient alone.
 
 Agent memory needs reliable answers to questions like "what did we decide about
 this file?", "where did this error happen?", and "which review found this bug?"
@@ -25,24 +27,33 @@ PostgreSQL should store normalized retrieval documents with:
 - trigram-friendly fields;
 - embedding reference.
 
-Recommended initial stack:
+V1 stack:
 
 - PostgreSQL full-text search;
 - `pg_trgm` for fuzzy exact strings;
-- optional `pgvector` for embeddings;
-- later Qdrant adapter for customers that need separate vector scaling.
+- `pgvector` or equivalent in-PostgreSQL vector storage;
+- embedding generation as a server-side worker job using the organization/team
+  model policy, with OpenAI embeddings supported in V1;
+- hybrid result fusion;
+- deterministic ranking;
+- citations and audit.
+
+Later:
+
+- Qdrant adapter for customers that need separate vector scaling;
+- model reranking.
 
 ## Retrieval Pipeline
 
 1. Parse request intent and context.
 2. Resolve actor and effective scope.
 3. Build permission filters before querying content.
-4. Run exact, full-text, trigram, and vector retrieval in parallel.
-5. Fuse candidates with deterministic ranking.
-6. Optionally rerank through the configured server-side model.
-7. Pack context with citations, confidence, source references, and stale/conflict
+4. Run exact, full-text, trigram, and vector retrieval.
+5. Fuse candidates deterministically, with exact matches allowed to dominate
+   when filenames, symbols, ticket ids, commands, or error strings match.
+6. Pack context with citations, confidence, source references, and stale/conflict
    warnings.
-8. Audit the final injected memory set.
+7. Audit the final injected memory set.
 
 ## Result Types
 
@@ -59,7 +70,7 @@ Recommended initial stack:
 Every response to an agent should be explainable:
 
 - matched exact terms;
-- semantic neighbors used;
+- semantic neighbors used and embedding model/version;
 - scope filters applied;
 - memory versions returned;
 - stale or conflict markers;

@@ -7,6 +7,12 @@ Development:
 - Docker Compose with app, PostgreSQL, Redis-compatible broker, and worker.
 - Local provider secret mode may use encrypted database storage.
 
+V1 production trial:
+
+- Docker Compose on a controlled company host.
+- External PostgreSQL is allowed if the operator owns backups.
+- Helm is not required for V1.
+
 Standard on-premise:
 
 - Kubernetes Helm chart.
@@ -38,6 +44,8 @@ No component should require a developer-machine local memory worker.
 Required telemetry:
 
 - request id and trace id across hooks, API, outbox, workers, and provider calls;
+- span id, actor id, team/project ids, hook event id, idempotency key, outbox
+  event id, worker job id, and provider call id where present;
 - structured logs with tenant-safe redaction;
 - metrics for hook latency, retrieval latency, queue depth, distillation cost,
   provider errors, secret failures, and audit write failures;
@@ -48,7 +56,8 @@ Required telemetry:
 
 Server unavailable:
 
-- hooks return no memory or use bounded retry mode according to admin policy;
+- hooks return no memory or use bounded metadata-only retry mode according to
+  admin policy;
 - agents should keep working without local worker startup.
 
 Secret store unavailable:

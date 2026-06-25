@@ -16,9 +16,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Check whitespace
-        run: git diff --check
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1
+            if git merge-base "origin/${{ github.base_ref }}" HEAD >/dev/null; then
+              git diff --check "origin/${{ github.base_ref }}...HEAD"
+            else
+              git diff-tree --check --no-commit-id --root -r HEAD
+            fi
+          else
+            git diff-tree --check --no-commit-id --root -r HEAD
+          fi
 
       - name: Check forbidden internal brand terms
         run: |
@@ -27,9 +39,15 @@ jobs:
       - name: Check required docs
         run: |
           test -f docs/product-requirements.md
+          test -f docs/v1-scope.md
           test -f docs/architecture.md
+          test -f docs/backend-contracts.md
           test -f docs/rbac-and-scopes.md
           test -f docs/agent-integrations.md
+          test -f docs/client-installation.md
+          test -f docs/mcp-tools.md
+          test -f docs/ai-workflow-loop.md
+          test -f docs/admin-ui-requirements.md
           test -f docs/secrets-and-model-config.md
           test -f docs/search-and-retrieval.md
           test -f docs/operations-and-deployment.md

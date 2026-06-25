@@ -6,13 +6,13 @@
 clients. The server owns identity, authorization, observation ingestion, memory
 generation, search, model routing, secret access, audit, and background work.
 
-Recommended stack:
+V1 stack:
 
-- Python web application with typed service boundaries.
+- Django and Django REST Framework.
 - PostgreSQL as the system of record.
 - Redis-compatible broker for background jobs.
-- Celery or equivalent worker pool for distillation, embeddings, indexing, and
-  retention tasks.
+- Celery worker pools for ingestion follow-up, digest generation, memory
+  curation, indexing, and retention tasks.
 - Durable outbox for domain events and integration fan-out.
 - OpenTelemetry traces, structured logs, metrics, and error reporting.
 - Admin frontend as a dense operational console.
@@ -29,6 +29,7 @@ All local-worker responsibilities move behind authenticated server APIs.
 - Observations: raw hook events, normalized observations, source references.
 - Memory: candidate memories, approved memories, versions, conflicts, expiry.
 - Retrieval: exact search, semantic search, ranking, context packing.
+- AI workflows: scheduled team digests and autonomous memory curation.
 - Secrets: provider keys, signing keys, webhook secrets, encryption metadata.
 - Model policy: provider/model selection per organization, team, project, task.
 - Audit: immutable append-only activity stream.
@@ -44,8 +45,8 @@ All local-worker responsibilities move behind authenticated server APIs.
 4. The domain service validates the event and stores a normalized observation or
    retrieval request.
 5. Domain events are written to the outbox in the same database transaction.
-6. Background workers distill observations, update indexes, generate embeddings,
-   and mark conflicts or stale memories.
+6. Background workers distill observations, update indexes, generate team
+   digests, curate memory candidates, and mark conflicts or stale memories.
 7. Retrieval APIs filter candidates by authorization before ranking and context
    packing.
 8. Hook response returns compact guidance, citations, and debug metadata.
@@ -64,6 +65,9 @@ Core events:
 - `MemoryApproved`
 - `MemorySuperseded`
 - `MemoryConflictDetected`
+- `MemoryRefuted`
+- `TeamDigestGenerated`
+- `MemoryCuratorActionRecorded`
 - `MemoryRetrieved`
 - `SecretUsed`
 - `ModelPolicyResolved`
@@ -99,6 +103,8 @@ Public server APIs:
 - `/v1/memories`
 - `/v1/search`
 - `/v1/context`
+- `/v1/context/session-start`
+- `/v1/hooks/dry-run`
 - `/v1/projects`
 - `/v1/api-keys`
 - `/v1/model-policies`
@@ -115,3 +121,6 @@ There should be no hidden local-only API path.
 - Retrieval must be explainable: why this memory, why this scope, why this model.
 - Background work is idempotent and retryable.
 - Every cross-domain side effect goes through the outbox.
+
+See [Backend contracts](backend-contracts.md) for the domain service, durable
+outbox, RBAC, observability, and vault contracts required by implementation.
