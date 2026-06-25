@@ -223,8 +223,7 @@ Required local commands:
 - `cd apps/backend && poetry run pytest -v`
 - `cd apps/backend && poetry run ruff check .`
 - `cd apps/backend && poetry run ruff format --check .`
-- `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings`
-- `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings`
+- `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"`
 - `cd apps/backend && poetry check --lock`
 - `git diff --check HEAD`
 
@@ -232,6 +231,10 @@ Required CI:
 
 - Backend;
 - Repository Quality.
+
+CI continues to run migration apply and migration freshness through the Backend
+workflow's PostgreSQL service. Local migration verification uses Compose so the
+backend runs against PostgreSQL instead of the host SQLite test default.
 
 ## Boundaries
 

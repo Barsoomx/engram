@@ -17,7 +17,7 @@ class Command(BaseCommand):
         parser.add_argument('source_root')
         parser.add_argument('--organization-id', required=True)
         parser.add_argument('--project-id', required=True)
-        parser.add_argument('--team-id', required=True)
+        parser.add_argument('--team-id')
         parser.add_argument('--source-store-id', required=True)
         parser.add_argument('--dry-run', action='store_true')
         parser.add_argument('--apply', action='store_true')
@@ -31,7 +31,7 @@ class Command(BaseCommand):
                     source_root=Path(str(options['source_root'])),
                     organization_id=self._uuid_option(options, 'organization_id'),
                     project_id=self._uuid_option(options, 'project_id'),
-                    team_id=self._uuid_option(options, 'team_id'),
+                    team_id=self._optional_uuid_option(options, 'team_id'),
                     source_store_id=str(options['source_store_id']),
                     apply=apply_import,
                 ),
@@ -66,3 +66,9 @@ class Command(BaseCommand):
         except ValueError as error:
             option_name = key.replace('_', '-')
             raise CommandError(f'Invalid --{option_name}: {options[key]}') from error
+
+    def _optional_uuid_option(self, options: dict[str, Any], key: str) -> uuid.UUID | None:
+        if not options.get(key):
+            return None
+
+        return self._uuid_option(options, key)

@@ -466,10 +466,13 @@ class ClaudeMemImporter:
         sessions_redacted = False
         for row in session_rows:
             runtime = self._runtime(row.get('platform_source'))
-            agent_external_id = self._agent_external_id(import_input, row, observation_rows)
+            agent_external_id_result = redact_value(self._agent_external_id(import_input, row, observation_rows))
+            agent_external_id = str(agent_external_id_result.value)[:255]
             branch, branch_metadata = self._session_branch(row)
             session_metadata_result = redact_value(self._session_metadata(row, branch_metadata))
-            sessions_redacted = sessions_redacted or session_metadata_result.redacted
+            sessions_redacted = (
+                sessions_redacted or agent_external_id_result.redacted or session_metadata_result.redacted
+            )
             agent, agent_created = Agent.objects.get_or_create(
                 organization=organization,
                 runtime=runtime,
@@ -602,6 +605,7 @@ class ClaudeMemImporter:
             payload_redacted=payload_result.redacted,
             observation_data=observation_result.value,
             observation_redacted=observation_result.redacted,
+            unsupported_source_type='observations',
         )
 
     def _import_summary_memory(
@@ -655,6 +659,7 @@ class ClaudeMemImporter:
             payload_redacted=payload_result.redacted,
             observation_data=observation_result.value,
             observation_redacted=observation_result.redacted,
+            unsupported_source_type='session_summaries',
         )
 
     def _import_memory_record(
@@ -674,8 +679,25 @@ class ClaudeMemImporter:
         payload_redacted: bool,
         observation_data: object,
         observation_redacted: bool,
+        unsupported_source_type: str,
     ) -> dict[str, object]:
-        if session is None or not isinstance(observation_data, dict):
+        if session is None:
+            return self._unsupported_memory_result(
+                redacted=payload_redacted or observation_redacted,
+                source_type=unsupported_source_type,
+                source_id=source_id,
+                reason='missing_source_session',
+            )
+
+        if not isinstance(observation_data, dict):
+            return self._empty_memory_result(payload_redacted or observation_redacted)
+
+        if ObservationSource.objects.filter(
+            organization=organization,
+            project=project,
+            source_type='claude_mem',
+            source_id=source_id,
+        ).exists():
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
         raw_event, raw_created = self._get_or_create_raw_event(
@@ -752,6 +774,25 @@ class ClaudeMemImporter:
             'version_created': False,
             'retrieval_document_created': False,
         }
+
+    def _unsupported_memory_result(
+        self,
+        redacted: bool,
+        source_type: str,
+        source_id: str,
+        reason: str,
+    ) -> dict[str, object]:
+        result = self._empty_memory_result(redacted)
+        result['count_result'] = False
+        result['unsupported'] = [
+            {
+                'source_type': source_type,
+                'source_id': source_id,
+                'reason': reason,
+            },
+        ]
+
+        return result
 
     def _get_or_create_raw_event(
         self,
@@ -854,6 +895,12 @@ class ClaudeMemImporter:
         memory.save(update_fields=['metadata', 'updated_at'])
 
     def _record_memory_result(self, report: ImportReport, result: dict[str, object]) -> None:
+        unsupported = result.get('unsupported')
+        if isinstance(unsupported, list):
+            report['unsupported'].extend(unsupported)
+        if result.get('count_result') is False:
+            return
+
         if result['raw_event_created']:
             report['created']['raw_events'] += 1
         else:

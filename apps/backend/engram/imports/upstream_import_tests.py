@@ -470,6 +470,149 @@ def test_claude_mem_importer_is_idempotent_for_rerun(
 
 
 @pytest.mark.django_db
+def test_claude_mem_importer_is_idempotent_by_source_id_when_upstream_text_changes(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    import_input = ClaudeMemImportInput(
+        source_root=f_claude_mem_fixture,
+        organization_id=f_import_scope.organization.id,
+        project_id=f_import_scope.project.id,
+        team_id=f_import_scope.team.id,
+        source_store_id='fixture-store',
+        apply=True,
+    )
+
+    first_report = ClaudeMemImporter().execute(import_input)
+    with sqlite3.connect(f_claude_mem_fixture / 'claude-mem.db') as connection:
+        connection.execute(
+            'UPDATE observations SET text = ?, title = ? WHERE id = 1',
+            ('Changed upstream observation body for the same source row.', 'Changed observation title'),
+        )
+        connection.execute(
+            'UPDATE session_summaries SET request = ?, learned = ? WHERE id = 1',
+            ('Changed summary request for the same source row.', 'Changed summary learning.'),
+        )
+    second_report = ClaudeMemImporter().execute(import_input)
+
+    assert first_report['created']['memories'] == 2
+    assert second_report['created'] == {
+        'agents': 0,
+        'sessions': 0,
+        'raw_events': 0,
+        'observations': 0,
+        'memory_candidates': 0,
+        'memories': 0,
+        'memory_versions': 0,
+        'retrieval_documents': 0,
+    }
+    assert second_report['duplicates'] == {
+        'sessions': 1,
+        'raw_events': 3,
+        'observations': 2,
+        'memories': 2,
+    }
+    assert Observation.objects.count() == 2
+    assert Memory.objects.count() == 2
+    assert MemoryVersion.objects.count() == 2
+    assert RetrievalDocument.objects.count() == 2
+
+
+@pytest.mark.django_db
+def test_claude_mem_importer_reports_missing_source_sessions_without_counting_duplicates(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    with sqlite3.connect(f_claude_mem_fixture / 'claude-mem.db') as connection:
+        connection.execute(
+            'INSERT INTO observations '
+            '(id, memory_session_id, project, text, type, title, created_at, created_at_epoch) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            (
+                2,
+                'missing-memory-session',
+                '/workspace/example-repo',
+                'This observation points at a missing upstream session.',
+                'discovery',
+                'Missing session observation',
+                '2026-06-25T09:03:00Z',
+                1782378180000,
+            ),
+        )
+        connection.execute(
+            'INSERT INTO session_summaries '
+            '(id, memory_session_id, project, request, learned, created_at, created_at_epoch) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (
+                2,
+                'missing-memory-session',
+                '/workspace/example-repo',
+                'Summarize a missing upstream session.',
+                'The source session was not imported.',
+                '2026-06-25T09:09:00Z',
+                1782378540000,
+            ),
+        )
+
+    report = ClaudeMemImporter().execute(
+        ClaudeMemImportInput(
+            source_root=f_claude_mem_fixture,
+            organization_id=f_import_scope.organization.id,
+            project_id=f_import_scope.project.id,
+            team_id=f_import_scope.team.id,
+            source_store_id='fixture-store',
+            apply=True,
+        ),
+    )
+
+    unsupported = {(entry['source_type'], entry['source_id'], entry['reason']) for entry in report['unsupported']}
+    assert (
+        'observations',
+        'claude-mem:fixture-store:observation:missing-memory-session:2',
+        'missing_source_session',
+    ) in unsupported
+    assert (
+        'session_summaries',
+        'claude-mem:fixture-store:session_summary:missing-memory-session:2',
+        'missing_source_session',
+    ) in unsupported
+    assert report['created']['raw_events'] == 3
+    assert report['created']['observations'] == 2
+    assert report['created']['memories'] == 2
+    assert report['duplicates'] == {
+        'sessions': 0,
+        'raw_events': 0,
+        'observations': 0,
+        'memories': 0,
+    }
+
+
+@pytest.mark.django_db
+def test_claude_mem_import_command_allows_project_only_import_without_team(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    out = io.StringIO()
+    call_command(
+        'engram_import_claude_mem',
+        str(f_claude_mem_fixture),
+        organization_id=str(f_import_scope.organization.id),
+        project_id=str(f_import_scope.project.id),
+        source_store_id='fixture-store',
+        apply=True,
+        as_json=True,
+        stdout=out,
+    )
+    report = json.loads(out.getvalue())
+
+    assert report['target']['team_id'] is None
+    session = AgentSession.objects.get()
+    assert session.team_id is None
+    assert Observation.objects.filter(team__isnull=True).count() == 2
+    assert Memory.objects.filter(team__isnull=True).count() == 2
+
+
+@pytest.mark.django_db
 def test_claude_mem_importer_preserves_prompt_rows_as_raw_events_without_promoting_them(
     f_import_scope: ImportScope,
     f_claude_mem_fixture: Path,
@@ -610,6 +753,56 @@ def test_claude_mem_import_command_redacts_provider_token_shapes_before_persisti
     for fake_token in (fake_gemini_token, fake_telegram_token, fake_slack_token):
         assert fake_token not in out.getvalue()
         assert fake_token not in persisted_values
+    assert '[REDACTED]' in persisted_values
+
+
+@pytest.mark.django_db
+def test_claude_mem_import_command_redacts_agent_id_and_json_string_metadata_before_persisting(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    fake_agent_token = 'sk-agent_fake_import_token_1234567890'
+    fake_metadata_secret = 'plain-secret-value'
+    with sqlite3.connect(f_claude_mem_fixture / 'claude-mem.db') as connection:
+        connection.execute(
+            'UPDATE observations SET agent_id = ?, metadata = ? WHERE id = 1',
+            (
+                fake_agent_token,
+                json.dumps({'providerApiKey': fake_metadata_secret}),
+            ),
+        )
+
+    out = io.StringIO()
+    call_command(
+        'engram_import_claude_mem',
+        str(f_claude_mem_fixture),
+        organization_id=str(f_import_scope.organization.id),
+        project_id=str(f_import_scope.project.id),
+        team_id=str(f_import_scope.team.id),
+        source_store_id='fixture-store',
+        apply=True,
+        as_json=True,
+        stdout=out,
+    )
+    report = json.loads(out.getvalue())
+    observation_event = RawEventEnvelope.objects.get(event_type='claude_mem.observation')
+
+    persisted_values = ' '.join(
+        [
+            str(list(AgentSession.objects.values('metadata'))),
+            str(list(RawEventEnvelope.objects.values('payload', 'metadata'))),
+            str(list(Observation.objects.values('title', 'body', 'source_metadata'))),
+            str(list(Memory.objects.values('title', 'body', 'metadata'))),
+            str(list(AgentSession.objects.values('agent__external_id', 'agent__display_name'))),
+        ],
+    )
+    assert report['redactions'] == {'redacted': True}
+    assert fake_agent_token not in out.getvalue()
+    assert fake_agent_token not in persisted_values
+    assert fake_metadata_secret not in out.getvalue()
+    assert fake_metadata_secret not in persisted_values
+    assert isinstance(observation_event.payload['metadata'], str)
+    assert fake_metadata_secret not in observation_event.payload['metadata']
     assert '[REDACTED]' in persisted_values
 
 
