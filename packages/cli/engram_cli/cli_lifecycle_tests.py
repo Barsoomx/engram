@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from engram_cli.config import credential_fingerprint
 from engram_cli import main
 
 
@@ -165,9 +166,45 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn(PROJECT_ID, stdout)
             self.assertIn('codex', stdout)
             self.assertIn('claude_code', stdout)
-            self.assertIn('egk_test_cli...', stdout)
+            self.assertIn('sha256:', stdout)
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
+
+    def test_connect_fingerprint_uses_only_derived_material_for_short_keys(self) -> None:
+        short_key = 'short'
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = FakeTransport([(200, dry_run_ok()), (200, dry_run_ok())])
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    'connect',
+                    '--server',
+                    'https://engram.example',
+                    '--api-key',
+                    short_key,
+                    '--project',
+                    PROJECT_ID,
+                    '--config-dir',
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            public_state = ' '.join(
+                [
+                    stdout,
+                    (config_dir / 'config.json').read_text(encoding='utf-8'),
+                    (config_dir / 'hooks' / 'codex.json').read_text(encoding='utf-8'),
+                    (config_dir / 'hooks' / 'claude_code.json').read_text(encoding='utf-8'),
+                ],
+            )
+
+            self.assertIn('sha256:', public_state)
+            self.assertNotIn(short_key, public_state)
+            self.assertNotIn(short_key, credential_fingerprint(short_key))
 
     def test_connect_writes_nothing_when_dry_run_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,6 +275,29 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn('invalid_key', stderr)
             self.assertIn('[REDACTED]', stderr)
             self.assertNotIn(RAW_KEY, stderr)
+
+    def test_connect_rejects_malformed_server_url_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    'connect',
+                    '--server',
+                    'not-a-url',
+                    '--api-key',
+                    RAW_KEY,
+                    '--project',
+                    PROJECT_ID,
+                    '--config-dir',
+                    tmp,
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual('', stdout)
+            self.assertIn('server_unavailable', stderr)
+            self.assertIn('http:// or https://', stderr)
+            self.assertNotIn('Traceback', stderr)
 
     def test_doctor_passes_when_config_health_hooks_and_dry_run_are_valid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +379,24 @@ class CliLifecycleTests(unittest.TestCase):
 
             self.assertEqual(1, exit_code)
             self.assertIn('server_unavailable', stderr)
+
+    def test_doctor_rejects_malformed_stored_server_url_without_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            config_path = config_dir / 'config.json'
+            config = read_json(config_path)
+            config['server_url'] = 'not-a-url'
+            config_path.write_text(json.dumps(config), encoding='utf-8')
+
+            exit_code, _stdout, stderr = self.run_cli(
+                ['doctor', '--config-dir', str(config_dir)],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn('server_unavailable', stderr)
+            self.assertIn('http:// or https://', stderr)
 
     def test_doctor_reports_invalid_key_from_dry_run(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

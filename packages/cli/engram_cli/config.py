@@ -77,7 +77,7 @@ def remove_if_exists(path: Path) -> bool:
 def credential_fingerprint(raw_key: str) -> str:
     digest = hashlib.sha256(raw_key.encode()).hexdigest()
 
-    return f'{raw_key[:12]}...{digest[-12:]}'
+    return f'sha256:{digest[:12]}...{digest[-12:]}'
 
 
 def as_string(value: object) -> str:

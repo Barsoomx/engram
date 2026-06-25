@@ -335,7 +335,7 @@ Scope:
 | Check | Local command | CI job | Required | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
 | live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-11-cli-lifecycle` plus pre-existing unstaged `.gitignore` edit. |
-| CLI lifecycle tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend and Repository Quality | yes | pass | Exit 0. Ran 13 tests for connect, doctor, disconnect, redaction, dry-run failure, hook manifests, and strict credential file mode. |
+| CLI lifecycle tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend and Repository Quality | yes | pass | Exit 0. Ran 16 tests for connect, doctor, disconnect, redaction, derived-only fingerprints, malformed URL handling, dry-run failure, hook manifests, and strict credential file mode. |
 | CLI syntax | `python3 -m compileall packages/cli/engram_cli` | none yet | yes | pass | Exit 0. Compiled the package without syntax errors. |
 | repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. CLI package metadata, command modules, and lifecycle tests are required paths. |
 | repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
@@ -362,3 +362,9 @@ First decisive failures fixed during the TDD loop:
   active credential in `connect` and `doctor`.
 - Root repository tests first failed because CLI package paths and CI commands
   were not part of the layout/workflow contracts.
+- Independent review found the credential fingerprint leaked raw key prefix
+  material into stdout, config, and hook manifests; fingerprints now use only
+  derived SHA-256 material, including for short keys.
+- Independent review found malformed server URLs could reach transport and
+  escape as Python exceptions; connect and doctor now validate server URLs
+  before health or dry-run calls.
