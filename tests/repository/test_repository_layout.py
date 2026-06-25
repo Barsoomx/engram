@@ -77,6 +77,27 @@ class RepositoryContractDocumentationTests(unittest.TestCase):
                 self.assertIn('django-celery-outbox', text)
                 self.assertNotIn('engram_process_observation_outbox', text)
 
+    def test_live_contract_docs_do_not_reintroduce_custom_outbox_contract(self) -> None:
+        forbidden_phrases = (
+            'API writes domain events/outbox entries',
+            'outbox event in one PostgreSQL transaction',
+            'Outbox entries must track',
+            'Domain event/outbox entry',
+            'OutboxEvent',
+            'OutboxStatus',
+        )
+        live_contracts = (
+            'docs/architecture.md',
+            'docs/backend-contracts.md',
+            'docs/operations-and-deployment.md',
+        )
+
+        for relative_path in live_contracts:
+            text = (ROOT / relative_path).read_text(encoding='utf-8')
+            for phrase in forbidden_phrases:
+                with self.subTest(path=relative_path, phrase=phrase):
+                    self.assertNotIn(phrase, text)
+
 
 if __name__ == '__main__':
     unittest.main()
