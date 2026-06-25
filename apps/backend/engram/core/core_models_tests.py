@@ -14,7 +14,6 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
-    OutboxEvent,
     Project,
     ProjectTeam,
     RawEventEnvelope,
@@ -640,104 +639,4 @@ def test_audit_event_rejects_cross_scope_project_on_create() -> None:
             event_type='MemoryRetrieved',
             actor_type='agent',
             result='allowed',
-        )
-
-
-@pytest.mark.django_db
-def test_outbox_idempotency_is_unique_per_event_type() -> None:
-    organization, team, project, _agent, _session = create_scope()
-
-    OutboxEvent.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        aggregate_type='observation',
-        aggregate_id='observation-1',
-        event_type='ObservationRecorded',
-        idempotency_key='observation-1',
-        payload={'observation_id': 'observation-1'},
-    )
-    OutboxEvent.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        aggregate_type='observation',
-        aggregate_id='observation-1',
-        event_type='RetrievalDocumentRefreshRequested',
-        idempotency_key='observation-1',
-        payload={'observation_id': 'observation-1'},
-    )
-
-    with pytest.raises(IntegrityError):
-        OutboxEvent.objects.create(
-            organization=organization,
-            project=project,
-            team=team,
-            aggregate_type='observation',
-            aggregate_id='observation-1',
-            event_type='ObservationRecorded',
-            idempotency_key='observation-1',
-            payload={'observation_id': 'observation-1'},
-        )
-
-
-@pytest.mark.django_db
-def test_outbox_idempotency_is_scoped_by_source() -> None:
-    organization, team, project, _agent, _session = create_scope()
-
-    OutboxEvent.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        aggregate_type='observation',
-        aggregate_id='observation-1',
-        source_type='hook_event',
-        source_id='event-1',
-        event_type='ObservationRecorded',
-        idempotency_key='shared-key',
-        payload={'observation_id': 'observation-1'},
-    )
-    OutboxEvent.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        aggregate_type='observation',
-        aggregate_id='observation-2',
-        source_type='hook_event',
-        source_id='event-2',
-        event_type='ObservationRecorded',
-        idempotency_key='shared-key',
-        payload={'observation_id': 'observation-2'},
-    )
-
-    with pytest.raises(IntegrityError):
-        OutboxEvent.objects.create(
-            organization=organization,
-            project=project,
-            team=team,
-            aggregate_type='observation',
-            aggregate_id='observation-1',
-            source_type='hook_event',
-            source_id='event-1',
-            event_type='ObservationRecorded',
-            idempotency_key='shared-key',
-            payload={'observation_id': 'observation-1'},
-        )
-
-
-@pytest.mark.django_db
-def test_outbox_rejects_cross_scope_project_on_create() -> None:
-    organization, team, _project, _agent, _session = create_scope()
-    _other_organization, _other_team, other_project, _other_agent, _other_session = create_second_scope()
-
-    with pytest.raises(ValidationError):
-        OutboxEvent.objects.create(
-            organization=organization,
-            project=other_project,
-            team=team,
-            aggregate_type='observation',
-            aggregate_id='observation-1',
-            event_type='ObservationRecorded',
-            idempotency_key='cross-outbox-key',
-            payload={'observation_id': 'observation-1'},
         )

@@ -137,8 +137,8 @@ services, stdlib CLI, unittest, pytest, Docker Compose, GitHub Actions.
       assert RawEventEnvelope.objects.get().event_type == 'session_start'
       assert Observation.objects.get().observation_type == 'session_start'
       queued = CeleryOutbox.objects.get()
-      assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
-      assert queued.args == [body['outbox_event_id']]
+      assert queued.task_name == 'engram.memory.process_observation_recorded'
+      assert queued.args == [body['observation_id']]
   ```
 
   Add equivalent tests for:

@@ -31,45 +31,30 @@ Each service exposes one public `execute()` boundary:
 - transaction boundary documented at the service level;
 - structured log context bound at entry;
 - trace/span created for the service call;
-- domain events emitted through the durable outbox before commit completes.
+- asynchronous follow-up work queued through the approved transaction-safe
+  transport before commit completes.
 
 Adapters must not bypass domain services for writes.
 
-## Durable Outbox
+## Async Transport
 
-The outbox is the reliable bridge from transactional writes to asynchronous
-work.
-
-Required columns:
-
-- id;
-- tenant id;
-- event type;
-- payload JSON;
-- payload version;
-- idempotency key;
-- actor type/id;
-- organization/team/project ids when applicable;
-- correlation id;
-- trace id;
-- status: pending, processing, done, failed, dead_letter;
-- attempts;
-- next retry at;
-- locked by;
-- locked at;
-- last error;
-- created at;
-- updated at.
+Current V1 uses `django-celery-outbox` as the reliable bridge from
+transactional writes to asynchronous work. Engram does not own a parallel
+transport model, status enum, polling command, or relay in the live runtime.
 
 Rules:
 
-- domain write and outbox insert happen in the same database transaction;
-- idempotency key is unique per event type and source;
-- dispatcher uses row locking with skip-locked semantics;
-- retries use bounded exponential backoff;
-- dead-letter records stay queryable and replayable by an admin action;
-- event handlers are idempotent;
+- domain writes and Celery task enqueue happen inside the same database
+  transaction;
+- task payloads contain stable ids only, not API keys, provider secrets, prompt
+  bodies, or raw tool output;
+- `django-celery-outbox` owns the transport tables, retry/dead-letter state,
+  and `celery_outbox_relay` command;
+- Engram workers load authoritative domain rows by id and must be idempotent;
 - schema changes include migration and replay tests.
+
+A future Engram-owned domain-event stream requires a separate decision record
+and must not be introduced as a weaker replacement for the package transport.
 
 ## RBAC Source Of Truth
 
@@ -87,7 +72,7 @@ Rules:
 
 ## Observability Fields
 
-Every API request, hook event, service call, outbox event, worker job, and
+Every API request, hook event, service call, queued task, worker job, and
 provider call propagates:
 
 - request id;
@@ -97,7 +82,7 @@ provider call propagates:
 - actor type/id;
 - hook event id;
 - idempotency key;
-- outbox event id;
+- Celery task id when queued;
 - worker job id;
 - provider call id when present.
 

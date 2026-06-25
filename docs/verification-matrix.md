@@ -3,6 +3,70 @@
 This matrix records local commands, CI equivalents, status, and first decisive
 failures for each completed Engram slice.
 
+Current outbox contract (2026-06-25): Engram uses
+`django-celery-outbox package transport`. Hook ingest queues
+`engram.memory.process_observation_recorded` with the observation id through
+the Celery task `.delay(...)` call. The Compose `relay` service runs the
+package-owned `python manage.py celery_outbox_relay`; it is not an Engram
+domain outbox processor.
+
+## 2026-06-25: Celery Outbox Package Refactor
+
+Branch: `fix/use-celery-outbox-package`
+
+Scope:
+
+- `apps/backend/engram/core/models.py`
+- `apps/backend/engram/core/migrations/0003_delete_outboxevent.py`
+- `apps/backend/engram/hooks/*`
+- `apps/backend/engram/memory/*`
+- `scripts/repository_layout.py`
+- `tests/repository/*`
+- `docs/superpowers/specs/2026-06-25-celery-outbox-package-design.md`
+- `docs/superpowers/plans/2026-06-25-celery-outbox-package.md`
+- historical outbox docs supersession notes
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED regression | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py::test_process_observation_recorded_task_rejects_malformed_observation_id -v` | Backend | yes | fixed | First ran exit 1 with `ValueError: badly formed hexadecimal UUID string`; task wrapper now raises `MemoryWorkerError('malformed observation id')`. |
+| focused host backend | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py engram/hooks/hook_ingest_tests.py engram/memory/memory_worker_tests.py -v` | Backend | yes | pass | Exit 0. Ran 57 tests for model cleanup, hook package transport, replay idempotency, memory candidate creation, redaction, malformed ids, and promotion. |
+| full host backend | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 127 tests. |
+| host lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| host format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. `68 files already formatted`. |
+| host migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --skip-checks --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality | yes | pass | Exit 0. Ran 26 tests. |
+| whitespace | `git diff --check` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| Docker image build | `docker compose -f deploy/compose/docker-compose.yml build api worker relay` | Compose E2E | yes | pass | Exit 0. Rebuilt images after code changes. |
+| container focused backend | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "poetry install --no-interaction --with dev && poetry run pytest engram/hooks/hook_ingest_tests.py engram/memory/memory_worker_tests.py -v"` | Backend / Compose E2E | yes | pass | Exit 0. Ran 38 tests against Compose Postgres after fixing `FOR UPDATE` to lock only `Observation`. |
+| container full backend plus lint | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "poetry install --no-interaction --with dev && poetry run pytest -v && poetry run ruff check . && poetry run ruff format --check ."` | Backend / Compose E2E | yes | pass | Exit 0 for pytest, ruff, and format. Ran 127 backend tests against Compose Postgres. |
+| container migrations | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "python manage.py migrate --noinput --settings=settings.test_settings && python manage.py makemigrations --check --dry-run --settings=settings.test_settings"` | Backend / Compose E2E | yes | pass | Exit 0. Applied through `core.0003_delete_outboxevent` and package migrations, then reported `No changes detected`. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Package relay delivered the observation-id Celery task, worker created a candidate, promotion succeeded, and a future context bundle included the memory. |
+| Compose cleanup | `docker compose -f deploy/compose/docker-compose.yml ps --format json` | none | yes | pass | Exit 0 with no running services after E2E cleanup. |
+
+First decisive failures fixed during the TDD/debug loop:
+
+- Focused backend RED failed with missing `process_observation_recorded`.
+- Direct container `pytest` failed because the production image intentionally
+  installs only main dependencies; verification installs dev dependencies in
+  the ephemeral test container.
+- Container focused tests first failed on Postgres with `FOR UPDATE cannot be
+  applied to the nullable side of an outer join`; `ProcessObservationRecorded`
+  now locks only the `Observation` row with `select_for_update(of=('self',))`.
+- Container `makemigrations` first failed with `celery_outbox.E006` before the
+  default database schema existed; the management verification now runs
+  `migrate` before migration freshness.
+
+Accepted migration risk:
+
+- `core.0003_delete_outboxevent` drops the old custom `core_outboxevent` table.
+  Existing pending custom outbox rows are not migrated because the live contract
+  now relies on `django-celery-outbox` transport rows. Production environments
+  with custom outbox backlog must drain or snapshot it before applying this
+  migration.
+
 ## 2026-06-25: Upstream Parity Audit Docs
 
 Branch: `docs/parity-01-upstream-audit`

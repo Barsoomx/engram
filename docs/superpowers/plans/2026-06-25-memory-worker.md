@@ -1,5 +1,13 @@
 # Memory Candidate Worker Implementation Plan
 
+Supersession note (2026-06-25): this historical plan described an Engram-owned
+domain outbox worker. The live contract now uses
+`django-celery-outbox package transport`; hook ingest queues
+`engram.memory.process_observation_recorded` with the observation id through
+the Celery task `.delay(...)` call. The package-owned relay may run
+`python manage.py celery_outbox_relay`, but Engram no longer requires a custom
+`OutboxEvent` worker command or outbox migration gate.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use

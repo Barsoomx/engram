@@ -33,6 +33,8 @@ Enterprise/SaaS:
 
 - API service: synchronous hook/admin/API traffic.
 - Worker service: background jobs.
+- Relay service: `django-celery-outbox` transport relay that publishes queued
+  Celery messages to the broker.
 - Scheduler: retention, stale memory checks, model health checks.
 - Admin frontend: operational console.
 - Migration job: database migrations and data migrations.
@@ -43,9 +45,10 @@ No component should require a developer-machine local memory worker.
 
 Required telemetry:
 
-- request id and trace id across hooks, API, outbox, workers, and provider calls;
-- span id, actor id, team/project ids, hook event id, idempotency key, outbox
-  event id, worker job id, and provider call id where present;
+- request id and trace id across hooks, API, queued tasks, workers, and provider
+  calls;
+- span id, actor id, team/project ids, hook event id, idempotency key, Celery
+  task id, worker job id, and provider call id where present;
 - structured logs with tenant-safe redaction;
 - metrics for hook latency, retrieval latency, queue depth, distillation cost,
   provider errors, secret failures, and audit write failures;

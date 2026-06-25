@@ -22,7 +22,6 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
-    OutboxEvent,
     Project,
     ProjectTeam,
     RawEventEnvelope,
@@ -206,7 +205,7 @@ def test_hook_dry_run_denies_wrong_project() -> None:
 
 
 @pytest.mark.django_db
-def test_post_tool_use_ingests_raw_event_observation_source_and_outbox() -> None:
+def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_task() -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
 
@@ -228,11 +227,10 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_outbox() -> None
     raw_event = RawEventEnvelope.objects.get()
     observation = Observation.objects.get()
     source = ObservationSource.objects.get()
-    outbox = OutboxEvent.objects.get()
 
     assert body['raw_event_id'] == str(raw_event.id)
     assert body['observation_id'] == str(observation.id)
-    assert body['outbox_event_id'] == str(outbox.id)
+    assert 'outbox_event_id' not in body
     assert body['agent_session_id'] == str(session.id)
     assert agent.runtime == 'codex'
     assert agent.external_id == 'codex-local'
@@ -259,13 +257,6 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_outbox() -> None
     assert source.raw_event_id == raw_event.id
     assert source.source_type == 'hook_event'
     assert source.source_id == 'event-1'
-    assert outbox.event_type == 'ObservationRecorded'
-    assert outbox.source_type == 'hook_event'
-    assert outbox.source_id == 'event-1'
-    assert outbox.idempotency_key == 'idem-1'
-    assert outbox.payload['raw_event_id'] == str(raw_event.id)
-    assert outbox.payload['observation_id'] == str(observation.id)
-    assert RAW_KEY not in str(outbox.payload)
 
 
 @pytest.mark.django_db
@@ -304,8 +295,8 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox() -> None:
     body = response.json()
     queued = CeleryOutbox.objects.get()
 
-    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
-    assert queued.args == [body['outbox_event_id']]
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
     assert queued.kwargs == {}
     transport_payload = f'{queued.args} {queued.kwargs} {queued.options}'
     assert RAW_KEY not in transport_payload
@@ -338,8 +329,9 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task() ->
     assert RawEventEnvelope.objects.get().event_type == 'session_start'
     assert Observation.objects.get().observation_type == 'session_start'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
-    assert queued.args == [body['outbox_event_id']]
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
@@ -368,8 +360,9 @@ def test_error_hook_persists_error_event_and_queues_worker_task() -> None:
     assert RawEventEnvelope.objects.get().event_type == 'error'
     assert Observation.objects.get().observation_type == 'error'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
-    assert queued.args == [body['outbox_event_id']]
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
@@ -398,8 +391,9 @@ def test_decision_hook_persists_decision_event_and_queues_worker_task() -> None:
     assert RawEventEnvelope.objects.get().event_type == 'decision'
     assert Observation.objects.get().observation_type == 'decision'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
-    assert queued.args == [body['outbox_event_id']]
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
@@ -427,7 +421,6 @@ def test_hook_event_endpoint_rejects_mismatched_event_type_before_writes() -> No
     assert response.json() == {'event_type': ['Expected session_start.']}
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -466,7 +459,6 @@ def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worke
     assert second.json()['raw_event_id'] == first.json()['raw_event_id']
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert OutboxEvent.objects.count() == 1
     assert CeleryOutbox.objects.count() == 1
 
 
@@ -496,7 +488,6 @@ def test_decision_hook_denies_wrong_project_before_records_or_queued_worker_task
     assert response.json()['code'] == 'project_scope_denied'
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -577,12 +568,10 @@ def test_post_tool_use_uses_key_bound_team_when_request_omits_team_id() -> None:
     session = AgentSession.objects.get()
     raw_event = RawEventEnvelope.objects.get()
     observation = Observation.objects.get()
-    outbox = OutboxEvent.objects.get()
 
     assert session.team_id == team.id
     assert raw_event.team_id == team.id
     assert observation.team_id == team.id
-    assert outbox.team_id == team.id
 
 
 @pytest.mark.django_db
@@ -606,7 +595,7 @@ def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows() -> None
     assert second.json()['raw_event_id'] == first.json()['raw_event_id']
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert OutboxEvent.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -628,7 +617,7 @@ def test_post_tool_use_replay_by_session_event_id_returns_existing_rows() -> Non
     assert second.json()['raw_event_id'] == first.json()['raw_event_id']
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert OutboxEvent.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db(transaction=True)
@@ -662,7 +651,7 @@ def test_post_tool_use_replay_race_returns_existing_rows(m_monkeypatch: pytest.M
     assert second.json()['raw_event_id'] == first.json()['raw_event_id']
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert OutboxEvent.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -682,7 +671,7 @@ def test_post_tool_use_denies_cross_project_before_writes() -> None:
     assert response.json()['code'] == 'project_scope_denied'
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -714,7 +703,6 @@ def test_post_tool_use_rejects_oversized_nested_payload_before_writes() -> None:
     assert response.json()['payload']['code'] == ['hook_payload_too_large']
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -740,7 +728,6 @@ def test_post_tool_use_rejects_oversized_observation_body_before_writes() -> Non
     assert response.json()['observation']['body']['code'] == ['hook_observation_body_too_large']
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -769,7 +756,6 @@ def test_post_tool_use_rejects_too_many_or_too_long_observation_file_paths_befor
     ]
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -793,7 +779,6 @@ def test_post_tool_use_rejects_too_long_repository_path_fields_before_writes() -
     assert response.json()['cwd']['code'] == ['hook_cwd_too_long']
     assert RawEventEnvelope.objects.count() == 0
     assert Observation.objects.count() == 0
-    assert OutboxEvent.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
@@ -838,11 +823,13 @@ def test_session_end_marks_session_ended_and_writes_durable_event() -> None:
     session = AgentSession.objects.get()
     raw_event = RawEventEnvelope.objects.get()
     observation = Observation.objects.get()
-    outbox = OutboxEvent.objects.get()
 
     assert session.status == SessionStatus.ENDED
     assert session.ended_at is not None
     assert raw_event.event_type == 'session_end'
     assert observation.observation_type == 'session_end'
-    assert outbox.event_type == 'ObservationRecorded'
     assert response.json()['agent_session_id'] == str(session.id)
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [response.json()['observation_id']]
+    assert queued.kwargs == {}
