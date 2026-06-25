@@ -168,12 +168,17 @@ Upstream behavior:
 
 Classification:
 
-- `preserve`: Claude Code event coverage needed for the parity loop.
+- `preserve`: Claude Code event semantics needed for the parity loop.
 - `preserve`: normalized payload fields and response envelope.
 - `preserve`: `additionalContext` injection at session start.
 - `replace`: local worker start/version-check commands.
+- `defer`: native Claude Code package implementation. The first working path is
+  Codex; Claude-specific response formatting and installer/config writes remain
+  a separate checkpoint before Engram claims Claude Code runtime parity.
 - `defer`: `PreToolUse` file timeline injection unless the first golden fixture
   requires it.
+- `defer`: `Stop` summary generation as a runtime hook until the session-summary
+  worker contract is implemented.
 
 Engram target:
 
@@ -212,11 +217,17 @@ Classification:
   complete, unless a committed defer rationale explicitly says otherwise.
 - `preserve`: strict session validation and response compatibility.
 - `replace`: package ids, branding, local script resolution, and worker command.
+- `defer`: `PreToolUse` and `Stop` remain outside the first Codex package
+  contract; the first package contract covers `SessionStart`, `PostToolUse`,
+  `Error`, and `Decision`.
 
 Engram target:
 
 - Codex plugin package is a thin client over the same Engram server API schema.
 - Contract tests prove Codex-specific responses emit only supported fields.
+- 2026-06-25 checkpoint: `packages/codex-plugin` plus the thin
+  `engram_cli hook` commands implement the Codex-native hook contract for
+  `SessionStart`, `PostToolUse`, `Error`, and `Decision`.
 
 ### Cursor, Gemini CLI, And Other IDE Hooks
 
@@ -388,8 +399,9 @@ Classification:
   runtime, cwd, transcript provenance, agent identity, status, and prompt/tool
   linkage.
 - `replace`: in-memory session buffer and local SQLite session authority.
-- `defer`: live transcript watcher and transcript replay unless needed by the
-  migration fixture.
+- `defer`: live transcript watcher and runtime transcript replay. Migration
+  import may read transcript artifacts where stable data can be reconstructed,
+  but the runtime path must not depend on transcript watching.
 
 Engram target:
 
@@ -790,8 +802,12 @@ Importer requirements for the parity gate:
 Required before North Star expansion:
 
 - `engram connect`, `engram doctor`, and `engram disconnect` thin-client flow.
-- Claude Code and Codex hook packages or explicit defer/drop rationale for any
-  unsupported runtime.
+- Codex hook package and thin CLI event commands are implemented for
+  `SessionStart`, `PostToolUse`, `Error`, and `Decision` through
+  `packages/codex-plugin` and `packages/cli`.
+- Claude Code native package remains deferred because the first installed path
+  is Codex. Claude-specific response formatting and installer/config writes are
+  a separate checkpoint before Claude Code runtime parity can be claimed.
 - Hook/session-start request to context API.
 - Hook observation ingest to API.
 - PostgreSQL raw event envelope, normalized observation, generated memory or
@@ -806,6 +822,9 @@ Required before North Star expansion:
 Explicitly out of the first parity implementation unless the fixture requires
 it:
 
+- `PreToolUse` and `Stop` runtime hook coverage;
+- live transcript replay/watch; migration import handles supported static
+  upstream artifacts instead of adding a runtime transcript watcher;
 - custom admin UI depth;
 - MCP bridge implementation;
 - Cursor/Gemini/OpenAI Agents support;

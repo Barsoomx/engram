@@ -1,10 +1,7 @@
 # Compose Deployment
 
-Owns the future local and self-hosted Compose profile for PostgreSQL,
-Redis-compatible broker, backend API, worker, optional scheduler, and frontend.
+Local self-hosted profile for the parity backend runtime: API, worker,
+PostgreSQL, and Redis-compatible broker.
 
-This directory is inactive in the skeleton checkpoint. It must not introduce
-partial services, env files, or container images before the backend runtime
-slice defines real commands and health checks.
-
-Activation gate: first Django backend and Compose health-check slice.
+The Compose E2E workflow runs `scripts/e2e_golden_path.py` to prove the
+first CLI/hook-to-context loop.

@@ -424,3 +424,48 @@ First decisive failures fixed during the Task 5 loop:
 - Evidence docs verification passed with `python3 scripts/repository_quality.py`
   exit 0 and `git diff --check` exit 0 after the security artifact, verification
   matrix entry, and evidence report were written.
+
+## 2026-06-25: Hook Event Coverage
+
+Branch: `feat/parity-14-hook-event-coverage`
+
+Scope:
+
+- Task 2 backend hook endpoints: commit `c6ed9ae8`; review clean.
+- Task 3 CLI commands and Codex adapter: commits `8da62b21` and README fix
+  `400e75e8`; review clean.
+- Task 4 Codex plugin contract: commit `f49e8aeb`; review clean.
+- Session-start lifecycle payload fix: commit `c24669f3`; review clean.
+- Evidence-only docs update for parity map, verification matrix, and Compose
+  README.
+
+CI status: pending/not run for this branch after `c24669f3`; the rows below are
+local command evidence, not CI evidence.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| backend hook tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/hooks/hook_ingest_tests.py -v"` | Backend equivalent | yes | pass | Exit 0. Task 2 report: 21 passed at commit `c6ed9ae8`; review clean. |
+| CLI hook tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend and Repository Quality | yes | pass | Exit 0. Fix verification after `c24669f3`: 26 tests passed. |
+| CLI syntax | `python3 -m compileall packages/cli/engram_cli` | none yet | yes | pass | Exit 0. Fix verification after `c24669f3`: CLI package compiled. |
+| Codex plugin contract tests | `python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v` | none yet | yes | pass | Exit 0. Task 4 report: OK after 2 tests at commit `f49e8aeb`; review clean. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Fresh Task 5 docs pass: 22 tests OK. |
+| backend full tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v"` | Backend equivalent | yes | pass | Exit 0. Fresh Task 5 docs pass: 114 passed. |
+| Compose migration command | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend migration steps use PostgreSQL service | yes | pass | Exit 0. Fresh Task 5 docs pass: migrations applied and `No changes detected`. |
+| local Compose golden path first run | `python3 scripts/e2e_golden_path.py` | future Compose E2E | yes | fixed | Exit 1. First decisive failure: future `engram_cli hook session-start` failed with `invalid_response: Server returned invalid JSON`; direct POST to `/v1/hooks/session-start` returned HTTP 500 HTML with `django.core.exceptions.ValidationError: {'payload': ['This field cannot be blank.']}` because the CLI sent an empty nested hook `payload={}` for session-start context input. |
+| local Compose golden path rerun | `python3 scripts/e2e_golden_path.py` | future Compose E2E | yes | pass | Exit 0. Fix verification after `c24669f3`: Compose golden path passed. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0. Fresh Task 5 docs verification after evidence update. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. Fresh Task 5 docs verification after evidence update. |
+
+First decisive failures fixed during the hook event coverage loop:
+
+- Task 2 backend endpoint red test first failed with HTTP 404 for
+  `/v1/hooks/session-start`; fixed by adding the endpoint and lifecycle event
+  persistence.
+- Task 3 CLI red test first failed with `KeyError: 'commands'`; fixed by
+  writing event-specific hook commands and adding hook subcommands.
+- Task 4 Codex plugin contract tests first failed because
+  `packages/codex-plugin/.codex-plugin/plugin.json` and
+  `packages/codex-plugin/plugin/hooks/codex-hooks.json` were missing; fixed by
+  adding the package-local contract fixtures.
+- Compose E2E first failed after Task 4 because `session-start` sent an empty
+  nested hook payload to the backend lifecycle endpoint; fixed in `c24669f3`.
