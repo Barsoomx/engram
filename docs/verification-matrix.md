@@ -446,9 +446,20 @@ Scope:
 - Evidence-only docs update for parity map, verification matrix, and Compose
   README: commit `76bd251c`.
 
-CI status: pending/not run for this branch after the security fix commit
-`3a3952fd`; evidence-only docs later reached `76bd251c`. The rows below are
-local command evidence, not CI evidence.
+PR status: merged through
+`https://github.com/Barsoomx/engram/pull/11`.
+
+Merge commit:
+`cc2f1f2e5baa9b49af74b195774d18482eb94e4f`.
+
+CI status on the merge commit: pass.
+
+- Backend:
+  `https://github.com/Barsoomx/engram/actions/runs/28172695242`
+- Compose E2E:
+  `https://github.com/Barsoomx/engram/actions/runs/28172695204`
+- Repository Quality:
+  `https://github.com/Barsoomx/engram/actions/runs/28172695225`
 
 | Check | Local command | CI job | Required | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -465,6 +476,7 @@ local command evidence, not CI evidence.
 | Compose migration command | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend migration steps use PostgreSQL service | yes | pass | Exit 0. Fresh Task 5 docs pass: migrations applied and `No changes detected`. |
 | local Compose golden path first run | `python3 scripts/e2e_golden_path.py` | future Compose E2E | yes | fixed | Exit 1. First decisive failure: future `engram_cli hook session-start` failed with `invalid_response: Server returned invalid JSON`; direct POST to `/v1/hooks/session-start` returned HTTP 500 HTML with `django.core.exceptions.ValidationError: {'payload': ['This field cannot be blank.']}` because the CLI sent an empty nested hook `payload={}` for session-start context input. |
 | local Compose golden path rerun | `python3 scripts/e2e_golden_path.py` | future Compose E2E | yes | pass | Exit 0 after both CLI fixes. |
+| current master Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 on `cc2f1f2e5baa9b49af74b195774d18482eb94e4f`: Compose started, host CLI connected, hook observation submitted, relayed memory candidate promoted, future session context returned, and Compose stopped. |
 | focused security review | Initial review, stable-id fix, and security re-review recorded in `docs/security/reviews/2026-06-25-hook-event-coverage.md` | none | yes | pass | Initial SECURITY CHANGES_REQUIRED finding was fixed in `3a3952fd`; re-review SECURITY APPROVED with CRITICAL none, IMPORTANT none, MINOR none. |
 | repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0. Fresh Task 5 docs verification after evidence update. |
 | whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. Fresh Task 5 docs verification after evidence update. |
@@ -488,3 +500,53 @@ First decisive failures fixed during the hook event coverage loop:
 - A parallel verification run failed because `python3 scripts/e2e_golden_path.py`
   ran `docker compose down -v` while the full backend pytest command still used
   Postgres; serial rerun passed with 114 tests.
+
+## 2026-06-25: First Parity Gate Evidence And Request Size Limits
+
+Branch: `chore/parity-gate-evidence`
+
+Scope:
+
+- `docs/parity/2026-06-25-first-parity-gate-report.md`
+- `docs/security/reviews/2026-06-25-first-parity-gate-rollup.md`
+- `docs/verification-matrix.md`
+- `apps/backend/engram/hooks/serializers.py`
+- `apps/backend/engram/hooks/hook_ingest_tests.py`
+- `apps/backend/engram/context/serializers.py`
+- `apps/backend/engram/context/context_api_tests.py`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| checkpoint-start Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 on checkpoint start SHA `cc2f1f2e5baa9b49af74b195774d18482eb94e4f`: Compose started, host CLI connected, hook observation submitted, relayed memory candidate promoted, future session context returned, and Compose stopped. |
+| post-fix Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 after the request-size-limit fix and evidence docs: Compose started, host CLI connected, hook observation submitted, relayed memory candidate promoted, future session context returned, and Compose stopped. |
+| request-size-limit focused tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/hooks/hook_ingest_tests.py engram/context/context_api_tests.py -v"` | Backend equivalent | yes | pass | Exit 0. Reported 44 passed after hook/context serializer caps were added. |
+| backend full tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v"` | Backend | yes | pass | Exit 0. Reported 123 passed after request-size-limit fix. |
+| request-size-limit lint and format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff check engram/hooks engram/context && ruff format --check engram/hooks engram/context"` | Backend equivalent | yes | pass | Exit 0. Ruff check passed and format check reported 14 files already formatted. |
+| backend lint | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff check ."` | Backend | yes | pass | Exit 0. |
+| backend format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff format --check ."` | Backend | yes | pass | Exit 0. Reported 64 files already formatted. |
+| migration apply and freshness | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend | yes | pass | Exit 0. Migrations applied and `No changes detected`. |
+| CLI tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend and Repository Quality | yes | pass | Exit 0. Reported 28 tests OK. |
+| Codex plugin contract tests | `python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v` | none yet | yes | pass | Exit 0. Reported 2 tests OK. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Reported 22 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 after evidence docs were added. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 after evidence docs were added. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 after evidence docs were added. |
+| focused security roll-up | Independent read-only security review and re-review recorded in `docs/security/reviews/2026-06-25-first-parity-gate-rollup.md` | none | yes | pass | Initial SECURITY CHANGES_REQUIRED finding for missing hook/context size caps was fixed; re-review SECURITY APPROVED with CRITICAL none, IMPORTANT none, MINOR none. |
+
+First decisive failures fixed during this checkpoint:
+
+- Fresh gate audit found the evidence report was missing and the hook-event
+  matrix still said CI was pending even though PR `#11` and the master push CI
+  were green.
+- Focused security roll-up found authenticated hook/context request content had
+  no Engram-level per-event/per-field caps before persistence and retrieval
+  processing.
+- TDD red tests first failed because oversized hook inputs returned HTTP 202 and
+  oversized context inputs returned HTTP 200 instead of HTTP 400.
+- A follow-up context repository metadata red test first failed because
+  oversized `repository_url`, `repository_root`, and `cwd` still returned HTTP
+  200 instead of HTTP 400.
+- A reviewer-driven context metadata red test first failed with a Django
+  validation error on oversized `AuditEvent.correlation_id`; context serializer
+  caps now reject oversized `agent_version`, `agent_external_id`,
+  `correlation_id`, `trace_id`, and `branch` before records are created.

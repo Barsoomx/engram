@@ -36,6 +36,12 @@ from engram.core.models import (
 
 RAW_KEY = 'egk_test_context_0123456789abcdefghijklmnopqrstuvwxyz'
 OTHER_RAW_KEY = 'egk_test_context_other_0123456789abcdefghijklmnopqrstuvwxyz'
+CONTEXT_QUERY_MAX_LENGTH = 8000
+CONTEXT_LIST_VALUE_MAX_LENGTH = 1024
+CONTEXT_LIST_MAX_ITEMS = 100
+CONTEXT_PATH_MAX_LENGTH = 1024
+CONTEXT_AGENT_VERSION_MAX_LENGTH = 80
+CONTEXT_METADATA_MAX_LENGTH = 255
 
 
 def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKey]:
@@ -278,6 +284,161 @@ def test_session_start_requires_memories_read_capability() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'missing_capability'
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_rejects_oversized_query_before_creating_bundle() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-oversized-query',
+            query='x' * (CONTEXT_QUERY_MAX_LENGTH + 1),
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['query']['code'] == ['context_query_too_large']
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_rejects_too_many_or_too_long_file_paths_before_creating_bundle() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-oversized-file-paths',
+            file_paths=[f'apps/file-{index}.py' for index in range(CONTEXT_LIST_MAX_ITEMS + 1)],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+    long_path_response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-too-long-file-path',
+            file_paths=['a' * (CONTEXT_LIST_VALUE_MAX_LENGTH + 1)],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['file_paths']['code'] == ['context_file_paths_too_many']
+    assert long_path_response.status_code == 400
+    assert long_path_response.json()['file_paths']['code'] == ['context_file_paths_value_too_long']
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_rejects_too_many_or_too_long_symbols_before_creating_bundle() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-oversized-symbols',
+            file_paths=[],
+            symbols=[f'Symbol{index}' for index in range(CONTEXT_LIST_MAX_ITEMS + 1)],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+    long_symbol_response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-too-long-symbol',
+            file_paths=[],
+            symbols=['S' * (CONTEXT_LIST_VALUE_MAX_LENGTH + 1)],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['symbols']['code'] == ['context_symbols_too_many']
+    assert long_symbol_response.status_code == 400
+    assert long_symbol_response.json()['symbols']['code'] == ['context_symbols_value_too_long']
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_rejects_too_long_repository_path_fields_before_creating_bundle() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-too-long-context-repository',
+            repository_url='https://example.test/' + ('z' * CONTEXT_PATH_MAX_LENGTH),
+            repository_root='/' + ('x' * CONTEXT_PATH_MAX_LENGTH),
+            cwd='/' + ('y' * CONTEXT_PATH_MAX_LENGTH),
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['repository_url']['code'] == ['context_repository_url_too_long']
+    assert response.json()['repository_root']['code'] == ['context_repository_root_too_long']
+    assert response.json()['cwd']['code'] == ['context_cwd_too_long']
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_rejects_too_long_metadata_fields_before_creating_records() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-too-long-context-metadata',
+            agent_version='v' * (CONTEXT_AGENT_VERSION_MAX_LENGTH + 1),
+            agent_external_id='a' * (CONTEXT_METADATA_MAX_LENGTH + 1),
+            correlation_id='c' * (CONTEXT_METADATA_MAX_LENGTH + 1),
+            trace_id='t' * (CONTEXT_METADATA_MAX_LENGTH + 1),
+            branch='b' * (CONTEXT_METADATA_MAX_LENGTH + 1),
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['agent_version']['code'] == ['context_agent_version_too_long']
+    assert response.json()['agent_external_id']['code'] == ['context_agent_external_id_too_long']
+    assert response.json()['correlation_id']['code'] == ['context_correlation_id_too_long']
+    assert response.json()['trace_id']['code'] == ['context_trace_id_too_long']
+    assert response.json()['branch']['code'] == ['context_branch_too_long']
+    assert Agent.objects.count() == 0
+    assert AgentSession.objects.count() == 0
+    assert AuditEvent.objects.count() == 0
     assert ContextBundle.objects.count() == 0
 
 

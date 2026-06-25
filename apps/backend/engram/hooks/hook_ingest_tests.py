@@ -32,6 +32,10 @@ from engram.core.models import (
 from engram.hooks.services import IngestHookEvent
 
 RAW_KEY = 'egk_test_hook_ingest_0123456789abcdefghijklmnopqrstuvwxyz'
+HOOK_PAYLOAD_MAX_BYTES = 65536
+HOOK_OBSERVATION_BODY_MAX_LENGTH = 16000
+HOOK_PATH_MAX_LENGTH = 1024
+HOOK_PATH_LIST_MAX_ITEMS = 100
 
 
 @pytest.fixture
@@ -692,6 +696,105 @@ def test_post_tool_use_rejects_non_object_payload() -> None:
     assert response.status_code == 400
     assert 'payload' in response.json()
     assert RawEventEnvelope.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_tool_use_rejects_oversized_nested_payload_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        payload={'tool_input': {'nested': 'x' * HOOK_PAYLOAD_MAX_BYTES}},
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json()['payload']['code'] == ['hook_payload_too_large']
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_tool_use_rejects_oversized_observation_body_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        observation={
+            'type': 'tool_use',
+            'title': 'bash completed',
+            'body': 'x' * (HOOK_OBSERVATION_BODY_MAX_LENGTH + 1),
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json()['observation']['body']['code'] == ['hook_observation_body_too_large']
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_tool_use_rejects_too_many_or_too_long_observation_file_paths_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        observation={
+            'type': 'tool_use',
+            'title': 'bash completed',
+            'body': 'pytest exited 0',
+            'files_read': [f'apps/file-{index}.py' for index in range(HOOK_PATH_LIST_MAX_ITEMS + 1)],
+            'files_modified': ['a' * (HOOK_PATH_MAX_LENGTH + 1)],
+        },
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json()['observation']['files_read']['code'] == ['hook_observation_files_read_too_many']
+    assert response.json()['observation']['files_modified']['code'] == [
+        'hook_observation_files_modified_path_too_long',
+    ]
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_tool_use_rejects_too_long_repository_path_fields_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        repository_url='https://example.test/' + ('z' * HOOK_PATH_MAX_LENGTH),
+        repository_root='/' + ('x' * HOOK_PATH_MAX_LENGTH),
+        cwd='/' + ('y' * HOOK_PATH_MAX_LENGTH),
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json()['repository_url']['code'] == ['hook_repository_url_too_long']
+    assert response.json()['repository_root']['code'] == ['hook_repository_root_too_long']
+    assert response.json()['cwd']['code'] == ['hook_cwd_too_long']
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
