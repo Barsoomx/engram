@@ -838,17 +838,22 @@ it:
 
 The first checked-in sanitized fixture should cover:
 
-1. Claude Code or Codex `SessionStart` with project/cwd/session id.
+1. Codex `SessionStart` with project/cwd/session id.
 2. Empty context response for first session.
-3. `UserPromptSubmit` with a prompt that is not private.
-4. `PostToolUse` with command or file evidence worth remembering.
-5. `Stop` with last assistant message.
+3. Codex `PostToolUse` with command or file evidence worth remembering.
+4. Codex `Error` with sanitized failure evidence when the scenario needs error
+   capture.
+5. Codex `Decision` with the agent decision metadata needed by the fixture.
 6. Worker job creates one durable memory from the event.
 7. Future `SessionStart` returns a context bundle that cites that memory.
 8. Duplicate `PostToolUse` replay does not create a duplicate memory.
 9. Wrong project or API key is denied before retrieval.
 
-If this fixture cannot cover both Claude Code and Codex in the first
-implementation batch, the parity map must be amended with the exact runtime
-classified as `defer`, the reason, and the test that proves the implemented
-runtime does not claim full upstream parity.
+`Stop` is deferred for runtime hook coverage in this checkpoint. If the fixture
+needs last-assistant-message or transcript-derived evidence, cover it only
+through migration/import artifacts and the unsupported-record report path, not
+through the runtime golden path.
+
+This checkpoint intentionally covers the Codex runtime fixture only. Claude
+Code native package coverage remains deferred above, so the implemented runtime
+fixture must not claim full Claude Code parity.
