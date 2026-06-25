@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 
@@ -27,6 +28,7 @@ from engram.core.models import (
 from engram.core.redaction import redact_value
 from engram.model_policy.services import (
     EmbeddingCallInput,
+    EmbeddingCallResult,
     FakeProviderGateway,
     ModelPolicyError,
     ProviderSecretError,
@@ -193,6 +195,22 @@ def redact_text(value: object) -> str:
     return str(redact_value(value).value)
 
 
+SEMANTIC_MIN_SIMILARITY = 0.3
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+
+    return dot / (left_norm * right_norm)
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -314,14 +332,20 @@ class BuildContextBundle:
         team = self._resolve_team(organization, data.team_id, scope)
         agent = self._get_or_create_agent(organization, data)
         session = self._get_or_create_session(organization, project, team, agent, data)
-        matches = self._rank_matches(
-            self._authorized_documents(organization, project, scope),
+        authorized_documents = self._authorized_documents(organization, project, scope)
+        matches, has_semantic, embedding_result = self._rank_matches(
+            authorized_documents,
             data,
+            organization,
+            project,
+            team,
         )
         query_result = redact_value(data.query)
-        metadata = {'retrieval_strategy': 'exact'}
+        metadata = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
+        if has_semantic and embedding_result is not None:
+            metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -504,14 +528,17 @@ class BuildContextBundle:
         self,
         documents: tuple[RetrievalDocument, ...],
         data: ContextBundleInput,
-    ) -> tuple[RetrievalMatch, ...]:
-        matches = []
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None]:
         has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
+        exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = self._score_document(document, data, has_request_terms)
             if match is not None:
-                matches.append(match)
-        matches.sort(
+                exact_matches.append(match)
+        exact_matches.sort(
             key=lambda match: (
                 -match.score,
                 -match.document.updated_at.timestamp(),
@@ -519,8 +546,92 @@ class BuildContextBundle:
                 str(match.document.id),
             ),
         )
+        if len(exact_matches) >= data.limit:
+            return tuple(exact_matches[: data.limit]), False, None
 
-        return tuple(matches[: data.limit])
+        embedding_result = self._resolve_query_embedding(data, organization, project, team)
+        if embedding_result is None:
+            return tuple(exact_matches), False, None
+
+        query_vector = list(embedding_result.embedding)
+        semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
+
+        return (
+            tuple((exact_matches + list(semantic_matches))[: data.limit]),
+            bool(semantic_matches),
+            embedding_result,
+        )
+
+    def _semantic_matches(
+        self,
+        documents: tuple[RetrievalDocument, ...],
+        exact_matches: list[RetrievalMatch],
+        query_vector: list[float],
+    ) -> list[RetrievalMatch]:
+        already_matched = {match.document.id for match in exact_matches}
+        scored: list[tuple[float, RetrievalMatch]] = []
+        for document in documents:
+            if document.id in already_matched or not document.embedding_vector:
+                continue
+            similarity = cosine_similarity(query_vector, list(document.embedding_vector))
+            if similarity < SEMANTIC_MIN_SIMILARITY:
+                continue
+            scored.append(
+                (
+                    similarity,
+                    RetrievalMatch(
+                        document=document,
+                        score=30,
+                        matched_terms=(f'cosine {similarity:.2f}',),
+                        inclusion_reason=f'semantic match: cosine {similarity:.2f}',
+                    ),
+                ),
+            )
+        scored.sort(key=lambda item: -item[0])
+
+        return [match for _similarity, match in scored]
+
+    def _resolve_query_embedding(
+        self,
+        data: ContextBundleInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+    ) -> EmbeddingCallResult | None:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=team.id if team is not None else None,
+                    task_type='embedding',
+                ),
+            )
+            result = FakeProviderGateway().embed(
+                EmbeddingCallInput(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=team.id if team is not None else None,
+                    policy=resolved.policy,
+                    request_id=data.request_id,
+                    trace_id=data.trace_id or data.request_id,
+                    text='\n'.join([data.query, *data.file_paths, *data.symbols]),
+                ),
+            )
+        except ModelPolicyError:
+            return None
+        except ProviderSecretError as error:
+            logger.warning(
+                'context query embedding skipped: provider secret unavailable',
+                organization_id=str(organization.id),
+                project_id=str(project.id),
+                request_id=data.request_id,
+                error=str(error),
+            )
+
+            return None
+
+        return result
 
     def _score_document(
         self,

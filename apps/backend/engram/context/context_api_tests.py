@@ -33,6 +33,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 
 RAW_KEY = 'egk_test_context_0123456789abcdefghijklmnopqrstuvwxyz'
 OTHER_RAW_KEY = 'egk_test_context_other_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -95,6 +96,44 @@ def create_scoped_api_key(
         )
 
     return api_key
+
+
+def create_embedding_policy(
+    organization: Organization,
+    team: Team,
+    project: Project,
+) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team Embedding OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-embedding-secret',
+        hmac_digest='embedding-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
 
 
 def auth_headers(raw_key: str = RAW_KEY) -> dict[str, str]:
@@ -839,3 +878,140 @@ def test_index_memory_version_rejects_refuted_memory() -> None:
         IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     assert RetrievalDocument.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-semantic-1',
+    )
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='color behavior optimization',
+            file_paths=[],
+            symbols=[],
+            limit=5,
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'semantic_fallback'
+    body = response.json()
+    items = body['items']
+    assert len(items) == 1
+    assert items[0]['inclusion_reason'].startswith('semantic match: cosine')
+    assert bundle.metadata['semantic_provider_call_id']
+
+
+@pytest.mark.django_db
+def test_context_bundle_keeps_exact_strategy_when_limit_filled() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation pattern for retrieval fallback.',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-exact-1',
+    )
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+    document = RetrievalDocument.objects.get(memory_version=version)
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='colour',
+            file_paths=[document.file_paths[0]] if document.file_paths else [],
+            symbols=[],
+            limit=5,
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    body = response.json()
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'exact'
+    assert 'semantic_provider_call_id' not in bundle.metadata
+    assert body['items']
+
+
+@pytest.mark.django_db
+def test_context_bundle_skips_semantic_fallback_without_embedding_policy() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation pattern for retrieval fallback.',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-no-embedding-policy-1',
+    )
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='color behavior optimization',
+            file_paths=[],
+            symbols=[],
+            limit=5,
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    body = response.json()
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'exact'
+    assert body['items'] == []
