@@ -1,0 +1,11 @@
+{
+  "source_store_id": "fixture-store",
+  "expected": {
+    "sdk_sessions": 1,
+    "user_prompts": 1,
+    "observations": 1,
+    "session_summaries": 1,
+    "pending_messages": 1,
+    "observation_feedback": 1
+  }
+}

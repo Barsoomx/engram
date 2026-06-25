@@ -1,4 +1,6 @@
+import json
 from pathlib import Path
+import sqlite3
 import unittest
 
 from scripts.repository_layout import REQUIRED_PATHS, missing_paths
@@ -31,6 +33,15 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/engram/hooks/urls.py',
         'apps/backend/engram/hooks/views.py',
         'apps/backend/engram/hooks/hook_ingest_tests.py',
+        'apps/backend/engram/imports/__init__.py',
+        'apps/backend/engram/imports/apps.py',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/manifest.json',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/claude_mem_minimal.sql',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/settings.json',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/transcript-watch.json',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/transcript-watch-state.json',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/corpora/deferred.corpus.json',
+        'apps/backend/engram/imports/fixtures/claude_mem_minimal/vector-db/.keep',
         'apps/backend/engram/memory/apps.py',
         'apps/backend/engram/memory/services.py',
         'apps/backend/engram/memory/tasks.py',
@@ -57,6 +68,54 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
             'apps/backend/engram/memory/management/commands/engram_process_observation_outbox.py',
             REQUIRED_PATHS,
         )
+
+    def test_import_app_is_installed(self) -> None:
+        settings = (ROOT / 'apps/backend/settings/settings.py').read_text(encoding='utf-8')
+
+        self.assertIn("'engram.imports'", settings)
+
+    def test_claude_mem_fixture_is_text_reviewable_and_sanitized(self) -> None:
+        fixture_root = ROOT / 'apps/backend/engram/imports/fixtures/claude_mem_minimal'
+        manifest = json.loads((fixture_root / 'manifest.json').read_text(encoding='utf-8'))
+        sql = (fixture_root / 'claude_mem_minimal.sql').read_text(encoding='utf-8')
+
+        self.assertEqual('fixture-store', manifest['source_store_id'])
+        self.assertEqual(
+            {
+                'sdk_sessions': 1,
+                'user_prompts': 1,
+                'observations': 1,
+                'session_summaries': 1,
+                'pending_messages': 1,
+                'observation_feedback': 1,
+            },
+            manifest['expected'],
+        )
+        self.assertIn('CREATE TABLE sdk_sessions', sql)
+        self.assertIn('CREATE TABLE user_prompts', sql)
+        self.assertIn('CREATE TABLE observations', sql)
+        self.assertIn('CREATE TABLE session_summaries', sql)
+        self.assertIn('CREATE TABLE pending_messages', sql)
+        self.assertIn('CREATE TABLE observation_feedback', sql)
+        self.assertNotIn('SQLite format 3', sql)
+        self.assertEqual(1, sql.count('sk-test_fake_import_token_1234567890'))
+
+        connection = sqlite3.connect(':memory:')
+        try:
+            connection.executescript(sql)
+            for table_name, expected_count in manifest['expected'].items():
+                row_count = connection.execute(f'SELECT COUNT(*) FROM {table_name}').fetchone()[0]
+                self.assertEqual(expected_count, row_count)
+        finally:
+            connection.close()
+
+        fixture_files = [path for path in fixture_root.rglob('*') if path.is_file()]
+        self.assertNotIn('.env', {path.name for path in fixture_files})
+
+        fixture_text = '\n'.join(path.read_text(encoding='utf-8') for path in fixture_files)
+        self.assertNotIn('OPENAI_API_KEY', fixture_text)
+        self.assertNotIn('ANTHROPIC_API_KEY', fixture_text)
+        self.assertNotIn('DATABASE_URL', fixture_text)
 
 
 class BackendComposeContractTests(unittest.TestCase):

@@ -1,0 +1,11 @@
+{
+  "kind": "claude_mem_corpus",
+  "status": "deferred",
+  "entries": [
+    {
+      "id": "fixture-corpus-001",
+      "path": "/workspace/example-repo/docs/example.md",
+      "text": "Synthetic corpus content included only to prove deferred artifact reporting."
+    }
+  ]
+}

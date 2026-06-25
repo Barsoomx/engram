@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "paths": [
+    "/workspace/example-repo/.agent/transcripts"
+  ],
+  "lastScanAt": "2026-06-25T09:05:00Z"
+}
