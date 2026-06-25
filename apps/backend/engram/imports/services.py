@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import UTC
 from pathlib import Path
 from uuid import UUID
 
-from engram.core.models import Organization, Project, ProjectTeam, Team
+from django.db import transaction
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
+
+from engram.core.models import (
+    Agent,
+    AgentSession,
+    CandidateStatus,
+    Memory,
+    MemoryCandidate,
+    Observation,
+    ObservationSource,
+    Organization,
+    Project,
+    ProjectTeam,
+    RawEventEnvelope,
+    Runtime,
+    SessionStatus,
+    Team,
+    VisibilityScope,
+)
+from engram.core.redaction import RedactionResult, redact_value
+from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 
 ImportReport = dict[str, object]
 
@@ -114,6 +139,7 @@ class ClaudeMemImporter:
             schema_versions = self._schema_versions(connection, detected_tables)
             counts = self._count_tables(connection, detected_tables)
             unsupported = self._unsupported_tables(connection, all_tables)
+            import_rows = self._import_rows(connection, detected_tables) if import_input.apply else {}
 
         report['source'] = {
             **report['source'],
@@ -122,6 +148,8 @@ class ClaudeMemImporter:
         }
         report['counts'] = counts
         report['unsupported'] = unsupported + self._unsupported_artifacts(source_root)
+        if import_input.apply:
+            self._apply_import(import_input, import_rows, report)
 
         return report
 
@@ -191,7 +219,10 @@ class ClaudeMemImporter:
         return {table: dict.fromkeys(fields, 0) for table, fields in self._expected_counts.items()}
 
     def _connect_readonly(self, db_path: Path) -> sqlite3.Connection:
-        return sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        connection = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+        connection.row_factory = sqlite3.Row
+
+        return connection
 
     def _detected_tables(self, connection: sqlite3.Connection) -> list[str]:
         cursor = connection.execute(
@@ -287,6 +318,668 @@ class ClaudeMemImporter:
         cursor = connection.execute(query)
 
         return int(cursor.fetchone()[0])
+
+    def _import_rows(
+        self,
+        connection: sqlite3.Connection,
+        detected_tables: list[str],
+    ) -> dict[str, list[dict[str, object]]]:
+        return {
+            'sdk_sessions': self._rows(
+                connection, detected_tables, 'sdk_sessions', 'SELECT * FROM sdk_sessions ORDER BY id'
+            ),
+            'user_prompts': self._rows(
+                connection, detected_tables, 'user_prompts', 'SELECT * FROM user_prompts ORDER BY id'
+            ),
+            'observations': self._rows(
+                connection, detected_tables, 'observations', 'SELECT * FROM observations ORDER BY id'
+            ),
+            'session_summaries': self._rows(
+                connection,
+                detected_tables,
+                'session_summaries',
+                'SELECT * FROM session_summaries ORDER BY id',
+            ),
+        }
+
+    def _rows(
+        self,
+        connection: sqlite3.Connection,
+        detected_tables: list[str],
+        table: str,
+        query: str,
+    ) -> list[dict[str, object]]:
+        if table not in detected_tables:
+            return []
+
+        cursor = connection.execute(query)
+
+        return [dict(row) for row in cursor.fetchall()]
+
+    def _apply_import(
+        self,
+        import_input: ClaudeMemImportInput,
+        rows: dict[str, list[dict[str, object]]],
+        report: ImportReport,
+    ) -> None:
+        organization = Organization.objects.get(id=import_input.organization_id)
+        project = Project.objects.get(organization=organization, id=import_input.project_id)
+        team = None
+        if import_input.team_id is not None:
+            team = Team.objects.get(organization=organization, id=import_input.team_id)
+
+        redacted = False
+        with transaction.atomic():
+            sessions, agents_created, sessions_created, session_duplicates, sessions_redacted = self._import_sessions(
+                import_input,
+                organization,
+                project,
+                team,
+                rows['sdk_sessions'],
+                rows['observations'],
+            )
+            report['created']['agents'] = agents_created
+            report['created']['sessions'] = sessions_created
+            report['duplicates']['sessions'] = session_duplicates
+            redacted = redacted or sessions_redacted
+
+            for prompt in rows['user_prompts']:
+                raw_event, created, prompt_result = self._import_prompt(
+                    import_input,
+                    organization,
+                    project,
+                    team,
+                    sessions,
+                    prompt,
+                )
+                redacted = redacted or prompt_result.redacted
+                if raw_event is None:
+                    continue
+                if created:
+                    report['created']['raw_events'] += 1
+                else:
+                    report['duplicates']['raw_events'] += 1
+
+            for observation in rows['observations']:
+                result = self._import_observation_memory(
+                    import_input,
+                    organization,
+                    project,
+                    team,
+                    sessions,
+                    observation,
+                )
+                redacted = redacted or result['redacted']
+                self._record_memory_result(report, result)
+
+            for summary in rows['session_summaries']:
+                result = self._import_summary_memory(
+                    import_input,
+                    organization,
+                    project,
+                    team,
+                    sessions,
+                    summary,
+                )
+                redacted = redacted or result['redacted']
+                self._record_memory_result(report, result)
+
+        if redacted:
+            report['redactions'] = {'redacted': True}
+
+    def _import_sessions(
+        self,
+        import_input: ClaudeMemImportInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session_rows: list[dict[str, object]],
+        observation_rows: list[dict[str, object]],
+    ) -> tuple[dict[str, AgentSession], int, int, int, bool]:
+        sessions = {}
+        agents_created = 0
+        sessions_created = 0
+        session_duplicates = 0
+        sessions_redacted = False
+        for row in session_rows:
+            runtime = self._runtime(row.get('platform_source'))
+            agent_external_id = self._agent_external_id(import_input, row, observation_rows)
+            branch, branch_metadata = self._session_branch(row)
+            session_metadata_result = redact_value(self._session_metadata(row, branch_metadata))
+            sessions_redacted = sessions_redacted or session_metadata_result.redacted
+            agent, agent_created = Agent.objects.get_or_create(
+                organization=organization,
+                runtime=runtime,
+                external_id=agent_external_id,
+                defaults={
+                    'display_name': agent_external_id,
+                    'metadata': {'source': 'claude_mem_import', 'source_store_id': import_input.source_store_id},
+                },
+            )
+            if agent_created:
+                agents_created += 1
+
+            external_session_id = self._session_source_id(import_input, row['content_session_id'])
+            session, session_created = AgentSession.objects.get_or_create(
+                organization=organization,
+                project=project,
+                external_session_id=external_session_id,
+                defaults={
+                    'team': team,
+                    'agent': agent,
+                    'content_session_id': str(row.get('content_session_id') or ''),
+                    'memory_session_id': str(row.get('memory_session_id') or ''),
+                    'runtime': runtime,
+                    'platform_source': str(row.get('platform_source') or ''),
+                    'repository_root': str(row.get('project') or project.repository_root),
+                    'cwd': str(row.get('project') or project.repository_root),
+                    'branch': branch,
+                    'status': self._session_status(row.get('status')),
+                    'prompt_counter': int(row.get('prompt_counter') or 0),
+                    'metadata': session_metadata_result.value,
+                    'started_at': self._datetime(row.get('started_at')),
+                    'ended_at': self._datetime(row.get('completed_at')),
+                },
+            )
+            if session_created:
+                sessions_created += 1
+            else:
+                session_duplicates += 1
+            sessions[str(row.get('content_session_id') or '')] = session
+            sessions[str(row.get('memory_session_id') or '')] = session
+
+        return sessions, agents_created, sessions_created, session_duplicates, sessions_redacted
+
+    def _import_prompt(
+        self,
+        import_input: ClaudeMemImportInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        sessions: dict[str, AgentSession],
+        row: dict[str, object],
+    ) -> tuple[RawEventEnvelope | None, bool, RedactionResult]:
+        session = sessions.get(str(row.get('content_session_id') or ''))
+        source_id = self._prompt_source_id(import_input, row)
+        payload_result = redact_value(
+            {
+                'source_id': source_id,
+                'content_session_id': row.get('content_session_id'),
+                'prompt_number': row.get('prompt_number'),
+                'prompt_text': row.get('prompt_text'),
+                'created_at': row.get('created_at'),
+            },
+        )
+        if session is None:
+            return None, False, payload_result
+
+        raw_event, created = self._get_or_create_raw_event(
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type='claude_mem.user_prompt',
+            occurred_at=self._datetime(row.get('created_at')),
+            payload=payload_result.value,
+            redacted=payload_result.redacted,
+        )
+
+        return raw_event, created, payload_result
+
+    def _import_observation_memory(
+        self,
+        import_input: ClaudeMemImportInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        sessions: dict[str, AgentSession],
+        row: dict[str, object],
+    ) -> dict[str, object]:
+        source_id = self._observation_source_id(import_input, row)
+        body = str(row.get('text') or '')
+        title = str(row.get('title') or row.get('type') or 'Imported observation')
+        source_metadata = {
+            'source': 'claude_mem_import',
+            'source_id': source_id,
+            'upstream_row_id': row.get('id'),
+            'memory_session_id': row.get('memory_session_id'),
+            'event_type': 'claude_mem.observation',
+            'metadata': self._json_value(row.get('metadata'), {}),
+        }
+        payload_result = redact_value({**row, 'source_id': source_id})
+        observation_result = redact_value(
+            {
+                'title': title,
+                'subtitle': row.get('subtitle') or '',
+                'body': body,
+                'facts': self._json_value(row.get('facts'), []),
+                'narrative': row.get('narrative') or '',
+                'concepts': self._json_value(row.get('concepts'), []),
+                'files_read': self._file_paths(row.get('files_read')),
+                'files_modified': self._file_paths(row.get('files_modified')),
+                'source_metadata': source_metadata,
+            },
+        )
+        session = sessions.get(str(row.get('memory_session_id') or ''))
+
+        return self._import_memory_record(
+            import_input=import_input,
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type='claude_mem.observation',
+            observation_type=str(row.get('type') or 'observation'),
+            occurred_at=self._datetime(row.get('created_at')),
+            prompt_number=row.get('prompt_number'),
+            generated_model=str(row.get('generated_by_model') or ''),
+            payload=payload_result.value,
+            payload_redacted=payload_result.redacted,
+            observation_data=observation_result.value,
+            observation_redacted=observation_result.redacted,
+        )
+
+    def _import_summary_memory(
+        self,
+        import_input: ClaudeMemImportInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        sessions: dict[str, AgentSession],
+        row: dict[str, object],
+    ) -> dict[str, object]:
+        source_id = self._summary_source_id(import_input, row)
+        request = str(row.get('request') or '')
+        title = f'Session summary: {request}'[:255] if request else 'Session summary'
+        body = self._summary_body(row)
+        payload_result = redact_value({**row, 'source_id': source_id})
+        observation_result = redact_value(
+            {
+                'title': title,
+                'subtitle': '',
+                'body': body,
+                'facts': [],
+                'narrative': body,
+                'concepts': ['session_summary'],
+                'files_read': self._file_paths(row.get('files_read')),
+                'files_modified': self._file_paths(row.get('files_edited')),
+                'source_metadata': {
+                    'source': 'claude_mem_import',
+                    'source_id': source_id,
+                    'upstream_row_id': row.get('id'),
+                    'memory_session_id': row.get('memory_session_id'),
+                    'event_type': 'claude_mem.session_summary',
+                },
+            },
+        )
+        session = sessions.get(str(row.get('memory_session_id') or ''))
+
+        return self._import_memory_record(
+            import_input=import_input,
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type='claude_mem.session_summary',
+            observation_type='session_summary',
+            occurred_at=self._datetime(row.get('created_at')),
+            prompt_number=row.get('prompt_number'),
+            generated_model='',
+            payload=payload_result.value,
+            payload_redacted=payload_result.redacted,
+            observation_data=observation_result.value,
+            observation_redacted=observation_result.redacted,
+        )
+
+    def _import_memory_record(
+        self,
+        import_input: ClaudeMemImportInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession | None,
+        source_id: str,
+        event_type: str,
+        observation_type: str,
+        occurred_at: object | None,
+        prompt_number: object,
+        generated_model: str,
+        payload: object,
+        payload_redacted: bool,
+        observation_data: object,
+        observation_redacted: bool,
+    ) -> dict[str, object]:
+        if session is None or not isinstance(observation_data, dict):
+            return self._empty_memory_result(payload_redacted or observation_redacted)
+
+        raw_event, raw_created = self._get_or_create_raw_event(
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type=event_type,
+            occurred_at=occurred_at,
+            payload=payload,
+            redacted=payload_redacted,
+        )
+        content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
+        observation, observation_created = Observation.objects.get_or_create(
+            organization=organization,
+            project=project,
+            session=session,
+            content_hash=content_hash,
+            defaults={
+                'team': team,
+                'agent': session.agent,
+                'raw_event': raw_event,
+                'observation_type': observation_type,
+                'title': str(observation_data.get('title') or '')[:255],
+                'subtitle': str(observation_data.get('subtitle') or '')[:255],
+                'body': str(observation_data.get('body') or ''),
+                'facts': observation_data.get('facts') or [],
+                'narrative': str(observation_data.get('narrative') or ''),
+                'concepts': observation_data.get('concepts') or [],
+                'files_read': observation_data.get('files_read') or [],
+                'files_modified': observation_data.get('files_modified') or [],
+                'prompt_number': int(prompt_number) if prompt_number is not None else None,
+                'generation_key': source_id,
+                'generated_model': generated_model,
+                'redaction_metadata': {'redacted': observation_redacted},
+                'source_metadata': observation_data.get('source_metadata') or {},
+                'observed_at': occurred_at,
+            },
+        )
+        ObservationSource.objects.get_or_create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=raw_event,
+            source_type='claude_mem',
+            source_id=source_id,
+            defaults={
+                'citation': self._source_citation('claude_mem', source_id),
+                'metadata': {'event_type': event_type},
+            },
+        )
+        memory_result = self._promote_imported_observation(
+            import_input,
+            observation,
+            source_id,
+            event_type,
+        )
+
+        return {
+            'redacted': payload_redacted or observation_redacted,
+            'raw_event_created': raw_created,
+            'observation_created': observation_created,
+            **memory_result,
+        }
+
+    def _empty_memory_result(self, redacted: bool) -> dict[str, object]:
+        return {
+            'redacted': redacted,
+            'raw_event_created': False,
+            'observation_created': False,
+            'candidate_created': False,
+            'memory_created': False,
+            'version_created': False,
+            'retrieval_document_created': False,
+        }
+
+    def _get_or_create_raw_event(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+        occurred_at: object | None,
+        payload: object,
+        redacted: bool,
+    ) -> tuple[RawEventEnvelope, bool]:
+        metadata = {'source': 'claude_mem_import'}
+        if redacted:
+            metadata['redaction'] = {'payload': True}
+        raw_event, created = RawEventEnvelope.objects.get_or_create(
+            organization=organization,
+            project=project,
+            idempotency_key=source_id,
+            defaults={
+                'team': team,
+                'agent': session.agent,
+                'session': session,
+                'event_type': event_type,
+                'source_adapter': 'claude_mem',
+                'client_event_id': source_id,
+                'content_hash': self._content_hash(source_id, payload),
+                'runtime': session.runtime,
+                'payload_schema_version': 'v1',
+                'occurred_at': occurred_at,
+                'payload': payload if isinstance(payload, dict) else {'value': payload},
+                'headers': {},
+                'metadata': metadata,
+            },
+        )
+
+        return raw_event, created
+
+    def _promote_imported_observation(
+        self,
+        import_input: ClaudeMemImportInput,
+        observation: Observation,
+        source_id: str,
+        event_type: str,
+    ) -> dict[str, bool]:
+        candidate_hash = self._content_hash('memory-candidate', source_id, observation.content_hash)
+        candidate, candidate_created = MemoryCandidate.objects.get_or_create(
+            organization=observation.organization,
+            project=observation.project,
+            content_hash=candidate_hash,
+            defaults={
+                'team': observation.team,
+                'source_observation': observation,
+                'title': observation.title,
+                'body': observation.body or observation.title,
+                'status': CandidateStatus.PROPOSED,
+                'visibility_scope': VisibilityScope.PROJECT,
+                'evidence': [
+                    {
+                        'source': 'claude_mem_import',
+                        'source_id': source_id,
+                        'event_type': event_type,
+                        'observation_id': str(observation.id),
+                        'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
+                    },
+                ],
+            },
+        )
+        promoted = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+        self._mark_imported_memory(promoted.memory, import_input, source_id, event_type)
+
+        return {
+            'candidate_created': candidate_created,
+            'memory_created': not promoted.duplicate,
+            'version_created': not promoted.duplicate,
+            'retrieval_document_created': not promoted.duplicate,
+        }
+
+    def _mark_imported_memory(
+        self,
+        memory: Memory,
+        import_input: ClaudeMemImportInput,
+        source_id: str,
+        event_type: str,
+    ) -> None:
+        metadata = dict(memory.metadata)
+        metadata.update(
+            {
+                'source': 'claude_mem_import',
+                'source_store_id': import_input.source_store_id,
+                'source_id': source_id,
+                'event_type': event_type,
+            },
+        )
+        if metadata == memory.metadata:
+            return
+
+        memory.metadata = metadata
+        memory.save(update_fields=['metadata', 'updated_at'])
+
+    def _record_memory_result(self, report: ImportReport, result: dict[str, object]) -> None:
+        if result['raw_event_created']:
+            report['created']['raw_events'] += 1
+        else:
+            report['duplicates']['raw_events'] += 1
+        if result['observation_created']:
+            report['created']['observations'] += 1
+        else:
+            report['duplicates']['observations'] += 1
+        if result['candidate_created']:
+            report['created']['memory_candidates'] += 1
+        if result['memory_created']:
+            report['created']['memories'] += 1
+            report['created']['memory_versions'] += 1
+            report['created']['retrieval_documents'] += 1
+        else:
+            report['duplicates']['memories'] += 1
+
+    def _session_source_id(self, import_input: ClaudeMemImportInput, content_session_id: object) -> str:
+        return f'claude-mem:{import_input.source_store_id}:sdk_session:{content_session_id}'
+
+    def _observation_source_id(self, import_input: ClaudeMemImportInput, row: dict[str, object]) -> str:
+        return f'claude-mem:{import_input.source_store_id}:observation:{row.get("memory_session_id")}:{row.get("id")}'
+
+    def _summary_source_id(self, import_input: ClaudeMemImportInput, row: dict[str, object]) -> str:
+        return (
+            f'claude-mem:{import_input.source_store_id}:session_summary:{row.get("memory_session_id")}:{row.get("id")}'
+        )
+
+    def _prompt_source_id(self, import_input: ClaudeMemImportInput, row: dict[str, object]) -> str:
+        return (
+            f'claude-mem:{import_input.source_store_id}:user_prompt:'
+            f'{row.get("content_session_id")}:{row.get("prompt_number")}:{row.get("id")}'
+        )
+
+    def _runtime(self, value: object) -> str:
+        normalized = str(value or '').strip().lower()
+        if normalized in {'codex', Runtime.CODEX}:
+            return Runtime.CODEX
+        if normalized in {'claude', 'claude_code', 'claude-code', Runtime.CLAUDE_CODE}:
+            return Runtime.CLAUDE_CODE
+
+        return Runtime.UNKNOWN
+
+    def _agent_external_id(
+        self,
+        import_input: ClaudeMemImportInput,
+        session_row: dict[str, object],
+        observation_rows: list[dict[str, object]],
+    ) -> str:
+        memory_session_id = session_row.get('memory_session_id')
+        for row in observation_rows:
+            if row.get('memory_session_id') == memory_session_id and row.get('agent_id'):
+                return str(row['agent_id'])
+
+        return f'claude_mem:{import_input.source_store_id}'
+
+    def _session_status(self, value: object) -> str:
+        status = str(value or '').strip().lower()
+        if status == 'completed':
+            return SessionStatus.ENDED
+        if status == 'failed':
+            return SessionStatus.ERRORED
+
+        return SessionStatus.ACTIVE
+
+    def _session_branch(self, row: dict[str, object]) -> tuple[str, dict[str, object]]:
+        upstream_metadata = self._upstream_session_metadata(row)
+        for key in ('branch', 'git_branch', 'repository_branch'):
+            branch = str(upstream_metadata.get(key) or '').strip()
+            if branch:
+                return branch[:255], {'upstream_branch_source': key}
+
+        return '', {'upstream_branch_unavailable': True}
+
+    def _session_metadata(self, row: dict[str, object], branch_metadata: dict[str, object]) -> dict[str, object]:
+        metadata = {
+            'source': 'claude_mem_import',
+            'upstream_id': row.get('id'),
+            'custom_title': row.get('custom_title') or '',
+            'user_prompt': row.get('user_prompt') or '',
+            **branch_metadata,
+        }
+        upstream_metadata = self._upstream_session_metadata(row)
+        if upstream_metadata:
+            metadata['upstream_metadata'] = upstream_metadata
+
+        return metadata
+
+    def _upstream_session_metadata(self, row: dict[str, object]) -> dict[str, object]:
+        metadata = self._json_value(row.get('metadata'), {})
+        if not isinstance(metadata, dict):
+            return {}
+
+        return metadata
+
+    def _datetime(self, value: object) -> object | None:
+        if not value:
+            return None
+        parsed = parse_datetime(str(value))
+        if parsed is None:
+            return None
+        if timezone.is_naive(parsed):
+            return timezone.make_aware(parsed, UTC)
+
+        return parsed
+
+    def _json_value(self, value: object, default: object) -> object:
+        if value in (None, ''):
+            return default
+        try:
+            return json.loads(str(value))
+        except json.JSONDecodeError:
+            return default
+
+    def _file_paths(self, value: object) -> list[str]:
+        raw_items = self._json_value(value, [])
+        if not isinstance(raw_items, list):
+            return []
+
+        paths = []
+        for item in raw_items:
+            if isinstance(item, dict):
+                path = str(item.get('path') or '').strip()
+            else:
+                path = str(item).strip()
+            if path:
+                paths.append(path)
+
+        return paths
+
+    def _summary_body(self, row: dict[str, object]) -> str:
+        sections = [
+            ('Request', row.get('request')),
+            ('Investigated', row.get('investigated')),
+            ('Learned', row.get('learned')),
+            ('Completed', row.get('completed')),
+            ('Next steps', row.get('next_steps')),
+            ('Notes', row.get('notes')),
+        ]
+
+        return '\n\n'.join(f'{label}: {value}' for label, value in sections if value)
+
+    def _content_hash(self, *values: object) -> str:
+        serialized = json.dumps(values, sort_keys=True, default=str, separators=(',', ':'))
+
+        return hashlib.sha256(serialized.encode()).hexdigest()
+
+    def _source_citation(self, source_type: str, source_id: str) -> str:
+        return f'{source_type}:{hashlib.sha256(source_id.encode()).hexdigest()[:16]}'
 
     def _unsupported_artifacts(self, source_root: Path) -> list[dict[str, str]]:
         unsupported = []
