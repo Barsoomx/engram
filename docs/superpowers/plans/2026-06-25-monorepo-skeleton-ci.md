@@ -97,7 +97,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 2: Run the layout test and verify red**
 
-Run: `python -m unittest tests.repository.test_repository_layout -v`
+Run: `python3 -m unittest tests.repository.test_repository_layout -v`
 
 Expected: fails with `ModuleNotFoundError` or missing path assertions.
 
@@ -153,11 +153,11 @@ the later activation gate. Keep all files short and specific to their path.
 
 - [ ] **Step 5: Run the layout test and script**
 
-Run: `python -m unittest tests.repository.test_repository_layout -v`
+Run: `python3 -m unittest tests.repository.test_repository_layout -v`
 
 Expected: `OK`.
 
-Run: `python scripts/repository_layout.py`
+Run: `python3 scripts/repository_layout.py`
 
 Expected: exit `0` with no output.
 
@@ -237,7 +237,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 2: Run the quality tests and verify red**
 
-Run: `python -m unittest tests.repository.test_repository_quality -v`
+Run: `python3 -m unittest tests.repository.test_repository_quality -v`
 
 Expected: fails with `ModuleNotFoundError` or missing function errors.
 
@@ -253,11 +253,11 @@ not contain the scanned markers as contiguous text.
 
 - [ ] **Step 4: Run quality tests and local scan**
 
-Run: `python -m unittest tests.repository.test_repository_quality -v`
+Run: `python3 -m unittest tests.repository.test_repository_quality -v`
 
 Expected: `OK`.
 
-Run: `python scripts/repository_quality.py`
+Run: `python3 scripts/repository_quality.py`
 
 Expected: exit `0` with no findings.
 
@@ -278,8 +278,8 @@ git commit -m "test: add repository quality scanner"
 **Interfaces:**
 
 - Consumes: `.github/workflows/repository-quality.yml`
-- Produces: workflow steps that run `python scripts/repository_layout.py`,
-  `python scripts/repository_quality.py`, and `python -m unittest discover -s tests`.
+- Produces: workflow steps that run `python3 scripts/repository_layout.py`,
+  `python3 scripts/repository_quality.py`, and `python3 -m unittest discover -s tests`.
 
 - [ ] **Step 1: Write failing workflow test**
 
@@ -297,9 +297,9 @@ class RepositoryQualityWorkflowTests(unittest.TestCase):
             encoding='utf-8',
         )
 
-        self.assertIn('python scripts/repository_layout.py', workflow)
-        self.assertIn('python scripts/repository_quality.py', workflow)
-        self.assertIn('python -m unittest discover -s tests', workflow)
+        self.assertIn('python3 scripts/repository_layout.py', workflow)
+        self.assertIn('python3 scripts/repository_quality.py', workflow)
+        self.assertIn('python3 -m unittest discover -s tests', workflow)
 
     def test_workflow_does_not_use_brittle_shell_grep(self) -> None:
         workflow = (ROOT / '.github/workflows/repository-quality.yml').read_text(
@@ -315,7 +315,7 @@ if __name__ == '__main__':
 
 - [ ] **Step 2: Run workflow test and verify red**
 
-Run: `python -m unittest tests.repository.test_repository_quality_workflow -v`
+Run: `python3 -m unittest tests.repository.test_repository_quality_workflow -v`
 
 Expected: fails because the workflow still contains the old shell scan and does
 not call the new scripts.
@@ -326,22 +326,22 @@ Replace the brittle shell scan with three script-backed steps:
 
 ```yaml
       - name: Check required repository layout
-        run: python scripts/repository_layout.py
+        run: python3 scripts/repository_layout.py
 
       - name: Check repository text quality
-        run: python scripts/repository_quality.py
+        run: python3 scripts/repository_quality.py
 
       - name: Run repository tests
-        run: python -m unittest discover -s tests
+        run: python3 -m unittest discover -s tests
 ```
 
 - [ ] **Step 4: Run workflow test and full local checks**
 
-Run: `python -m unittest tests.repository.test_repository_quality_workflow -v`
+Run: `python3 -m unittest tests.repository.test_repository_quality_workflow -v`
 
 Expected: `OK`.
 
-Run: `python -m unittest discover -s tests -v`
+Run: `python3 -m unittest discover -s tests -v`
 
 Expected: `OK`.
 
@@ -376,9 +376,9 @@ Record branch, scope, commands, exit codes, and first decisive failure if any.
 Run:
 
 ```bash
-python scripts/repository_layout.py
-python scripts/repository_quality.py
-python -m unittest discover -s tests -v
+python3 scripts/repository_layout.py
+python3 scripts/repository_quality.py
+python3 -m unittest discover -s tests -v
 git diff --check HEAD
 ```
 
