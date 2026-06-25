@@ -397,6 +397,75 @@ def test_session_start_replay_returns_existing_bundle_without_duplicate_audit() 
 
 
 @pytest.mark.django_db
+def test_session_start_replay_denies_existing_bundle_outside_current_team_scope() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=other_team, project=project)
+    other_owner = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-context-security',
+        display_name='Security context service account',
+    )
+    role = Role.objects.get(code='developer')
+    OrganizationMembership.objects.create(organization=organization, identity=other_owner, role=role)
+    ProjectGrant.objects.create(organization=organization, project=project, identity=other_owner, role=role)
+    hidden_memory, _hidden_version, _hidden_document = create_approved_memory_document(
+        organization,
+        other_team,
+        project,
+        title='Security-only memory',
+        body='Replay collisions must not reveal this security-team memory.',
+        visibility_scope=VisibilityScope.TEAM,
+        exact_terms=['security replay collision'],
+    )
+    create_scoped_api_key(
+        organization,
+        other_team,
+        project,
+        other_owner,
+        raw_key=OTHER_RAW_KEY,
+        capabilities=('memories:read',),
+    )
+    client = APIClient()
+
+    first = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            other_team,
+            request_id='request-cross-team-replay',
+            query='security replay collision',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(OTHER_RAW_KEY),
+    )
+    second = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-cross-team-replay',
+            query='security replay collision',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 200
+    assert [item['memory_id'] for item in first.json()['items']] == [str(hidden_memory.id)]
+    assert second.status_code == 403
+    assert second.json()['code'] == 'team_scope_denied'
+    assert str(hidden_memory.id) not in str(second.json())
+    assert ContextBundle.objects.count() == 1
+    assert ContextBundleItem.objects.count() == 1
+
+
+@pytest.mark.django_db
 def test_session_start_redacts_token_shaped_query_before_persisting_bundle() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_approved_memory_document(organization, team, project)
@@ -419,6 +488,52 @@ def test_session_start_redacts_token_shaped_query_before_persisting_bundle() -> 
 
     assert RAW_KEY not in bundle.query_text
     assert '[REDACTED]' in bundle.query_text
+
+
+@pytest.mark.django_db
+def test_session_start_redacts_token_shaped_memory_and_match_values_before_response_or_item_metadata() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    leaked_token = 'egk_memory_secret_0123456789abcdefghijklmnopqrstuvwxyz'
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title=f'Redact memory {leaked_token}',
+        body=f'Memory body contains {leaked_token}.',
+        file_paths=[],
+        symbols=[],
+        exact_terms=[f'match {leaked_token}'],
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-redacted-memory',
+            query=f'match {leaked_token}',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    bundle = ContextBundle.objects.get()
+    item = ContextBundleItem.objects.get()
+
+    assert body['items'][0]['memory_id'] == str(memory.id)
+    assert leaked_token not in str(body)
+    assert leaked_token not in bundle.rendered_text
+    assert leaked_token not in item.inclusion_reason
+    assert leaked_token not in str(item.metadata)
+    assert '[REDACTED]' in str(body)
+    assert '[REDACTED]' in bundle.rendered_text
+    assert '[REDACTED]' in item.inclusion_reason
+    assert '[REDACTED]' in str(item.metadata)
 
 
 @pytest.mark.django_db
@@ -529,6 +644,34 @@ def test_index_memory_version_rejects_non_approved_memory() -> None:
         version=1,
         body=memory.body,
         content_hash='memory-archived-version-hash',
+    )
+
+    with pytest.raises(ContextIndexError):
+        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    assert RetrievalDocument.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_index_memory_version_rejects_refuted_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Refuted memory',
+        body='Refuted memory must not be indexed.',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        refuted=True,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='memory-refuted-version-hash',
     )
 
     with pytest.raises(ContextIndexError):
