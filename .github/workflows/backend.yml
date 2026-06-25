@@ -53,6 +53,9 @@ jobs:
         working-directory: apps/backend
         run: poetry run pytest -v
 
+      - name: Run CLI tests
+        run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v
+
       - name: Check repository layout
         run: python3 scripts/repository_layout.py
 

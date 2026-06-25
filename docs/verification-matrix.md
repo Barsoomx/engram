@@ -314,3 +314,51 @@ First decisive failures fixed during the TDD loop:
   regression now covers candidate title, body, and evidence redaction.
 - Focused lint first failed on a test sentinel path containing `/tmp/`; the
   sentinel now uses a repo-shaped path.
+
+## 2026-06-25: CLI Lifecycle
+
+Branch: `feat/parity-11-cli-lifecycle`
+
+Scope:
+
+- `packages/cli/*`
+- `.github/workflows/backend.yml`
+- `.github/workflows/repository-quality.yml`
+- `scripts/repository_layout.py`
+- `tests/repository/test_repository_layout.py`
+- `tests/repository/test_backend_workflow.py`
+- `tests/repository/test_repository_quality_workflow.py`
+- `docs/superpowers/specs/2026-06-25-cli-lifecycle-design.md`
+- `docs/superpowers/plans/2026-06-25-cli-lifecycle.md`
+- `docs/verification-matrix.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-11-cli-lifecycle` plus pre-existing unstaged `.gitignore` edit. |
+| CLI lifecycle tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend and Repository Quality | yes | pass | Exit 0. Ran 13 tests for connect, doctor, disconnect, redaction, dry-run failure, hook manifests, and strict credential file mode. |
+| CLI syntax | `python3 -m compileall packages/cli/engram_cli` | none yet | yes | pass | Exit 0. Compiled the package without syntax errors. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. CLI package metadata, command modules, and lifecycle tests are required paths. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests, including workflow assertions that both CI jobs run CLI tests. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 79 backend tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. |
+| migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied migrations against the test database. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Exit 1. Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
+
+First decisive failures fixed during the TDD loop:
+
+- CLI unittest discovery first exited 5 with zero tests because the new
+  `engram_cli` directory was not importable; the package marker now lets
+  discovery reach the intended missing-interface failure.
+- CLI tests next failed with `ImportError: cannot import name 'main' from
+  'engram_cli'`, proving production command code was not present before the
+  tests.
+- A redaction regression first failed because a server error detail echoing the
+  submitted API key was printed verbatim; CLI error rendering now redacts the
+  active credential in `connect` and `doctor`.
+- Root repository tests first failed because CLI package paths and CI commands
+  were not part of the layout/workflow contracts.
