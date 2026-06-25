@@ -565,3 +565,46 @@ First decisive failures fixed during this checkpoint:
   validation error on oversized `AuditEvent.correlation_id`; context serializer
   caps now reject oversized `agent_version`, `agent_external_id`,
   `correlation_id`, `trace_id`, and `branch` before records are created.
+
+## 2026-06-25: Memory Feedback Loop
+
+Branch: `feat/memory-feedback-loop`
+
+Implementation review SHA:
+`3884f0dd16c56a481e9b340dc5695572b066d55a`
+
+Scope:
+
+- `apps/backend/engram/memory/serializers.py`
+- `apps/backend/engram/memory/services.py`
+- `apps/backend/engram/memory/views.py`
+- `apps/backend/engram/memory/urls.py`
+- `apps/backend/engram/memory/memory_feedback_tests.py`
+- `apps/backend/settings/urls.py`
+- `docs/superpowers/specs/2026-06-25-memory-feedback-loop-design.md`
+- `docs/superpowers/plans/2026-06-25-memory-feedback-loop.md`
+- `docs/security/reviews/2026-06-25-memory-feedback-loop.md`
+- `docs/verification-matrix.md`
+
+This checkpoint proves only the backend stale/refuted memory feedback loop:
+authorized `memories:review` callers can mark memory stale or refuted, the
+retrieval projection flags are updated, audit metadata is redacted, and future
+context retrieval excludes corrected memory. It does not prove frontend/admin
+review UI, MCP `memory.feedback`, daily curator jobs, provider/model-policy
+calls, semantic/vector retrieval, or broader memory quality workflows.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch`; `git rev-parse HEAD`; `git rev-parse origin/master`; `git rev-parse upstream` | none | yes | pass | Exit 0. Branch was `feat/memory-feedback-loop`; head was `3884f0dd16c56a481e9b340dc5695572b066d55a`; `origin/master` was `9967f2156e3126f225745ea9bdfff114ec7ac2ff`; `upstream` was `3fe0725a97e18b5edf3e61cde60e181ab2b6c997`. |
+| focused memory feedback tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/memory/memory_feedback_tests.py -v"` | Backend equivalent | yes | pass | Exit 0. Reported 6 passed, covering stale/refuted updates, future context exclusion, missing `memories:review`, project-scope denial, project-visible memory correction, oversized reason rejection, audit target/capability, and raw key redaction. |
+| adjacent context/access tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/context/context_api_tests.py engram/access/access_scope_tests.py -v"` | Backend equivalent | yes | pass | Exit 0. Reported 37 passed, covering retrieval filters, team/project scope denial, key capability narrowing, and access audit scope filters. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v"` | Backend | yes | pass | Exit 0. Reported 129 passed. |
+| backend lint and format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Ruff check reported `All checks passed!`; format check reported 68 files already formatted. |
+| migration apply and freshness | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend | yes | pass | Exit 0. Migrations applied against Compose PostgreSQL and `makemigrations --check --dry-run` reported `No changes detected`. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Compose started, host CLI connected, hook observation submitted, relayed memory candidate promoted, future session context returned, and Compose stopped. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no findings. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no findings. |
+| focused security review | Manual diff/readback plus command evidence recorded in `docs/security/reviews/2026-06-25-memory-feedback-loop.md` | none | yes | pass | SECURITY APPROVED for the backend stale/refuted feedback checkpoint. CRITICAL none, IMPORTANT none, MINOR none. |
+
+No decisive verification failures occurred during this Task 2 evidence run.
