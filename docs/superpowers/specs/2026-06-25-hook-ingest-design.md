@@ -62,7 +62,9 @@ Create `engram.hooks` with:
 - one domain service for durable hook-event ingest.
 
 All views authenticate using `Authorization: Bearer <api-key>`. The raw key is
-never stored in models, audit rows, responses, logs, or outbox payloads.
+never stored in models, audit rows, responses, logs, or outbox payloads. Hook
+payload and observation text are redacted before persistence for obvious
+secret-bearing keys and token-shaped values.
 
 ## Request Contract
 
@@ -114,8 +116,13 @@ Hook event request:
 }
 ```
 
-The server treats `project_id`, `team_id`, and all scope fields as hints. The
-effective authorization scope comes from the API key resolver.
+The `payload` field must be a JSON object. The server treats `project_id`,
+`team_id`, and all scope fields as hints. The effective authorization scope
+comes from the API key resolver. If a key is bound to one team and the request
+omits `team_id`, accepted durable rows use the key-bound team.
+The `observation` object is optional. Thin hooks may send only raw tool/session
+metadata; the server creates a deterministic observation shell when no
+normalized observation is supplied.
 
 ## Response Contract
 
@@ -172,28 +179,34 @@ Error responses use stable codes:
 
 1. resolves API-key scope with required capability `observations:write`;
 2. rejects requested projects/teams outside the resolved scope;
-3. creates or updates an `Agent` for runtime/external id;
-4. creates or updates an `AgentSession` for project/session id;
-5. writes `RawEventEnvelope`;
-6. writes a normalized `Observation`;
-7. writes an `ObservationSource` linking the observation to the raw event;
-8. writes an `OutboxEvent` for later worker processing;
-9. returns existing durable rows on duplicate idempotency without duplicate
+3. derives durable team ownership from the resolved scope when omitted by the
+   request;
+4. redacts secret-shaped hook payload and observation fields before persistence;
+5. creates or updates an `Agent` for runtime/external id;
+6. creates or updates an `AgentSession` for project/session id;
+7. writes `RawEventEnvelope`;
+8. writes a normalized `Observation`;
+9. writes an `ObservationSource` linking the observation to the raw event;
+10. writes an `OutboxEvent` for later worker processing;
+11. returns existing durable rows on duplicate idempotency without duplicate
    side effects.
 
 The transaction boundary covers raw event, observation, source, and outbox
-write. The API never relies on Celery delivery as proof of acceptance.
+write. If a concurrent duplicate insert reaches a database uniqueness
+constraint first, the service reloads the existing rows and returns
+`duplicate: true`. The API never relies on Celery delivery as proof of
+acceptance.
 
 ## Observation Normalization
 
-This checkpoint does not call a model provider. It stores a deterministic,
-client-supplied normalized observation envelope:
+This checkpoint does not call a model provider. It stores a deterministic
+observation shell from accepted hook payloads:
 
-- `observation.type` -> `Observation.observation_type`;
-- `observation.title` -> `Observation.title`;
-- `observation.body` -> `Observation.body`;
-- `observation.files_read` and `observation.files_modified` -> matching JSON
-  fields;
+- if supplied, `observation.type` -> `Observation.observation_type`;
+- if supplied, `observation.title` -> `Observation.title`;
+- if supplied, `observation.body` -> `Observation.body`;
+- if supplied, `observation.files_read` and `observation.files_modified` ->
+  matching JSON fields;
 - missing title falls back to event type and tool name.
 
 The later worker checkpoint may refine observations and generate memory
@@ -216,6 +229,7 @@ This slice defers:
 - retrieval and context bundle assembly;
 - CLI `connect`, `doctor`, `disconnect`;
 - Claude Code/Codex adapter packages;
+- request signatures and managed hook trust signing;
 - worker handlers and memory candidate generation;
 - provider calls, embeddings, semantic search, and context packing;
 - offline retry envelope storage.
@@ -228,11 +242,17 @@ Tests must prove behavior:
 - missing/invalid/denied API keys return stable errors;
 - post-tool-use creates agent, session, raw event, observation, source, and
   outbox in one accepted request;
+- post-tool-use accepts a thin payload without `observation` and creates a
+  deterministic observation shell server-side;
+- hook payload and observation text redact obvious API keys, bearer tokens,
+  provider keys, secrets, and passwords before persistence;
+- key-bound team scope is preserved when the request omits `team_id`;
 - duplicate idempotency returns existing ids without new durable rows;
 - same session/event id replay is duplicate-safe;
+- database uniqueness races on replay return existing rows instead of HTTP 500;
 - cross-project and cross-team requests are denied before any event rows are
   written;
-- malformed payloads return HTTP 400;
+- malformed payloads and non-object `payload` values return HTTP 400;
 - session-end marks the session ended and writes a durable observation/outbox;
 - audit/outbox payloads do not include raw API keys.
 

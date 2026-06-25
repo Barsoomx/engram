@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'engram.core',
     'engram.access',
+    'engram.hooks',
     'engram.health',
 ]
 

@@ -1,0 +1,485 @@
+from __future__ import annotations
+
+import re
+import uuid
+from dataclasses import dataclass
+
+from django.db import IntegrityError, transaction
+from django.utils import timezone
+
+from engram.access.services import EffectiveScope, ResolveApiKeyScope
+from engram.core.models import (
+    Agent,
+    AgentSession,
+    Observation,
+    ObservationSource,
+    Organization,
+    OutboxEvent,
+    Project,
+    RawEventEnvelope,
+    SessionStatus,
+    Team,
+)
+
+REDACTED_VALUE = '[REDACTED]'
+SENSITIVE_KEY_MARKERS = (
+    'apikey',
+    'authorization',
+    'accesskey',
+    'password',
+    'privatekey',
+    'providerkey',
+    'secret',
+    'token',
+)
+SECRET_STRING_RE = re.compile(
+    r'(?i)(sk-[a-z0-9][a-z0-9_-]{8,}|egk_[a-z0-9][a-z0-9_-]{8,}|bearer\s+[a-z0-9._~+/=-]{12,})',
+)
+
+
+@dataclass(frozen=True)
+class HookDryRunInput:
+    raw_key: str
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    agent_runtime: str
+    agent_version: str
+    request_id: str
+
+
+@dataclass(frozen=True)
+class HookDryRunResult:
+    request_id: str
+    scope: EffectiveScope
+
+
+@dataclass(frozen=True)
+class HookEventInput:
+    raw_key: str
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    agent_runtime: str
+    agent_version: str
+    agent_external_id: str
+    session_id: str
+    event_id: str
+    idempotency_key: str
+    event_type: str
+    payload_schema_version: str
+    sequence_number: int | None
+    occurred_at: object | None
+    content_hash: str
+    request_id: str
+    correlation_id: str
+    trace_id: str
+    repository_url: str
+    repository_root: str
+    branch: str
+    cwd: str
+    payload: dict[str, object]
+    observation: dict[str, object]
+
+
+@dataclass(frozen=True)
+class HookIngestResult:
+    request_id: str
+    raw_event: RawEventEnvelope
+    observation: Observation
+    outbox_event: OutboxEvent
+    session: AgentSession
+    duplicate: bool
+
+
+@dataclass(frozen=True)
+class RedactionResult:
+    value: object
+    redacted: bool
+
+
+class VerifyHookDryRun:
+    def execute(self, data: HookDryRunInput) -> HookDryRunResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='observations:write',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            target_type='hook_dry_run',
+            target_id=data.agent_runtime,
+        )
+
+        return HookDryRunResult(request_id=data.request_id, scope=scope)
+
+
+class IngestHookEvent:
+    def execute(self, data: HookEventInput) -> HookIngestResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='observations:write',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='hook_event',
+            target_id=data.event_id,
+        )
+        organization = Organization.objects.get(id=scope.organization_id)
+        project = Project.objects.get(organization=organization, id=data.project_id)
+        team = self._resolve_team(organization, data.team_id, scope)
+        duplicate = self._find_duplicate(organization, project, data)
+        if duplicate is not None:
+            return self._existing_result(duplicate)
+        payload_result = redact_hook_value(data.payload)
+        redacted_payload = payload_result.value if isinstance(payload_result.value, dict) else {}
+
+        try:
+            with transaction.atomic():
+                agent = self._get_or_create_agent(organization, data)
+                session = self._get_or_create_session(organization, project, team, agent, data)
+                if data.event_type == 'session_end':
+                    session.status = SessionStatus.ENDED
+                    session.ended_at = data.occurred_at or timezone.now()
+                    session.save(update_fields=['status', 'ended_at', 'updated_at'])
+
+                raw_event = RawEventEnvelope.objects.create(
+                    organization=organization,
+                    project=project,
+                    team=team,
+                    agent=agent,
+                    session=session,
+                    event_type=data.event_type,
+                    source_adapter=data.agent_runtime,
+                    client_event_id=data.event_id,
+                    idempotency_key=data.idempotency_key,
+                    content_hash=data.content_hash,
+                    runtime=data.agent_runtime,
+                    payload_schema_version=data.payload_schema_version,
+                    sequence_number=data.sequence_number,
+                    occurred_at=data.occurred_at,
+                    payload=redacted_payload,
+                    headers={},
+                    request_id=data.request_id,
+                    correlation_id=data.correlation_id,
+                    trace_id=data.trace_id,
+                    actor_type=scope.actor_type,
+                    actor_id=scope.actor_id,
+                    metadata=self._raw_event_metadata(data, payload_result),
+                )
+                observation = self._get_or_create_observation(
+                    organization,
+                    project,
+                    team,
+                    agent,
+                    session,
+                    raw_event,
+                    data,
+                    redacted_payload,
+                )
+                ObservationSource.objects.get_or_create(
+                    organization=organization,
+                    project=project,
+                    observation=observation,
+                    raw_event=raw_event,
+                    source_type='hook_event',
+                    source_id=data.event_id,
+                    defaults={'citation': data.event_id, 'metadata': {'event_type': data.event_type}},
+                )
+                outbox_event = self._get_or_create_outbox(
+                    organization,
+                    project,
+                    team,
+                    scope,
+                    raw_event,
+                    observation,
+                    data,
+                )
+
+                return HookIngestResult(
+                    request_id=data.request_id,
+                    raw_event=raw_event,
+                    observation=observation,
+                    outbox_event=outbox_event,
+                    session=session,
+                    duplicate=False,
+                )
+        except IntegrityError:
+            duplicate = self._find_duplicate(organization, project, data)
+            if duplicate is not None:
+                return self._existing_result(duplicate)
+
+            raise
+
+    def _resolve_team(
+        self,
+        organization: Organization,
+        team_id: uuid.UUID | None,
+        scope: EffectiveScope,
+    ) -> Team | None:
+        selected_team_id = team_id
+        if selected_team_id is None and len(scope.team_ids) == 1:
+            selected_team_id = scope.team_ids[0]
+        if selected_team_id is None:
+            return None
+
+        return Team.objects.get(organization=organization, id=selected_team_id)
+
+    def _raw_event_metadata(self, data: HookEventInput, payload_result: RedactionResult) -> dict[str, object]:
+        metadata: dict[str, object] = {
+            'repository_url': data.repository_url,
+            'repository_root': data.repository_root,
+            'branch': data.branch,
+            'cwd': data.cwd,
+        }
+        if payload_result.redacted:
+            metadata['redaction'] = {'payload': True}
+
+        return metadata
+
+    def _find_duplicate(
+        self,
+        organization: Organization,
+        project: Project,
+        data: HookEventInput,
+    ) -> RawEventEnvelope | None:
+        duplicate = RawEventEnvelope.objects.filter(
+            organization=organization,
+            project=project,
+            idempotency_key=data.idempotency_key,
+        ).first()
+        if duplicate is not None:
+            return duplicate
+
+        session = AgentSession.objects.filter(
+            organization=organization,
+            project=project,
+            external_session_id=data.session_id,
+        ).first()
+        if session is None:
+            return None
+
+        return RawEventEnvelope.objects.filter(
+            organization=organization,
+            project=project,
+            session=session,
+            client_event_id=data.event_id,
+        ).first()
+
+    def _existing_result(self, raw_event: RawEventEnvelope) -> HookIngestResult:
+        observation = raw_event.observations.order_by('created_at').first()
+        if observation is None:
+            observation = Observation.objects.get(
+                organization=raw_event.organization,
+                project=raw_event.project,
+                session=raw_event.session,
+                content_hash=raw_event.content_hash,
+            )
+        outbox_event = OutboxEvent.objects.get(
+            organization=raw_event.organization,
+            project=raw_event.project,
+            event_type='ObservationRecorded',
+            source_type='hook_event',
+            source_id=raw_event.client_event_id,
+            idempotency_key=raw_event.idempotency_key,
+        )
+
+        return HookIngestResult(
+            request_id=raw_event.request_id,
+            raw_event=raw_event,
+            observation=observation,
+            outbox_event=outbox_event,
+            session=raw_event.session,
+            duplicate=True,
+        )
+
+    def _get_or_create_agent(self, organization: Organization, data: HookEventInput) -> Agent:
+        external_id = data.agent_external_id or f'{data.agent_runtime}:default'
+        agent, _created = Agent.objects.get_or_create(
+            organization=organization,
+            runtime=data.agent_runtime,
+            external_id=external_id,
+            defaults={'version': data.agent_version, 'display_name': external_id},
+        )
+        if data.agent_version and agent.version != data.agent_version:
+            agent.version = data.agent_version
+            agent.save(update_fields=['version', 'updated_at'])
+
+        return agent
+
+    def _get_or_create_session(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        agent: Agent,
+        data: HookEventInput,
+    ) -> AgentSession:
+        session, _created = AgentSession.objects.get_or_create(
+            organization=organization,
+            project=project,
+            external_session_id=data.session_id,
+            defaults={
+                'team': team,
+                'agent': agent,
+                'runtime': data.agent_runtime,
+                'platform_source': data.agent_runtime,
+                'repository_url': data.repository_url,
+                'repository_root': data.repository_root,
+                'branch': data.branch,
+                'cwd': data.cwd,
+                'started_at': data.occurred_at or timezone.now(),
+            },
+        )
+        update_fields = []
+        for field, value in (
+            ('team', team),
+            ('agent', agent),
+            ('runtime', data.agent_runtime),
+            ('platform_source', data.agent_runtime),
+            ('repository_url', data.repository_url),
+            ('repository_root', data.repository_root),
+            ('branch', data.branch),
+            ('cwd', data.cwd),
+        ):
+            if getattr(session, field) != value:
+                setattr(session, field, value)
+                update_fields.append(field)
+        if update_fields:
+            update_fields.append('updated_at')
+            session.save(update_fields=update_fields)
+
+        return session
+
+    def _get_or_create_observation(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        agent: Agent,
+        session: AgentSession,
+        raw_event: RawEventEnvelope,
+        data: HookEventInput,
+        payload: dict[str, object],
+    ) -> Observation:
+        observation_data = data.observation
+        observation_type = str(observation_data.get('type') or data.event_type)
+        title = str(observation_data.get('title') or self._fallback_title(data, payload))
+        redacted_title = redact_hook_value(title)
+        redacted_body = redact_hook_value(str(observation_data.get('body') or ''))
+        redacted_files_read = redact_hook_value(list(observation_data.get('files_read') or []))
+        redacted_files_modified = redact_hook_value(list(observation_data.get('files_modified') or []))
+        redacted = (
+            redacted_title.redacted
+            or redacted_body.redacted
+            or redacted_files_read.redacted
+            or redacted_files_modified.redacted
+        )
+        observation, created = Observation.objects.get_or_create(
+            organization=organization,
+            project=project,
+            session=session,
+            content_hash=data.content_hash,
+            defaults={
+                'team': team,
+                'agent': agent,
+                'raw_event': raw_event,
+                'observation_type': observation_type,
+                'title': str(redacted_title.value)[:255],
+                'body': str(redacted_body.value),
+                'files_read': list(redacted_files_read.value),
+                'files_modified': list(redacted_files_modified.value),
+                'redaction_metadata': {'redacted': True} if redacted else {},
+                'source_metadata': {'event_type': data.event_type},
+                'observed_at': data.occurred_at,
+            },
+        )
+        if created:
+            return observation
+        if observation.raw_event_id is None:
+            observation.raw_event = raw_event
+            observation.save(update_fields=['raw_event', 'updated_at'])
+
+        return observation
+
+    def _fallback_title(self, data: HookEventInput, payload: dict[str, object] | None = None) -> str:
+        tool_name = (payload or data.payload).get('tool_name')
+        if isinstance(tool_name, str) and tool_name:
+            return f'{data.event_type}: {tool_name}'
+
+        return data.event_type
+
+    def _get_or_create_outbox(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        scope: EffectiveScope,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        data: HookEventInput,
+    ) -> OutboxEvent:
+        outbox_event, _created = OutboxEvent.objects.get_or_create(
+            organization=organization,
+            event_type='ObservationRecorded',
+            source_type='hook_event',
+            source_id=data.event_id,
+            idempotency_key=data.idempotency_key,
+            defaults={
+                'project': project,
+                'team': team,
+                'aggregate_type': 'observation',
+                'aggregate_id': str(observation.id),
+                'payload_version': 1,
+                'payload': {
+                    'raw_event_id': str(raw_event.id),
+                    'observation_id': str(observation.id),
+                    'agent_session_id': str(raw_event.session_id),
+                    'event_type': data.event_type,
+                },
+                'actor_type': scope.actor_type,
+                'actor_id': scope.actor_id,
+                'correlation_id': data.correlation_id,
+                'trace_id': data.trace_id,
+            },
+        )
+
+        return outbox_event
+
+
+def redact_hook_value(value: object) -> RedactionResult:
+    if isinstance(value, dict):
+        redacted = False
+        cleaned = {}
+        for key, item in value.items():
+            if is_sensitive_key(key):
+                cleaned[key] = REDACTED_VALUE
+                redacted = True
+                continue
+
+            item_result = redact_hook_value(item)
+            cleaned[key] = item_result.value
+            redacted = redacted or item_result.redacted
+
+        return RedactionResult(value=cleaned, redacted=redacted)
+
+    if isinstance(value, list | tuple):
+        redacted = False
+        cleaned = []
+        for item in value:
+            item_result = redact_hook_value(item)
+            cleaned.append(item_result.value)
+            redacted = redacted or item_result.redacted
+
+        return RedactionResult(value=cleaned, redacted=redacted)
+
+    if isinstance(value, str):
+        cleaned = SECRET_STRING_RE.sub(REDACTED_VALUE, value)
+
+        return RedactionResult(value=cleaned, redacted=cleaned != value)
+
+    return RedactionResult(value=value, redacted=False)
+
+
+def is_sensitive_key(key: object) -> bool:
+    normalized = re.sub(r'[^a-z0-9]', '', str(key).lower())
+
+    return any(marker in normalized for marker in SENSITIVE_KEY_MARKERS)
