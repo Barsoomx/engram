@@ -67,6 +67,6 @@ def build_parser() -> argparse.ArgumentParser:
         hook_command = hook_subparsers.add_parser(command)
         hook_command.add_argument('--agent', choices=('codex', 'claude-code', 'claude_code'))
         hook_command.add_argument('--config-dir')
-        hook_command.add_argument('--response-format', choices=('server', 'codex'), default='server')
+        hook_command.add_argument('--response-format', choices=('server', 'codex', 'claude-code'), default='server')
 
     return parser

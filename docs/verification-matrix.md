@@ -785,3 +785,42 @@ Final whole-branch review found missing endpoint proof for cross-team feedback
 denial and oversized `request_id`/`correlation_id`; the follow-up
 `test: cover memory feedback denials` added those tests and reran the evidence
 commands above.
+
+## 2026-06-25: Claude Code Client Package
+
+Branch: `feat/parity-15-claude-code-client`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `packages/claude-plugin/.claude-plugin/plugin.json`
+- `packages/claude-plugin/hooks/hooks.json`
+- `packages/claude-plugin/claude_plugin_contract_tests.py`
+- `packages/claude-plugin/README.md`
+- `packages/cli/engram_cli/main.py`
+- `packages/cli/engram_cli/commands.py`
+- `packages/cli/engram_cli/cli_lifecycle_tests.py`
+- `docs/parity/claude-mem-parity-map.md`
+- `docs/security/reviews/2026-06-25-claude-code-client.md`
+- `docs/superpowers/specs/2026-06-25-claude-code-client-design.md`
+- `docs/superpowers/plans/2026-06-25-claude-code-client.md`
+- `scripts/repository_layout.py`
+
+This checkpoint proves native Claude Code package and CLI response-format
+coverage only for the currently implemented Engram hook events:
+`SessionStart`, `PostToolUse`, `Error`, and `Decision`. It does not prove
+`UserPromptSubmit`, `PreToolUse`, or `Stop`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD red CLI tests | `PYTHONPATH=packages/cli python3 -m unittest packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_connect_writes_event_specific_hook_commands packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_session_start_claude_code_response_format_emits_claude_output_only packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_non_session_claude_code_response_format_emits_empty_ack -v` | none | yes | pass | Exit 1 before implementation, with failures for missing `claude-code` response format and old hook command strings. |
+| focused CLI tests | `PYTHONPATH=packages/cli python3 -m unittest packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_connect_writes_event_specific_hook_commands packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_session_start_claude_code_response_format_emits_claude_output_only packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_non_session_claude_code_response_format_emits_empty_ack -v` | none | yes | pass | Exit 0. Reported 3 tests OK. |
+| full CLI tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| Claude plugin contract tests | `python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v` | none | yes | pass | Exit 0. Reported 2 tests OK. |
+| Codex plugin contract tests | `python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v` | none | yes | pass | Exit 0. Reported 2 tests OK. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| focused security review | Independent read-only security review plus command evidence recorded in `docs/security/reviews/2026-06-25-claude-code-client.md` | none | yes | pass | SECURITY APPROVED. CRITICAL none, IMPORTANT none, MINOR none. Live Claude Code plugin install was not run; this checkpoint validates manifest and CLI contracts only. |

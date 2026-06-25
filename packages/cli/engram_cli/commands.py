@@ -310,6 +310,13 @@ def normalize_runtimes(value: str | None) -> tuple[str, ...]:
     raise CliError('invalid_response', f'Unsupported agent runtime {runtime}', remediation_for('invalid_response'))
 
 
+def response_format_for_runtime(runtime: str) -> str:
+    if runtime == 'claude_code':
+        return 'claude-code'
+
+    return runtime
+
+
 def selected_runtime(value: str | None, configured_runtimes: list[str]) -> str:
     if not configured_runtimes:
         raise CliError('missing_hook_config', 'No hook manifests are configured', remediation_for('missing_hook_config'))
@@ -442,6 +449,14 @@ def format_hook_response(body: dict[str, object], response_format: str, hook_com
         return body
     if hook_command == 'session-start':
         rendered = as_string(body.get('rendered_context'))
+        if response_format == 'claude-code':
+            return {
+                'systemMessage': rendered,
+                'hookSpecificOutput': {
+                    'hookEventName': 'SessionStart',
+                    'additionalContext': rendered,
+                },
+            }
 
         return {
             'continue': True,
@@ -451,6 +466,8 @@ def format_hook_response(body: dict[str, object], response_format: str, hook_com
                 'additionalContext': rendered,
             },
         }
+    if response_format == 'claude-code':
+        return {}
 
     return {'continue': True}
 
@@ -637,10 +654,22 @@ def write_local_state(
             'team_id': team_id or None,
             'credential_fingerprint': fingerprint,
             'commands': {
-                'SessionStart': f'engram hook session-start --agent {runtime}',
-                'PostToolUse': f'engram hook post-tool-use --agent {runtime}',
-                'Error': f'engram hook error --agent {runtime}',
-                'Decision': f'engram hook decision --agent {runtime}',
+                'SessionStart': (
+                    f'engram hook session-start --agent {runtime} '
+                    f'--response-format {response_format_for_runtime(runtime)}'
+                ),
+                'PostToolUse': (
+                    f'engram hook post-tool-use --agent {runtime} '
+                    f'--response-format {response_format_for_runtime(runtime)}'
+                ),
+                'Error': (
+                    f'engram hook error --agent {runtime} '
+                    f'--response-format {response_format_for_runtime(runtime)}'
+                ),
+                'Decision': (
+                    f'engram hook decision --agent {runtime} '
+                    f'--response-format {response_format_for_runtime(runtime)}'
+                ),
             },
         }
         for runtime in runtimes
