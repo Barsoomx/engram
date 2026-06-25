@@ -213,7 +213,7 @@ Extend repository tests to require:
 - `apps/backend/engram/core/models.py`;
 - `apps/backend/engram/core/migrations/0001_initial.py`;
 - backend workflow command `poetry run python manage.py makemigrations --check --dry-run`;
-- backend workflow command `poetry run python manage.py migrate --check`.
+- backend workflow command `poetry run python manage.py migrate --noinput --settings=settings.test_settings`.
 
 Run:
 

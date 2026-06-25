@@ -104,6 +104,12 @@ Slugs are unique within their parent scope. Core records carry organization and,
 where project-owned, project scope. This enables authorization filters to be
 applied before retrieval or context packing.
 
+Models that duplicate `organization` or `project` beside scoped foreign keys
+must validate those fields on normal saves, including `objects.create()`. The
+first schema runs Django `full_clean(validate_unique=False,
+validate_constraints=False)` on normal saves for cross-row scope consistency and
+uses database uniqueness constraints for replay/idempotency.
+
 ### Agents And Sessions
 
 `Agent` represents one runtime identity in an organization, such as Codex or
@@ -164,13 +170,13 @@ memory reads/writes, context injection, and worker/provider actions.
 ### Outbox
 
 `OutboxEvent` is the durable async bridge. It tracks organization/project/team,
-aggregate type/id, event type, payload version, payload, idempotency key,
-actor, correlation id, trace id, status, attempts, retry timing, lock owner,
-lock time, last error, processed time, and timestamps.
+aggregate type/id, source type/id, event type, payload version, payload,
+idempotency key, actor, correlation id, trace id, status, attempts, retry
+timing, lock owner, lock time, last error, processed time, and timestamps.
 
 The dispatcher and Celery task implementations are deferred. This slice must
-still enforce idempotency keys and expose indexes needed by later claim/retry
-logic.
+still enforce idempotency keys per event type and source, and expose indexes
+needed by later claim/retry logic.
 
 ## Testing
 
@@ -180,10 +186,12 @@ Tests must prove schema behavior, not only imports:
 - scoped uniqueness for organization/team/project/session/event/observation;
 - raw event duplicate replay cannot create a second row in the same scope;
 - the same external ids are allowed in different organizations or projects;
+- cross-scope foreign key combinations are rejected through normal
+  `objects.create()` paths;
 - retrieval documents must point at the same organization/project scope as their
   memory version;
 - context bundle items persist citations and scope evidence;
-- outbox idempotency is unique per event type and idempotency key.
+- outbox idempotency is unique per event type, source, and idempotency key.
 
 Migration checks must run through Django's migration tooling. API/RBAC/worker
 tests are explicitly out of scope for this slice.
