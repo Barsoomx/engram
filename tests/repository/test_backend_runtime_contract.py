@@ -170,7 +170,39 @@ class BackendComposeContractTests(unittest.TestCase):
         script = (ROOT / 'scripts/e2e_golden_path.py').read_text(encoding='utf-8')
 
         self.assertNotIn('engram_process_observation_outbox', script)
-        self.assertIn('engram_promote_memory_candidate', script)
+        self.assertNotIn('engram_promote_memory_candidate', script)
+        self.assertIn('Waiting for worker-created retrieval document', script)
+
+    def test_golden_path_proves_current_hook_observation_created_context_memory(self) -> None:
+        script = (ROOT / 'scripts/e2e_golden_path.py').read_text(encoding='utf-8')
+
+        self.assertIn("run_id = secrets.token_hex(8)", script)
+        self.assertIn("progress('Clearing Compose state')", script)
+        self.assertLess(
+            script.index("progress('Clearing Compose state')"),
+            script.index("progress('Starting Compose services')"),
+        )
+        self.assertIn("run(['docker', 'compose', 'down', '-v'], cwd=COMPOSE_DIR, secret=api_key)", script)
+        self.assertIn('post_tool_use_payload(run_id)', script)
+        self.assertIn('session_start_payload(run_id)', script)
+        self.assertIn('wait_for_worker_memory(project_id, run_id, api_key)', script)
+        self.assertIn('worker_memory_query(project_id, run_id)', script)
+        self.assertIn('def memory_title(run_id: str) -> str:', script)
+        self.assertIn('def memory_body(run_id: str) -> str:', script)
+        self.assertIn("'session_id': f'e2e-session-observation-{run_id}'", script)
+        self.assertIn("'event_id': f'e2e-hook-event-{run_id}'", script)
+        self.assertIn("'idempotency_key': f'e2e-hook-idempotency-{run_id}'", script)
+        self.assertIn("'request_id': f'e2e-hook-request-{run_id}'", script)
+        self.assertIn("'session_id': f'e2e-session-context-{run_id}'", script)
+        self.assertIn("'request_id': f'e2e-context-request-{run_id}'", script)
+        self.assertIn("'source_observation__raw_event'", script)
+        self.assertIn('client_event_id = {json.dumps(client_event_id)}', script)
+        self.assertIn('request_id = {json.dumps(request_id)}', script)
+        self.assertIn('raw_event.client_event_id != client_event_id', script)
+        self.assertIn('raw_event.request_id != request_id', script)
+        self.assertIn('str(version.source_observation_id) not in document.source_observation_ids', script)
+        self.assertNotIn("'session_id': 'e2e-session-observation'", script)
+        self.assertNotIn("'event_id': 'e2e-hook-event-1'", script)
 
 
 if __name__ == '__main__':

@@ -35,6 +35,9 @@ class MemoryCandidateWorkerInput:
 @dataclass(frozen=True)
 class MemoryCandidateWorkerResult:
     candidate: MemoryCandidate
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
     duplicate: bool
 
 
@@ -201,10 +204,16 @@ class ProcessObservationRecorded:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation)
+            promotion = PromoteMemoryCandidate().execute(
+                PromoteMemoryCandidateInput(candidate_id=candidate.id),
+            )
 
             return MemoryCandidateWorkerResult(
-                candidate=candidate,
-                duplicate=not candidate_created,
+                candidate=promotion.candidate,
+                memory=promotion.memory,
+                memory_version=promotion.memory_version,
+                retrieval_document=promotion.retrieval_document,
+                duplicate=not candidate_created or promotion.duplicate,
             )
 
     def _lock_observation(self, observation_id: uuid.UUID) -> Observation:
@@ -322,13 +331,13 @@ class PromoteMemoryCandidate:
             candidate.status = CandidateStatus.PROMOTED
             candidate.promoted_memory = memory
             candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
-            index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+            retrieval_document = self._index_memory_version(candidate, version)
 
             return PromoteMemoryCandidateResult(
                 candidate=candidate,
                 memory=memory,
                 memory_version=version,
-                retrieval_document=index_result.retrieval_document,
+                retrieval_document=retrieval_document,
                 duplicate=False,
             )
 
@@ -341,15 +350,27 @@ class PromoteMemoryCandidate:
     def _existing_result(self, candidate: MemoryCandidate) -> PromoteMemoryCandidateResult:
         memory = candidate.promoted_memory
         version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
-        index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+        retrieval_document = self._index_memory_version(candidate, version)
 
         return PromoteMemoryCandidateResult(
             candidate=candidate,
             memory=memory,
             memory_version=version,
-            retrieval_document=index_result.retrieval_document,
+            retrieval_document=retrieval_document,
             duplicate=True,
         )
+
+    def _index_memory_version(self, candidate: MemoryCandidate, version: MemoryVersion) -> RetrievalDocument:
+        index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+        document = index_result.retrieval_document
+        file_paths = self._candidate_file_paths(candidate)
+        if document.file_paths == file_paths:
+            return document
+
+        document.file_paths = file_paths
+        document.save(update_fields=['file_paths', 'updated_at'])
+
+        return document
 
     def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
         return {
@@ -364,4 +385,10 @@ class PromoteMemoryCandidate:
         if observation is None:
             return []
 
-        return [*observation.files_read, *observation.files_modified]
+        return [
+            redact_text(file_path)
+            for file_path in [
+                *observation.files_read,
+                *observation.files_modified,
+            ]
+        ]

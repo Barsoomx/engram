@@ -10,6 +10,115 @@ the Celery task `.delay(...)` call. The Compose `relay` service runs the
 package-owned `python manage.py celery_outbox_relay`; it is not an Engram
 domain outbox processor.
 
+## 2026-06-25: Worker Auto-Promotes Memory
+
+Branch: `feat/worker-auto-promotes-memory`
+
+Code commits in slice:
+
+- `2cb084cf feat: auto promote observed memory`
+- `c8767724 fix: redact auto-promoted memory evidence`
+- `da06e17f test: prove worker-created memory in e2e`
+- `60e83a02 fix: bind e2e to current worker observation`
+
+Final review blocker correction after reviewed head
+`38b5e5b591bca1aa9769db329f7512b5beffcf54`:
+
+- The correction fixes the stale Compose DB acceptance gap in
+  `scripts/e2e_golden_path.py`.
+- Root cause: the previous golden path could pass against stale Compose
+  volumes because it used deterministic hook/context ids, looked up approved
+  memory only by project/title, and did not prove the `RetrievalDocument` came
+  from the current hook observation.
+- Fix: the golden path now clears Compose volumes before startup, generates a
+  per-run id, uses that id in hook and context identities, queries by
+  project/per-run memory title, verifies the source raw event's
+  `client_event_id` and `request_id`, verifies
+  `RetrievalDocument.source_observation_ids`, and asserts context against the
+  per-run title/body.
+- Residual risks after this correction: none for this focused checkpoint.
+
+Scope:
+
+- `apps/backend/engram/memory/services.py`
+- `apps/backend/engram/memory/tasks.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `scripts/e2e_golden_path.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/verification-matrix.md`
+- `docs/security/reviews/2026-06-25-worker-auto-promotes-memory.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED worker tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | fixed | Exit 1 before worker auto-promotion. Reported 4 failed / 14 passed. Representative failures: status expected promoted vs proposed, `Memory.DoesNotExist` for auto-promotion, missing `memory` on result, and task returning candidate path. |
+| focused redaction and duplicate RED | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py::test_observation_recorded_worker_redacts_candidate_content_and_evidence engram/memory/memory_worker_tests.py::test_promote_memory_candidate_command_is_idempotent_for_duplicate_candidate -v` | Backend | yes | fixed | Exit 1 with 1 failed / 1 passed. Expected failure was raw `egk_test_memory_worker_...` leaked via persisted memory/retrieval file paths. Duplicate command regression already passed before production change because the command delegated to the idempotent promotion service. |
+| focused worker tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | pass | Exit 0. Reported 19 passed. |
+| focused worker lint | `cd apps/backend && poetry run ruff check engram/memory/services.py engram/memory/tasks.py engram/memory/memory_worker_tests.py` | Backend | yes | pass | Exit 0. `All checks passed!` |
+| Compose focused worker tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/memory/memory_worker_tests.py -v"` | Backend / Compose E2E | yes | pass | Exit 0. Reported 19 passed. |
+| repository runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 11 tests passed and proves the golden path no longer calls manual promotion. |
+| Python syntax gate | `python3 -m py_compile scripts/e2e_golden_path.py` | Repository Quality | yes | pass | Exit 0. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included Starting Compose services, Submitting hook observation, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| full Compose backend, lint, and format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."` | Backend / Compose E2E | yes | pass | Exit 0. Pytest reported 133 passed; ruff reported `All checks passed!`; format reported `68 files already formatted`. |
+| Compose migration freshness | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend / Compose E2E | yes | pass | Exit 0. Migrations applied through `django_celery_outbox.0006` and `sessions.0001`; `No changes detected`. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Unit discovery exit 0 with 27 tests passed; layout exit 0 with no output; quality exit 0 with no output; whitespace exit 0 with no output. |
+| final Compose golden path rerun | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 through the same worker-created retrieval-document wait path. |
+| Compose cleanup | `docker compose -f deploy/compose/docker-compose.yml ps --format json` | none | yes | pass | Exit 0 with no output. |
+| focused security review | manual review recorded in `docs/security/reviews/2026-06-25-worker-auto-promotes-memory.md` | Security Review | yes | pass | Covers task payload secrecy, candidate/memory/retrieval redaction, tenant/project scoping, duplicate delivery idempotency, and context audit evidence. No open Critical or Important findings. |
+| task reviews | read-only Task 1 and Task 2 reviews | Review | yes | pass | Task 2 review approved. Task 1 worker scope was clean after valid findings were fixed, and its remaining blocker was Task 2 golden path, now resolved. |
+| final review stale-state RED | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 after adding the freshness contract. Expected failure: `run_id = secrets.token_hex(8)` was missing from the golden path script. |
+| final review generated-query RED | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 after tightening the contract for generated shell constants. Expected failure: `client_event_id = {json.dumps(client_event_id)}` was missing from the generated worker-memory query. |
+| final review syntax gate | `python3 -m py_compile scripts/e2e_golden_path.py` | Repository Quality | yes | pass | Exit 0 with no output after the stale-state correction. |
+| final review repository contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 12 tests passed, including the new freshness guard contract. |
+| final review Compose golden path first rerun | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | fixed | Exit 1. First decisive failure was a generated Django shell `NameError: name 'client_event_id' is not defined`; the query compared against constants that had not been emitted into the shell snippet. |
+| final review Compose golden path source-bound rerun | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| final review repository quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output after docs update. |
+| final review whitespace | `git diff --check` | Repository Quality | yes | pass | Exit 0 with no output after docs update. |
+| final review final Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0 after docs update. Output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+
+Task 3 verification-command contract:
+
+| Brief command | Recorded result |
+| --- | --- |
+| `python3 -m unittest discover -s tests -v` | Run directly. Exit 0. Reported 27 tests passed. |
+| `cd apps/backend && poetry run pytest -v` | Not run directly in final verification because local `AGENTS.md` requires backend verification inside Docker Compose once Compose exists. Superseded by `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."`: exit 0, pytest 133 passed. |
+| `cd apps/backend && poetry run ruff check .` | Not run directly in final verification for the same Compose policy. Superseded by the full Compose backend/lint/format command: exit 0, `All checks passed!`. |
+| `cd apps/backend && poetry run ruff format --check .` | Not run directly in final verification for the same Compose policy. Superseded by the full Compose backend/lint/format command: exit 0, `68 files already formatted`. |
+| `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --skip-checks --settings=settings.test_settings` | Not run directly in final verification for the same Compose policy. Superseded by `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"`: exit 0, `No changes detected`. |
+| `python3 scripts/e2e_golden_path.py` | Run directly. Exit 0. Final rerun completed through the worker-created retrieval-document wait path. |
+| `git diff --check` | Rerun for the Task 3 docs/evidence correction. Exit 0. The original main-agent final whitespace command was `git diff --check HEAD`, exit 0. |
+
+Residual risks: none for this focused checkpoint.
+
+Final review blocker fixed: stale Compose state can no longer satisfy the
+acceptance gate because the E2E clears volumes before startup and requires the
+current run's hook raw event and source observation to match the retrieval
+document used for context.
+
+First decisive failures fixed during the TDD/debug loop:
+
+- Worker auto-promotion RED failed before implementation: status stayed
+  proposed instead of promoted, worker-created memory was missing, the result
+  did not include `memory`, and the task returned a candidate path.
+- Redaction RED failed because a raw `egk_test_memory_worker_...` token-shaped
+  value leaked through persisted memory/retrieval file paths.
+- Duplicate command regression was already green before the production change
+  because the command delegated to the idempotent promotion service.
+
+Security evidence:
+
+- Hook enqueue remains package `.delay(str(observation.id))`; queued task
+  payloads are observation-id only and do not include API keys, bearer tokens,
+  provider secrets, prompt bodies, or raw tool payloads.
+- Candidate title/body/evidence are redacted. Memory metadata file paths and
+  `RetrievalDocument` file paths are redacted when token-shaped values appear.
+- Worker promotion uses the loaded `Observation` organization/project/team.
+  The E2E retrieval query filters by project id and title.
+- Duplicate delivery reuses the same candidate, memory, version, and retrieval
+  document. The manual command duplicate regression returns `duplicate true`
+  with stable ids.
+- The E2E verifies `ContextBundleItem` and `MemoryRetrieved` `AuditEvent`
+  records for the returned context bundle, request, and retrieval document.
+
 ## 2026-06-25: Celery Outbox Package Refactor
 
 Branch: `fix/use-celery-outbox-package`

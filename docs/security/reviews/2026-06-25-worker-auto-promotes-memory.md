@@ -1,0 +1,184 @@
+# Worker Auto-Promotes Memory Security Review
+
+Date: 2026-06-25
+
+Branch: `feat/worker-auto-promotes-memory`
+
+Reviewed code head: `da06e17f10a75acd483182a3ad36934a9e67b01e`
+
+Evidence/docs head before this correction: `4a911ebfc3a3f693de4665465a2af9fa4612d4d8`
+
+Result: SECURITY APPROVED for the worker auto-promotion checkpoint.
+
+Final review correction after reviewed head
+`38b5e5b591bca1aa9769db329f7512b5beffcf54`: the original E2E acceptance
+gate had a stale Compose database proof gap. A previous killed run could leave
+approved memory, retrieval, context, or audit rows that matched the next run's
+deterministic project/title-only checks even if relay or worker processing was
+broken. The correction makes the E2E clear Compose volumes before startup and
+prove the current hook observation produced the retrieval document used by the
+future-session context.
+
+## Scope Reviewed
+
+- `apps/backend/engram/memory/services.py`
+- `apps/backend/engram/memory/tasks.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `scripts/e2e_golden_path.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- Worker task payload secrecy.
+- Candidate, memory, and retrieval document redaction.
+- Tenant/project/team scoping for worker-created memory.
+- Duplicate worker delivery and manual command idempotency.
+- Context bundle and retrieval audit evidence.
+
+The focused review covered the security risks introduced by automatically
+promoting useful worker-observed memory instead of stopping at proposed
+candidates. It did not cover unrelated memory-quality workflows, frontend
+review UI, MCP tooling, provider/model-policy calls, deployment changes, or
+future semantic retrieval work.
+
+## Commands And Tools Run
+
+| Check | Result |
+| --- | --- |
+| Task 1 RED worker tests | Exit 1. `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v` reported 4 failed / 14 passed before worker auto-promotion. Representative failures: status expected promoted vs proposed, `Memory.DoesNotExist` for auto-promotion, missing `memory` on result, and task returning candidate path. |
+| Task 1 redaction and duplicate RED | Exit 1. `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py::test_observation_recorded_worker_redacts_candidate_content_and_evidence engram/memory/memory_worker_tests.py::test_promote_memory_candidate_command_is_idempotent_for_duplicate_candidate -v` reported 1 failed / 1 passed. Expected failure was raw `egk_test_memory_worker_...` leaked via persisted memory/retrieval file paths. Duplicate command regression already passed before production change because the command delegated to the idempotent promotion service. |
+| focused worker tests | Exit 0. `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v` reported 19 passed. |
+| focused worker lint | Exit 0. `cd apps/backend && poetry run ruff check engram/memory/services.py engram/memory/tasks.py engram/memory/memory_worker_tests.py` reported `All checks passed!` |
+| Compose focused worker tests | Exit 0. `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/memory/memory_worker_tests.py -v"` reported 19 passed. |
+| repository runtime contract | Exit 0. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` reported 11 tests passed. |
+| Python syntax gate | Exit 0. `python3 -m py_compile scripts/e2e_golden_path.py`. |
+| Task 2 E2E | Exit 0. `python3 scripts/e2e_golden_path.py` output included Starting Compose services, Submitting hook observation, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| full Compose backend, lint, and format | Exit 0. `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."` reported pytest 133 passed, ruff `All checks passed!`, and format `68 files already formatted`. |
+| Compose migration freshness | Exit 0. `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` applied migrations through `django_celery_outbox.0006` and `sessions.0001`; `No changes detected`. |
+| repository checks | Exit 0 for `python3 -m unittest discover -s tests -v` with 27 tests passed; `python3 scripts/repository_layout.py` with no output; `python3 scripts/repository_quality.py` with no output; `git diff --check HEAD` with no output. |
+| final Compose golden path rerun | Exit 0. `python3 scripts/e2e_golden_path.py` completed through the same worker-created retrieval-document wait path. |
+| Compose cleanup | Exit 0. `docker compose -f deploy/compose/docker-compose.yml ps --format json` returned no output. |
+| final review stale-state RED | Exit 1. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` failed as expected after adding the freshness contract because `run_id = secrets.token_hex(8)` was missing from the golden path script. |
+| final review generated-query RED | Exit 1. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` failed as expected after tightening the contract because `client_event_id = {json.dumps(client_event_id)}` was missing from the generated worker-memory query. |
+| final review syntax gate | Exit 0. `python3 -m py_compile scripts/e2e_golden_path.py` produced no output after the correction. |
+| final review repository contract | Exit 0. `python3 -m unittest tests.repository.test_backend_runtime_contract -v` reported 12 tests passed. |
+| final review Compose golden path first rerun | Exit 1. `python3 scripts/e2e_golden_path.py` failed with generated Django shell `NameError: name 'client_event_id' is not defined`; this was fixed by emitting the current run's expected raw-event ids into the query snippet. |
+| final review Compose golden path source-bound rerun | Exit 0. `python3 scripts/e2e_golden_path.py` output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+| final review repository quality | Exit 0. `python3 scripts/repository_quality.py` produced no output after docs update. |
+| final review whitespace | Exit 0. `git diff --check` produced no output after docs update. |
+| final review final Compose golden path | Exit 0. `python3 scripts/e2e_golden_path.py` ran after docs update and output included Clearing Compose state, Waiting for worker-created retrieval document, Requesting future session context, Compose golden path passed, and Stopping Compose services. |
+
+## Task 3 Verification-Command Contract
+
+The Task 3 brief listed host-side backend verification commands. Final backend
+verification was not run directly on the host because local `AGENTS.md`
+requires backend tests and management commands to run inside Docker Compose
+once Compose exists. The exact command contract is mapped below without
+inventing unrun host results.
+
+| Brief command | Recorded result |
+| --- | --- |
+| `python3 -m unittest discover -s tests -v` | Run directly. Exit 0. Reported 27 tests passed. |
+| `cd apps/backend && poetry run pytest -v` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; pytest 133 passed. |
+| `cd apps/backend && poetry run ruff check .` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; `All checks passed!`. |
+| `cd apps/backend && poetry run ruff format --check .` | Not run directly in final verification; superseded by the full Compose backend/lint/format command. Exit 0; `68 files already formatted`. |
+| `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --skip-checks --settings=settings.test_settings` | Not run directly in final verification; superseded by the Compose migration freshness command. Exit 0; `No changes detected`. |
+| `python3 scripts/e2e_golden_path.py` | Run directly. Exit 0. |
+| `git diff --check` | Rerun for this Task 3 docs/evidence correction. Exit 0. The original main-agent final whitespace command was `git diff --check HEAD`, exit 0. |
+
+## Findings By Severity
+
+### CRITICAL
+
+None.
+
+### IMPORTANT
+
+None open.
+
+Resolved during final review: the Compose golden path could pass against stale
+state because it started Compose without a pre-run volume reset, reused
+deterministic hook/context ids, and accepted any approved memory matching only
+project/title. The fixed script now uses a per-run id for hook and context
+identities, clears Compose volumes before startup, queries by per-run memory
+title, verifies `MemoryVersion.source_observation.raw_event.client_event_id`
+and `request_id`, verifies the retrieval document contains the current source
+observation id, and asserts context against the per-run title/body.
+
+Resolved during the slice: token-shaped values leaked through persisted
+memory/retrieval file paths during the redaction RED. Candidate title/body and
+evidence were already in scope for redaction; the fix extended protection to
+memory metadata file paths and `RetrievalDocument` file paths.
+
+### MINOR
+
+None.
+
+## Security Checks
+
+- Task payload secrecy: hook enqueue remains package
+  `.delay(str(observation.id))`. Queued task payloads are id-only and do not
+  carry API keys, bearer tokens, provider secrets, prompt bodies, or raw tool
+  payloads.
+- Candidate, memory, and retrieval redaction: candidate title/body/evidence
+  are redacted. Memory metadata file paths and `RetrievalDocument` file paths
+  are redacted when token-shaped values appear. Regression tests cover the
+  leak.
+- Tenant/project scoping: the worker loads `Observation` by id and promotes
+  using that observation's organization, project, and team. The E2E retrieval
+  query filters by project id and title.
+- Duplicate delivery idempotency: duplicate worker delivery reuses the same
+  candidate, memory, version, and retrieval document. The manual command
+  duplicate regression proves the second command returns `duplicate true` with
+  stable ids.
+- Context audit evidence: E2E verifies `ContextBundleItem` and
+  `MemoryRetrieved` `AuditEvent` records for the returned context bundle,
+  request, and retrieval document.
+- Freshness against stale Compose state: E2E now performs a pre-start
+  `docker compose down -v`, uses per-run hook/session/request identities, and
+  requires the approved memory version and retrieval document to trace back to
+  the current run's hook raw event and source observation.
+
+## Fixes Applied
+
+- Worker processing now promotes worker-created useful memory instead of
+  leaving it as a proposed candidate.
+- Worker result evidence includes the promoted memory path needed by callers.
+- Token-shaped values are redacted from memory metadata file paths and
+  retrieval document file paths.
+- The E2E golden path waits for the worker-created retrieval document and then
+  verifies future-session context and audit evidence.
+- Repository runtime contract proves the golden path no longer uses manual
+  promotion.
+- Final review correction: the E2E golden path no longer accepts stale Compose
+  state. It clears volumes before startup, makes hook/context identities unique
+  per run, verifies the source raw event's `client_event_id` and `request_id`,
+  and requires `RetrievalDocument.source_observation_ids` to include the
+  current source observation id.
+
+## Regression Tests Added
+
+- Worker auto-promotion creates memory and retrieval state from an observed
+  hook event.
+- Worker duplicate delivery is idempotent across candidate, memory, version,
+  and retrieval document ids.
+- Task delegation uses only the observation id.
+- Redaction regression covers token-shaped values in persisted memory and
+  retrieval evidence paths.
+- Manual command duplicate regression proves the second command reports
+  `duplicate true` with stable ids.
+- Compose golden path proves worker-created retrieval state reaches future
+  session context and audit records.
+- Repository runtime contract now proves the stale-state freshness guards:
+  pre-run Compose volume reset, per-run ids, source raw-event verification,
+  retrieval document source-observation verification, and no manual promotion.
+
+## Accepted Risk
+
+No accepted security risk remains for this focused checkpoint.
+
+Residual risks: none for this focused checkpoint.
+
+Task 2 review approved the golden path. Task 1 worker scope was clean after
+valid findings were fixed, and its remaining blocker was Task 2 golden path,
+now resolved.
+
+Final review blocker fixed. Residual risks after the stale-state correction:
+none for this focused checkpoint.

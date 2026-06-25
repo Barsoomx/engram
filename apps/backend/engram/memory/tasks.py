@@ -17,4 +17,4 @@ def process_observation_recorded(observation_id: object) -> str:
         MemoryCandidateWorkerInput(observation_id=parsed_observation_id),
     )
 
-    return str(result.candidate.id)
+    return str(result.memory.id)

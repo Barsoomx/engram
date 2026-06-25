@@ -135,6 +135,31 @@ def execute_worker(observation: Observation) -> Any:
     )
 
 
+def create_memory_candidate(observation: Observation) -> MemoryCandidate:
+    return MemoryCandidate.objects.create(
+        organization=observation.organization,
+        project=observation.project,
+        team=observation.team,
+        source_observation=observation,
+        title=observation.title,
+        body=observation.body,
+        status=CandidateStatus.PROPOSED,
+        visibility_scope=VisibilityScope.PROJECT,
+        evidence=[
+            {
+                'observation_id': str(observation.id),
+                'raw_event_id': str(observation.raw_event_id),
+                'event_type': 'post_tool_use',
+                'title': observation.title,
+                'files_read': observation.files_read,
+                'files_modified': observation.files_modified,
+            },
+        ],
+        content_hash=memory_candidate_content_hash(observation),
+        confidence=Decimal('0.500'),
+    )
+
+
 @pytest.mark.django_db
 def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() -> None:
     _organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
@@ -151,7 +176,7 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     assert candidate.source_observation_id == observation.id
     assert candidate.title == 'pytest failure fixed'
     assert candidate.body == 'pytest failed on missing memory worker and now exits 0'
-    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.status == CandidateStatus.PROMOTED
     assert candidate.visibility_scope == VisibilityScope.PROJECT
     assert candidate.confidence == Decimal('0.500')
     assert candidate.content_hash == memory_candidate_content_hash(observation)
@@ -169,22 +194,59 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
 
 
 @pytest.mark.django_db
+def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval() -> None:
+    _organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+
+    result = execute_worker(observation)
+
+    candidate = MemoryCandidate.objects.get()
+    memory = Memory.objects.get()
+    version = MemoryVersion.objects.get()
+    document = RetrievalDocument.objects.get()
+
+    assert result.duplicate is False
+    assert result.candidate.id == candidate.id
+    assert result.memory.id == memory.id
+    assert result.memory_version.id == version.id
+    assert result.retrieval_document.id == document.id
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == memory.id
+    assert memory.organization_id == project.organization_id
+    assert memory.project_id == project.id
+    assert memory.team_id == team.id
+    assert memory.status == MemoryStatus.APPROVED
+    assert memory.title == candidate.title
+    assert memory.body == candidate.body
+    assert version.memory_id == memory.id
+    assert version.source_observation_id == observation.id
+    assert document.memory_id == memory.id
+    assert document.memory_version_id == version.id
+    assert document.file_paths == observation.files_read + observation.files_modified
+    assert RAW_KEY not in f'{candidate.evidence} {memory.title} {memory.body} {document.full_text}'
+
+
+@pytest.mark.django_db
 def test_observation_recorded_worker_redacts_candidate_content_and_evidence() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
     observation.title = f'Bearer {RAW_KEY}'
     observation.body = f'command printed {RAW_KEY}'
     observation.files_read = [f'apps/backend/{RAW_KEY}.txt']
-    observation.save(update_fields=['title', 'body', 'files_read', 'updated_at'])
+    observation.files_modified = [f'apps/backend/{RAW_KEY}-modified.py']
+    observation.save(update_fields=['title', 'body', 'files_read', 'files_modified', 'updated_at'])
 
     execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    persisted = f'{candidate.title} {candidate.body} {candidate.evidence}'
+    memory = Memory.objects.get()
+    document = RetrievalDocument.objects.get()
+    persisted = f'{candidate.title} {candidate.body} {candidate.evidence} {memory.metadata} {document.file_paths}'
 
     assert RAW_KEY not in persisted
     assert '[REDACTED]' in candidate.title
     assert '[REDACTED]' in candidate.body
     assert '[REDACTED]' in str(candidate.evidence)
+    assert '[REDACTED]' in str(memory.metadata['file_paths'])
+    assert '[REDACTED]' in str(document.file_paths)
 
 
 @pytest.mark.django_db
@@ -196,7 +258,13 @@ def test_observation_recorded_worker_is_idempotent_for_duplicate_delivery() -> N
 
     assert second.duplicate is True
     assert second.candidate.id == first.candidate.id
+    assert second.memory.id == first.memory.id
+    assert second.memory_version.id == first.memory_version.id
+    assert second.retrieval_document.id == first.retrieval_document.id
     assert MemoryCandidate.objects.count() == 1
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -248,11 +316,12 @@ def test_observation_recorded_worker_raises_for_missing_observation() -> None:
 def test_process_observation_recorded_task_delegates_by_observation_id() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
 
-    candidate_id = process_observation_recorded.run(str(observation.id))
+    memory_id = process_observation_recorded.run(str(observation.id))
 
-    candidate = MemoryCandidate.objects.get()
+    memory = Memory.objects.get()
 
-    assert candidate_id == str(candidate.id)
+    assert memory_id == str(memory.id)
+    assert RetrievalDocument.objects.get().memory_id == memory.id
 
 
 @pytest.mark.django_db
@@ -269,7 +338,7 @@ def test_process_observation_recorded_task_rejects_malformed_observation_id(
 @pytest.mark.django_db
 def test_promote_memory_candidate_lock_query_locks_candidate_row_without_related_joins() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = execute_worker(observation).candidate
+    candidate = create_memory_candidate(observation)
 
     with CaptureQueriesContext(connection) as queries:
         locked = PromoteMemoryCandidate()._lock_candidate(candidate.id)
@@ -285,7 +354,7 @@ def test_promote_memory_candidate_lock_query_locks_candidate_row_without_related
 @pytest.mark.django_db
 def test_promote_memory_candidate_creates_memory_version_and_retrieval_document() -> None:
     _organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = execute_worker(observation).candidate
+    candidate = create_memory_candidate(observation)
 
     result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
@@ -328,7 +397,7 @@ def test_promote_memory_candidate_creates_memory_version_and_retrieval_document(
 @pytest.mark.django_db
 def test_promote_memory_candidate_is_idempotent() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = execute_worker(observation).candidate
+    candidate = create_memory_candidate(observation)
     first = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
     second = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
@@ -345,7 +414,7 @@ def test_promote_memory_candidate_is_idempotent() -> None:
 @pytest.mark.django_db
 def test_promote_memory_candidate_command_outputs_json_ids() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = execute_worker(observation).candidate
+    candidate = create_memory_candidate(observation)
     stdout = io.StringIO()
 
     call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=stdout)
@@ -366,9 +435,33 @@ def test_promote_memory_candidate_command_outputs_json_ids() -> None:
 
 
 @pytest.mark.django_db
+def test_promote_memory_candidate_command_is_idempotent_for_duplicate_candidate() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    candidate = create_memory_candidate(observation)
+    first_stdout = io.StringIO()
+    second_stdout = io.StringIO()
+
+    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=first_stdout)
+    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=second_stdout)
+
+    first = json.loads(first_stdout.getvalue())
+    second = json.loads(second_stdout.getvalue())
+
+    assert first['duplicate'] is False
+    assert second['duplicate'] is True
+    assert second['candidate_id'] == first['candidate_id']
+    assert second['memory_id'] == first['memory_id']
+    assert second['memory_version_id'] == first['memory_version_id']
+    assert second['retrieval_document_id'] == first['retrieval_document_id']
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
+
+
+@pytest.mark.django_db
 def test_promote_memory_candidate_command_accepts_candidate_id_option() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = execute_worker(observation).candidate
+    candidate = create_memory_candidate(observation)
     stdout = io.StringIO()
 
     call_command('engram_promote_memory_candidate', '--candidate-id', str(candidate.id), '--json', stdout=stdout)
@@ -382,11 +475,11 @@ def test_promote_memory_candidate_command_accepts_candidate_id_option() -> None:
 @pytest.mark.django_db
 def test_promote_memory_candidate_command_can_promote_latest_project_candidate() -> None:
     _organization, _team, project, _session, _raw_event, first_observation = create_observation_recorded_scope()
-    first_candidate = execute_worker(first_observation).candidate
+    first_candidate = create_memory_candidate(first_observation)
     _other_org, _other_team, other_project, _other_session, _other_raw, other_observation = (
         create_observation_recorded_scope(suffix='2')
     )
-    other_candidate = execute_worker(other_observation).candidate
+    other_candidate = create_memory_candidate(other_observation)
     stdout = io.StringIO()
 
     call_command(
