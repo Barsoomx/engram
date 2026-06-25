@@ -10,6 +10,9 @@ python -m engram_cli connect --server URL --api-key KEY --project PROJECT
 python -m engram_cli doctor
 python -m engram_cli hook post-tool-use < hook.json
 python -m engram_cli hook session-start < context.json
+python -m engram_cli hook error < hook.json
+python -m engram_cli hook decision < hook.json
+python -m engram_cli hook session-start --response-format codex < hook.json
 python -m engram_cli disconnect
 ```
 

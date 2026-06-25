@@ -208,25 +208,66 @@ def run_hook(
         server_url = normalize_server_url(as_string(config.get('server_url')))
         runtime = selected_runtime(args.agent, as_string_list(config.get('agent_runtimes')))
         input_payload = read_stdin_json(stdin)
+        active_transport = transport or urllib_transport
         if args.hook_command == 'post-tool-use':
-            path = '/v1/hooks/post-tool-use'
-            request_payload = build_post_tool_use_payload(config, runtime, input_payload)
+            status, body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path='/v1/hooks/post-tool-use',
+                event_type='post_tool_use',
+            )
         elif args.hook_command == 'session-start':
-            path = '/v1/context/session-start'
-            request_payload = build_session_start_payload(config, runtime, input_payload)
+            hook_status, hook_body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path='/v1/hooks/session-start',
+                event_type='session_start',
+            )
+            if hook_status < 200 or hook_status >= 300:
+                raise error_from_body(hook_body, fallback='http_error')
+            status, body = post_json(
+                transport=active_transport,
+                server_url=server_url,
+                path='/v1/context/session-start',
+                api_key=api_key,
+                payload=build_session_start_payload(config, runtime, input_payload),
+            )
+        elif args.hook_command == 'error':
+            status, body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path='/v1/hooks/error',
+                event_type='error',
+            )
+        elif args.hook_command == 'decision':
+            status, body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path='/v1/hooks/decision',
+                event_type='decision',
+            )
         else:
             raise CliError('invalid_response', 'Unsupported hook command', remediation_for('invalid_response'))
 
-        status, body = post_json(
-            transport=transport or urllib_transport,
-            server_url=server_url,
-            path=path,
-            api_key=api_key,
-            payload=request_payload,
-        )
         if status < 200 or status >= 300:
             raise error_from_body(body, fallback='http_error')
-        stdout.write(json.dumps(body, sort_keys=True) + '\n')
+        stdout.write(json.dumps(format_hook_response(body, args.response_format, args.hook_command), sort_keys=True) + '\n')
 
         return 0
     except CliError as error:
@@ -297,6 +338,15 @@ def build_post_tool_use_payload(
     runtime: str,
     input_payload: dict[str, object],
 ) -> dict[str, object]:
+    return build_generic_hook_payload(config, runtime, input_payload, 'post_tool_use')
+
+
+def build_generic_hook_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+    event_type: str,
+) -> dict[str, object]:
     event_id = payload_string(input_payload, 'event_id') or f'engram-cli-{uuid.uuid4()}'
     payload = dict_value(input_payload.get('payload'))
     observation = dict_value(input_payload.get('observation'))
@@ -306,7 +356,7 @@ def build_post_tool_use_payload(
             'session_id': required_payload_string(input_payload, 'session_id'),
             'event_id': event_id,
             'idempotency_key': payload_string(input_payload, 'idempotency_key') or event_id,
-            'event_type': 'post_tool_use',
+            'event_type': event_type,
             'payload_schema_version': payload_string(input_payload, 'payload_schema_version') or 'v1',
             'content_hash': payload_string(input_payload, 'content_hash')
             or stable_content_hash({'payload': payload, 'observation': observation, 'event_id': event_id}),
@@ -323,6 +373,44 @@ def build_post_tool_use_payload(
     )
 
     return request_payload
+
+
+def send_hook_event(
+    transport: Transport,
+    *,
+    server_url: str,
+    api_key: str,
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+    path: str,
+    event_type: str,
+) -> tuple[int, dict[str, object]]:
+    return post_json(
+        transport=transport,
+        server_url=server_url,
+        path=path,
+        api_key=api_key,
+        payload=build_generic_hook_payload(config, runtime, input_payload, event_type),
+    )
+
+
+def format_hook_response(body: dict[str, object], response_format: str, hook_command: str) -> dict[str, object]:
+    if response_format == 'server':
+        return body
+    if hook_command == 'session-start':
+        rendered = as_string(body.get('rendered_context'))
+
+        return {
+            'continue': True,
+            'systemMessage': rendered,
+            'hookSpecificOutput': {
+                'hookEventName': 'SessionStart',
+                'additionalContext': rendered,
+            },
+        }
+
+    return {'continue': True}
 
 
 def build_session_start_payload(
@@ -506,7 +594,12 @@ def write_local_state(
             'project_id': project_id,
             'team_id': team_id or None,
             'credential_fingerprint': fingerprint,
-            'command': f'engram hook --agent {runtime}',
+            'commands': {
+                'SessionStart': f'engram hook session-start --agent {runtime}',
+                'PostToolUse': f'engram hook post-tool-use --agent {runtime}',
+                'Error': f'engram hook error --agent {runtime}',
+                'Decision': f'engram hook decision --agent {runtime}',
+            },
         }
         for runtime in runtimes
     }
