@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+import structlog
 from django.db import transaction
 from django.utils import timezone
 
@@ -14,6 +15,7 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    Memory,
     MemoryStatus,
     MemoryVersion,
     Organization,
@@ -23,6 +25,16 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
+from engram.model_policy.services import (
+    EmbeddingCallInput,
+    FakeProviderGateway,
+    ModelPolicyError,
+    ProviderSecretError,
+    ResolveModelPolicy,
+    ResolveModelPolicyInput,
+)
+
+logger = structlog.get_logger(__name__)
 
 
 class ContextIndexError(Exception):
@@ -230,8 +242,52 @@ class IndexMemoryVersion:
                 'metadata': {},
             },
         )
+        self._embed_document(retrieval_document, memory, version)
 
         return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=created)
+
+    def _embed_document(
+        self,
+        document: RetrievalDocument,
+        memory: Memory,
+        version: MemoryVersion,
+    ) -> None:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    task_type='embedding',
+                ),
+            )
+            result = FakeProviderGateway().embed(
+                EmbeddingCallInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    policy=resolved.policy,
+                    request_id=f'memory-indexer:{version.id}:embedding',
+                    trace_id=f'memory-indexer:{version.id}',
+                    text=document.full_text,
+                ),
+            )
+        except ModelPolicyError:
+            return
+        except ProviderSecretError as error:
+            logger.warning(
+                'embedding skipped: provider secret unavailable',
+                organization_id=str(memory.organization_id),
+                project_id=str(memory.project_id),
+                memory_version_id=str(version.id),
+                error=str(error),
+            )
+
+            return
+
+        document.embedding_vector = list(result.embedding)
+        document.embedding_reference = f'provider:{result.call_record_id}'
+        document.save(update_fields=['embedding_vector', 'embedding_reference', 'updated_at'])
 
 
 class BuildContextBundle:

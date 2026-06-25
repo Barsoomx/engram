@@ -13,6 +13,7 @@ from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -183,6 +184,40 @@ def create_generation_policy(organization: Organization, team: Team, project: Pr
         model='gpt-4.1-mini',
         secret=secret,
         version=3,
+    )
+
+
+def create_embedding_policy(organization: Organization, team: Team, project: Project) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team Embedding OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-embedding-secret',
+        hmac_digest='embedding-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
     )
 
 
@@ -650,3 +685,64 @@ def test_promote_memory_candidate_command_can_promote_latest_project_candidate()
     assert first_candidate.status == CandidateStatus.PROMOTED
     assert other_candidate.status == CandidateStatus.PROPOSED
     assert other_project.id != project.id
+
+
+@pytest.mark.django_db
+def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+
+    execute_worker(observation)
+
+    document = RetrievalDocument.objects.get()
+    assert len(document.embedding_vector) == 64
+    assert document.embedding_reference.startswith('provider:')
+    assert document.embedding_vector == document.embedding_vector
+
+
+@pytest.mark.django_db
+def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+
+    execute_worker(observation)
+    first_document = RetrievalDocument.objects.get()
+    first_vector = list(first_document.embedding_vector)
+    first_reference = first_document.embedding_reference
+
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=first_document.memory_version_id))
+
+    second_document = RetrievalDocument.objects.get()
+    assert second_document.embedding_vector == first_vector
+    assert second_document.embedding_reference == first_reference
+    embedding_calls = ProviderCallRecord.objects.filter(task_type='embedding')
+    assert embedding_calls.count() == 1
+
+
+@pytest.mark.django_db
+def test_index_memory_version_skips_embedding_without_policy() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+
+    execute_worker(observation)
+
+    document = RetrievalDocument.objects.get()
+    assert document.embedding_vector == []
+    assert document.embedding_reference == ''
+
+
+@pytest.mark.django_db
+def test_index_memory_version_skips_embedding_when_secret_disabled() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    embedding_policy = create_embedding_policy(organization, team, project)
+    embedding_policy.secret.active = False
+    embedding_policy.secret.save(update_fields=['active'])
+
+    execute_worker(observation)
+
+    document = RetrievalDocument.objects.get()
+    assert document.embedding_vector == []
+    assert document.embedding_reference == ''
