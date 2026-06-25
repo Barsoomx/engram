@@ -41,6 +41,8 @@ governance framework before first use.
    or team.
 7. Give admins a clear operational surface for access, configuration, review,
    audit, and deployment.
+8. Provide a small client connect wizard that writes server-backed hooks without
+   installing a local memory worker.
 
 ## Hook-Centric Behavior
 
@@ -95,6 +97,8 @@ policy decisions remain authoritative.
 
 - A developer can install Claude Code and Codex hooks that only call the company
   server; no local worker starts.
+- The client installer asks for server URL and identity/scope credentials; it
+  does not deploy the server or install local summarization infrastructure.
 - A team can configure provider keys and model policy without exposing raw
   secrets to agents.
 - A single-team developer cannot read another team's memory unless a shared

@@ -16,6 +16,16 @@ local memory workers or depend on local databases.
 The hook adapters should be separate thin packages that share the same server
 API schema. Agent-specific differences belong at the adapter boundary.
 
+## Installation Model
+
+The target installer is a client connector, not a worker bootstrapper. It should
+ask for server URL, authentication, organization, team, project, and repository
+binding, then write the correct hook configuration for Claude Code and/or Codex.
+
+Server deployment is handled separately by Compose, Helm, or SaaS provisioning.
+The installer must not install local databases, vector stores, provider workers,
+or background services.
+
 ## Hook Responsibilities
 
 Session start:

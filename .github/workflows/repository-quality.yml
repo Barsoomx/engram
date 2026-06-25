@@ -30,6 +30,7 @@ jobs:
           test -f docs/architecture.md
           test -f docs/rbac-and-scopes.md
           test -f docs/agent-integrations.md
+          test -f docs/client-installation.md
           test -f docs/secrets-and-model-config.md
           test -f docs/search-and-retrieval.md
           test -f docs/operations-and-deployment.md

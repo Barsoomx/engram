@@ -31,6 +31,7 @@ is the product and architecture track for the server-only rewrite.
 - [Architecture](docs/architecture.md)
 - [RBAC and scopes](docs/rbac-and-scopes.md)
 - [Agent integrations](docs/agent-integrations.md)
+- [Client installation and hook bootstrap](docs/client-installation.md)
 - [Secrets and model configuration](docs/secrets-and-model-config.md)
 - [Search and retrieval](docs/search-and-retrieval.md)
 - [Operations and deployment](docs/operations-and-deployment.md)
@@ -46,6 +47,7 @@ fallbacks, and inspectable behavior:
 
 - one server-side source of truth;
 - one hook protocol per agent family;
+- one small client connect wizard, not a local worker installer;
 - one scope model reused by users, teams, projects, memories, API keys, and
   secrets;
 - exact search first, semantic search as recall expansion;

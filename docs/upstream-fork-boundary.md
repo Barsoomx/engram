@@ -22,6 +22,8 @@ The rewrite should remove or replace:
 - desktop-only viewer as the primary admin surface;
 - mutable local settings as the enterprise configuration source;
 - old package branding and installer assumptions;
+- inherited `npx claude-mem install` behavior that bootstraps local runtime
+  dependencies or a local worker;
 - automation that publishes the inherited npm package;
 - any flow that requires developer hosts to run summarization, embedding, or
   indexing services.
@@ -33,7 +35,9 @@ The rewrite should remove or replace:
 3. Port hook payload knowledge into thin adapter packages.
 4. Port useful event and memory semantics into Python domain services.
 5. Replace local worker calls with authenticated server APIs.
-6. Add import tooling only after the target schema and authorization model are
+6. Replace the inherited installer with a small `connect`/`doctor`/`disconnect`
+   client package that only manages hooks and server credentials.
+7. Add import tooling only after the target schema and authorization model are
    stable.
 
 ## Compatibility Rule

@@ -22,6 +22,8 @@
 - Remove local worker startup, local SQLite as authoritative state, local vector
   database runtime, desktop-only admin assumptions, and old npm publish
   automation from the target branch.
+- Replace the inherited install command with a narrow client connector. Server
+  deployment and client hook installation are separate product flows.
 
 ## Hook Findings
 
