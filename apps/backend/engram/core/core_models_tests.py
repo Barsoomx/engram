@@ -640,3 +640,27 @@ def test_audit_event_rejects_cross_scope_project_on_create() -> None:
             actor_type='agent',
             result='allowed',
         )
+
+
+@pytest.mark.django_db
+def test_retrieval_document_defaults_to_empty_embedding_vector() -> None:
+    organization = Organization.objects.create(name='Org', slug='org-embedding')
+    project = Project.objects.create(organization=organization, name='P', slug='p-embedding')
+    memory = Memory.objects.create(organization=organization, project=project, title='t', body='b')
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body='b',
+        content_hash='hash-embedding-default',
+    )
+    document = RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        full_text='t',
+    )
+
+    assert document.embedding_vector == []

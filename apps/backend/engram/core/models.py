@@ -577,6 +577,7 @@ class RetrievalDocument(TimestampedModel):
     exact_terms = models.JSONField(default=list, blank=True)
     full_text = models.TextField()
     embedding_reference = models.CharField(max_length=255, blank=True)
+    embedding_vector = models.JSONField(default=list, blank=True)
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
