@@ -268,3 +268,49 @@ First decisive failures fixed during the TDD and review loop:
   uncaught `IntegrityError` on the raw-event uniqueness constraint.
 - Focused lint first failed on import ordering in
   `engram/hooks/hook_ingest_tests.py`.
+
+## 2026-06-25: Memory Candidate Worker
+
+Branch: `feat/parity-07-memory-worker`
+
+Scope:
+
+- `apps/backend/engram/memory/*`
+- `apps/backend/settings/settings.py`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/superpowers/specs/2026-06-25-memory-worker-design.md`
+- `docs/superpowers/plans/2026-06-25-memory-worker.md`
+- `docs/verification-matrix.md`
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| live repo state | `git status --short --branch` | none | yes | pass | Exit 0. Shows branch `feat/parity-07-memory-worker` plus pre-existing unstaged `.gitignore` edit. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality and Backend | yes | pass | Exit 0 with no output. Memory app config, services, tasks, and tests are required paths. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality and Backend | yes | pass | Exit 0 with no findings. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 14 tests. |
+| backend runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality and Backend | yes | pass | Exit 0. Ran 5 tests requiring memory worker paths. |
+| memory worker tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | pass | Exit 0. Ran 8 tests for candidate creation, redaction, downstream event emission, duplicate delivery, pending-source reuse, failure marking, malformed id handling, and Celery task delegation. |
+| backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Ran 65 tests. |
+| backend lint | `cd apps/backend && poetry run ruff check .` | Backend | yes | pass | Exit 0. |
+| backend format | `cd apps/backend && poetry run ruff format --check .` | Backend | yes | pass | Exit 0. `41 files already formatted`. |
+| migration freshness | `cd apps/backend && poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings` | Backend | yes | pass | Exit 0. `No changes detected`. |
+| migration apply | `cd apps/backend && poetry run python manage.py migrate --noinput --settings=settings.test_settings` | Backend | yes | pass | Exit 0. Applied core, access, Django auth/contenttypes, and sessions migrations against the test database. |
+| backend Poetry metadata | `cd apps/backend && poetry check` | Backend | yes | pass | Exit 0. `All set!`. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0. |
+| focused security review | Independent read-only review plus local diff/readback | none yet | yes | pass | Review findings fixed: malformed non-scalar `observation_id` now marks failed, and candidate title/body/evidence are redacted before persistence. |
+| live Compose availability | `docker compose version` | future Compose smoke | yes | blocked | Exit 1. Docker is still unavailable in this WSL distro; live Compose smoke remains blocked until Docker Desktop WSL integration is enabled. |
+
+First decisive failures fixed during the TDD loop:
+
+- Memory worker tests first failed with `ModuleNotFoundError: No module named
+  'engram.memory.services'`.
+- The first implementation pass then made
+  `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py -v`
+  pass with 6 tests.
+- Independent review found non-scalar `observation_id` could escape failed-row
+  marking; a regression now covers the Django `ValidationError` path.
+- Independent review found candidate evidence was not sink-redacted; a
+  regression now covers candidate title, body, and evidence redaction.
+- Focused lint first failed on a test sentinel path containing `/tmp/`; the
+  sentinel now uses a repo-shaped path.
