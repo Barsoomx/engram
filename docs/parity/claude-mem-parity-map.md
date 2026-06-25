@@ -536,6 +536,45 @@ Engram target:
 - Context bundle output includes selected memories, citations, scope evidence,
   inclusion reason, freshness state, token metadata, and audit id.
 
+### Semantic Retrieval Gate For First E2E
+
+Roadmap item 10 is explicitly deferred for the first parity E2E path unless the
+checked-in fixture later proves semantic recall is required.
+
+Not reproduced in the first E2E path:
+
+- local Chroma semantic search and Chroma metadata storage;
+- Chroma top-k ordering with the upstream 90-day recency window;
+- SQLite hydration of semantic observation, session-summary, and prompt ids;
+- hybrid semantic ordering plus SQLite metadata filters for concept/type/file
+  searches;
+- `/api/context/semantic` and optional prompt-submit semantic injection.
+
+Reason:
+
+- the first golden fixture is exact and deterministic: hook/tool evidence names
+  commands, file paths, and source observations that become approved memory,
+  retrieval documents, and a future session-start context bundle;
+- the merged exact retrieval/context API can prove authorization-before-ranking,
+  cited bundle output, replay idempotency, and wrong-project denial without
+  provider secrets, embeddings, or vector storage;
+- prompt-submit semantic recall is useful upstream behavior, but it is not part
+  of the first session-start golden path.
+
+Trigger to implement before the first E2E:
+
+- if the fixture is changed so the future context request can only succeed by
+  paraphrase/semantic recall rather than file path, symbol, command, ticket id,
+  exact term, or full-text match; or
+- if the first installed hook/client contract includes prompt-submit semantic
+  injection instead of session-start context injection.
+
+Later owner:
+
+- semantic retrieval remains a V1 requirement after the exact CLI/hooks/API E2E
+  loop is green, implemented through server-side model policy, embeddings, and
+  PostgreSQL-backed vector storage or an explicitly documented equivalent.
+
 ## Context Injection Format
 
 Source:
