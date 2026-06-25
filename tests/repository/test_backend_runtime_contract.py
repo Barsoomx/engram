@@ -14,7 +14,11 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/manage.py',
         'apps/backend/pyproject.toml',
         'apps/backend/pytest.ini',
+        'apps/backend/engram/celery_app.py',
+        'apps/backend/engram/celery_bootsteps.py',
+        'apps/backend/engram/celeryconfig.py',
         'apps/backend/settings/settings.py',
+        'apps/backend/settings/logs.py',
         'apps/backend/settings/test_settings.py',
         'apps/backend/settings/urls.py',
         'apps/backend/engram/access/models.py',
@@ -23,6 +27,24 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
         'apps/backend/engram/access/migrations/0001_initial.py',
         'apps/backend/engram/access/migrations/0002_seed_default_roles.py',
         'apps/backend/engram/core/models.py',
+        'apps/backend/engram/core/application_foundation_tests.py',
+        'apps/backend/engram/core/domain/__init__.py',
+        'apps/backend/engram/core/domain/event_dispatcher.py',
+        'apps/backend/engram/core/domain/event_store.py',
+        'apps/backend/engram/core/domain/events.py',
+        'apps/backend/engram/core/domain/singleton.py',
+        'apps/backend/engram/core/domain/types.py',
+        'apps/backend/engram/core/domain/usecases/base.py',
+        'apps/backend/engram/core/domain/usecases/errors.py',
+        'apps/backend/engram/core/domain/usecases/transactional_base.py',
+        'apps/backend/engram/core/middlewares/domain_exception.py',
+        'apps/backend/engram/core/middlewares/drf_exception_handler.py',
+        'apps/backend/engram/core/middlewares/request_response_logging.py',
+        'apps/backend/engram/core/observability/logs.py',
+        'apps/backend/engram/core/observability/sentryconfig.py',
+        'apps/backend/engram/core/redis_sentinel.py',
+        'apps/backend/engram/core/retryable_django_task.py',
+        'apps/backend/engram/core/retries_checker.py',
         'apps/backend/engram/core/golden_path_tests.py',
         'apps/backend/engram/core/migrations/0001_initial.py',
         'apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py',
@@ -81,6 +103,43 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
 
         self.assertIn("'engram.imports'", settings)
 
+    def test_application_foundation_is_installed(self) -> None:
+        settings = (ROOT / 'apps/backend/settings/settings.py').read_text(encoding='utf-8')
+        logs = (ROOT / 'apps/backend/settings/logs.py').read_text(encoding='utf-8')
+        pyproject = (ROOT / 'apps/backend/pyproject.toml').read_text(encoding='utf-8')
+
+        self.assertIn("'django_structlog'", settings)
+        self.assertIn("'django_structlog.middlewares.RequestMiddleware'", settings)
+        self.assertIn("'engram.core.middlewares.ExceptionHandlingMiddleware'", settings)
+        self.assertIn("'EXCEPTION_HANDLER': 'engram.core.middlewares.custom_exception_handler'", settings)
+        self.assertIn('configure_logger(', settings)
+        self.assertIn('DJANGO_STRUCTLOG_CELERY_ENABLED = True', settings)
+        self.assertIn("'BACKEND': 'django_redis.cache.RedisCache'", settings)
+        self.assertIn("'LOCATION': ENGRAM_REDIS_URL", settings)
+        self.assertIn('send_default_pii=False', logs)
+        self.assertIn('django-redis', pyproject)
+
+    def test_celery_foundation_uses_sla_queues_and_confirm_publish(self) -> None:
+        celeryconfig = (ROOT / 'apps/backend/engram/celeryconfig.py').read_text(encoding='utf-8')
+        celery_app = (ROOT / 'apps/backend/engram/celery_app.py').read_text(encoding='utf-8')
+        settings = (ROOT / 'apps/backend/settings/settings.py').read_text(encoding='utf-8')
+
+        for queue_name in (
+            'QUEUE_REALTIME',
+            'QUEUE_NEAR_REALTIME',
+            'QUEUE_BATCH',
+            'QUEUE_HIGHMEMORY',
+            'QUEUE_DOMAIN_EVENTS',
+        ):
+            self.assertIn(queue_name, celeryconfig)
+
+        self.assertIn("'confirm_publish': True", celeryconfig)
+        self.assertIn("task_cls='engram.core.retryable_django_task.RetryableTask'", celery_app)
+        self.assertIn('DjangoStructLogInitStep', celery_app)
+        self.assertIn('LivenessProbe', celery_app)
+        self.assertIn("'amqp://engram:engram@rabbitmq:5672/engram'", settings)
+        self.assertNotIn('CELERY_BROKER_URL = os.environ.get(\'ENGRAM_CELERY_BROKER_URL\', ENGRAM_REDIS_URL)', settings)
+
     def test_claude_mem_fixture_is_text_reviewable_and_sanitized(self) -> None:
         fixture_root = ROOT / 'apps/backend/engram/imports/fixtures/claude_mem_minimal'
         manifest = json.loads((fixture_root / 'manifest.json').read_text(encoding='utf-8'))
@@ -128,9 +187,14 @@ class BackendRuntimeLayoutTests(unittest.TestCase):
 class BackendComposeContractTests(unittest.TestCase):
     def test_compose_declares_backend_runtime_services(self) -> None:
         compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')
+        readme = (ROOT / 'deploy/compose/README.md').read_text(encoding='utf-8')
 
-        for service_name in ('api:', 'relay:', 'worker:', 'postgres:', 'redis:'):
+        for service_name in ('api:', 'relay:', 'worker:', 'postgres:', 'redis:', 'rabbitmq:'):
             self.assertIn(service_name, compose)
+
+        self.assertIn('RabbitMQ broker', readme)
+        self.assertIn('Redis result/cache backend', readme)
+        self.assertNotIn('Redis-compatible broker', readme)
 
     def test_compose_uses_healthchecks_relay_and_real_worker(self) -> None:
         compose = (ROOT / 'deploy/compose/docker-compose.yml').read_text(encoding='utf-8')
@@ -139,6 +203,8 @@ class BackendComposeContractTests(unittest.TestCase):
         self.assertIn('/-/readyz/', compose)
         self.assertIn('pg_isready', compose)
         self.assertIn('redis-cli', compose)
+        self.assertIn('rabbitmq-diagnostics', compose)
+        self.assertIn('amqp://engram:engram@rabbitmq:5672/engram', compose)
         self.assertIn('python manage.py celery_outbox_relay', compose)
         self.assertIn('celery -A engram.celery_app worker', compose)
 

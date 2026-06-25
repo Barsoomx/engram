@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+import importlib
+import inspect
+from collections.abc import Callable
+from unittest.mock import Mock, patch
+
+from django_celery_outbox.app import OutboxCelery
+
+from engram import celeryconfig
+from engram.celery_app import app as celery_app
+from engram.celery_bootsteps import LivenessProbe
+from engram.core.domain.event_dispatcher import QUEUE_DOMAIN_EVENTS, CeleryEventDispatcher
+from engram.core.domain.events import DomainEvent
+from engram.core.redis_sentinel import REDIS_DB_CACHE, DynamicRedisConnectionFactory
+from engram.core.retryable_django_task import RetryableTask
+
+EXPECTED_QUEUE_NAMES = {
+    'engram-realtime',
+    'engram-near-realtime',
+    'engram-batch',
+    'engram-highmemory',
+    'engram-domain-events',
+}
+
+
+class SampleCeleryEvent(DomainEvent):
+    value: int
+
+
+def test_celeryconfig_registers_sla_quorum_queues() -> None:
+    registered_queues = {queue.name: queue for queue in celeryconfig.task_queues}
+
+    assert set(registered_queues) == EXPECTED_QUEUE_NAMES
+    assert celeryconfig.QUEUE_DOMAIN_EVENTS == QUEUE_DOMAIN_EVENTS
+    assert celeryconfig.task_default_queue == celeryconfig.QUEUE_NEAR_REALTIME
+    assert celeryconfig.task_default_exchange == celeryconfig.QUEUE_NEAR_REALTIME
+    assert celeryconfig.task_default_exchange_type == 'topic'
+    assert celeryconfig.task_default_routing_key == celeryconfig.QUEUE_NEAR_REALTIME
+    assert celeryconfig.task_default_queue_type == 'quorum'
+
+    for queue_name, queue in registered_queues.items():
+        assert queue.exchange.name == queue_name
+        assert queue.exchange.type == 'topic'
+        assert queue.routing_key == queue_name
+        assert queue.queue_arguments == {'x-queue-type': 'quorum'}
+
+
+def test_celeryconfig_uses_confirm_publish_and_quorum_delivery() -> None:
+    assert celeryconfig.broker_transport_options == {'confirm_publish': True}
+    assert celeryconfig.broker_native_delayed_delivery_queue_type == 'quorum'
+    assert celeryconfig.worker_detect_quorum_queues is True
+    assert celeryconfig.broker_connection_retry_on_startup is False
+    assert celeryconfig.broker_connection_retry is False
+    assert celeryconfig.worker_soft_shutdown_timeout == 60
+
+
+def test_celeryconfig_uses_json_and_eager_result_contract() -> None:
+    assert celeryconfig.task_serializer == 'json'
+    assert celeryconfig.accept_content == ['json']
+    assert celeryconfig.result_serializer == 'json'
+    assert celeryconfig.enable_utc is True
+    assert celeryconfig.result_expires == 3600
+    assert celeryconfig.task_ignore_result is True
+    assert celeryconfig.task_store_eager_result == celeryconfig.task_always_eager
+
+
+def test_celery_app_uses_outbox_transport_and_foundation_config() -> None:
+    engram_package = importlib.import_module('engram')
+
+    assert isinstance(celery_app, OutboxCelery)
+    assert celery_app.main == 'engram'
+    assert engram_package.celery_app is celery_app
+    assert celery_app.task_cls == 'engram.core.retryable_django_task.RetryableTask'
+    assert set(celery_app.conf.include or ()) == {'engram.memory.tasks'}
+    assert celery_app.conf.broker_transport_options == {'confirm_publish': True}
+    assert celery_app.conf.task_default_queue == celeryconfig.QUEUE_NEAR_REALTIME
+    assert celery_app.conf.task_default_queue_type == 'quorum'
+    assert LivenessProbe in celery_app.steps['worker']
+
+
+def test_celery_support_classes_are_available() -> None:
+    assert issubclass(RetryableTask, object)
+    assert DynamicRedisConnectionFactory().redis_db == REDIS_DB_CACHE
+
+
+def test_celery_event_dispatcher_wraps_handlers_with_concrete_event_type() -> None:
+    captured: dict[str, Callable] = {}
+
+    def handler(_: DomainEvent) -> None:
+        return None
+
+    def shared_task_stub(**_: object) -> Callable:
+        def decorator(func: Callable) -> Mock:
+            captured['func'] = func
+            task = Mock()
+            task.__name__ = getattr(func, '__name__', 'task')
+            return task
+
+        return decorator
+
+    dispatcher = CeleryEventDispatcher()
+
+    with patch('engram.core.domain.event_dispatcher.shared_task', shared_task_stub):
+        dispatcher.add_handler(SampleCeleryEvent, handler, queue=QUEUE_DOMAIN_EVENTS)
+
+    wrapped_handler = captured['func']
+    annotation = inspect.signature(wrapped_handler).parameters['event'].annotation
+    parsed_event = annotation.model_validate(SampleCeleryEvent(value=7).model_dump())
+
+    assert annotation is SampleCeleryEvent
+    assert parsed_event.value == 7
+
+
+@patch('engram.core.domain.event_dispatcher.transaction')
+def test_celery_event_dispatcher_delays_handlers_after_current_transaction(m_transaction: Mock) -> None:
+    dispatcher = CeleryEventDispatcher()
+    dispatcher._handlers.clear()
+    handler = Mock()
+    event = SampleCeleryEvent(value=11)
+    m_transaction.get_connection.return_value.in_atomic_block = True
+
+    dispatcher._run_handler(handler, event)
+
+    handler.delay_on_commit.assert_called_once_with(event={'value': 11})
+    handler.delay.assert_not_called()

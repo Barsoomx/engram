@@ -12,7 +12,8 @@ V1 stack:
 
 - Django and Django REST Framework.
 - PostgreSQL as the system of record.
-- Redis-compatible broker for background jobs.
+- RabbitMQ-compatible broker for background jobs.
+- Redis result/cache backend for Celery results and application cache.
 - Celery worker pools for ingestion follow-up, digest generation, memory
   curation, indexing, and retention tasks.
 - Transaction-safe Celery enqueueing through `django-celery-outbox`.

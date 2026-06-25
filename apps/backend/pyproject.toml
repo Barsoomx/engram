@@ -10,6 +10,12 @@ redis = {extras = ["hiredis"], version = "^5.2.1"}
 celery = "^5.5.3"
 gunicorn = "^23.0.0"
 django-celery-outbox = "0.4.0"
+pydantic = {extras = ["email"], version = "^2.11.3"}
+sentry-sdk = "^2.27.0"
+structlog = "^25.2.0"
+structlog-sentry = "^2.2.1"
+django-structlog = "^9.1.1"
+django-redis = "^7.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.4.0"
