@@ -7,7 +7,17 @@ from typing import Sequence
 
 REQUIRED_PATHS: tuple[str, ...] = (
     'apps/backend/README.md',
+    'apps/backend/manage.py',
+    'apps/backend/pyproject.toml',
+    'apps/backend/pytest.ini',
+    'apps/backend/settings/settings.py',
+    'apps/backend/settings/test_settings.py',
+    'apps/backend/settings/urls.py',
+    'apps/backend/engram/health/views.py',
+    'apps/backend/Dockerfile',
     'apps/frontend/README.md',
+    'deploy/compose/.env.example',
+    'deploy/compose/docker-compose.yml',
     'packages/cli/README.md',
     'packages/mcp/README.md',
     'packages/claude-plugin/README.md',
