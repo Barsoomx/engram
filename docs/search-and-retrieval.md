@@ -25,24 +25,29 @@ PostgreSQL should store normalized retrieval documents with:
 - trigram-friendly fields;
 - embedding reference.
 
-Recommended initial stack:
+V1 stack:
 
 - PostgreSQL full-text search;
 - `pg_trgm` for fuzzy exact strings;
-- optional `pgvector` for embeddings;
-- later Qdrant adapter for customers that need separate vector scaling.
+- deterministic ranking;
+- citations and audit.
+
+Later:
+
+- `pgvector` for embeddings;
+- Qdrant adapter for customers that need separate vector scaling;
+- model reranking.
 
 ## Retrieval Pipeline
 
 1. Parse request intent and context.
 2. Resolve actor and effective scope.
 3. Build permission filters before querying content.
-4. Run exact, full-text, trigram, and vector retrieval in parallel.
-5. Fuse candidates with deterministic ranking.
-6. Optionally rerank through the configured server-side model.
-7. Pack context with citations, confidence, source references, and stale/conflict
+4. Run exact, full-text, and trigram retrieval.
+5. Rank candidates deterministically.
+6. Pack context with citations, confidence, source references, and stale/conflict
    warnings.
-8. Audit the final injected memory set.
+7. Audit the final injected memory set.
 
 ## Result Types
 

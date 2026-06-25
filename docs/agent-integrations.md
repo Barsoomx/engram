@@ -18,13 +18,35 @@ API schema. Agent-specific differences belong at the adapter boundary.
 
 ## Installation Model
 
-The target installer is a client connector, not a worker bootstrapper. It should
-ask for server URL, authentication, organization, team, project, and repository
-binding, then write the correct hook configuration for Claude Code and/or Codex.
+The target installer is a client connector, not a worker bootstrapper. The V1
+golden path is explicit:
+
+```bash
+npx claudex-teams connect --server URL --api-key KEY --project PROJECT
+```
+
+It writes hook configuration for Claude Code and/or Codex, then calls the dry-run
+endpoint.
 
 Server deployment is handled separately by Compose, Helm, or SaaS provisioning.
 The installer must not install local databases, vector stores, provider workers,
 or background services.
+
+## Hook Protocol Matrix
+
+| Event | Endpoint | Sync behavior | Timeout budget | Response |
+| --- | --- | --- | --- | --- |
+| session start | `/v1/context/session-start` | synchronous retrieval | 2s | memory bundle, citations, warnings |
+| prompt submit | `/v1/context` | optional synchronous retrieval | 1s | focused guidance |
+| pre tool use | `/v1/hooks/pre-tool-use` | warning/audit in V1 | 1s | allowed warning fields only |
+| post tool use | `/v1/hooks/post-tool-use` | synchronous durable ingest, async distillation | 2s | ack, request id |
+| stop/session end | `/v1/hooks/session-end` | synchronous durable ingest, async digest/curation | 2s | ack, scheduled job ids |
+| dry run | `/v1/hooks/dry-run` | synchronous verification | 2s | resolved actor, scopes, server health |
+
+Every request includes agent family, agent version, event id, session id,
+repository metadata, cwd, idempotency key, timestamp, and auth credential.
+Responses are adapter-specific and must not emit fields unsupported by the
+target agent.
 
 ## Hook Responsibilities
 
@@ -71,11 +93,16 @@ Explicit tools:
 
 ## Server-Only Contract
 
-Adapters may cache request ids, hook trust state, and short-lived retry buffers.
+Adapters may cache request ids, hook trust state, credential metadata, and
+short-lived retry buffers.
 They must not run persistent local summarizers, vector indexes, SQLite stores, or
 background workers. If the server is unavailable, hooks should degrade by
 recording a bounded local retry envelope or returning no memory, depending on
 admin policy.
+
+Retry envelopes are metadata-only by default. They have a strict size limit, TTL,
+redaction pass, optional encryption, and never contain provider secrets, memory
+bundles, embeddings, or unredacted prompt/tool-output bodies.
 
 ## Trust And Managed Hooks
 

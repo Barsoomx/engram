@@ -22,13 +22,13 @@ The client command should be renamed and narrowed. Candidate names:
 - `npx claudex-teams hooks install`
 - `npx claudex-teams agent connect`
 
-The recommended first version is:
+The V1 golden path is non-interactive and scriptable:
 
 ```bash
-npx claudex-teams connect
+npx claudex-teams connect --server URL --api-key KEY --project PROJECT
 ```
 
-It should run a small wizard:
+The interactive wizard can wrap the same fields later:
 
 1. Choose agent: Claude Code, Codex, or both.
 2. Enter server URL.
@@ -39,6 +39,20 @@ It should run a small wizard:
 
 The command must not install Bun, local vector databases, local SQLite stores,
 provider SDK workers, or background services.
+
+## Local Credential
+
+V1 stores one hook credential artifact:
+
+- preferred: OS keychain entry containing a project-scoped agent token minted
+  from the supplied API key;
+- fallback for headless hosts: file containing the agent token with strict file
+  permissions;
+- local config stores only server URL, project id, and redacted fingerprint.
+
+The raw organization/team provider keys never reach the client. `doctor` verifies
+token validity, expiry, project scope, last rotation time, hook file state, and
+server reachability.
 
 ## Managed Installation
 
@@ -65,10 +79,12 @@ Allowed local state:
 
 - server URL;
 - selected organization/team/project ids;
-- short-lived device-flow token cache;
-- redacted API key fingerprint;
+- short-lived device-flow token cache when device flow is added later;
+- scoped agent token or managed-hook injected credential;
+- redacted credential fingerprint;
 - hook installation metadata;
-- bounded retry envelopes if admin policy allows offline buffering.
+- bounded metadata-only retry envelopes if admin policy allows offline
+  buffering.
 
 Forbidden local state:
 
@@ -77,6 +93,8 @@ Forbidden local state:
 - embeddings;
 - summarization worker;
 - persistent queue;
+- cached memory bundles;
+- unredacted prompt/tool-output bodies in retry storage;
 - local admin UI as the operational source of truth.
 
 ## Hook Output Contract

@@ -17,14 +17,15 @@ governance framework before first use.
 
 - Developer: wants agent sessions to remember project decisions, incident
   lessons, local conventions, and review outcomes without manual copy-paste.
-- Team lead: wants shared project memory, stale-memory cleanup, and visibility
-  into what agents are using.
+- Team lead: wants a daily AI-generated summary of what changed, what is
+  blocked, and what memory changed, without manually reviewing raw observations.
 - Platform admin: wants on-premise deployment, provider key control, RBAC, audit
   logs, and simple rollout across Claude Code and Codex.
 - Security admin: wants no secrets in memory, scoped API keys, retention rules,
   review queues, and an answer to "who could see this memory?"
-- Memory curator: wants to review proposed observations, merge duplicates,
-  resolve conflicts, and promote durable knowledge.
+- Memory curator: is an AI workflow that automatically rejects noise, merges
+  duplicates, marks refuted or contradictory memory, and escalates only critical
+  or ambiguous changes for human review.
 - Auditor: wants immutable evidence for memory reads, writes, policy decisions,
   and secret access.
 
@@ -43,6 +44,8 @@ governance framework before first use.
    audit, and deployment.
 8. Provide a small client connect wizard that writes server-backed hooks without
    installing a local memory worker.
+9. Run scheduled AI workflows that produce team digests and curate memory with
+   exception-based human review.
 
 ## Hook-Centric Behavior
 
@@ -75,7 +78,8 @@ policy decisions remain authoritative.
 - Project and repository binding.
 - User invitations, service accounts, and scoped API keys.
 - Team-owned AI provider secrets and model routing.
-- Memory review workflow: proposed, approved, stale, conflicted, archived.
+- AI memory workflow: proposed, rejected, merged, approved, refuted,
+  conflicted, archived, escalated.
 - Memory visibility: private user memory, team memory, project memory,
   organization memory, shared packs, and policy packs.
 - Exact and semantic retrieval with permission filtering before response.
@@ -92,6 +96,7 @@ policy decisions remain authoritative.
 - Complex cloud-style conditional access language.
 - Vector-only retrieval.
 - Multi-region active-active control plane.
+- Manual review of every observation or memory proposal.
 
 ## Success Criteria
 
@@ -108,3 +113,7 @@ policy decisions remain authoritative.
   scale retrieval and distillation independently.
 - The first implementation remains small enough to reason about: few domain
   concepts, explicit contracts, and boring operational dependencies.
+- Team leads receive daily or twice-daily digests with changelog, problems,
+  unresolved questions, and memory changes.
+- The AI curator can archive obvious noise and stale/refuted memories without a
+  human queue, while escalating high-risk contradictions.

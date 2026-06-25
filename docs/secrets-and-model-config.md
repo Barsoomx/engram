@@ -27,10 +27,13 @@ Both modes expose the same domain API:
 
 ## Secret Scope
 
-Secrets can belong to:
+V1 secrets can belong to:
 
 - organization;
 - team;
+
+Later secrets can belong to:
+
 - project;
 - service account.
 
@@ -77,6 +80,10 @@ or team context; the server resolves policy.
 
 ## Simple First Version
 
-Start with organization and team secrets, plus project-level model overrides.
-Avoid per-file, per-branch, or arbitrary condition expressions until customer
-use proves they are needed.
+Start with organization and team secrets, plus project-level model-policy
+overrides that select existing secrets. Project and service-account owned raw
+secrets are later. Avoid per-file, per-branch, or arbitrary condition
+expressions until customer use proves they are needed.
+
+See [Backend contracts](backend-contracts.md) for vault adapter and envelope
+encryption invariants.

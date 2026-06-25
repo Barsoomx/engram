@@ -3,12 +3,14 @@
 ## Inputs
 
 - Upstream project: `thedotmack/claude-mem`, imported into the `upstream` branch.
-- Official Claude Code hooks documentation: lifecycle hooks can run commands,
-  HTTP endpoints, and prompt hooks around session, prompt, and tool events.
-- Official Codex hooks documentation: hooks are an extensibility framework with
-  managed hook configuration, trust review, event scopes, and JSON event I/O.
-- Repository baseline: `Barsoomx/django-celery-outbox` branch protection,
-  workflow naming, Dependabot, CodeQL, documentation, and contribution hygiene.
+- Official Claude Code hooks documentation, accessed 2026-06-25:
+  https://docs.anthropic.com/en/docs/claude-code/hooks
+- Official Claude Code hooks guide, accessed 2026-06-25:
+  https://docs.anthropic.com/en/docs/claude-code/hooks-guide
+- Official Codex hooks documentation, accessed 2026-06-25:
+  https://developers.openai.com/codex/hooks
+- Repository baseline, accessed 2026-06-25:
+  https://github.com/Barsoomx/django-celery-outbox
 - Local product requirements: server-only runtime, company-owned deployment,
   Sentry-like teams and scopes, team-owned model keys, and simple enterprise
   administration.

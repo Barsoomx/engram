@@ -28,10 +28,14 @@ is the product and architecture track for the server-only rewrite.
 ## Documentation
 
 - [Product requirements](docs/product-requirements.md)
+- [V1 scope](docs/v1-scope.md)
 - [Architecture](docs/architecture.md)
+- [Backend contracts](docs/backend-contracts.md)
 - [RBAC and scopes](docs/rbac-and-scopes.md)
 - [Agent integrations](docs/agent-integrations.md)
 - [Client installation and hook bootstrap](docs/client-installation.md)
+- [AI workflow loop](docs/ai-workflow-loop.md)
+- [Admin UI requirements](docs/admin-ui-requirements.md)
 - [Secrets and model configuration](docs/secrets-and-model-config.md)
 - [Search and retrieval](docs/search-and-retrieval.md)
 - [Operations and deployment](docs/operations-and-deployment.md)
@@ -48,6 +52,7 @@ fallbacks, and inspectable behavior:
 - one server-side source of truth;
 - one hook protocol per agent family;
 - one small client connect wizard, not a local worker installer;
+- one scheduled AI workflow loop for digest and memory curation;
 - one scope model reused by users, teams, projects, memories, API keys, and
   secrets;
 - exact search first, semantic search as recall expansion;
