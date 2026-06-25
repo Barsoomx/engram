@@ -48,9 +48,9 @@ The first production version should remain intentionally small:
 - one reusable scope model;
 - one hook API family per agent type;
 - one secret/model policy resolver;
+- one local MCP bridge that exposes server-side tools;
 - PostgreSQL first;
-- exact search first;
-- vector search as an adapter;
+- hybrid exact + semantic search in V1;
 - domain events and durable outbox for asynchronous work.
 
 This keeps the system understandable while leaving room for SaaS and on-premise

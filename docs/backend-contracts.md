@@ -109,6 +109,22 @@ Forbidden in logs and traces:
 - memory content marked sensitive;
 - unredacted tool output that matches secret patterns.
 
+## Model Provider Contract
+
+Memory generation, digesting, curation, and embeddings use provider adapters
+resolved by model policy.
+
+V1 adapters:
+
+- Anthropic generation.
+- OpenAI generation.
+- OpenAI embeddings.
+
+Provider calls record provider, model, policy version, tenant/team/project,
+request id, trace id, token usage, latency, cost metadata when available, and
+redaction state. Provider selection must be testable without changing hook
+adapters.
+
 ## Vault Adapter Contract
 
 Vault-compatible storage must support:

@@ -35,7 +35,8 @@ The interactive wizard can wrap the same fields later:
 3. Authenticate by device/browser flow or paste a scoped API key.
 4. Choose organization, team, project, and repository binding.
 5. Install thin hook config for the selected agent.
-6. Run a dry-run hook call and print the resolved identity/scope.
+6. Optionally install the local MCP bridge for memory tools.
+7. Run a dry-run hook call and print the resolved identity/scope.
 
 The command must not install Bun, local vector databases, local SQLite stores,
 provider SDK workers, or background services.
@@ -128,6 +129,8 @@ Build the smallest useful client package:
 
 - `connect`: write thin hooks and verify server scope;
 - `doctor`: validate installed hooks and server reachability;
+- `mcp install`: configure the local MCP bridge without creating a local memory
+  store;
 - `disconnect`: remove local hook entries created by the package.
 
 Everything else stays server-side.

@@ -23,11 +23,14 @@ end-to-end.
 
 - Hook dry-run endpoint that prints resolved organization, team, project, actor,
   scopes, and server health.
+- Local MCP bridge for developer and lead workflows.
 - Observation ingestion.
 - Memory candidate generation.
 - AI workflow loop for daily team digest and automated memory curation.
 - Approved memory retrieval.
-- PostgreSQL full-text search plus `pg_trgm`.
+- Hybrid search: exact/grep-style retrieval plus semantic vector retrieval.
+- Organization/team model policy with Anthropic and OpenAI provider support for
+  memory generation, curation, embeddings, and optional summarization tasks.
 - Audit evidence for hook calls, memory reads/writes, API keys, and secrets.
 - Organization/team provider secrets through vault adapter or encrypted database
   envelopes.
@@ -41,8 +44,8 @@ end-to-end.
 - User-private, organization-wide, memory-pack, and policy-pack scopes.
 - Legal hold and eDiscovery workflows.
 - SaaS billing and chargeback.
-- Qdrant.
-- Embedding rerank as a required path.
+- Qdrant scale-out adapter.
+- Model rerank as a required path.
 - Policy enforcement blocks. V1 may warn and audit, but blocking is a later
   hardening step.
 - Managed hook distribution.
@@ -55,8 +58,11 @@ end-to-end.
 1. Operator starts server with Compose.
 2. Admin creates organization, team, project, user, and project-scoped API key.
 3. Developer runs `npx claudex-teams connect --server URL --api-key KEY --project PROJECT`.
-4. Installer writes thin hooks and calls dry-run.
+4. Installer writes thin hooks, configures the local MCP bridge, and calls
+   dry-run.
 5. Agent session starts; server injects scoped memory.
 6. Hooks record observations.
 7. Scheduled AI workflow loop summarizes the day and curates memory candidates.
 8. Future sessions retrieve approved memory with citations and audit evidence.
+9. Team lead uses MCP tools or admin UI to inspect digests, contradictions, and
+   escalations.

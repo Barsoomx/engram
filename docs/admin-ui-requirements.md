@@ -60,6 +60,9 @@ Secrets and model policies:
 - rotation test;
 - dependency impact;
 - inherited organization/team/project policy display;
+- provider selector for Anthropic and OpenAI;
+- task-level routing for generation, curation, embeddings, and summaries;
+- cost/latency hints per provider and model;
 - provider health;
 - budget warning;
 - fallback simulation.
@@ -72,6 +75,7 @@ Memory review:
 - provenance and citations;
 - approve, edit, narrow, reject, archive, supersede;
 - bulk archive for low-confidence noise.
+- same contradiction/escalation concepts as MCP lead tools.
 
 AI workflow runs:
 

@@ -16,6 +16,10 @@ local memory workers or depend on local databases.
 The hook adapters should be separate thin packages that share the same server
 API schema. Agent-specific differences belong at the adapter boundary.
 
+The local MCP bridge is installed alongside hooks when requested. It exposes
+developer and lead tools, but every tool call goes back to the server and uses
+the same RBAC checks as HTTP APIs.
+
 ## Installation Model
 
 The target installer is a client connector, not a worker bootstrapper. The V1

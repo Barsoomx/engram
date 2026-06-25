@@ -15,6 +15,9 @@ V1 runs scheduled jobs once or twice per day per team/project:
 - end-of-day digest for durable summary and cleanup.
 
 Teams can tune the schedule, but the default should work without manual setup.
+The model used by each workflow is resolved through organization/team model
+policy. V1 supports both Anthropic and OpenAI backends so teams can trade off
+quality and cost per task.
 
 ## Daily Team Digest
 
@@ -71,6 +74,7 @@ Escalation is reserved for:
 Human review is exception-based:
 
 - review queue contains only escalated items;
+- queue is available in the admin UI and through lead-scoped MCP tools;
 - every item includes the curator's recommendation and evidence;
 - reviewer can approve, edit, narrow scope, reject, archive, or request another
   check;
@@ -83,6 +87,7 @@ Every automated curator action writes an audit record:
 
 - input window;
 - model policy used;
+- provider and model used;
 - source ids;
 - decision;
 - confidence;

@@ -67,6 +67,21 @@ Sentry project settings:
 Developers should not need to understand provider wiring. They choose a project
 or team context; the server resolves policy.
 
+V1 provider support:
+
+- Anthropic models for teams that want Claude-quality generation.
+- OpenAI models for cost-aware memory generation, digesting, curation, and
+  embeddings.
+- Task-level routing so an organization can use a cheaper OpenAI model for
+  routine observation distillation and reserve a stronger model for
+  contradiction resolution or high-impact summaries.
+- Provider health and cost metadata visible to admins before they choose a
+  default.
+
+The product must support multiple generation backends. Provider selection is an
+organization/team setting, and every generated memory records the provider,
+model, policy version, and cost metadata when available.
+
 ## Safety Requirements
 
 - Secrets are redacted before logs, traces, observations, and audit details.
