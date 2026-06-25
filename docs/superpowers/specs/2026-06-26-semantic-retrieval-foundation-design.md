@@ -87,23 +87,31 @@ gateway method. Generation behavior is unchanged.
   idempotent, otherwise creates a redacted `ProviderCallRecord`, and returns a
   deterministic embedding derived from the redacted input text.
 
-Deterministic embedding algorithm (feature-hashing projection):
+Deterministic embedding algorithm (character 3-gram hashing trick):
 
-- Tokenize the redacted text: lowercase, split on non-alphanumeric characters,
-  drop tokens shorter than two characters.
-- For each token, compute `sha256(token)`; use the digest to pick a dimension
+- Normalize the redacted text: lowercase, strip every non-alphanumeric character
+  (boundaries collapse), and slide a 3-character window over the result.
+- For each 3-gram, compute `sha256(gram)`; use the digest to pick a dimension
   index in `[0, EMBEDDING_DIMENSION)` and a sign in `{-1, +1}`; accumulate
-  `sign` into that dimension.
+  `sign` into that dimension. Repeated grams accumulate, so frequency is a
+  signal.
 - `EMBEDDING_DIMENSION = 64`.
-- L2-normalize the vector. If the text has no tokens, return the zero vector.
+- L2-normalize the vector. If the text has fewer than three alphanumeric
+  characters, return the zero vector.
 - Round each component to six decimal places so persisted JSON is stable and
   readable.
 
-This is not real semantic similarity. It is a deterministic lexical-overlap
-signal: documents and queries that share tokens produce correlated vectors, so
-cosine similarity is non-trivial and testable, while the provider boundary stays
-identical to the generation path. Swapping in OpenAI embeddings later replaces
-only the `embed` implementation and the storage column type.
+Character 3-grams, not word tokens, are deliberate. Exact retrieval already
+matches any query term that is a substring of a document's full text
+(`first_full_text_match`, score 40). A word-level embedding would only surface
+documents that share whole tokens with the query, which exact retrieval already
+catches, so a word-level semantic fallback would never activate. Character
+3-grams instead surface fuzzy overlap that exact substring matching misses:
+typos (`authorisation` vs `authorization`), partial words (`auth` vs
+`authorization`), and morphological variants. This gives the semantic fallback a
+real purpose distinct from exact retrieval, while staying deterministic and free
+of new infrastructure. Swapping in real OpenAI embeddings later replaces only
+the `embed` implementation and the storage column type.
 
 Redaction: the embedding input text is redacted through
 `engram.core.redaction.redact_value` before tokenization, exactly as generation
