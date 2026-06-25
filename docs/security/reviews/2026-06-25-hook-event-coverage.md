@@ -85,6 +85,6 @@ None.
 
 ## Accepted Risk
 
-No accepted security risk remains for the focused hook-event slice. CI is still
-pending/not run until the branch is pushed and PR checks run; that is a
-release/process gate, not an accepted security risk.
+No accepted security risk remains for the focused hook-event slice. The branch
+was merged through PR `#11`, and Backend, Compose E2E, and Repository Quality CI
+passed on the merge commit.
