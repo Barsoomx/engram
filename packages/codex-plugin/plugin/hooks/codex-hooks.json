@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-start --agent codex --response-format codex",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook post-tool-use --agent codex --response-format codex",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Error": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook error --agent codex --response-format codex",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Decision": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook decision --agent codex --response-format codex",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
