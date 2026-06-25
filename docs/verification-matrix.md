@@ -505,6 +505,21 @@ First decisive failures fixed during the hook event coverage loop:
 
 Branch: `chore/parity-gate-evidence`
 
+PR status: merged through
+`https://github.com/Barsoomx/engram/pull/12`.
+
+Merge commit:
+`8de3c263928164a4581700bc1152b917e7023574`.
+
+CI status on the merge commit: pass.
+
+- Backend:
+  `https://github.com/Barsoomx/engram/actions/runs/28175303549`
+- Compose E2E:
+  `https://github.com/Barsoomx/engram/actions/runs/28175303754`
+- Repository Quality:
+  `https://github.com/Barsoomx/engram/actions/runs/28175304695`
+
 Scope:
 
 - `docs/parity/2026-06-25-first-parity-gate-report.md`

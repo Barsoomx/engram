@@ -9,13 +9,16 @@ Upstream audit SHA:
 `3fe0725a97e18b5edf3e61cde60e181ab2b6c997`
 
 PR evidence:
-`https://github.com/Barsoomx/engram/pull/11`
+
+- Hook event coverage: `https://github.com/Barsoomx/engram/pull/11`
+- Parity evidence and request-size limits:
+  `https://github.com/Barsoomx/engram/pull/12`
 
 ## Verdict
 
-The first Codex-led CLI/hooks/API parity gate is proven by this checkpoint once
-the evidence report, request-size-limit fix, security roll-up, and CI are
-merged.
+The first Codex-led CLI/hooks/API parity gate is proven on `master` by the
+merged hook event coverage checkpoint, parity evidence report,
+request-size-limit fix, security roll-up, and passing CI.
 
 This report does not claim Claude Code runtime parity, MCP parity, semantic
 retrieval breadth, frontend/admin readiness, production deployment readiness,
@@ -70,7 +73,7 @@ Local verification on the checkpoint branch:
   targeted CLI tests exit 0 with 28 tests OK, and targeted backend parity tests
   exit 0 with 71 tests passed.
 
-Prior GitHub CI on the checkpoint start merge commit:
+GitHub CI on the checkpoint start merge commit:
 
 - Backend:
   `https://github.com/Barsoomx/engram/actions/runs/28172695242`
@@ -79,7 +82,17 @@ Prior GitHub CI on the checkpoint start merge commit:
 - Repository Quality:
   `https://github.com/Barsoomx/engram/actions/runs/28172695225`
 
-This checkpoint still requires its own pull-request CI to pass before merge.
+GitHub CI on the final parity evidence merge commit
+`8de3c263928164a4581700bc1152b917e7023574`:
+
+- Backend:
+  `https://github.com/Barsoomx/engram/actions/runs/28175303549`
+- Compose E2E:
+  `https://github.com/Barsoomx/engram/actions/runs/28175303754`
+- Repository Quality:
+  `https://github.com/Barsoomx/engram/actions/runs/28175304695`
+
+PR `#12` pull-request checks also passed before merge.
 
 ## Security Evidence
 
