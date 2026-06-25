@@ -1,10 +1,10 @@
 # Backend
 
-Owns the future Django and Django REST Framework API, domain services,
-PostgreSQL state, durable outbox, and worker entrypoints.
+Owns the Django and Django REST Framework API, domain services, PostgreSQL
+state, durable outbox, and worker entrypoints.
 
-This directory is inactive in the skeleton checkpoint. It must not introduce
-runtime code, migrations, service containers, provider calls, or local memory
-storage until the backend gate starts with failing tests.
+The first active backend gate adds the runtime shell and health endpoints. Hook
+ingest, tenancy/RBAC, memory storage, durable outbox, provider calls, and
+context retrieval remain deferred to later parity slices.
 
-Activation gate: first Django backend and health-check slice.
+Current gate: first Django backend and health-check slice.

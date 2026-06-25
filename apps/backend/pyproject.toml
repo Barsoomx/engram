@@ -1,0 +1,42 @@
+[tool.poetry]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "3.12.*"
+Django = "^5.2"
+djangorestframework = "^3.16.0"
+psycopg = {extras = ["binary"], version = "^3.2.6"}
+redis = {extras = ["hiredis"], version = "^5.2.1"}
+celery = "^5.5.3"
+gunicorn = "^23.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.4.0"
+pytest-django = "^4.11.1"
+ruff = "^0.11.7"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+lint.select = [
+  "W", "ARG", "ANN", "ASYNC", "B", "COM", "C4", "C90", "DTZ",
+  "E", "ERA", "F", "UP", "T10", "T20", "Q", "S", "I", "N", "YTT", "PTH",
+]
+lint.ignore = [
+  "ANN401", "ARG001", "ARG002", "COM812", "S101", "S105",
+]
+lint.exclude = [
+  ".git", ".mypy_cache", ".ruff_cache", "__pycache__", "*/migrations/**",
+]
+lint.fixable = ["ALL"]
+
+[tool.ruff.format]
+quote-style = "single"
+docstring-code-format = true
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
