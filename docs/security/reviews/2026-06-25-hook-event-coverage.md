@@ -4,7 +4,10 @@ Date: 2026-06-25
 
 Branch: `feat/parity-14-hook-event-coverage`
 
-Head SHA: `3a3952fd303dfcf2d8a401f1cd10240380a97de2`
+Artifact head before evidence-head correction:
+`76bd251c763513ce3d627967b592c3f9ef1fca8f`
+
+Security fix commit: `3a3952fd303dfcf2d8a401f1cd10240380a97de2`
 
 Result: SECURITY APPROVED after stable hook idempotency fix.
 
@@ -12,7 +15,7 @@ Result: SECURITY APPROVED after stable hook idempotency fix.
 
 - `packages/cli/engram_cli/commands.py`
 - `packages/cli/engram_cli/cli_lifecycle_tests.py`
-- Final hook event coverage diff from `b7aeb007` to
+- Security-reviewed hook event coverage diff from `b7aeb007` to
   `3a3952fd303dfcf2d8a401f1cd10240380a97de2`.
 - Hook-event fallback id derivation for `event_id`, `idempotency_key`, and
   `content_hash`.

@@ -429,7 +429,10 @@ First decisive failures fixed during the Task 5 loop:
 
 Branch: `feat/parity-14-hook-event-coverage`
 
-Final head: `3a3952fd303dfcf2d8a401f1cd10240380a97de2`
+Artifact head before evidence-head correction:
+`76bd251c763513ce3d627967b592c3f9ef1fca8f`
+
+Security fix commit: `3a3952fd303dfcf2d8a401f1cd10240380a97de2`
 
 Scope:
 
@@ -441,9 +444,10 @@ Scope:
 - Stable hook idempotency fix: commit `3a3952fd`; focused security re-review
   approved.
 - Evidence-only docs update for parity map, verification matrix, and Compose
-  README.
+  README: commit `76bd251c`.
 
-CI status: pending/not run for this branch after `3a3952fd`; the rows below are
+CI status: pending/not run for this branch after the security fix commit
+`3a3952fd`; evidence-only docs later reached `76bd251c`. The rows below are
 local command evidence, not CI evidence.
 
 | Check | Local command | CI job | Required | Status | Notes |
