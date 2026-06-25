@@ -1,0 +1,9 @@
+[project]
+name = "engram-cli"
+version = "0.1.0"
+description = "Thin Engram command-line client"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+engram = "engram_cli.main:console_main"
