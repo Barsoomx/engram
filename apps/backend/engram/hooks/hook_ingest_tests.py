@@ -78,6 +78,12 @@ def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKe
     return organization, team, project, owner, api_key
 
 
+def create_hook_scope() -> tuple[Organization, Project, Team, str]:
+    organization, team, project, _owner, _api_key = create_project_scope()
+
+    return organization, project, team, RAW_KEY
+
+
 def auth_headers(raw_key: str = RAW_KEY) -> dict[str, str]:
     return {'HTTP_AUTHORIZATION': f'Bearer {raw_key}'}
 
@@ -300,6 +306,194 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox() -> None:
     transport_payload = f'{queued.args} {queued.kwargs} {queued.options}'
     assert RAW_KEY not in transport_payload
     assert provider_secret not in transport_payload
+
+
+@pytest.mark.django_db
+def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task() -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='session_start',
+        event_id='session-start-event-1',
+        idempotency_key='session-start-idempotency-1',
+        payload={'trigger': 'startup', 'cwd': '/workspace/engram'},
+        observation={
+            'type': 'session_start',
+            'title': 'Session started',
+            'body': 'Agent session started for backend work.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    body = response.json()
+    assert RawEventEnvelope.objects.get().event_type == 'session_start'
+    assert Observation.objects.get().observation_type == 'session_start'
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
+    assert queued.args == [body['outbox_event_id']]
+
+
+@pytest.mark.django_db
+def test_error_hook_persists_error_event_and_queues_worker_task() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='error',
+        event_id='error-event-1',
+        idempotency_key='error-idempotency-1',
+        payload={'message': 'Command failed', 'exit_code': 1},
+        observation={
+            'type': 'error',
+            'title': 'Command failed',
+            'body': 'pytest exited 1.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/error', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    body = response.json()
+    assert RawEventEnvelope.objects.get().event_type == 'error'
+    assert Observation.objects.get().observation_type == 'error'
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
+    assert queued.args == [body['outbox_event_id']]
+
+
+@pytest.mark.django_db
+def test_decision_hook_persists_decision_event_and_queues_worker_task() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='decision',
+        event_id='decision-event-1',
+        idempotency_key='decision-idempotency-1',
+        payload={'decision': 'Use django-celery-outbox transport'},
+        observation={
+            'type': 'decision',
+            'title': 'Outbox transport decision',
+            'body': 'Use django-celery-outbox delay transport for worker dispatch.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    body = response.json()
+    assert RawEventEnvelope.objects.get().event_type == 'decision'
+    assert Observation.objects.get().observation_type == 'decision'
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded_outbox'
+    assert queued.args == [body['outbox_event_id']]
+
+
+@pytest.mark.django_db
+def test_hook_event_endpoint_rejects_mismatched_event_type_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='error',
+        event_id='mismatched-event-1',
+        idempotency_key='mismatched-idempotency-1',
+        payload={'message': 'wrong endpoint'},
+        observation={
+            'type': 'error',
+            'title': 'Wrong endpoint',
+            'body': 'Event type does not match endpoint.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json() == {'event_type': ['Expected session_start.']}
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worker_task() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='error',
+        event_id='error-replay-event-1',
+        idempotency_key='error-replay-idempotency-1',
+        payload={'message': 'Command failed', 'exit_code': 1},
+        observation={
+            'type': 'error',
+            'title': 'Command failed',
+            'body': 'pytest exited 1.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+    first = client.post('/v1/hooks/error', payload, format='json', **auth_headers())
+    replay = {
+        **payload,
+        'event_id': 'error-replay-event-2',
+        'content_hash': 'hash-error-replay-event-2',
+        'observation': {**payload['observation'], 'title': 'should not create'},
+    }
+
+    second = client.post('/v1/hooks/error', replay, format='json', **auth_headers())
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert second.json()['duplicate'] is True
+    assert second.json()['raw_event_id'] == first.json()['raw_event_id']
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert OutboxEvent.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_decision_hook_denies_wrong_project_before_records_or_queued_worker_task() -> None:
+    organization, team, _project, _owner, _api_key = create_project_scope()
+    other_project = Project.objects.create(organization=organization, name='CLI', slug='cli')
+    payload = valid_hook_payload(
+        other_project,
+        team,
+        event_type='decision',
+        event_id='decision-wrong-project-event-1',
+        idempotency_key='decision-wrong-project-idempotency-1',
+        payload={'decision': 'Try unauthorized project'},
+        observation={
+            'type': 'decision',
+            'title': 'Unauthorized project',
+            'body': 'Decision event targets a denied project.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+    assert OutboxEvent.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db

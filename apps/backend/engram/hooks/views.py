@@ -142,5 +142,17 @@ class PostToolUseView(HookIngestView):
     expected_event_type = 'post_tool_use'
 
 
+class SessionStartHookView(HookIngestView):
+    expected_event_type = 'session_start'
+
+
+class ErrorHookView(HookIngestView):
+    expected_event_type = 'error'
+
+
+class DecisionHookView(HookIngestView):
+    expected_event_type = 'decision'
+
+
 class SessionEndView(HookIngestView):
     expected_event_type = 'session_end'
