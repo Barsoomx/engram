@@ -19,6 +19,7 @@ Code commits in slice:
 - `2cb084cf feat: auto promote observed memory`
 - `c8767724 fix: redact auto-promoted memory evidence`
 - `da06e17f test: prove worker-created memory in e2e`
+- `60e83a02 fix: bind e2e to current worker observation`
 
 Final review blocker correction after reviewed head
 `38b5e5b591bca1aa9769db329f7512b5beffcf54`:
