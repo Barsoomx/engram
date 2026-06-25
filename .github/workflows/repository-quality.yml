@@ -41,6 +41,9 @@ jobs:
       - name: Run repository tests
         run: python3 -m unittest discover -s tests
 
+      - name: Run CLI tests
+        run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v
+
       - name: Check required docs
         run: |
           test -f docs/north-star.md
