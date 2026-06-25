@@ -790,7 +790,8 @@ commands above.
 
 Branch: `feat/parity-15-claude-code-client`
 
-Final checkpoint SHA is recorded in the status report after commit.
+Implementation commit:
+`128b2afed125d8880b85195cd27ceb9afd4e4ea8`.
 
 Scope:
 

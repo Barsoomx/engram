@@ -857,6 +857,8 @@ needs last-assistant-message or transcript-derived evidence, cover it only
 through migration/import artifacts and the unsupported-record report path, not
 through the runtime golden path.
 
-This checkpoint intentionally covers the Codex runtime fixture only. Claude
-Code native package coverage remains deferred above, so the implemented runtime
-fixture must not claim full Claude Code parity.
+The first runtime fixture was Codex-led. Checkpoint `128b2afe` adds Claude Code
+package and response-format coverage for the same current event set:
+`SessionStart`, `PostToolUse`, `Error`, and `Decision`. Runtime fixture evidence
+must still not claim `UserPromptSubmit`, `PreToolUse`, `Stop`, MCP, semantic
+retrieval breadth, or plugin release-channel readiness.
