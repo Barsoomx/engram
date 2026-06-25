@@ -551,6 +551,97 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_hook_error_derives_stable_fallback_idempotency_for_identical_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (202, {'status': 'accepted', 'duplicate': False, 'request_id': 'error-request-1'}),
+                    (202, {'status': 'accepted', 'duplicate': True, 'request_id': 'error-request-2'}),
+                    (202, {'status': 'accepted', 'duplicate': False, 'request_id': 'error-request-3'}),
+                ],
+            )
+            base_input = {
+                'session_id': 'session-1',
+                'request_id': 'request-1',
+                'payload_schema_version': 'v2',
+                'sequence_number': 7,
+                'payload': {'message': 'tool failed'},
+                'observation': {'type': 'error', 'title': 'tool failed'},
+                'agent_external_id': 'codex-agent-1',
+                'repository_url': 'https://github.com/Barsoomx/engram',
+                'repository_root': '/workspace/engram',
+                'branch': 'feat/parity-14-hook-event-coverage',
+                'cwd': '/workspace/engram/packages/cli',
+            }
+
+            for hook_input in (base_input, dict(base_input), {**base_input, 'payload': {'message': 'tool failed again'}}):
+                exit_code, stdout, stderr = self.run_cli(
+                    ['hook', 'error', '--agent', 'codex', '--config-dir', str(config_dir)],
+                    transport,
+                    stdin=io.StringIO(json.dumps(hook_input)),
+                )
+                self.assertEqual(0, exit_code, stderr)
+                self.assertEqual('', stderr)
+                self.assertEqual('accepted', json.loads(stdout)['status'])
+
+            first_payload = transport.calls[0]['payload']
+            second_payload = transport.calls[1]['payload']
+            changed_payload = transport.calls[2]['payload']
+            for payload in (first_payload, second_payload, changed_payload):
+                self.assertTrue(str(payload['event_id']).startswith('engram-cli-'))
+                self.assertEqual(payload['event_id'], payload['idempotency_key'])
+                self.assertTrue(payload['content_hash'])
+
+            self.assertEqual(first_payload['event_id'], second_payload['event_id'])
+            self.assertEqual(first_payload['idempotency_key'], second_payload['idempotency_key'])
+            self.assertEqual(first_payload['content_hash'], second_payload['content_hash'])
+            self.assertNotEqual(first_payload['event_id'], changed_payload['event_id'])
+            self.assertNotEqual(first_payload['idempotency_key'], changed_payload['idempotency_key'])
+            self.assertNotEqual(first_payload['content_hash'], changed_payload['content_hash'])
+
+    def test_hook_error_preserves_explicit_idempotency_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            'status': 'accepted',
+                            'duplicate': False,
+                            'request_id': 'error-request-1',
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        'session_id': 'session-1',
+                        'event_id': 'explicit-event-1',
+                        'idempotency_key': 'explicit-key-1',
+                        'content_hash': 'explicit-content-hash-1',
+                        'payload': {'message': 'tool failed'},
+                    },
+                ),
+            )
+
+            exit_code, _stdout, stderr = self.run_cli(
+                ['hook', 'error', '--agent', 'codex', '--config-dir', str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            payload = transport.calls[0]['payload']
+            self.assertEqual('explicit-event-1', payload['event_id'])
+            self.assertEqual('explicit-key-1', payload['idempotency_key'])
+            self.assertEqual('explicit-content-hash-1', payload['content_hash'])
+
     def test_hook_decision_posts_connected_event_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

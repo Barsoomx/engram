@@ -347,19 +347,39 @@ def build_generic_hook_payload(
     input_payload: dict[str, object],
     event_type: str,
 ) -> dict[str, object]:
-    event_id = payload_string(input_payload, 'event_id') or f'engram-cli-{uuid.uuid4()}'
     payload = dict_value(input_payload.get('payload'))
     observation = dict_value(input_payload.get('observation'))
+    session_id = required_payload_string(input_payload, 'session_id')
+    payload_schema_version = payload_string(input_payload, 'payload_schema_version') or 'v1'
+    sequence_number = input_payload.get('sequence_number')
+    stable_event_material = {
+        'event_type': event_type,
+        'session_id': session_id,
+        'request_id': payload_string(input_payload, 'request_id'),
+        'payload_schema_version': payload_schema_version,
+        'sequence_number': sequence_number if isinstance(sequence_number, int) else None,
+        'payload': payload,
+        'observation': observation,
+        'project_id': as_string(config.get('project_id')),
+        'team_id': as_string(config.get('team_id')),
+        'agent_runtime': runtime,
+        'agent_external_id': payload_string(input_payload, 'agent_external_id'),
+        'repository_url': payload_string(input_payload, 'repository_url'),
+        'repository_root': payload_string(input_payload, 'repository_root'),
+        'branch': payload_string(input_payload, 'branch'),
+        'cwd': payload_string(input_payload, 'cwd'),
+    }
+    stable_hash = stable_content_hash(stable_event_material)
+    event_id = payload_string(input_payload, 'event_id') or f'engram-cli-{stable_hash}'
     request_payload = base_hook_payload(config, runtime, input_payload)
     request_payload.update(
         {
-            'session_id': required_payload_string(input_payload, 'session_id'),
+            'session_id': session_id,
             'event_id': event_id,
             'idempotency_key': payload_string(input_payload, 'idempotency_key') or event_id,
             'event_type': event_type,
-            'payload_schema_version': payload_string(input_payload, 'payload_schema_version') or 'v1',
-            'content_hash': payload_string(input_payload, 'content_hash')
-            or stable_content_hash({'payload': payload, 'observation': observation, 'event_id': event_id}),
+            'payload_schema_version': payload_schema_version,
+            'content_hash': payload_string(input_payload, 'content_hash') or stable_hash,
             'request_id': payload_string(input_payload, 'request_id') or event_id,
             'payload': payload,
         },
