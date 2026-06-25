@@ -32,14 +32,14 @@ jobs:
             git diff-tree --check --no-commit-id --root -r HEAD
           fi
 
-      - name: Check forbidden internal brand terms
-        run: |
-          latin_upper="$(printf '%s%s' 'Alt' 'yn')"
-          latin_lower="$(printf '%s%s' 'alt' 'yn')"
-          cyrillic_upper="$(printf '\u0410\u043b\u0442\u044b\u043d')"
-          cyrillic_lower="$(printf '\u0430\u043b\u0442\u044b\u043d')"
-          pattern="${latin_upper}|${latin_lower}|${cyrillic_upper}|${cyrillic_lower}"
-          ! grep -RInE "${pattern}" README.md docs .github CONTRIBUTING.md SECURITY.md CODEOWNERS
+      - name: Check required repository layout
+        run: python3 scripts/repository_layout.py
+
+      - name: Check repository text quality
+        run: python3 scripts/repository_quality.py
+
+      - name: Run repository tests
+        run: python3 -m unittest discover -s tests
 
       - name: Check required docs
         run: |
