@@ -1,32 +1,82 @@
 # Engram Frontend
 
-Next.js admin console skeleton for Engram. This is a minimal slice: a home page,
-a `/health` page that render backend status from the Engram API health endpoint,
-and a read-only `/memories` admin page that lists memories from the inspection
-API (`GET /v1/inspection/memories/`).
+Next.js admin console for Engram. Provides token-based login (username/password),
+an admin shell with sidebar navigation, a dashboard with backend health and user
+scope, plus read-only Memories and Health pages.
 
 ## Stack
 
-- Next.js 14.x (App Router, React Server Components)
+- Next.js 14.x (App Router)
 - React 18.x
 - TypeScript (strict)
+- HeroUI (`@heroui/react`, `@heroui/system`, `@heroui/theme`) component library
+- Tailwind CSS 3.x (dark theme by default)
+- @tanstack/react-query (server state)
+- axios (HTTP client)
+- lucide-react (icons)
 - pnpm (package manager)
 
-## Prerequisites
+## Routes
 
-- Node.js 20+
-- pnpm 9.x (`corepack enable`)
+| Route | Auth | Description |
+| --- | --- | --- |
+| `/login` | public | Username + password login. Stores the auth token in `localStorage` and redirects to `/`. Redirects to `/` if a token is already present. |
+| `/` | required | Dashboard. Backend health status, signed-in user info, capabilities. Lives inside the admin shell. |
+| `/memories` | required | Read-only memory list from `/v1/inspection/memories/`, authenticated with the stored token. |
+| `/observations` | required | Placeholder route for the observations admin (sidebar link active). |
+| `/audit` | required | Placeholder route for the audit admin (sidebar link active). |
+| `/health` | required | Dedicated backend health page (`/-/healthz/`). |
+
+`required` means the admin shell redirects to `/login` when no token is in
+`localStorage`.
+
+## Architecture
+
+```
+src/
+  app/
+    layout.tsx          # Root layout: dark theme, HeroUI + react-query Providers
+    providers.tsx       # HeroUIProvider + ToastProvider + QueryClientProvider
+    login/page.tsx      # Login page (client component)
+    (admin)/
+      layout.tsx        # Admin shell: sidebar + header, token gate
+      page.tsx          # Dashboard (health + user scope)
+      memories/page.tsx # Memories list (auth token via apiClient())
+      health/page.tsx   # Backend health detail
+  components/
+    layout/sidebar.tsx  # Sidebar navigation
+  lib/
+    auth.ts             # Token storage + axios client + login/me/logout
+  styles/
+    globals.css         # Tailwind base + HeroUI CSS variables
+```
+
+The admin shell is a client component route group (`(admin)`). It reads the token
+from `localStorage` on mount and redirects to `/login` when absent. The user
+profile (`GET /v1/auth/me`) is fetched once via react-query and shared between
+the sidebar/header and the dashboard through the `['auth','me']` query key.
+
+## Authentication
+
+The frontend uses Django REST framework Token auth (not next-auth):
+
+- `POST /v1/auth/login` `{username, password}` -> `{token, user_id, username, identity_id, organization_id, capabilities}`
+- `GET /v1/auth/me` (header `Authorization: Token <key>`) -> `{user_id, username, identity_id, organization_id, capabilities}`
+- `POST /v1/auth/logout` (header `Authorization: Token <key>`) -> clears server-side token
+
+The token is stored under `localStorage['engram_token']` and attached to every
+request by the axios instance returned from `apiClient()` in `src/lib/auth.ts`.
 
 ## Environment
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `NEXT_PUBLIC_ENGRAM_API_URL` | `http://localhost:8000` | Base URL of the Engram backend. Used by server components to reach `/-/healthz/` and `/v1/inspection/memories/`. The `NEXT_PUBLIC_` prefix is intentional so the value is inlined into the build when needed. |
-| `NEXT_PUBLIC_ENGRAM_PROJECT_ID` | _(empty)_ | Project UUID used to scope inspection API requests. Required for the `/memories` page; the page renders a config-missing state when unset. Safe to expose to the client bundle. |
-| `NEXT_PUBLIC_ENGRAM_TEAM_ID` | _(empty)_ | Optional team UUID used to scope inspection API requests. When unset, requests are sent without `team_id`. Safe to expose to the client bundle. |
-| `ENGRA_ADMIN_API_KEY` | _(empty)_ | Admin API key sent as `Authorization: Bearer <key>` to the inspection API. Requires the `memories:admin` capability. **Server-only** (no `NEXT_PUBLIC_` prefix); never expose in the client bundle. Required for the `/memories` page. |
+| `NEXT_PUBLIC_ENGRAM_API_URL` | `http://localhost:8000` | Base URL of the Engram backend. `NEXT_PUBLIC_` prefix inlines it into the client bundle. |
+| `NEXT_PUBLIC_ENGRAM_PROJECT_ID` | _(empty)_ | Project UUID used to scope inspection API requests (Memories page). Safe to expose to the client bundle. |
+| `NEXT_PUBLIC_ENGRAM_TEAM_ID` | _(empty)_ | Optional team UUID used to scope inspection API requests. Safe to expose to the client bundle. |
 
-No real secrets are required for this skeleton. Do not commit `.env` files with
+No server-only admin API key is required for the authenticated admin pages: the
+browser sends the user token from `localStorage`. Do not commit `.env` files with
 real values (see `.gitignore`).
 
 ## Local development
@@ -37,36 +87,24 @@ From `apps/frontend/`:
 pnpm install
 NEXT_PUBLIC_ENGRAM_API_URL=http://localhost:8000 \
 NEXT_PUBLIC_ENGRAM_PROJECT_ID=<project-uuid> \
-ENGRA_ADMIN_API_KEY=<admin-key> \
 pnpm dev
 ```
 
 The dev server runs on http://localhost:3000.
 
-- `/` — Home page, fetches `${NEXT_PUBLIC_ENGRAM_API_URL}/-/healthz/` and renders
-  status. Renders a static fallback message when the backend is unreachable.
-- `/health` — Dedicated health page showing the same endpoint response.
-- `/memories` — Read-only admin list of memories. Fetches
-  `${NEXT_PUBLIC_ENGRAM_API_URL}/v1/inspection/memories/?project_id=...&team_id=...`
-  with `Authorization: Bearer ${ENGRA_ADMIN_API_KEY}`. Renders a memories table
-  or a graceful empty / config-missing / error state.
+1. Open `/login` and sign in with an Engram username and password.
+2. On success you are redirected to the dashboard at `/`.
 
 ## Production build
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
 pnpm build
 pnpm start
 ```
 
-The smoke gate for this slice is a clean `pnpm build`. Run:
-
-```bash
-pnpm install --frozen-lockfile
-pnpm build
-```
-
-`pnpm lint` is also available (`next lint`).
+The smoke gate for this slice is a clean `pnpm build`. `pnpm lint` and
+`pnpm typecheck` are also available.
 
 ## Docker
 
@@ -82,27 +120,8 @@ Run (pointing at a backend reachable from the host):
 docker run --rm -p 3000:3000 \
   -e NEXT_PUBLIC_ENGRAM_API_URL=http://localhost:8000 \
   -e NEXT_PUBLIC_ENGRAM_PROJECT_ID=<project-uuid> \
-  -e NEXT_PUBLIC_ENGRAM_TEAM_ID=<team-uuid> \
-  -e ENGRAM_ADMIN_API_KEY=<admin-key> \
   engram/frontend:latest
 ```
 
-The image is based on `node:20-slim`, installs pnpm via corepack, builds the
-Next.js app, and starts it on port 3000. `NEXT_PUBLIC_ENGRAM_API_URL`,
-`NEXT_PUBLIC_ENGRAM_PROJECT_ID`, and `NEXT_PUBLIC_ENGRAM_TEAM_ID` are baked
-at build time for client bundle usage; for server-component fetches they are
-also read at runtime, so pass them via `-e` for runtime overrides.
-`ENGRA_ADMIN_API_KEY` is server-only and must always be provided at runtime via
-`-e` (it is never inlined into the client bundle).
-
-## Notes
-
-- This skeleton intentionally avoids UI libraries. Styling is inline to keep the
-  dependency surface minimal.
-- The home page is a React Server Component that performs the health fetch on the
-  server and degrades gracefully to a static fallback string when the fetch
-  fails (e.g. backend not running during a static/preview build).
-- The `/memories` page is a React Server Component that fetches the inspection
-  API on the server using the admin API key. It degrades gracefully when the
-  project/key env vars are missing, when the fetch fails, or when the project
-  has no memories.
+`NEXT_PUBLIC_*` vars are baked at build time for client bundle usage and are also
+read at runtime for browser fetches, so pass them via `-e` for runtime overrides.
