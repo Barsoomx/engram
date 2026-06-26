@@ -10,5 +10,6 @@ urlpatterns = [
     path('v1/inspection/', include('engram.inspection.urls')),
     path('v1/memories/', include('engram.memory.urls')),
     path('v1/model-policy/', include('engram.model_policy.urls')),
+    path('v1/observations/', include('engram.observations.urls')),
     path('v1/search/', include('engram.search.urls')),
 ]
