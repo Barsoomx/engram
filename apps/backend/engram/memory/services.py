@@ -19,6 +19,7 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Observation,
+    Project,
     RetrievalDocument,
     VisibilityScope,
 )
@@ -741,4 +742,134 @@ class RecordMemoryLink:
                     'team_ids': [str(team_id) for team_id in scope.team_ids],
                 },
             },
+        )
+
+
+@dataclass(frozen=True)
+class DigestInput:
+    project_id: uuid.UUID
+    memory_ids: tuple[uuid.UUID, ...]
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class DigestResult:
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
+    provider_call_id: uuid.UUID
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'memory_version_id': str(self.memory_version.id),
+            'retrieval_document_id': str(self.retrieval_document.id),
+            'provider_call_id': str(self.provider_call_id),
+            'title': str(self.memory.title),
+        }
+
+
+def digest_prompt(sources: tuple[Memory, ...]) -> str:
+    lines = [f'- {source.title}: {source.body}' for source in sources]
+
+    return '\n'.join(lines)
+
+
+def digest_content_hash(project_id: uuid.UUID, memory_ids: tuple[uuid.UUID, ...]) -> str:
+    material = f'{project_id}:{sorted(str(mid) for mid in memory_ids)}'
+
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+class GenerateDigest:
+    def execute(self, data: DigestInput) -> DigestResult:
+        project = Project.objects.get(id=data.project_id)
+        sources = tuple(
+            Memory.objects.filter(
+                id__in=data.memory_ids,
+                organization=project.organization,
+                project=project,
+                status=MemoryStatus.APPROVED,
+            ).order_by('title'),
+        )
+        if not sources:
+            raise MemoryWorkerError('no approved source memories found for digest')
+        resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                team_id=None,
+                task_type='digest',
+            ),
+        )
+        prompt = digest_prompt(sources)
+        provider_result = FakeProviderGateway().call(
+            ProviderCallInput(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                team_id=None,
+                policy=resolved.policy,
+                request_id=data.request_id,
+                trace_id=data.request_id,
+                prompt=prompt,
+            ),
+        )
+        content_hash = digest_content_hash(project.id, data.memory_ids)
+        with transaction.atomic():
+            memory = Memory.objects.create(
+                organization=project.organization,
+                project=project,
+                title=f'Digest {provider_result.generated_title}',
+                body=provider_result.generated_body,
+                status=MemoryStatus.APPROVED,
+                visibility_scope=VisibilityScope.PROJECT,
+                metadata={
+                    'kind': 'digest',
+                    'source_memory_ids': [str(source.id) for source in sources],
+                    'content_hash': content_hash,
+                    'provider_call_id': str(provider_result.call_record_id),
+                    'provider': provider_result.provider,
+                    'model': provider_result.model,
+                },
+            )
+            version = MemoryVersion.objects.create(
+                organization=memory.organization,
+                project=memory.project,
+                memory=memory,
+                version=1,
+                body=memory.body,
+                content_hash=content_hash,
+                source_metadata={'kind': 'digest'},
+            )
+            retrieval_document = (
+                IndexMemoryVersion()
+                .execute(
+                    IndexMemoryVersionInput(memory_version_id=version.id),
+                )
+                .retrieval_document
+            )
+            AuditEvent.objects.create(
+                organization=memory.organization,
+                project=memory.project,
+                event_type='DigestGenerated',
+                actor_type='api_key',
+                target_type='memory',
+                target_id=str(memory.id),
+                capability='memories:review',
+                result=AuditResult.RECORDED,
+                request_id=data.request_id,
+                correlation_id=data.correlation_id,
+                metadata={
+                    'source_memory_ids': [str(source.id) for source in sources],
+                    'provider_call_id': str(provider_result.call_record_id),
+                    'memory_version_id': str(version.id),
+                },
+            )
+
+        return DigestResult(
+            memory=memory,
+            memory_version=version,
+            retrieval_document=retrieval_document,
+            provider_call_id=provider_result.call_record_id,
         )
