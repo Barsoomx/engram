@@ -211,6 +211,63 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def score_retrieval_document(
+    document: RetrievalDocument,
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    has_request_terms: bool,
+) -> RetrievalMatch | None:
+    document_file_paths = tuple(str(value) for value in document.file_paths)
+    file_match = first_path_match(file_paths, document_file_paths)
+    if file_match:
+        return RetrievalMatch(
+            document=document,
+            score=100,
+            matched_terms=(file_match,),
+            inclusion_reason=f'exact match: {file_match}',
+        )
+
+    document_symbols = tuple(str(value) for value in document.symbols)
+    symbol_match = first_exact_match(symbols, document_symbols)
+    if symbol_match:
+        return RetrievalMatch(
+            document=document,
+            score=80,
+            matched_terms=(symbol_match,),
+            inclusion_reason=f'exact match: {symbol_match}',
+        )
+
+    query_terms = request_query_terms(query)
+    exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
+    if exact_match:
+        return RetrievalMatch(
+            document=document,
+            score=60,
+            matched_terms=(exact_match,),
+            inclusion_reason=f'exact match: {exact_match}',
+        )
+
+    full_text_match = first_full_text_match(query_terms, document.full_text)
+    if full_text_match:
+        return RetrievalMatch(
+            document=document,
+            score=40,
+            matched_terms=(full_text_match,),
+            inclusion_reason=f'full-text match: {full_text_match}',
+        )
+
+    if not has_request_terms:
+        return RetrievalMatch(
+            document=document,
+            score=1,
+            matched_terms=(),
+            inclusion_reason='filter-only authorized memory',
+        )
+
+    return None
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -639,54 +696,7 @@ class BuildContextBundle:
         data: ContextBundleInput,
         has_request_terms: bool,
     ) -> RetrievalMatch | None:
-        document_file_paths = tuple(str(value) for value in document.file_paths)
-        file_match = first_path_match(data.file_paths, document_file_paths)
-        if file_match:
-            return RetrievalMatch(
-                document=document,
-                score=100,
-                matched_terms=(file_match,),
-                inclusion_reason=f'exact match: {file_match}',
-            )
-
-        document_symbols = tuple(str(value) for value in document.symbols)
-        symbol_match = first_exact_match(data.symbols, document_symbols)
-        if symbol_match:
-            return RetrievalMatch(
-                document=document,
-                score=80,
-                matched_terms=(symbol_match,),
-                inclusion_reason=f'exact match: {symbol_match}',
-            )
-
-        query_terms = request_query_terms(data.query)
-        exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
-        if exact_match:
-            return RetrievalMatch(
-                document=document,
-                score=60,
-                matched_terms=(exact_match,),
-                inclusion_reason=f'exact match: {exact_match}',
-            )
-
-        full_text_match = first_full_text_match(query_terms, document.full_text)
-        if full_text_match:
-            return RetrievalMatch(
-                document=document,
-                score=40,
-                matched_terms=(full_text_match,),
-                inclusion_reason=f'full-text match: {full_text_match}',
-            )
-
-        if not has_request_terms:
-            return RetrievalMatch(
-                document=document,
-                score=1,
-                matched_terms=(),
-                inclusion_reason='filter-only authorized memory',
-            )
-
-        return None
+        return score_retrieval_document(document, data.query, data.file_paths, data.symbols, has_request_terms)
 
     def _create_items(
         self,
