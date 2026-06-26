@@ -64,6 +64,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'rest_framework.authtoken',
     'django_structlog',
     'django_celery_outbox',
     'engram.core',
@@ -126,6 +127,9 @@ CACHES = {
 
 REST_FRAMEWORK = {
     'EXCEPTION_HANDLER': 'engram.core.middlewares.custom_exception_handler',
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.TokenAuthentication',
+    ],
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],

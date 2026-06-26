@@ -6,6 +6,7 @@ from engram.core.observability.views import metrics
 urlpatterns = [
     path('-/', include('engram.health.urls')),
     path('-/metrics', metrics, name='metrics'),
+    path('v1/auth/', include('engram.access.auth_urls')),
     path('v1/context', TaskContextView.as_view(), name='context-task'),
     path('v1/context/', include('engram.context.urls')),
     path('v1/hooks/', include('engram.hooks.urls')),
