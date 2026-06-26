@@ -5,8 +5,25 @@ from typing import Any
 from django.db import transaction
 from django.utils import timezone
 
-from engram.access.models import Identity
+from engram.access.models import (
+    Identity,
+    IdentityType,
+    OrganizationMembership,
+    Role,
+)
+from engram.console.exceptions import LastOwnerError
 from engram.core.models import AuditEvent, AuditResult, Organization, Project, Team
+
+
+OWNER_ROLE_CODE = 'organization_owner'
+
+
+def _active_owner_count(organization: Organization) -> int:
+    return OrganizationMembership.objects.filter(
+        organization=organization,
+        role__code=OWNER_ROLE_CODE,
+        active=True,
+    ).count()
 
 
 def audit_admin_action(
@@ -76,4 +93,61 @@ def archive_project(project: Project) -> Project:
     project.save(update_fields=['archived_at', 'updated_at'])
 
     return project
+
+
+@transaction.atomic
+def invite_member(
+    *,
+    organization: Organization,
+    external_id: str,
+    display_name: str,
+    email: str,
+    role: Role,
+) -> OrganizationMembership:
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.USER,
+        external_id=external_id,
+        display_name=display_name,
+        email=email,
+    )
+
+    return OrganizationMembership.objects.create(
+        organization=organization,
+        identity=identity,
+        role=role,
+    )
+
+
+@transaction.atomic
+def set_member_role(membership: OrganizationMembership, role: Role) -> OrganizationMembership:
+    is_current_owner = membership.role.code == OWNER_ROLE_CODE and membership.active
+
+    if is_current_owner and role.code != OWNER_ROLE_CODE:
+        if _active_owner_count(membership.organization) <= 1:
+            raise LastOwnerError(
+                'cannot demote the last active organization owner',
+            )
+
+    membership.role = role
+
+    membership.save(update_fields=['role', 'updated_at'])
+
+    return membership
+
+
+@transaction.atomic
+def remove_member(membership: OrganizationMembership) -> OrganizationMembership:
+    is_current_owner = membership.role.code == OWNER_ROLE_CODE and membership.active
+
+    if is_current_owner and _active_owner_count(membership.organization) <= 1:
+        raise LastOwnerError(
+            'cannot remove the last active organization owner',
+        )
+
+    membership.active = False
+
+    membership.save(update_fields=['active', 'updated_at'])
+
+    return membership
 
