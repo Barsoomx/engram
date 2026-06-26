@@ -18,3 +18,25 @@ class MemoryFeedbackSerializer(serializers.Serializer):
         default='',
         max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH,
     )
+
+
+MEMORY_VERSION_BODY_MAX_LENGTH = 16000
+
+
+class MemoryVersionSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    body = serializers.CharField(max_length=MEMORY_VERSION_BODY_MAX_LENGTH, allow_blank=False)
+    reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        max_length=MEMORY_FEEDBACK_REASON_MAX_LENGTH,
+    )
+    request_id = serializers.CharField(max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH)
+    correlation_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH,
+    )

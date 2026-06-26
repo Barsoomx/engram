@@ -138,27 +138,10 @@ class RecordMemoryFeedback:
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
-        memory = (
-            Memory.objects.select_for_update()
-            .filter(
-                organization_id=scope.organization_id,
-                project_id=data.project_id,
-                id=data.memory_id,
-            )
-            .first()
-        )
-        if memory is None:
-            raise MemoryFeedbackError('memory_not_found', 'Memory was not found')
-
-        return memory
+        return lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryFeedbackError)
 
     def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
-        if (
-            memory.visibility_scope == VisibilityScope.TEAM
-            and memory.team_id is not None
-            and memory.team_id not in scope.team_ids
-        ):
-            raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+        ensure_memory_team_scope(memory, scope)
 
     def _already_applied(self, memory: Memory, action: str) -> bool:
         return bool(getattr(memory, action))
@@ -504,3 +487,162 @@ class PromoteMemoryCandidate:
                 *observation.files_modified,
             ]
         ]
+
+
+@dataclass(frozen=True)
+class UpdateMemoryBodyInput:
+    raw_key: str
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    body: str
+    reason: str
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class UpdateMemoryBodyResult:
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'project_id': str(self.memory.project_id),
+            'team_id': str(self.memory.team_id) if self.memory.team_id else '',
+            'current_version': self.memory.current_version,
+            'memory_version_id': str(self.memory_version.id),
+            'retrieval_document_id': str(self.retrieval_document.id),
+        }
+
+
+class MemoryVersionError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def memory_body_content_hash(memory: Memory, next_version: int, body: str) -> str:
+    source = f'{memory.id}:{next_version}:{body}'
+
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def lock_memory_for_update(
+    scope: EffectiveScope,
+    project_id: uuid.UUID,
+    memory_id: uuid.UUID,
+    error_cls: type[Exception],
+) -> Memory:
+    memory = (
+        Memory.objects.select_for_update()
+        .filter(
+            organization_id=scope.organization_id,
+            project_id=project_id,
+            id=memory_id,
+        )
+        .first()
+    )
+    if memory is None:
+        raise error_cls('memory_not_found', 'Memory was not found')
+
+    return memory
+
+
+def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
+    if (
+        memory.visibility_scope == VisibilityScope.TEAM
+        and memory.team_id is not None
+        and memory.team_id not in scope.team_ids
+    ):
+        raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+
+class UpdateMemoryBody:
+    def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='memories:review',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='memory',
+            target_id=str(data.memory_id),
+        )
+        with transaction.atomic():
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            ensure_memory_team_scope(memory, scope)
+            latest_version = memory.versions.order_by('-version').first()
+            if latest_version is not None and latest_version.body == data.body:
+                retrieval_document = self._index_version(latest_version)
+
+                return UpdateMemoryBodyResult(
+                    memory=memory,
+                    memory_version=latest_version,
+                    retrieval_document=retrieval_document,
+                )
+            version = self._create_version(memory, data)
+            memory.body = data.body
+            memory.current_version = version.version
+            memory.save(update_fields=['body', 'current_version', 'updated_at'])
+            retrieval_document = self._index_version(version)
+            self._audit(memory, version, scope, data)
+
+        memory.refresh_from_db()
+
+        return UpdateMemoryBodyResult(
+            memory=memory,
+            memory_version=version,
+            retrieval_document=retrieval_document,
+        )
+
+    def _create_version(self, memory: Memory, data: UpdateMemoryBodyInput) -> MemoryVersion:
+        next_version = memory.current_version + 1
+
+        return MemoryVersion.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            memory=memory,
+            version=next_version,
+            body=data.body,
+            content_hash=memory_body_content_hash(memory, next_version, data.body),
+        )
+
+    def _index_version(self, version: MemoryVersion) -> RetrievalDocument:
+        result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+        return result.retrieval_document
+
+    def _audit(
+        self,
+        memory: Memory,
+        version: MemoryVersion,
+        scope: EffectiveScope,
+        data: UpdateMemoryBodyInput,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryVersionCreated',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory',
+            target_id=str(memory.id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'version': version.version,
+                'reason': redact_text(data.reason),
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )

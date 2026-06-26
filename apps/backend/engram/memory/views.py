@@ -10,10 +10,20 @@ from rest_framework.views import APIView
 
 from engram.access.services import AccessDeniedError
 from engram.context.views import access_error_response, bearer_key
-from engram.memory.serializers import MemoryFeedbackSerializer
-from engram.memory.services import MemoryFeedbackError, MemoryFeedbackInput, RecordMemoryFeedback
+from engram.memory.serializers import MemoryFeedbackSerializer, MemoryVersionSerializer
+from engram.memory.services import (
+    MemoryFeedbackError,
+    MemoryFeedbackInput,
+    MemoryVersionError,
+    RecordMemoryFeedback,
+    UpdateMemoryBody,
+    UpdateMemoryBodyInput,
+)
 
 MEMORY_FEEDBACK_STATUS = {
+    'memory_not_found': status.HTTP_404_NOT_FOUND,
+}
+MEMORY_VERSION_STATUS = {
     'memory_not_found': status.HTTP_404_NOT_FOUND,
 }
 
@@ -49,3 +59,35 @@ class MemoryFeedbackView(APIView):
             request_id=data['request_id'],
             correlation_id=data.get('correlation_id', ''),
         )
+
+
+class MemoryVersionView(APIView):
+    authentication_classes: list[type] = []
+    permission_classes: list[type] = []
+
+    def post(self, request: Request, memory_id: uuid.UUID) -> Response:
+        serializer = MemoryVersionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            result = UpdateMemoryBody().execute(
+                UpdateMemoryBodyInput(
+                    raw_key=bearer_key(request),
+                    memory_id=memory_id,
+                    project_id=data['project_id'],
+                    team_id=data.get('team_id'),
+                    body=data['body'],
+                    reason=data.get('reason', ''),
+                    request_id=data['request_id'],
+                    correlation_id=data.get('correlation_id', ''),
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except MemoryVersionError as error:
+            return Response(
+                {'code': error.code, 'detail': str(error)},
+                status=MEMORY_VERSION_STATUS.get(error.code, status.HTTP_400_BAD_REQUEST),
+            )
+
+        return Response(result.to_response())
