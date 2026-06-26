@@ -6,9 +6,10 @@ a local memory store, local embeddings, or provider secrets.
 
 ## Status
 
-Active. The bridge exposes the `engram_search` tool, which calls the Engram
-server `POST /v1/search/` endpoint. More tools (context, observe, memory
-version/link) will be added in later slices.
+Active. The bridge exposes three tools:
+- `engram_search` — `POST /v1/search/`
+- `engram_context` — `POST /v1/context/session-start`
+- `engram_memory_link` — `POST /v1/memories/<id>/links`
 
 ## Run
 

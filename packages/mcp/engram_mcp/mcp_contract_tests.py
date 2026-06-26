@@ -9,9 +9,25 @@ def fake_search(arguments: dict) -> str:
     return f"searched: {arguments.get('query')}"
 
 
+def fake_context(arguments: dict) -> str:
+    return f"context for {arguments.get('session_id')}"
+
+
+def fake_link(arguments: dict) -> str:
+    return f"linked {arguments.get('link_type')} -> {arguments.get('target')}"
+
+
+def build_tools() -> dict:
+    return {
+        'engram_search': fake_search,
+        'engram_context': fake_context,
+        'engram_memory_link': fake_link,
+    }
+
+
 class McpContractTests(unittest.TestCase):
     def test_initialize_returns_protocol_and_server_info(self) -> None:
-        response = handle_request({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}, fake_search)
+        response = handle_request({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'}, build_tools())
 
         self.assertEqual(response['id'], 1)
         self.assertEqual(response['result']['protocolVersion'], PROTOCOL_VERSION)
@@ -19,18 +35,17 @@ class McpContractTests(unittest.TestCase):
         self.assertIn('tools', response['result']['capabilities'])
 
     def test_initialized_notification_returns_none(self) -> None:
-        response = handle_request({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, fake_search)
+        response = handle_request({'jsonrpc': '2.0', 'method': 'notifications/initialized'}, build_tools())
 
         self.assertIsNone(response)
 
-    def test_tools_list_returns_engram_search(self) -> None:
-        response = handle_request({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, fake_search)
+    def test_tools_list_returns_all_tools(self) -> None:
+        response = handle_request({'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'}, build_tools())
         names = [tool['name'] for tool in response['result']['tools']]
 
-        self.assertEqual(names, ['engram_search'])
-        schema = response['result']['tools'][0]['inputSchema']
-        self.assertIn('query', schema['properties'])
-        self.assertEqual(['query'], schema['required'])
+        self.assertEqual(names, ['engram_search', 'engram_context', 'engram_memory_link'])
+        link_schema = response['result']['tools'][2]['inputSchema']
+        self.assertEqual(['memory_id', 'link_type', 'target'], link_schema['required'])
 
     def test_tools_call_search_returns_text_content(self) -> None:
         response = handle_request(
@@ -40,27 +55,56 @@ class McpContractTests(unittest.TestCase):
                 'method': 'tools/call',
                 'params': {'name': 'engram_search', 'arguments': {'query': 'auth'}},
             },
-            fake_search,
+            build_tools(),
         )
 
         self.assertEqual('text', response['result']['content'][0]['type'])
         self.assertIn('searched: auth', response['result']['content'][0]['text'])
 
-    def test_unknown_tool_returns_error(self) -> None:
+    def test_tools_call_context_returns_text_content(self) -> None:
         response = handle_request(
             {
                 'jsonrpc': '2.0',
                 'id': 4,
                 'method': 'tools/call',
+                'params': {'name': 'engram_context', 'arguments': {'session_id': 'sess-1'}},
+            },
+            build_tools(),
+        )
+
+        self.assertIn('context for sess-1', response['result']['content'][0]['text'])
+
+    def test_tools_call_memory_link_returns_text_content(self) -> None:
+        response = handle_request(
+            {
+                'jsonrpc': '2.0',
+                'id': 5,
+                'method': 'tools/call',
+                'params': {
+                    'name': 'engram_memory_link',
+                    'arguments': {'memory_id': 'mem-1', 'link_type': 'file', 'target': 'a.py'},
+                },
+            },
+            build_tools(),
+        )
+
+        self.assertIn('linked file -> a.py', response['result']['content'][0]['text'])
+
+    def test_unknown_tool_returns_error(self) -> None:
+        response = handle_request(
+            {
+                'jsonrpc': '2.0',
+                'id': 6,
+                'method': 'tools/call',
                 'params': {'name': 'nope', 'arguments': {}},
             },
-            fake_search,
+            build_tools(),
         )
 
         self.assertEqual(-32601, response['error']['code'])
 
     def test_unknown_method_returns_error(self) -> None:
-        response = handle_request({'jsonrpc': '2.0', 'id': 5, 'method': 'frog'}, fake_search)
+        response = handle_request({'jsonrpc': '2.0', 'id': 7, 'method': 'frog'}, build_tools())
 
         self.assertEqual(-32601, response['error']['code'])
 
@@ -80,18 +124,18 @@ class McpContractTests(unittest.TestCase):
             + '\n',
         )
         stdout = io.StringIO()
-        run_server(fake_search, stdin=stdin, stdout=stdout)
+        run_server(build_tools(), stdin=stdin, stdout=stdout)
         lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
 
         self.assertEqual(3, len(lines))
         self.assertEqual(PROTOCOL_VERSION, lines[0]['result']['protocolVersion'])
-        self.assertEqual('engram_search', lines[1]['result']['tools'][0]['name'])
+        self.assertEqual(3, len(lines[1]['result']['tools']))
         self.assertIn('searched: auth', lines[2]['result']['content'][0]['text'])
 
     def test_run_server_skips_malformed_lines(self) -> None:
         stdin = io.StringIO('not json\n' + json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/list'}) + '\n')
         stdout = io.StringIO()
-        run_server(fake_search, stdin=stdin, stdout=stdout)
+        run_server(build_tools(), stdin=stdin, stdout=stdout)
 
         self.assertEqual(1, len(stdout.getvalue().splitlines()))
 
