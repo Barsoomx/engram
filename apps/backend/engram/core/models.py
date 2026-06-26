@@ -5,6 +5,11 @@ import uuid
 from django.core.exceptions import ValidationError
 from django.db import models
 
+try:
+    from pgvector.django import VectorField
+except ImportError:
+    VectorField = None
+
 
 class TimestampedModel(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -578,6 +583,7 @@ class RetrievalDocument(TimestampedModel):
     full_text = models.TextField()
     embedding_reference = models.CharField(max_length=255, blank=True)
     embedding_vector = models.JSONField(default=list, blank=True)
+    embedding_pgvector = VectorField(dimensions=64, null=True, blank=True) if VectorField is not None else None
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)

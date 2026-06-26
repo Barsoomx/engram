@@ -127,7 +127,7 @@ services:
       start_period: 30s
 
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: engram
       POSTGRES_USER: engram
