@@ -309,9 +309,7 @@ class ProcessObservationRecorded:
 
 
 def memory_candidate_content_hash(observation: Observation) -> str:
-    source = f'{observation.id}:{observation.content_hash}'
-
-    return hashlib.sha256(source.encode()).hexdigest()
+    return hashlib.sha256(observation.content_hash.encode()).hexdigest()
 
 
 def candidate_title(observation: Observation) -> str:

@@ -746,3 +746,63 @@ def test_index_memory_version_skips_embedding_when_secret_disabled() -> None:
     document = RetrievalDocument.objects.get()
     assert document.embedding_vector == []
     assert document.embedding_reference == ''
+
+
+@pytest.mark.django_db
+def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sessions() -> None:
+    organization, team, project, session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+    execute_worker(observation)
+
+    second_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=session.agent,
+        external_session_id='session-dedup',
+        runtime=Runtime.CODEX,
+    )
+    second_raw = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=session.agent,
+        session=second_session,
+        event_type='post_tool_use',
+        source_adapter=Runtime.CODEX,
+        client_event_id='event-dedup',
+        idempotency_key='idem-dedup',
+        content_hash='hash-event-dedup',
+        runtime=Runtime.CODEX,
+        payload_schema_version='v1',
+        payload={'tool_name': 'bash'},
+        headers={},
+        request_id='request-event-dedup',
+        actor_type='api_key',
+        actor_id='api-key-dedup',
+    )
+    second_observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=session.agent,
+        session=second_session,
+        raw_event=second_raw,
+        observation_type='tool_use',
+        title=observation.title,
+        body=observation.body,
+        files_read=observation.files_read,
+        files_modified=observation.files_modified,
+        content_hash=observation.content_hash,
+        redaction_metadata={'redacted': True},
+        source_metadata={'event_type': 'post_tool_use'},
+        observed_at=timezone.now(),
+    )
+
+    result = execute_worker(second_observation)
+
+    assert result.duplicate is True
+    assert Memory.objects.count() == 1
+    assert MemoryCandidate.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
