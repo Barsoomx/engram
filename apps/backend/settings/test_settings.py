@@ -14,6 +14,12 @@ DATABASES = {
         'CONN_HEALTH_CHECKS': False,
     },
 }
+if DATABASES['default']['ENGINE'] == 'django.db.backends.sqlite3':
+    SILENCED_SYSTEM_CHECKS = [
+        'celery_outbox.E001',
+        'celery_outbox.E006',
+    ]
+
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

@@ -12,7 +12,7 @@ evolution of `claude-mem`, not a broad enterprise platform upfront.
 - Frontend for daily operational workflows.
 - CLI for client connection, diagnostics, and agent-native workflows.
 - PostgreSQL as the source of truth.
-- Redis-compatible broker and Celery workers.
+- RabbitMQ-compatible broker, Redis result/cache backend, and Celery workers.
 - Organization, project, team, agent, memory, session, and context model.
 - User and API key model for human and agent access.
 - Four roles: Owner, Admin, Developer, Auditor.

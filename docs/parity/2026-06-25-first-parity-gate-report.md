@@ -20,14 +20,18 @@ The first Codex-led CLI/hooks/API parity gate is proven on `master` by the
 merged hook event coverage checkpoint, parity evidence report,
 request-size-limit fix, security roll-up, and passing CI.
 
-This report does not claim Claude Code runtime parity, MCP parity, semantic
-retrieval breadth, frontend/admin readiness, production deployment readiness,
-or full Engram North Star completion.
+This historical report does not claim Claude Code runtime parity, MCP parity,
+semantic retrieval breadth, frontend/admin readiness, production deployment
+readiness, or full Engram North Star completion.
 
-`docs/parity/claude-mem-parity-map.md` explicitly defers Claude Code native
+At this report's original checkpoint,
+`docs/parity/claude-mem-parity-map.md` explicitly deferred Claude Code native
 package work, MCP bridge implementation, `PreToolUse`, `Stop`, live transcript
 watching, semantic retrieval breadth, frontend/admin depth, signed plugin
-release channels, and production hardening. Those are later checkpoints.
+release channels, and production hardening. Later checkpoint `128b2afe`
+implements Claude Code package and response-format coverage for
+`SessionStart`, `PostToolUse`, `Error`, and `Decision`; the other items remain
+later checkpoints.
 
 ## Gate Requirements
 
@@ -50,10 +54,13 @@ Codex is the implemented first runtime path for the gate:
 - `packages/codex-plugin/codex_plugin_contract_tests.py`
 - `packages/cli/engram_cli/commands.py`
 
-Claude Code is explicitly deferred for this gate. The repo currently contains
-only `packages/claude-plugin/README.md`; there is no native Claude Code plugin
-manifest or Claude-specific response formatter. Do not claim Claude Code runtime
-parity until a later checkpoint implements and verifies it.
+At this report's original checkpoint, Claude Code was explicitly deferred and
+the repo contained only `packages/claude-plugin/README.md`. Later checkpoint
+`128b2afe` supersedes that limitation by adding
+`packages/claude-plugin/.claude-plugin/plugin.json`,
+`packages/claude-plugin/hooks/hooks.json`, package contract tests, and the
+`--response-format claude-code` CLI formatter for `SessionStart`,
+`PostToolUse`, `Error`, and `Decision`.
 
 MCP is audited and classified, but the MCP bridge is deferred until after the
 first CLI/hooks parity loop. Do not claim MCP parity from this gate.

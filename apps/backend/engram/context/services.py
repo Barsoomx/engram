@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 
+import structlog
 from django.db import transaction
 from django.utils import timezone
 
@@ -14,6 +16,7 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    Memory,
     MemoryStatus,
     MemoryVersion,
     Organization,
@@ -23,6 +26,17 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
+from engram.model_policy.services import (
+    EmbeddingCallInput,
+    EmbeddingCallResult,
+    FakeProviderGateway,
+    ModelPolicyError,
+    ProviderSecretError,
+    ResolveModelPolicy,
+    ResolveModelPolicyInput,
+)
+
+logger = structlog.get_logger(__name__)
 
 
 class ContextIndexError(Exception):
@@ -181,6 +195,22 @@ def redact_text(value: object) -> str:
     return str(redact_value(value).value)
 
 
+SEMANTIC_MIN_SIMILARITY = 0.3
+
+
+def cosine_similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+
+    dot = sum(a * b for a, b in zip(left, right, strict=True))
+    left_norm = math.sqrt(sum(a * a for a in left))
+    right_norm = math.sqrt(sum(b * b for b in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+
+    return dot / (left_norm * right_norm)
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -230,8 +260,52 @@ class IndexMemoryVersion:
                 'metadata': {},
             },
         )
+        self._embed_document(retrieval_document, memory, version)
 
         return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=created)
+
+    def _embed_document(
+        self,
+        document: RetrievalDocument,
+        memory: Memory,
+        version: MemoryVersion,
+    ) -> None:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    task_type='embedding',
+                ),
+            )
+            result = FakeProviderGateway().embed(
+                EmbeddingCallInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    policy=resolved.policy,
+                    request_id=f'memory-indexer:{version.id}:embedding',
+                    trace_id=f'memory-indexer:{version.id}',
+                    text=document.full_text,
+                ),
+            )
+        except ModelPolicyError:
+            return
+        except ProviderSecretError as error:
+            logger.warning(
+                'embedding skipped: provider secret unavailable',
+                organization_id=str(memory.organization_id),
+                project_id=str(memory.project_id),
+                memory_version_id=str(version.id),
+                error=str(error),
+            )
+
+            return
+
+        document.embedding_vector = list(result.embedding)
+        document.embedding_reference = f'provider:{result.call_record_id}'
+        document.save(update_fields=['embedding_vector', 'embedding_reference', 'updated_at'])
 
 
 class BuildContextBundle:
@@ -258,14 +332,20 @@ class BuildContextBundle:
         team = self._resolve_team(organization, data.team_id, scope)
         agent = self._get_or_create_agent(organization, data)
         session = self._get_or_create_session(organization, project, team, agent, data)
-        matches = self._rank_matches(
-            self._authorized_documents(organization, project, scope),
+        authorized_documents = self._authorized_documents(organization, project, scope)
+        matches, has_semantic, embedding_result = self._rank_matches(
+            authorized_documents,
             data,
+            organization,
+            project,
+            team,
         )
         query_result = redact_value(data.query)
-        metadata = {'retrieval_strategy': 'exact'}
+        metadata = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
+        if has_semantic and embedding_result is not None:
+            metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -286,7 +366,7 @@ class BuildContextBundle:
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
-            self._audit_retrieval(bundle, persisted_matches, scope, data)
+            self._audit_retrieval(bundle, persisted_matches, scope, data, has_semantic, embedding_result)
 
         bundle = ContextBundle.objects.prefetch_related(
             'items__retrieval_document__memory',
@@ -448,14 +528,17 @@ class BuildContextBundle:
         self,
         documents: tuple[RetrievalDocument, ...],
         data: ContextBundleInput,
-    ) -> tuple[RetrievalMatch, ...]:
-        matches = []
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None]:
         has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
+        exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = self._score_document(document, data, has_request_terms)
             if match is not None:
-                matches.append(match)
-        matches.sort(
+                exact_matches.append(match)
+        exact_matches.sort(
             key=lambda match: (
                 -match.score,
                 -match.document.updated_at.timestamp(),
@@ -463,8 +546,92 @@ class BuildContextBundle:
                 str(match.document.id),
             ),
         )
+        if len(exact_matches) >= data.limit:
+            return tuple(exact_matches[: data.limit]), False, None
 
-        return tuple(matches[: data.limit])
+        embedding_result = self._resolve_query_embedding(data, organization, project, team)
+        if embedding_result is None:
+            return tuple(exact_matches), False, None
+
+        query_vector = list(embedding_result.embedding)
+        semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
+
+        return (
+            tuple((exact_matches + list(semantic_matches))[: data.limit]),
+            bool(semantic_matches),
+            embedding_result,
+        )
+
+    def _semantic_matches(
+        self,
+        documents: tuple[RetrievalDocument, ...],
+        exact_matches: list[RetrievalMatch],
+        query_vector: list[float],
+    ) -> list[RetrievalMatch]:
+        already_matched = {match.document.id for match in exact_matches}
+        scored: list[tuple[float, RetrievalMatch]] = []
+        for document in documents:
+            if document.id in already_matched or not document.embedding_vector:
+                continue
+            similarity = cosine_similarity(query_vector, list(document.embedding_vector))
+            if similarity < SEMANTIC_MIN_SIMILARITY:
+                continue
+            scored.append(
+                (
+                    similarity,
+                    RetrievalMatch(
+                        document=document,
+                        score=30,
+                        matched_terms=(f'cosine {similarity:.2f}',),
+                        inclusion_reason=f'semantic match: cosine {similarity:.2f}',
+                    ),
+                ),
+            )
+        scored.sort(key=lambda item: -item[0])
+
+        return [match for _similarity, match in scored]
+
+    def _resolve_query_embedding(
+        self,
+        data: ContextBundleInput,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+    ) -> EmbeddingCallResult | None:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=team.id if team is not None else None,
+                    task_type='embedding',
+                ),
+            )
+            result = FakeProviderGateway().embed(
+                EmbeddingCallInput(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=team.id if team is not None else None,
+                    policy=resolved.policy,
+                    request_id=data.request_id,
+                    trace_id=data.trace_id or data.request_id,
+                    text='\n'.join([data.query, *data.file_paths, *data.symbols]),
+                ),
+            )
+        except ModelPolicyError:
+            return None
+        except ProviderSecretError as error:
+            logger.warning(
+                'context query embedding skipped: provider secret unavailable',
+                organization_id=str(organization.id),
+                project_id=str(project.id),
+                request_id=data.request_id,
+                error=str(error),
+            )
+
+            return None
+
+        return result
 
     def _score_document(
         self,
@@ -576,7 +743,24 @@ class BuildContextBundle:
         matches: tuple[RetrievalMatch, ...],
         scope: EffectiveScope,
         data: ContextBundleInput,
+        has_semantic: bool,
+        embedding_result: EmbeddingCallResult | None,
     ) -> None:
+        metadata = {
+            'selected_count': len(matches),
+            'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact',
+            'scope_filters': {
+                'organization_id': str(scope.organization_id),
+                'project_ids': [str(project_id) for project_id in scope.project_ids],
+                'team_ids': [str(team_id) for team_id in scope.team_ids],
+            },
+            'memory_ids': [str(match.document.memory_id) for match in matches],
+            'retrieval_document_ids': [str(match.document.id) for match in matches],
+        }
+        if has_semantic and embedding_result is not None:
+            metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
+            metadata['semantic_document_ids'] = [str(match.document.id) for match in matches if match.score == 30]
+
         AuditEvent.objects.create(
             organization=bundle.organization,
             project=bundle.project,
@@ -590,17 +774,7 @@ class BuildContextBundle:
             result=AuditResult.ALLOWED,
             request_id=data.request_id,
             correlation_id=data.correlation_id,
-            metadata={
-                'selected_count': len(matches),
-                'retrieval_strategy': 'exact',
-                'scope_filters': {
-                    'organization_id': str(scope.organization_id),
-                    'project_ids': [str(project_id) for project_id in scope.project_ids],
-                    'team_ids': [str(team_id) for team_id in scope.team_ids],
-                },
-                'memory_ids': [str(match.document.memory_id) for match in matches],
-                'retrieval_document_ids': [str(match.document.id) for match in matches],
-            },
+            metadata=metadata,
         )
 
 

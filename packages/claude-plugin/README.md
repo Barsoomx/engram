@@ -1,9 +1,15 @@
 # Claude Code Plugin
 
-Owns the future native Claude Code plugin package and hook manifests.
+Active native Claude Code plugin package for Engram hook capture.
 
-This directory is inactive in the skeleton checkpoint. It must not introduce a
-local worker, local database, provider secret storage, or product naming outside
-agent-integration boundaries.
+The package exposes the currently implemented Engram hook events:
 
-Activation gate: Claude Code hook/client parity slice.
+- `SessionStart`;
+- `PostToolUse`;
+- `Error`;
+- `Decision`.
+
+The hook manifest uses `engram hook` as a thin client with
+`--agent claude_code` and `--response-format claude-code`. This package must not
+introduce a local worker, local database, provider secret storage, or product
+naming outside agent-integration boundaries.

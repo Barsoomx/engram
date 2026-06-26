@@ -7,7 +7,8 @@ V1 uses:
 - Django;
 - Django REST Framework;
 - PostgreSQL;
-- Redis-compatible broker;
+- RabbitMQ-compatible broker;
+- Redis result/cache backend;
 - Celery;
 - Poetry;
 - Ruff;

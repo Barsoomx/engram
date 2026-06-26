@@ -177,17 +177,40 @@ class CliLifecycleTests(unittest.TestCase):
             self.connect(config_dir)
 
             codex_hook = read_json(config_dir / 'hooks' / 'codex.json')
+            claude_hook = read_json(config_dir / 'hooks' / 'claude_code.json')
 
             self.assertEqual(
-                'engram hook session-start --agent codex',
+                'engram hook session-start --agent codex --response-format codex',
                 codex_hook['commands']['SessionStart'],
             )
             self.assertEqual(
-                'engram hook post-tool-use --agent codex',
+                'engram hook post-tool-use --agent codex --response-format codex',
                 codex_hook['commands']['PostToolUse'],
             )
-            self.assertEqual('engram hook error --agent codex', codex_hook['commands']['Error'])
-            self.assertEqual('engram hook decision --agent codex', codex_hook['commands']['Decision'])
+            self.assertEqual(
+                'engram hook error --agent codex --response-format codex',
+                codex_hook['commands']['Error'],
+            )
+            self.assertEqual(
+                'engram hook decision --agent codex --response-format codex',
+                codex_hook['commands']['Decision'],
+            )
+            self.assertEqual(
+                'engram hook session-start --agent claude_code --response-format claude-code',
+                claude_hook['commands']['SessionStart'],
+            )
+            self.assertEqual(
+                'engram hook post-tool-use --agent claude_code --response-format claude-code',
+                claude_hook['commands']['PostToolUse'],
+            )
+            self.assertEqual(
+                'engram hook error --agent claude_code --response-format claude-code',
+                claude_hook['commands']['Error'],
+            )
+            self.assertEqual(
+                'engram hook decision --agent claude_code --response-format claude-code',
+                claude_hook['commands']['Decision'],
+            )
 
     def test_connect_fingerprint_uses_only_derived_material_for_short_keys(self) -> None:
         short_key = 'short'
@@ -892,6 +915,112 @@ class CliLifecycleTests(unittest.TestCase):
                 },
                 body['hookSpecificOutput'],
             )
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_session_start_claude_code_response_format_emits_claude_output_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            'status': 'accepted',
+                            'duplicate': False,
+                            'request_id': 'session-event-request-1',
+                        },
+                    ),
+                    (
+                        200,
+                        {
+                            'status': 'created',
+                            'purpose': 'session_start',
+                            'rendered_context': 'Relevant Engram context',
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        'session_id': 'future-session',
+                        'event_id': 'session-event-1',
+                        'request_id': 'context-request-1',
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    'hook',
+                    'session-start',
+                    '--response-format',
+                    'claude-code',
+                    '--config-dir',
+                    str(config_dir),
+                ],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            body = json.loads(stdout)
+            self.assertNotIn('continue', body)
+            self.assertEqual('Relevant Engram context', body['systemMessage'])
+            self.assertEqual(
+                {
+                    'hookEventName': 'SessionStart',
+                    'additionalContext': 'Relevant Engram context',
+                },
+                body['hookSpecificOutput'],
+            )
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_non_session_claude_code_response_format_emits_empty_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            'status': 'accepted',
+                            'duplicate': False,
+                            'request_id': 'tool-event-request-1',
+                        },
+                    ),
+                ],
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    'hook',
+                    'post-tool-use',
+                    '--response-format',
+                    'claude-code',
+                    '--config-dir',
+                    str(config_dir),
+                ],
+                transport,
+                stdin=io.StringIO(
+                    json.dumps(
+                        {
+                            'session_id': 'future-session',
+                            'event_id': 'tool-event-1',
+                            'tool_name': 'Read',
+                        },
+                    ),
+                ),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual('', stderr)
+            self.assertEqual({}, json.loads(stdout))
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 

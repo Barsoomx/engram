@@ -138,7 +138,7 @@ def main() -> int:
                 input_text=json.dumps(session_start_payload(run_id)),
                 secret=api_key,
             )
-            assert_context_response(context, run_id)
+            assert_context_response(context, worker_memory)
             context_bundle_id = required_string(context, 'context_bundle_id')
             request_id = required_string(context, 'request_id')
             audit_evidence = assert_context_audit_evidence(
@@ -257,7 +257,6 @@ def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[st
 
 
 def worker_memory_query(project_id: str, run_id: str) -> str:
-    title = memory_title(run_id)
     client_event_id = f'e2e-hook-event-{run_id}'
     request_id = f'e2e-hook-request-{run_id}'
 
@@ -273,8 +272,9 @@ version = (
     .filter(
         project_id={json.dumps(project_id)},
         memory__project_id={json.dumps(project_id)},
-        memory__title={json.dumps(title)},
         memory__status=MemoryStatus.APPROVED,
+        source_observation__raw_event__client_event_id=client_event_id,
+        source_observation__raw_event__request_id=request_id,
     )
     .order_by('-created_at')
     .first()
@@ -311,6 +311,8 @@ print(json.dumps({{
     'memory_version_id': str(version.id),
     'retrieval_document_id': str(document.id),
     'source_observation_id': str(version.source_observation_id),
+    'memory_title': memory.title,
+    'memory_body': memory.body,
 }}))
 """
 
@@ -423,7 +425,7 @@ def run(
     return result
 
 
-def assert_context_response(response: dict[str, object], run_id: str) -> None:
+def assert_context_response(response: dict[str, object], worker_memory: dict[str, object]) -> None:
     assert_equal(response.get('status'), 'created', 'context status')
     assert_equal(response.get('purpose'), 'session_start', 'context purpose')
     items = response.get('items')
@@ -433,8 +435,12 @@ def assert_context_response(response: dict[str, object], run_id: str) -> None:
     if not isinstance(first_item, dict):
         raise E2EError('Context response item is not an object')
     assert_equal(first_item.get('citation'), 'M1', 'first context citation')
-    title = memory_title(run_id)
-    body = memory_body(run_id)
+    title = required_string(worker_memory, 'memory_title')
+    body = required_string(worker_memory, 'memory_body')
+    if not title.startswith('Provider-generated memory '):
+        raise E2EError(f'Expected provider-generated memory title, got {title!r}')
+    if not body.startswith('Provider-generated candidate body '):
+        raise E2EError(f'Expected provider-generated memory body, got {body!r}')
     assert_equal(first_item.get('title'), title, 'memory title')
     assert_equal(first_item.get('body'), body, 'memory body')
     rendered_context = required_string(response, 'rendered_context')

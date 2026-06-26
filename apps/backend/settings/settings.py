@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from urllib.parse import urlparse
+
+import structlog
+
+from .logs import configure_logger
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -43,7 +48,9 @@ def database_config(url: str) -> dict[str, str]:
 
 
 SECRET_KEY = os.environ.get('ENGRAM_SECRET_KEY', 'engram-development-secret')
+ENGRAM_SECRET_ENCRYPTION_KEY = os.environ.get('ENGRAM_SECRET_ENCRYPTION_KEY', '')
 DEBUG = to_bool(os.environ.get('ENGRAM_DEBUG', 'false'))
+ENVIRONMENT = os.environ.get('ENGRAM_ENVIRONMENT', 'dev')
 ALLOWED_HOSTS = csv(os.environ.get('ENGRAM_ALLOWED_HOSTS', 'localhost,127.0.0.1,0.0.0.0'), default=('localhost',))
 ROOT_URLCONF = 'settings.urls'
 WSGI_APPLICATION = 'settings.wsgi.application'
@@ -57,6 +64,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'rest_framework',
+    'django_structlog',
     'django_celery_outbox',
     'engram.core',
     'engram.access',
@@ -64,6 +72,8 @@ INSTALLED_APPS = [
     'engram.imports',
     'engram.memory',
     'engram.context',
+    'engram.inspection',
+    'engram.model_policy',
     'engram.health',
 ]
 
@@ -73,6 +83,9 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
+    'django_structlog.middlewares.RequestMiddleware',
+    'engram.core.middlewares.ApiRequestResponseLoggingMiddleware',
+    'engram.core.middlewares.ExceptionHandlingMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
 
@@ -91,17 +104,82 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 ENGRAM_REDIS_URL = os.environ.get('ENGRAM_REDIS_URL', 'redis://redis:6379/0')
-CELERY_BROKER_URL = os.environ.get('ENGRAM_CELERY_BROKER_URL', ENGRAM_REDIS_URL)
+ENGRAM_CELERY_BROKER_URL = os.environ.get('ENGRAM_CELERY_BROKER_URL', 'amqp://engram:engram@rabbitmq:5672/engram')
+CELERY_BROKER_URL = ENGRAM_CELERY_BROKER_URL
 CELERY_RESULT_BACKEND = os.environ.get('ENGRAM_CELERY_RESULT_BACKEND', ENGRAM_REDIS_URL)
 CELERY_TASK_IGNORE_RESULT = True
 CELERY_OUTBOX_APP = 'engram.celery_app.app'
+DJANGO_STRUCTLOG_CELERY_ENABLED = True
 
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': ENGRAM_REDIS_URL,
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        },
+    },
+}
+
+REST_FRAMEWORK = {
+    'EXCEPTION_HANDLER': 'engram.core.middlewares.custom_exception_handler',
+    'DEFAULT_RENDERER_CLASSES': [
+        'rest_framework.renderers.JSONRenderer',
+    ],
+}
+
+LOG_FORMATTER = os.environ.get('LOG_FORMATTER', 'console')
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,
+    'filters': {
+        'require_debug_true': {
+            '()': 'django.utils.log.RequireDebugTrue',
+        },
+    },
+    'formatters': {
+        'json': {
+            '()': structlog.stdlib.ProcessorFormatter,
+            'processor': structlog.processors.JSONRenderer(),
+        },
+        'console': {
+            '()': structlog.stdlib.ProcessorFormatter,
+            'processor': structlog.dev.ConsoleRenderer(),
+        },
+    },
     'handlers': {
+        'console_debug': {
+            'class': 'logging.StreamHandler',
+            'level': 'DEBUG',
+            'formatter': LOG_FORMATTER,
+            'filters': ['require_debug_true'],
+            'stream': sys.stdout,
+        },
         'console': {
             'class': 'logging.StreamHandler',
+            'formatter': LOG_FORMATTER,
+            'level': 'INFO',
+            'stream': sys.stdout,
+        },
+    },
+    'loggers': {
+        'django.db.backends': {
+            'level': 'DEBUG',
+            'handlers': ['console_debug'],
+        },
+        '': {
+            'level': 'DEBUG' if DEBUG else 'INFO',
+            'handlers': ['console_debug'] if DEBUG else ['console'],
+        },
+        'django.request': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': True,
+        },
+        'django': {
+            'handlers': ['console'],
+            'level': 'ERROR',
+            'propagate': False,
         },
     },
     'root': {
@@ -109,3 +187,5 @@ LOGGING = {
         'level': os.environ.get('ENGRAM_LOG_LEVEL', 'INFO'),
     },
 }
+
+configure_logger(log_level='DEBUG' if DEBUG else 'INFO', env_profile=ENVIRONMENT)
