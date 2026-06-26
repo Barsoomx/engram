@@ -1217,3 +1217,45 @@ replay-protected code/symbol/commit/issue links attached to an approved memory.
 Security evidence: replay of the same `(link_type, target)` reuses the link;
 team-visible memory outside scope denied; `target`/`label` redacted; audit
 records the actor, capability, memory id, and redacted target.
+
+## 2026-06-26: CLI Search, CLI Memory Commands, MCP Bridge
+
+Three stacked slices merged into local master after the memory-links merge. All
+are additive clients over existing authorized endpoints; none touches backend
+models, migrations, or the worker.
+
+### CLI Search (`feat/cli-search`)
+
+`engram search --query ... [--file-path ...] [--symbol ...] [--limit N] [--json]`
+calls `POST /v1/search/`. CLI suite grew from 27 to 30 tests; new tests cover
+query POST shape, missing-config, and empty-state output.
+
+### CLI Memory Commands (`feat/cli-memory-commands`)
+
+`engram memory version <id> --body ...`, `engram memory link <id> --link-type
+... --target ...`, and `engram memory links <id>` call the version and links
+endpoints. Added `get_json` HTTP helper. CLI suite grew to 36 tests.
+
+### MCP Bridge (`feat/mcp-bridge`)
+
+`packages/mcp/engram_mcp` — newline-delimited JSON-RPC stdio server exposing
+the `engram_search` tool over `POST /v1/search/`. No local store, embeddings, or
+secrets. 8 contract tests cover initialize, notifications, tools/list,
+tools/call, unknown tool/method, ndjson round-trip, and malformed-line skip.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| CLI tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Repository Quality | yes | pass | 36 passed including search + memory command tests. |
+| MCP contract tests | `PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v` | none | yes | pass | 8 passed. |
+| CLI/MCP compile | `python3 -m compileall packages/cli/engram_cli packages/mcp/engram_mcp` | none | yes | pass | Exit 0. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean; layout now requires the MCP package paths. |
+
+Security: all three are thin authenticated clients over proven server-side
+authorization; the MCP bridge carries the configured API key only in process
+memory and forwards it as a bearer header to the Engram server. No new server
+write path or secret surface.
+
+Accepted risks: MCP framing is newline-delimited JSON (matches the reference
+stdio transport); full Content-Length framing and additional tools (context,
+observe, memory version/link) are deferred. CLI commands assume the connected
+project/team from local config (no per-command override yet).
