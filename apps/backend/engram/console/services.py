@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import secrets
+from collections.abc import Iterable
 from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
 
 from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
     Identity,
     IdentityType,
     OrganizationMembership,
     Role,
 )
+from engram.access.services import (
+    api_key_fingerprint,
+    api_key_prefix,
+    hash_api_key,
+)
 from engram.console.exceptions import LastOwnerError
 from engram.core.models import AuditEvent, AuditResult, Organization, Project, Team
 
-
 OWNER_ROLE_CODE = 'organization_owner'
+
+API_KEY_TOKEN_PREFIX = 'egk_'
+
+WILDCARD_ADMIN_CAPABILITY = 'policy:admin'
 
 
 def _active_owner_count(organization: Organization) -> int:
@@ -150,4 +163,96 @@ def remove_member(membership: OrganizationMembership) -> OrganizationMembership:
     membership.save(update_fields=['active', 'updated_at'])
 
     return membership
+
+
+class CapabilityWideningError(Exception):
+    pass
+
+
+def _issuer_can_grant(
+    requested_capabilities: Iterable[str],
+    issuer_capabilities: Iterable[str],
+) -> set[str]:
+    issuer = set(issuer_capabilities)
+
+    granted: set[str] = set()
+
+    for capability in requested_capabilities:
+        if capability in issuer:
+            granted.add(capability)
+
+            continue
+
+        group = capability.split(':')[0]
+
+        if f'{group}:*' in issuer or WILDCARD_ADMIN_CAPABILITY in issuer:
+            granted.add(capability)
+
+            continue
+
+        raise CapabilityWideningError(
+            f'issuer cannot grant capability {capability!r}',
+        )
+
+    return granted
+
+
+def generate_api_key_plaintext() -> str:
+    return f'{API_KEY_TOKEN_PREFIX}{secrets.token_urlsafe(32)}'
+
+
+@transaction.atomic
+def issue_api_key(
+    *,
+    organization: Organization,
+    owner_identity: Identity,
+    name: str,
+    capabilities: list[str],
+    team: Team | None = None,
+    project: Project | None = None,
+    expires_at: Any = None,
+) -> tuple[ApiKey, str]:
+    capability_objs = list(Capability.objects.filter(code__in=capabilities))
+
+    found_codes = {capability.code for capability in capability_objs}
+
+    missing_codes = set(capabilities) - found_codes
+
+    if missing_codes:
+        raise CapabilityWideningError(
+            f'unknown capabilities: {sorted(missing_codes)}',
+        )
+
+    plaintext = generate_api_key_plaintext()
+
+    api_key = ApiKey(
+        organization=organization,
+        owner_identity=owner_identity,
+        name=name,
+        key_prefix=api_key_prefix(plaintext),
+        key_hash=hash_api_key(plaintext),
+        key_fingerprint=api_key_fingerprint(plaintext),
+        team=team,
+        project=project,
+        active=True,
+        expires_at=expires_at,
+    )
+
+    api_key.full_clean()
+
+    api_key.save()
+
+    for capability in capability_objs:
+        ApiKeyCapability.objects.get_or_create(api_key=api_key, capability=capability)
+
+    return api_key, plaintext
+
+
+@transaction.atomic
+def revoke_api_key(api_key: ApiKey) -> ApiKey:
+    api_key.revoked_at = timezone.now()
+
+    api_key.save(update_fields=['revoked_at', 'updated_at'])
+
+    return api_key
 
