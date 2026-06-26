@@ -24,6 +24,7 @@ from engram.core.redaction import redact_value
 from engram.model_policy.models import (
     ModelPolicy,
     PolicyScope,
+    Provider,
     ProviderCallRecord,
     ProviderSecret,
     ProviderSecretEnvelope,
@@ -718,7 +719,132 @@ def _split_completion(content: str) -> tuple[str, str]:
     return lines[0][:255], '\n'.join(lines[1:])
 
 
-def get_provider_gateway(policy: ModelPolicy, *, opener: Any = None) -> FakeProviderGateway | OpenAICompatibleGateway:
+class AnthropicMessagesGateway:
+    def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
+        self._base_url = base_url.rstrip('/')
+        self._api_key = api_key
+        self._opener = opener or urllib.request.urlopen
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        policy = data.policy
+        existing_record = self._existing_record(data)
+        redacted_prompt = redact_value(data.prompt)
+        prompt_text = str(redacted_prompt.value)
+        if existing_record is not None:
+            title, body = _split_completion(prompt_text)
+
+            return ProviderCallResult(
+                provider=existing_record.provider,
+                model=existing_record.model,
+                call_record_id=existing_record.id,
+                redaction_state=existing_record.redaction_state,
+                generated_title=title,
+                generated_body=body,
+            )
+
+        content = self._messages(policy.model, prompt_text)
+        title, body = _split_completion(content)
+        record = self._record_call(
+            data,
+            policy,
+            redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
+            token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+        )
+
+        return ProviderCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state=record.redaction_state,
+            generated_title=title,
+            generated_body=body,
+        )
+
+    def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
+        raise ModelPolicyError(
+            'anthropic_embeddings_unsupported',
+            'Anthropic-compatible providers do not expose embeddings through this gateway',
+        )
+
+    def _existing_record(self, data: ProviderCallInput | EmbeddingCallInput) -> ProviderCallRecord | None:
+        policy = data.policy
+
+        return (
+            ProviderCallRecord.objects.filter(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                task_type=policy.task_type,
+                request_id=data.request_id,
+            )
+            .order_by('created_at')
+            .first()
+        )
+
+    def _record_call(
+        self,
+        data: ProviderCallInput | EmbeddingCallInput,
+        policy: ModelPolicy,
+        *,
+        redaction_state: str,
+        token_usage: dict[str, int],
+    ) -> ProviderCallRecord:
+        return ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=data.trace_id,
+            redaction_state=redaction_state,
+            token_usage=token_usage,
+            latency_ms=0,
+            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            result=AuditResult.RECORDED,
+            metadata={'prompt_retained': False, 'transport': 'http-anthropic'},
+        )
+
+    def _messages(self, model: str, prompt: str) -> str:
+        payload = json.dumps(
+            {
+                'model': model,
+                'max_tokens': 1024,
+                'messages': [{'role': 'user', 'content': prompt}],
+            },
+        ).encode()
+        response = self._open(self._base_url + '/v1/messages', payload)
+
+        return str(response['content'][0]['text'])
+
+    def _open(self, url: str, body: bytes) -> dict[str, Any]:
+        request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
+            url,
+            data=body,
+            headers={
+                'x-api-key': self._api_key,
+                'anthropic-version': '2023-06-01',
+                'content-type': 'application/json',
+            },
+            method='POST',
+        )
+        try:
+            with self._opener(request, timeout=30) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as error:
+            raise ModelPolicyError('provider_http_error', f'provider returned {error.code}') from error
+        except urllib.error.URLError as error:
+            raise ModelPolicyError('provider_unreachable', f'provider unreachable: {error.reason}') from error
+
+
+def get_provider_gateway(
+    policy: ModelPolicy,
+    *,
+    opener: Any = None,
+) -> FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway:
     mode = os.environ.get('ENGRAM_PROVIDER_MODE', 'fake')
 
     if mode != 'real':
@@ -733,7 +859,14 @@ def get_provider_gateway(policy: ModelPolicy, *, opener: Any = None) -> FakeProv
     if envelope is None:
         raise ProviderSecretError('provider secret has no active envelope')
     api_key = decrypt_secret(envelope)
-    gateway = OpenAICompatibleGateway(base_url=_resolve_base_url(policy), api_key=api_key)
+    base_url = _resolve_base_url(policy)
+    if policy.provider == Provider.ANTHROPIC:
+        gateway: FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway = AnthropicMessagesGateway(
+            base_url=base_url,
+            api_key=api_key,
+        )
+    else:
+        gateway = OpenAICompatibleGateway(base_url=base_url, api_key=api_key)
     if opener is not None:
         gateway._opener = opener
 
