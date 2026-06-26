@@ -1,4 +1,4 @@
-FROM node:20-slim AS base
+FROM node:22-slim AS base
 
 ARG HTTP_PROXY
 ARG HTTPS_PROXY
@@ -11,7 +11,7 @@ RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 WORKDIR /app
 
 FROM base AS deps
-COPY package.json pnpm-lock.yaml* ./
+COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
 RUN pnpm install --frozen-lockfile || pnpm install
 
 FROM base AS builder
