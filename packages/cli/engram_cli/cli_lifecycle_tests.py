@@ -1123,3 +1123,71 @@ class CliLifecycleTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+    def test_search_posts_query_and_prints_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                'request_id': 'request-search-1',
+                'items': [
+                    {
+                        'citation': 'M1',
+                        'memory_id': 'mem-1',
+                        'memory_version_id': 'ver-1',
+                        'retrieval_document_id': 'doc-1',
+                        'title': 'Authorisation handling',
+                        'body': 'Authorisation runs before ranking.',
+                        'inclusion_reason': 'exact match: auth',
+                        'scope_evidence': {'visibility_scope': 'project'},
+                        'matched_terms': ['auth'],
+                    },
+                ],
+                'warnings': [],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ['search', '--query', 'auth ranking', '--limit', '3', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(1, len(transport.calls))
+            call = transport.calls[0]
+            self.assertEqual('https://engram.example/v1/search/', call['url'])
+            self.assertEqual('POST', call['method'])
+            self.assertEqual('auth ranking', call['payload']['query'])
+            self.assertEqual(3, call['payload']['limit'])
+            self.assertEqual(PROJECT_ID, call['payload']['project_id'])
+            self.assertEqual(TEAM_ID, call['payload']['team_id'])
+            self.assertEqual(f'Bearer {RAW_KEY}', call['headers']['Authorization'])
+            self.assertIn('Authorisation handling', stdout)
+            self.assertIn('M1', stdout)
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_search_reports_missing_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = FakeTransport([])
+            exit_code, _stdout, stderr = self.run_cli(
+                ['search', '--query', 'auth', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual(0, len(transport.calls))
+            self.assertIn('missing_config', stderr)
+
+    def test_search_prints_empty_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {'request_id': 'r', 'items': [], 'warnings': []})])
+            exit_code, stdout, stderr = self.run_cli(
+                ['search', '--query', 'nothing', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn('No memory matched', stdout)
