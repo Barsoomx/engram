@@ -138,27 +138,10 @@ class RecordMemoryFeedback:
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
-        memory = (
-            Memory.objects.select_for_update()
-            .filter(
-                organization_id=scope.organization_id,
-                project_id=data.project_id,
-                id=data.memory_id,
-            )
-            .first()
-        )
-        if memory is None:
-            raise MemoryFeedbackError('memory_not_found', 'Memory was not found')
-
-        return memory
+        return lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryFeedbackError)
 
     def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
-        if (
-            memory.visibility_scope == VisibilityScope.TEAM
-            and memory.team_id is not None
-            and memory.team_id not in scope.team_ids
-        ):
-            raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+        ensure_memory_team_scope(memory, scope)
 
     def _already_applied(self, memory: Memory, action: str) -> bool:
         return bool(getattr(memory, action))
@@ -547,6 +530,36 @@ def memory_body_content_hash(memory: Memory, next_version: int, body: str) -> st
     return hashlib.sha256(source.encode()).hexdigest()
 
 
+def lock_memory_for_update(
+    scope: EffectiveScope,
+    project_id: uuid.UUID,
+    memory_id: uuid.UUID,
+    error_cls: type[Exception],
+) -> Memory:
+    memory = (
+        Memory.objects.select_for_update()
+        .filter(
+            organization_id=scope.organization_id,
+            project_id=project_id,
+            id=memory_id,
+        )
+        .first()
+    )
+    if memory is None:
+        raise error_cls('memory_not_found', 'Memory was not found')
+
+    return memory
+
+
+def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
+    if (
+        memory.visibility_scope == VisibilityScope.TEAM
+        and memory.team_id is not None
+        and memory.team_id not in scope.team_ids
+    ):
+        raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
         scope = ResolveApiKeyScope().execute(
@@ -560,8 +573,17 @@ class UpdateMemoryBody:
             target_id=str(data.memory_id),
         )
         with transaction.atomic():
-            memory = self._lock_memory(data, scope)
-            self._ensure_team_scope(memory, scope)
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            ensure_memory_team_scope(memory, scope)
+            latest_version = memory.versions.order_by('-version').first()
+            if latest_version is not None and latest_version.body == data.body:
+                retrieval_document = self._index_version(latest_version)
+
+                return UpdateMemoryBodyResult(
+                    memory=memory,
+                    memory_version=latest_version,
+                    retrieval_document=retrieval_document,
+                )
             version = self._create_version(memory, data)
             memory.body = data.body
             memory.current_version = version.version
@@ -576,29 +598,6 @@ class UpdateMemoryBody:
             memory_version=version,
             retrieval_document=retrieval_document,
         )
-
-    def _lock_memory(self, data: UpdateMemoryBodyInput, scope: EffectiveScope) -> Memory:
-        memory = (
-            Memory.objects.select_for_update()
-            .filter(
-                organization_id=scope.organization_id,
-                project_id=data.project_id,
-                id=data.memory_id,
-            )
-            .first()
-        )
-        if memory is None:
-            raise MemoryVersionError('memory_not_found', 'Memory was not found')
-
-        return memory
-
-    def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
-        if (
-            memory.visibility_scope == VisibilityScope.TEAM
-            and memory.team_id is not None
-            and memory.team_id not in scope.team_ids
-        ):
-            raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
 
     def _create_version(self, memory: Memory, data: UpdateMemoryBodyInput) -> MemoryVersion:
         next_version = memory.current_version + 1

@@ -190,3 +190,31 @@ def test_update_memory_body_supports_multiple_versions() -> None:
     assert memory.current_version == 3
     assert memory.body == 'Second update'
     assert MemoryVersion.objects.filter(memory=memory).count() == 3
+
+
+@pytest.mark.django_db
+def test_update_memory_body_is_idempotent_for_same_body() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    first = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, body='Same body replayed', request_id='request-version-same-a'),
+        format='json',
+        **auth_headers(),
+    )
+    second = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, body='Same body replayed', request_id='request-version-same-b'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()['memory_version_id'] == second.json()['memory_version_id']
+    assert first.json()['current_version'] == 2
+    assert second.json()['current_version'] == 2
+    assert MemoryVersion.objects.filter(memory=memory).count() == 2
