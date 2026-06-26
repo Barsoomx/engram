@@ -86,6 +86,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django_structlog.middlewares.RequestMiddleware',
+    'engram.core.middlewares.MetricsMiddleware',
     'engram.core.middlewares.ApiRequestResponseLoggingMiddleware',
     'engram.core.middlewares.ExceptionHandlingMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',

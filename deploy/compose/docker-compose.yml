@@ -106,6 +106,26 @@ services:
     command: >
       sh -ec "python manage.py celery_outbox_relay"
 
+  frontend:
+    build:
+      context: ../../apps/frontend
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_ENGRAM_API_URL: http://api:8000
+      NUXT_TELEMETRY_DISABLED: '1'
+      PORT: '3000'
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   postgres:
     image: postgres:16-alpine
     environment:
