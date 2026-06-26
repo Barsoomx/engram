@@ -125,6 +125,7 @@ class Team(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='teams')
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=120)
+    archived_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
