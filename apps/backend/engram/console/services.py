@@ -6,7 +6,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from engram.access.models import Identity
-from engram.core.models import AuditEvent, AuditResult, Organization, Team
+from engram.core.models import AuditEvent, AuditResult, Organization, Project, Team
 
 
 def audit_admin_action(
@@ -49,4 +49,31 @@ def archive_team(team: Team) -> Team:
     team.save(update_fields=['archived_at', 'updated_at'])
 
     return team
+
+
+@transaction.atomic
+def create_project(
+    *,
+    organization: Organization,
+    name: str,
+    slug: str,
+    repository_url: str = '',
+    default_branch: str = '',
+) -> Project:
+    return Project.objects.create(
+        organization=organization,
+        name=name,
+        slug=slug,
+        repository_url=repository_url,
+        default_branch=default_branch,
+    )
+
+
+@transaction.atomic
+def archive_project(project: Project) -> Project:
+    project.archived_at = timezone.now()
+
+    project.save(update_fields=['archived_at', 'updated_at'])
+
+    return project
 

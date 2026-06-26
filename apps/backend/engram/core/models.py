@@ -144,6 +144,7 @@ class Project(TimestampedModel):
     repository_url = models.TextField(blank=True)
     repository_root = models.TextField(blank=True)
     default_branch = models.CharField(max_length=255, blank=True)
+    archived_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
