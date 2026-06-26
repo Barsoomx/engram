@@ -19,7 +19,7 @@ from engram_cli.config import (
     write_json,
     write_secret_json,
 )
-from engram_cli.http import Transport, get_health, post_dry_run, post_json, urllib_transport
+from engram_cli.http import Transport, get_health, get_json, post_dry_run, post_json, urllib_transport
 
 
 class CliError(Exception):
@@ -745,6 +745,134 @@ def run_search(
         for item in items:
             stdout.write(f"{item.get('citation')}: {item.get('title')}\n")
             stdout.write(f"  {item.get('body')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def _load_cli_scope(args: Namespace) -> tuple[Path, str, str, dict[str, object], str]:
+    paths = local_paths(args.config_dir)
+    config = load_required_json(paths.config, 'missing_config', 'Engram config is missing')
+    credentials = load_required_json(paths.credentials, 'missing_credential', 'Engram credential is missing')
+    api_key = as_string(credentials.get('api_key'))
+    if not api_key:
+        raise CliError('missing_credential', 'Engram credential is missing', remediation_for('missing_credential'))
+    server_url = normalize_server_url(as_string(config.get('server_url')))
+
+    return paths, api_key, server_url, config, as_string(config.get('team_id'))
+
+
+def run_memory_version(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        payload: dict[str, object] = {
+            'project_id': as_string(config.get('project_id')),
+            'body': args.body,
+            'request_id': args.request_id or f'engram-cli-{uuid.uuid4()}',
+        }
+        if args.reason:
+            payload['reason'] = args.reason
+        if team_id:
+            payload['team_id'] = team_id
+        active_transport = transport or urllib_transport
+        status, body = post_json(
+            transport=active_transport,
+            server_url=server_url,
+            path=f'/v1/memories/{args.memory_id}/version',
+            api_key=api_key,
+            payload=payload,
+        )
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback='http_error')
+        stdout.write(f"memory_id={body.get('memory_id')}\n")
+        stdout.write(f"current_version={body.get('current_version')}\n")
+        stdout.write(f"memory_version_id={body.get('memory_version_id')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_memory_link(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        payload: dict[str, object] = {
+            'project_id': as_string(config.get('project_id')),
+            'link_type': args.link_type,
+            'target': args.target,
+            'request_id': args.request_id or f'engram-cli-{uuid.uuid4()}',
+        }
+        if args.label:
+            payload['label'] = args.label
+        if team_id:
+            payload['team_id'] = team_id
+        active_transport = transport or urllib_transport
+        status, body = post_json(
+            transport=active_transport,
+            server_url=server_url,
+            path=f'/v1/memories/{args.memory_id}/links',
+            api_key=api_key,
+            payload=payload,
+        )
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback='http_error')
+        stdout.write(f"link_id={body.get('link_id')}\n")
+        stdout.write(f"link_type={body.get('link_type')}\n")
+        stdout.write(f"target={body.get('target')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_memory_links(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        params: dict[str, str] = {'project_id': as_string(config.get('project_id'))}
+        if team_id:
+            params['team_id'] = team_id
+        active_transport = transport or urllib_transport
+        status, body = get_json(
+            transport=active_transport,
+            server_url=server_url,
+            path=f'/v1/memories/{args.memory_id}/links',
+            api_key=api_key,
+            params=params,
+        )
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback='http_error')
+        items = body.get('items', [])
+        if not items:
+            stdout.write('No links recorded for this memory.\n')
+
+            return 0
+        for item in items:
+            stdout.write(f"{item.get('link_type')}: {item.get('target')}\n")
 
         return 0
     except CliError as error:

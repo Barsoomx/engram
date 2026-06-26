@@ -5,7 +5,16 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
-from engram_cli.commands import run_connect, run_disconnect, run_doctor, run_hook, run_search
+from engram_cli.commands import (
+    run_connect,
+    run_disconnect,
+    run_doctor,
+    run_hook,
+    run_memory_link,
+    run_memory_links,
+    run_memory_version,
+    run_search,
+)
 from engram_cli.http import Transport
 
 
@@ -34,6 +43,13 @@ def main(
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
     if args.command == 'search':
         return run_search(args, output, errors, transport)
+    if args.command == 'memory':
+        if args.memory_command == 'version':
+            return run_memory_version(args, output, errors, transport)
+        if args.memory_command == 'link':
+            return run_memory_link(args, output, errors, transport)
+        if args.memory_command == 'links':
+            return run_memory_links(args, output, errors, transport)
 
     parser.print_help(file=errors)
 
@@ -78,5 +94,27 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument('--limit', type=int, default=5)
     search.add_argument('--config-dir')
     search.add_argument('--json', action='store_true', dest='as_json')
+
+    memory = subparsers.add_parser('memory')
+    memory_subparsers = memory.add_subparsers(dest='memory_command')
+
+    memory_version = memory_subparsers.add_parser('version')
+    memory_version.add_argument('memory_id')
+    memory_version.add_argument('--body', required=True)
+    memory_version.add_argument('--reason', default='')
+    memory_version.add_argument('--request-id', dest='request_id', default='')
+    memory_version.add_argument('--config-dir')
+
+    memory_link = memory_subparsers.add_parser('link')
+    memory_link.add_argument('memory_id')
+    memory_link.add_argument('--link-type', dest='link_type', required=True, choices=('file', 'symbol', 'commit', 'issue'))
+    memory_link.add_argument('--target', required=True)
+    memory_link.add_argument('--label', default='')
+    memory_link.add_argument('--request-id', dest='request_id', default='')
+    memory_link.add_argument('--config-dir')
+
+    memory_links = memory_subparsers.add_parser('links')
+    memory_links.add_argument('memory_id')
+    memory_links.add_argument('--config-dir')
 
     return parser
