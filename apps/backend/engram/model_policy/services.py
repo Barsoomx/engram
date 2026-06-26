@@ -3,8 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import math
+import os
 import re
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -536,6 +540,204 @@ def generated_candidate_content(prompt: str) -> tuple[str, str]:
     digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
 
     return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'
+
+
+def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
+    return Fernet(encryption_key()).decrypt(envelope.ciphertext.encode()).decode()
+
+
+def default_base_url(provider: str) -> str:
+    if provider == 'openai':
+        return 'https://api.openai.com/v1'
+
+    return 'https://api.openai.com/v1'
+
+
+def _resolve_base_url(policy: ModelPolicy) -> str:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    base_url = str(metadata.get('base_url') or '').strip()
+
+    return base_url if base_url else default_base_url(policy.provider)
+
+
+class OpenAICompatibleGateway:
+    def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
+        self._base_url = base_url.rstrip('/')
+        self._api_key = api_key
+        self._opener = opener or urllib.request.urlopen
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        policy = data.policy
+        existing_record = self._existing_record(data)
+        redacted_prompt = redact_value(data.prompt)
+        prompt_text = str(redacted_prompt.value)
+        if existing_record is not None:
+            title, body = _split_completion(prompt_text)
+
+            return ProviderCallResult(
+                provider=existing_record.provider,
+                model=existing_record.model,
+                call_record_id=existing_record.id,
+                redaction_state=existing_record.redaction_state,
+                generated_title=title,
+                generated_body=body,
+            )
+
+        content = self._chat_completion(policy.model, prompt_text)
+        title, body = _split_completion(content)
+        record = self._record_call(
+            data,
+            policy,
+            redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
+            token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+        )
+
+        return ProviderCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state=record.redaction_state,
+            generated_title=title,
+            generated_body=body,
+        )
+
+    def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
+        policy = data.policy
+        existing_record = self._existing_record(data)
+        redacted_text = redact_value(data.text)
+        text_value = str(redacted_text.value)
+        if existing_record is not None:
+            return EmbeddingCallResult(
+                provider=existing_record.provider,
+                model=existing_record.model,
+                call_record_id=existing_record.id,
+                redaction_state=existing_record.redaction_state,
+                embedding=self._embeddings(policy.model, text_value),
+            )
+
+        embedding = self._embeddings(policy.model, text_value)
+        record = self._record_call(
+            data,
+            policy,
+            redaction_state='redacted' if redacted_text.redacted or '[REDACTED]' in data.text else 'clean',
+            token_usage={'input_tokens': len(text_value.split()), 'output_tokens': 0},
+        )
+
+        return EmbeddingCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state=record.redaction_state,
+            embedding=embedding,
+        )
+
+    def _existing_record(self, data: ProviderCallInput | EmbeddingCallInput) -> ProviderCallRecord | None:
+        policy = data.policy
+
+        return (
+            ProviderCallRecord.objects.filter(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                task_type=policy.task_type,
+                request_id=data.request_id,
+            )
+            .order_by('created_at')
+            .first()
+        )
+
+    def _record_call(
+        self,
+        data: ProviderCallInput | EmbeddingCallInput,
+        policy: ModelPolicy,
+        *,
+        redaction_state: str,
+        token_usage: dict[str, int],
+    ) -> ProviderCallRecord:
+        return ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=data.trace_id,
+            redaction_state=redaction_state,
+            token_usage=token_usage,
+            latency_ms=0,
+            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            result=AuditResult.RECORDED,
+            metadata={'prompt_retained': False, 'transport': 'http'},
+        )
+
+    def _chat_completion(self, model: str, prompt: str) -> str:
+        payload = json.dumps(
+            {
+                'model': model,
+                'messages': [{'role': 'user', 'content': prompt}],
+                'temperature': 0.2,
+            },
+        ).encode()
+        response = self._open(self._base_url + '/chat/completions', payload)
+
+        return str(response['choices'][0]['message']['content'])
+
+    def _embeddings(self, model: str, text: str) -> tuple[float, ...]:
+        payload = json.dumps({'model': model, 'input': text}).encode()
+        response = self._open(self._base_url + '/embeddings', payload)
+
+        return tuple(float(component) for component in response['data'][0]['embedding'])
+
+    def _open(self, url: str, body: bytes) -> dict[str, Any]:
+        request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
+            url,
+            data=body,
+            headers={'Authorization': f'Bearer {self._api_key}', 'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with self._opener(request, timeout=30) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as error:
+            raise ModelPolicyError('provider_http_error', f'provider returned {error.code}') from error
+        except urllib.error.URLError as error:
+            raise ModelPolicyError('provider_unreachable', f'provider unreachable: {error.reason}') from error
+
+
+def _split_completion(content: str) -> tuple[str, str]:
+    lines = [line for line in content.splitlines() if line.strip()]
+    if not lines:
+        return 'Provider-generated memory', content
+
+    if len(lines) == 1:
+        return lines[0][:255], content
+
+    return lines[0][:255], '\n'.join(lines[1:])
+
+
+def get_provider_gateway(policy: ModelPolicy, *, opener: Any = None) -> FakeProviderGateway | OpenAICompatibleGateway:
+    mode = os.environ.get('ENGRAM_PROVIDER_MODE', 'fake')
+
+    if mode != 'real':
+        return FakeProviderGateway()
+
+    secret = policy.secret
+    if not secret.active:
+        raise ProviderSecretError('provider secret is disabled')
+    envelope = (
+        ProviderSecretEnvelope.objects.filter(secret=secret, active=True).order_by('-version', '-created_at').first()
+    )
+    if envelope is None:
+        raise ProviderSecretError('provider secret has no active envelope')
+    api_key = decrypt_secret(envelope)
+    gateway = OpenAICompatibleGateway(base_url=_resolve_base_url(policy), api_key=api_key)
+    if opener is not None:
+        gateway._opener = opener
+
+    return gateway
 
 
 EMBEDDING_DIMENSION = 64
