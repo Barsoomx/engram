@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+from celery.schedules import crontab
 from django.apps import apps
 from django.db.models import Model
 from kombu import Exchange, Queue
@@ -103,7 +104,13 @@ task_queues = (
     ),
 )
 
-beat_schedule: dict[str, dict] = {}
+beat_schedule: dict[str, dict] = {
+    'daily-digest': {
+        'task': 'engram.memory.run_scheduled_digests',
+        'schedule': crontab(hour=2, minute=0),
+        'options': {'queue': QUEUE_BATCH},
+    },
+}
 
 worker_max_tasks_per_child = int(os.getenv('ENGRAM_WORKER_MAX_TASKS_PER_CHILD', 512))
 worker_task_log_format = '[%(asctime)s] [%(levelname)s] %(name)s %(module)s %(process)d | %(message)s'

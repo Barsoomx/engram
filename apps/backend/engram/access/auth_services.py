@@ -105,26 +105,18 @@ class LoginUser:
 
     def _ensure_identity(self, user: User) -> Identity:
         external_id = external_id_for_user(user)
-        existing = Identity.objects.filter(
-            identity_type=IdentityType.USER,
-            external_id=external_id,
-        ).first()
-        if existing is not None:
-            if not existing.active:
-                existing.active = True
-                existing.save(update_fields=['active', 'updated_at'])
-
-            return existing
-
         organization = self._ensure_organization()
-        identity = Identity.objects.create(
+        identity, created = Identity.objects.get_or_create(
             organization=organization,
             identity_type=IdentityType.USER,
             external_id=external_id,
-            display_name=user.get_username(),
-            email=getattr(user, 'email', '') or '',
+            defaults={
+                'display_name': user.get_username(),
+                'email': getattr(user, 'email', '') or '',
+            },
         )
-        self._ensure_membership(organization, identity)
+        if created:
+            self._ensure_membership(organization, identity)
 
         return identity
 

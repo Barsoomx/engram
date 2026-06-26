@@ -40,4 +40,4 @@ class MetricsMiddleware:
             if view_name:
                 return view_name
 
-        return request.path
+        return 'unresolved'
