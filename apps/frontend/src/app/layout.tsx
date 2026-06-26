@@ -1,5 +1,9 @@
+import '@/styles/globals.css';
+import clsx from 'clsx';
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
+
+import { Providers } from './providers';
 
 export const metadata: Metadata = {
   title: 'Engram Admin',
@@ -8,26 +12,13 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html lang='en'>
-      <body>
-        <header
-          style={{
-            padding: '1rem',
-            borderBottom: '1px solid #e5e5e5',
-            display: 'flex',
-            gap: '1rem',
-          }}
-        >
-          <strong>Engram Admin</strong>
-          <nav style={{ display: 'flex', gap: '1rem' }}>
-            <a href='/'>Home</a>
-            <a href='/health'>Health</a>
-            <a href='/memories'>Memories</a>
-          </nav>
-        </header>
-        <main style={{ padding: '1rem', fontFamily: 'sans-serif' }}>
-          {children}
-        </main>
+    <html className='dark' lang='en' suppressHydrationWarning>
+      <head>
+        <meta content='dark' name='color-scheme' />
+        <meta name='darkreader-lock' />
+      </head>
+      <body className={clsx('font-sans antialiased')}>
+        <Providers>{children}</Providers>
       </body>
     </html>
   );

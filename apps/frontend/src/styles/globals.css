@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    background: hsl(var(--heroui-background));
+  }
+
+  html.dark {
+    color-scheme: dark;
+  }
+
+  body {
+    -webkit-font-smoothing: antialiased;
+    background: hsl(var(--heroui-background));
+    color: hsl(var(--heroui-foreground));
+  }
+
+  *:focus-visible {
+    outline: none;
+  }
+}
+
+@layer components {
+  .surface-card {
+    background-color: hsl(var(--heroui-content1));
+    border: 1px solid hsl(var(--heroui-divider));
+    border-radius: 16px;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fade-up 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
