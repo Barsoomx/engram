@@ -1087,3 +1087,65 @@ Accepted risks: deterministic character 3-gram embeddings are an interface-only
 stand-in for real OpenAI embeddings; `JSONField` vector storage without
 dimension validation while there is one producer at dimension 64; gateway
 record-creation duplication deferred to the real-adapter slice.
+
+## 2026-06-26: Memory Search API
+
+Branch: `feat/memory-search-api` (stacked on `feat/semantic-retrieval-foundation`;
+decision: user delegated slice selection and branch decisions, so stacked work
+is explicit and documented; merge order is semantic-retrieval first, then
+memory-search).
+
+Scope:
+
+- `apps/backend/engram/search/` (new app: `apps.py`, `serializers.py`,
+  `services.py`, `views.py`, `urls.py`, `search_api_tests.py`)
+- `apps/backend/engram/context/services.py` — extracted module helpers
+  `score_retrieval_document` and `authorized_retrieval_documents`;
+  `BuildContextBundle._score_document`/`_authorized_documents` delegate.
+- `apps/backend/settings/settings.py` — registered `'engram.search'`.
+- `apps/backend/settings/urls.py` — added `/v1/search/` route.
+- `scripts/repository_layout.py` — required search app paths.
+- `docs/superpowers/specs/2026-06-26-memory-search-api-design.md`
+- `docs/security/reviews/2026-06-26-memory-search-api.md`
+
+This checkpoint adds the missing `POST /v1/search` endpoint from
+`docs/architecture.md`'s public API surface: an authorized, stateless, exact
+read that returns cited ranked memory matches without persisting a context
+bundle. It unblocks a future search MCP tool and `engram search` CLI. Semantic
+recall is intentionally deferred for search.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED search tests | `docker compose -f deploy/compose/docker-compose.yml run --rm --no-deps -e ENGRAM_DATABASE_URL=sqlite:///:memory: -v "$PWD/apps/backend:/srv/app" api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/search/search_api_tests.py -v"` | Backend | yes | pass | Exit 0. Reported 6 passed: ranked cited matches, capability denial, wrong-project denial, cross-team exclusion, oversized-query rejection, missing bearer key. |
+| extraction safety | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 22 passed after extracting `score_retrieval_document` and `authorized_retrieval_documents`; behavior preserved. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. System check clean; pytest reported 190 passed; Ruff `All checks passed!`; format reported 119 files already formatted. |
+| migration apply and freshness | covered by the full-gate `migrate --noinput` above (no migration added) | Backend | yes | pass | Exit 0. No model change; migrations unchanged. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Unchanged exact fixture stayed green; search endpoint is not exercised by the golden path and introduced no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Exit 0. Repository unittest reported 31 OK; layout and quality scripts exited with no output; whitespace clean. |
+| focused security review | Self-review recorded in `docs/security/reviews/2026-06-26-memory-search-api.md` | none | yes | pass | `SECURITY APPROVED`. Read-only reuser of proven authorization and retrieval primitives; no new write path, secret surface, provider boundary, or untrusted-content rendering. |
+
+First decisive failures fixed during the TDD loop:
+
+- Initial `ruff check` reported five import-ordering errors in the new search
+  package; applied `ruff check --fix` and `ruff format` before amending the
+  search commit.
+
+Accepted risks: search is exact-only (semantic recall deferred); no dedicated
+search audit event beyond `AccessScopeResolved`.
+
+### 2026-06-26: Memory Search Semantic Recall (extension)
+
+Stacked on `feat/memory-search-api`. Lifts the search-slice deferral: search now
+uses hybrid retrieval identical to context. `_semantic_matches` and
+`_resolve_query_embedding` were extracted to module functions
+(`semantic_retrieval_matches`, `resolve_query_embedding`) and reused by both
+`BuildContextBundle` and `SearchMemories`.
+
+| Check | Local command | Status | Notes |
+| --- | --- | --- | --- |
+| focused search + context tests | `docker compose ... pytest engram/search/search_api_tests.py engram/context/context_api_tests.py -v` | pass | 29 passed; new `test_search_returns_semantic_match_when_exact_misses` green; context semantic tests unchanged after extraction. |
+| full backend gate | `docker compose ... run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | pass | 191 passed; ruff clean; 119 files formatted. |
+
+Security unchanged: the query-embedding provider call on the search path is
+authorized under the same scope, redacts the query text, and is made only when
+exact matches are below the requested limit.

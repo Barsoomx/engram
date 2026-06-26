@@ -74,6 +74,7 @@ INSTALLED_APPS = [
     'engram.context',
     'engram.inspection',
     'engram.model_policy',
+    'engram.search',
     'engram.health',
 ]
 

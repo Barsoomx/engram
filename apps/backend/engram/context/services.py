@@ -211,6 +211,167 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def authorized_retrieval_documents(
+    organization: Organization,
+    project: Project,
+    scope: EffectiveScope,
+) -> tuple[RetrievalDocument, ...]:
+    documents = RetrievalDocument.objects.select_related(
+        'memory',
+        'memory_version',
+        'team',
+    ).filter(
+        organization=organization,
+        project=project,
+        memory__status=MemoryStatus.APPROVED,
+        memory__stale=False,
+        memory__refuted=False,
+        stale=False,
+        refuted=False,
+    )
+    authorized: list[RetrievalDocument] = []
+    allowed_team_ids = set(scope.team_ids)
+    for document in documents:
+        if document.visibility_scope == VisibilityScope.PROJECT:
+            authorized.append(document)
+        elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
+            authorized.append(document)
+
+    return tuple(authorized)
+
+
+def score_retrieval_document(
+    document: RetrievalDocument,
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    has_request_terms: bool,
+) -> RetrievalMatch | None:
+    document_file_paths = tuple(str(value) for value in document.file_paths)
+    file_match = first_path_match(file_paths, document_file_paths)
+    if file_match:
+        return RetrievalMatch(
+            document=document,
+            score=100,
+            matched_terms=(file_match,),
+            inclusion_reason=f'exact match: {file_match}',
+        )
+
+    document_symbols = tuple(str(value) for value in document.symbols)
+    symbol_match = first_exact_match(symbols, document_symbols)
+    if symbol_match:
+        return RetrievalMatch(
+            document=document,
+            score=80,
+            matched_terms=(symbol_match,),
+            inclusion_reason=f'exact match: {symbol_match}',
+        )
+
+    query_terms = request_query_terms(query)
+    exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
+    if exact_match:
+        return RetrievalMatch(
+            document=document,
+            score=60,
+            matched_terms=(exact_match,),
+            inclusion_reason=f'exact match: {exact_match}',
+        )
+
+    full_text_match = first_full_text_match(query_terms, document.full_text)
+    if full_text_match:
+        return RetrievalMatch(
+            document=document,
+            score=40,
+            matched_terms=(full_text_match,),
+            inclusion_reason=f'full-text match: {full_text_match}',
+        )
+
+    if not has_request_terms:
+        return RetrievalMatch(
+            document=document,
+            score=1,
+            matched_terms=(),
+            inclusion_reason='filter-only authorized memory',
+        )
+
+    return None
+
+
+def semantic_retrieval_matches(
+    documents: tuple[RetrievalDocument, ...],
+    exact_matches: list[RetrievalMatch],
+    query_vector: list[float],
+) -> list[RetrievalMatch]:
+    already_matched = {match.document.id for match in exact_matches}
+    scored: list[tuple[float, RetrievalMatch]] = []
+    for document in documents:
+        if document.id in already_matched or not document.embedding_vector:
+            continue
+        similarity = cosine_similarity(query_vector, list(document.embedding_vector))
+        if similarity < SEMANTIC_MIN_SIMILARITY:
+            continue
+        scored.append(
+            (
+                similarity,
+                RetrievalMatch(
+                    document=document,
+                    score=30,
+                    matched_terms=(f'cosine {similarity:.2f}',),
+                    inclusion_reason=f'semantic match: cosine {similarity:.2f}',
+                ),
+            ),
+        )
+    scored.sort(key=lambda item: -item[0])
+
+    return [match for _similarity, match in scored]
+
+
+def resolve_query_embedding(
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    organization: Organization,
+    project: Project,
+    team: Team | None,
+    request_id: str,
+    trace_id: str,
+) -> EmbeddingCallResult | None:
+    try:
+        resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team.id if team is not None else None,
+                task_type='embedding',
+            ),
+        )
+        result = FakeProviderGateway().embed(
+            EmbeddingCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team.id if team is not None else None,
+                policy=resolved.policy,
+                request_id=request_id,
+                trace_id=trace_id,
+                text='\n'.join([query, *file_paths, *symbols]),
+            ),
+        )
+    except ModelPolicyError:
+        return None
+    except ProviderSecretError as error:
+        logger.warning(
+            'query embedding skipped: provider secret unavailable',
+            organization_id=str(organization.id),
+            project_id=str(project.id),
+            request_id=request_id,
+            error=str(error),
+        )
+
+        return None
+
+    return result
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -501,28 +662,7 @@ class BuildContextBundle:
         project: Project,
         scope: EffectiveScope,
     ) -> tuple[RetrievalDocument, ...]:
-        documents = RetrievalDocument.objects.select_related(
-            'memory',
-            'memory_version',
-            'team',
-        ).filter(
-            organization=organization,
-            project=project,
-            memory__status=MemoryStatus.APPROVED,
-            memory__stale=False,
-            memory__refuted=False,
-            stale=False,
-            refuted=False,
-        )
-        authorized = []
-        allowed_team_ids = set(scope.team_ids)
-        for document in documents:
-            if document.visibility_scope == VisibilityScope.PROJECT:
-                authorized.append(document)
-            elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
-                authorized.append(document)
-
-        return tuple(authorized)
+        return authorized_retrieval_documents(organization, project, scope)
 
     def _rank_matches(
         self,
@@ -568,28 +708,7 @@ class BuildContextBundle:
         exact_matches: list[RetrievalMatch],
         query_vector: list[float],
     ) -> list[RetrievalMatch]:
-        already_matched = {match.document.id for match in exact_matches}
-        scored: list[tuple[float, RetrievalMatch]] = []
-        for document in documents:
-            if document.id in already_matched or not document.embedding_vector:
-                continue
-            similarity = cosine_similarity(query_vector, list(document.embedding_vector))
-            if similarity < SEMANTIC_MIN_SIMILARITY:
-                continue
-            scored.append(
-                (
-                    similarity,
-                    RetrievalMatch(
-                        document=document,
-                        score=30,
-                        matched_terms=(f'cosine {similarity:.2f}',),
-                        inclusion_reason=f'semantic match: cosine {similarity:.2f}',
-                    ),
-                ),
-            )
-        scored.sort(key=lambda item: -item[0])
-
-        return [match for _similarity, match in scored]
+        return semantic_retrieval_matches(documents, exact_matches, query_vector)
 
     def _resolve_query_embedding(
         self,
@@ -598,40 +717,16 @@ class BuildContextBundle:
         project: Project,
         team: Team | None,
     ) -> EmbeddingCallResult | None:
-        try:
-            resolved = ResolveModelPolicy().execute(
-                ResolveModelPolicyInput(
-                    organization_id=organization.id,
-                    project_id=project.id,
-                    team_id=team.id if team is not None else None,
-                    task_type='embedding',
-                ),
-            )
-            result = FakeProviderGateway().embed(
-                EmbeddingCallInput(
-                    organization_id=organization.id,
-                    project_id=project.id,
-                    team_id=team.id if team is not None else None,
-                    policy=resolved.policy,
-                    request_id=data.request_id,
-                    trace_id=data.trace_id or data.request_id,
-                    text='\n'.join([data.query, *data.file_paths, *data.symbols]),
-                ),
-            )
-        except ModelPolicyError:
-            return None
-        except ProviderSecretError as error:
-            logger.warning(
-                'context query embedding skipped: provider secret unavailable',
-                organization_id=str(organization.id),
-                project_id=str(project.id),
-                request_id=data.request_id,
-                error=str(error),
-            )
-
-            return None
-
-        return result
+        return resolve_query_embedding(
+            data.query,
+            data.file_paths,
+            data.symbols,
+            organization,
+            project,
+            team,
+            data.request_id,
+            data.trace_id or data.request_id,
+        )
 
     def _score_document(
         self,
@@ -639,54 +734,7 @@ class BuildContextBundle:
         data: ContextBundleInput,
         has_request_terms: bool,
     ) -> RetrievalMatch | None:
-        document_file_paths = tuple(str(value) for value in document.file_paths)
-        file_match = first_path_match(data.file_paths, document_file_paths)
-        if file_match:
-            return RetrievalMatch(
-                document=document,
-                score=100,
-                matched_terms=(file_match,),
-                inclusion_reason=f'exact match: {file_match}',
-            )
-
-        document_symbols = tuple(str(value) for value in document.symbols)
-        symbol_match = first_exact_match(data.symbols, document_symbols)
-        if symbol_match:
-            return RetrievalMatch(
-                document=document,
-                score=80,
-                matched_terms=(symbol_match,),
-                inclusion_reason=f'exact match: {symbol_match}',
-            )
-
-        query_terms = request_query_terms(data.query)
-        exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
-        if exact_match:
-            return RetrievalMatch(
-                document=document,
-                score=60,
-                matched_terms=(exact_match,),
-                inclusion_reason=f'exact match: {exact_match}',
-            )
-
-        full_text_match = first_full_text_match(query_terms, document.full_text)
-        if full_text_match:
-            return RetrievalMatch(
-                document=document,
-                score=40,
-                matched_terms=(full_text_match,),
-                inclusion_reason=f'full-text match: {full_text_match}',
-            )
-
-        if not has_request_terms:
-            return RetrievalMatch(
-                document=document,
-                score=1,
-                matched_terms=(),
-                inclusion_reason='filter-only authorized memory',
-            )
-
-        return None
+        return score_retrieval_document(document, data.query, data.file_paths, data.symbols, has_request_terms)
 
     def _create_items(
         self,
