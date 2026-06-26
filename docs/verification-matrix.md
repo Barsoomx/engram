@@ -1196,3 +1196,24 @@ First decisive failures fixed:
 Security evidence: replay of the same body reuses the latest version; concurrent
 updates serialize through `select_for_update` + the unique-version constraint;
 audit records the actor, capability, version, and redacted reason.
+
+## 2026-06-26: Memory Links
+
+Branch: `feat/memory-links` (off local master after merging versioning).
+
+Scope: `MemoryLink` model + migration `0005_memorylink`; `RecordMemoryLink`
+service; `MemoryLinksView` (GET list + POST create); serializers; tests;
+spec; security note. Adds `POST/GET /v1/memories/<id>/links` — authorized,
+replay-protected code/symbol/commit/issue links attached to an approved memory.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused links tests | `docker compose ... pytest engram/memory/memory_links_tests.py -v` | Backend | yes | pass | 6 passed: create+list, idempotency, capability denial, team-scope denial, oversized target, list project denial. |
+| full backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | 204 passed; migration `0005_memorylink` applied; ruff clean; 122 files formatted. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0; links endpoint not on golden path, no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean. |
+| focused security review | Self-review in `docs/security/reviews/2026-06-26-memory-links.md` | none | yes | pass | `SECURITY APPROVED`; reuses proven lock/scope/audit/redaction primitives. |
+
+Security evidence: replay of the same `(link_type, target)` reuses the link;
+team-visible memory outside scope denied; `target`/`label` redacted; audit
+records the actor, capability, memory id, and redacted target.
