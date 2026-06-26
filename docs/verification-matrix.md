@@ -1149,3 +1149,50 @@ uses hybrid retrieval identical to context. `_semantic_matches` and
 Security unchanged: the query-embedding provider call on the search path is
 authorized under the same scope, redacts the query text, and is made only when
 exact matches are below the requested limit.
+
+## 2026-06-26: Memory Versioning
+
+Branch: `feat/memory-versioning` (off local master after merging
+semantic-retrieval + memory-search).
+
+Scope:
+
+- `apps/backend/engram/memory/services.py` — `UpdateMemoryBody`,
+  `UpdateMemoryBodyInput`/`Result`, `MemoryVersionError`,
+  `memory_body_content_hash`, shared `lock_memory_for_update` /
+  `ensure_memory_team_scope` (extracted from `RecordMemoryFeedback`).
+- `apps/backend/engram/memory/views.py` — `MemoryVersionView`.
+- `apps/backend/engram/memory/serializers.py` — `MemoryVersionSerializer`.
+- `apps/backend/engram/memory/urls.py` — `/version` route.
+- `apps/backend/engram/memory/memory_versioning_tests.py`.
+- `docs/superpowers/specs/2026-06-26-memory-versioning-design.md`
+- `docs/security/reviews/2026-06-26-memory-versioning.md`
+
+Adds `POST /v1/memories/<id>/version`: an authorized, replay-protected body
+update that appends a `MemoryVersion`, bumps `current_version`, re-indexes the
+retrieval document, and audits `MemoryVersionCreated`. Advances the Memory
+Quality roadmap item.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED versioning tests | `docker compose ... pytest engram/memory/memory_versioning_tests.py -v` | Backend | yes | fixed | Initial run failed: `grant_review_capability` only added the key capability, but `developer` role lacks `memories:review`, so effective caps missed it. Fixed by granting the capability to the role too. |
+| feedback regression after extraction | `docker compose ... pytest engram/memory/memory_feedback_tests.py -v` | Backend | yes | pass | 9 passed after extracting shared lock/scope helpers. |
+| focused versioning tests | `docker compose ... pytest engram/memory/memory_versioning_tests.py -v` | Backend | yes | pass | 7 passed including new idempotency test. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | System check clean; ruff clean. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0; versioning endpoint not on the golden path, no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean. |
+| focused security + Karpathy review | Independent agents recorded in `docs/security/reviews/2026-06-26-memory-versioning.md` | none | yes | pass | Initial findings: idempotency gap (M1) + lock/scope duplication (K-1). Both fixed in `5e64cf39`. Re-`SECURITY APPROVED`. |
+
+First decisive failures fixed:
+
+- `developer` role lacked `memories:review`, so the first versioning test run
+  returned `missing_capability`. Granted the capability to the role and the key.
+- Initial ruff run flagged missing type annotations on `version_payload` and a
+  long serializer line; fixed inline.
+- Independent review found replay created a second version and that
+  `_lock_memory`/`_ensure_team_scope` were duplicated; fixed by content-based
+  idempotency plus shared helper extraction.
+
+Security evidence: replay of the same body reuses the latest version; concurrent
+updates serialize through `select_for_update` + the unique-version constraint;
+audit records the actor, capability, version, and redacted reason.
