@@ -5,7 +5,7 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
-from engram_cli.commands import run_connect, run_disconnect, run_doctor, run_hook
+from engram_cli.commands import run_connect, run_disconnect, run_doctor, run_hook, run_search
 from engram_cli.http import Transport
 
 
@@ -32,6 +32,8 @@ def main(
         return run_disconnect(args, output, errors)
     if args.command == 'hook':
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
+    if args.command == 'search':
+        return run_search(args, output, errors, transport)
 
     parser.print_help(file=errors)
 
@@ -68,5 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
         hook_command.add_argument('--agent', choices=('codex', 'claude-code', 'claude_code'))
         hook_command.add_argument('--config-dir')
         hook_command.add_argument('--response-format', choices=('server', 'codex', 'claude-code'), default='server')
+
+    search = subparsers.add_parser('search')
+    search.add_argument('--query', default='')
+    search.add_argument('--file-path', action='append', default=[])
+    search.add_argument('--symbol', action='append', default=[])
+    search.add_argument('--limit', type=int, default=5)
+    search.add_argument('--config-dir')
+    search.add_argument('--json', action='store_true', dest='as_json')
 
     return parser

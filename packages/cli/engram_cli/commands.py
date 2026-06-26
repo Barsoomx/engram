@@ -694,3 +694,60 @@ def redact_secret(value: str, secret: str) -> str:
         return value
 
     return value.replace(secret, '[REDACTED]')
+
+
+def run_search(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        paths = local_paths(args.config_dir)
+        config = load_required_json(paths.config, 'missing_config', 'Engram config is missing')
+        credentials = load_required_json(paths.credentials, 'missing_credential', 'Engram credential is missing')
+        api_key = as_string(credentials.get('api_key'))
+        if not api_key:
+            raise CliError('missing_credential', 'Engram credential is missing', remediation_for('missing_credential'))
+        server_url = normalize_server_url(as_string(config.get('server_url')))
+        payload = {
+            'project_id': as_string(config.get('project_id')),
+            'query': args.query or '',
+            'file_paths': list(args.file_path or []),
+            'symbols': list(args.symbol or []),
+            'limit': args.limit,
+        }
+        team_id = as_string(config.get('team_id'))
+        if team_id:
+            payload['team_id'] = team_id
+        active_transport = transport or urllib_transport
+        status, body = post_json(
+            transport=active_transport,
+            server_url=server_url,
+            path='/v1/search/',
+            api_key=api_key,
+            payload=payload,
+        )
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback='http_error')
+        items = body.get('items', [])
+        if getattr(args, 'as_json', False):
+            stdout.write(json.dumps(body, sort_keys=True) + '\n')
+
+            return 0
+
+        if not items:
+            stdout.write('No memory matched the search.\n')
+
+            return 0
+
+        for item in items:
+            stdout.write(f"{item.get('citation')}: {item.get('title')}\n")
+            stdout.write(f"  {item.get('body')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
