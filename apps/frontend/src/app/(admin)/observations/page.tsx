@@ -1,0 +1,119 @@
+'use client';
+
+import { useQuery } from '@tanstack/react-query';
+import * as React from 'react';
+
+import { apiClient } from '@/lib/auth';
+
+type ObservationItem = {
+  observation_id: string;
+  session_id: string | null;
+  observation_type: string;
+  title: string;
+  body: string;
+  files_read: string[] | null;
+  files_modified: string[] | null;
+  observed_at: string | null;
+};
+
+type ObservationsResponse = {
+  request_id: string;
+  items: ObservationItem[];
+};
+
+const PROJECT_ID = process.env.NEXT_PUBLIC_ENGRAM_PROJECT_ID ?? '';
+const TEAM_ID = process.env.NEXT_PUBLIC_ENGRAM_TEAM_ID ?? '';
+
+async function fetchObservations(): Promise<ObservationsResponse> {
+  const client = apiClient();
+  const params: Record<string, string> = { project_id: PROJECT_ID };
+
+  if (TEAM_ID) {
+    params.team_id = TEAM_ID;
+  }
+
+  const response = await client.get<ObservationsResponse>('/v1/observations/', { params });
+
+  return response.data;
+}
+
+function ObservationsTable({ items }: { items: ObservationItem[] }) {
+  return (
+    <div className='overflow-x-auto'>
+      <table className='w-full border-collapse text-left text-sm'>
+        <thead>
+          <tr className='border-b border-divider'>
+            <th className='py-2 px-3 text-default-500 font-medium'>Type</th>
+            <th className='py-2 px-3 text-default-500 font-medium'>Title</th>
+            <th className='py-2 px-3 text-default-500 font-medium'>Body</th>
+            <th className='py-2 px-3 text-default-500 font-medium'>Observed at</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((observation) => (
+            <tr key={observation.observation_id} className='border-b border-divider/50'>
+              <td className='py-2 px-3 font-mono text-xs text-default-700'>{observation.observation_type}</td>
+              <td className='py-2 px-3 text-foreground'>{observation.title || '(untitled)'}</td>
+              <td className='py-2 px-3 text-default-700 max-w-md truncate'>{observation.body}</td>
+              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+                {observation.observed_at ?? '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default function ObservationsPage() {
+  const query = useQuery<ObservationsResponse>({
+    queryKey: ['observations', PROJECT_ID, TEAM_ID],
+    enabled: Boolean(PROJECT_ID),
+    queryFn: fetchObservations,
+  });
+
+  if (!PROJECT_ID) {
+    return (
+      <section>
+        <h1 className='text-2xl font-semibold text-foreground'>Observations</h1>
+        <pre className='mt-4 text-sm text-default-500 bg-content2/50 rounded-medium p-3'>
+          NEXT_PUBLIC_ENGRAM_PROJECT_ID is not set.
+        </pre>
+      </section>
+    );
+  }
+
+  return (
+    <section className='space-y-4'>
+      <div>
+        <h1 className='text-2xl font-semibold text-foreground'>Observations</h1>
+        <p className='text-xs text-default-500 mt-1 font-mono'>
+          {process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000'}
+          /v1/observations/
+        </p>
+      </div>
+
+      {query.isLoading && <p className='text-default-500'>Loading observations...</p>}
+
+      {query.isError && (
+        <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
+          {query.error instanceof Error ? query.error.message : 'Failed to load observations.'}
+        </pre>
+      )}
+
+      {query.data && (
+        <>
+          <p className='text-sm text-default-500'>Items: {query.data.items.length}</p>
+          {query.data.items.length > 0 ? (
+            <div className='surface-card p-2'>
+              <ObservationsTable items={query.data.items} />
+            </div>
+          ) : (
+            <p className='text-default-500'>No observations found for this project.</p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
