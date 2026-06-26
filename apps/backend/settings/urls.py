@@ -1,4 +1,5 @@
 from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView
 
 from engram.context.views import TaskContextView
 from engram.core.observability.views import metrics
@@ -6,6 +7,7 @@ from engram.core.observability.views import metrics
 urlpatterns = [
     path('-/', include('engram.health.urls')),
     path('-/metrics', metrics, name='metrics'),
+    path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('v1/auth/', include('engram.access.auth_urls')),
     path('v1/admin/', include('engram.console.urls')),
     path('v1/context', TaskContextView.as_view(), name='context-task'),

@@ -123,6 +123,10 @@ class ApiKeyViewSet(
             event_type='ApiKeyRevoked',
             target_type='api_key',
             target_id=str(api_key.id),
+            metadata={
+                'name': api_key.name,
+                'key_prefix': api_key.key_prefix,
+            },
         )
 
         return Response(status=HTTP_200_OK)

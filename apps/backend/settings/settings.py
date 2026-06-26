@@ -144,6 +144,12 @@ REST_FRAMEWORK = {
     'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'Engram API',
+    'DESCRIPTION': 'Engineering memory layer for AI agents',
+    'VERSION': '1.0.0',
+}
+
 LOG_FORMATTER = os.environ.get('LOG_FORMATTER', 'console')
 LOGGING = {
     'version': 1,
