@@ -1259,3 +1259,40 @@ Accepted risks: MCP framing is newline-delimited JSON (matches the reference
 stdio transport); full Content-Length framing and additional tools (context,
 observe, memory version/link) are deferred. CLI commands assume the connected
 project/team from local config (no per-command override yet).
+
+## 2026-06-26: Real Provider Adapter + Memory Digest
+
+Branch: `feat/real-provider-adapter` (off local master).
+
+### Real Provider Adapter
+
+Adds `OpenAICompatibleGateway` (HTTP chat completions + embeddings via stdlib
+`urllib`) and a `get_provider_gateway()` factory. Any OpenAI-compatible endpoint
+works by setting `ModelPolicy.metadata['base_url']` (OpenAI, GLM/ZhipuAI at
+`https://open.bigmodel.cn/api/paas/v4`, OpenRouter, local). The API key comes
+only from the decrypted `ProviderSecretEnvelope`. `ENGRAM_PROVIDER_MODE=real`
+opts in; the default stays `FakeProviderGateway` so the deterministic offline
+suite is unchanged. All four production call sites now route through the factory.
+
+### Memory Digest (Daily Workflow foundation)
+
+`GenerateDigest` collects approved source memories, resolves a `digest` policy,
+generates a digest via the gateway, stores it as a `metadata.kind='digest'`
+memory + version + retrieval document, and audits `DigestGenerated`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused real-provider tests | `docker compose ... pytest engram/model_policy/real_provider_tests.py -v` | Backend | yes | pass | 7 passed: factory fake/real selection, missing-envelope, chat-completion parse, reuse-by-request_id, embeddings parse, HTTP-error translation. HTTP mocked (no network). |
+| focused digest tests | `docker compose ... pytest engram/memory/memory_digest_tests.py -v` | Backend | yes | pass | 4 passed including provider-failure graceful wrap. |
+| full backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | 220 passed; ruff clean; 131 files formatted. |
+| focused security review | Independent agent in `docs/security/reviews/2026-06-26-real-provider-adapter.md` | none | yes | pass | Initial `SECURITY CHANGES_REQUIRED` (I-1: digest call site lacked error handling); fixed in `8ef6065e`. Re-`SECURITY APPROVED`. |
+
+First decisive failures: factory tests lacked `@pytest.mark.django_db`; the
+HTTP-error test matched on the error code instead of the message; the digest
+provider-failure test initially disabled the secret (excluded from resolution by
+`secret__active=True`) and was switched to deleting the envelope so the policy
+still resolves and the provider call raises.
+
+Local e2e (not committed): `ENGRAM_PROVIDER_MODE=real` + a runtime-injected key
+into the encrypted envelope (GLM base_url via `metadata`). Recorded for when a
+local key is available; no key committed.

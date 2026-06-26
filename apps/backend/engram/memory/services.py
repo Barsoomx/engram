@@ -25,12 +25,12 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value as core_redact_value
 from engram.model_policy.services import (
-    FakeProviderGateway,
     ModelPolicyError,
     ProviderCallInput,
     ProviderSecretError,
     ResolveModelPolicy,
     ResolveModelPolicyInput,
+    get_provider_gateway,
 )
 
 
@@ -271,7 +271,7 @@ class ProcessObservationRecorded:
                     task_type='generation',
                 ),
             )
-            provider_result = FakeProviderGateway().call(
+            provider_result = get_provider_gateway(resolved.policy).call(
                 ProviderCallInput(
                     organization_id=observation.organization_id,
                     project_id=observation.project_id,
@@ -804,17 +804,20 @@ class GenerateDigest:
             ),
         )
         prompt = digest_prompt(sources)
-        provider_result = FakeProviderGateway().call(
-            ProviderCallInput(
-                organization_id=project.organization_id,
-                project_id=project.id,
-                team_id=None,
-                policy=resolved.policy,
-                request_id=data.request_id,
-                trace_id=data.request_id,
-                prompt=prompt,
-            ),
-        )
+        try:
+            provider_result = get_provider_gateway(resolved.policy).call(
+                ProviderCallInput(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    team_id=None,
+                    policy=resolved.policy,
+                    request_id=data.request_id,
+                    trace_id=data.request_id,
+                    prompt=prompt,
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError) as error:
+            raise MemoryWorkerError(f'digest provider unavailable: {error}') from error
         content_hash = digest_content_hash(project.id, data.memory_ids)
         with transaction.atomic():
             memory = Memory.objects.create(

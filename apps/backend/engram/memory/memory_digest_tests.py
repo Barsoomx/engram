@@ -110,3 +110,17 @@ def test_generate_digest_raises_for_missing_policy() -> None:
         GenerateDigest().execute(
             DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-no-policy'),
         )
+
+
+@pytest.mark.django_db
+def test_generate_digest_wraps_provider_failure_as_worker_error() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    policy = create_digest_policy(organization, team, project)
+    ProviderSecretEnvelope.objects.filter(secret=policy.secret).delete()
+    source = create_source_memory(organization, team, project, title='Source')
+
+    with pytest.raises(MemoryWorkerError, match='digest provider unavailable'):
+        GenerateDigest().execute(
+            DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-fail'),
+        )
+    assert Memory.objects.filter(metadata__kind='digest').count() == 0

@@ -29,11 +29,11 @@ from engram.core.redaction import redact_value
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,
-    FakeProviderGateway,
     ModelPolicyError,
     ProviderSecretError,
     ResolveModelPolicy,
     ResolveModelPolicyInput,
+    get_provider_gateway,
 )
 
 logger = structlog.get_logger(__name__)
@@ -345,7 +345,7 @@ def resolve_query_embedding(
                 task_type='embedding',
             ),
         )
-        result = FakeProviderGateway().embed(
+        result = get_provider_gateway(resolved.policy).embed(
             EmbeddingCallInput(
                 organization_id=organization.id,
                 project_id=project.id,
@@ -440,7 +440,7 @@ class IndexMemoryVersion:
                     task_type='embedding',
                 ),
             )
-            result = FakeProviderGateway().embed(
+            result = get_provider_gateway(resolved.policy).embed(
                 EmbeddingCallInput(
                     organization_id=memory.organization_id,
                     project_id=memory.project_id,
