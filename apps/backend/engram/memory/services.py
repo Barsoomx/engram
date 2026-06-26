@@ -15,6 +15,7 @@ from engram.core.models import (
     CandidateStatus,
     Memory,
     MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Observation,
@@ -639,6 +640,103 @@ class UpdateMemoryBody:
             metadata={
                 'version': version.version,
                 'reason': redact_text(data.reason),
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )
+
+
+@dataclass(frozen=True)
+class MemoryLinkInput:
+    raw_key: str
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    link_type: str
+    target: str
+    label: str
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class MemoryLinkResult:
+    memory: Memory
+    link: MemoryLink
+    created: bool
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'link_id': str(self.link.id),
+            'link_type': self.link.link_type,
+            'target': redact_text(self.link.target),
+            'label': redact_text(self.link.label),
+            'created': self.created,
+        }
+
+
+class RecordMemoryLink:
+    def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='memories:review',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='memory_link',
+            target_id=str(data.memory_id),
+        )
+        with transaction.atomic():
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            ensure_memory_team_scope(memory, scope)
+            link, created = MemoryLink.objects.get_or_create(
+                memory=memory,
+                link_type=data.link_type,
+                target=data.target,
+                defaults={
+                    'organization': memory.organization,
+                    'project': memory.project,
+                    'label': data.label,
+                },
+            )
+            if not created and data.label and link.label != data.label:
+                link.label = data.label
+                link.save(update_fields=['label', 'updated_at'])
+            self._audit(memory, link, scope, data, created)
+
+        return MemoryLinkResult(memory=memory, link=link, created=created)
+
+    def _audit(
+        self,
+        memory: Memory,
+        link: MemoryLink,
+        scope: EffectiveScope,
+        data: MemoryLinkInput,
+        created: bool,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryLinkRecorded',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory_link',
+            target_id=str(link.id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'memory_id': str(memory.id),
+                'link_type': link.link_type,
+                'created': created,
+                'target': redact_text(link.target),
                 'scope_filters': {
                     'organization_id': str(scope.organization_id),
                     'project_ids': [str(project_id) for project_id in scope.project_ids],
