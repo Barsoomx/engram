@@ -13,6 +13,7 @@ from engram_cli.commands import (
     run_memory_link,
     run_memory_links,
     run_memory_version,
+    run_observations,
     run_search,
 )
 from engram_cli.http import Transport
@@ -43,6 +44,8 @@ def main(
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
     if args.command == 'search':
         return run_search(args, output, errors, transport)
+    if args.command == 'observations':
+        return run_observations(args, output, errors, transport)
     if args.command == 'memory':
         if args.memory_command == 'version':
             return run_memory_version(args, output, errors, transport)
@@ -116,5 +119,9 @@ def build_parser() -> argparse.ArgumentParser:
     memory_links = memory_subparsers.add_parser('links')
     memory_links.add_argument('memory_id')
     memory_links.add_argument('--config-dir')
+
+    observations = subparsers.add_parser('observations')
+    observations.add_argument('--limit', type=int, default=20)
+    observations.add_argument('--config-dir')
 
     return parser

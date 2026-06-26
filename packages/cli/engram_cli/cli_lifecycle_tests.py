@@ -1282,5 +1282,33 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn('project_id=', call['url'])
             self.assertIn('file: apps/backend/engram/memory/services.py', stdout)
 
+    def test_observations_lists_recorded_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                'request_id': 'observations-1',
+                'items': [
+                    {
+                        'observation_type': 'tool_use',
+                        'title': 'Obs one',
+                        'body': 'Obs body one.',
+                    },
+                ],
+                'warnings': [],
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ['observations', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual('GET', call['method'])
+            self.assertIn('/v1/observations/', call['url'])
+            self.assertIn('project_id=', call['url'])
+            self.assertIn('Obs one', stdout)
+
 if __name__ == '__main__':
     unittest.main()
