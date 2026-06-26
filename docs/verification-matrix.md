@@ -1132,3 +1132,20 @@ First decisive failures fixed during the TDD loop:
 
 Accepted risks: search is exact-only (semantic recall deferred); no dedicated
 search audit event beyond `AccessScopeResolved`.
+
+### 2026-06-26: Memory Search Semantic Recall (extension)
+
+Stacked on `feat/memory-search-api`. Lifts the search-slice deferral: search now
+uses hybrid retrieval identical to context. `_semantic_matches` and
+`_resolve_query_embedding` were extracted to module functions
+(`semantic_retrieval_matches`, `resolve_query_embedding`) and reused by both
+`BuildContextBundle` and `SearchMemories`.
+
+| Check | Local command | Status | Notes |
+| --- | --- | --- | --- |
+| focused search + context tests | `docker compose ... pytest engram/search/search_api_tests.py engram/context/context_api_tests.py -v` | pass | 29 passed; new `test_search_returns_semantic_match_when_exact_misses` green; context semantic tests unchanged after extraction. |
+| full backend gate | `docker compose ... run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | pass | 191 passed; ruff clean; 119 files formatted. |
+
+Security unchanged: the query-embedding provider call on the search path is
+authorized under the same scope, redacts the query text, and is made only when
+exact matches are below the requested limit.
