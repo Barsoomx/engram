@@ -4,8 +4,13 @@ import uuid
 from typing import Any
 
 from django.contrib.auth.models import User
+from rest_framework.permissions import BasePermission
 
-from engram.access.auth_services import external_id_for_user
+from engram.access.auth_services import (
+    AuthError,
+    external_id_for_user,
+    resolve_user_scope_for_organization,
+)
 from engram.access.models import Identity, IdentityType, OrganizationMembership
 from engram.core.models import Organization
 
@@ -91,3 +96,31 @@ def _active_memberships_for_user(user: User) -> Any:
         identity_id__in=identity_ids,
         active=True,
     )
+
+
+class ActiveOrganizationPermission(BasePermission):
+    def has_permission(self, request: Any, view: Any) -> bool:
+        try:
+            organization = resolve_active_organization(request)
+        except (OrganizationRequiredError, OrganizationNotMemberError):
+            return False
+
+        identity = _user_identity_in_organization(request.user, organization)
+
+        if identity is None:
+            return False
+
+        request.active_organization = organization
+
+        request.user_identity = identity
+
+        try:
+            request.effective_scope = resolve_user_scope_for_organization(
+                request.user,
+                organization,
+            )
+        except AuthError:
+
+            return False
+
+        return True

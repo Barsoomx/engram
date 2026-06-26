@@ -192,6 +192,49 @@ def resolve_user_identity(user: User) -> Identity | None:
     )
 
 
+def resolve_user_identity_in_organization(
+    user: User,
+    organization: Organization,
+) -> Identity | None:
+    return Identity.objects.filter(
+        organization=organization,
+        identity_type=IdentityType.USER,
+        external_id=external_id_for_user(user),
+    ).first()
+
+
+def resolve_user_scope_for_organization(
+    user: User,
+    organization: Organization,
+) -> EffectiveScope:
+    identity = resolve_user_identity_in_organization(user, organization)
+
+    if identity is None:
+        raise AuthError('identity_missing', 'User identity is not linked')
+
+    if not OrganizationMembership.objects.filter(
+        organization=organization,
+        identity=identity,
+        active=True,
+    ).exists():
+        raise AuthError('membership_missing', 'User has no active membership in organization')
+
+    capabilities = _user_capability_codes(organization, identity)
+    project_ids = _user_project_ids(organization, identity, capabilities)
+    team_ids = _user_team_ids(organization, identity)
+
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=identity.id,
+        api_key_id=uuid.UUID(int=0),
+        project_ids=project_ids,
+        team_ids=team_ids,
+        capabilities=tuple(sorted(capabilities)),
+        actor_type='user',
+        actor_id=str(user.id),
+    )
+
+
 def _user_capability_codes(organization: Organization, identity: Identity) -> set[str]:
     role_ids = list(
         OrganizationMembership.objects.filter(
