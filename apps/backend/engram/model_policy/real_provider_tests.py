@@ -9,6 +9,7 @@ import pytest
 from engram.context.context_api_tests import create_project_scope
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
+    AnthropicMessagesGateway,
     EmbeddingCallInput,
     FakeProviderGateway,
     ModelPolicyError,
@@ -59,12 +60,13 @@ def make_real_policy(
     task_type: str = 'generation',
     base_url: str = 'https://provider.example/v1',
     raw_key: str = 'test-provider-key',
+    provider: str = 'openai',
 ) -> ModelPolicy:
     secret = ProviderSecret.objects.create(
         organization=organization,
         team=None,
         name='Org Provider',
-        provider='openai',
+        provider=provider,
         scope='organization',
         current_version=1,
     )
@@ -86,8 +88,8 @@ def make_real_policy(
         name='Real policy',
         scope='project',
         task_type=task_type,
-        provider='openai',
-        model='gpt-4o-mini',
+        provider=provider,
+        model='gpt-4o-mini' if provider == 'openai' else 'glm-4.7',
         secret=secret,
         version=1,
         metadata={'base_url': base_url},
@@ -246,5 +248,78 @@ def test_openai_compatible_gateway_translates_http_error() -> None:
                 request_id='real-call-error',
                 trace_id='real-call-error',
                 prompt='prompt',
+            ),
+        )
+
+
+@pytest.mark.django_db
+def test_factory_returns_anthropic_gateway_for_glm(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        provider='anthropic',
+        base_url='https://api.z.ai/api/anthropic',
+        raw_key='glm-key',
+    )
+    monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+
+    gateway = get_provider_gateway(policy)
+
+    assert isinstance(gateway, AnthropicMessagesGateway)
+    assert gateway._base_url == 'https://api.z.ai/api/anthropic'
+    assert gateway._api_key == 'glm-key'
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_call_parses_message() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    response = {'content': [{'type': 'text', 'text': 'Memory title\nBody line one\nBody line two'}]}
+    opener = _opener_returning(json.dumps(response).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-call-1',
+            trace_id='anthropic-call-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert result.generated_title == 'Memory title'
+    assert result.generated_body == 'Body line one\nBody line two'
+    assert result.model == 'glm-4.7'
+    record = ProviderCallRecord.objects.get(id=result.call_record_id)
+    assert record.metadata['transport'] == 'http-anthropic'
+    sent = json.loads(opener.requests[0].data)
+    assert sent['model'] == 'glm-4.7'
+    assert sent['messages'][0]['content'] == 'prompt text'
+    sent_headers = {key.lower(): value for key, value in opener.requests[0].headers.items()}
+    assert sent_headers.get('x-api-key') == 'key'
+    assert sent_headers.get('anthropic-version') == '2023-06-01'
+    assert opener.requests[0].full_url == 'https://api.z.ai/api/anthropic/v1/messages'
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_embed_is_unsupported() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding', provider='anthropic')
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key')
+
+    with pytest.raises(ModelPolicyError, match='do not expose embeddings'):
+        gateway.embed(
+            EmbeddingCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='anthropic-embed-1',
+                trace_id='anthropic-embed-1',
+                text='text',
             ),
         )
