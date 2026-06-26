@@ -1002,3 +1002,88 @@ the package outbox transport.
 | independent security review | Independent read-only security review and re-review recorded in `docs/security/reviews/2026-06-26-provider-memory-worker.md` | none | yes | pass | Initial review PASS; re-review after generated provider output PASS. Residual non-blocking hardening note: add DB uniqueness before real provider network side effects. |
 | Karpathy simplicity/scope review | Independent read-only Karpathy-style review agent plus re-review | none | yes | pass | Initial `CHANGES_REQUIRED`; fixed provider-generated title/body consumption and existing-candidate provenance update. Re-review `PASS_CODE`. |
 | final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Applied migrations, system check clean, 172 passed, Ruff clean, 111 files already formatted. |
+
+## 2026-06-26: Semantic Retrieval Foundation
+
+Branch: `feat/semantic-retrieval-foundation`
+
+Scope:
+
+- `apps/backend/engram/core/models.py` (`RetrievalDocument.embedding_vector`)
+- `apps/backend/engram/core/migrations/0004_retrievaldocument_embedding_vector.py`
+- `apps/backend/engram/model_policy/services.py` (`EMBEDDING_DIMENSION`,
+  `EmbeddingCallInput`, `EmbeddingCallResult`, `_embedding_grams`,
+  `generated_embedding`, `FakeProviderGateway.embed`)
+- `apps/backend/engram/context/services.py` (`SEMANTIC_MIN_SIMILARITY`,
+  `cosine_similarity`, `IndexMemoryVersion._embed_document`,
+  `BuildContextBundle._rank_matches`/`_semantic_matches`/
+  `_resolve_query_embedding`, `_audit_retrieval`)
+- `apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py`
+- `apps/backend/engram/core/core_models_tests.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `apps/backend/engram/context/context_api_tests.py`
+- `apps/backend/engram/core/golden_path_tests.py`
+- `docs/superpowers/specs/2026-06-26-semantic-retrieval-foundation-design.md`
+- `docs/superpowers/plans/2026-06-26-semantic-retrieval-foundation.md`
+- `docs/security/reviews/2026-06-26-semantic-retrieval-foundation.md`
+
+This checkpoint lifts the `claude-mem` parity-map semantic-retrieval deferral
+(the first exact CLI/hooks/API E2E loop is green) and adds the first working
+hybrid retrieval path: a deterministic character 3-gram embeddings provider
+adapter, embedding-vector persistence on `RetrievalDocument`, and a cosine
+semantic fallback inside `BuildContextBundle` that fires only when exact
+matching returns fewer items than the requested limit. Exact matching stays
+authoritative. It does not add pgvector, real OpenAI network calls, a new
+HTTP endpoint, prompt-submit injection, or backfill.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED model test | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py::test_retrieval_document_defaults_to_empty_embedding_vector -v` | Backend | yes | fixed | Exit 1 before the field existed; passed after `embedding_vector` JSONField + migration `0004`. |
+| focused RED embeddings adapter | `docker compose -f deploy/compose/docker-compose.yml run --rm --no-deps -e ENGRAM_DATABASE_URL=sqlite:///:memory: -v "$PWD/apps/backend:/srv/app" api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/model_policy/model_policy_tests.py -v"` | Backend | yes | fixed | Exit 1 before `FakeProviderGateway.embed`/`generated_embedding`; initial norm assertion (`round(norm,6)==1.0`) failed at `1.000001` and was relaxed to `pytest.approx(1.0, abs=1e-3)` because rounding each component to 6 decimals perturbs the norm slightly. |
+| focused RED indexer lifecycle | `docker compose ... pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | fixed | Exit 1 before `IndexMemoryVersion._embed_document`; the first semantic-fallback retrieval test then failed because `Memory` was created without `team` while the embeddings policy is team-scoped, so `ResolveModelPolicy(team_id=None)` filtered `team__isnull=True` and missed it. Added `team=team` to the test memories; vector then populated. |
+| focused RED retrieval fallback | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | fixed | Exit 1 before `_semantic_matches`/`_resolve_query_embedding`; body did not expose `metadata`, so assertions were switched to `ContextBundle.objects.get().metadata`. |
+| audit RED | `docker compose ... pytest engram/context/context_api_tests.py::test_context_bundle_returns_semantic_fallback_when_exact_misses -v` | Backend | yes | fixed | Exit 1 after independent review found `_audit_retrieval` hard-coded `retrieval_strategy: 'exact'` and dropped `semantic_provider_call_id`; commit `e48c07e1` threads `has_semantic`/`embedding_result` into the audit and adds a regression assertion. |
+| focused model-policy tests | `docker compose ... pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | pass | Exit 0. Reported 13 passed. |
+| focused memory worker tests | `docker compose ... pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | pass | Exit 0. Reported 26 passed including four embedding lifecycle tests. |
+| focused context API tests | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 22 passed including three semantic fallback tests. |
+| focused golden path tests | `docker compose ... pytest engram/core/golden_path_tests.py -v` | Backend | yes | pass | Exit 0. Reported 2 passed. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. System check clean; pytest reported 184 passed; Ruff `All checks passed!`; format reported 112 files already formatted. |
+| migration apply and freshness | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend | yes | pass | Exit 0. Applied through `core.0004_retrievaldocument_embedding_vector`; `No changes detected`. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Unchanged exact fixture stayed green: Compose started, host CLI connected, hook observation submitted, worker-created retrieval document observed, future session context returned, Compose stopped. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Exit 0. Repository unittest reported 31 OK; layout and quality scripts exited with no output; whitespace clean. |
+| focused security review | Independent read-only security review agent (opus) recorded in `docs/security/reviews/2026-06-26-semantic-retrieval-foundation.md` | none | yes | pass | Initial `SECURITY CHANGES_REQUIRED` (I-1 audit hard-code); fixed in `e48c07e1`. Re-review `SECURITY APPROVED`: no Critical/Important remain. |
+| Karpathy simplicity/scope review | Independent read-only Karpathy-style review agent (opus) | none | yes | pass | Initial `CHANGES_REQUIRED`; the substantive finding (audit hard-code) was the same as I-1 and is fixed. Duplication between `call`/`embed`, cosmetic `list(...)` conversions, and the split constants are accepted risks for the fake single-consumer gateway. |
+
+First decisive failures fixed during the TDD loop:
+
+- Embedding-vector model test failed before the field/migration existed.
+- Embeddings adapter norm assertion failed at `1.000001` due to 6-decimal
+  rounding; relaxed to `pytest.approx`.
+- Semantic-fallback retrieval test failed because the test `Memory` lacked a
+  team while the embeddings policy is team-scoped; `ResolveModelPolicy` then
+  found no policy and left `embedding_vector` empty. Fixed by binding the test
+  memory to the team.
+- Context API tests asserted on `body['metadata']`, which the response contract
+  does not expose; switched to `ContextBundle.objects.get().metadata`.
+- Independent review found `_audit_retrieval` hard-coded the retrieval strategy
+  and dropped the query-embedding provider call id; fixed in `e48c07e1`.
+
+Security evidence:
+
+- Embedding input is redacted before tokenization; token-shaped secrets cannot
+  reach the vector, the provider call record, or logs.
+- Semantic candidates come only from the authorized document set; no
+  cross-organization/project/team document can enter via the semantic path.
+- Query embedding is computed only when exact matches are below the requested
+  limit; no eager provider call on the hot path.
+- Missing embeddings policy degrades silently to exact-only; a disabled
+  embeddings secret skips embedding with a structured warning log.
+- The `MemoryRetrieved` audit records the real `retrieval_strategy` plus
+  `semantic_provider_call_id` and `semantic_document_ids` when the fallback
+  activates.
+
+Accepted risks: deterministic character 3-gram embeddings are an interface-only
+stand-in for real OpenAI embeddings; `JSONField` vector storage without
+dimension validation while there is one producer at dimension 64; gateway
+record-creation duplication deferred to the real-adapter slice.
