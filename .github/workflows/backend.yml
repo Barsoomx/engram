@@ -76,6 +76,9 @@ jobs:
       - name: Run CLI tests
         run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v
 
+      - name: Run MCP tests
+        run: PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v
+
       - name: Check repository layout
         run: python3 scripts/repository_layout.py
 
