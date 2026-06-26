@@ -5,6 +5,8 @@ import {
   Activity,
   ClipboardList,
   Database,
+  FolderTree,
+  Key,
   LayoutDashboard,
   LogOut,
   ScrollText,
@@ -26,6 +28,8 @@ const NAV_ITEMS: SidebarNavItem[] = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/memories', label: 'Memories', icon: Database },
   { href: '/observations', label: 'Observations', icon: ScrollText },
+  { href: '/api-keys', label: 'API Keys', icon: Key },
+  { href: '/projects', label: 'Projects', icon: FolderTree },
   { href: '/audit', label: 'Audit', icon: ClipboardList },
   { href: '/health', label: 'Health', icon: Activity },
 ];
