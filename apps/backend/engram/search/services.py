@@ -3,14 +3,16 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from engram.access.services import ResolveApiKeyScope
+from engram.access.services import EffectiveScope, ResolveApiKeyScope
 from engram.context.services import (
     RetrievalMatch,
     authorized_retrieval_documents,
     redact_text,
+    resolve_query_embedding,
     score_retrieval_document,
+    semantic_retrieval_matches,
 )
-from engram.core.models import Organization, Project
+from engram.core.models import Organization, Project, Team
 
 
 @dataclass(frozen=True)
@@ -88,5 +90,30 @@ class SearchMemories:
                 str(match.document.id),
             ),
         )
+        if len(matches) >= data.limit:
+            return SearchResult(matches=tuple(matches[: data.limit]))
+
+        embedding_result = resolve_query_embedding(
+            data.query,
+            data.file_paths,
+            data.symbols,
+            organization,
+            project,
+            self._resolve_team(data, scope),
+            data.request_id,
+            data.request_id,
+        )
+        if embedding_result is not None:
+            query_vector = list(embedding_result.embedding)
+            matches = list(matches) + semantic_retrieval_matches(documents, matches, query_vector)
 
         return SearchResult(matches=tuple(matches[: data.limit]))
+
+    def _resolve_team(self, data: SearchInput, scope: EffectiveScope) -> Team | None:
+        selected_team_id = data.team_id
+        if selected_team_id is None and len(scope.team_ids) == 1:
+            selected_team_id = scope.team_ids[0]
+        if selected_team_id is None:
+            return None
+
+        return Team.objects.get(organization_id=scope.organization_id, id=selected_team_id)

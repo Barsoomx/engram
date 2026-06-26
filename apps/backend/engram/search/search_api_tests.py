@@ -9,10 +9,12 @@ from engram.context.context_api_tests import (
     RAW_KEY,
     auth_headers,
     create_approved_memory_document,
+    create_embedding_policy,
     create_project_scope,
     create_scoped_api_key,
 )
-from engram.core.models import Project, Team, VisibilityScope
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
+from engram.core.models import Memory, MemoryStatus, MemoryVersion, Project, Team, VisibilityScope
 
 
 def search_payload(project: Project, **overrides: object) -> dict[str, object]:
@@ -161,3 +163,42 @@ def test_search_requires_bearer_api_key() -> None:
 
     assert response.status_code == 401
     assert response.json()['code'] == 'missing_api_key'
+
+
+@pytest.mark.django_db
+def test_search_returns_semantic_match_when_exact_misses() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    create_embedding_policy(organization, team, project)
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='search-semantic-1',
+    )
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, query='color behavior optimization', file_paths=[], symbols=[]),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body['items']) == 1
+    assert body['items'][0]['inclusion_reason'].startswith('semantic match: cosine')
+    assert body['items'][0]['memory_id'] == str(memory.id)
