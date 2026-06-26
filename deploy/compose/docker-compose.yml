@@ -94,6 +94,18 @@ services:
     command: >
       sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-domain-events"
 
+  beat:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app beat --loglevel=info"
+
   relay:
     <<: *backend
     depends_on:

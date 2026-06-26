@@ -174,4 +174,4 @@ def test_middleware_falls_back_to_path_when_resolver_match_missing() -> None:
 
     middleware(_StubRequest())
 
-    assert http_requests_total.value(view='/v1/context', status='5xx') == 1.0
+    assert http_requests_total.value(view='unresolved', status='5xx') == 1.0
