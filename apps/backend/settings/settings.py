@@ -65,6 +65,8 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'rest_framework',
     'rest_framework.authtoken',
+    'django_filters',
+    'drf_spectacular',
     'django_structlog',
     'django_celery_outbox',
     'engram.core',
@@ -78,6 +80,7 @@ INSTALLED_APPS = [
     'engram.model_policy',
     'engram.search',
     'engram.health',
+    'engram.console',
 ]
 
 MIDDLEWARE = [
@@ -133,6 +136,12 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
+    'DEFAULT_FILTER_BACKENDS': [
+        'django_filters.rest_framework.DjangoFilterBackend',
+    ],
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 20,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 LOG_FORMATTER = os.environ.get('LOG_FORMATTER', 'console')
