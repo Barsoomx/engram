@@ -58,6 +58,30 @@ def list_tools() -> list[dict[str, object]]:
                 'required': ['memory_id', 'link_type', 'target'],
             },
         },
+        {
+            'name': 'engram_observations',
+            'description': 'List recent Engram observations for the connected project.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'limit': {'type': 'integer'},
+                },
+                'required': [],
+            },
+        },
+        {
+            'name': 'engram_memory_version',
+            'description': 'Update an approved memory body, creating a new reviewed version.',
+            'inputSchema': {
+                'type': 'object',
+                'properties': {
+                    'memory_id': {'type': 'string'},
+                    'body': {'type': 'string'},
+                    'reason': {'type': 'string'},
+                },
+                'required': ['memory_id', 'body'],
+            },
+        },
     ]
 
 

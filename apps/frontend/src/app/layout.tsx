@@ -22,6 +22,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <nav style={{ display: 'flex', gap: '1rem' }}>
             <a href='/'>Home</a>
             <a href='/health'>Health</a>
+            <a href='/memories'>Memories</a>
           </nav>
         </header>
         <main style={{ padding: '1rem', fontFamily: 'sans-serif' }}>

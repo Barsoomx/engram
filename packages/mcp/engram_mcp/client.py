@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -27,6 +28,28 @@ def _server_call(path: str, payload: dict[str, Any], method: str = 'POST') -> di
         data=body,
         headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
         method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except Exception as error:
+        return f'Engram call failed: {error}'
+
+
+def _server_get(path: str, params: dict[str, Any]) -> dict[str, Any] | str:
+    server_url = os.environ.get('ENGRAM_SERVER_URL', '').rstrip('/')
+    api_key = os.environ.get('ENGRAM_API_KEY', '')
+    project_id = os.environ.get('ENGRAM_PROJECT_ID', '')
+    if not server_url or not api_key or not project_id:
+
+        return _missing_config_message()
+
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v != ''})
+    url = f'{server_url}{path}?{query}' if query else f'{server_url}{path}'
+    request = urllib.request.Request(
+        url,
+        headers={'Authorization': f'Bearer {api_key}'},
+        method='GET',
     )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
@@ -128,4 +151,59 @@ def create_memory_link(arguments: dict[str, Any]) -> str:
     return (
         f"link_id={data.get('link_id')} link_type={data.get('link_type')} "
         f"target={data.get('target')} created={data.get('created')}"
+    )
+
+
+def list_observations(arguments: dict[str, Any]) -> str:
+    params: dict[str, Any] = {
+        'project_id': os.environ.get('ENGRAM_PROJECT_ID', ''),
+        'limit': arguments.get('limit', 10),
+    }
+    team_id = os.environ.get('ENGRAM_TEAM_ID', '')
+    if team_id:
+        params['team_id'] = team_id
+
+    data = _server_get('/v1/observations/', params)
+    if isinstance(data, str):
+
+        return data
+
+    items = data.get('items', [])
+    if not items:
+
+        return 'No observations found.'
+
+    lines = []
+    for item in items:
+        lines.append(f"[{item.get('observation_type')}] {item.get('title')}")
+        body = item.get('body') or ''
+        if body:
+            lines.append(f"  {body}")
+
+    return '\n'.join(lines)
+
+
+def update_memory_version(arguments: dict[str, Any]) -> str:
+    memory_id = arguments.get('memory_id', '')
+    body = arguments.get('body', '')
+    if not memory_id or not body:
+
+        return 'engram_memory_version requires memory_id and body.'
+
+    payload = _base_payload(arguments)
+    payload.update(
+        {
+            'body': body,
+            'reason': arguments.get('reason', ''),
+            'request_id': arguments.get('request_id', f'mcp-version-{memory_id}'),
+        },
+    )
+    data = _server_call(f'/v1/memories/{memory_id}/version', payload)
+    if isinstance(data, str):
+
+        return data
+
+    return (
+        f"memory_id={data.get('memory_id') or memory_id} "
+        f"version={data.get('version')} reason={data.get('reason')}"
     )
