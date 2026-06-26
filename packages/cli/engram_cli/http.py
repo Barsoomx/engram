@@ -4,6 +4,7 @@ import json
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from urllib.parse import urlencode
 
 
 Transport = Callable[
@@ -104,3 +105,25 @@ def get_health(
     timeout: float = 2.0,
 ) -> tuple[int, dict[str, object]]:
     return transport('GET', f'{server_url}/-/healthz/', {}, None, timeout)
+
+
+def get_json(
+    *,
+    transport: Transport,
+    server_url: str,
+    path: str,
+    api_key: str,
+    params: dict[str, str] | None = None,
+    timeout: float = 2.0,
+) -> tuple[int, dict[str, object]]:
+    query = ''
+    if params:
+        query = '?' + urlencode(params)
+
+    return transport(
+        'GET',
+        f'{server_url}{path}{query}',
+        {'Authorization': f'Bearer {api_key}'},
+        None,
+        timeout,
+    )

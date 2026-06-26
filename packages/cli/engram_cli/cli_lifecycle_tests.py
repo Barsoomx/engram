@@ -1121,8 +1121,6 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn('missing_project', stderr)
 
 
-if __name__ == '__main__':
-    unittest.main()
 
     def test_search_posts_query_and_prints_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1191,3 +1189,98 @@ if __name__ == '__main__':
 
             self.assertEqual(0, exit_code, stderr)
             self.assertIn('No memory matched', stdout)
+
+    def test_memory_version_posts_body_and_prints_version(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                'memory_id': 'mem-1',
+                'project_id': PROJECT_ID,
+                'team_id': TEAM_ID,
+                'current_version': 2,
+                'memory_version_id': 'ver-2',
+                'retrieval_document_id': 'doc-2',
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ['memory', 'version', 'mem-1', '--body', 'Updated body', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(1, len(transport.calls))
+            call = transport.calls[0]
+            self.assertEqual('https://engram.example/v1/memories/mem-1/version', call['url'])
+            self.assertEqual('Updated body', call['payload']['body'])
+            self.assertEqual(PROJECT_ID, call['payload']['project_id'])
+            self.assertIn('current_version=2', stdout)
+            self.assertNotIn(RAW_KEY, stdout)
+
+    def test_memory_link_posts_link_and_prints_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                'memory_id': 'mem-1',
+                'link_id': 'link-1',
+                'link_type': 'file',
+                'target': 'apps/backend/engram/memory/services.py',
+                'label': 'service',
+                'created': True,
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    'memory',
+                    'link',
+                    'mem-1',
+                    '--link-type',
+                    'file',
+                    '--target',
+                    'apps/backend/engram/memory/services.py',
+                    '--label',
+                    'service',
+                    '--config-dir',
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual('https://engram.example/v1/memories/mem-1/links', call['url'])
+            self.assertEqual('file', call['payload']['link_type'])
+            self.assertIn('link_id=link-1', stdout)
+            self.assertIn('apps/backend/engram/memory/services.py', stdout)
+
+    def test_memory_links_lists_recorded_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                'items': [
+                    {
+                        'link_id': 'link-1',
+                        'link_type': 'file',
+                        'target': 'apps/backend/engram/memory/services.py',
+                        'label': '',
+                        'created_at': '2026-06-26T00:00:00Z',
+                    },
+                ],
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ['memory', 'links', 'mem-1', '--config-dir', str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual('GET', call['method'])
+            self.assertIn('/v1/memories/mem-1/links', call['url'])
+            self.assertIn('project_id=', call['url'])
+            self.assertIn('file: apps/backend/engram/memory/services.py', stdout)
+
+if __name__ == '__main__':
+    unittest.main()
