@@ -150,6 +150,21 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
                 'active': True,
             },
         )
+        embedding_policy, _created = ModelPolicy.objects.update_or_create(
+            organization=organization,
+            team=team,
+            project=project,
+            task_type='embedding',
+            scope='project',
+            defaults={
+                'name': 'Golden path embeddings',
+                'provider': 'openai',
+                'model': 'text-embedding-3-small',
+                'secret': provider_secret,
+                'version': 1,
+                'active': True,
+            },
+        )
 
         return {
             'organization_id': str(organization.id),
@@ -161,4 +176,5 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
             'capabilities': list(GOLDEN_PATH_CAPABILITIES),
             'provider_secret_id': str(provider_secret.id),
             'generation_policy_id': str(generation_policy.id),
+            'embedding_policy_id': str(embedding_policy.id),
         }
