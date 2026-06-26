@@ -926,6 +926,10 @@ def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
     assert len(items) == 1
     assert items[0]['inclusion_reason'].startswith('semantic match: cosine')
     assert bundle.metadata['semantic_provider_call_id']
+    audit = AuditEvent.objects.get(event_type='MemoryRetrieved', target_id=str(bundle.id))
+    assert audit.metadata['retrieval_strategy'] == 'semantic_fallback'
+    assert audit.metadata['semantic_provider_call_id'] == bundle.metadata['semantic_provider_call_id']
+    assert audit.metadata['semantic_document_ids'] == [items[0]['retrieval_document_id']]
 
 
 @pytest.mark.django_db

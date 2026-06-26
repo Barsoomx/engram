@@ -366,7 +366,7 @@ class BuildContextBundle:
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
-            self._audit_retrieval(bundle, persisted_matches, scope, data)
+            self._audit_retrieval(bundle, persisted_matches, scope, data, has_semantic, embedding_result)
 
         bundle = ContextBundle.objects.prefetch_related(
             'items__retrieval_document__memory',
@@ -743,7 +743,24 @@ class BuildContextBundle:
         matches: tuple[RetrievalMatch, ...],
         scope: EffectiveScope,
         data: ContextBundleInput,
+        has_semantic: bool,
+        embedding_result: EmbeddingCallResult | None,
     ) -> None:
+        metadata = {
+            'selected_count': len(matches),
+            'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact',
+            'scope_filters': {
+                'organization_id': str(scope.organization_id),
+                'project_ids': [str(project_id) for project_id in scope.project_ids],
+                'team_ids': [str(team_id) for team_id in scope.team_ids],
+            },
+            'memory_ids': [str(match.document.memory_id) for match in matches],
+            'retrieval_document_ids': [str(match.document.id) for match in matches],
+        }
+        if has_semantic and embedding_result is not None:
+            metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
+            metadata['semantic_document_ids'] = [str(match.document.id) for match in matches if match.score == 30]
+
         AuditEvent.objects.create(
             organization=bundle.organization,
             project=bundle.project,
@@ -757,17 +774,7 @@ class BuildContextBundle:
             result=AuditResult.ALLOWED,
             request_id=data.request_id,
             correlation_id=data.correlation_id,
-            metadata={
-                'selected_count': len(matches),
-                'retrieval_strategy': 'exact',
-                'scope_filters': {
-                    'organization_id': str(scope.organization_id),
-                    'project_ids': [str(project_id) for project_id in scope.project_ids],
-                    'team_ids': [str(team_id) for team_id in scope.team_ids],
-                },
-                'memory_ids': [str(match.document.memory_id) for match in matches],
-                'retrieval_document_ids': [str(match.document.id) for match in matches],
-            },
+            metadata=metadata,
         )
 
 
