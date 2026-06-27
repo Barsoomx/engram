@@ -116,6 +116,65 @@ export async function archiveTeam(id: string): Promise<void> {
   await client.delete(`/v1/admin/teams/${id}/`);
 }
 
+export type Project = {
+  id: string;
+  name: string;
+  slug: string;
+  organization: string;
+  repository_url: string;
+  default_branch: string;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type ProjectWriteInput = {
+  name: string;
+  slug: string;
+  repository_url: string;
+  default_branch: string;
+};
+
+export async function listProjects(
+  params?: ListParams,
+): Promise<Paginated<Project>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<Project>>(
+    '/v1/admin/projects/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function createProject(
+  input: ProjectWriteInput,
+): Promise<Project> {
+  const client = apiClient();
+  const response = await client.post<Project>('/v1/admin/projects/', input);
+
+  return response.data;
+}
+
+export async function updateProject(
+  id: string,
+  input: ProjectWriteInput,
+): Promise<Project> {
+  const client = apiClient();
+  const response = await client.patch<Project>(
+    `/v1/admin/projects/${id}/`,
+    input,
+  );
+
+  return response.data;
+}
+
+export async function archiveProject(id: string): Promise<void> {
+  const client = apiClient();
+
+  await client.delete(`/v1/admin/projects/${id}/`);
+}
+
 export async function listApiKeys(
   params?: ListParams,
 ): Promise<Paginated<ApiKey>> {
