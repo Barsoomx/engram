@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
+import uuid
 from collections.abc import Iterable
 from typing import Any
 
@@ -22,7 +24,20 @@ from engram.access.services import (
     hash_api_key,
 )
 from engram.console.exceptions import LastOwnerError
-from engram.core.models import AuditEvent, AuditResult, Organization, Project, Team
+from engram.core.models import (
+    AuditEvent,
+    AuditResult,
+    CandidateStatus,
+    LinkType,
+    Memory,
+    MemoryCandidate,
+    MemoryLink,
+    MemoryStatus,
+    MemoryVersion,
+    Organization,
+    Project,
+    Team,
+)
 
 OWNER_ROLE_CODE = 'organization_owner'
 
@@ -255,3 +270,339 @@ def revoke_api_key(api_key: ApiKey) -> ApiKey:
     api_key.save(update_fields=['revoked_at', 'updated_at'])
 
     return api_key
+
+
+REVIEW_LOW_CONFIDENCE_THRESHOLD = '0.300'
+
+
+class MemoryReviewError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400) -> None:
+        super().__init__(message)
+
+        self.code = code
+
+        self.status = status
+
+
+def get_review_candidate_or_404(
+    organization: Organization,
+    item_id: uuid.UUID,
+) -> MemoryCandidate:
+    candidate = MemoryCandidate.objects.filter(
+        organization=organization,
+        id=item_id,
+    ).first()
+
+    if candidate is None:
+        raise MemoryReviewError('not_found', 'review item not found', status=404)
+
+    return candidate
+
+
+def get_review_memory_or_404(
+    organization: Organization,
+    memory_id: uuid.UUID,
+) -> Memory:
+    memory = Memory.objects.filter(organization=organization, id=memory_id).first()
+
+    if memory is None:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    return memory
+
+
+@transaction.atomic
+def approve_memory_candidate(
+    organization: Organization,
+    actor_identity: Identity,
+    candidate: MemoryCandidate,
+    reason: str,
+) -> Memory:
+    if candidate.organization_id != organization.id:
+        raise MemoryReviewError('not_found', 'candidate not found', status=404)
+
+    if candidate.status != CandidateStatus.PROPOSED:
+        raise MemoryReviewError(
+            'invalid_state',
+            'only proposed candidates can be approved',
+        )
+
+    memory = Memory.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        title=candidate.title,
+        body=candidate.body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=candidate.visibility_scope,
+        confidence=candidate.confidence,
+        metadata={
+            'source': 'memory_candidate',
+            'memory_candidate_id': str(candidate.id),
+            'evidence': candidate.evidence,
+        },
+    )
+
+    MemoryVersion.objects.create(
+        organization=memory.organization,
+        project=memory.project,
+        memory=memory,
+        version=1,
+        body=candidate.body,
+        content_hash=candidate.content_hash,
+        source_observation=candidate.source_observation,
+    )
+
+    candidate.status = CandidateStatus.PROMOTED
+
+    candidate.promoted_memory = memory
+
+    candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory_candidate',
+        target_id=str(candidate.id),
+        metadata={'action': 'approve', 'reason': reason},
+    )
+
+    return memory
+
+
+@transaction.atomic
+def edit_memory_body(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    body: str,
+    reason: str,
+) -> MemoryVersion:
+    if memory.organization_id != organization.id:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    next_version = memory.current_version + 1
+
+    version = MemoryVersion.objects.create(
+        organization=memory.organization,
+        project=memory.project,
+        memory=memory,
+        version=next_version,
+        body=body,
+        content_hash=_memory_body_hash(memory.id, next_version, body),
+    )
+
+    memory.body = body
+
+    memory.current_version = next_version
+
+    memory.save(update_fields=['body', 'current_version', 'updated_at'])
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory',
+        target_id=str(memory.id),
+        metadata={'action': 'edit', 'reason': reason, 'version': next_version},
+    )
+
+    return version
+
+
+@transaction.atomic
+def narrow_memory(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    target_memory_id: uuid.UUID,
+    reason: str,
+) -> MemoryLink:
+    return _record_memory_link(
+        organization=organization,
+        actor_identity=actor_identity,
+        memory=memory,
+        link_type=LinkType.NARROWED_BY,
+        target_id=target_memory_id,
+        action='narrow',
+        reason=reason,
+    )
+
+
+@transaction.atomic
+def supersede_memory(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    target_memory_id: uuid.UUID,
+    reason: str,
+) -> MemoryLink:
+    if memory.organization_id != organization.id:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    memory.stale = True
+
+    memory.save(update_fields=['stale', 'updated_at'])
+
+    return _record_memory_link(
+        organization=organization,
+        actor_identity=actor_identity,
+        memory=memory,
+        link_type=LinkType.SUPERSEDED_BY,
+        target_id=target_memory_id,
+        action='supersede',
+        reason=reason,
+    )
+
+
+def _record_memory_link(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    link_type: str,
+    target_id: uuid.UUID,
+    action: str,
+    reason: str,
+) -> MemoryLink:
+    if memory.organization_id != organization.id:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    target = str(target_id)
+
+    link, _created = MemoryLink.objects.get_or_create(
+        memory=memory,
+        link_type=link_type,
+        target=target,
+        defaults={
+            'organization': memory.organization,
+            'project': memory.project,
+            'label': '',
+        },
+    )
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory',
+        target_id=str(memory.id),
+        metadata={
+            'action': action,
+            'reason': reason,
+            'link_id': str(link.id),
+            'target_memory_id': target,
+        },
+    )
+
+    return link
+
+
+@transaction.atomic
+def reject_review_item(
+    organization: Organization,
+    actor_identity: Identity,
+    item: MemoryCandidate | Memory,
+    reason: str,
+) -> None:
+    if isinstance(item, MemoryCandidate):
+        if item.organization_id != organization.id:
+            raise MemoryReviewError('not_found', 'candidate not found', status=404)
+
+        if item.status == CandidateStatus.REJECTED:
+            return
+
+        item.status = CandidateStatus.REJECTED
+
+        item.save(update_fields=['status', 'updated_at'])
+
+        target_type = 'memory_candidate'
+
+    else:
+        if item.organization_id != organization.id:
+            raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+        if item.status == MemoryStatus.REFUTED:
+            return
+
+        item.status = MemoryStatus.REFUTED
+
+        item.save(update_fields=['status', 'updated_at'])
+
+        target_type = 'memory'
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type=target_type,
+        target_id=str(item.id),
+        metadata={'action': 'reject', 'reason': reason},
+    )
+
+
+@transaction.atomic
+def archive_memory(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    reason: str,
+) -> Memory:
+    if memory.organization_id != organization.id:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    if memory.status == MemoryStatus.ARCHIVED:
+        return memory
+
+    memory.status = MemoryStatus.ARCHIVED
+
+    memory.save(update_fields=['status', 'updated_at'])
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory',
+        target_id=str(memory.id),
+        metadata={'action': 'archive', 'reason': reason},
+    )
+
+    return memory
+
+
+@transaction.atomic
+def bulk_archive_memories(
+    organization: Organization,
+    actor_identity: Identity,
+    reason: str,
+    *,
+    ids: list[uuid.UUID] | None = None,
+    confidence_lte: str | None = None,
+) -> list[uuid.UUID]:
+    archived_ids: list[uuid.UUID] = []
+
+    if ids is not None:
+        memories = list(
+            Memory.objects.filter(organization=organization, id__in=ids),
+        )
+
+    else:
+        memories = list(
+            Memory.objects.filter(
+                organization=organization,
+                confidence__lte=confidence_lte,
+            ).exclude(status=MemoryStatus.ARCHIVED),
+        )
+
+    for memory in memories:
+        archive_memory(organization, actor_identity, memory, reason)
+
+        archived_ids.append(memory.id)
+
+    return archived_ids
+
+
+def _memory_body_hash(memory_id: uuid.UUID, version: int, body: str) -> str:
+    source = f'{memory_id}:{version}:{body}'
+
+    return hashlib.sha256(source.encode()).hexdigest()
