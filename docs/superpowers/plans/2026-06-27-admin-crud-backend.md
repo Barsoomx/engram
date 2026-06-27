@@ -14,7 +14,7 @@
 - Org switcher transport = `X-Engram-Organization` header.
 - Organizations: read + update only in Phase A (no create/delete; tenant provisioning is Phase C).
 - Roles: read + assign only (built-in presets); custom roles are "Later".
-- References: altyn-backend (backend patterns), asgard-admin (frontend patterns). Local Engram docs may be unreliable.
+- References: *****-backend (backend patterns), asgard-admin (frontend patterns). Local Engram docs may be unreliable.
 
 **Reference design:** `docs/superpowers/specs/2026-06-26-admin-crud-backend-design.md`
 
