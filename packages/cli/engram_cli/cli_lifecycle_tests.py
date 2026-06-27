@@ -1814,5 +1814,286 @@ class WizardTests(unittest.TestCase):
             self.assertEqual([], transport.calls)
 
 
+class McpInstallTests(unittest.TestCase):
+    def run_cli(
+        self,
+        argv: list[str],
+        transport: FakeTransport,
+    ) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        exit_code = main.main(
+            argv, stdin=None, stdout=stdout, stderr=stderr, transport=transport
+        )
+
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def connect(self, config_dir: Path) -> None:
+        transport = FakeTransport(
+            [(200, dry_run_ok()), (200, dry_run_ok())]
+        )
+        exit_code, _stdout, stderr = self.run_cli(
+            [
+                "connect",
+                "--server",
+                "https://engram.example/",
+                "--api-key",
+                RAW_KEY,
+                "--project",
+                PROJECT_ID,
+                "--team",
+                TEAM_ID,
+                "--config-dir",
+                str(config_dir),
+            ],
+            transport,
+        )
+        self.assertEqual(0, exit_code, stderr)
+
+    def test_mcp_install_default_writes_engram_entry_to_claude_code_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(claude_code_config.exists())
+            data = read_json(claude_code_config)
+            servers = data["mcpServers"]
+            self.assertIn("engram", servers)
+            entry = servers["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(["-m", "engram_mcp"], entry["args"])
+            env = entry["env"]
+            self.assertEqual("https://engram.example", env["ENGRAM_SERVER_URL"])
+            self.assertEqual(RAW_KEY, env["ENGRAM_API_KEY"])
+            self.assertEqual(PROJECT_ID, env["ENGRAM_PROJECT_ID"])
+            self.assertIn("engram", stdout)
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_mcp_install_creates_file_with_mcp_servers_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertIn("mcpServers", data)
+            self.assertIn("engram", data["mcpServers"])
+
+    def test_mcp_install_merges_engram_entry_without_duplicating_or_dropping_existing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+            claude_code_config.parent.mkdir(parents=True, exist_ok=True)
+            existing = {
+                "mcpServers": {
+                    "other": {
+                        "command": "node",
+                        "args": ["other.js"],
+                    },
+                    "engram": {
+                        "command": "stale",
+                        "args": ["old"],
+                        "env": {"ENGRAM_API_KEY": "old-key"},
+                    },
+                },
+                "theme": "dark",
+            }
+            claude_code_config.write_text(
+                json.dumps(existing), encoding="utf-8"
+            )
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertEqual("dark", data["theme"])
+            servers = data["mcpServers"]
+            self.assertIn("other", servers)
+            self.assertEqual("node", servers["other"]["command"])
+            self.assertIn("engram", servers)
+            entry = servers["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(["-m", "engram_mcp"], entry["args"])
+            self.assertEqual(RAW_KEY, entry["env"]["ENGRAM_API_KEY"])
+            engram_entries = [
+                name for name in servers if name == "engram"
+            ]
+            self.assertEqual(1, len(engram_entries))
+
+    def test_mcp_install_is_idempotent_on_repeat_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            for _ in range(2):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "mcp-install",
+                        "--agent",
+                        "claude_code",
+                        "--config-dir",
+                        str(config_dir),
+                        "--claude-code-config",
+                        str(claude_code_config),
+                    ],
+                    FakeTransport([]),
+                )
+                self.assertEqual(0, exit_code, stderr)
+
+            data = read_json(claude_code_config)
+            servers = data["mcpServers"]
+            self.assertEqual(
+                ["engram"], [name for name in servers if name == "engram"]
+            )
+
+    def test_mcp_install_agent_flag_claude_desktop_writes_desktop_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            desktop_dir = config_dir / "Claude"
+            desktop_config = desktop_dir / "claude_desktop_config.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_desktop",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-desktop-config",
+                    str(desktop_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(desktop_config.exists())
+            data = read_json(desktop_config)
+            entry = data["mcpServers"]["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(RAW_KEY, entry["env"]["ENGRAM_API_KEY"])
+            self.assertEqual(PROJECT_ID, entry["env"]["ENGRAM_PROJECT_ID"])
+
+    def test_mcp_install_agent_flag_both_writes_both_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+            desktop_config = config_dir / "claude_desktop_config.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "both",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                    "--claude-desktop-config",
+                    str(desktop_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(claude_code_config.exists())
+            self.assertTrue(desktop_config.exists())
+            self.assertEqual(
+                "python",
+                read_json(claude_code_config)["mcpServers"]["engram"]["command"],
+            )
+            self.assertEqual(
+                "python",
+                read_json(desktop_config)["mcpServers"]["engram"]["command"],
+            )
+
+    def test_mcp_install_reports_error_when_not_connected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertFalse(claude_code_config.exists())
+            self.assertIn("missing_config", stderr)
+            self.assertIn("engram connect", stderr)
+
+    def test_mcp_install_reports_error_when_credentials_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            (config_dir / "credentials.json").unlink()
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("missing_credential", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

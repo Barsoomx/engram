@@ -15,6 +15,8 @@ from engram_cli.config import (
     as_string,
     as_string_list,
     credential_fingerprint,
+    default_claude_code_config_path,
+    default_claude_desktop_config_path,
     local_paths,
     read_json,
     remove_if_exists,
@@ -59,7 +61,7 @@ ERROR_REMEDIATION: dict[str, str] = {
     "missing_server_url": "Pass --server with the Engram server URL.",
     "missing_api_key": "Pass --api-key with a scoped Engram API key.",
     "missing_project": "Pass --project with the Engram project id.",
-    "missing_config": "Run `engram connect` before doctor.",
+    "missing_config": "Run `engram connect` first.",
     "missing_credential": "Run `engram connect` again to write credentials.",
     "missing_hook_config": "Run `engram connect` again to write hook manifests.",
     "server_unavailable": "Check the server URL and /-/healthz/ endpoint.",
@@ -75,6 +77,8 @@ ERROR_REMEDIATION: dict[str, str] = {
     "no_organizations": "Ask an admin to add your account to an organization.",
     "no_projects": "Ask an admin to create a project in this organization.",
     "api_key_issue_failed": "Check server logs and key capabilities.",
+    "missing_mcp_target": "Pass --claude-code-config or --claude-desktop-config.",
+    "invalid_agent_target": "Use claude_code, claude_desktop, or both.",
 }
 
 
@@ -1172,6 +1176,167 @@ def redact_secret(value: str, secret: str) -> str:
         return value
 
     return value.replace(secret, "[REDACTED]")
+
+
+def run_mcp_install(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        paths = local_paths(args.config_dir)
+        config = load_required_json(
+            paths.config, "missing_config", "Engram config is missing"
+        )
+        credentials = load_required_json(
+            paths.credentials, "missing_credential", "Engram credential is missing"
+        )
+        api_key = as_string(credentials.get("api_key"))
+        if not api_key:
+            raise CliError(
+                "missing_credential",
+                "Engram credential is missing",
+                remediation_for("missing_credential"),
+            )
+        server_url = as_string(config.get("server_url"))
+        project_id = as_string(config.get("project_id"))
+        if not server_url or not project_id:
+            raise CliError(
+                "missing_config",
+                "Engram config is incomplete",
+                remediation_for("missing_config"),
+            )
+        targets = resolve_mcp_targets(args)
+        entry = build_engram_mcp_entry(
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+        )
+        written: list[str] = []
+        skipped: list[str] = []
+        for label, path in targets:
+            if label == "claude_desktop" and not desktop_target_writable(
+                args, path
+            ):
+                skipped.append(label)
+
+                continue
+            write_engram_mcp_entry(path, entry)
+            written.append(str(path))
+        if not written:
+            raise CliError(
+                "missing_mcp_target",
+                "No Claude config target was available",
+                remediation_for("missing_mcp_target"),
+            )
+        for path_str in written:
+            stdout.write(f"wrote engram MCP server to {path_str}\n")
+        for label in skipped:
+            stderr.write(
+                f"skipped {label}: config path not found (install Claude "
+                f"Desktop or pass --claude-desktop-config).\n"
+            )
+        stdout.write("installed engram MCP server.\n")
+        if skipped:
+            stdout.write(
+                f"skipped: {', '.join(skipped)}\n"
+            )
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def build_engram_mcp_entry(
+    *,
+    server_url: str,
+    api_key: str,
+    project_id: str,
+) -> dict[str, object]:
+    return {
+        "command": "python",
+        "args": ["-m", "engram_mcp"],
+        "env": {
+            "ENGRAM_SERVER_URL": server_url,
+            "ENGRAM_API_KEY": api_key,
+            "ENGRAM_PROJECT_ID": project_id,
+        },
+    }
+
+
+def write_engram_mcp_entry(path: Path, entry: dict[str, object]) -> None:
+    if path.exists():
+        try:
+            data = read_json(path)
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            raise CliError(
+                "invalid_response",
+                f"Could not read {path.name}: {error}",
+                remediation_for("invalid_response"),
+            ) from error
+    else:
+        data = {}
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        data["mcpServers"] = servers
+    servers["engram"] = entry
+    write_json(path, data)
+
+
+def resolve_mcp_targets(
+    args: Namespace,
+) -> list[tuple[str, Path]]:
+    agent = normalize_mcp_agent(getattr(args, "agent", "both"))
+    targets: list[tuple[str, Path]] = []
+    code_override = getattr(args, "claude_code_config", None)
+    desktop_override = getattr(args, "claude_desktop_config", None)
+    if "claude_code" in agent:
+        targets.append(
+            (
+                "claude_code",
+                Path(code_override).expanduser()
+                if code_override
+                else default_claude_code_config_path(),
+            )
+        )
+    if "claude_desktop" in agent:
+        targets.append(
+            (
+                "claude_desktop",
+                Path(desktop_override).expanduser()
+                if desktop_override
+                else default_claude_desktop_config_path(),
+            )
+        )
+
+    return targets
+
+
+def desktop_target_writable(args: Namespace, path: Path) -> bool:
+    if getattr(args, "claude_desktop_config", None):
+        return True
+
+    return path.parent.exists()
+
+
+def normalize_mcp_agent(value: str | None) -> tuple[str, ...]:
+    agent = (value or "both").strip()
+    if agent == "both":
+        return ("claude_code", "claude_desktop")
+    if agent == "claude_code":
+        return ("claude_code",)
+    if agent == "claude_desktop":
+        return ("claude_desktop",)
+    raise CliError(
+        "invalid_agent_target",
+        f"Unsupported --agent value {agent}",
+        remediation_for("invalid_agent_target"),
+    )
 
 
 def run_search(
