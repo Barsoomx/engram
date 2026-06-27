@@ -302,3 +302,143 @@ export async function revokeApiKey(id: string): Promise<void> {
 
   await client.post(`/v1/admin/api-keys/${id}/revoke/`);
 }
+
+export type MemoryReviewItemType = 'candidate' | 'memory';
+
+export type MemoryReviewSourceSummary = {
+  id: string;
+  title: string;
+  files_read: string[] | null;
+  files_modified: string[] | null;
+};
+
+export type MemoryReviewCitation = {
+  id: string;
+  link_type: string;
+  target: string;
+  label: string;
+};
+
+export type MemoryReviewItem = {
+  id: string;
+  type: MemoryReviewItemType;
+  title: string;
+  body: string;
+  status: string;
+  confidence: string | null;
+  visibility_scope: string;
+  team_id: string | null;
+  project_id: string;
+  evidence: unknown;
+  source_observation: MemoryReviewSourceSummary | null;
+  citations: MemoryReviewCitation[];
+  created_at: string;
+};
+
+export type MemoryReviewListParams = ListParams & {
+  team_id?: string;
+  project_id?: string;
+  visibility_scope?: string;
+  confidence__gte?: string;
+  confidence__lte?: string;
+  status?: string;
+  age_days__gte?: number;
+  source_type?: string;
+  page?: number;
+};
+
+export type MemoryReviewDiffSlice = {
+  version: number;
+  body: string;
+  created_at: string;
+};
+
+export type MemoryReviewDiff = {
+  from: MemoryReviewDiffSlice;
+  to: MemoryReviewDiffSlice;
+};
+
+export type MemoryReviewActionName =
+  | 'approve'
+  | 'edit'
+  | 'narrow'
+  | 'supersede'
+  | 'reject'
+  | 'archive';
+
+export type MemoryReviewActionPayload = {
+  action: MemoryReviewActionName;
+  reason: string;
+  body?: string;
+  target_memory_id?: string;
+};
+
+export type MemoryReviewActionResult = {
+  action: MemoryReviewActionName;
+  candidate_id?: string;
+  memory_id?: string;
+  version?: number;
+  link_id?: string;
+};
+
+export type BulkArchiveMemoryReviewPayload = {
+  ids?: string[];
+  confidence__lte?: string;
+  reason: string;
+};
+
+export type BulkArchiveMemoryReviewResult = {
+  archived_count: number;
+  archived_ids: string[];
+};
+
+export async function listMemoryReview(
+  params?: MemoryReviewListParams,
+): Promise<Paginated<MemoryReviewItem>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<MemoryReviewItem>>(
+    '/v1/admin/memory-review/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function memoryReviewDiff(
+  id: string,
+  fromVersion: number,
+  toVersion: number,
+): Promise<MemoryReviewDiff> {
+  const client = apiClient();
+  const response = await client.get<MemoryReviewDiff>(
+    `/v1/admin/memory-review/${id}/diff/`,
+    { params: { from_version: fromVersion, to_version: toVersion } },
+  );
+
+  return response.data;
+}
+
+export async function memoryReviewAction(
+  id: string,
+  payload: MemoryReviewActionPayload,
+): Promise<MemoryReviewActionResult> {
+  const client = apiClient();
+  const response = await client.post<MemoryReviewActionResult>(
+    `/v1/admin/memory-review/${id}/action/`,
+    payload,
+  );
+
+  return response.data;
+}
+
+export async function bulkArchiveMemoryReview(
+  payload: BulkArchiveMemoryReviewPayload,
+): Promise<BulkArchiveMemoryReviewResult> {
+  const client = apiClient();
+  const response = await client.post<BulkArchiveMemoryReviewResult>(
+    '/v1/admin/memory-review/bulk-archive/',
+    payload,
+  );
+
+  return response.data;
+}
