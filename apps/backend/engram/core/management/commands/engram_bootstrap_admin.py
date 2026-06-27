@@ -5,7 +5,6 @@ import os
 import secrets
 from typing import Any
 
-from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.management.base import BaseCommand, CommandParser
 from django.db import transaction
@@ -198,7 +197,6 @@ def _env_or_default(name: str, default: str) -> str:
     value = os.environ.get(name)
 
     if value is None or value == '':
-
         return default
 
     return value
@@ -217,14 +215,14 @@ def _generate_api_key(org_slug: str) -> str:
 def _write_report(stdout: Any, result: dict[str, object]) -> None:
     stdout.write('Engram bootstrap complete')
     stdout.write('-------------------------')
-    stdout.write(f"Login URL: {result['login_url']}")
-    stdout.write(f"Username: {result['username']}")
+    stdout.write(f'Login URL: {result["login_url"]}')
+    stdout.write(f'Username: {result["username"]}')
     generated_password = result.get('generated_password') or ''
     if generated_password:
         stdout.write(f'Generated admin password: {generated_password}')
-    stdout.write(f"Organization: {result['organization_slug']}")
-    stdout.write(f"Team: {result['team_slug']}")
-    stdout.write(f"Project: {result['project_slug']}")
+    stdout.write(f'Organization: {result["organization_slug"]}')
+    stdout.write(f'Team: {result["team_slug"]}')
+    stdout.write(f'Project: {result["project_slug"]}')
     stdout.write('API key (shown once):')
     stdout.write(str(result['api_key']))
-    stdout.write(f"API key fingerprint: {result['api_key_fingerprint']}")
+    stdout.write(f'API key fingerprint: {result["api_key_fingerprint"]}')

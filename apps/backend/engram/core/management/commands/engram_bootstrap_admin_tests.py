@@ -220,11 +220,7 @@ def test_bootstrap_uses_env_slugs(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.django_db
 def test_bootstrap_all_admin_capabilities_exist_in_seed() -> None:
-    missing = [
-        code
-        for code in ADMIN_CAPABILITY_CODES
-        if not Capability.objects.filter(code=code).exists()
-    ]
+    missing = [code for code in ADMIN_CAPABILITY_CODES if not Capability.objects.filter(code=code).exists()]
 
     assert missing == []
 
@@ -234,7 +230,6 @@ def _extract_generated_password(output: str) -> str:
 
     for line in output.splitlines():
         if marker in line:
-
             return line.split(marker, 1)[1].strip()
 
     raise AssertionError('generated password not found in output')
