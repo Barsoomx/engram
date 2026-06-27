@@ -24,6 +24,7 @@ services:
     <<: *backend
     command: >
       sh -ec "python manage.py migrate --noinput &&
+              python manage.py engram_bootstrap_admin &&
               gunicorn settings.wsgi:application --bind 0.0.0.0:8000"
     ports:
       - "8000:8000"
