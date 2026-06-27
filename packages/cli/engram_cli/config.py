@@ -40,6 +40,19 @@ def local_paths(config_dir: str | None) -> LocalPaths:
     )
 
 
+def default_claude_code_config_path() -> Path:
+    return Path.home() / ".claude.json"
+
+
+def default_claude_desktop_config_path() -> Path:
+    home = Path.home()
+    macos_candidate = home / "Library" / "Application Support" / "Claude"
+    if macos_candidate.exists():
+        return macos_candidate / "claude_desktop_config.json"
+
+    return home / ".config" / "Claude" / "claude_desktop_config.json"
+
+
 def read_json(path: Path) -> dict[str, object]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):

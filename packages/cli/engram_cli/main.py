@@ -10,6 +10,7 @@ from engram_cli.commands import (
     run_disconnect,
     run_doctor,
     run_hook,
+    run_mcp_install,
     run_memory_link,
     run_memory_links,
     run_memory_version,
@@ -40,6 +41,8 @@ def main(
         return run_doctor(args, output, errors, transport)
     if args.command == "disconnect":
         return run_disconnect(args, output, errors)
+    if args.command == "mcp-install":
+        return run_mcp_install(args, output, errors, transport)
     if args.command == "hook":
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
     if args.command == "search":
@@ -85,6 +88,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     disconnect = subparsers.add_parser("disconnect")
     disconnect.add_argument("--config-dir")
+
+    mcp_install = subparsers.add_parser("mcp-install")
+    mcp_install.add_argument(
+        "--agent",
+        choices=("claude_code", "claude_desktop", "both"),
+        default="both",
+    )
+    mcp_install.add_argument("--config-dir")
+    mcp_install.add_argument("--claude-code-config")
+    mcp_install.add_argument("--claude-desktop-config")
 
     hook = subparsers.add_parser("hook")
     hook_subparsers = hook.add_subparsers(dest="hook_command")
