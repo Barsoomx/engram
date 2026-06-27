@@ -255,4 +255,3 @@ def revoke_api_key(api_key: ApiKey) -> ApiKey:
     api_key.save(update_fields=['revoked_at', 'updated_at'])
 
     return api_key
-

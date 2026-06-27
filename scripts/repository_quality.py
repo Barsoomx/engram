@@ -7,44 +7,48 @@ from typing import Iterable, Sequence
 
 
 SCAN_ROOT_FILES: tuple[str, ...] = (
-    'README.md',
-    'CONTRIBUTING.md',
-    'SECURITY.md',
-    'CODEOWNERS',
+    "README.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "CODEOWNERS",
 )
 
 SCAN_DIRECTORIES: tuple[str, ...] = (
-    '.github',
-    'apps',
-    'deploy',
-    'docs',
-    'packages',
-    'plugin-repository',
-    'scripts',
-    'tests',
+    ".github",
+    "apps",
+    "deploy",
+    "docs",
+    "packages",
+    "plugin-repository",
+    "scripts",
+    "tests",
 )
 
-SKIP_DIRECTORIES: frozenset[str] = frozenset({
-    '.git',
-    '.idea',
-    '__pycache__',
-})
+SKIP_DIRECTORIES: frozenset[str] = frozenset(
+    {
+        ".git",
+        ".idea",
+        "__pycache__",
+    }
+)
 
 INCOMPLETE_MARKERS: tuple[str, ...] = (
-    'T' + 'ODO',
-    'T' + 'BD',
-    'F' + 'IXME',
-    'PLACE' + 'HOLDER',
+    "T" + "ODO",
+    "T" + "BD",
+    "F" + "IXME",
+    "PLACE" + "HOLDER",
 )
 
 PRIVATE_REFERENCE_TERMS: tuple[str, ...] = (
-    'alt' + 'yn',
-    '\u0430\u043b\u0442\u044b\u043d',
+    "alt" + "yn",
+    "\u0430\u043b\u0442\u044b\u043d",
 )
 
-PRIVATE_REFERENCE_ALLOWED_PATHS: frozenset[str] = frozenset({
-    'docs/reference-gates.md',
-})
+PRIVATE_REFERENCE_ALLOWED_PATHS: frozenset[str] = frozenset(
+    {
+        "docs/reference-gates.md",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -66,8 +70,8 @@ def scan_text(path: str, text: str) -> list[Finding]:
                     Finding(
                         path=path,
                         line=line_number,
-                        code='incomplete-marker',
-                        message=f'incomplete work marker {marker!r}',
+                        code="incomplete-marker",
+                        message=f"incomplete work marker {marker!r}",
                     ),
                 )
 
@@ -79,8 +83,8 @@ def scan_text(path: str, text: str) -> list[Finding]:
                         Finding(
                             path=path,
                             line=line_number,
-                            code='private-reference-term',
-                            message='private reference term outside allowlist',
+                            code="private-reference-term",
+                            message="private reference term outside allowlist",
                         ),
                     )
 
@@ -111,7 +115,7 @@ def iter_scan_paths(root: Path) -> Iterable[Path]:
         if not directory.is_dir():
             continue
 
-        for path in sorted(directory.rglob('*')):
+        for path in sorted(directory.rglob("*")):
             if path.is_file() and should_scan_path(path):
                 yield path
 
@@ -122,25 +126,24 @@ def should_scan_path(path: Path) -> bool:
 
 def read_text_or_none(path: Path) -> str | None:
     try:
-        return path.read_text(encoding='utf-8')
+        return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return None
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--root', default='.')
+    parser.add_argument("--root", default=".")
     args = parser.parse_args(argv)
 
     findings = scan_root(Path(args.root))
     for finding in findings:
         print(
-            f'{finding.path}:{finding.line}: '
-            f'{finding.code}: {finding.message}',
+            f"{finding.path}:{finding.line}: {finding.code}: {finding.message}",
         )
 
     return 1 if findings else 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

@@ -7,49 +7,71 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class BackendWorkflowTests(unittest.TestCase):
     def test_backend_workflow_runs_required_commands(self) -> None:
-        workflow = (ROOT / '.github/workflows/backend.yml').read_text(encoding='utf-8')
+        workflow = (ROOT / ".github/workflows/backend.yml").read_text(encoding="utf-8")
 
-        self.assertIn('working-directory: apps/backend', workflow)
-        self.assertIn('poetry install --no-interaction', workflow)
-        self.assertIn('poetry run ruff check .', workflow)
-        self.assertIn('poetry run ruff format --check .', workflow)
-        self.assertIn('poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings', workflow)
-        self.assertIn('poetry run python manage.py migrate --noinput --settings=settings.test_settings', workflow)
-        self.assertIn('poetry run pytest engram/imports/upstream_import_tests.py -v', workflow)
-        self.assertIn('poetry run pytest -v', workflow)
-        self.assertIn("PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v", workflow)
-        self.assertIn('python3 scripts/repository_layout.py', workflow)
-        self.assertIn('python3 scripts/repository_quality.py', workflow)
+        self.assertIn("working-directory: apps/backend", workflow)
+        self.assertIn("poetry install --no-interaction", workflow)
+        self.assertIn("poetry run ruff check .", workflow)
+        self.assertIn("poetry run ruff format --check .", workflow)
+        self.assertIn(
+            "poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings",
+            workflow,
+        )
+        self.assertIn(
+            "poetry run python manage.py migrate --noinput --settings=settings.test_settings",
+            workflow,
+        )
+        self.assertIn(
+            "poetry run pytest engram/imports/upstream_import_tests.py -v", workflow
+        )
+        self.assertIn("poetry run pytest -v", workflow)
+        self.assertIn(
+            "PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v",
+            workflow,
+        )
+        self.assertIn("python3 scripts/repository_layout.py", workflow)
+        self.assertIn("python3 scripts/repository_quality.py", workflow)
 
     def test_backend_workflow_runs_backend_checks_against_postgres(self) -> None:
-        workflow = (ROOT / '.github/workflows/backend.yml').read_text(encoding='utf-8')
+        workflow = (ROOT / ".github/workflows/backend.yml").read_text(encoding="utf-8")
 
-        self.assertIn('services:', workflow)
-        self.assertIn('postgres:', workflow)
-        self.assertIn('image: postgres:16', workflow)
-        self.assertIn('POSTGRES_DB: engram', workflow)
-        self.assertIn('POSTGRES_USER: engram', workflow)
-        self.assertIn('POSTGRES_PASSWORD: engram', workflow)
-        self.assertIn('5432:5432', workflow)
-        self.assertIn('ENGRAM_DATABASE_URL: postgresql://engram:engram@localhost:5432/engram', workflow)
+        self.assertIn("services:", workflow)
+        self.assertIn("postgres:", workflow)
+        self.assertIn("image: postgres:16", workflow)
+        self.assertIn("POSTGRES_DB: engram", workflow)
+        self.assertIn("POSTGRES_USER: engram", workflow)
+        self.assertIn("POSTGRES_PASSWORD: engram", workflow)
+        self.assertIn("5432:5432", workflow)
+        self.assertIn(
+            "ENGRAM_DATABASE_URL: postgresql://engram:engram@localhost:5432/engram",
+            workflow,
+        )
 
-    def test_backend_test_settings_preserve_sqlite_fallback_and_allow_postgres_override(self) -> None:
-        settings = (ROOT / 'apps/backend/settings/test_settings.py').read_text(encoding='utf-8')
+    def test_backend_test_settings_preserve_sqlite_fallback_and_allow_postgres_override(
+        self,
+    ) -> None:
+        settings = (ROOT / "apps/backend/settings/test_settings.py").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn('database_config(', settings)
+        self.assertIn("database_config(", settings)
         self.assertIn("os.environ.get('ENGRAM_DATABASE_URL'", settings)
         self.assertIn("'sqlite:///:memory:'", settings)
 
-    def test_backend_workflow_applies_migrations_before_checking_migration_drift(self) -> None:
-        workflow = (ROOT / '.github/workflows/backend.yml').read_text(encoding='utf-8')
+    def test_backend_workflow_applies_migrations_before_checking_migration_drift(
+        self,
+    ) -> None:
+        workflow = (ROOT / ".github/workflows/backend.yml").read_text(encoding="utf-8")
 
-        migrate_position = workflow.index('poetry run python manage.py migrate --noinput --settings=settings.test_settings')
+        migrate_position = workflow.index(
+            "poetry run python manage.py migrate --noinput --settings=settings.test_settings"
+        )
         makemigrations_position = workflow.index(
-            'poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings'
+            "poetry run python manage.py makemigrations --check --dry-run --settings=settings.test_settings"
         )
 
         self.assertLess(migrate_position, makemigrations_position)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

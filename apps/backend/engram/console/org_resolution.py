@@ -120,7 +120,6 @@ class ActiveOrganizationPermission(BasePermission):
                 organization,
             )
         except AuthError:
-
             return False
 
         return True

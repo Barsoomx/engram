@@ -6,15 +6,15 @@ from pathlib import Path
 
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
-README_PATH = PACKAGE_ROOT / 'README.md'
-PLUGIN_MANIFEST_PATH = PACKAGE_ROOT / '.claude-plugin' / 'plugin.json'
-HOOK_MANIFEST_PATH = PACKAGE_ROOT / 'hooks' / 'hooks.json'
+README_PATH = PACKAGE_ROOT / "README.md"
+PLUGIN_MANIFEST_PATH = PACKAGE_ROOT / ".claude-plugin" / "plugin.json"
+HOOK_MANIFEST_PATH = PACKAGE_ROOT / "hooks" / "hooks.json"
 REQUIRED_PACKAGE_FILES = (
     README_PATH,
     PLUGIN_MANIFEST_PATH,
     HOOK_MANIFEST_PATH,
 )
-REQUIRED_HOOK_EVENTS = ('SessionStart', 'PostToolUse', 'Error', 'Decision')
+REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision")
 
 
 class ClaudePluginContractTests(unittest.TestCase):
@@ -26,31 +26,31 @@ class ClaudePluginContractTests(unittest.TestCase):
         self.assertTrue(PLUGIN_MANIFEST_PATH.exists(), PLUGIN_MANIFEST_PATH)
         self.assertTrue(HOOK_MANIFEST_PATH.exists(), HOOK_MANIFEST_PATH)
 
-        plugin_manifest_text = PLUGIN_MANIFEST_PATH.read_text(encoding='utf-8')
-        hook_manifest_text = HOOK_MANIFEST_PATH.read_text(encoding='utf-8')
+        plugin_manifest_text = PLUGIN_MANIFEST_PATH.read_text(encoding="utf-8")
+        hook_manifest_text = HOOK_MANIFEST_PATH.read_text(encoding="utf-8")
         plugin_manifest = json.loads(plugin_manifest_text)
         hook_manifest = json.loads(hook_manifest_text)
-        hooks = hook_manifest['hooks']
+        hooks = hook_manifest["hooks"]
         commands: list[str] = []
 
-        self.assertEqual('./hooks/hooks.json', plugin_manifest['hooks'])
-        self.assertNotIn('claude-mem', plugin_manifest_text)
-        self.assertNotIn('claude-mem', hook_manifest_text)
+        self.assertEqual("./hooks/hooks.json", plugin_manifest["hooks"])
+        self.assertNotIn("claude-mem", plugin_manifest_text)
+        self.assertNotIn("claude-mem", hook_manifest_text)
 
         for event_name in REQUIRED_HOOK_EVENTS:
             self.assertIn(event_name, hooks)
             for matcher in hooks[event_name]:
-                for hook in matcher['hooks']:
-                    if hook['type'] == 'command':
-                        commands.append(hook['command'])
+                for hook in matcher["hooks"]:
+                    if hook["type"] == "command":
+                        commands.append(hook["command"])
 
         self.assertEqual(len(REQUIRED_HOOK_EVENTS), len(commands))
         for command in commands:
-            self.assertIn('engram hook', command)
-            self.assertIn('--agent claude_code', command)
-            self.assertIn('--response-format claude-code', command)
-            self.assertNotIn('claude-mem', command)
+            self.assertIn("engram hook", command)
+            self.assertIn("--agent claude_code", command)
+            self.assertIn("--response-format claude-code", command)
+            self.assertNotIn("claude-mem", command)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
