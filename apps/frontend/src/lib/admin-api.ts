@@ -175,6 +175,87 @@ export async function archiveProject(id: string): Promise<void> {
   await client.delete(`/v1/admin/projects/${id}/`);
 }
 
+export type Role = {
+  id: string;
+  code: string;
+  name: string;
+  built_in: boolean;
+  capabilities: string[];
+};
+
+export async function listRoles(
+  params?: ListParams,
+): Promise<Paginated<Role>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<Role>>(
+    '/v1/admin/roles/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export type Member = {
+  id: string;
+  external_id: string;
+  display_name: string;
+  email: string;
+  identity_type: string;
+  active: boolean;
+  role: string;
+};
+
+export type MemberInviteInput = {
+  external_id: string;
+  display_name: string;
+  email?: string;
+  role: string;
+};
+
+export type MemberRoleInput = {
+  role: string;
+};
+
+export async function listMembers(
+  params?: ListParams,
+): Promise<Paginated<Member>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<Member>>(
+    '/v1/admin/members/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function inviteMember(
+  input: MemberInviteInput,
+): Promise<Member> {
+  const client = apiClient();
+  const response = await client.post<Member>('/v1/admin/members/', input);
+
+  return response.data;
+}
+
+export async function updateMemberRole(
+  id: string,
+  input: MemberRoleInput,
+): Promise<Member> {
+  const client = apiClient();
+  const response = await client.patch<Member>(
+    `/v1/admin/members/${id}/`,
+    input,
+  );
+
+  return response.data;
+}
+
+export async function deactivateMember(id: string): Promise<void> {
+  const client = apiClient();
+
+  await client.delete(`/v1/admin/members/${id}/`);
+}
+
 export async function listApiKeys(
   params?: ListParams,
 ): Promise<Paginated<ApiKey>> {
