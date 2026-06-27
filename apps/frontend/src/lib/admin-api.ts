@@ -28,6 +28,23 @@ export async function listOrganizations(
   return response.data;
 }
 
+export type OrganizationWriteInput = {
+  name: string;
+};
+
+export async function updateOrganization(
+  id: string,
+  input: OrganizationWriteInput,
+): Promise<Organization> {
+  const client = apiClient();
+  const response = await client.patch<Organization>(
+    `/v1/admin/organizations/${id}/`,
+    input,
+  );
+
+  return response.data;
+}
+
 export type ApiKeyOwner = {
   id: string;
   display_name: string;
