@@ -63,6 +63,59 @@ export type ApiKeyIssueResult = {
   created_at: string;
 };
 
+export type Team = {
+  id: string;
+  name: string;
+  slug: string;
+  organization: string;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type TeamWriteInput = {
+  name: string;
+  slug: string;
+};
+
+export async function listTeams(
+  params?: ListParams,
+): Promise<Paginated<Team>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<Team>>(
+    '/v1/admin/teams/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function createTeam(input: TeamWriteInput): Promise<Team> {
+  const client = apiClient();
+  const response = await client.post<Team>('/v1/admin/teams/', input);
+
+  return response.data;
+}
+
+export async function updateTeam(
+  id: string,
+  input: TeamWriteInput,
+): Promise<Team> {
+  const client = apiClient();
+  const response = await client.patch<Team>(
+    `/v1/admin/teams/${id}/`,
+    input,
+  );
+
+  return response.data;
+}
+
+export async function archiveTeam(id: string): Promise<void> {
+  const client = apiClient();
+
+  await client.delete(`/v1/admin/teams/${id}/`);
+}
+
 export async function listApiKeys(
   params?: ListParams,
 ): Promise<Paginated<ApiKey>> {
