@@ -65,7 +65,6 @@ def ensure_admin_capabilities(apps, schema_editor) -> None:
         try:
             role = Role.objects.get(code=role_code)
         except Role.DoesNotExist:
-
             continue
 
         for code in codes:
@@ -73,7 +72,6 @@ def ensure_admin_capabilities(apps, schema_editor) -> None:
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('access', '0002_seed_default_roles'),
     ]

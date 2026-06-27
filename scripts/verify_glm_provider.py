@@ -18,54 +18,59 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import urllib.error
 import urllib.request
 
 
 def main() -> int:
-    key = os.environ.get('ENGRAM_E2E_PROVIDER_KEY')
+    key = os.environ.get("ENGRAM_E2E_PROVIDER_KEY")
     if not key:
-        print('Set ENGRAM_E2E_PROVIDER_KEY before running this script.')
+        print("Set ENGRAM_E2E_PROVIDER_KEY before running this script.")
 
         return 1
 
-    base_url = os.environ.get('ENGRAM_PROVIDER_BASE_URL', 'https://api.z.ai/api/anthropic').rstrip('/')
-    model = os.environ.get('ENGRAM_PROVIDER_MODEL', 'glm-4.7')
-    prompt = os.environ.get('ENGRAM_PROVIDER_PROMPT', 'Reply with exactly: ENGRAM_OK')
+    base_url = os.environ.get(
+        "ENGRAM_PROVIDER_BASE_URL", "https://api.z.ai/api/anthropic"
+    ).rstrip("/")
+    model = os.environ.get("ENGRAM_PROVIDER_MODEL", "glm-4.7")
+    prompt = os.environ.get("ENGRAM_PROVIDER_PROMPT", "Reply with exactly: ENGRAM_OK")
     body = json.dumps(
-        {'model': model, 'max_tokens': 50, 'messages': [{'role': 'user', 'content': prompt}]},
+        {
+            "model": model,
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": prompt}],
+        },
     ).encode()
     request = urllib.request.Request(
-        f'{base_url}/v1/messages',
+        f"{base_url}/v1/messages",
         data=body,
         headers={
-            'x-api-key': key,
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
         },
-        method='POST',
+        method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as error:
-        print(f'HTTP ERROR {error.code}')
+        print(f"HTTP ERROR {error.code}")
         print(error.read().decode()[:500])
 
         return 2
     except urllib.error.URLError as error:
-        print(f'NETWORK ERROR {error.reason}')
+        print(f"NETWORK ERROR {error.reason}")
 
         return 3
 
-    print('STATUS: ok')
-    print(f'MODEL: {data.get("model")}')
-    print(f'CONTENT: {data["content"][0]["text"]}')
-    print(f'USAGE: {data.get("usage")}')
+    print("STATUS: ok")
+    print(f"MODEL: {data.get('model')}")
+    print(f"CONTENT: {data['content'][0]['text']}")
+    print(f"USAGE: {data.get('usage')}")
 
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     raise SystemExit(main())

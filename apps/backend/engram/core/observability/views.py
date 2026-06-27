@@ -17,7 +17,6 @@ def metrics(request: HttpRequest) -> HttpResponse:
     if expected_token:
         auth_header = request.META.get('HTTP_AUTHORIZATION', '')
         if auth_header != f'Bearer {expected_token}':
-
             return HttpResponseForbidden('Forbidden')
 
     body = render_prometheus([http_requests_total])

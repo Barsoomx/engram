@@ -34,24 +34,24 @@ def main(
         args = parser.parse_args(argv)
     except SystemExit as error:
         return int(error.code)
-    if args.command == 'connect':
+    if args.command == "connect":
         return run_connect(args, output, errors, transport)
-    if args.command == 'doctor':
+    if args.command == "doctor":
         return run_doctor(args, output, errors, transport)
-    if args.command == 'disconnect':
+    if args.command == "disconnect":
         return run_disconnect(args, output, errors)
-    if args.command == 'hook':
+    if args.command == "hook":
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
-    if args.command == 'search':
+    if args.command == "search":
         return run_search(args, output, errors, transport)
-    if args.command == 'observations':
+    if args.command == "observations":
         return run_observations(args, output, errors, transport)
-    if args.command == 'memory':
-        if args.memory_command == 'version':
+    if args.command == "memory":
+        if args.memory_command == "version":
             return run_memory_version(args, output, errors, transport)
-        if args.memory_command == 'link':
+        if args.memory_command == "link":
             return run_memory_link(args, output, errors, transport)
-        if args.memory_command == 'links':
+        if args.memory_command == "links":
             return run_memory_links(args, output, errors, transport)
 
     parser.print_help(file=errors)
@@ -64,64 +64,79 @@ def console_main() -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='engram')
-    subparsers = parser.add_subparsers(dest='command')
+    parser = argparse.ArgumentParser(prog="engram")
+    subparsers = parser.add_subparsers(dest="command")
 
-    connect = subparsers.add_parser('connect')
-    connect.add_argument('--server')
-    connect.add_argument('--api-key')
-    connect.add_argument('--project')
-    connect.add_argument('--team')
-    connect.add_argument('--agent', choices=('codex', 'claude-code', 'claude_code', 'both'), default='both')
-    connect.add_argument('--agent-version', default='')
-    connect.add_argument('--config-dir')
+    connect = subparsers.add_parser("connect")
+    connect.add_argument("--server")
+    connect.add_argument("--api-key")
+    connect.add_argument("--project")
+    connect.add_argument("--team")
+    connect.add_argument(
+        "--agent",
+        choices=("codex", "claude-code", "claude_code", "both"),
+        default="both",
+    )
+    connect.add_argument("--agent-version", default="")
+    connect.add_argument("--config-dir")
 
-    doctor = subparsers.add_parser('doctor')
-    doctor.add_argument('--config-dir')
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--config-dir")
 
-    disconnect = subparsers.add_parser('disconnect')
-    disconnect.add_argument('--config-dir')
+    disconnect = subparsers.add_parser("disconnect")
+    disconnect.add_argument("--config-dir")
 
-    hook = subparsers.add_parser('hook')
-    hook_subparsers = hook.add_subparsers(dest='hook_command')
-    for command in ('post-tool-use', 'session-start', 'error', 'decision'):
+    hook = subparsers.add_parser("hook")
+    hook_subparsers = hook.add_subparsers(dest="hook_command")
+    for command in ("post-tool-use", "session-start", "error", "decision"):
         hook_command = hook_subparsers.add_parser(command)
-        hook_command.add_argument('--agent', choices=('codex', 'claude-code', 'claude_code'))
-        hook_command.add_argument('--config-dir')
-        hook_command.add_argument('--response-format', choices=('server', 'codex', 'claude-code'), default='server')
+        hook_command.add_argument(
+            "--agent", choices=("codex", "claude-code", "claude_code")
+        )
+        hook_command.add_argument("--config-dir")
+        hook_command.add_argument(
+            "--response-format",
+            choices=("server", "codex", "claude-code"),
+            default="server",
+        )
 
-    search = subparsers.add_parser('search')
-    search.add_argument('--query', default='')
-    search.add_argument('--file-path', action='append', default=[])
-    search.add_argument('--symbol', action='append', default=[])
-    search.add_argument('--limit', type=int, default=5)
-    search.add_argument('--config-dir')
-    search.add_argument('--json', action='store_true', dest='as_json')
+    search = subparsers.add_parser("search")
+    search.add_argument("--query", default="")
+    search.add_argument("--file-path", action="append", default=[])
+    search.add_argument("--symbol", action="append", default=[])
+    search.add_argument("--limit", type=int, default=5)
+    search.add_argument("--config-dir")
+    search.add_argument("--json", action="store_true", dest="as_json")
 
-    memory = subparsers.add_parser('memory')
-    memory_subparsers = memory.add_subparsers(dest='memory_command')
+    memory = subparsers.add_parser("memory")
+    memory_subparsers = memory.add_subparsers(dest="memory_command")
 
-    memory_version = memory_subparsers.add_parser('version')
-    memory_version.add_argument('memory_id')
-    memory_version.add_argument('--body', required=True)
-    memory_version.add_argument('--reason', default='')
-    memory_version.add_argument('--request-id', dest='request_id', default='')
-    memory_version.add_argument('--config-dir')
+    memory_version = memory_subparsers.add_parser("version")
+    memory_version.add_argument("memory_id")
+    memory_version.add_argument("--body", required=True)
+    memory_version.add_argument("--reason", default="")
+    memory_version.add_argument("--request-id", dest="request_id", default="")
+    memory_version.add_argument("--config-dir")
 
-    memory_link = memory_subparsers.add_parser('link')
-    memory_link.add_argument('memory_id')
-    memory_link.add_argument('--link-type', dest='link_type', required=True, choices=('file', 'symbol', 'commit', 'issue'))
-    memory_link.add_argument('--target', required=True)
-    memory_link.add_argument('--label', default='')
-    memory_link.add_argument('--request-id', dest='request_id', default='')
-    memory_link.add_argument('--config-dir')
+    memory_link = memory_subparsers.add_parser("link")
+    memory_link.add_argument("memory_id")
+    memory_link.add_argument(
+        "--link-type",
+        dest="link_type",
+        required=True,
+        choices=("file", "symbol", "commit", "issue"),
+    )
+    memory_link.add_argument("--target", required=True)
+    memory_link.add_argument("--label", default="")
+    memory_link.add_argument("--request-id", dest="request_id", default="")
+    memory_link.add_argument("--config-dir")
 
-    memory_links = memory_subparsers.add_parser('links')
-    memory_links.add_argument('memory_id')
-    memory_links.add_argument('--config-dir')
+    memory_links = memory_subparsers.add_parser("links")
+    memory_links.add_argument("memory_id")
+    memory_links.add_argument("--config-dir")
 
-    observations = subparsers.add_parser('observations')
-    observations.add_argument('--limit', type=int, default=20)
-    observations.add_argument('--config-dir')
+    observations = subparsers.add_parser("observations")
+    observations.add_argument("--limit", type=int, default=20)
+    observations.add_argument("--config-dir")
 
     return parser

@@ -7,11 +7,7 @@ from engram.access.models import Capability, Role, RoleCapability
 
 
 def _role_caps(role_code: str) -> set[str]:
-    return set(
-        RoleCapability.objects.filter(role__code=role_code).values_list(
-            'capability__code', flat=True
-        )
-    )
+    return set(RoleCapability.objects.filter(role__code=role_code).values_list('capability__code', flat=True))
 
 
 @pytest.mark.django_db
