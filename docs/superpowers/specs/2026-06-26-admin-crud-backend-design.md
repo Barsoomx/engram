@@ -3,7 +3,7 @@
 Date: 2026-06-26
 Status: Design (autonomous, decisions delegated by owner)
 Owner: implementation lead
-References: `altyn-backend` (backend RBAC/CRUD), `asgard-admin` (frontend admin UI)
+References: `*****-backend` (backend RBAC/CRUD), `*****-admin` (frontend admin UI)
 
 ## Context
 
@@ -20,7 +20,7 @@ request "API keys for organizations in the panel".
 
 The owner flagged that the local Engram docs and code "may be messy, not
 reviewed". This design therefore grounds decisions in two reviewed reference
-projects (`altyn-backend`, `asgard-admin`) rather than in existing Engram docs.
+projects (`*****-backend`, `*****-admin`) rather than in existing Engram docs.
 
 ## Goal
 
@@ -48,13 +48,13 @@ Keep the already-verified username/password → DRF `Token` flow
 `TokenAuthentication` + `IsAuthenticated`, same token the frontend already
 stores.
 
-- Alternative considered: switch to `next-auth` (asgard-admin) or session auth.
+- Alternative considered: switch to `next-auth` (*****-admin) or session auth.
   Rejected: current flow is verified (200/401 proven) and minimal; introducing
   next-auth adds a JWT layer with no benefit for a single-product admin.
 - API keys (agent credentials) remain a **separate** auth path (`ResolveApiKeyScope`,
   bearer `egk_...`) and are NOT used for admin UI auth. Admin = human session
-  token; agent = API key. This matches altyn's split (user session vs merchant
-  HMAC) and asgard's (manager token vs none).
+  token; agent = API key. This matches *****'s split (user session vs merchant
+  HMAC) and *****'s (manager token vs none).
 
 ### AD-2: RBAC — DRF permission classes keyed on capabilities
 
@@ -80,8 +80,8 @@ Capabilities are wildcard-aware: `api_keys:*` grants `api_keys:read`,
 action (via `get_permissions()`), so list/read need `*:read`, create/update need
 the write capability, revoke is its own capability.
 
-This mirrors altyn's `IsActiveWhitelabelManager` (permission class, stashes
-resolved role on `request`) and asgard's `hasManagerCapability` (frontend gate).
+This mirrors *****'s `IsActiveWhitelabelManager` (permission class, stashes
+resolved role on `request`) and *****'s `hasManagerCapability` (frontend gate).
 
 - Alternative: service-layer checks. Rejected: DRF permission classes keep
   authorization visible in the view declaration and uniform with the runtime
@@ -100,7 +100,7 @@ Resolution is done in a thin DRF `initialize_request`/permission step that
 validates the user is an **active member** of that org and stashes
 `request.active_organization` + `request.effective_scope`.
 
-This mirrors altyn's brand resolution (Origin > `X-Brand-Slug` > session) but
+This mirrors *****'s brand resolution (Origin > `X-Brand-Slug` > session) but
 simpler: header > single-membership fallback. All `get_queryset()` filter by
 `organization=request.active_organization`.
 
@@ -112,7 +112,7 @@ simpler: header > single-membership fallback. All `get_queryset()` filter by
 
 Switch from the current ad-hoc `APIView`-per-action style to `ModelViewSet` +
 `Router` for the admin surface only. RESTful, compact, OpenAPI-friendly, and
-matches the asgard `manager_api/v1/` shape (altyn uses function paths; router is
+matches the ***** `manager_api/v1/` shape (***** uses function paths; router is
 cleaner for Sentry-style resources).
 
 Mounted under `/v1/admin/`:
@@ -138,7 +138,7 @@ Each ViewSet: capability-gated `permission_classes`/`get_permissions()`,
 ### AD-5: Serializers — read/write split
 
 Separate input (write) and output (read) serializers via `get_serializer_class()`
-(altyn pattern). Write serializers validate constraints and call a service;
+(***** pattern). Write serializers validate constraints and call a service;
 read serializers never leak secrets. For API keys: read serializer returns
 `name`, `key_prefix`, `key_fingerprint`, `created_at`, `expires_at`,
 `last_used_at`, `active`, `revoked_at`, `capabilities` — **never** the raw key.
@@ -150,7 +150,7 @@ The create response returns the raw key **exactly once** in a dedicated
 Every admin mutation writes an `AuditEvent` (the model and `_audit` helper
 already exist) with `actor_type='user'`, `actor_id=<identity>`,
 `target_type`/`target_id`, `capability`, `result`, and a `metadata` JSON bag of
-the change. This matches altyn's immutable `WhitelabelBrandAuditLog` +
+the change. This matches *****'s immutable `WhitelabelBrandAuditLog` +
 `write_brand_audit_log` helper, adapted to Engram's existing `AuditEvent`.
 
 ## Capability & Role Model
@@ -230,7 +230,7 @@ Capabilities are wildcard-expanded in the permission check (`api_keys:*` covers
   capabilities, created_at}` — `plaintext` only here, never again.
 - Revoke sets `revoked_at`; key cannot be used after (already enforced in
   `_state_error`).
-- Phase A does NOT add Fernet at-rest encryption (altyn pattern) — the existing
+- Phase A does NOT add Fernet at-rest encryption (***** pattern) — the existing
   HMAC-hash scheme is sound because the raw key is unrecoverable. Encryption is
   only needed if we ever need to recover/rotate plaintext, which we don't.
 
