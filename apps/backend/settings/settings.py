@@ -110,6 +110,20 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = 'static/'
 
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+            ],
+        },
+    },
+]
+
 ENGRAM_REDIS_URL = os.environ.get('ENGRAM_REDIS_URL', 'redis://redis:6379/0')
 ENGRAM_CELERY_BROKER_URL = os.environ.get('ENGRAM_CELERY_BROKER_URL', 'amqp://engram:engram@rabbitmq:5672/engram')
 CELERY_BROKER_URL = ENGRAM_CELERY_BROKER_URL

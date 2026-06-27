@@ -10,6 +10,24 @@ re-learning a project.
 The `upstream` branch keeps the original project snapshot. The `master` branch
 is the product and architecture track for the server-only rewrite.
 
+## Quickstart
+
+Get a working Engram deployment in 10-15 minutes: clone, `docker compose up`,
+bootstrap a ready-to-use project and scoped API key, connect an agent, and
+verify memory ingest and context retrieval.
+
+See [Quickstart](docs/quickstart.md) for the end-to-end walkthrough.
+
+User guides:
+
+- [CLI guide](docs/guides/cli.md)
+- [MCP guide](docs/guides/mcp.md)
+- [Plugins guide](docs/guides/plugins.md)
+- [Admin UI guide](docs/guides/admin-ui.md)
+- [API keys guide](docs/guides/api-keys.md)
+- [Auth guide](docs/guides/auth.md)
+- [API reference](docs/api-reference.md)
+
 ## North Star
 
 The single source of truth for product vision is
