@@ -109,6 +109,75 @@ def get_health(
     return transport("GET", f"{server_url}/-/healthz/", {}, None, timeout)
 
 
+def probe_health(
+    *,
+    transport: Transport,
+    server_url: str,
+    timeout: float = 2.0,
+) -> bool:
+    status, body = get_health(transport=transport, server_url=server_url, timeout=timeout)
+
+    return status == 200 and body.get("status") == "ok"
+
+
+def post_login(
+    *,
+    transport: Transport,
+    server_url: str,
+    username: str,
+    password: str,
+    timeout: float = 5.0,
+) -> tuple[int, dict[str, object]]:
+    payload: dict[str, object] = {"username": username, "password": password}
+
+    return transport(
+        "POST",
+        f"{server_url}/v1/auth/login",
+        {"Content-Type": "application/json"},
+        payload,
+        timeout,
+    )
+
+
+def admin_get(
+    *,
+    transport: Transport,
+    server_url: str,
+    path: str,
+    drf_token: str,
+    organization_id: str | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, dict[str, object]]:
+    headers: dict[str, str] = {
+        "Authorization": f"Token {drf_token}",
+        "Accept": "application/json",
+    }
+    if organization_id:
+        headers["X-Engram-Organization"] = organization_id
+
+    return transport("GET", f"{server_url}{path}", headers, None, timeout)
+
+
+def admin_post(
+    *,
+    transport: Transport,
+    server_url: str,
+    path: str,
+    drf_token: str,
+    payload: dict[str, object],
+    organization_id: str | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, dict[str, object]]:
+    headers: dict[str, str] = {
+        "Authorization": f"Token {drf_token}",
+        "Content-Type": "application/json",
+    }
+    if organization_id:
+        headers["X-Engram-Organization"] = organization_id
+
+    return transport("POST", f"{server_url}{path}", headers, payload, timeout)
+
+
 def get_json(
     *,
     transport: Transport,

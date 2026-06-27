@@ -10,11 +10,14 @@ from typing import Any
 
 from engram_cli.config import credential_fingerprint
 from engram_cli import main
+from engram_cli.commands import run_connect
 
 
 RAW_KEY = "egk_test_cli_0123456789abcdefghijklmnopqrstuvwxyz"
 PROJECT_ID = "11111111-1111-1111-1111-111111111111"
 TEAM_ID = "22222222-2222-2222-2222-222222222222"
+ORG_ID = "33333333-3333-3333-3333-333333333333"
+DRF_TOKEN = "drf-token-abc123"
 
 
 class FakeTransport:
@@ -1457,6 +1460,639 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("/v1/observations/", call["url"])
             self.assertIn("project_id=", call["url"])
             self.assertIn("Obs one", stdout)
+
+
+class StubPrompt:
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+        self.prompts: list[str] = []
+
+    def __call__(self, message: str) -> str:
+        self.prompts.append(message)
+        if not self.answers:
+            raise AssertionError(f"unexpected prompt: {message}")
+
+        return self.answers.pop(0)
+
+
+def login_ok() -> dict[str, object]:
+    return {
+        "token": DRF_TOKEN,
+        "user_id": 1,
+        "username": "alice",
+        "identity_id": "ident-1",
+        "organization_id": ORG_ID,
+        "capabilities": ["memories:read", "observations:write", "search:query"],
+    }
+
+
+def org_list() -> dict[str, object]:
+    return {
+        "count": 1,
+        "results": [
+            {"id": ORG_ID, "name": "Acme", "slug": "acme"},
+        ],
+    }
+
+
+def project_list() -> dict[str, object]:
+    return {
+        "count": 1,
+        "results": [
+            {
+                "id": PROJECT_ID,
+                "name": "Demo",
+                "slug": "demo",
+                "repository_url": "",
+                "default_branch": "main",
+            },
+        ],
+    }
+
+
+def api_key_issued() -> dict[str, object]:
+    return {
+        "id": "api-key-1",
+        "name": "cli-key",
+        "key_prefix": "egk_live_abcde",
+        "key_fingerprint": "sha256:abc",
+        "plaintext": RAW_KEY,
+        "capabilities": ["memories:read", "observations:write", "search:query"],
+        "created_at": "2026-06-27T00:00:00Z",
+    }
+
+
+def health_ok() -> dict[str, object]:
+    return {"status": "ok", "checks": {"process": "ok"}}
+
+
+class WizardTests(unittest.TestCase):
+    def run_connect_wizard(
+        self,
+        config_dir: Path,
+        responses: list[tuple[int, dict[str, object]]],
+        answers: list[str],
+    ) -> tuple[int, str, str, FakeTransport]:
+        transport = FakeTransport(responses)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        args = main.build_parser().parse_args(
+            ["connect", "--config-dir", str(config_dir)]
+        )
+        exit_code = run_connect(
+            args,
+            stdout,
+            stderr,
+            transport,
+            prompt=StubPrompt(answers),
+            interactive=True,
+        )
+
+        return exit_code, stdout.getvalue(), stderr.getvalue(), transport
+
+    def test_wizard_full_flow_probes_logins_lists_and_writes_local_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            exit_code, stdout, stderr, transport = self.run_connect_wizard(
+                config_dir,
+                [
+                    (200, health_ok()),
+                    (200, login_ok()),
+                    (200, org_list()),
+                    (200, project_list()),
+                    (201, api_key_issued()),
+                ],
+                ["", "alice", "secret", "1", "1", "cli-key"],
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            methods = [call["method"] for call in transport.calls]
+            self.assertEqual(
+                ["GET", "POST", "GET", "GET", "POST"], methods
+            )
+            self.assertEqual(
+                "http://localhost:8000/-/healthz/", transport.calls[0]["url"]
+            )
+            self.assertEqual(
+                "http://localhost:8000/v1/auth/login", transport.calls[1]["url"]
+            )
+            self.assertEqual(
+                {"username": "alice", "password": "secret"},
+                transport.calls[1]["payload"],
+            )
+            self.assertEqual(
+                "http://localhost:8000/v1/admin/organizations/",
+                transport.calls[2]["url"],
+            )
+            self.assertEqual(
+                f"Token {DRF_TOKEN}",
+                transport.calls[2]["headers"]["Authorization"],
+            )
+            self.assertEqual(
+                "http://localhost:8000/v1/admin/projects/",
+                transport.calls[3]["url"],
+            )
+            self.assertEqual(
+                ORG_ID,
+                transport.calls[3]["headers"]["X-Engram-Organization"],
+            )
+            self.assertEqual(
+                f"Token {DRF_TOKEN}",
+                transport.calls[3]["headers"]["Authorization"],
+            )
+            issue_call = transport.calls[4]
+            self.assertEqual(
+                "http://localhost:8000/v1/admin/api-keys/", issue_call["url"]
+            )
+            self.assertEqual(
+                ORG_ID,
+                issue_call["headers"]["X-Engram-Organization"],
+            )
+            self.assertEqual(
+                f"Token {DRF_TOKEN}", issue_call["headers"]["Authorization"]
+            )
+            self.assertEqual("cli-key", issue_call["payload"]["name"])
+            self.assertEqual(
+                [
+                    "memories:read",
+                    "observations:write",
+                    "search:query",
+                ],
+                issue_call["payload"]["capabilities"],
+            )
+
+            config = read_json(config_dir / "config.json")
+            credentials = read_json(config_dir / "credentials.json")
+            self.assertEqual(
+                "http://localhost:8000", config["server_url"]
+            )
+            self.assertEqual(ORG_ID, config["organization_id"])
+            self.assertEqual(PROJECT_ID, config["project_id"])
+            self.assertEqual(RAW_KEY, credentials["api_key"])
+            self.assertEqual(
+                0o600,
+                stat.S_IMODE((config_dir / "credentials.json").stat().st_mode),
+            )
+            self.assertTrue(
+                (config_dir / "hooks" / "codex.json").exists()
+            )
+            self.assertTrue(
+                (config_dir / "hooks" / "claude_code.json").exists()
+            )
+            self.assertIn("connected", stdout)
+            self.assertIn(PROJECT_ID, stdout)
+            self.assertNotIn("secret", stdout)
+            self.assertNotIn(DRF_TOKEN, stdout)
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn("Traceback", stderr)
+
+    def test_wizard_reprompts_server_when_health_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            exit_code, stdout, stderr, transport = self.run_connect_wizard(
+                config_dir,
+                [
+                    (503, {"status": "unavailable"}),
+                    (200, health_ok()),
+                    (200, login_ok()),
+                    (200, org_list()),
+                    (200, project_list()),
+                    (201, api_key_issued()),
+                ],
+                [
+                    "http://broken.example",
+                    "http://localhost:8000",
+                    "alice",
+                    "secret",
+                    "1",
+                    "1",
+                    "cli-key",
+                ],
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(6, len(transport.calls))
+            self.assertEqual(
+                "http://broken.example/-/healthz/", transport.calls[0]["url"]
+            )
+            self.assertEqual(
+                "http://localhost:8000/-/healthz/", transport.calls[1]["url"]
+            )
+            self.assertIn("Could not reach", stderr)
+
+    def test_wizard_surfaces_login_failure_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            exit_code, stdout, stderr, transport = self.run_connect_wizard(
+                config_dir,
+                [
+                    (200, health_ok()),
+                    (401, {"code": "invalid_credentials", "detail": "Bad creds"}),
+                    (200, login_ok()),
+                    (200, org_list()),
+                    (200, project_list()),
+                    (201, api_key_issued()),
+                ],
+                [
+                    "",
+                    "alice",
+                    "wrong",
+                    "alice",
+                    "secret",
+                    "1",
+                    "1",
+                    "cli-key",
+                ],
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            login_calls = [
+                call
+                for call in transport.calls
+                if call["url"].endswith("/v1/auth/login")
+            ]
+            self.assertEqual(2, len(login_calls))
+            self.assertEqual("wrong", login_calls[0]["payload"]["password"])
+            self.assertEqual("secret", login_calls[1]["payload"]["password"])
+            self.assertIn("Login failed", stderr)
+
+    def test_wizard_login_failure_without_retry_surfaces_error_and_writes_nothing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            exit_code, stdout, stderr, transport = self.run_connect_wizard(
+                config_dir,
+                [
+                    (200, health_ok()),
+                    (
+                        401,
+                        {"code": "invalid_credentials", "detail": "Bad creds"},
+                    ),
+                    (
+                        401,
+                        {"code": "invalid_credentials", "detail": "Bad creds"},
+                    ),
+                    (
+                        401,
+                        {"code": "invalid_credentials", "detail": "Bad creds"},
+                    ),
+                ],
+                [
+                    "",
+                    "alice",
+                    "wrong1",
+                    "alice",
+                    "wrong2",
+                    "alice",
+                    "wrong3",
+                ],
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("invalid_credentials", stderr)
+            self.assertEqual([], list(config_dir.rglob("*")))
+
+    def test_wizard_preserves_non_interactive_flag_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = FakeTransport([(200, dry_run_ok()), (200, dry_run_ok())])
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = main.build_parser().parse_args(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--project",
+                    PROJECT_ID,
+                    "--config-dir",
+                    str(config_dir),
+                ]
+            )
+            exit_code = run_connect(
+                args,
+                stdout,
+                stderr,
+                transport,
+                prompt=StubPrompt(["should-not-be-called"]),
+                interactive=False,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(2, len(transport.calls))
+            self.assertEqual(
+                "https://engram.example/v1/hooks/dry-run",
+                transport.calls[0]["url"],
+            )
+
+    def test_wizard_non_interactive_missing_flags_errors_without_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            transport = FakeTransport([])
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            args = main.build_parser().parse_args(
+                ["connect", "--config-dir", tmp]
+            )
+            exit_code = run_connect(
+                args,
+                stdout,
+                stderr,
+                transport,
+                prompt=StubPrompt(["should-not-be-called"]),
+                interactive=False,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("missing_server_url", stderr.getvalue())
+            self.assertEqual([], transport.calls)
+
+
+class McpInstallTests(unittest.TestCase):
+    def run_cli(
+        self,
+        argv: list[str],
+        transport: FakeTransport,
+    ) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        exit_code = main.main(
+            argv, stdin=None, stdout=stdout, stderr=stderr, transport=transport
+        )
+
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def connect(self, config_dir: Path) -> None:
+        transport = FakeTransport(
+            [(200, dry_run_ok()), (200, dry_run_ok())]
+        )
+        exit_code, _stdout, stderr = self.run_cli(
+            [
+                "connect",
+                "--server",
+                "https://engram.example/",
+                "--api-key",
+                RAW_KEY,
+                "--project",
+                PROJECT_ID,
+                "--team",
+                TEAM_ID,
+                "--config-dir",
+                str(config_dir),
+            ],
+            transport,
+        )
+        self.assertEqual(0, exit_code, stderr)
+
+    def test_mcp_install_default_writes_engram_entry_to_claude_code_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(claude_code_config.exists())
+            data = read_json(claude_code_config)
+            servers = data["mcpServers"]
+            self.assertIn("engram", servers)
+            entry = servers["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(["-m", "engram_mcp"], entry["args"])
+            env = entry["env"]
+            self.assertEqual("https://engram.example", env["ENGRAM_SERVER_URL"])
+            self.assertEqual(RAW_KEY, env["ENGRAM_API_KEY"])
+            self.assertEqual(PROJECT_ID, env["ENGRAM_PROJECT_ID"])
+            self.assertIn("engram", stdout)
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_mcp_install_creates_file_with_mcp_servers_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertIn("mcpServers", data)
+            self.assertIn("engram", data["mcpServers"])
+
+    def test_mcp_install_merges_engram_entry_without_duplicating_or_dropping_existing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+            claude_code_config.parent.mkdir(parents=True, exist_ok=True)
+            existing = {
+                "mcpServers": {
+                    "other": {
+                        "command": "node",
+                        "args": ["other.js"],
+                    },
+                    "engram": {
+                        "command": "stale",
+                        "args": ["old"],
+                        "env": {"ENGRAM_API_KEY": "old-key"},
+                    },
+                },
+                "theme": "dark",
+            }
+            claude_code_config.write_text(
+                json.dumps(existing), encoding="utf-8"
+            )
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertEqual("dark", data["theme"])
+            servers = data["mcpServers"]
+            self.assertIn("other", servers)
+            self.assertEqual("node", servers["other"]["command"])
+            self.assertIn("engram", servers)
+            entry = servers["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(["-m", "engram_mcp"], entry["args"])
+            self.assertEqual(RAW_KEY, entry["env"]["ENGRAM_API_KEY"])
+            engram_entries = [
+                name for name in servers if name == "engram"
+            ]
+            self.assertEqual(1, len(engram_entries))
+
+    def test_mcp_install_is_idempotent_on_repeat_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+
+            for _ in range(2):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "mcp-install",
+                        "--agent",
+                        "claude_code",
+                        "--config-dir",
+                        str(config_dir),
+                        "--claude-code-config",
+                        str(claude_code_config),
+                    ],
+                    FakeTransport([]),
+                )
+                self.assertEqual(0, exit_code, stderr)
+
+            data = read_json(claude_code_config)
+            servers = data["mcpServers"]
+            self.assertEqual(
+                ["engram"], [name for name in servers if name == "engram"]
+            )
+
+    def test_mcp_install_agent_flag_claude_desktop_writes_desktop_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            desktop_dir = config_dir / "Claude"
+            desktop_config = desktop_dir / "claude_desktop_config.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "claude_desktop",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-desktop-config",
+                    str(desktop_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(desktop_config.exists())
+            data = read_json(desktop_config)
+            entry = data["mcpServers"]["engram"]
+            self.assertEqual("python", entry["command"])
+            self.assertEqual(RAW_KEY, entry["env"]["ENGRAM_API_KEY"])
+            self.assertEqual(PROJECT_ID, entry["env"]["ENGRAM_PROJECT_ID"])
+
+    def test_mcp_install_agent_flag_both_writes_both_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            claude_code_config = config_dir / "claude.json"
+            desktop_config = config_dir / "claude_desktop_config.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--agent",
+                    "both",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                    "--claude-desktop-config",
+                    str(desktop_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue(claude_code_config.exists())
+            self.assertTrue(desktop_config.exists())
+            self.assertEqual(
+                "python",
+                read_json(claude_code_config)["mcpServers"]["engram"]["command"],
+            )
+            self.assertEqual(
+                "python",
+                read_json(desktop_config)["mcpServers"]["engram"]["command"],
+            )
+
+    def test_mcp_install_reports_error_when_not_connected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertFalse(claude_code_config.exists())
+            self.assertIn("missing_config", stderr)
+            self.assertIn("engram connect", stderr)
+
+    def test_mcp_install_reports_error_when_credentials_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            (config_dir / "credentials.json").unlink()
+            claude_code_config = config_dir / "claude.json"
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "mcp-install",
+                    "--config-dir",
+                    str(config_dir),
+                    "--claude-code-config",
+                    str(claude_code_config),
+                ],
+                FakeTransport([]),
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("missing_credential", stderr)
 
 
 if __name__ == "__main__":
