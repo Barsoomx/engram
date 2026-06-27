@@ -13,10 +13,10 @@ import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import {
   Archive,
-  GitBranch,
   Pencil,
   Plus,
   ShieldCheck,
+  Users,
 } from 'lucide-react';
 import * as React from 'react';
 
@@ -26,13 +26,13 @@ import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import {
-  useArchiveProject,
-  useCreateProject,
-  useProjects,
-  useUpdateProject,
-} from '@/hooks/use-projects';
+  useArchiveTeam,
+  useCreateTeam,
+  useTeams,
+  useUpdateTeam,
+} from '@/hooks/use-teams';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
-import type { Project, ProjectWriteInput } from '@/lib/admin-api';
+import type { Team, TeamWriteInput } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
 
 function formatDateTime(value: string | null): string {
@@ -50,16 +50,16 @@ function formatDateTime(value: string | null): string {
   }
 }
 
-function ProjectsTable({
+function TeamsTable({
   items,
   canAdmin,
   onEdit,
   onArchive,
 }: {
-  items: Project[];
+  items: Team[];
   canAdmin: boolean;
-  onEdit: (project: Project) => void;
-  onArchive: (project: Project) => void;
+  onEdit: (team: Team) => void;
+  onArchive: (team: Team) => void;
 }) {
   return (
     <div className='overflow-x-auto'>
@@ -68,12 +68,6 @@ function ProjectsTable({
           <tr className='border-b border-divider'>
             <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
             <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>
-              Repository
-            </th>
-            <th className='py-2 px-3 text-default-500 font-medium'>
-              Default branch
-            </th>
             <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
             {canAdmin && (
               <th className='py-2 px-3 text-default-500 font-medium text-right'>
@@ -83,20 +77,14 @@ function ProjectsTable({
           </tr>
         </thead>
         <tbody>
-          {items.map((project) => (
-            <tr key={project.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 text-foreground'>{project.name}</td>
+          {items.map((team) => (
+            <tr key={team.id} className='border-b border-divider/50'>
+              <td className='py-2 px-3 text-foreground'>{team.name}</td>
               <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {project.slug}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700 break-all max-w-[20rem]'>
-                {project.repository_url || '—'}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700 whitespace-nowrap'>
-                {project.default_branch || '—'}
+                {team.slug}
               </td>
               <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {formatDateTime(project.created_at)}
+                {formatDateTime(team.created_at)}
               </td>
               {canAdmin && (
                 <td className='py-2 px-3'>
@@ -105,7 +93,7 @@ function ProjectsTable({
                       size='sm'
                       variant='flat'
                       startContent={<Pencil className='w-3.5 h-3.5' />}
-                      onPress={() => onEdit(project)}
+                      onPress={() => onEdit(team)}
                     >
                       Edit
                     </Button>
@@ -114,8 +102,8 @@ function ProjectsTable({
                       color='danger'
                       variant='flat'
                       startContent={<Archive className='w-3.5 h-3.5' />}
-                      onPress={() => onArchive(project)}
-                      isDisabled={project.archived_at !== null}
+                      onPress={() => onArchive(team)}
+                      isDisabled={team.archived_at !== null}
                     >
                       Archive
                     </Button>
@@ -130,54 +118,46 @@ function ProjectsTable({
   );
 }
 
-type ProjectModalMode = 'create' | 'edit';
+type TeamModalMode = 'create' | 'edit';
 
-interface ProjectModalProps {
+interface TeamModalProps {
   isOpen: boolean;
-  mode: ProjectModalMode;
-  initialProject: Project | null;
+  mode: TeamModalMode;
+  initialTeam: Team | null;
   isPending: boolean;
   error: string | null;
   onClose: () => void;
-  onSubmit: (input: ProjectWriteInput) => Promise<boolean>;
+  onSubmit: (input: TeamWriteInput) => Promise<boolean>;
 }
 
-function ProjectModal({
+function TeamModal({
   isOpen,
   mode,
-  initialProject,
+  initialTeam,
   isPending,
   error,
   onClose,
   onSubmit,
-}: ProjectModalProps) {
+}: TeamModalProps) {
   const [name, setName] = React.useState('');
   const [slug, setSlug] = React.useState('');
-  const [repositoryUrl, setRepositoryUrl] = React.useState('');
-  const [defaultBranch, setDefaultBranch] = React.useState('');
 
   React.useEffect(() => {
     if (!isOpen) {
       setName('');
       setSlug('');
-      setRepositoryUrl('');
-      setDefaultBranch('');
 
       return;
     }
 
-    if (mode === 'edit' && initialProject) {
-      setName(initialProject.name);
-      setSlug(initialProject.slug);
-      setRepositoryUrl(initialProject.repository_url);
-      setDefaultBranch(initialProject.default_branch);
+    if (mode === 'edit' && initialTeam) {
+      setName(initialTeam.name);
+      setSlug(initialTeam.slug);
     } else {
       setName('');
       setSlug('');
-      setRepositoryUrl('');
-      setDefaultBranch('');
     }
-  }, [isOpen, mode, initialProject]);
+  }, [isOpen, mode, initialTeam]);
 
   const canSubmit =
     name.trim().length > 0 && slug.trim().length > 0 && !isPending;
@@ -188,19 +168,14 @@ function ProjectModal({
       return;
     }
 
-    const ok = await onSubmit({
-      name: name.trim(),
-      slug: slug.trim(),
-      repository_url: repositoryUrl.trim(),
-      default_branch: defaultBranch.trim(),
-    });
+    const ok = await onSubmit({ name: name.trim(), slug: slug.trim() });
 
     if (ok) {
       onClose();
     }
   }
 
-  const title = mode === 'create' ? 'Create project' : 'Edit project';
+  const title = mode === 'create' ? 'Create team' : 'Edit team';
   const confirmLabel = mode === 'create' ? 'Create' : 'Save';
 
   return (
@@ -222,7 +197,7 @@ function ProjectModal({
                 <Input
                   label='Name'
                   labelPlacement='outside'
-                  placeholder='Engram Core'
+                  placeholder='Engineering'
                   value={name}
                   onValueChange={setName}
                   maxLength={255}
@@ -231,29 +206,10 @@ function ProjectModal({
                 <Input
                   label='Slug'
                   labelPlacement='outside'
-                  placeholder='engram-core'
+                  placeholder='engineering'
                   value={slug}
                   onValueChange={setSlug}
                   description='Lowercase, unique within the organization.'
-                  isDisabled={isPending}
-                />
-                <Input
-                  label='Repository URL'
-                  labelPlacement='outside'
-                  placeholder='git@github.com:org/repo.git'
-                  value={repositoryUrl}
-                  onValueChange={setRepositoryUrl}
-                  isDisabled={isPending}
-                />
-                <Input
-                  label='Default branch'
-                  labelPlacement='outside'
-                  placeholder='main'
-                  value={defaultBranch}
-                  onValueChange={setDefaultBranch}
-                  startContent={
-                    <GitBranch className='w-3.5 h-3.5 text-default-500' />
-                  }
                   isDisabled={isPending}
                 />
                 {error && (
@@ -288,7 +244,7 @@ function ProjectModal({
   );
 }
 
-export default function ProjectsPage() {
+export default function TeamsPage() {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
   const meQuery = useQuery<MeResponse>({
     queryKey: ['auth', 'me'],
@@ -301,19 +257,19 @@ export default function ProjectsPage() {
   );
 
   const params = React.useMemo(() => ({ page: 1, pageSize: 50 }), []);
-  const projectsQuery = useProjects(activeOrgId, params);
+  const teamsQuery = useTeams(activeOrgId, params);
 
-  const createMutation = useCreateProject(activeOrgId);
-  const updateMutation = useUpdateProject(activeOrgId);
-  const archiveMutation = useArchiveProject(activeOrgId);
+  const createMutation = useCreateTeam(activeOrgId);
+  const updateMutation = useUpdateTeam(activeOrgId);
+  const archiveMutation = useArchiveTeam(activeOrgId);
 
-  const [modalMode, setModalMode] = React.useState<ProjectModalMode>('create');
+  const [modalMode, setModalMode] = React.useState<TeamModalMode>('create');
   const [modalOpen, setModalOpen] = React.useState(false);
-  const [editTarget, setEditTarget] = React.useState<Project | null>(null);
+  const [editTarget, setEditTarget] = React.useState<Team | null>(null);
   const [modalError, setModalError] = React.useState<string | null>(null);
-  const [archiveTarget, setArchiveTarget] = React.useState<Project | null>(null);
+  const [archiveTarget, setArchiveTarget] = React.useState<Team | null>(null);
 
-  const canAdmin = hasCapability(capabilities, 'projects:admin');
+  const canAdmin = hasCapability(capabilities, 'teams:admin');
 
   function openCreate() {
     setModalMode('create');
@@ -322,14 +278,14 @@ export default function ProjectsPage() {
     setModalOpen(true);
   }
 
-  function openEdit(project: Project) {
+  function openEdit(team: Team) {
     setModalMode('edit');
-    setEditTarget(project);
+    setEditTarget(team);
     setModalError(null);
     setModalOpen(true);
   }
 
-  async function handleSubmit(input: ProjectWriteInput): Promise<boolean> {
+  async function handleSubmit(input: TeamWriteInput): Promise<boolean> {
     setModalError(null);
 
     try {
@@ -349,7 +305,7 @@ export default function ProjectsPage() {
         detail = data?.detail;
       }
 
-      setModalError(detail ?? 'Failed to save project.');
+      setModalError(detail ?? 'Failed to save team.');
 
       return false;
     }
@@ -374,16 +330,16 @@ export default function ProjectsPage() {
       ? updateMutation.isPending
       : createMutation.isPending;
 
-  const isLoading = meQuery.isLoading || projectsQuery.isLoading;
-  const items = projectsQuery.data?.results ?? [];
+  const isLoading = meQuery.isLoading || teamsQuery.isLoading;
+  const items = teamsQuery.data?.results ?? [];
   const meLoaded = meQuery.data !== undefined;
 
   return (
-    <CapabilityGate capabilities={capabilities} required='projects:read'>
+    <CapabilityGate capabilities={capabilities} required='teams:read'>
       <section className='space-y-6'>
         <PageHeader
-          title='Projects'
-          subtitle='Create, edit, and archive projects within this organization.'
+          title='Teams'
+          subtitle='Create, edit, and archive teams within this organization.'
           actions={
             canAdmin ? (
               <Button
@@ -392,7 +348,7 @@ export default function ProjectsPage() {
                 onPress={openCreate}
                 isDisabled={!meLoaded}
               >
-                Create project
+                Create team
               </Button>
             ) : null
           }
@@ -403,7 +359,7 @@ export default function ProjectsPage() {
             <table className='w-full border-collapse text-left text-sm'>
               <thead>
                 <tr className='border-b border-divider'>
-                  {Array.from({ length: canAdmin ? 6 : 5 }).map((_, index) => (
+                  {Array.from({ length: canAdmin ? 4 : 3 }).map((_, index) => (
                     <th
                       key={index}
                       className='py-2 px-3 text-default-500 font-medium'
@@ -413,13 +369,13 @@ export default function ProjectsPage() {
                   ))}
                 </tr>
               </thead>
-              <TableRowSkeleton columns={canAdmin ? 6 : 5} />
+              <TableRowSkeleton columns={canAdmin ? 4 : 3} />
             </table>
           ) : items.length === 0 ? (
             <EmptyState
-              title='No projects yet'
-              description='Create a project to scope memory ingestion and retrieval within this organization.'
-              icon={<GitBranch className='w-6 h-6' />}
+              title='No teams yet'
+              description='Create a team to group members and projects within this organization.'
+              icon={<Users className='w-6 h-6' />}
               action={
                 canAdmin ? (
                   <Button
@@ -427,13 +383,13 @@ export default function ProjectsPage() {
                     startContent={<Plus className='w-4 h-4' />}
                     onPress={openCreate}
                   >
-                    Create project
+                    Create team
                   </Button>
                 ) : undefined
               }
             />
           ) : (
-            <ProjectsTable
+            <TeamsTable
               items={items}
               canAdmin={canAdmin}
               onEdit={openEdit}
@@ -445,7 +401,7 @@ export default function ProjectsPage() {
         {items.length > 0 && (
           <div className='flex items-center justify-between text-xs text-default-500'>
             <p>
-              Showing {items.length} project{items.length === 1 ? '' : 's'}.
+              Showing {items.length} team{items.length === 1 ? '' : 's'}.
             </p>
             {canAdmin && (
               <p className='flex items-center gap-1'>
@@ -456,18 +412,18 @@ export default function ProjectsPage() {
           </div>
         )}
 
-        {projectsQuery.isError && (
+        {teamsQuery.isError && (
           <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {projectsQuery.error instanceof Error
-              ? projectsQuery.error.message
-              : 'Failed to load projects.'}
+            {teamsQuery.error instanceof Error
+              ? teamsQuery.error.message
+              : 'Failed to load teams.'}
           </pre>
         )}
 
-        <ProjectModal
+        <TeamModal
           isOpen={modalOpen}
           mode={modalMode}
-          initialProject={editTarget}
+          initialTeam={editTarget}
           isPending={mutationPending}
           error={modalError}
           onClose={() => setModalOpen(false)}
@@ -476,10 +432,10 @@ export default function ProjectsPage() {
 
         <ConfirmDialog
           isOpen={archiveTarget !== null}
-          title='Archive project'
+          title='Archive team'
           description={
             archiveTarget
-              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? Memory within this project will be retained but hidden from active views.`
+              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? Members and projects in this team will be retained but hidden from active views.`
               : undefined
           }
           confirmLabel='Archive'

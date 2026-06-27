@@ -6,8 +6,10 @@ import { Menu } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
+import { OrgSwitcher } from '@/components/layout/org-switcher';
 import { Sidebar } from '@/components/layout/sidebar';
-import { clearToken, fetchMe, getToken, logout, type MeResponse } from '@/lib/auth';
+import { clearToken, fetchMe, getToken, hasCapability, logout, type MeResponse } from '@/lib/auth';
+import { useOrgStore } from '@/lib/org-store';
 
 function FullPageLoader() {
   return (
@@ -38,6 +40,7 @@ export default function AdminShellLayout({
   const router = useRouter();
   const [sidebarOpen, setSidebarOpen] = React.useState(false);
   const [hasToken, setHasToken] = React.useState<boolean | null>(null);
+  const activeOrgId = useOrgStore((state) => state.activeOrgId);
 
   React.useEffect(() => {
     setHasToken(Boolean(getToken()));
@@ -81,6 +84,7 @@ export default function AdminShellLayout({
   return (
     <div className='min-h-screen bg-background text-foreground'>
       <Sidebar
+        capabilities={profile?.capabilities ?? []}
         isOpen={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
         onLogout={handleLogout}
@@ -97,7 +101,12 @@ export default function AdminShellLayout({
         <span className='ml-3 text-sm font-bold text-foreground'>Engram</span>
       </div>
 
-      <header className='hidden lg:flex h-14 items-center justify-end px-8 border-b border-divider bg-content1/50 backdrop-blur'>
+      <header className='hidden lg:flex h-14 items-center justify-between px-8 border-b border-divider bg-content1/50 backdrop-blur'>
+        <div className='flex items-center'>
+          {profile && hasCapability(profile.capabilities, 'organizations:read') && (
+            <OrgSwitcher orgId={activeOrgId} />
+          )}
+        </div>
         {profile && (
           <div className={clsx('flex items-center gap-3 text-sm')}>
             <span className='text-default-500'>Signed in as</span>

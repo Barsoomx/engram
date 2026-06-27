@@ -6,6 +6,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
+import { getToken } from '@/lib/auth';
+import { useOrgStore } from '@/lib/org-store';
+
 export interface ProvidersProps {
   children: React.ReactNode;
 }
@@ -23,6 +26,29 @@ export function Providers({ children }: ProvidersProps) {
         },
       }),
   );
+
+  const activeOrgId = useOrgStore((state) => state.activeOrgId);
+  const [activeToken, setActiveToken] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setActiveToken(getToken());
+  }, []);
+
+  React.useEffect(() => {
+    const syncToken = (): void => {
+      setActiveToken(getToken());
+    };
+
+    window.addEventListener('storage', syncToken);
+
+    return () => {
+      window.removeEventListener('storage', syncToken);
+    };
+  }, []);
+
+  React.useEffect(() => {
+    queryClient.clear();
+  }, [activeOrgId, activeToken, queryClient]);
 
   return (
     <HeroUIProvider navigate={router.push}>

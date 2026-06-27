@@ -3,6 +3,8 @@
 import clsx from 'clsx';
 import {
   Activity,
+  BadgeCheck,
+  Building2,
   ClipboardList,
   Database,
   FolderTree,
@@ -10,27 +12,33 @@ import {
   LayoutDashboard,
   LogOut,
   ScrollText,
+  Users,
   X,
 } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import * as React from 'react';
 
-import { logout } from '@/lib/auth';
+import { hasCapability, logout } from '@/lib/auth';
 
 export interface SidebarNavItem {
   href: string;
   label: string;
   icon: typeof LayoutDashboard;
+  capability?: string;
 }
 
 const NAV_ITEMS: SidebarNavItem[] = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/memories', label: 'Memories', icon: Database },
   { href: '/observations', label: 'Observations', icon: ScrollText },
-  { href: '/api-keys', label: 'API Keys', icon: Key },
-  { href: '/projects', label: 'Projects', icon: FolderTree },
-  { href: '/audit', label: 'Audit', icon: ClipboardList },
+  { href: '/organizations', label: 'Organizations', icon: Building2, capability: 'organizations:read' },
+  { href: '/teams', label: 'Teams', icon: Users, capability: 'teams:read' },
+  { href: '/projects', label: 'Projects', icon: FolderTree, capability: 'projects:read' },
+  { href: '/members', label: 'Members', icon: Users, capability: 'members:read' },
+  { href: '/roles', label: 'Roles', icon: BadgeCheck, capability: 'roles:read' },
+  { href: '/api-keys', label: 'API Keys', icon: Key, capability: 'api_keys:read' },
+  { href: '/audit', label: 'Audit', icon: ClipboardList, capability: 'audit:read' },
   { href: '/health', label: 'Health', icon: Activity },
 ];
 
@@ -38,10 +46,20 @@ export interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   onLogout: () => void;
+  capabilities: string[];
 }
 
-export function Sidebar({ isOpen, onClose, onLogout }: SidebarProps) {
+export function Sidebar({ isOpen, onClose, onLogout, capabilities }: SidebarProps) {
   const pathname = usePathname();
+
+  const visibleItems = NAV_ITEMS.filter((item) => {
+    if (!item.capability) {
+
+      return true;
+    }
+
+    return hasCapability(capabilities, item.capability);
+  });
 
   const isActive = (href: string) => {
     if (href === '/') {
@@ -87,7 +105,7 @@ export function Sidebar({ isOpen, onClose, onLogout }: SidebarProps) {
         </div>
 
         <nav className='flex-1 px-3 py-4 space-y-1'>
-          {NAV_ITEMS.map((item) => {
+          {visibleItems.map((item) => {
             const Icon = item.icon;
             const active = isActive(item.href);
 
