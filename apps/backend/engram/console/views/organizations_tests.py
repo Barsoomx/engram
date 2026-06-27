@@ -116,12 +116,15 @@ def test_list_returns_member_organizations_with_pagination(f_owner_user_token: s
 
 
 @pytest.mark.django_db
-def test_list_denied_without_capability(f_developer_user_token: str, f_other_org: Organization) -> None:
-    client = _auth_client(f_developer_user_token, org=f_other_org)
+def test_list_available_without_active_org_header(f_developer_user_token: str) -> None:
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {f_developer_user_token}')
 
     response = client.get('/v1/admin/organizations/')
 
-    assert response.status_code == 403
+    assert response.status_code == 200
+
+    assert 'results' in response.data
 
 
 @pytest.mark.django_db

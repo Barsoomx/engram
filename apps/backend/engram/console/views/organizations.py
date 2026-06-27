@@ -6,6 +6,8 @@ from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.serializers import BaseSerializer
 
+from engram.access.auth_services import external_id_for_user
+from engram.access.models import Identity, IdentityType
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.organizations import (
@@ -25,7 +27,10 @@ class OrganizationViewSet(
     permission_classes = [IsAuthenticated]
 
     def get_permissions(self) -> list[BasePermission]:
-        if self.action in {'list', 'retrieve'}:
+        if self.action == 'list':
+            return [IsAuthenticated()]
+
+        if self.action == 'retrieve':
             return [
                 IsAuthenticated(),
                 ActiveOrganizationPermission(),
@@ -39,6 +44,17 @@ class OrganizationViewSet(
         ]
 
     def get_queryset(self) -> Any:
+        if self.action == 'list':
+            identity_ids = Identity.objects.filter(
+                identity_type=IdentityType.USER,
+                external_id=external_id_for_user(self.request.user),
+            ).values('id')
+
+            return Organization.objects.filter(
+                organization_memberships__identity_id__in=identity_ids,
+                organization_memberships__active=True,
+            ).distinct()
+
         return Organization.objects.filter(
             organization_memberships__identity=self.request.user_identity,
             organization_memberships__active=True,
