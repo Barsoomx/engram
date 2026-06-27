@@ -1,6 +1,9 @@
 import axios, { AxiosInstance, AxiosResponse } from 'axios';
 
+import { useOrgStore } from '@/lib/org-store';
+
 const TOKEN_STORAGE_KEY = 'engram_token';
+const ORG_HEADER = 'X-Engram-Organization';
 
 const API_URL = process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000';
 
@@ -66,7 +69,29 @@ export function apiClient(): AxiosInstance {
     instance.defaults.headers.common.Authorization = `Token ${token}`;
   }
 
+  const activeOrgId = useOrgStore.getState().activeOrgId;
+
+  if (activeOrgId) {
+    instance.defaults.headers.common[ORG_HEADER] = activeOrgId;
+  }
+
   return instance;
+}
+
+export function hasCapability(capabilities: string[], code: string): boolean {
+  if (capabilities.includes(code)) {
+
+    return true;
+  }
+
+  const group = code.split(':')[0];
+
+  if (group && capabilities.includes(`${group}:*`)) {
+
+    return true;
+  }
+
+  return false;
 }
 
 export async function login(
