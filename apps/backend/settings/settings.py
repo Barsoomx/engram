@@ -56,6 +56,7 @@ ROOT_URLCONF = 'settings.urls'
 WSGI_APPLICATION = 'settings.wsgi.application'
 ASGI_APPLICATION = 'settings.asgi.application'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+HTTP_HOST = os.getenv('HTTP_HOST', 'http://localhost:8000')
 CSRF_TRUSTED_ORIGINS = [
     HTTP_HOST,
     'http://127.0.0.1',
