@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import uuid
 from argparse import Namespace
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -21,10 +23,14 @@ from engram_cli.config import (
 )
 from engram_cli.http import (
     Transport,
+    admin_get,
+    admin_post,
     get_health,
     get_json,
     post_dry_run,
     post_json,
+    post_login,
+    probe_health,
     urllib_transport,
 )
 
@@ -35,6 +41,18 @@ class CliError(Exception):
         self.code = code
         self.detail = detail
         self.remediation = remediation
+
+
+PromptFn = Callable[[str], str]
+
+DEFAULT_SERVER_URL = "http://localhost:8000"
+WIZARD_API_KEY_CAPABILITIES = (
+    "memories:read",
+    "observations:write",
+    "search:query",
+)
+MAX_LOGIN_RETRIES = 3
+MAX_SERVER_RETRIES = 3
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -52,6 +70,11 @@ ERROR_REMEDIATION: dict[str, str] = {
     "missing_capability": "Use a key with observations:write for hook dry-run.",
     "project_scope_denied": "Use a key scoped to the requested project.",
     "team_scope_denied": "Use a key scoped to the requested team.",
+    "invalid_credentials": "Check the username and password and try again.",
+    "wizard_aborted": "Connect wizard was cancelled.",
+    "no_organizations": "Ask an admin to add your account to an organization.",
+    "no_projects": "Ask an admin to create a project in this organization.",
+    "api_key_issue_failed": "Check server logs and key capabilities.",
 }
 
 
@@ -60,6 +83,42 @@ def run_connect(
     stdout: TextIO,
     stderr: TextIO,
     transport: Transport | None = None,
+    *,
+    prompt: PromptFn | None = None,
+    interactive: bool | None = None,
+) -> int:
+    active_transport = transport or urllib_transport
+    is_interactive = interactive if interactive is not None else stdin_is_tty()
+    if not is_interactive or all_flags_present(args):
+        return run_connect_flags(args, stdout, stderr, active_transport)
+
+    prompt_fn = prompt if prompt is not None else builtin_input
+
+    return run_connect_wizard(
+        args, stdout, stderr, active_transport, prompt_fn
+    )
+
+
+def all_flags_present(args: Namespace) -> bool:
+    return bool(args.server and args.api_key and args.project)
+
+
+def stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def builtin_input(message: str) -> str:
+    return input(message)
+
+
+def run_connect_flags(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport,
 ) -> int:
     api_key_for_redaction = args.api_key or ""
     try:
@@ -72,10 +131,9 @@ def run_connect(
         team_id = args.team or ""
         agent_version = args.agent_version or ""
         runtimes = normalize_runtimes(args.agent)
-        active_transport = transport or urllib_transport
         dry_run_results = [
             require_dry_run_ok(
-                active_transport,
+                transport,
                 server_url=server_url,
                 api_key=api_key,
                 project_id=project_id,
@@ -120,6 +178,293 @@ def run_connect(
         emit_error(stderr, error, api_key_for_redaction)
 
         return 1
+
+
+def run_connect_wizard(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport,
+    prompt: PromptFn,
+) -> int:
+    try:
+        team_id = args.team or ""
+        agent_version = args.agent_version or ""
+        runtimes = normalize_runtimes(args.agent)
+        server_url = prompt_server_url(prompt, stderr, transport)
+        drf_token = prompt_login(prompt, stdout, stderr, transport, server_url)
+        organizations = fetch_organizations(transport, server_url, drf_token)
+        organization_id = prompt_organization(prompt, stdout, organizations)
+        projects = fetch_projects(
+            transport, server_url, drf_token, organization_id
+        )
+        project_id = prompt_project(prompt, stdout, projects)
+        api_key_name = prompt_api_key_name(prompt)
+        api_key = issue_wizard_api_key(
+            transport,
+            server_url=server_url,
+            drf_token=drf_token,
+            organization_id=organization_id,
+            api_key_name=api_key_name,
+        )
+        paths = local_paths(args.config_dir)
+        fingerprint = credential_fingerprint(api_key)
+        write_local_state(
+            paths_root=paths.root,
+            server_url=server_url,
+            project_id=project_id,
+            team_id=team_id,
+            runtimes=runtimes,
+            agent_version=agent_version,
+            api_key=api_key,
+            fingerprint=fingerprint,
+            dry_run_result={
+                "resolved_actor": {},
+                "scope": {"organization_id": organization_id},
+            },
+            organization_id=organization_id,
+        )
+        stdout.write(f"connected Engram CLI to {server_url}\n")
+        stdout.write(f"organization: {organization_id}\n")
+        stdout.write(f"project: {project_id}\n")
+        stdout.write(f"runtimes: {', '.join(runtimes)}\n")
+        stdout.write(f"credential: {fingerprint}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, "")
+
+        return 1
+
+
+def prompt_server_url(
+    prompt: PromptFn, stderr: TextIO, transport: Transport
+) -> str:
+    for _ in range(MAX_SERVER_RETRIES):
+        raw = prompt(f"Server URL [{DEFAULT_SERVER_URL}]: ").strip()
+        if raw.lower() in {"quit", "exit"}:
+            raise CliError(
+                "wizard_aborted",
+                "Connect wizard cancelled",
+                remediation_for("wizard_aborted"),
+            )
+        candidate = raw or DEFAULT_SERVER_URL
+        try:
+            server_url = normalize_server_url(candidate)
+        except CliError as error:
+            stderr.write(f"{error.detail}\n")
+
+            continue
+        if probe_health(transport=transport, server_url=server_url):
+
+            return server_url
+        stderr.write(
+            f"Could not reach {server_url}/-/healthz/. Try another URL.\n"
+        )
+
+    raise CliError(
+        "server_unavailable",
+        "Server health check failed after retries",
+        remediation_for("server_unavailable"),
+    )
+
+
+def prompt_login(
+    prompt: PromptFn,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport,
+    server_url: str,
+) -> str:
+    for _ in range(MAX_LOGIN_RETRIES):
+        username = prompt("Username: ").strip()
+        if username.lower() in {"quit", "exit"}:
+            raise CliError(
+                "wizard_aborted",
+                "Connect wizard cancelled",
+                remediation_for("wizard_aborted"),
+            )
+        password = prompt("Password: ").strip()
+        status, body = post_login(
+            transport=transport,
+            server_url=server_url,
+            username=username,
+            password=password,
+        )
+        if status >= 200 and status < 300:
+            token = as_string(body.get("token"))
+            if token:
+
+                return token
+            raise CliError(
+                "invalid_response",
+                "Login response did not include a token",
+                remediation_for("invalid_response"),
+            )
+        code = as_string(body.get("code")) or "invalid_credentials"
+        detail = as_string(body.get("detail")) or remediation_for(code)
+        stderr.write(f"Login failed: {detail}\n")
+
+    raise CliError(
+        "invalid_credentials",
+        "Login failed after retries",
+        remediation_for("invalid_credentials"),
+    )
+
+
+def fetch_organizations(
+    transport: Transport, server_url: str, drf_token: str
+) -> list[dict[str, object]]:
+    status, body = admin_get(
+        transport=transport,
+        server_url=server_url,
+        path="/v1/admin/organizations/",
+        drf_token=drf_token,
+    )
+    if status < 200 or status >= 300:
+        raise error_from_body(body, fallback="http_error")
+    items = extract_results(body)
+    if not items:
+        raise CliError(
+            "no_organizations",
+            "Your account has no accessible organizations",
+            remediation_for("no_organizations"),
+        )
+
+    return items
+
+
+def prompt_organization(
+    prompt: PromptFn, stdout: TextIO, organizations: list[dict[str, object]]
+) -> str:
+    stdout.write("Organizations:\n")
+    for index, org in enumerate(organizations, start=1):
+        stdout.write(f"  {index}. {org.get('name')} ({org.get('slug')})\n")
+    selection = pick_from_list(prompt, organizations, "organization")
+
+    return as_string(organizations[selection - 1].get("id"))
+
+
+def fetch_projects(
+    transport: Transport,
+    server_url: str,
+    drf_token: str,
+    organization_id: str,
+) -> list[dict[str, object]]:
+    status, body = admin_get(
+        transport=transport,
+        server_url=server_url,
+        path="/v1/admin/projects/",
+        drf_token=drf_token,
+        organization_id=organization_id,
+    )
+    if status < 200 or status >= 300:
+        raise error_from_body(body, fallback="http_error")
+    items = extract_results(body)
+    if not items:
+        raise CliError(
+            "no_projects",
+            "This organization has no projects",
+            remediation_for("no_projects"),
+        )
+
+    return items
+
+
+def prompt_project(
+    prompt: PromptFn, stdout: TextIO, projects: list[dict[str, object]]
+) -> str:
+    stdout.write("Projects:\n")
+    for index, project in enumerate(projects, start=1):
+        stdout.write(f"  {index}. {project.get('name')} ({project.get('slug')})\n")
+    selection = pick_from_list(prompt, projects, "project")
+
+    return as_string(projects[selection - 1].get("id"))
+
+
+def prompt_api_key_name(prompt: PromptFn) -> str:
+    raw = prompt("API key name [engram-cli]: ").strip()
+
+    return raw or "engram-cli"
+
+
+def issue_wizard_api_key(
+    transport: Transport,
+    *,
+    server_url: str,
+    drf_token: str,
+    organization_id: str,
+    api_key_name: str,
+) -> str:
+    status, body = admin_post(
+        transport=transport,
+        server_url=server_url,
+        path="/v1/admin/api-keys/",
+        drf_token=drf_token,
+        organization_id=organization_id,
+        payload={
+            "name": api_key_name,
+            "capabilities": list(WIZARD_API_KEY_CAPABILITIES),
+        },
+    )
+    if status < 200 or status >= 300:
+        raise error_from_body(body, fallback="api_key_issue_failed")
+    plaintext = as_string(body.get("plaintext"))
+    if not plaintext:
+        raise CliError(
+            "api_key_issue_failed",
+            "API key response did not include plaintext",
+            remediation_for("api_key_issue_failed"),
+        )
+
+    return plaintext
+
+
+def pick_from_list(
+    prompt: PromptFn, items: list[dict[str, object]], label: str
+) -> int:
+    raw = prompt(f"Select {label} [1-{len(items)}]: ").strip()
+    if raw.lower() in {"quit", "exit"}:
+        raise CliError(
+            "wizard_aborted",
+            "Connect wizard cancelled",
+            remediation_for("wizard_aborted"),
+        )
+    try:
+        selection = int(raw)
+    except ValueError as error:
+        raise CliError(
+            "invalid_response",
+            f"Selection must be a number",
+            remediation_for("invalid_response"),
+        ) from error
+    if selection < 1 or selection > len(items):
+        raise CliError(
+            "invalid_response",
+            f"Selection must be between 1 and {len(items)}",
+            remediation_for("invalid_response"),
+        )
+
+    return selection
+
+
+def extract_results(body: dict[str, object]) -> list[dict[str, object]]:
+    results = body.get("results")
+    if isinstance(results, list):
+        return [item for item in results if isinstance(item, dict)]
+    if isinstance(body.get("count"), int) and not results:
+
+        return []
+    candidate = [
+        item for item in body.values() if isinstance(item, list)
+    ]
+    for items in candidate:
+        normalized = [item for item in items if isinstance(item, dict)]
+        if normalized:
+
+            return normalized
+
+    return []
 
 
 def run_doctor(
@@ -752,6 +1097,7 @@ def write_local_state(
     api_key: str,
     fingerprint: str,
     dry_run_result: dict[str, object],
+    organization_id: str = "",
 ) -> None:
     paths = local_paths(str(paths_root))
     connected_at = (
@@ -769,6 +1115,8 @@ def write_local_state(
         "resolved_actor": dry_run_result.get("resolved_actor", {}),
         "resolved_scope": dry_run_result.get("scope", {}),
     }
+    if organization_id:
+        config_payload["organization_id"] = organization_id
     credential_payload: dict[str, object] = {
         "version": 1,
         "api_key": api_key,
