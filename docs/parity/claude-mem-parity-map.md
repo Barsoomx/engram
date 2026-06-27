@@ -172,9 +172,9 @@ Classification:
 - `preserve`: normalized payload fields and response envelope.
 - `preserve`: `additionalContext` injection at session start.
 - `replace`: local worker start/version-check commands.
-- `defer`: native Claude Code package implementation. The first working path is
-  Codex; Claude-specific response formatting and installer/config writes remain
-  a separate checkpoint before Engram claims Claude Code runtime parity.
+- `preserve`: native Claude Code package and response formatting for the same
+  first package event contract as Codex: `SessionStart`, `PostToolUse`,
+  `Error`, and `Decision`.
 - `defer`: `PreToolUse` file timeline injection unless the first golden fixture
   requires it.
 - `defer`: `Stop` summary generation as a runtime hook until the session-summary
@@ -189,6 +189,9 @@ Engram target:
 - Missing server, bad credential, bad project, malformed payload, provider
   failure, and unsupported agent version all produce actionable contract-tested
   errors.
+- 2026-06-25 checkpoint: `packages/claude-plugin` plus the thin
+  `engram_cli hook` commands implement the Claude Code-native package and
+  response contract for `SessionStart`, `PostToolUse`, `Error`, and `Decision`.
 
 ### Codex
 
@@ -805,9 +808,9 @@ Required before North Star expansion:
 - Codex hook package and thin CLI event commands are implemented for
   `SessionStart`, `PostToolUse`, `Error`, and `Decision` through
   `packages/codex-plugin` and `packages/cli`.
-- Claude Code native package remains deferred because the first installed path
-  is Codex. Claude-specific response formatting and installer/config writes are
-  a separate checkpoint before Claude Code runtime parity can be claimed.
+- Claude Code native package and thin CLI response formatting are implemented
+  for `SessionStart`, `PostToolUse`, `Error`, and `Decision` through
+  `packages/claude-plugin` and `packages/cli`.
 - Hook/session-start request to context API.
 - Hook observation ingest to API.
 - PostgreSQL raw event envelope, normalized observation, generated memory or
@@ -854,6 +857,8 @@ needs last-assistant-message or transcript-derived evidence, cover it only
 through migration/import artifacts and the unsupported-record report path, not
 through the runtime golden path.
 
-This checkpoint intentionally covers the Codex runtime fixture only. Claude
-Code native package coverage remains deferred above, so the implemented runtime
-fixture must not claim full Claude Code parity.
+The first runtime fixture was Codex-led. Checkpoint `128b2afe` adds Claude Code
+package and response-format coverage for the same current event set:
+`SessionStart`, `PostToolUse`, `Error`, and `Decision`. Runtime fixture evidence
+must still not claim `UserPromptSubmit`, `PreToolUse`, `Stop`, MCP, semantic
+retrieval breadth, or plugin release-channel readiness.

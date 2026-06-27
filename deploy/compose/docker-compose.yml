@@ -9,12 +9,14 @@ x-backend: &backend
   environment:
     ENGRAM_DATABASE_URL: postgresql://engram:engram@postgres:5432/engram
     ENGRAM_REDIS_URL: redis://redis:6379/0
-    ENGRAM_CELERY_BROKER_URL: redis://redis:6379/0
+    ENGRAM_CELERY_BROKER_URL: amqp://engram:engram@rabbitmq:5672/engram
     ENGRAM_CELERY_RESULT_BACKEND: redis://redis:6379/1
   depends_on:
     postgres:
       condition: service_healthy
     redis:
+      condition: service_healthy
+    rabbitmq:
       condition: service_healthy
 
 services:
@@ -32,15 +34,77 @@ services:
       retries: 20
       start_period: 20s
 
-  worker:
+  worker-realtime:
     <<: *backend
     depends_on:
       api:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info"
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-realtime"
+
+  worker-near-realtime:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-near-realtime"
+
+  worker-batch:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-batch"
+
+  worker-highmemory:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-highmemory"
+
+  worker-domain-events:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-domain-events"
+
+  beat:
+    <<: *backend
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    command: >
+      sh -ec "celery -A engram.celery_app beat --loglevel=info"
 
   relay:
     <<: *backend
@@ -49,11 +113,37 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
     command: >
       sh -ec "python manage.py celery_outbox_relay"
 
+  frontend:
+    build:
+      context: ../../apps/frontend
+      dockerfile: Dockerfile
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      NEXT_PUBLIC_ENGRAM_API_URL: http://api:8000
+      NUXT_TELEMETRY_DISABLED: '1'
+      PORT: '3000'
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: engram
       POSTGRES_USER: engram
@@ -73,6 +163,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: engram
+      RABBITMQ_DEFAULT_PASS: engram
+      RABBITMQ_DEFAULT_VHOST: engram
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
 volumes:
   postgres_data:

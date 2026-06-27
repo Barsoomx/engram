@@ -5,6 +5,11 @@ import uuid
 from django.core.exceptions import ValidationError
 from django.db import models
 
+try:
+    from pgvector.django import VectorField
+except ImportError:
+    VectorField = None
+
 
 class TimestampedModel(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -120,6 +125,7 @@ class Team(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='teams')
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=120)
+    archived_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -138,6 +144,7 @@ class Project(TimestampedModel):
     repository_url = models.TextField(blank=True)
     repository_root = models.TextField(blank=True)
     default_branch = models.CharField(max_length=255, blank=True)
+    archived_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         constraints = [
@@ -577,6 +584,8 @@ class RetrievalDocument(TimestampedModel):
     exact_terms = models.JSONField(default=list, blank=True)
     full_text = models.TextField()
     embedding_reference = models.CharField(max_length=255, blank=True)
+    embedding_vector = models.JSONField(default=list, blank=True)
+    embedding_pgvector = VectorField(dimensions=64, null=True, blank=True) if VectorField is not None else None
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
@@ -727,3 +736,42 @@ class AuditEvent(TimestampedModel):
 
     def __str__(self) -> str:
         return f'{self.event_type}:{self.result}'
+
+
+class LinkType(models.TextChoices):
+    FILE = 'file', 'File'
+    SYMBOL = 'symbol', 'Symbol'
+    COMMIT = 'commit', 'Commit'
+    ISSUE = 'issue', 'Issue'
+
+
+class MemoryLink(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_links')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_links')
+    memory = models.ForeignKey(Memory, on_delete=models.CASCADE, related_name='links')
+    link_type = models.CharField(max_length=40, choices=LinkType.choices)
+    target = models.CharField(max_length=1024)
+    label = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['memory', 'link_type', 'target'],
+                name='core_memory_link_unique_target',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'link_type']),
+        ]
+        ordering = ['organization_id', 'project_id', 'memory_id', 'link_type', 'target']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.memory_id:
+            check_project_scope(errors, 'memory', self.memory, self.organization_id, self.project_id)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'{self.link_type}:{self.target}'

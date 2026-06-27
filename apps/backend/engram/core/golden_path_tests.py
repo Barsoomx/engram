@@ -17,6 +17,7 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import Organization, Project, ProjectTeam, Team
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 
 RAW_KEY = 'egk_test_golden_path_0123456789abcdefghijklmnopqrstuvwxyz'
 
@@ -42,6 +43,14 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         external_id='golden-path-agent',
     )
     api_key = ApiKey.objects.get(organization=organization, owner_identity=identity)
+    secret = ProviderSecret.objects.get(organization=organization, team=team, provider='openai')
+    policy = ModelPolicy.objects.get(organization=organization, team=team, project=project, task_type='generation')
+    embedding_policy = ModelPolicy.objects.get(
+        organization=organization,
+        team=team,
+        project=project,
+        task_type='embedding',
+    )
 
     assert body == {
         'organization_id': str(organization.id),
@@ -51,6 +60,9 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         'api_key_id': str(api_key.id),
         'api_key_fingerprint': api_key_fingerprint(RAW_KEY),
         'capabilities': ['memories:read', 'observations:write'],
+        'provider_secret_id': str(secret.id),
+        'generation_policy_id': str(policy.id),
+        'embedding_policy_id': str(embedding_policy.id),
     }
     assert ProjectTeam.objects.filter(organization=organization, team=team, project=project).exists()
     assert OrganizationMembership.objects.filter(
@@ -75,8 +87,19 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         'memories:read',
         'observations:write',
     }
+    assert secret.active is True
+    assert secret.secret_fingerprint
+    assert ProviderSecretEnvelope.objects.filter(secret=secret, active=True).count() == 1
+    assert policy.provider == 'openai'
+    assert policy.model == 'gpt-4.1-mini'
+    assert policy.secret_id == secret.id
+    assert embedding_policy.provider == 'openai'
+    assert embedding_policy.model == 'text-embedding-3-small'
+    assert embedding_policy.secret_id == secret.id
     assert RAW_KEY not in str(body)
     assert RAW_KEY not in str(api_key.__dict__)
+    assert RAW_KEY not in str(secret.__dict__)
+    assert RAW_KEY not in str(ProviderSecretEnvelope.objects.filter(secret=secret).values())
 
 
 @pytest.mark.django_db
@@ -92,3 +115,6 @@ def test_bootstrap_golden_path_is_idempotent() -> None:
     assert Identity.objects.count() == 1
     assert ApiKey.objects.count() == 1
     assert ApiKeyCapability.objects.count() == 2
+    assert ProviderSecret.objects.count() == 1
+    assert ProviderSecretEnvelope.objects.count() == 1
+    assert ModelPolicy.objects.count() == 2

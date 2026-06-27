@@ -1,0 +1,3 @@
+allowBuilds:
+  '@heroui/shared-utils': false
+  unrs-resolver: false

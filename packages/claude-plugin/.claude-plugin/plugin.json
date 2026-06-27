@@ -1,0 +1,8 @@
+{
+  "name": "engram",
+  "displayName": "Engram",
+  "version": "0.1.0",
+  "description": "Thin Engram hook adapter for Claude Code.",
+  "hooks": "./hooks/hooks.json",
+  "keywords": ["engineering-memory", "hooks", "claude-code"]
+}

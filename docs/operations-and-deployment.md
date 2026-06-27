@@ -4,7 +4,8 @@
 
 Development:
 
-- Docker Compose with app, PostgreSQL, Redis-compatible broker, and worker.
+- Docker Compose with app, PostgreSQL, RabbitMQ broker, Redis result backend,
+  relay, and worker.
 - Local provider secret mode may use encrypted database storage.
 
 V1 production trial:
@@ -17,7 +18,7 @@ Standard on-premise:
 
 - Kubernetes Helm chart.
 - PostgreSQL supplied by the customer or an operator.
-- Redis-compatible broker supplied by the customer or chart dependency.
+- RabbitMQ-compatible broker supplied by the customer or chart dependency.
 - External vault optional.
 - Ingress, TLS, metrics, traces, and logs configured through values.
 

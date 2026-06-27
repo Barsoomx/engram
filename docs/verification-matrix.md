@@ -785,3 +785,514 @@ Final whole-branch review found missing endpoint proof for cross-team feedback
 denial and oversized `request_id`/`correlation_id`; the follow-up
 `test: cover memory feedback denials` added those tests and reran the evidence
 commands above.
+
+## 2026-06-25: Claude Code Client Package
+
+Branch: `feat/parity-15-claude-code-client`
+
+Implementation commit:
+`128b2afed125d8880b85195cd27ceb9afd4e4ea8`.
+
+Scope:
+
+- `packages/claude-plugin/.claude-plugin/plugin.json`
+- `packages/claude-plugin/hooks/hooks.json`
+- `packages/claude-plugin/claude_plugin_contract_tests.py`
+- `packages/claude-plugin/README.md`
+- `packages/cli/engram_cli/main.py`
+- `packages/cli/engram_cli/commands.py`
+- `packages/cli/engram_cli/cli_lifecycle_tests.py`
+- `docs/parity/claude-mem-parity-map.md`
+- `docs/security/reviews/2026-06-25-claude-code-client.md`
+- `docs/superpowers/specs/2026-06-25-claude-code-client-design.md`
+- `docs/superpowers/plans/2026-06-25-claude-code-client.md`
+- `scripts/repository_layout.py`
+
+This checkpoint proves native Claude Code package and CLI response-format
+coverage only for the currently implemented Engram hook events:
+`SessionStart`, `PostToolUse`, `Error`, and `Decision`. It does not prove
+`UserPromptSubmit`, `PreToolUse`, or `Stop`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD red CLI tests | `PYTHONPATH=packages/cli python3 -m unittest packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_connect_writes_event_specific_hook_commands packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_session_start_claude_code_response_format_emits_claude_output_only packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_non_session_claude_code_response_format_emits_empty_ack -v` | none | yes | pass | Exit 1 before implementation, with failures for missing `claude-code` response format and old hook command strings. |
+| focused CLI tests | `PYTHONPATH=packages/cli python3 -m unittest packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_connect_writes_event_specific_hook_commands packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_session_start_claude_code_response_format_emits_claude_output_only packages.cli.engram_cli.cli_lifecycle_tests.CliLifecycleTests.test_hook_non_session_claude_code_response_format_emits_empty_ack -v` | none | yes | pass | Exit 0. Reported 3 tests OK. |
+| full CLI tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| Claude plugin contract tests | `python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v` | none | yes | pass | Exit 0. Reported 2 tests OK. |
+| Codex plugin contract tests | `python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v` | none | yes | pass | Exit 0. Reported 2 tests OK. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| focused security review | Independent read-only security review plus command evidence recorded in `docs/security/reviews/2026-06-25-claude-code-client.md` | none | yes | pass | SECURITY APPROVED. CRITICAL none, IMPORTANT none, MINOR none. Live Claude Code plugin install was not run; this checkpoint validates manifest and CLI contracts only. |
+
+## 2026-06-25: Admin Inspection API
+
+Branch: `feat/admin-inspection-api`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/inspection/__init__.py`
+- `apps/backend/engram/inspection/apps.py`
+- `apps/backend/engram/inspection/serializers.py`
+- `apps/backend/engram/inspection/services.py`
+- `apps/backend/engram/inspection/views.py`
+- `apps/backend/engram/inspection/urls.py`
+- `apps/backend/engram/inspection/inspection_api_tests.py`
+- `apps/backend/settings/settings.py`
+- `apps/backend/settings/urls.py`
+- `docs/security/reviews/2026-06-25-admin-inspection-api.md`
+- `docs/superpowers/specs/2026-06-25-admin-inspection-api-design.md`
+- `docs/superpowers/plans/2026-06-25-admin-inspection-api.md`
+- `scripts/repository_layout.py`
+
+This checkpoint proves the minimal V1 operational inspection API:
+read-only memory inspection, context-bundle inspection, and audit-event
+inspection through `/v1/inspection/*`. It does not add a custom frontend, MCP
+bridge, semantic retrieval, provider/model-policy code, or memory mutation
+beyond the existing feedback endpoint.
+
+Memory and context-bundle inspection require `memories:admin`; regular
+developer-style `memories:read` keys are denied. Audit inspection requires
+`audit:read`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD red inspection tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | none | yes | pass | Exit 1 before implementation. All four tests failed with 404 because `/v1/inspection/*` routes did not exist. |
+| string redaction RED tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py::test_memory_inspection_lists_authorized_memories_and_redacts_detail_metadata engram/inspection/inspection_api_tests.py::test_context_bundle_inspection_returns_items_and_hides_other_team_bundles -v` | none | yes | pass | Exit 1 after initial implementation. Failures proved raw token-shaped values leaked through memory title/body and context `rendered_text`; output redaction was expanded before green. |
+| security-fix RED tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | none | yes | pass | Exit 1 after independent review. Failures proved regular `memories:read` keys could inspect memory/context data and audit identifiers were returned raw. |
+| focused inspection tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py -v` | Backend equivalent | yes | pass | Exit 0 after security fixes. Reported 4 passed. |
+| adjacent access/context/memory tests | `cd apps/backend && poetry run pytest engram/inspection/inspection_api_tests.py engram/access/access_scope_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py -v` | Backend equivalent | yes | pass | Exit 0 after security fixes. Reported 50 passed. |
+| host manage.py check | `cd apps/backend && poetry run python manage.py check` | none | yes | fixed | Exit 1 because the host process cannot resolve the Compose-only `postgres` hostname. Reran inside Compose after migration. |
+| Compose migrate and manage.py check | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check"` | Backend equivalent | yes | pass | Exit 0. Fresh Compose DB migrated and system check reported no issues. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v"` | Backend | yes | pass | Exit 0. Reported 159 passed. |
+| backend lint and format | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Ruff check passed; format check reported 101 files already formatted. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality equivalent | yes | pass | Exit 0. Reported 30 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| focused security review | Independent read-only security review plus fix re-review recorded in `docs/security/reviews/2026-06-25-admin-inspection-api.md` | none | yes | pass | Initial review found weak capability gate, identifier redaction gaps, and audit-listing self-noise. Fix re-review verified code-level findings resolved; stale doc statuses were updated before commit. |
+
+## 2026-06-25: Celery SLA Compose Topology
+
+Branch: `chore/celery-sla-compose-topology`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `deploy/compose/docker-compose.yml`
+- `deploy/compose/README.md`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/security/reviews/2026-06-25-celery-sla-compose-topology.md`
+- `docs/superpowers/specs/2026-06-25-celery-sla-compose-topology-design.md`
+- `docs/superpowers/plans/2026-06-25-celery-sla-compose-topology.md`
+- `docs/verification-matrix.md`
+
+This checkpoint keeps the existing Engram Celery foundation and makes Compose
+consume its SLA queues explicitly. Compose now runs dedicated workers for
+`engram-realtime`, `engram-near-realtime`, `engram-batch`,
+`engram-highmemory`, and `engram-domain-events`; the package relay remains a
+separate `python manage.py celery_outbox_relay` service.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| delegated RED repository contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | fixed | Exit 1 before implementation. The new contract failed against the old single generic worker because `worker-realtime` and queue routing were missing. |
+| repository runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 15 tests OK. |
+| Compose service graph | `docker compose -f deploy/compose/docker-compose.yml config --quiet` | Compose E2E | yes | pass | Exit 0 with no output. |
+| backend Celery foundation tests | `cd apps/backend && poetry run pytest engram/core/celery_foundation_tests.py -v` | Backend | yes | pass | Exit 0. Reported 7 passed. |
+| repository tests | `python3 -m unittest discover -s tests -v` | Repository Quality | yes | pass | Exit 0. Reported 31 tests OK. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| repository text quality | `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| whitespace | `git diff --check HEAD` | Repository Quality whitespace step | yes | pass | Exit 0 with no output. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Output included worker-created retrieval document, future context injection, Compose golden path passed, and stopped Compose services. |
+| focused security review | Independent read-only review plus command evidence recorded in `docs/security/reviews/2026-06-25-celery-sla-compose-topology.md` | none | yes | pass | Reviewer reported no Critical, Important, or Minor findings. Verified queue coverage, separate relay, unchanged broker/result configuration, no public-doc private reference leakage, and sufficient Compose/E2E evidence. |
+
+## 2026-06-25: Model Policy Secrets Foundation
+
+Branch: `feat/model-policy-secrets`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/model_policy/__init__.py`
+- `apps/backend/engram/model_policy/apps.py`
+- `apps/backend/engram/model_policy/models.py`
+- `apps/backend/engram/model_policy/migrations/0001_initial.py`
+- `apps/backend/engram/model_policy/serializers.py`
+- `apps/backend/engram/model_policy/services.py`
+- `apps/backend/engram/model_policy/views.py`
+- `apps/backend/engram/model_policy/urls.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/settings/settings.py`
+- `apps/backend/settings/urls.py`
+- `apps/backend/pyproject.toml`
+- `apps/backend/poetry.lock`
+- `scripts/repository_layout.py`
+- `tests/repository/test_backend_runtime_contract.py`
+- `docs/security/reviews/2026-06-25-model-policy-secrets.md`
+- `docs/superpowers/specs/2026-06-25-model-policy-secrets-design.md`
+- `docs/superpowers/plans/2026-06-25-model-policy-secrets.md`
+
+This checkpoint adds the first backend provider secret and model policy
+foundation. It supports organization/team provider secret references, encrypted
+database envelopes, project/team/organization model policy resolution, fake
+provider adapter selection, and provider call audit records. It does not add
+real provider network calls, semantic retrieval, frontend/admin UI, MCP tools,
+or AI workflow jobs.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| initial RED focused test | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | fixed | Exit 2 before implementation. Failure: `ModuleNotFoundError: No module named 'engram.model_policy.models'`. |
+| cross-team secret RED regression | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py::test_provider_secret_detail_and_rotation_hide_other_team_secret -v` | Backend | yes | fixed | Exit 1 after initial implementation. Detail returned `200` for another team's provider secret; scoped secret filtering now returns 404 and rotate returns `secret_scope_denied`. |
+| team-bound project policy RED regression | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py::test_model_policy_resolution_prefers_project_then_team_then_organization_and_rejects_cross_scope -v` | Backend | yes | fixed | Exit 1 after initial resolver. Another team received a project policy bound to the first team's secret; resolver now skips team-bound project policies for other teams. |
+| focused model-policy tests | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | pass | Exit 0. Reported 7 passed. |
+| focused model-policy lint/format | `cd apps/backend && poetry run ruff check engram/model_policy && poetry run ruff format --check engram/model_policy` | Backend | yes | pass | Exit 0. All checks passed; 10 files already formatted. |
+| adjacent access/context/memory/inspection tests | `cd apps/backend && poetry run pytest engram/model_policy/model_policy_tests.py engram/access/access_scope_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py engram/inspection/inspection_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 57 passed. |
+| migration drift | `cd apps/backend && DJANGO_SETTINGS_MODULE=settings.test_settings poetry run python manage.py makemigrations --check --dry-run` | Backend | yes | pass | Exit 0. Reported no changes detected. |
+| repository runtime contract | `python3 -m unittest tests.repository.test_backend_runtime_contract -v` | Repository Quality | yes | pass | Exit 0. Reported 15 tests OK. |
+| poetry lock check | `cd apps/backend && poetry check --lock` | Backend | yes | pass | Exit 0. Reported all set. |
+| repository layout | `python3 scripts/repository_layout.py` | Repository Quality | yes | pass | Exit 0 with no output. |
+| independent security review | Independent read-only security review plus fix verification recorded in `docs/security/reviews/2026-06-25-model-policy-secrets.md` | none | yes | pass | Initial `CHANGES_REQUIRED`; fix verification `PASS`. Resolved org-secret mutation by team-scoped `secrets:*`, disabled-secret resolver candidates, and production encryption-key fail-closed behavior. |
+| Karpathy simplicity/scope re-review | Independent read-only Karpathy-style review agent | none | yes | pass | Initial `CHANGES_REQUIRED`; code findings resolved. Schema placeholder surface accepted as non-blocking for this checkpoint. |
+| final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. No pending migrations, system check clean, 166 passed, Ruff clean, 111 files already formatted. |
+
+## 2026-06-26: Provider Memory Worker
+
+Branch: `feat/provider-memory-worker`
+
+Final checkpoint SHA is recorded in the status report after commit.
+
+Scope:
+
+- `apps/backend/engram/memory/services.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `apps/backend/engram/model_policy/services.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py`
+- `apps/backend/engram/core/golden_path_tests.py`
+- `apps/backend/engram/celeryconfig.py`
+- `apps/backend/engram/core/celery_foundation_tests.py`
+- `scripts/e2e_golden_path.py`
+- `docs/security/reviews/2026-06-26-provider-memory-worker.md`
+- `docs/superpowers/specs/2026-06-26-provider-memory-worker-design.md`
+- `docs/superpowers/plans/2026-06-26-provider-memory-worker.md`
+- `docs/verification-matrix.md`
+
+This checkpoint makes the memory worker use model-policy-resolved provider
+generation before creating memory candidates. It keeps exact retrieval,
+semantic retrieval, embeddings, frontend/admin UI, MCP tools, and digest
+scheduling out of scope. It also applies the reference-backend Celery Redis Sentinel
+result-backend pattern while preserving Engram SLA queues, confirm-publish, and
+the package outbox transport.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| TDD RED focused tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py engram/model_policy/model_policy_tests.py -v` | Backend | yes | fixed | Initial RED exited 1 with 5 failures for missing provider call/provenance and missing policy fallback. Fix RED exited 1 with 3 failures for xoxb redaction and existing-candidate policy bypass. Karpathy-fix RED exited 1 with 4 failures for local candidate text, missing generated fields, and missing existing-candidate provenance update. |
+| focused memory/model-policy/Celery/golden-path tests | `cd apps/backend && poetry run pytest engram/memory/memory_worker_tests.py engram/model_policy/model_policy_tests.py engram/core/golden_path_tests.py engram/core/celery_foundation_tests.py -v` | Backend | yes | pass | Exit 0. Reported 41 passed. |
+| full backend tests | `cd apps/backend && poetry run pytest -v` | Backend | yes | pass | Exit 0. Reported 172 passed. |
+| focused lint/format | `cd apps/backend && poetry run ruff check engram/celeryconfig.py engram/core/celery_foundation_tests.py engram/memory/services.py engram/memory/memory_worker_tests.py engram/model_policy/services.py engram/model_policy/model_policy_tests.py engram/core/management/commands/engram_bootstrap_golden_path.py engram/core/golden_path_tests.py && poetry run ruff format --check engram/celeryconfig.py engram/core/celery_foundation_tests.py engram/memory/services.py engram/memory/memory_worker_tests.py engram/model_policy/services.py engram/model_policy/model_policy_tests.py engram/core/management/commands/engram_bootstrap_golden_path.py engram/core/golden_path_tests.py` | Backend | yes | pass | Exit 0. All checks passed; 8 files already formatted. |
+| adjacent hook/context/memory feedback/Celery tests | `cd apps/backend && poetry run pytest engram/hooks/hook_ingest_tests.py engram/context/context_api_tests.py engram/memory/memory_feedback_tests.py engram/core/celery_foundation_tests.py engram/core/golden_path_tests.py -v` | Backend | yes | pass | Exit 0. Reported 63 passed before the Karpathy fix; covered adjacent queue/context/feedback/Celery behavior. |
+| migration drift | `cd apps/backend && DJANGO_SETTINGS_MODULE=settings.test_settings poetry run python manage.py makemigrations --check --dry-run` | Backend | yes | pass | Exit 0. Reported no changes detected. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py` | Repository Quality | yes | pass | Exit 0. Repository unittest suite reported 31 tests OK; layout and quality scripts exited with no output. |
+| Compose golden path E2E | `python3 scripts/e2e_golden_path.py` | Backend | yes | fixed | Exit 1 after provider-generated titles landed because the E2E still searched by the old observation title. Updated the script to find memory by source raw event and assert provider-generated title/body; rerun exited 0. |
+| independent security review | Independent read-only security review and re-review recorded in `docs/security/reviews/2026-06-26-provider-memory-worker.md` | none | yes | pass | Initial review PASS; re-review after generated provider output PASS. Residual non-blocking hardening note: add DB uniqueness before real provider network side effects. |
+| Karpathy simplicity/scope review | Independent read-only Karpathy-style review agent plus re-review | none | yes | pass | Initial `CHANGES_REQUIRED`; fixed provider-generated title/body consumption and existing-candidate provenance update. Re-review `PASS_CODE`. |
+| final Compose backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. Applied migrations, system check clean, 172 passed, Ruff clean, 111 files already formatted. |
+
+## 2026-06-26: Semantic Retrieval Foundation
+
+Branch: `feat/semantic-retrieval-foundation`
+
+Scope:
+
+- `apps/backend/engram/core/models.py` (`RetrievalDocument.embedding_vector`)
+- `apps/backend/engram/core/migrations/0004_retrievaldocument_embedding_vector.py`
+- `apps/backend/engram/model_policy/services.py` (`EMBEDDING_DIMENSION`,
+  `EmbeddingCallInput`, `EmbeddingCallResult`, `_embedding_grams`,
+  `generated_embedding`, `FakeProviderGateway.embed`)
+- `apps/backend/engram/context/services.py` (`SEMANTIC_MIN_SIMILARITY`,
+  `cosine_similarity`, `IndexMemoryVersion._embed_document`,
+  `BuildContextBundle._rank_matches`/`_semantic_matches`/
+  `_resolve_query_embedding`, `_audit_retrieval`)
+- `apps/backend/engram/core/management/commands/engram_bootstrap_golden_path.py`
+- `apps/backend/engram/core/core_models_tests.py`
+- `apps/backend/engram/model_policy/model_policy_tests.py`
+- `apps/backend/engram/memory/memory_worker_tests.py`
+- `apps/backend/engram/context/context_api_tests.py`
+- `apps/backend/engram/core/golden_path_tests.py`
+- `docs/superpowers/specs/2026-06-26-semantic-retrieval-foundation-design.md`
+- `docs/superpowers/plans/2026-06-26-semantic-retrieval-foundation.md`
+- `docs/security/reviews/2026-06-26-semantic-retrieval-foundation.md`
+
+This checkpoint lifts the `claude-mem` parity-map semantic-retrieval deferral
+(the first exact CLI/hooks/API E2E loop is green) and adds the first working
+hybrid retrieval path: a deterministic character 3-gram embeddings provider
+adapter, embedding-vector persistence on `RetrievalDocument`, and a cosine
+semantic fallback inside `BuildContextBundle` that fires only when exact
+matching returns fewer items than the requested limit. Exact matching stays
+authoritative. It does not add pgvector, real OpenAI network calls, a new
+HTTP endpoint, prompt-submit injection, or backfill.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED model test | `cd apps/backend && poetry run pytest engram/core/core_models_tests.py::test_retrieval_document_defaults_to_empty_embedding_vector -v` | Backend | yes | fixed | Exit 1 before the field existed; passed after `embedding_vector` JSONField + migration `0004`. |
+| focused RED embeddings adapter | `docker compose -f deploy/compose/docker-compose.yml run --rm --no-deps -e ENGRAM_DATABASE_URL=sqlite:///:memory: -v "$PWD/apps/backend:/srv/app" api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/model_policy/model_policy_tests.py -v"` | Backend | yes | fixed | Exit 1 before `FakeProviderGateway.embed`/`generated_embedding`; initial norm assertion (`round(norm,6)==1.0`) failed at `1.000001` and was relaxed to `pytest.approx(1.0, abs=1e-3)` because rounding each component to 6 decimals perturbs the norm slightly. |
+| focused RED indexer lifecycle | `docker compose ... pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | fixed | Exit 1 before `IndexMemoryVersion._embed_document`; the first semantic-fallback retrieval test then failed because `Memory` was created without `team` while the embeddings policy is team-scoped, so `ResolveModelPolicy(team_id=None)` filtered `team__isnull=True` and missed it. Added `team=team` to the test memories; vector then populated. |
+| focused RED retrieval fallback | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | fixed | Exit 1 before `_semantic_matches`/`_resolve_query_embedding`; body did not expose `metadata`, so assertions were switched to `ContextBundle.objects.get().metadata`. |
+| audit RED | `docker compose ... pytest engram/context/context_api_tests.py::test_context_bundle_returns_semantic_fallback_when_exact_misses -v` | Backend | yes | fixed | Exit 1 after independent review found `_audit_retrieval` hard-coded `retrieval_strategy: 'exact'` and dropped `semantic_provider_call_id`; commit `e48c07e1` threads `has_semantic`/`embedding_result` into the audit and adds a regression assertion. |
+| focused model-policy tests | `docker compose ... pytest engram/model_policy/model_policy_tests.py -v` | Backend | yes | pass | Exit 0. Reported 13 passed. |
+| focused memory worker tests | `docker compose ... pytest engram/memory/memory_worker_tests.py -v` | Backend | yes | pass | Exit 0. Reported 26 passed including four embedding lifecycle tests. |
+| focused context API tests | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 22 passed including three semantic fallback tests. |
+| focused golden path tests | `docker compose ... pytest engram/core/golden_path_tests.py -v` | Backend | yes | pass | Exit 0. Reported 2 passed. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. System check clean; pytest reported 184 passed; Ruff `All checks passed!`; format reported 112 files already formatted. |
+| migration apply and freshness | `docker compose -f deploy/compose/docker-compose.yml run --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py makemigrations --check --dry-run"` | Backend | yes | pass | Exit 0. Applied through `core.0004_retrievaldocument_embedding_vector`; `No changes detected`. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Unchanged exact fixture stayed green: Compose started, host CLI connected, hook observation submitted, worker-created retrieval document observed, future session context returned, Compose stopped. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Exit 0. Repository unittest reported 31 OK; layout and quality scripts exited with no output; whitespace clean. |
+| focused security review | Independent read-only security review agent (opus) recorded in `docs/security/reviews/2026-06-26-semantic-retrieval-foundation.md` | none | yes | pass | Initial `SECURITY CHANGES_REQUIRED` (I-1 audit hard-code); fixed in `e48c07e1`. Re-review `SECURITY APPROVED`: no Critical/Important remain. |
+| Karpathy simplicity/scope review | Independent read-only Karpathy-style review agent (opus) | none | yes | pass | Initial `CHANGES_REQUIRED`; the substantive finding (audit hard-code) was the same as I-1 and is fixed. Duplication between `call`/`embed`, cosmetic `list(...)` conversions, and the split constants are accepted risks for the fake single-consumer gateway. |
+
+First decisive failures fixed during the TDD loop:
+
+- Embedding-vector model test failed before the field/migration existed.
+- Embeddings adapter norm assertion failed at `1.000001` due to 6-decimal
+  rounding; relaxed to `pytest.approx`.
+- Semantic-fallback retrieval test failed because the test `Memory` lacked a
+  team while the embeddings policy is team-scoped; `ResolveModelPolicy` then
+  found no policy and left `embedding_vector` empty. Fixed by binding the test
+  memory to the team.
+- Context API tests asserted on `body['metadata']`, which the response contract
+  does not expose; switched to `ContextBundle.objects.get().metadata`.
+- Independent review found `_audit_retrieval` hard-coded the retrieval strategy
+  and dropped the query-embedding provider call id; fixed in `e48c07e1`.
+
+Security evidence:
+
+- Embedding input is redacted before tokenization; token-shaped secrets cannot
+  reach the vector, the provider call record, or logs.
+- Semantic candidates come only from the authorized document set; no
+  cross-organization/project/team document can enter via the semantic path.
+- Query embedding is computed only when exact matches are below the requested
+  limit; no eager provider call on the hot path.
+- Missing embeddings policy degrades silently to exact-only; a disabled
+  embeddings secret skips embedding with a structured warning log.
+- The `MemoryRetrieved` audit records the real `retrieval_strategy` plus
+  `semantic_provider_call_id` and `semantic_document_ids` when the fallback
+  activates.
+
+Accepted risks: deterministic character 3-gram embeddings are an interface-only
+stand-in for real OpenAI embeddings; `JSONField` vector storage without
+dimension validation while there is one producer at dimension 64; gateway
+record-creation duplication deferred to the real-adapter slice.
+
+## 2026-06-26: Memory Search API
+
+Branch: `feat/memory-search-api` (stacked on `feat/semantic-retrieval-foundation`;
+decision: user delegated slice selection and branch decisions, so stacked work
+is explicit and documented; merge order is semantic-retrieval first, then
+memory-search).
+
+Scope:
+
+- `apps/backend/engram/search/` (new app: `apps.py`, `serializers.py`,
+  `services.py`, `views.py`, `urls.py`, `search_api_tests.py`)
+- `apps/backend/engram/context/services.py` — extracted module helpers
+  `score_retrieval_document` and `authorized_retrieval_documents`;
+  `BuildContextBundle._score_document`/`_authorized_documents` delegate.
+- `apps/backend/settings/settings.py` — registered `'engram.search'`.
+- `apps/backend/settings/urls.py` — added `/v1/search/` route.
+- `scripts/repository_layout.py` — required search app paths.
+- `docs/superpowers/specs/2026-06-26-memory-search-api-design.md`
+- `docs/security/reviews/2026-06-26-memory-search-api.md`
+
+This checkpoint adds the missing `POST /v1/search` endpoint from
+`docs/architecture.md`'s public API surface: an authorized, stateless, exact
+read that returns cited ranked memory matches without persisting a context
+bundle. It unblocks a future search MCP tool and `engram search` CLI. Semantic
+recall is intentionally deferred for search.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED search tests | `docker compose -f deploy/compose/docker-compose.yml run --rm --no-deps -e ENGRAM_DATABASE_URL=sqlite:///:memory: -v "$PWD/apps/backend:/srv/app" api sh -ec "poetry install --no-interaction --no-root --with dev && pytest engram/search/search_api_tests.py -v"` | Backend | yes | pass | Exit 0. Reported 6 passed: ranked cited matches, capability denial, wrong-project denial, cross-team exclusion, oversized-query rejection, missing bearer key. |
+| extraction safety | `docker compose ... pytest engram/context/context_api_tests.py -v` | Backend | yes | pass | Exit 0. Reported 22 passed after extracting `score_retrieval_document` and `authorized_retrieval_documents`; behavior preserved. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | Exit 0. System check clean; pytest reported 190 passed; Ruff `All checks passed!`; format reported 119 files already formatted. |
+| migration apply and freshness | covered by the full-gate `migrate --noinput` above (no migration added) | Backend | yes | pass | Exit 0. No model change; migrations unchanged. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0. Unchanged exact fixture stayed green; search endpoint is not exercised by the golden path and introduced no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `python3 scripts/repository_layout.py`; `python3 scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Exit 0. Repository unittest reported 31 OK; layout and quality scripts exited with no output; whitespace clean. |
+| focused security review | Self-review recorded in `docs/security/reviews/2026-06-26-memory-search-api.md` | none | yes | pass | `SECURITY APPROVED`. Read-only reuser of proven authorization and retrieval primitives; no new write path, secret surface, provider boundary, or untrusted-content rendering. |
+
+First decisive failures fixed during the TDD loop:
+
+- Initial `ruff check` reported five import-ordering errors in the new search
+  package; applied `ruff check --fix` and `ruff format` before amending the
+  search commit.
+
+Accepted risks: search is exact-only (semantic recall deferred); no dedicated
+search audit event beyond `AccessScopeResolved`.
+
+### 2026-06-26: Memory Search Semantic Recall (extension)
+
+Stacked on `feat/memory-search-api`. Lifts the search-slice deferral: search now
+uses hybrid retrieval identical to context. `_semantic_matches` and
+`_resolve_query_embedding` were extracted to module functions
+(`semantic_retrieval_matches`, `resolve_query_embedding`) and reused by both
+`BuildContextBundle` and `SearchMemories`.
+
+| Check | Local command | Status | Notes |
+| --- | --- | --- | --- |
+| focused search + context tests | `docker compose ... pytest engram/search/search_api_tests.py engram/context/context_api_tests.py -v` | pass | 29 passed; new `test_search_returns_semantic_match_when_exact_misses` green; context semantic tests unchanged after extraction. |
+| full backend gate | `docker compose ... run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | pass | 191 passed; ruff clean; 119 files formatted. |
+
+Security unchanged: the query-embedding provider call on the search path is
+authorized under the same scope, redacts the query text, and is made only when
+exact matches are below the requested limit.
+
+## 2026-06-26: Memory Versioning
+
+Branch: `feat/memory-versioning` (off local master after merging
+semantic-retrieval + memory-search).
+
+Scope:
+
+- `apps/backend/engram/memory/services.py` — `UpdateMemoryBody`,
+  `UpdateMemoryBodyInput`/`Result`, `MemoryVersionError`,
+  `memory_body_content_hash`, shared `lock_memory_for_update` /
+  `ensure_memory_team_scope` (extracted from `RecordMemoryFeedback`).
+- `apps/backend/engram/memory/views.py` — `MemoryVersionView`.
+- `apps/backend/engram/memory/serializers.py` — `MemoryVersionSerializer`.
+- `apps/backend/engram/memory/urls.py` — `/version` route.
+- `apps/backend/engram/memory/memory_versioning_tests.py`.
+- `docs/superpowers/specs/2026-06-26-memory-versioning-design.md`
+- `docs/security/reviews/2026-06-26-memory-versioning.md`
+
+Adds `POST /v1/memories/<id>/version`: an authorized, replay-protected body
+update that appends a `MemoryVersion`, bumps `current_version`, re-indexes the
+retrieval document, and audits `MemoryVersionCreated`. Advances the Memory
+Quality roadmap item.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused RED versioning tests | `docker compose ... pytest engram/memory/memory_versioning_tests.py -v` | Backend | yes | fixed | Initial run failed: `grant_review_capability` only added the key capability, but `developer` role lacks `memories:review`, so effective caps missed it. Fixed by granting the capability to the role too. |
+| feedback regression after extraction | `docker compose ... pytest engram/memory/memory_feedback_tests.py -v` | Backend | yes | pass | 9 passed after extracting shared lock/scope helpers. |
+| focused versioning tests | `docker compose ... pytest engram/memory/memory_versioning_tests.py -v` | Backend | yes | pass | 7 passed including new idempotency test. |
+| full backend tests | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | System check clean; ruff clean. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0; versioning endpoint not on the golden path, no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean. |
+| focused security + Karpathy review | Independent agents recorded in `docs/security/reviews/2026-06-26-memory-versioning.md` | none | yes | pass | Initial findings: idempotency gap (M1) + lock/scope duplication (K-1). Both fixed in `5e64cf39`. Re-`SECURITY APPROVED`. |
+
+First decisive failures fixed:
+
+- `developer` role lacked `memories:review`, so the first versioning test run
+  returned `missing_capability`. Granted the capability to the role and the key.
+- Initial ruff run flagged missing type annotations on `version_payload` and a
+  long serializer line; fixed inline.
+- Independent review found replay created a second version and that
+  `_lock_memory`/`_ensure_team_scope` were duplicated; fixed by content-based
+  idempotency plus shared helper extraction.
+
+Security evidence: replay of the same body reuses the latest version; concurrent
+updates serialize through `select_for_update` + the unique-version constraint;
+audit records the actor, capability, version, and redacted reason.
+
+## 2026-06-26: Memory Links
+
+Branch: `feat/memory-links` (off local master after merging versioning).
+
+Scope: `MemoryLink` model + migration `0005_memorylink`; `RecordMemoryLink`
+service; `MemoryLinksView` (GET list + POST create); serializers; tests;
+spec; security note. Adds `POST/GET /v1/memories/<id>/links` — authorized,
+replay-protected code/symbol/commit/issue links attached to an approved memory.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused links tests | `docker compose ... pytest engram/memory/memory_links_tests.py -v` | Backend | yes | pass | 6 passed: create+list, idempotency, capability denial, team-scope denial, oversized target, list project denial. |
+| full backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | 204 passed; migration `0005_memorylink` applied; ruff clean; 122 files formatted. |
+| Compose golden path | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | Exit 0; links endpoint not on golden path, no regression. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean. |
+| focused security review | Self-review in `docs/security/reviews/2026-06-26-memory-links.md` | none | yes | pass | `SECURITY APPROVED`; reuses proven lock/scope/audit/redaction primitives. |
+
+Security evidence: replay of the same `(link_type, target)` reuses the link;
+team-visible memory outside scope denied; `target`/`label` redacted; audit
+records the actor, capability, memory id, and redacted target.
+
+## 2026-06-26: CLI Search, CLI Memory Commands, MCP Bridge
+
+Three stacked slices merged into local master after the memory-links merge. All
+are additive clients over existing authorized endpoints; none touches backend
+models, migrations, or the worker.
+
+### CLI Search (`feat/cli-search`)
+
+`engram search --query ... [--file-path ...] [--symbol ...] [--limit N] [--json]`
+calls `POST /v1/search/`. CLI suite grew from 27 to 30 tests; new tests cover
+query POST shape, missing-config, and empty-state output.
+
+### CLI Memory Commands (`feat/cli-memory-commands`)
+
+`engram memory version <id> --body ...`, `engram memory link <id> --link-type
+... --target ...`, and `engram memory links <id>` call the version and links
+endpoints. Added `get_json` HTTP helper. CLI suite grew to 36 tests.
+
+### MCP Bridge (`feat/mcp-bridge`)
+
+`packages/mcp/engram_mcp` — newline-delimited JSON-RPC stdio server exposing
+the `engram_search` tool over `POST /v1/search/`. No local store, embeddings, or
+secrets. 8 contract tests cover initialize, notifications, tools/list,
+tools/call, unknown tool/method, ndjson round-trip, and malformed-line skip.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| CLI tests | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Repository Quality | yes | pass | 36 passed including search + memory command tests. |
+| MCP contract tests | `PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v` | none | yes | pass | 8 passed. |
+| CLI/MCP compile | `python3 -m compileall packages/cli/engram_cli packages/mcp/engram_mcp` | none | yes | pass | Exit 0. |
+| repository checks | `python3 -m unittest discover -s tests -v`; `scripts/repository_layout.py`; `scripts/repository_quality.py`; `git diff --check HEAD` | Repository Quality | yes | pass | Clean; layout now requires the MCP package paths. |
+
+Security: all three are thin authenticated clients over proven server-side
+authorization; the MCP bridge carries the configured API key only in process
+memory and forwards it as a bearer header to the Engram server. No new server
+write path or secret surface.
+
+Accepted risks: MCP framing is newline-delimited JSON (matches the reference
+stdio transport); full Content-Length framing and additional tools (context,
+observe, memory version/link) are deferred. CLI commands assume the connected
+project/team from local config (no per-command override yet).
+
+## 2026-06-26: Real Provider Adapter + Memory Digest
+
+Branch: `feat/real-provider-adapter` (off local master).
+
+### Real Provider Adapter
+
+Adds `OpenAICompatibleGateway` (HTTP chat completions + embeddings via stdlib
+`urllib`) and a `get_provider_gateway()` factory. Any OpenAI-compatible endpoint
+works by setting `ModelPolicy.metadata['base_url']` (OpenAI, GLM/ZhipuAI at
+`https://open.bigmodel.cn/api/paas/v4`, OpenRouter, local). The API key comes
+only from the decrypted `ProviderSecretEnvelope`. `ENGRAM_PROVIDER_MODE=real`
+opts in; the default stays `FakeProviderGateway` so the deterministic offline
+suite is unchanged. All four production call sites now route through the factory.
+
+### Memory Digest (Daily Workflow foundation)
+
+`GenerateDigest` collects approved source memories, resolves a `digest` policy,
+generates a digest via the gateway, stores it as a `metadata.kind='digest'`
+memory + version + retrieval document, and audits `DigestGenerated`.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| focused real-provider tests | `docker compose ... pytest engram/model_policy/real_provider_tests.py -v` | Backend | yes | pass | 7 passed: factory fake/real selection, missing-envelope, chat-completion parse, reuse-by-request_id, embeddings parse, HTTP-error translation. HTTP mocked (no network). |
+| focused digest tests | `docker compose ... pytest engram/memory/memory_digest_tests.py -v` | Backend | yes | pass | 4 passed including provider-failure graceful wrap. |
+| full backend gate | `docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install ... && python manage.py migrate --noinput && python manage.py check && pytest -v && ruff check . && ruff format --check ."` | Backend | yes | pass | 220 passed; ruff clean; 131 files formatted. |
+| focused security review | Independent agent in `docs/security/reviews/2026-06-26-real-provider-adapter.md` | none | yes | pass | Initial `SECURITY CHANGES_REQUIRED` (I-1: digest call site lacked error handling); fixed in `8ef6065e`. Re-`SECURITY APPROVED`. |
+
+First decisive failures: factory tests lacked `@pytest.mark.django_db`; the
+HTTP-error test matched on the error code instead of the message; the digest
+provider-failure test initially disabled the secret (excluded from resolution by
+`secret__active=True`) and was switched to deleting the envelope so the policy
+still resolves and the provider call raises.
+
+Local e2e (not committed): `ENGRAM_PROVIDER_MODE=real` + a runtime-injected key
+into the encrypted envelope (GLM base_url via `metadata`). Recorded for when a
+local key is available; no key committed.

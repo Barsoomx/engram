@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -16,14 +15,23 @@ from engram.core.models import (
     CandidateStatus,
     Memory,
     MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Observation,
+    Project,
     RetrievalDocument,
     VisibilityScope,
 )
-
-TOKEN_RE = re.compile(r'(?i)(sk-[a-z0-9][a-z0-9_-]{8,}|egk_[a-z0-9][a-z0-9_-]{8,}|bearer\s+[a-z0-9._~+/=-]{12,})')
+from engram.core.redaction import redact_value as core_redact_value
+from engram.model_policy.services import (
+    ModelPolicyError,
+    ProviderCallInput,
+    ProviderSecretError,
+    ResolveModelPolicy,
+    ResolveModelPolicyInput,
+    get_provider_gateway,
+)
 
 
 @dataclass(frozen=True)
@@ -43,6 +51,13 @@ class MemoryCandidateWorkerResult:
 
 class MemoryWorkerError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class GeneratedMemoryCandidate:
+    title: str
+    body: str
+    evidence: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
@@ -125,27 +140,10 @@ class RecordMemoryFeedback:
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
-        memory = (
-            Memory.objects.select_for_update()
-            .filter(
-                organization_id=scope.organization_id,
-                project_id=data.project_id,
-                id=data.memory_id,
-            )
-            .first()
-        )
-        if memory is None:
-            raise MemoryFeedbackError('memory_not_found', 'Memory was not found')
-
-        return memory
+        return lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryFeedbackError)
 
     def _ensure_team_scope(self, memory: Memory, scope: EffectiveScope) -> None:
-        if (
-            memory.visibility_scope == VisibilityScope.TEAM
-            and memory.team_id is not None
-            and memory.team_id not in scope.team_ids
-        ):
-            raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+        ensure_memory_team_scope(memory, scope)
 
     def _already_applied(self, memory: Memory, action: str) -> bool:
         return bool(getattr(memory, action))
@@ -203,7 +201,8 @@ class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
-            candidate, candidate_created = self._get_or_create_candidate(observation)
+            generated = self._generate_candidate(observation)
+            candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             promotion = PromoteMemoryCandidate().execute(
                 PromoteMemoryCandidateInput(candidate_id=candidate.id),
             )
@@ -229,30 +228,89 @@ class ProcessObservationRecorded:
     def _get_or_create_candidate(
         self,
         observation: Observation,
+        generated: GeneratedMemoryCandidate,
     ) -> tuple[MemoryCandidate, bool]:
         candidate_hash = memory_candidate_content_hash(observation)
-
-        return MemoryCandidate.objects.get_or_create(
+        candidate = MemoryCandidate.objects.filter(
             organization=observation.organization,
             project=observation.project,
             content_hash=candidate_hash,
-            defaults={
-                'team': observation.team,
-                'source_observation': observation,
-                'title': candidate_title(observation),
-                'body': candidate_body(observation),
-                'status': CandidateStatus.PROPOSED,
-                'visibility_scope': VisibilityScope.PROJECT,
-                'evidence': candidate_evidence(observation),
-                'confidence': Decimal('0.500'),
-            },
+        ).first()
+        if candidate is not None:
+            if not self._has_provider_provenance(candidate):
+                candidate.title = generated.title
+                candidate.body = generated.body
+                candidate.evidence = generated.evidence
+                candidate.save(update_fields=['title', 'body', 'evidence', 'updated_at'])
+
+            return candidate, False
+
+        candidate = MemoryCandidate.objects.create(
+            organization=observation.organization,
+            project=observation.project,
+            team=observation.team,
+            source_observation=observation,
+            title=generated.title,
+            body=generated.body,
+            status=CandidateStatus.PROPOSED,
+            visibility_scope=VisibilityScope.PROJECT,
+            evidence=generated.evidence,
+            content_hash=candidate_hash,
+            confidence=Decimal('0.500'),
         )
+
+        return candidate, True
+
+    def _generate_candidate(self, observation: Observation) -> GeneratedMemoryCandidate:
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=observation.organization_id,
+                    project_id=observation.project_id,
+                    team_id=observation.team_id,
+                    task_type='generation',
+                ),
+            )
+            provider_result = get_provider_gateway(resolved.policy).call(
+                ProviderCallInput(
+                    organization_id=observation.organization_id,
+                    project_id=observation.project_id,
+                    team_id=observation.team_id,
+                    policy=resolved.policy,
+                    request_id=f'memory-worker:{observation.id}:generation',
+                    trace_id=f'memory-worker:{observation.id}',
+                    prompt=provider_prompt(observation),
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError) as error:
+            raise MemoryWorkerError(redact_error(str(error))) from error
+
+        provenance = {
+            'provider_call_id': str(provider_result.call_record_id),
+            'provider': provider_result.provider,
+            'model': provider_result.model,
+            'policy_id': str(resolved.policy.id),
+            'policy_version': resolved.policy.version,
+            'task_type': resolved.policy.task_type,
+            'redaction_state': provider_result.redaction_state,
+        }
+
+        return GeneratedMemoryCandidate(
+            title=provider_result.generated_title,
+            body=provider_result.generated_body,
+            evidence=candidate_evidence(observation, provider_result.generated_title, provenance),
+        )
+
+    def _has_provider_provenance(self, candidate: MemoryCandidate) -> bool:
+        if not candidate.evidence:
+            return False
+        evidence = candidate.evidence[0]
+
+        return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
 
 
 def memory_candidate_content_hash(observation: Observation) -> str:
-    source = f'{observation.id}:{observation.content_hash}'
-
-    return hashlib.sha256(source.encode()).hexdigest()
+    return hashlib.sha256(observation.content_hash.encode()).hexdigest()
 
 
 def candidate_title(observation: Observation) -> str:
@@ -267,32 +325,45 @@ def candidate_body(observation: Observation) -> str:
     return redact_text(observation.title)
 
 
-def candidate_evidence(observation: Observation) -> list[dict[str, object]]:
+def candidate_evidence(
+    observation: Observation,
+    title: str | None = None,
+    provenance: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    evidence = {
+        'observation_id': str(observation.id),
+        'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
+        'event_type': observation.source_metadata.get('event_type', observation.observation_type),
+        'title': redact_text(title or observation.title),
+        'files_read': redact_value(observation.files_read),
+        'files_modified': redact_value(observation.files_modified),
+    }
+    if provenance:
+        evidence.update(redact_value(provenance))
+
     return [
-        {
-            'observation_id': str(observation.id),
-            'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
-            'event_type': observation.source_metadata.get('event_type', observation.observation_type),
-            'title': redact_text(observation.title),
-            'files_read': redact_value(observation.files_read),
-            'files_modified': redact_value(observation.files_modified),
-        },
+        evidence,
     ]
 
 
-def redact_value(value: object) -> object:
-    if isinstance(value, dict):
-        return {key: redact_value(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [redact_value(item) for item in value]
-    if isinstance(value, str):
-        return redact_text(value)
+def provider_prompt(observation: Observation) -> str:
+    return '\n'.join(
+        [
+            f'Title: {redact_text(observation.title)}',
+            f'Body: {redact_text(observation.body)}',
+            f'Files read: {redact_value(observation.files_read)}',
+            f'Files modified: {redact_value(observation.files_modified)}',
+            f'Source metadata: {redact_value(observation.source_metadata)}',
+        ],
+    )
 
-    return value
+
+def redact_value(value: object) -> object:
+    return core_redact_value(value).value
 
 
 def redact_text(value: str) -> str:
-    return TOKEN_RE.sub('[REDACTED]', value)
+    return str(redact_value(value))
 
 
 def redact_error(message: str) -> str:
@@ -373,11 +444,35 @@ class PromoteMemoryCandidate:
         return document
 
     def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
-        return {
+        metadata = {
             'source': 'memory_candidate',
             'memory_candidate_id': str(candidate.id),
             'evidence': candidate.evidence,
             'file_paths': self._candidate_file_paths(candidate),
+        }
+        metadata.update(self._provider_provenance(candidate))
+
+        return metadata
+
+    def _provider_provenance(self, candidate: MemoryCandidate) -> dict[str, object]:
+        if not candidate.evidence:
+            return {}
+        evidence = candidate.evidence[0]
+        if not isinstance(evidence, dict) or 'provider_call_id' not in evidence:
+            return {}
+
+        return {
+            key: evidence[key]
+            for key in (
+                'provider_call_id',
+                'provider',
+                'model',
+                'policy_id',
+                'policy_version',
+                'task_type',
+                'redaction_state',
+            )
+            if key in evidence
         }
 
     def _candidate_file_paths(self, candidate: MemoryCandidate) -> list[str]:
@@ -392,3 +487,392 @@ class PromoteMemoryCandidate:
                 *observation.files_modified,
             ]
         ]
+
+
+@dataclass(frozen=True)
+class UpdateMemoryBodyInput:
+    raw_key: str
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    body: str
+    reason: str
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class UpdateMemoryBodyResult:
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'project_id': str(self.memory.project_id),
+            'team_id': str(self.memory.team_id) if self.memory.team_id else '',
+            'current_version': self.memory.current_version,
+            'memory_version_id': str(self.memory_version.id),
+            'retrieval_document_id': str(self.retrieval_document.id),
+        }
+
+
+class MemoryVersionError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def memory_body_content_hash(memory: Memory, next_version: int, body: str) -> str:
+    source = f'{memory.id}:{next_version}:{body}'
+
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def lock_memory_for_update(
+    scope: EffectiveScope,
+    project_id: uuid.UUID,
+    memory_id: uuid.UUID,
+    error_cls: type[Exception],
+) -> Memory:
+    memory = (
+        Memory.objects.select_for_update()
+        .filter(
+            organization_id=scope.organization_id,
+            project_id=project_id,
+            id=memory_id,
+        )
+        .first()
+    )
+    if memory is None:
+        raise error_cls('memory_not_found', 'Memory was not found')
+
+    return memory
+
+
+def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
+    if (
+        memory.visibility_scope == VisibilityScope.TEAM
+        and memory.team_id is not None
+        and memory.team_id not in scope.team_ids
+    ):
+        raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+
+class UpdateMemoryBody:
+    def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='memories:review',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='memory',
+            target_id=str(data.memory_id),
+        )
+        with transaction.atomic():
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            ensure_memory_team_scope(memory, scope)
+            latest_version = memory.versions.order_by('-version').first()
+            if latest_version is not None and latest_version.body == data.body:
+                retrieval_document = self._index_version(latest_version)
+
+                return UpdateMemoryBodyResult(
+                    memory=memory,
+                    memory_version=latest_version,
+                    retrieval_document=retrieval_document,
+                )
+            version = self._create_version(memory, data)
+            memory.body = data.body
+            memory.current_version = version.version
+            memory.save(update_fields=['body', 'current_version', 'updated_at'])
+            retrieval_document = self._index_version(version)
+            self._audit(memory, version, scope, data)
+
+        memory.refresh_from_db()
+
+        return UpdateMemoryBodyResult(
+            memory=memory,
+            memory_version=version,
+            retrieval_document=retrieval_document,
+        )
+
+    def _create_version(self, memory: Memory, data: UpdateMemoryBodyInput) -> MemoryVersion:
+        next_version = memory.current_version + 1
+
+        return MemoryVersion.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            memory=memory,
+            version=next_version,
+            body=data.body,
+            content_hash=memory_body_content_hash(memory, next_version, data.body),
+        )
+
+    def _index_version(self, version: MemoryVersion) -> RetrievalDocument:
+        result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+        return result.retrieval_document
+
+    def _audit(
+        self,
+        memory: Memory,
+        version: MemoryVersion,
+        scope: EffectiveScope,
+        data: UpdateMemoryBodyInput,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryVersionCreated',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory',
+            target_id=str(memory.id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'version': version.version,
+                'reason': redact_text(data.reason),
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )
+
+
+@dataclass(frozen=True)
+class MemoryLinkInput:
+    raw_key: str
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    link_type: str
+    target: str
+    label: str
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class MemoryLinkResult:
+    memory: Memory
+    link: MemoryLink
+    created: bool
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'link_id': str(self.link.id),
+            'link_type': self.link.link_type,
+            'target': redact_text(self.link.target),
+            'label': redact_text(self.link.label),
+            'created': self.created,
+        }
+
+
+class RecordMemoryLink:
+    def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
+        scope = ResolveApiKeyScope().execute(
+            raw_key=data.raw_key,
+            required_capability='memories:review',
+            requested_project_id=data.project_id,
+            requested_team_id=data.team_id,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            target_type='memory_link',
+            target_id=str(data.memory_id),
+        )
+        with transaction.atomic():
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            ensure_memory_team_scope(memory, scope)
+            link, created = MemoryLink.objects.get_or_create(
+                memory=memory,
+                link_type=data.link_type,
+                target=data.target,
+                defaults={
+                    'organization': memory.organization,
+                    'project': memory.project,
+                    'label': data.label,
+                },
+            )
+            if not created and data.label and link.label != data.label:
+                link.label = data.label
+                link.save(update_fields=['label', 'updated_at'])
+            self._audit(memory, link, scope, data, created)
+
+        return MemoryLinkResult(memory=memory, link=link, created=created)
+
+    def _audit(
+        self,
+        memory: Memory,
+        link: MemoryLink,
+        scope: EffectiveScope,
+        data: MemoryLinkInput,
+        created: bool,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryLinkRecorded',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory_link',
+            target_id=str(link.id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'memory_id': str(memory.id),
+                'link_type': link.link_type,
+                'created': created,
+                'target': redact_text(link.target),
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )
+
+
+@dataclass(frozen=True)
+class DigestInput:
+    project_id: uuid.UUID
+    memory_ids: tuple[uuid.UUID, ...]
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class DigestResult:
+    memory: Memory
+    memory_version: MemoryVersion
+    retrieval_document: RetrievalDocument
+    provider_call_id: uuid.UUID
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'memory_version_id': str(self.memory_version.id),
+            'retrieval_document_id': str(self.retrieval_document.id),
+            'provider_call_id': str(self.provider_call_id),
+            'title': str(self.memory.title),
+        }
+
+
+def digest_prompt(sources: tuple[Memory, ...]) -> str:
+    lines = [f'- {source.title}: {source.body}' for source in sources]
+
+    return '\n'.join(lines)
+
+
+def digest_content_hash(project_id: uuid.UUID, memory_ids: tuple[uuid.UUID, ...]) -> str:
+    material = f'{project_id}:{sorted(str(mid) for mid in memory_ids)}'
+
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+class GenerateDigest:
+    def execute(self, data: DigestInput) -> DigestResult:
+        project = Project.objects.get(id=data.project_id)
+        sources = tuple(
+            Memory.objects.filter(
+                id__in=data.memory_ids,
+                organization=project.organization,
+                project=project,
+                status=MemoryStatus.APPROVED,
+            ).order_by('title'),
+        )
+        if not sources:
+            raise MemoryWorkerError('no approved source memories found for digest')
+        resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                team_id=None,
+                task_type='digest',
+            ),
+        )
+        prompt = digest_prompt(sources)
+        try:
+            provider_result = get_provider_gateway(resolved.policy).call(
+                ProviderCallInput(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    team_id=None,
+                    policy=resolved.policy,
+                    request_id=data.request_id,
+                    trace_id=data.request_id,
+                    prompt=prompt,
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError) as error:
+            raise MemoryWorkerError(f'digest provider unavailable: {error}') from error
+        content_hash = digest_content_hash(project.id, data.memory_ids)
+        with transaction.atomic():
+            memory = Memory.objects.create(
+                organization=project.organization,
+                project=project,
+                title=f'Digest {provider_result.generated_title}',
+                body=provider_result.generated_body,
+                status=MemoryStatus.APPROVED,
+                visibility_scope=VisibilityScope.PROJECT,
+                metadata={
+                    'kind': 'digest',
+                    'source_memory_ids': [str(source.id) for source in sources],
+                    'content_hash': content_hash,
+                    'provider_call_id': str(provider_result.call_record_id),
+                    'provider': provider_result.provider,
+                    'model': provider_result.model,
+                },
+            )
+            version = MemoryVersion.objects.create(
+                organization=memory.organization,
+                project=memory.project,
+                memory=memory,
+                version=1,
+                body=memory.body,
+                content_hash=content_hash,
+                source_metadata={'kind': 'digest'},
+            )
+            retrieval_document = (
+                IndexMemoryVersion()
+                .execute(
+                    IndexMemoryVersionInput(memory_version_id=version.id),
+                )
+                .retrieval_document
+            )
+            AuditEvent.objects.create(
+                organization=memory.organization,
+                project=memory.project,
+                event_type='DigestGenerated',
+                actor_type='api_key',
+                target_type='memory',
+                target_id=str(memory.id),
+                capability='memories:review',
+                result=AuditResult.RECORDED,
+                request_id=data.request_id,
+                correlation_id=data.correlation_id,
+                metadata={
+                    'source_memory_ids': [str(source.id) for source in sources],
+                    'provider_call_id': str(provider_result.call_record_id),
+                    'memory_version_id': str(version.id),
+                },
+            )
+
+        return DigestResult(
+            memory=memory,
+            memory_version=version,
+            retrieval_document=retrieval_document,
+            provider_call_id=provider_result.call_record_id,
+        )
