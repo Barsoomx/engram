@@ -116,6 +116,8 @@ def iter_scan_paths(root: Path) -> Iterable[Path]:
             continue
 
         for path in sorted(directory.rglob("*")):
+            if 'node_modules' in str(path):
+                continue
             if path.is_file() and should_scan_path(path):
                 yield path
 
