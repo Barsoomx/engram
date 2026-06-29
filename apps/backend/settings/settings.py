@@ -57,19 +57,41 @@ WSGI_APPLICATION = 'settings.wsgi.application'
 ASGI_APPLICATION = 'settings.asgi.application'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 HTTP_HOST = os.getenv('HTTP_HOST', 'http://localhost:8000')
-CSRF_TRUSTED_ORIGINS = [
-    HTTP_HOST,
-    'http://127.0.0.1',
-    'http://127.0.0.1:8000',
-    'http://127.0.0.1:3000',
-    'http://localhost',
-    'http://0.0.0.0',
-]
+_DEFAULT_BROWSER_ORIGINS = ','.join(
+    (
+        HTTP_HOST,
+        'http://127.0.0.1',
+        'http://127.0.0.1:8000',
+        'http://127.0.0.1:3000',
+        'http://localhost',
+        'http://localhost:3000',
+        'http://0.0.0.0',
+    )
+)
+CSRF_TRUSTED_ORIGINS = csv(
+    os.environ.get('ENGRAM_CSRF_TRUSTED_ORIGINS', _DEFAULT_BROWSER_ORIGINS),
+    default=(HTTP_HOST,),
+)
 CORS_ALLOW_ALL_ORIGINS = False
-CORS_ALLOWED_ORIGINS = CSRF_TRUSTED_ORIGINS
-CORS_ALLOW_HEADERS = ('*',)
-CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOW_METHODS = ('*',)
+CORS_ALLOWED_ORIGINS = csv(
+    os.environ.get('ENGRAM_CORS_ALLOWED_ORIGINS', _DEFAULT_BROWSER_ORIGINS),
+    default=(HTTP_HOST,),
+)
+CORS_ALLOW_CREDENTIALS = False
+CORS_ALLOW_HEADERS = (
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-engram-organization',
+    'x-engram-project',
+    'x-engram-team',
+)
 
 INSTALLED_APPS = [
     'django.contrib.auth',
