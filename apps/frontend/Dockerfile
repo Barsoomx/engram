@@ -30,4 +30,6 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json
 
 EXPOSE 3000
-CMD ["pnpm", "start"]
+# Invoke next directly: `pnpm start` triggers pnpm 11 verify-deps-before-run, which
+# re-runs install and fails on the gated sharp build script in this minimal runner.
+CMD ["node_modules/.bin/next", "start", "-p", "3000"]
