@@ -116,38 +116,46 @@ function shortId(value: string | null): string {
   return value.length > 8 ? `${value.slice(0, 8)}…` : value;
 }
 
+type WorkflowRunFilters = {
+  run_type?: WorkflowRunType;
+  status?: WorkflowRunStatus;
+  project_id?: string;
+  team_id?: string;
+  escalation?: boolean;
+  created_at__gte?: string;
+  created_at__lte?: string;
+};
+
 function FiltersBar({
   filters,
   projects,
   onChange,
   onReset,
 }: {
-  filters: Omit<WorkflowRunListParams, 'page' | 'pageSize'>;
+  filters: WorkflowRunFilters;
   projects: Project[];
-  onChange: (
-    next: Partial<Omit<WorkflowRunListParams, 'page' | 'pageSize'>>,
-  ) => void;
+  onChange: (next: Partial<WorkflowRunFilters>) => void;
   onReset: () => void;
 }) {
   const runTypeKeys = React.useMemo(
-    () => (filters.run_type ? new Set([filters.run_type]) : new Set<string>()),
+    () => new Set<string>(filters.run_type ? [filters.run_type] : []),
     [filters.run_type],
   );
   const statusKeys = React.useMemo(
-    () => (filters.status ? new Set([filters.status]) : new Set<string>()),
+    () => new Set<string>(filters.status ? [filters.status] : []),
     [filters.status],
   );
-  const escalationKeys = React.useMemo(() => {
-    if (filters.escalation === undefined) {
-
-      return new Set<string>();
-    }
-
-    return new Set([filters.escalation ? 'true' : 'false']);
-  }, [filters.escalation]);
-  const projectKeys = React.useMemo(
+  const escalationKeys = React.useMemo(
     () =>
-      filters.project_id ? new Set([filters.project_id]) : new Set<string>(),
+      new Set<string>(
+        filters.escalation === undefined
+          ? []
+          : [filters.escalation ? 'true' : 'false'],
+      ),
+    [filters.escalation],
+  );
+  const projectKeys = React.useMemo(
+    () => new Set<string>(filters.project_id ? [filters.project_id] : []),
     [filters.project_id],
   );
 
@@ -328,9 +336,7 @@ export default function WorkflowRunsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const [rawFilters, setRawFilters] = React.useState<
-    Omit<WorkflowRunListParams, 'page' | 'pageSize'>
-  >({});
+  const [rawFilters, setRawFilters] = React.useState<WorkflowRunFilters>({});
   const [page, setPage] = React.useState(1);
 
   const projectsParams = React.useMemo(() => ({ pageSize: 100 }), []);
@@ -351,9 +357,7 @@ export default function WorkflowRunsPage() {
   const total = runsQuery.data?.count ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
-  function handleFilterChange(
-    next: Partial<Omit<WorkflowRunListParams, 'page' | 'pageSize'>>,
-  ) {
+  function handleFilterChange(next: Partial<WorkflowRunFilters>) {
     setRawFilters((prev) => ({ ...prev, ...next }));
     setPage(1);
   }
