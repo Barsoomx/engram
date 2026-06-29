@@ -743,6 +743,8 @@ class LinkType(models.TextChoices):
     SYMBOL = 'symbol', 'Symbol'
     COMMIT = 'commit', 'Commit'
     ISSUE = 'issue', 'Issue'
+    NARROWED_BY = 'narrowed_by', 'Narrowed by'
+    SUPERSEDED_BY = 'superseded_by', 'Superseded by'
 
 
 class MemoryLink(TimestampedModel):

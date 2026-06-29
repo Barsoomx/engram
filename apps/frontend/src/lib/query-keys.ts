@@ -31,4 +31,23 @@ export const adminQueryKeys = {
 
   workflowRun: (orgId: string | null, id: string | null) =>
     ['admin', orgId, 'workflow-run', id] as const,
+
+  memoryReview: (orgId: string | null, params?: ListParams) =>
+    ['admin', orgId, 'memory-review', params ?? {}] as const,
+
+  memoryReviewDiff: (
+    orgId: string | null,
+    memoryId: string | null,
+    fromVersion: number | null,
+    toVersion: number | null,
+  ) =>
+    [
+      'admin',
+      orgId,
+      'memory-review',
+      'diff',
+      memoryId,
+      fromVersion,
+      toVersion,
+    ] as const,
 };
