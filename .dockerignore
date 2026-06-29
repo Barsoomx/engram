@@ -1,0 +1,32 @@
+# Root build context is used by apps/backend/Dockerfile (copies only apps/backend).
+# Keep the context small: exclude VCS, the frontend tree, caches and local cruft.
+.git
+.github
+.idea
+.vscode
+.scratch
+private
+reports
+docs
+plugin-repository
+
+apps/frontend
+
+**/node_modules
+**/.next
+**/__pycache__
+**/*.py[cod]
+**/.venv
+venv
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.coverage
+**/htmlcov
+
+*.log
+*.tmp
+*.temp
+.env
+.env.*
+!.env.example
