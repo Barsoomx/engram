@@ -302,3 +302,119 @@ export async function revokeApiKey(id: string): Promise<void> {
 
   await client.post(`/v1/admin/api-keys/${id}/revoke/`);
 }
+
+export type WorkflowRunStatus = 'queued' | 'running' | 'succeeded' | 'failed';
+
+export type WorkflowRunType = 'daily_digest' | 'observation_processing';
+
+export type WorkflowRunListItem = {
+  id: string;
+  organization_id: string;
+  project_id: string;
+  team_id: string | null;
+  run_type: WorkflowRunType;
+  status: WorkflowRunStatus;
+  escalation: boolean;
+  request_id: string;
+  correlation_id: string;
+  result_memory_id: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+};
+
+export type WorkflowRunCuratorAction = {
+  id: string;
+  event_type: string;
+  actor_type: string;
+  target_type: string | null;
+  target_id: string | null;
+  result: string;
+  created_at: string;
+};
+
+export type WorkflowRunProviderCall = {
+  id: string;
+  provider: string;
+  model: string;
+  task_type: string;
+  result: string;
+  latency_ms: number | null;
+};
+
+export type WorkflowRunResultMemory = {
+  id: string;
+  title: string;
+  status: string;
+};
+
+export type WorkflowRunDetail = {
+  id: string;
+  organization_id: string;
+  project_id: string;
+  team_id: string | null;
+  run_type: WorkflowRunType;
+  status: WorkflowRunStatus;
+  input_snapshot: Record<string, unknown>;
+  provider_call_ids: string[];
+  result_memory: WorkflowRunResultMemory | null;
+  curator_actions: WorkflowRunCuratorAction[];
+  provider_calls: WorkflowRunProviderCall[];
+  escalation: boolean;
+  failure_reason: string;
+  request_id: string;
+  correlation_id: string;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  rerun_of_id: string | null;
+};
+
+export type WorkflowRunListParams = ListParams & {
+  run_type?: WorkflowRunType;
+  status?: WorkflowRunStatus;
+  project_id?: string;
+  team_id?: string;
+  escalation?: boolean;
+  created_at__gte?: string;
+  created_at__lte?: string;
+};
+
+export type WorkflowRunRerunResult = {
+  run_id: string | null;
+  result_memory_id: string;
+};
+
+export async function listWorkflowRuns(
+  params?: WorkflowRunListParams,
+): Promise<Paginated<WorkflowRunListItem>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<WorkflowRunListItem>>(
+    '/v1/admin/workflow-runs/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function workflowRunDetail(
+  id: string,
+): Promise<WorkflowRunDetail> {
+  const client = apiClient();
+  const response = await client.get<WorkflowRunDetail>(
+    `/v1/admin/workflow-runs/${id}/`,
+  );
+
+  return response.data;
+}
+
+export async function rerunWorkflowRun(
+  id: string,
+): Promise<WorkflowRunRerunResult> {
+  const client = apiClient();
+  const response = await client.post<WorkflowRunRerunResult>(
+    `/v1/admin/workflow-runs/${id}/rerun/`,
+  );
+
+  return response.data;
+}

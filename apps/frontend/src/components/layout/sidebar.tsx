@@ -13,6 +13,7 @@ import {
   LogOut,
   ScrollText,
   Users,
+  Workflow,
   X,
 } from 'lucide-react';
 import Link from 'next/link';
@@ -39,6 +40,7 @@ const NAV_ITEMS: SidebarNavItem[] = [
   { href: '/roles', label: 'Roles', icon: BadgeCheck, capability: 'roles:read' },
   { href: '/api-keys', label: 'API Keys', icon: Key, capability: 'api_keys:read' },
   { href: '/audit', label: 'Audit', icon: ClipboardList, capability: 'audit:read' },
+  { href: '/workflow-runs', label: 'Workflow Runs', icon: Workflow, capability: 'memories:read' },
   { href: '/health', label: 'Health', icon: Activity },
 ];
 

@@ -25,4 +25,10 @@ export const adminQueryKeys = {
 
   apiKeys: (orgId: string | null, params?: ListParams) =>
     ['admin', orgId, 'api-keys', params ?? {}] as const,
+
+  workflowRuns: (orgId: string | null, params?: ListParams) =>
+    ['admin', orgId, 'workflow-runs', params ?? {}] as const,
+
+  workflowRun: (orgId: string | null, id: string | null) =>
+    ['admin', orgId, 'workflow-run', id] as const,
 };
