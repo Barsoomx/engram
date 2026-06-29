@@ -8,14 +8,12 @@ from django.utils import timezone
 from engram.celery_app import app
 from engram.core.models import Memory, MemoryStatus, Project
 from engram.memory.services import (
-    DigestInput,
-    GenerateDigest,
+    DAILY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
     MemoryWorkerError,
     ProcessObservationRecorded,
+    run_daily_digest_with_tracking,
 )
-
-DAILY_DIGEST_WINDOW_DAYS = 7
 
 
 @app.task(name='engram.memory.process_observation_recorded')
@@ -39,6 +37,7 @@ def generate_daily_digest(
     memory_ids: list[str],
 ) -> str:
     try:
+        parsed_organization_id = uuid.UUID(str(organization_id))
         parsed_project_id = uuid.UUID(project_id)
         parsed_memory_ids = tuple(uuid.UUID(value) for value in memory_ids)
     except (AttributeError, TypeError, ValueError) as error:
@@ -46,12 +45,11 @@ def generate_daily_digest(
 
     request_id = f'daily-digest:{parsed_project_id}'
 
-    result = GenerateDigest().execute(
-        DigestInput(
-            project_id=parsed_project_id,
-            memory_ids=parsed_memory_ids,
-            request_id=request_id,
-        ),
+    result = run_daily_digest_with_tracking(
+        organization_id=parsed_organization_id,
+        project_id=parsed_project_id,
+        memory_ids=parsed_memory_ids,
+        request_id=request_id,
     )
 
     return str(result.memory.id)

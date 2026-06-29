@@ -6,6 +6,7 @@ from engram.console.views.organizations import OrganizationViewSet
 from engram.console.views.projects import ProjectViewSet
 from engram.console.views.roles import RoleViewSet
 from engram.console.views.teams import TeamViewSet
+from engram.console.views.workflow_runs import WorkflowRunViewSet
 
 router = DefaultRouter()
 
@@ -15,5 +16,6 @@ router.register('projects', ProjectViewSet, basename='admin-project')
 router.register('members', MemberViewSet, basename='admin-member')
 router.register('roles', RoleViewSet, basename='admin-role')
 router.register('api-keys', ApiKeyViewSet, basename='admin-api-key')
+router.register('workflow-runs', WorkflowRunViewSet, basename='admin-workflow-run')
 
 urlpatterns = router.urls

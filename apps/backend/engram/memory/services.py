@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from django.db import transaction
+from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
@@ -22,6 +23,9 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
 )
 from engram.core.redaction import redact_value as core_redact_value
 from engram.model_policy.services import (
@@ -876,3 +880,77 @@ class GenerateDigest:
             retrieval_document=retrieval_document,
             provider_call_id=provider_result.call_record_id,
         )
+
+
+DAILY_DIGEST_WINDOW_DAYS = 7
+
+
+def run_daily_digest_with_tracking(
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    memory_ids: tuple[uuid.UUID, ...],
+    *,
+    window_days: int = DAILY_DIGEST_WINDOW_DAYS,
+    request_id: str = '',
+    correlation_id: str = '',
+) -> DigestResult:
+    project = Project.objects.get(id=project_id, organization_id=organization_id)
+
+    run = WorkflowRun.objects.create(
+        organization=project.organization,
+        project=project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={
+            'memory_ids': [str(value) for value in memory_ids],
+            'window_days': window_days,
+        },
+        request_id=request_id,
+        correlation_id=correlation_id,
+    )
+
+    run.status = WorkflowRunStatus.RUNNING
+
+    run.started_at = timezone.now()
+
+    run.save(update_fields=['status', 'started_at', 'updated_at'])
+
+    try:
+        result = GenerateDigest().execute(
+            DigestInput(
+                project_id=project_id,
+                memory_ids=memory_ids,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+        )
+    except Exception as error:
+        run.status = WorkflowRunStatus.FAILED
+
+        run.failure_reason = str(error)[:1024]
+
+        run.finished_at = timezone.now()
+
+        run.save(update_fields=['status', 'failure_reason', 'finished_at', 'updated_at'])
+
+        raise
+
+    run.status = WorkflowRunStatus.SUCCEEDED
+
+    run.finished_at = timezone.now()
+
+    run.result_memory = result.memory
+
+    run.provider_call_ids = [str(result.provider_call_id)]
+
+    run.save(
+        update_fields=[
+            'status',
+            'finished_at',
+            'result_memory',
+            'provider_call_ids',
+            'updated_at',
+        ],
+    )
+
+    return result

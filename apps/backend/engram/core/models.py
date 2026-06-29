@@ -775,3 +775,75 @@ class MemoryLink(TimestampedModel):
 
     def __str__(self) -> str:
         return f'{self.link_type}:{self.target}'
+
+
+class WorkflowRunType(models.TextChoices):
+    DAILY_DIGEST = 'daily_digest', 'Daily Digest'
+    OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
+
+
+class WorkflowRunStatus(models.TextChoices):
+    QUEUED = 'queued', 'Queued'
+    RUNNING = 'running', 'Running'
+    SUCCEEDED = 'succeeded', 'Succeeded'
+    FAILED = 'failed', 'Failed'
+
+
+class WorkflowRun(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='workflow_runs')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='workflow_runs')
+    team = models.ForeignKey(Team, on_delete=models.PROTECT, related_name='workflow_runs', null=True, blank=True)
+    run_type = models.CharField(max_length=40, choices=WorkflowRunType.choices)
+    status = models.CharField(
+        max_length=40,
+        choices=WorkflowRunStatus.choices,
+        default=WorkflowRunStatus.QUEUED,
+    )
+    input_snapshot = models.JSONField(default=dict, blank=True)
+    provider_call_ids = models.JSONField(default=list, blank=True)
+    result_memory = models.ForeignKey(
+        Memory,
+        on_delete=models.SET_NULL,
+        related_name='workflow_runs',
+        null=True,
+        blank=True,
+    )
+    escalation = models.BooleanField(default=False)
+    failure_reason = models.CharField(max_length=1024, blank=True)
+    request_id = models.CharField(max_length=255, blank=True)
+    correlation_id = models.CharField(max_length=255, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    rerun_of = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        related_name='reruns',
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'status']),
+            models.Index(fields=['organization', 'created_at']),
+        ]
+        ordering = ['organization_id', '-created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.result_memory_id:
+            check_project_scope(
+                errors,
+                'result_memory',
+                self.result_memory,
+                self.organization_id,
+                self.project_id,
+            )
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'{self.run_type}:{self.status}:{self.id}'
