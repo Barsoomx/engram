@@ -4,11 +4,9 @@ import psycopg
 import redis
 import structlog
 from django import db
-from django.http import HttpRequest
 from pydantic import ValidationError
 from rest_framework import status
 from rest_framework.exceptions import ValidationError as DRFValidationError
-from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
 
@@ -23,12 +21,6 @@ MANAGER_DOMAIN_EXTRA_FIELDS = {
     'scope': str,
     'current_access_version': int,
 }
-
-
-def get_session_flags(request: Request | HttpRequest | None) -> tuple[bool, bool, bool, bool]:
-    del request
-
-    return True, True, True, False
 
 
 def _translate_error(err: dict[str, Any]) -> str:
@@ -118,43 +110,16 @@ def _get_error_detail(exc: Exception) -> str:
     return str(exc)
 
 
-def build_domain_error_payload(exc: DomainError, request: Request | HttpRequest | None) -> dict[str, Any]:
-    need_verify_pin, need_verify_otp, session_is_closed, include_otp_flag = get_session_flags(request)
+def build_domain_error_payload(exc: DomainError) -> dict[str, Any]:
     error_code = getattr(exc, 'error_code', None)
-    if isinstance(error_code, str) and error_code.startswith('manager_'):
-        need_verify_pin = False
-        need_verify_otp = False
-        session_is_closed = False
-        include_otp_flag = False
 
-    response_data = {
-        'detail': _get_error_detail(exc),
-        'need_verify_pin': need_verify_pin,
-        'session_is_closed': session_is_closed,
-    }
+    response_data: dict[str, Any] = {'detail': _get_error_detail(exc)}
     if error_code is not None:
         response_data['error_code'] = error_code
-    if include_otp_flag:
-        response_data['need_verify_otp'] = need_verify_otp
     for field_name, field_type in MANAGER_DOMAIN_EXTRA_FIELDS.items():
         value = getattr(exc, field_name, None)
         if isinstance(value, field_type):
             response_data[field_name] = value
-    return response_data
-
-
-def _add_session_flags(
-    response_data: dict[str, Any],
-    *,
-    need_verify_pin: bool,
-    need_verify_otp: bool,
-    session_is_closed: bool,
-    include_otp_flag: bool,
-) -> dict[str, Any]:
-    response_data['need_verify_pin'] = need_verify_pin
-    response_data['session_is_closed'] = session_is_closed
-    if include_otp_flag:
-        response_data['need_verify_otp'] = need_verify_otp
     return response_data
 
 
@@ -164,47 +129,25 @@ def _build_non_domain_response_data(
     response: Response,
     detail: str,
     field_errors: dict[str, str] | None,
-    need_verify_pin: bool,
-    need_verify_otp: bool,
-    session_is_closed: bool,
-    include_otp_flag: bool,
 ) -> dict[str, Any]:
     if isinstance(exc, DRFValidationError):
-        response_data = response.data if isinstance(response.data, dict) else {'detail': detail}
-    else:
-        response_data = {'detail': detail}
-        if field_errors:
-            response_data['fields'] = field_errors
+        return response.data if isinstance(response.data, dict) else {'detail': detail}
 
-    return _add_session_flags(
-        response_data,
-        need_verify_pin=need_verify_pin,
-        need_verify_otp=need_verify_otp,
-        session_is_closed=session_is_closed,
-        include_otp_flag=include_otp_flag,
-    )
+    response_data: dict[str, Any] = {'detail': detail}
+    if field_errors:
+        response_data['fields'] = field_errors
+    return response_data
 
 
 def _build_fallback_response_data(
     *,
     detail: str,
     field_errors: dict[str, str] | None,
-    need_verify_pin: bool,
-    need_verify_otp: bool,
-    session_is_closed: bool,
-    include_otp_flag: bool,
 ) -> dict[str, Any]:
-    response_data = {
+    return {
         'detail': detail,
         **({'fields': field_errors} if field_errors else {}),
     }
-    return _add_session_flags(
-        response_data,
-        need_verify_pin=need_verify_pin,
-        need_verify_otp=need_verify_otp,
-        session_is_closed=session_is_closed,
-        include_otp_flag=include_otp_flag,
-    )
 
 
 def custom_exception_handler(exc: Exception, context: dict[str, Any]) -> Response | None:
@@ -227,34 +170,23 @@ def custom_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
     else:
         logger.warning(exc, view_name=view_name)
 
-    need_verify_pin, need_verify_otp, session_is_closed, include_otp_flag = get_session_flags(
-        context.get('request'),
-    )
     detail = _get_error_detail(exc)
 
     if response is not None:
         if isinstance(exc, DomainError):
-            response.data = build_domain_error_payload(exc, context.get('request'))
+            response.data = build_domain_error_payload(exc)
         else:
             response.data = _build_non_domain_response_data(
                 exc=exc,
                 response=response,
                 detail=detail,
                 field_errors=field_errors,
-                need_verify_pin=need_verify_pin,
-                need_verify_otp=need_verify_otp,
-                session_is_closed=session_is_closed,
-                include_otp_flag=include_otp_flag,
             )
     else:
         response = Response(
             _build_fallback_response_data(
                 detail=detail,
                 field_errors=field_errors,
-                need_verify_pin=need_verify_pin,
-                need_verify_otp=need_verify_otp,
-                session_is_closed=session_is_closed,
-                include_otp_flag=include_otp_flag,
             ),
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )

@@ -146,14 +146,12 @@ def test_domain_error_payload_matches_drf_handler_and_middleware() -> None:
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
     )
 
-    payload = build_domain_error_payload(exc, request)
+    payload = build_domain_error_payload(exc)
     drf_response = custom_exception_handler(exc, {'request': request})
     middleware_response = ExceptionHandlingMiddleware(lambda request: request).process_exception(request, exc)
 
     assert payload == {
         'detail': 'processing unavailable',
-        'need_verify_pin': True,
-        'session_is_closed': True,
         'error_code': 'processing_unavailable',
     }
     assert drf_response is not None
@@ -172,8 +170,6 @@ def test_drf_validation_error_preserves_field_payload() -> None:
     assert response is not None
     assert response.status_code == status.HTTP_400_BAD_REQUEST
     assert response.data['query']['code'] == ['context_query_too_large']
-    assert response.data['need_verify_pin'] is True
-    assert response.data['session_is_closed'] is True
 
 
 def test_base_use_case_uses_pydantic_dtos_and_dispatches_events() -> None:

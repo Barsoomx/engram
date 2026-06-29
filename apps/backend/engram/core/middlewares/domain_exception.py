@@ -20,7 +20,7 @@ class ExceptionHandlingMiddleware:
         exception: Exception,
     ) -> HttpResponse | None:
         if isinstance(exception, DomainError):
-            response_data = build_domain_error_payload(exception, request)
+            response_data = build_domain_error_payload(exception)
             return JsonResponse(
                 response_data,
                 status=exception.status_code,
