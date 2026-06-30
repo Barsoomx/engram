@@ -1,33 +1,38 @@
 'use client';
 
-import { Select, SelectItem } from '@heroui/react';
-import { Loader2, Users } from 'lucide-react';
+import { Users } from 'lucide-react';
 import * as React from 'react';
 
+import {
+  DropdownEyebrow,
+  DropdownPanel,
+  MenuRow,
+  SwitcherBackdrop,
+  SwitcherTrigger,
+} from '@/components/layout/switcher-ui';
+import { InitialTile } from '@/components/ui/initial-tile';
 import { useTeams } from '@/hooks/use-teams';
 import { useOrgStore } from '@/lib/org-store';
+import { useSwitcherStore } from '@/lib/switcher-store';
 import { useTeamStore } from '@/lib/team-store';
-
-const ALL_TEAMS_KEY = 'all';
-
-type TeamListItem = { id: string; name: string };
 
 export function TeamSwitcher() {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
   const activeTeamId = useTeamStore((state) => state.activeTeamId);
   const setActiveTeam = useTeamStore((state) => state.setActiveTeam);
+  const open = useSwitcherStore((s) => s.openMenu === 'team');
+  const toggle = useSwitcherStore((s) => s.toggle);
+  const close = useSwitcherStore((s) => s.close);
 
-  const query = useTeams(activeOrgId, { pageSize: 100 }, { enabled: Boolean(activeOrgId) });
+  const query = useTeams(
+    activeOrgId,
+    { pageSize: 100 },
+    { enabled: Boolean(activeOrgId) },
+  );
   const data = query.data;
 
   React.useEffect(() => {
-    if (!query.isSuccess || !data) {
-
-      return;
-    }
-
-    if (activeTeamId === null) {
-
+    if (!query.isSuccess || !data || activeTeamId === null) {
       return;
     }
 
@@ -38,51 +43,71 @@ export function TeamSwitcher() {
     }
   }, [query.isSuccess, data, activeTeamId, setActiveTeam]);
 
-  const teamItems: TeamListItem[] = React.useMemo(
-    () => [
-      { id: ALL_TEAMS_KEY, name: 'All teams' },
-      ...(data?.results ?? []).map((t) => ({ id: t.id, name: t.name })),
-    ],
-    [data],
-  );
-
-  const selectedKey = activeTeamId ?? ALL_TEAMS_KEY;
+  const teams = data?.results ?? [];
+  const activeTeam = teams.find((t) => t.id === activeTeamId) ?? null;
+  const label = activeTeam ? activeTeam.name : 'All teams';
 
   if (query.isLoading) {
-
     return (
-      <div className='flex items-center gap-2 text-sm text-default-500'>
-        <Loader2 className='w-4 h-4 animate-spin' />
-        <span>Loading teams…</span>
+      <div className='flex items-center gap-2 px-2 text-[13px] text-default-500'>
+        <Users className='h-4 w-4' />
+        <span>Loading…</span>
       </div>
     );
   }
 
   return (
-    <Select
-      aria-label='Active team'
-      classNames={{
-        base: 'w-[200px]',
-        trigger: 'h-9 min-h-9 bg-content2/60 border border-divider',
-      }}
-      items={teamItems}
-      labelPlacement='outside'
-      selectedKeys={new Set<string>([selectedKey])}
-      startContent={<Users className='w-4 h-4 text-default-500' />}
-      variant='bordered'
-      onSelectionChange={(keys) => {
-        const next = Array.from(keys)[0];
+    <div className='relative'>
+      {open && <SwitcherBackdrop onClose={close} />}
 
-        if (next === ALL_TEAMS_KEY || next === undefined) {
-          setActiveTeam(null);
-        } else if (typeof next === 'string') {
-          setActiveTeam(next);
-        }
-      }}
-    >
-      {(item) => (
-        <SelectItem key={item.id}>{item.name}</SelectItem>
+      <SwitcherTrigger active={open} onClick={() => toggle('team')}>
+        <Users size={15} strokeWidth={1.8} className='shrink-0 text-default-400' />
+        <span className='truncate text-[13px] font-medium text-foreground'>
+          {label}
+        </span>
+      </SwitcherTrigger>
+
+      {open && (
+        <DropdownPanel width={240}>
+          <DropdownEyebrow>Teams</DropdownEyebrow>
+          <div className='max-h-[300px] space-y-0.5 overflow-y-auto'>
+            <MenuRow
+              active={activeTeamId === null}
+              onClick={() => {
+                setActiveTeam(null);
+                close();
+              }}
+            >
+              <span className='flex h-6 w-6 shrink-0 items-center justify-center rounded-[7px] bg-content3 text-default-500'>
+                <Users size={13} strokeWidth={1.8} />
+              </span>
+              <span className='flex-1 text-[13px] font-medium text-foreground'>
+                All teams
+              </span>
+            </MenuRow>
+            {teams.map((team) => (
+              <MenuRow
+                key={team.id}
+                active={team.id === activeTeamId}
+                onClick={() => {
+                  setActiveTeam(team.id);
+                  close();
+                }}
+              >
+                <InitialTile
+                  name={team.name}
+                  seed={team.slug}
+                  size={24}
+                  variant='flat'
+                />
+                <span className='min-w-0 flex-1 truncate text-[13px] font-medium text-foreground'>
+                  {team.name}
+                </span>
+              </MenuRow>
+            ))}
+          </div>
+        </DropdownPanel>
       )}
-    </Select>
+    </div>
   );
 }

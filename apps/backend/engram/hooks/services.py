@@ -19,7 +19,7 @@ from engram.core.models import (
     Team,
 )
 from engram.core.redaction import RedactionResult, redact_value
-from engram.memory.tasks import process_observation_recorded
+from engram.memory.tasks import distill_session, process_observation_recorded
 
 
 @dataclass(frozen=True)
@@ -163,6 +163,8 @@ class IngestHookEvent:
                     defaults={'citation': data.event_id, 'metadata': {'event_type': data.event_type}},
                 )
                 process_observation_recorded.delay(str(observation.id))
+                if data.event_type == 'session_end':
+                    distill_session.delay(str(session.id))
 
                 return HookIngestResult(
                     request_id=data.request_id,

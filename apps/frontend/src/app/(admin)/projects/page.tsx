@@ -24,7 +24,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
-import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { PrimaryButton } from '@/components/ui/primary-button';
 import {
   useArchiveProject,
   useCreateProject,
@@ -33,21 +33,29 @@ import {
 } from '@/hooks/use-projects';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type { Project, ProjectWriteInput } from '@/lib/admin-api';
+import { formatRelativeTime } from '@/lib/design';
 import { useOrgStore } from '@/lib/org-store';
 
-function formatDateTime(value: string | null): string {
-  if (!value) {
+function gridColumns(canAdmin: boolean): string {
+  return canAdmin
+    ? 'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.8fr) minmax(0,0.8fr) auto'
+    : 'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.8fr) minmax(0,0.8fr)';
+}
 
-    return '—';
-  }
-
-  try {
-
-    return new Date(value).toLocaleString();
-  } catch {
-
-    return value;
-  }
+function ColumnHeader({ canAdmin }: { canAdmin: boolean }) {
+  return (
+    <div
+      className='grid items-center gap-4 border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'
+      style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+    >
+      <span>Project</span>
+      <span>Slug</span>
+      <span>Repository</span>
+      <span>Memories</span>
+      <span>Updated</span>
+      {canAdmin && <span className='sr-only'>Actions</span>}
+    </div>
+  );
 }
 
 function ProjectsTable({
@@ -62,70 +70,96 @@ function ProjectsTable({
   onArchive: (project: Project) => void;
 }) {
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>
-              Repository
-            </th>
-            <th className='py-2 px-3 text-default-500 font-medium'>
-              Default branch
-            </th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
-            {canAdmin && (
-              <th className='py-2 px-3 text-default-500 font-medium text-right'>
-                Actions
-              </th>
-            )}
-          </tr>
-        </thead>
-        <tbody>
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[680px]'>
+          <ColumnHeader canAdmin={canAdmin} />
           {items.map((project) => (
-            <tr key={project.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 text-foreground'>{project.name}</td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
+            <div
+              key={project.id}
+              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
+              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
+                  <GitBranch className='h-[15px] w-[15px]' strokeWidth={1.8} />
+                </span>
+                <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                  {project.name}
+                </span>
+              </div>
+              <span className='truncate font-mono text-[12px] text-default-500'>
                 {project.slug}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700 break-all max-w-[20rem]'>
+              </span>
+              <span className='truncate font-mono text-[12px] text-default-500'>
                 {project.repository_url || '—'}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700 whitespace-nowrap'>
-                {project.default_branch || '—'}
-              </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {formatDateTime(project.created_at)}
-              </td>
+              </span>
+              <span className='tnum font-mono text-[12px] text-default-400'>
+                {project.memory_count != null ? project.memory_count.toLocaleString() : '—'}
+              </span>
+              <span className='whitespace-nowrap text-[12px] text-default-400'>
+                {formatRelativeTime(project.updated_at)}
+              </span>
               {canAdmin && (
-                <td className='py-2 px-3'>
-                  <div className='flex items-center justify-end gap-2'>
-                    <Button
-                      size='sm'
-                      variant='flat'
-                      startContent={<Pencil className='w-3.5 h-3.5' />}
-                      onPress={() => onEdit(project)}
-                    >
-                      Edit
-                    </Button>
-                    <Button
-                      size='sm'
-                      color='danger'
-                      variant='flat'
-                      startContent={<Archive className='w-3.5 h-3.5' />}
-                      onPress={() => onArchive(project)}
-                      isDisabled={project.archived_at !== null}
-                    >
-                      Archive
-                    </Button>
-                  </div>
-                </td>
+                <div className='flex items-center justify-end gap-2'>
+                  <Button
+                    size='sm'
+                    variant='flat'
+                    startContent={<Pencil className='w-3.5 h-3.5' />}
+                    onPress={() => onEdit(project)}
+                  >
+                    Edit
+                  </Button>
+                  <Button
+                    size='sm'
+                    color='danger'
+                    variant='flat'
+                    startContent={<Archive className='w-3.5 h-3.5' />}
+                    onPress={() => onArchive(project)}
+                    isDisabled={project.archived_at !== null}
+                  >
+                    Archive
+                  </Button>
+                </div>
               )}
-            </tr>
+            </div>
           ))}
-        </tbody>
-      </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjectsTableSkeleton({ canAdmin }: { canAdmin: boolean }) {
+  return (
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[680px]'>
+          <ColumnHeader canAdmin={canAdmin} />
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div
+              key={index}
+              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 last:border-b-0'
+              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                <span className='h-[30px] w-[30px] shrink-0 rounded-[9px] bg-content2' />
+                <span className='h-3.5 w-28 rounded-medium bg-content2' />
+              </div>
+              <span className='h-3 w-20 rounded-medium bg-content2' />
+              <span className='h-3 w-40 rounded-medium bg-content2' />
+              <span className='h-3 w-8 rounded-medium bg-content2' />
+              <span className='h-3 w-12 rounded-medium bg-content2' />
+              {canAdmin && (
+                <div className='flex items-center justify-end gap-2'>
+                  <span className='h-8 w-14 rounded-medium bg-content2' />
+                  <span className='h-8 w-20 rounded-medium bg-content2' />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -383,72 +417,54 @@ export default function ProjectsPage() {
       <section className='space-y-6'>
         <PageHeader
           title='Projects'
-          subtitle='Create, edit, and archive projects within this organization.'
+          subtitle='Scopes for memory ingestion and retrieval.'
           actions={
             canAdmin ? (
-              <Button
-                color='primary'
+              <PrimaryButton
                 startContent={<Plus className='w-4 h-4' />}
                 onPress={openCreate}
                 isDisabled={!meLoaded}
               >
-                Create project
-              </Button>
+                New project
+              </PrimaryButton>
             ) : null
           }
         />
 
-        <div className='surface-card p-2'>
-          {isLoading ? (
-            <table className='w-full border-collapse text-left text-sm'>
-              <thead>
-                <tr className='border-b border-divider'>
-                  {Array.from({ length: canAdmin ? 6 : 5 }).map((_, index) => (
-                    <th
-                      key={index}
-                      className='py-2 px-3 text-default-500 font-medium'
-                    >
-                      <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <TableRowSkeleton columns={canAdmin ? 6 : 5} />
-            </table>
-          ) : items.length === 0 ? (
-            <EmptyState
-              title='No projects yet'
-              description='Create a project to scope memory ingestion and retrieval within this organization.'
-              icon={<GitBranch className='w-6 h-6' />}
-              action={
-                canAdmin ? (
-                  <Button
-                    color='primary'
-                    startContent={<Plus className='w-4 h-4' />}
-                    onPress={openCreate}
-                  >
-                    Create project
-                  </Button>
-                ) : undefined
-              }
-            />
-          ) : (
-            <ProjectsTable
-              items={items}
-              canAdmin={canAdmin}
-              onEdit={openEdit}
-              onArchive={setArchiveTarget}
-            />
-          )}
-        </div>
+        {isLoading ? (
+          <ProjectsTableSkeleton canAdmin={canAdmin} />
+        ) : items.length === 0 ? (
+          <EmptyState
+            title='No projects yet'
+            description='Create a project to scope memory ingestion and retrieval within this organization.'
+            icon={<GitBranch className='w-6 h-6' />}
+            action={
+              canAdmin ? (
+                <PrimaryButton
+                  startContent={<Plus className='w-4 h-4' />}
+                  onPress={openCreate}
+                >
+                  New project
+                </PrimaryButton>
+              ) : undefined
+            }
+          />
+        ) : (
+          <ProjectsTable
+            items={items}
+            canAdmin={canAdmin}
+            onEdit={openEdit}
+            onArchive={setArchiveTarget}
+          />
+        )}
 
         {items.length > 0 && (
-          <div className='flex items-center justify-between text-xs text-default-500'>
+          <div className='flex items-center justify-between text-[12px] text-default-400'>
             <p>
               Showing {items.length} project{items.length === 1 ? '' : 's'}.
             </p>
             {canAdmin && (
-              <p className='flex items-center gap-1'>
+              <p className='flex items-center gap-1.5'>
                 <ShieldCheck className='w-3.5 h-3.5' />
                 Archiving is reversible by an administrator.
               </p>
@@ -457,7 +473,7 @@ export default function ProjectsPage() {
         )}
 
         {projectsQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
+          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
             {projectsQuery.error instanceof Error
               ? projectsQuery.error.message
               : 'Failed to load projects.'}

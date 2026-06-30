@@ -122,6 +122,7 @@ class ProviderCallInput:
     trace_id: str
     prompt: str
     system_prompt: str = ''
+    response_kind: str = 'single'
 
 
 @dataclass(frozen=True)
@@ -328,6 +329,63 @@ class DisableProviderSecret:
             return secret
 
 
+@dataclass(frozen=True)
+class DisableModelPolicyInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    policy_id: uuid.UUID
+    request_id: str
+    actor_id: str
+    allowed_team_ids: tuple[uuid.UUID, ...] = ()
+
+
+@dataclass(frozen=True)
+class UpdateModelPolicyInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    policy_id: uuid.UUID
+    request_id: str
+    actor_id: str
+    allowed_team_ids: tuple[uuid.UUID, ...] = ()
+    name: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    secret_id: uuid.UUID | None = None
+    active: bool | None = None
+    fallback_enabled: bool | None = None
+    task_type: str | None = None
+
+
+@dataclass(frozen=True)
+class EnableProviderSecretInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    secret_id: uuid.UUID
+    request_id: str
+    actor_id: str
+    allowed_team_ids: tuple[uuid.UUID, ...] = ()
+
+
+@dataclass(frozen=True)
+class UpdateProviderSecretInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    secret_id: uuid.UUID
+    name: str
+    request_id: str
+    actor_id: str
+    allowed_team_ids: tuple[uuid.UUID, ...] = ()
+
+
+def ensure_policy_in_scope(policy: ModelPolicy, allowed_team_ids: tuple[uuid.UUID, ...]) -> None:
+    if policy.team_id and policy.team_id not in allowed_team_ids:
+        raise ModelPolicyError('model_policy_not_found', 'Model policy was not found')
+
+
 class CreateModelPolicy:
     def execute(self, data: ModelPolicyInput) -> ModelPolicy:
         team_id = data.scope_team_id if data.scope_team_id is not None else data.team_id
@@ -374,6 +432,163 @@ class CreateModelPolicy:
         )
 
         return policy
+
+
+class UpdateModelPolicy:
+    def _apply_scalar_updates(
+        self,
+        policy: ModelPolicy,
+        data: UpdateModelPolicyInput,
+        update_fields: list[str],
+    ) -> None:
+        scalar_fields = ('name', 'provider', 'model', 'task_type', 'active', 'fallback_enabled')
+        for field in scalar_fields:
+            value = getattr(data, field)
+            if value is not None:
+                setattr(policy, field, value)
+                update_fields.append(field)
+
+    def _apply_secret_update(
+        self,
+        policy: ModelPolicy,
+        data: UpdateModelPolicyInput,
+        update_fields: list[str],
+    ) -> None:
+        if data.secret_id is None:
+            return
+
+        try:
+            secret = ProviderSecret.objects.get(
+                organization_id=data.organization_id,
+                id=data.secret_id,
+            )
+        except ProviderSecret.DoesNotExist as err:
+            raise ModelPolicyError('policy_scope_mismatch', 'Secret not found in organization') from err
+
+        if secret.team_id and secret.team_id != policy.team_id:
+            raise ModelPolicyError('policy_scope_mismatch', 'Policy secret team must match policy team')
+
+        policy.secret = secret
+        update_fields.append('secret_id')
+
+    def execute(self, data: UpdateModelPolicyInput) -> ModelPolicy:
+        with transaction.atomic():
+            try:
+                policy = ModelPolicy.objects.select_for_update().get(
+                    organization_id=data.organization_id,
+                    id=data.policy_id,
+                )
+            except ModelPolicy.DoesNotExist as err:
+                raise ModelPolicyError('model_policy_not_found', 'Model policy was not found') from err
+
+            ensure_policy_in_scope(policy, data.allowed_team_ids)
+
+            update_fields: list[str] = ['version', 'updated_at']
+            self._apply_scalar_updates(policy, data, update_fields)
+            self._apply_secret_update(policy, data, update_fields)
+
+            policy.version += 1
+            policy.save(update_fields=update_fields)
+            audit_model_policy_event(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                actor_id=data.actor_id,
+                event_type='ModelPolicyUpdated',
+                target_type='model_policy',
+                target_id=str(policy.id),
+                capability='model_policy:*',
+                request_id=data.request_id,
+                metadata={'provider': policy.provider, 'model': policy.model, 'task_type': policy.task_type},
+            )
+
+            return policy
+
+
+class DisableModelPolicy:
+    def execute(self, data: DisableModelPolicyInput) -> ModelPolicy:
+        with transaction.atomic():
+            try:
+                policy = ModelPolicy.objects.select_for_update().get(
+                    organization_id=data.organization_id,
+                    id=data.policy_id,
+                )
+            except ModelPolicy.DoesNotExist as err:
+                raise ModelPolicyError('model_policy_not_found', 'Model policy was not found') from err
+
+            ensure_policy_in_scope(policy, data.allowed_team_ids)
+
+            policy.active = False
+            policy.save(update_fields=['active', 'updated_at'])
+            audit_model_policy_event(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                actor_id=data.actor_id,
+                event_type='ModelPolicyDisabled',
+                target_type='model_policy',
+                target_id=str(policy.id),
+                capability='model_policy:*',
+                request_id=data.request_id,
+                metadata={'provider': policy.provider, 'model': policy.model},
+            )
+
+            return policy
+
+
+class EnableProviderSecret:
+    def execute(self, data: EnableProviderSecretInput) -> ProviderSecret:
+        with transaction.atomic():
+            secret = ProviderSecret.objects.select_for_update().get(
+                organization_id=data.organization_id,
+                id=data.secret_id,
+            )
+            ensure_secret_scope_allowed(secret, data.allowed_team_ids)
+
+            secret.active = True
+            secret.rotation_state = 'active'
+            secret.save(update_fields=['active', 'rotation_state', 'updated_at'])
+            audit_model_policy_event(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                actor_id=data.actor_id,
+                event_type='ProviderSecretEnabled',
+                target_type='provider_secret',
+                target_id=str(secret.id),
+                capability='secrets:*',
+                request_id=data.request_id,
+                metadata={'provider': secret.provider},
+            )
+
+            return secret
+
+
+class UpdateProviderSecret:
+    def execute(self, data: UpdateProviderSecretInput) -> ProviderSecret:
+        with transaction.atomic():
+            secret = ProviderSecret.objects.select_for_update().get(
+                organization_id=data.organization_id,
+                id=data.secret_id,
+            )
+            ensure_secret_scope_allowed(secret, data.allowed_team_ids)
+
+            secret.name = data.name
+            secret.save(update_fields=['name', 'updated_at'])
+            audit_model_policy_event(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                actor_id=data.actor_id,
+                event_type='ProviderSecretRenamed',
+                target_type='provider_secret',
+                target_id=str(secret.id),
+                capability='secrets:*',
+                request_id=data.request_id,
+                metadata={'provider': secret.provider, 'name': data.name},
+            )
+
+            return secret
 
 
 class ResolveModelPolicy:
@@ -435,7 +650,7 @@ class FakeProviderGateway:
         )
         if existing_record is not None:
             redacted_prompt = redact_value(data.prompt)
-            generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+            generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -447,7 +662,7 @@ class FakeProviderGateway:
             )
 
         redacted_prompt = redact_value(data.prompt)
-        generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+        generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
         prompt_was_redacted = redacted_prompt.redacted or '[REDACTED]' in data.prompt
         token_count = len(data.prompt.split())
         record = ProviderCallRecord.objects.create(
@@ -545,6 +760,34 @@ def generated_candidate_content(prompt: str) -> tuple[str, str]:
     return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'
 
 
+def generated_candidates_payload(prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    candidates = [
+        {
+            'title': f'Provider-synthesized memory {digest} high',
+            'body': f'Provider-synthesized candidate body {digest} high',
+            'confidence': 0.9,
+            'supporting_observation_ids': [],
+        },
+        {
+            'title': f'Provider-synthesized memory {digest} low',
+            'body': f'Provider-synthesized candidate body {digest} low',
+            'confidence': 0.4,
+            'supporting_observation_ids': [],
+        },
+    ]
+
+    return json.dumps(candidates)
+
+
+def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
+    title, body = generated_candidate_content(prompt)
+    if data.response_kind == 'candidates':
+        return title, generated_candidates_payload(prompt)
+
+    return title, body
+
+
 def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
     return Fernet(encryption_key()).decrypt(envelope.ciphertext.encode()).decode()
 
@@ -575,7 +818,8 @@ class OpenAICompatibleGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -587,7 +831,8 @@ class OpenAICompatibleGateway:
             )
 
         content = self._chat_completion(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,
@@ -734,6 +979,20 @@ def _split_completion(content: str) -> tuple[str, str]:
     return lines[0][:255], '\n'.join(lines[1:])
 
 
+def _completion_body(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return content
+
+    return _split_completion(content)[1]
+
+
+def _completion_title(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return ''
+
+    return _split_completion(content)[0]
+
+
 class AnthropicMessagesGateway:
     def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
         self._base_url = base_url.rstrip('/')
@@ -746,7 +1005,8 @@ class AnthropicMessagesGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -758,7 +1018,8 @@ class AnthropicMessagesGateway:
             )
 
         content = self._messages(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,

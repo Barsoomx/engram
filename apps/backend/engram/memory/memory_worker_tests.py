@@ -18,6 +18,7 @@ from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     Agent,
     AgentSession,
+    AuditEvent,
     CandidateStatus,
     Memory,
     MemoryCandidate,
@@ -26,6 +27,7 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
+    OrganizationSettings,
     Project,
     RawEventEnvelope,
     RetrievalDocument,
@@ -157,6 +159,13 @@ def execute_worker(observation: Observation) -> Any:
     )
 
 
+def enable_auto_promote(organization: Organization, threshold: str = '0.500') -> None:
+    OrganizationSettings.objects.update_or_create(
+        organization=organization,
+        defaults={'distillation_auto_approve_threshold': Decimal(threshold)},
+    )
+
+
 def create_generation_policy(organization: Organization, team: Team, project: Project) -> ModelPolicy:
     secret = ProviderSecret.objects.create(
         organization=organization,
@@ -258,6 +267,8 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     result = execute_worker(observation)
 
     assert result.duplicate is False
+    assert result.held_for_review is True
+    assert result.memory is None
     candidate = MemoryCandidate.objects.get()
     provider_call = ProviderCallRecord.objects.get()
 
@@ -270,9 +281,15 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     assert candidate.body == expected_generated_body(observation)
     assert candidate.title != observation.title
     assert candidate.body != observation.body
-    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.status == CandidateStatus.PROPOSED
     assert candidate.visibility_scope == VisibilityScope.PROJECT
     assert candidate.confidence == Decimal('0.500')
+    assert Memory.objects.count() == 0
+    held_audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
+    assert held_audit.actor_type == 'system'
+    assert held_audit.target_id == str(candidate.id)
+    assert held_audit.metadata['confidence'] == '0.500'
+    assert held_audit.metadata['threshold'] == '0.800'
     assert candidate.content_hash == memory_candidate_content_hash(observation)
     assert candidate.evidence == [
         {
@@ -299,6 +316,7 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
 def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval() -> None:
     organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
     policy = create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
 
     result = execute_worker(observation)
 
@@ -341,6 +359,7 @@ def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval(
 def test_observation_recorded_worker_redacts_candidate_content_and_evidence() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
     observation.title = f'Bearer {RAW_KEY}'
     observation.body = f'command printed {RAW_KEY} and {RAW_SLACK_TOKEN}'
     observation.files_read = [f'apps/backend/{RAW_SLACK_TOKEN}.txt']
@@ -390,6 +409,7 @@ def test_provider_prompt_masks_token_shaped_values_before_provider_boundary() ->
 def test_observation_recorded_worker_is_idempotent_for_duplicate_delivery() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
     first = execute_worker(observation)
 
     second = execute_worker(observation)
@@ -410,6 +430,7 @@ def test_observation_recorded_worker_is_idempotent_for_duplicate_delivery() -> N
 def test_observation_recorded_worker_reuses_existing_candidate() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
     candidate = MemoryCandidate.objects.create(
         organization=organization,
         project=project,
@@ -504,6 +525,7 @@ def test_observation_recorded_worker_missing_generation_policy_fails_before_prom
 def test_process_observation_recorded_task_delegates_by_observation_id() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
 
     memory_id = process_observation_recorded.run(str(observation.id))
 
@@ -700,6 +722,7 @@ def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
+    enable_auto_promote(organization)
 
     execute_worker(observation)
 
@@ -714,6 +737,7 @@ def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
+    enable_auto_promote(organization)
 
     execute_worker(observation)
     first_document = RetrievalDocument.objects.get()
@@ -733,6 +757,7 @@ def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
 def test_index_memory_version_skips_embedding_without_policy() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
 
     execute_worker(observation)
 
@@ -748,6 +773,7 @@ def test_index_memory_version_skips_embedding_when_secret_disabled() -> None:
     embedding_policy = create_embedding_policy(organization, team, project)
     embedding_policy.secret.active = False
     embedding_policy.secret.save(update_fields=['active'])
+    enable_auto_promote(organization)
 
     execute_worker(observation)
 
@@ -761,6 +787,7 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
     organization, team, project, session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
+    enable_auto_promote(organization)
     execute_worker(observation)
 
     second_session = AgentSession.objects.create(

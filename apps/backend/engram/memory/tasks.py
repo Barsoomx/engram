@@ -8,6 +8,7 @@ from django.utils import timezone
 
 from engram.celery_app import app
 from engram.core.models import Memory, MemoryStatus, Project
+from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.services import (
     DAILY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
@@ -40,7 +41,40 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     finally:
         structlog.contextvars.clear_contextvars()
 
-    return str(result.memory.id)
+    if result.memory is not None:
+        return str(result.memory.id)
+
+    return str(result.candidate.id)
+
+
+@app.task(bind=True, name='engram.memory.distill_session', max_retries=_MAX_RETRIES)
+def distill_session(self: object, session_id: object) -> str:
+    try:
+        parsed_session_id = uuid.UUID(str(session_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise MemoryWorkerError('malformed session id') from error
+
+    request_id = f'distill-session:{parsed_session_id}'
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        correlation_id=request_id,
+        request_id=request_id,
+    )
+    try:
+        result = run_session_distillation_with_tracking(
+            session_id=parsed_session_id,
+            request_id=request_id,
+            correlation_id=request_id,
+        )
+    except MemoryWorkerError as exc:
+        if exc.retryable:
+            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
+            raise self.retry(exc=exc, countdown=countdown) from None
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    return str(result.session.id)
 
 
 @app.task(bind=True, name='engram.memory.generate_daily_digest', max_retries=_MAX_RETRIES)
