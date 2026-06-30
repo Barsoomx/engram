@@ -62,10 +62,44 @@ def f_project_empty(f_org: Organization) -> Project:
     )
 
 
+@pytest.fixture
+def f_project_digest_only(f_org: Organization) -> Project:
+    project = Project.objects.create(
+        organization=f_org,
+        name='project-digest-only',
+        slug='project-digest-only',
+    )
+    Memory.objects.create(
+        organization=f_org,
+        project=project,
+        title='digest-mem',
+        body='body',
+        status=MemoryStatus.APPROVED,
+        updated_at=timezone.now(),
+        metadata={'kind': 'digest'},
+    )
+
+    return project
+
+
 @pytest.mark.django_db
 def test_run_scheduled_weekly_digests_enqueues_per_project_with_memories(
     f_project_with_memory: Project,
     f_project_empty: Project,
+) -> None:
+    with mock.patch.object(generate_weekly_digest, 'delay') as m_delay:
+        run_scheduled_weekly_digests()
+
+    m_delay.assert_called_once_with(
+        str(f_project_with_memory.organization_id),
+        str(f_project_with_memory.id),
+    )
+
+
+@pytest.mark.django_db
+def test_run_scheduled_weekly_digests_skips_digest_kind_only_project(
+    f_project_with_memory: Project,
+    f_project_digest_only: Project,
 ) -> None:
     with mock.patch.object(generate_weekly_digest, 'delay') as m_delay:
         run_scheduled_weekly_digests()

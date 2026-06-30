@@ -11,6 +11,7 @@ from engram.core.models import Memory, MemoryStatus, Project
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.services import (
     DAILY_DIGEST_WINDOW_DAYS,
+    WEEKLY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
     MemoryWorkerError,
     ProcessObservationRecorded,
@@ -158,12 +159,19 @@ def run_scheduled_weekly_digests() -> dict[str, int]:
     enqueued_projects = 0
     enqueued_tasks = 0
 
+    weekly_window_start = timezone.now() - timedelta(days=WEEKLY_DIGEST_WINDOW_DAYS)
+
     for project in Project.objects.all():
-        has_approved = Memory.objects.filter(
-            organization_id=project.organization_id,
-            project=project,
-            status=MemoryStatus.APPROVED,
-        ).exists()
+        has_approved = (
+            Memory.objects.filter(
+                organization_id=project.organization_id,
+                project=project,
+                status=MemoryStatus.APPROVED,
+                updated_at__gte=weekly_window_start,
+            )
+            .exclude(metadata__contains={'kind': 'digest'})
+            .exists()
+        )
         if not has_approved:
             continue
 
@@ -214,6 +222,6 @@ def _recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
             status=MemoryStatus.APPROVED,
             updated_at__gte=window_start,
         )
-        .exclude(metadata__kind='digest')
+        .exclude(metadata__contains={'kind': 'digest'})
         .values_list('id', flat=True),
     )

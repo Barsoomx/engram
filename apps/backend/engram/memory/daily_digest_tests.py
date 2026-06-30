@@ -136,6 +136,35 @@ def test_run_scheduled_digests_skips_empty_projects() -> None:
     assert result == {'enqueued_projects': 0, 'enqueued_tasks': 0}
 
 
+@pytest.mark.django_db
+def test_run_scheduled_digests_excludes_digest_kind_memories() -> None:
+    organization_a, team_a, project_a = create_organization_project_team(slug='zeta')
+    Memory.objects.create(
+        organization=organization_a,
+        project=project_a,
+        team=team_a,
+        title='Existing digest',
+        body='Existing digest body.',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={'kind': 'digest'},
+    )
+
+    organization_b, team_b, project_b = create_organization_project_team(slug='eta')
+    normal_memory = create_approved_memory(organization_b, project_b, team_b, title='Normal source')
+
+    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
+        result = run_scheduled_digests()
+
+    m_delay.assert_called_once_with(
+        str(organization_b.id),
+        str(project_b.id),
+        [str(normal_memory.id)],
+    )
+    assert result == {'enqueued_projects': 1, 'enqueued_tasks': 1}
+
+
+@pytest.mark.skip(reason='stale mock: GenerateDigest does not exist in tasks; update separately')
 def test_generate_daily_digest_parses_ids_and_calls_service() -> None:
     organization_id = uuid.uuid4()
     project_id = uuid.uuid4()
@@ -159,6 +188,3 @@ def test_generate_daily_digest_parses_ids_and_calls_service() -> None:
     assert digest_input.memory_ids == (memory_id,)
     assert digest_input.request_id == f'daily-digest:{project_id}'
     assert returned == str(m_result.memory.id)
-
-
-pytestmark = pytest.mark.skip(reason='daily digest task tests need celery eager mode - deferred')
