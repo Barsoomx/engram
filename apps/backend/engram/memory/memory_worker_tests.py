@@ -39,6 +39,9 @@ from engram.memory.services import (
     ProcessObservationRecorded,
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
+    digest_prompt,
+    digest_system_prompt,
+    distillation_system_prompt,
     memory_candidate_content_hash,
     provider_prompt,
 )
@@ -880,3 +883,78 @@ def test_process_observation_recorded_task_clears_context_before_execution() -> 
     ctx = structlog.contextvars.get_contextvars()
     assert 'stale_key' not in ctx
     assert 'correlation_id' not in ctx
+
+
+def test_distillation_system_prompt_contains_instructions() -> None:
+    prompt = distillation_system_prompt()
+
+    assert 'Title' in prompt
+    assert 'Body' in prompt
+    assert 'verbatim' in prompt
+    assert 'invent' in prompt
+
+
+def test_distillation_system_prompt_is_runtime_neutral() -> None:
+    prompt = distillation_system_prompt()
+
+    for brand in ('Claude', 'Codex', 'claude-mem', 'OpenAI', 'GPT', 'Anthropic'):
+        assert brand not in prompt
+
+
+@pytest.mark.django_db
+def test_provider_prompt_preserves_exact_file_path_identifier() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    observation.files_read = ['apps/backend/engram/core/models.py']
+    observation.files_modified = ['apps/backend/engram/memory/services.py']
+    observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])
+
+    prompt = provider_prompt(observation)
+
+    assert 'apps/backend/engram/core/models.py' in prompt
+    assert 'apps/backend/engram/memory/services.py' in prompt
+
+
+def test_digest_system_prompt_contains_instructions() -> None:
+    prompt = digest_system_prompt()
+
+    assert 'Title' in prompt
+    assert 'Body' in prompt
+    assert 'de-duplicate' in prompt
+    assert 'invent' in prompt
+
+
+def test_digest_system_prompt_is_runtime_neutral() -> None:
+    prompt = digest_system_prompt()
+
+    for brand in ('Claude', 'Codex', 'claude-mem', 'OpenAI', 'GPT', 'Anthropic'):
+        assert brand not in prompt
+
+
+@pytest.mark.django_db
+def test_digest_prompt_lists_source_titles_and_bodies() -> None:
+    organization, team, project, _session, _raw_event, _observation = create_observation_recorded_scope()
+    source_a = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Fix missing migration',
+        body='Added 0042_user_schema migration for NOT NULL column',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    source_b = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Update CI cache key',
+        body='Changed poetry.lock hash in .github/workflows/ci.yml',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+
+    prompt = digest_prompt((source_a, source_b))
+
+    assert 'Fix missing migration' in prompt
+    assert 'Added 0042_user_schema migration' in prompt
+    assert 'Update CI cache key' in prompt
+    assert 'Changed poetry.lock hash' in prompt
