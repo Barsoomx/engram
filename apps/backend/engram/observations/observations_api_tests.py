@@ -21,7 +21,7 @@ from engram.access.models import (
 )
 from engram.access.services import hash_api_key
 from engram.context.context_api_tests import RAW_KEY, auth_headers, create_project_scope
-from engram.core.models import Agent, AgentSession, Observation, Organization, Project, Runtime
+from engram.core.models import Agent, AgentSession, Observation, Organization, Project, RawEventEnvelope, Runtime
 
 
 def grant_observations_read(raw_key: str) -> None:
@@ -40,6 +40,11 @@ def create_observation(
     title: str = 'Test observation',
     body: str = 'Observation body content.',
     content_hash: str = 'obs-hash-1',
+    subtitle: str = '',
+    facts: list[Any] | None = None,
+    narrative: str = '',
+    concepts: list[Any] | None = None,
+    raw_event: RawEventEnvelope | None = None,
 ) -> Observation:
     agent = Agent.objects.create(
         organization=organization,
@@ -61,11 +66,54 @@ def create_observation(
         team=team,
         agent=agent,
         session=session,
+        raw_event=raw_event,
         observation_type='tool_use',
         title=title,
+        subtitle=subtitle,
         body=body,
+        facts=facts or [],
+        narrative=narrative,
+        concepts=concepts or [],
         content_hash=content_hash,
         observed_at=timezone.now(),
+    )
+
+
+def create_raw_event(
+    organization: Any,
+    team: Any,
+    project: Any,
+    *,
+    correlation_id: str,
+    client_event_id: str,
+) -> RawEventEnvelope:
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id=f'codex-raw-{client_event_id}',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=f'session-raw-{client_event_id}',
+        runtime=Runtime.CODEX,
+    )
+
+    return RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        client_event_id=client_event_id,
+        idempotency_key=f'{client_event_id}-key',
+        content_hash=f'raw-hash-{client_event_id}',
+        runtime=Runtime.CODEX,
+        payload={'tool_name': 'bash'},
+        correlation_id=correlation_id,
     )
 
 
@@ -401,3 +449,113 @@ def test_session_user_lacking_observations_read_gets_403() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'missing_capability'
+
+
+@pytest.mark.django_db
+def test_list_observations_includes_facts_narrative_concepts_subtitle() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    create_observation(
+        organization,
+        team,
+        project,
+        title='Full fields obs',
+        subtitle='Subtitle text',
+        facts=['fact-one', 'fact-two'],
+        narrative='Narrative text',
+        concepts=['concept-one'],
+        content_hash='h-full-fields',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    item = response.json()['items'][0]
+    assert item['subtitle'] == 'Subtitle text'
+    assert item['facts'] == ['fact-one', 'fact-two']
+    assert item['narrative'] == 'Narrative text'
+    assert item['concepts'] == ['concept-one']
+
+
+@pytest.mark.django_db
+def test_observation_detail_includes_facts_narrative_concepts_subtitle() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    obs = create_observation(
+        organization,
+        team,
+        project,
+        title='Detail full fields obs',
+        subtitle='Detail subtitle',
+        facts=['detail-fact'],
+        narrative='Detail narrative',
+        concepts=['detail-concept'],
+        content_hash='h-detail-full-fields',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['subtitle'] == 'Detail subtitle'
+    assert body['facts'] == ['detail-fact']
+    assert body['narrative'] == 'Detail narrative'
+    assert body['concepts'] == ['detail-concept']
+
+
+@pytest.mark.django_db
+def test_list_observations_filters_by_correlation_id() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    matching_raw_event = create_raw_event(
+        organization,
+        team,
+        project,
+        correlation_id='corr-match-1',
+        client_event_id='event-match-1',
+    )
+    other_raw_event = create_raw_event(
+        organization,
+        team,
+        project,
+        correlation_id='corr-other-1',
+        client_event_id='event-other-1',
+    )
+    matching_obs = create_observation(
+        organization,
+        team,
+        project,
+        title='Matching correlation obs',
+        content_hash='h-corr-match',
+        raw_event=matching_raw_event,
+    )
+    create_observation(
+        organization,
+        team,
+        project,
+        title='Other correlation obs',
+        content_hash='h-corr-other',
+        raw_event=other_raw_event,
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'correlation_id': 'corr-match-1', 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    assert len(items) == 1
+    assert items[0]['observation_id'] == str(matching_obs.id)

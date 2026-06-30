@@ -52,6 +52,7 @@ class ObservationListView(APIView):
                     session_id=data.get('session_id'),
                     since=data.get('since'),
                     until=data.get('until'),
+                    correlation_id=data.get('correlation_id') or None,
                 ),
             )
         except AccessDeniedError as error:
