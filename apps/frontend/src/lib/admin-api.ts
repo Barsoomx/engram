@@ -566,3 +566,44 @@ export async function bulkArchiveMemoryReview(
 
   return response.data;
 }
+
+export type AuditEvent = {
+  id: string;
+  event_type: string;
+  actor_type: string;
+  actor_id: string;
+  actor_display: string | null;
+  target_type: string;
+  target_id: string;
+  target_display: string | null;
+  capability: string;
+  result: string;
+  request_id: string;
+  metadata: Record<string, unknown> | null;
+  project_id: string | null;
+  team_id: string | null;
+  created_at: string;
+};
+
+export type AuditEventListParams = ListParams & {
+  event_type?: string;
+  result?: string;
+  actor_id?: string;
+  target_type?: string;
+  project_id?: string;
+  team_id?: string;
+  created_at__gte?: string;
+  created_at__lt?: string;
+};
+
+export async function listAuditEvents(
+  params?: AuditEventListParams,
+): Promise<Paginated<AuditEvent>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<AuditEvent>>(
+    '/v1/admin/audit-events/',
+    { params },
+  );
+
+  return response.data;
+}

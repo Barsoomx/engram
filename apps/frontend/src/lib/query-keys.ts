@@ -71,4 +71,7 @@ export const adminQueryKeys = {
 
   settingsEmbedding: (orgId: string | null) =>
     ['admin', orgId, 'settings', 'embedding'] as const,
+
+  auditEvents: (orgId: string | null, params?: ListParams) =>
+    ['admin', orgId, 'audit-events', params ?? {}] as const,
 };

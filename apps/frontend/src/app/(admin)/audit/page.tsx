@@ -4,46 +4,24 @@ import { useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronDown, ScrollText, X } from 'lucide-react';
 import * as React from 'react';
 
+import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
-import { apiClient } from '@/lib/auth';
+import {
+  listAuditEvents,
+  type AuditEvent,
+  type AuditEventListParams,
+} from '@/lib/admin-api';
+import { fetchMe, type MeResponse } from '@/lib/auth';
 import { formatRelativeTime } from '@/lib/design';
-import { useProjectStore } from '@/lib/project-store';
-import { useTeamStore } from '@/lib/team-store';
+import { useOrgStore } from '@/lib/org-store';
+import { adminQueryKeys } from '@/lib/query-keys';
 
-const LIMIT = 50;
-
-type AuditEventItem = {
-  id: string;
-  project_id: string;
-  team_id: string | null;
-  event_type: string;
-  actor_type: string;
-  actor_id: string | null;
-  target_type: string | null;
-  target_id: string | null;
-  capability: string | null;
-  result: string;
-  request_id: string | null;
-  correlation_id: string | null;
-  metadata: Record<string, unknown> | null;
-  created_at: string | null;
-  updated_at: string | null;
-};
-
-type AuditEventDetail = AuditEventItem & {
-  actor_display?: string | null;
-  target_display?: string | null;
-};
-
-type AuditEventsResponse = {
-  count: number;
-  items: AuditEventItem[];
-};
+const PAGE_SIZE = 50;
 
 type AppliedFilters = {
   eventType: string;
-  correlationId: string;
+  result: string;
   since: string;
   until: string;
 };
@@ -69,6 +47,8 @@ const ACTION_STYLES: Record<AuditAction, string> = {
 
 const RESULT_COLORS: Record<string, string> = {
   success: '#3DD9AC',
+  allowed: '#3DD9AC',
+  recorded: '#6BA6FF',
   denied: '#FB6E72',
 };
 
@@ -113,22 +93,26 @@ function shortenId(value: string): string {
   return `${value.slice(0, 8)}…`;
 }
 
+function resultColorFor(result: string): string {
+  return RESULT_COLORS[result] ?? '#666C77';
+}
+
 function AuditRow({
   event,
   onSelect,
 }: {
-  event: AuditEventItem;
-  onSelect: (id: string) => void;
+  event: AuditEvent;
+  onSelect: (event: AuditEvent) => void;
 }) {
   const action = resolveAction(event.event_type);
-  const resultColor = RESULT_COLORS[event.result] ?? '#666C77';
+  const resultColor = resultColorFor(event.result);
 
   return (
     <div
       role='button'
       tabIndex={0}
-      onClick={() => onSelect(event.id)}
-      onKeyDown={(e) => e.key === 'Enter' && onSelect(event.id)}
+      onClick={() => onSelect(event)}
+      onKeyDown={(e) => e.key === 'Enter' && onSelect(event)}
       className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60`}
     >
       <div className='min-w-0'>
@@ -140,10 +124,10 @@ function AuditRow({
       </div>
 
       <div className='min-w-0'>
-        {event.target_type || event.target_id ? (
+        {event.target_display || event.target_type || event.target_id ? (
           <div className='truncate text-[13px] text-default-700'>
-            {event.target_type ?? 'target'}
-            {event.target_id && (
+            {event.target_display ?? event.target_type ?? 'target'}
+            {!event.target_display && event.target_id && (
               <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
                 {shortenId(event.target_id)}
               </span>
@@ -161,11 +145,17 @@ function AuditRow({
 
       <div className='min-w-0 truncate text-[13px]'>
         <span className='text-default-400'>by </span>
-        <span className='text-default-500'>{event.actor_type}</span>
-        {event.actor_id && (
-          <span className='ml-1 font-mono text-[11.5px] text-default-400'>
-            {shortenId(event.actor_id)}
-          </span>
+        {event.actor_display ? (
+          <span className='text-default-600'>{event.actor_display}</span>
+        ) : (
+          <>
+            <span className='text-default-500'>{event.actor_type}</span>
+            {event.actor_id && (
+              <span className='ml-1 font-mono text-[11.5px] text-default-400'>
+                {shortenId(event.actor_id)}
+              </span>
+            )}
+          </>
         )}
       </div>
 
@@ -194,8 +184,8 @@ function AuditTable({
   items,
   onSelect,
 }: {
-  items: AuditEventItem[];
-  onSelect: (id: string) => void;
+  items: AuditEvent[];
+  onSelect: (event: AuditEvent) => void;
 }) {
   return (
     <div className='surface-card overflow-hidden'>
@@ -252,37 +242,13 @@ function DetailRow({ label, value }: { label: string; value: React.ReactNode }) 
 }
 
 function AuditDetailModal({
-  eventId,
-  projectId,
-  teamId,
+  event,
   onClose,
 }: {
-  eventId: string;
-  projectId: string;
-  teamId: string | null;
+  event: AuditEvent;
   onClose: () => void;
 }) {
-  const query = useQuery<AuditEventDetail>({
-    queryKey: ['inspection', 'audit-event-detail', eventId, projectId, teamId],
-    queryFn: async () => {
-      const client = apiClient();
-      const params: Record<string, string> = { project_id: projectId };
-
-      if (teamId) {
-        params.team_id = teamId;
-      }
-
-      const response = await client.get<AuditEventDetail>(
-        `/v1/inspection/audit-events/${eventId}`,
-        { params },
-      );
-
-      return response.data;
-    },
-  });
-
-  const ev = query.data;
-  const resultColor = ev ? (RESULT_COLORS[ev.result] ?? '#666C77') : undefined;
+  const resultColor = resultColorFor(event.result);
 
   return (
     <div
@@ -306,119 +272,93 @@ function AuditDetailModal({
         </div>
 
         <div className='max-h-[70vh] overflow-y-auto p-6'>
-          {query.isLoading && (
-            <div className='space-y-3'>
-              {Array.from({ length: 6 }).map((_, i) => (
-                <div key={i} className='h-4 animate-pulse rounded-medium bg-content2' />
-              ))}
-            </div>
-          )}
-
-          {query.isError && (
-            <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-              <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-              <p className='text-[13px] text-danger'>
-                {query.error instanceof Error
-                  ? query.error.message
-                  : 'Failed to load event detail.'}
-              </p>
-            </div>
-          )}
-
-          {ev && (
-            <div>
-              <DetailRow
-                label='Event type'
-                value={<span className='font-mono text-[12px]'>{ev.event_type}</span>}
-              />
-              <DetailRow
-                label='Result'
-                value={
-                  <span className='inline-flex items-center gap-1.5'>
-                    <span
-                      className='inline-block h-1.5 w-1.5 rounded-full'
-                      style={{ backgroundColor: resultColor }}
-                    />
-                    <span
-                      className='font-medium capitalize'
-                      style={{ color: resultColor }}
-                    >
-                      {ev.result}
-                    </span>
-                  </span>
-                }
-              />
-              {ev.capability && (
-                <DetailRow
-                  label='Capability'
-                  value={<span className='font-mono text-[12px]'>{ev.capability}</span>}
+          <DetailRow
+            label='Event type'
+            value={<span className='font-mono text-[12px]'>{event.event_type}</span>}
+          />
+          <DetailRow
+            label='Result'
+            value={
+              <span className='inline-flex items-center gap-1.5'>
+                <span
+                  className='inline-block h-1.5 w-1.5 rounded-full'
+                  style={{ backgroundColor: resultColor }}
                 />
-              )}
-              {ev.actor_display ? (
-                <DetailRow label='Actor' value={ev.actor_display} />
+                <span className='font-medium capitalize' style={{ color: resultColor }}>
+                  {event.result}
+                </span>
+              </span>
+            }
+          />
+          {event.capability && (
+            <DetailRow
+              label='Capability'
+              value={<span className='font-mono text-[12px]'>{event.capability}</span>}
+            />
+          )}
+          <DetailRow
+            label='Actor'
+            value={
+              event.actor_display ? (
+                <span>
+                  {event.actor_display}
+                  <span className='ml-1.5 text-[11.5px] text-default-400'>
+                    ({event.actor_type})
+                  </span>
+                </span>
               ) : (
-                <DetailRow
-                  label='Actor'
-                  value={
-                    <span>
-                      <span className='text-default-500'>{ev.actor_type}</span>
-                      {ev.actor_id && (
-                        <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
-                          {ev.actor_id}
-                        </span>
-                      )}
+                <span>
+                  <span className='text-default-500'>{event.actor_type}</span>
+                  {event.actor_id && (
+                    <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
+                      {event.actor_id}
                     </span>
-                  }
-                />
-              )}
-              {(ev.target_display || ev.target_type || ev.target_id) && (
-                ev.target_display ? (
-                  <DetailRow label='Target' value={ev.target_display} />
-                ) : (
-                  <DetailRow
-                    label='Target'
-                    value={
-                      <span>
-                        <span className='text-default-500'>{ev.target_type}</span>
-                        {ev.target_id && (
-                          <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
-                            {ev.target_id}
-                          </span>
-                        )}
+                  )}
+                </span>
+              )
+            }
+          />
+          {(event.target_display || event.target_type || event.target_id) && (
+            <DetailRow
+              label='Target'
+              value={
+                event.target_display ? (
+                  <span>
+                    {event.target_display}
+                    {event.target_type && (
+                      <span className='ml-1.5 text-[11.5px] text-default-400'>
+                        ({event.target_type})
                       </span>
-                    }
-                  />
-                )
-              )}
-              {ev.request_id && (
-                <DetailRow
-                  label='Request ID'
-                  value={
-                    <span className='break-all font-mono text-[12px]'>{ev.request_id}</span>
-                  }
-                />
-              )}
-              {ev.correlation_id && (
-                <DetailRow
-                  label='Correlation'
-                  value={
-                    <span className='break-all font-mono text-[12px]'>{ev.correlation_id}</span>
-                  }
-                />
-              )}
-              {ev.created_at && (
-                <DetailRow label='When' value={formatRelativeTime(ev.created_at)} />
-              )}
-              {ev.metadata && Object.keys(ev.metadata).length > 0 && (
-                <div className='py-2.5'>
-                  <span className='block pb-2 text-[11.5px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-                    Metadata
+                    )}
                   </span>
-                  <pre className='overflow-x-auto rounded-[10px] bg-content2 p-3.5 font-mono text-[11.5px] leading-relaxed text-default-600'>
-                    {JSON.stringify(ev.metadata, null, 2)}
-                  </pre>
-                </div>
-              )}
+                ) : (
+                  <span>
+                    <span className='text-default-500'>{event.target_type}</span>
+                    {event.target_id && (
+                      <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
+                        {event.target_id}
+                      </span>
+                    )}
+                  </span>
+                )
+              }
+            />
+          )}
+          {event.request_id && (
+            <DetailRow
+              label='Request ID'
+              value={<span className='break-all font-mono text-[12px]'>{event.request_id}</span>}
+            />
+          )}
+          <DetailRow label='When' value={formatRelativeTime(event.created_at)} />
+          {event.metadata && Object.keys(event.metadata).length > 0 && (
+            <div className='py-2.5'>
+              <span className='block pb-2 text-[11.5px] font-semibold uppercase tracking-[0.08em] text-default-400'>
+                Metadata
+              </span>
+              <pre className='overflow-x-auto rounded-[10px] bg-content2 p-3.5 font-mono text-[11.5px] leading-relaxed text-default-600'>
+                {JSON.stringify(event.metadata, null, 2)}
+              </pre>
             </div>
           )}
         </div>
@@ -427,89 +367,71 @@ function AuditDetailModal({
   );
 }
 
-export default function AuditPage() {
-  const activeProjectId = useProjectStore((s) => s.activeProjectId);
-  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+function AuditLog() {
+  const activeOrgId = useOrgStore((s) => s.activeOrgId);
 
   const [draftEventType, setDraftEventType] = React.useState('');
-  const [draftCorrelationId, setDraftCorrelationId] = React.useState('');
+  const [draftResult, setDraftResult] = React.useState('');
   const [draftSince, setDraftSince] = React.useState('');
   const [draftUntil, setDraftUntil] = React.useState('');
   const [appliedFilters, setAppliedFilters] = React.useState<AppliedFilters>({
     eventType: '',
-    correlationId: '',
+    result: '',
     since: '',
     until: '',
   });
 
-  const [extraItems, setExtraItems] = React.useState<AuditEventItem[]>([]);
-  const [nextOffset, setNextOffset] = React.useState(LIMIT);
-  const [serverCount, setServerCount] = React.useState<number | null>(null);
+  const [extraItems, setExtraItems] = React.useState<AuditEvent[]>([]);
+  const [nextPage, setNextPage] = React.useState(2);
   const [isLoadingMore, setIsLoadingMore] = React.useState(false);
   const [loadMoreError, setLoadMoreError] = React.useState<string | null>(null);
 
-  const [selectedEventId, setSelectedEventId] = React.useState<string | null>(null);
+  const [selectedEvent, setSelectedEvent] = React.useState<AuditEvent | null>(null);
 
   React.useEffect(() => {
     setExtraItems([]);
-    setNextOffset(LIMIT);
-    setServerCount(null);
+    setNextPage(2);
     setLoadMoreError(null);
-  }, [activeProjectId, activeTeamId, appliedFilters]);
+  }, [appliedFilters]);
 
-  const buildParams = (offset: number): Record<string, string> => {
-    const params: Record<string, string> = {
-      project_id: activeProjectId ?? '',
-      limit: String(LIMIT),
-      offset: String(offset),
-    };
+  const buildParams = React.useCallback(
+    (page: number): AuditEventListParams => {
+      const params: AuditEventListParams = { page, pageSize: PAGE_SIZE };
 
-    if (activeTeamId) params.team_id = activeTeamId;
-    if (appliedFilters.eventType) params.event_type = appliedFilters.eventType;
-    if (appliedFilters.correlationId) params.correlation_id = appliedFilters.correlationId;
-    if (appliedFilters.since) params.since = appliedFilters.since;
-    if (appliedFilters.until) params.until = appliedFilters.until;
+      if (appliedFilters.eventType) params.event_type = appliedFilters.eventType;
+      if (appliedFilters.result) params.result = appliedFilters.result;
+      if (appliedFilters.since) params.created_at__gte = appliedFilters.since;
+      if (appliedFilters.until) params.created_at__lt = appliedFilters.until;
 
-    return params;
-  };
-
-  const query = useQuery<AuditEventsResponse>({
-    queryKey: ['inspection', 'audit-events', activeProjectId, activeTeamId, appliedFilters],
-    enabled: Boolean(activeProjectId),
-    queryFn: async () => {
-      const client = apiClient();
-      const response = await client.get<AuditEventsResponse>('/v1/inspection/audit-events', {
-        params: buildParams(0),
-      });
-
-      return response.data;
+      return params;
     },
+    [appliedFilters],
+  );
+
+  const query = useQuery({
+    queryKey: adminQueryKeys.auditEvents(activeOrgId, appliedFilters),
+    enabled: Boolean(activeOrgId),
+    queryFn: () => listAuditEvents(buildParams(1)),
   });
 
-  React.useEffect(() => {
-    if (query.data) {
-      setServerCount(query.data.count);
-    }
-  }, [query.data]);
-
   const allItems = React.useMemo(
-    () => [...(query.data?.items ?? []), ...extraItems],
+    () => [...(query.data?.results ?? []), ...extraItems],
     [query.data, extraItems],
   );
 
-  const totalCount = serverCount ?? query.data?.count ?? 0;
+  const totalCount = query.data?.count ?? 0;
   const hasMore = allItems.length < totalCount;
 
   const hasActiveFilters =
     Boolean(appliedFilters.eventType) ||
-    Boolean(appliedFilters.correlationId) ||
+    Boolean(appliedFilters.result) ||
     Boolean(appliedFilters.since) ||
     Boolean(appliedFilters.until);
 
   const applyFilters = () => {
     setAppliedFilters({
       eventType: draftEventType.trim(),
-      correlationId: draftCorrelationId.trim(),
+      result: draftResult.trim(),
       since: draftSince,
       until: draftUntil,
     });
@@ -517,14 +439,14 @@ export default function AuditPage() {
 
   const clearFilters = () => {
     setDraftEventType('');
-    setDraftCorrelationId('');
+    setDraftResult('');
     setDraftSince('');
     setDraftUntil('');
-    setAppliedFilters({ eventType: '', correlationId: '', since: '', until: '' });
+    setAppliedFilters({ eventType: '', result: '', since: '', until: '' });
   };
 
   const loadMore = async () => {
-    if (isLoadingMore || !activeProjectId) {
+    if (isLoadingMore) {
       return;
     }
 
@@ -532,14 +454,10 @@ export default function AuditPage() {
     setLoadMoreError(null);
 
     try {
-      const client = apiClient();
-      const res = await client.get<AuditEventsResponse>('/v1/inspection/audit-events', {
-        params: buildParams(nextOffset),
-      });
+      const res = await listAuditEvents(buildParams(nextPage));
 
-      setExtraItems((prev) => [...prev, ...res.data.items]);
-      setServerCount(res.data.count);
-      setNextOffset((prev) => prev + LIMIT);
+      setExtraItems((prev) => [...prev, ...res.results]);
+      setNextPage((prev) => prev + 1);
     } catch (err) {
       setLoadMoreError(err instanceof Error ? err.message : 'Failed to load more events.');
     } finally {
@@ -547,27 +465,11 @@ export default function AuditPage() {
     }
   };
 
-  if (!activeProjectId) {
-    return (
-      <section className='space-y-6'>
-        <PageHeader
-          title='Audit log'
-          subtitle='Every privileged action across this project, with actor and outcome.'
-        />
-        <EmptyState
-          title='No project selected'
-          description='Select a project to view its audit events.'
-          icon={<ScrollText className='h-6 w-6' />}
-        />
-      </section>
-    );
-  }
-
   return (
     <section className='space-y-6'>
       <PageHeader
         title='Audit log'
-        subtitle='Every privileged action across this project, with actor and outcome.'
+        subtitle='Every privileged action across your organization, with actor and outcome.'
       />
 
       <form
@@ -585,19 +487,19 @@ export default function AuditPage() {
             <input
               value={draftEventType}
               onChange={(e) => setDraftEventType(e.target.value)}
-              placeholder='e.g. memory.create'
+              placeholder='e.g. ProjectCreated'
               className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none placeholder:text-default-400 focus:border-primary'
             />
           </div>
-          <div className='flex min-w-[180px] flex-1 flex-col gap-1.5'>
+          <div className='flex min-w-[130px] flex-col gap-1.5'>
             <label className='text-[11px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-              Correlation ID
+              Result
             </label>
             <input
-              value={draftCorrelationId}
-              onChange={(e) => setDraftCorrelationId(e.target.value)}
-              placeholder='UUID or prefix'
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 font-mono text-[13px] text-foreground outline-none placeholder:font-sans placeholder:text-default-400 focus:border-primary'
+              value={draftResult}
+              onChange={(e) => setDraftResult(e.target.value)}
+              placeholder='success / denied'
+              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none placeholder:text-default-400 focus:border-primary'
             />
           </div>
           <div className='flex min-w-[130px] flex-col gap-1.5'>
@@ -656,7 +558,7 @@ export default function AuditPage() {
       {query.data &&
         (allItems.length > 0 ? (
           <div className='space-y-3'>
-            <AuditTable items={allItems} onSelect={setSelectedEventId} />
+            <AuditTable items={allItems} onSelect={setSelectedEvent} />
 
             {loadMoreError && (
               <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
@@ -693,19 +595,28 @@ export default function AuditPage() {
         ) : (
           <EmptyState
             title='No audit events yet'
-            description='Privileged actions in this project will appear here as they happen.'
+            description='Privileged actions across your organization will appear here as they happen.'
             icon={<ScrollText className='h-6 w-6' />}
           />
         ))}
 
-      {selectedEventId && activeProjectId && (
-        <AuditDetailModal
-          eventId={selectedEventId}
-          projectId={activeProjectId}
-          teamId={activeTeamId}
-          onClose={() => setSelectedEventId(null)}
-        />
+      {selectedEvent && (
+        <AuditDetailModal event={selectedEvent} onClose={() => setSelectedEvent(null)} />
       )}
     </section>
+  );
+}
+
+export default function AuditPage() {
+  const meQuery = useQuery<MeResponse>({
+    queryKey: ['auth', 'me'],
+    queryFn: fetchMe,
+  });
+  const capabilities = meQuery.data?.capabilities ?? [];
+
+  return (
+    <CapabilityGate capabilities={capabilities} required='audit:read'>
+      <AuditLog />
+    </CapabilityGate>
   );
 }
