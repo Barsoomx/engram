@@ -8,7 +8,7 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parent
 PLUGIN_MANIFEST_PATH = PACKAGE_ROOT / ".codex-plugin" / "plugin.json"
 HOOK_MANIFEST_PATH = PACKAGE_ROOT / "plugin" / "hooks" / "codex-hooks.json"
-REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd")
+REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd", "UserPromptSubmit")
 
 
 class CodexPluginContractTests(unittest.TestCase):

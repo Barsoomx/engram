@@ -74,10 +74,13 @@ The plugin registers the following Codex hook events. Each event calls
 | `Error`        | `.*`               | `engram hook error --agent codex --response-format codex`                | 60          |
 | `Decision`     | `.*`               | `engram hook decision --agent codex --response-format codex`             | 60          |
 | `SessionEnd`   | `.*`               | `engram hook session-end --agent codex --response-format codex`          | 60          |
+| `UserPromptSubmit` | `.*`           | `engram hook user-prompt-submit --agent codex --response-format codex`   | 60          |
 
-Hook lifecycle ordering: `SessionStart → PostToolUse* → Decision/Error → SessionEnd`.
+Hook lifecycle ordering: `SessionStart → UserPromptSubmit* → PostToolUse* → Decision/Error → SessionEnd`.
 
-Existing installs need a plugin re-install or version bump before `SessionEnd` fires.
+`UserPromptSubmit` fires on every user prompt: it records the prompt as an observation and injects a fresh per-turn context bundle into the agent.
+
+Existing installs need a plugin re-install or version bump before `SessionEnd` and `UserPromptSubmit` fire.
 
 ### How hooks call the CLI
 

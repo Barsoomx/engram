@@ -59,6 +59,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook user-prompt-submit --agent claude_code --response-format claude-code",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }

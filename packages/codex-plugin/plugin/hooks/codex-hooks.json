@@ -59,6 +59,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook user-prompt-submit --agent codex --response-format codex",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }
