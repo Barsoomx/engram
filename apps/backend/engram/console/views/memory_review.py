@@ -79,7 +79,14 @@ class MemoryReviewViewSet(
         ]
 
     def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        items = list(self._reviewable_items(request))
+        try:
+            items = list(self._reviewable_items(request))
+
+        except MemoryReviewError as error:
+            return Response(
+                {'code': error.code, 'detail': str(error)},
+                status=error.status,
+            )
 
         page = self._paginate(request, items)
 
@@ -279,17 +286,33 @@ class MemoryReviewViewSet(
         team_id = request.query_params.get('team_id')
 
         if team_id:
-            queryset = queryset.filter(team_id=team_id)
+            queryset = queryset.filter(team_id=self._uuid_filter_value('team_id', team_id))
 
         project_id = request.query_params.get('project_id')
 
         if project_id:
-            queryset = queryset.filter(project_id=project_id)
+            queryset = queryset.filter(project_id=self._uuid_filter_value('project_id', project_id))
 
         visibility_scope = request.query_params.get('visibility_scope')
 
         if visibility_scope:
             queryset = queryset.filter(visibility_scope=visibility_scope)
+
+        search = request.query_params.get('search')
+
+        if search:
+            queryset = queryset.filter(Q(title__icontains=search) | Q(body__icontains=search))
+
+        source_type = request.query_params.get('source_type')
+
+        if source_type:
+            if candidate:
+                queryset = queryset.filter(source_observation__sources__source_type=source_type)
+
+            else:
+                queryset = queryset.filter(versions__source_observation__sources__source_type=source_type)
+
+            queryset = queryset.distinct()
 
         confidence_gte = request.query_params.get('confidence__gte')
 
@@ -486,6 +509,17 @@ class MemoryReviewViewSet(
             )
 
         return version
+
+    def _uuid_filter_value(self, field: str, raw: str) -> uuid.UUID:
+        try:
+            return uuid.UUID(raw)
+
+        except ValueError as error:
+            raise MemoryReviewError(
+                'invalid_filter',
+                f'{field} is not a valid uuid',
+                status=HTTP_400_BAD_REQUEST,
+            ) from error
 
     def _uuid_kwarg(self, kwargs: dict[str, Any]) -> uuid.UUID:
         raw = kwargs.get('pk')

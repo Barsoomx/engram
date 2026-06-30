@@ -313,6 +313,44 @@ def get_review_memory_or_404(
     return memory
 
 
+def _lock_candidate_or_404(
+    organization: Organization,
+    candidate_id: uuid.UUID,
+) -> MemoryCandidate:
+    candidate = (
+        MemoryCandidate.objects.select_for_update()
+        .filter(
+            organization=organization,
+            id=candidate_id,
+        )
+        .first()
+    )
+
+    if candidate is None:
+        raise MemoryReviewError('not_found', 'candidate not found', status=404)
+
+    return candidate
+
+
+def _lock_memory_or_404(
+    organization: Organization,
+    memory_id: uuid.UUID,
+) -> Memory:
+    memory = (
+        Memory.objects.select_for_update()
+        .filter(
+            organization=organization,
+            id=memory_id,
+        )
+        .first()
+    )
+
+    if memory is None:
+        raise MemoryReviewError('not_found', 'memory not found', status=404)
+
+    return memory
+
+
 @transaction.atomic
 def approve_memory_candidate(
     organization: Organization,
@@ -320,8 +358,7 @@ def approve_memory_candidate(
     candidate: MemoryCandidate,
     reason: str,
 ) -> Memory:
-    if candidate.organization_id != organization.id:
-        raise MemoryReviewError('not_found', 'candidate not found', status=404)
+    candidate = _lock_candidate_or_404(organization, candidate.id)
 
     if candidate.status != CandidateStatus.PROPOSED:
         raise MemoryReviewError(
@@ -381,8 +418,7 @@ def edit_memory_body(
     body: str,
     reason: str,
 ) -> MemoryVersion:
-    if memory.organization_id != organization.id:
-        raise MemoryReviewError('not_found', 'memory not found', status=404)
+    memory = _lock_memory_or_404(organization, memory.id)
 
     next_version = memory.current_version + 1
 
@@ -421,6 +457,8 @@ def narrow_memory(
     target_memory_id: uuid.UUID,
     reason: str,
 ) -> MemoryLink:
+    memory = _lock_memory_or_404(organization, memory.id)
+
     return _record_memory_link(
         organization=organization,
         actor_identity=actor_identity,
@@ -440,8 +478,7 @@ def supersede_memory(
     target_memory_id: uuid.UUID,
     reason: str,
 ) -> MemoryLink:
-    if memory.organization_id != organization.id:
-        raise MemoryReviewError('not_found', 'memory not found', status=404)
+    memory = _lock_memory_or_404(organization, memory.id)
 
     memory.stale = True
 
@@ -508,8 +545,7 @@ def reject_review_item(
     reason: str,
 ) -> None:
     if isinstance(item, MemoryCandidate):
-        if item.organization_id != organization.id:
-            raise MemoryReviewError('not_found', 'candidate not found', status=404)
+        item = _lock_candidate_or_404(organization, item.id)
 
         if item.status == CandidateStatus.REJECTED:
             return
@@ -521,8 +557,7 @@ def reject_review_item(
         target_type = 'memory_candidate'
 
     else:
-        if item.organization_id != organization.id:
-            raise MemoryReviewError('not_found', 'memory not found', status=404)
+        item = _lock_memory_or_404(organization, item.id)
 
         if item.status == MemoryStatus.REFUTED:
             return
@@ -550,8 +585,7 @@ def archive_memory(
     memory: Memory,
     reason: str,
 ) -> Memory:
-    if memory.organization_id != organization.id:
-        raise MemoryReviewError('not_found', 'memory not found', status=404)
+    memory = _lock_memory_or_404(organization, memory.id)
 
     if memory.status == MemoryStatus.ARCHIVED:
         return memory
