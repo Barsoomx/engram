@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
@@ -115,6 +117,59 @@ def test_ops_overview_counts_failed_workflow_runs(f_admin_client: APIClient) -> 
 
     assert response.status_code == 200
     assert response.json()['failed_workflow_runs'] >= 1
+
+
+@pytest.mark.django_db
+def test_ops_overview_scopes_counts_to_active_organization(f_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='ops-org')
+
+    with (
+        patch('engram.console.views.ops.WorkflowRun') as m_workflow_run,
+        patch('engram.console.views.ops.RetrievalDocument') as m_retrieval_document,
+    ):
+        m_workflow_run.objects.filter.return_value.count.return_value = 2
+        m_retrieval_document.objects.filter.return_value.count.return_value = 5
+
+        response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    m_workflow_run.objects.filter.assert_called_once_with(status=WorkflowRunStatus.FAILED, organization=org)
+    m_retrieval_document.objects.filter.assert_called_once_with(embedding_pgvector__isnull=True, organization=org)
+    assert response.json()['failed_workflow_runs'] == 2
+    assert response.json()['pending_embedding_count'] == 5
+
+
+@pytest.mark.django_db
+def test_ops_overview_does_not_count_other_organizations_failed_workflow_runs(f_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='ops-org')
+    project = Project.objects.create(organization=org, name='Proj', slug='proj-ops')
+    other_org = Organization.objects.create(name='OtherOrg', slug='other-org')
+    other_project = Project.objects.create(organization=other_org, name='OtherProj', slug='proj-other')
+    WorkflowRun.objects.create(
+        organization=other_org,
+        project=other_project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.FAILED,
+        failure_reason='other org failure',
+    )
+
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    assert response.json()['failed_workflow_runs'] == 0
+
+    WorkflowRun.objects.create(
+        organization=org,
+        project=project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.FAILED,
+        failure_reason='own org failure',
+    )
+
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    assert response.json()['failed_workflow_runs'] == 1
 
 
 @pytest.mark.django_db

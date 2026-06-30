@@ -10,7 +10,7 @@ from rest_framework.views import APIView
 
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
-from engram.core.models import RetrievalDocument, WorkflowRun, WorkflowRunStatus
+from engram.core.models import Organization, RetrievalDocument, WorkflowRun, WorkflowRunStatus
 
 
 class OpsOverviewView(APIView):
@@ -33,9 +33,12 @@ class OpsOverviewView(APIView):
 
         dead_letter_count = CeleryOutboxDeadLetter.objects.count()
 
-        failed_workflow_runs = WorkflowRun.objects.filter(status=WorkflowRunStatus.FAILED).count()
+        failed_workflow_runs = WorkflowRun.objects.filter(
+            status=WorkflowRunStatus.FAILED,
+            organization=request.active_organization,
+        ).count()
 
-        pending_embedding_count = _pending_embedding_count()
+        pending_embedding_count = _pending_embedding_count(request.active_organization)
 
         return Response(
             {
@@ -48,10 +51,13 @@ class OpsOverviewView(APIView):
         )
 
 
-def _pending_embedding_count() -> int:
+def _pending_embedding_count(organization: Organization) -> int:
     try:
         RetrievalDocument._meta.get_field('embedding_pgvector')
     except FieldDoesNotExist:
         return 0
 
-    return RetrievalDocument.objects.filter(embedding_pgvector__isnull=True).count()
+    return RetrievalDocument.objects.filter(
+        embedding_pgvector__isnull=True,
+        organization=organization,
+    ).count()
