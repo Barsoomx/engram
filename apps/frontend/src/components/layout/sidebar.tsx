@@ -12,6 +12,8 @@ import {
   LayoutDashboard,
   LogOut,
   ScrollText,
+  Search,
+  Settings,
   ShieldCheck,
   Users,
   Workflow,
@@ -21,29 +23,87 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import * as React from 'react';
 
-import { hasCapability, logout } from '@/lib/auth';
+import { BrandLockup } from '@/components/brand/brand-logo';
+import { hasCapability } from '@/lib/auth';
 
 export interface SidebarNavItem {
   href: string;
   label: string;
   icon: typeof LayoutDashboard;
   capability?: string;
+  badge?: number;
 }
 
-const NAV_ITEMS: SidebarNavItem[] = [
-  { href: '/', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/memories', label: 'Memories', icon: Database },
-  { href: '/observations', label: 'Observations', icon: ScrollText },
-  { href: '/memory-review', label: 'Memory Review', icon: ShieldCheck, capability: 'memories:review' },
-  { href: '/organizations', label: 'Organizations', icon: Building2, capability: 'organizations:read' },
-  { href: '/teams', label: 'Teams', icon: Users, capability: 'teams:read' },
-  { href: '/projects', label: 'Projects', icon: FolderTree, capability: 'projects:read' },
-  { href: '/members', label: 'Members', icon: Users, capability: 'members:read' },
-  { href: '/roles', label: 'Roles', icon: BadgeCheck, capability: 'roles:read' },
-  { href: '/api-keys', label: 'API Keys', icon: Key, capability: 'api_keys:read' },
-  { href: '/audit', label: 'Audit', icon: ClipboardList, capability: 'audit:read' },
-  { href: '/workflow-runs', label: 'Workflow Runs', icon: Workflow, capability: 'memories:read' },
-  { href: '/health', label: 'Health', icon: Activity },
+interface SidebarNavGroup {
+  title: string;
+  items: SidebarNavItem[];
+}
+
+const NAV_GROUPS: SidebarNavGroup[] = [
+  {
+    title: 'Workspace',
+    items: [
+      { href: '/', label: 'Dashboard', icon: LayoutDashboard },
+      { href: '/memories', label: 'Memories', icon: Database },
+      { href: '/observations', label: 'Observations', icon: ScrollText },
+      {
+        href: '/memory-review',
+        label: 'Memory Review',
+        icon: ShieldCheck,
+        capability: 'memories:review',
+      },
+      {
+        href: '/projects',
+        label: 'Projects',
+        icon: FolderTree,
+        capability: 'projects:read',
+      },
+      {
+        href: '/workflow-runs',
+        label: 'Workflow Runs',
+        icon: Workflow,
+        capability: 'memories:read',
+      },
+    ],
+  },
+  {
+    title: 'Administration',
+    items: [
+      {
+        href: '/organizations',
+        label: 'Organizations',
+        icon: Building2,
+        capability: 'organizations:read',
+      },
+      { href: '/teams', label: 'Teams', icon: Users, capability: 'teams:read' },
+      {
+        href: '/members',
+        label: 'Members',
+        icon: Users,
+        capability: 'members:read',
+      },
+      {
+        href: '/roles',
+        label: 'Roles',
+        icon: BadgeCheck,
+        capability: 'roles:read',
+      },
+      {
+        href: '/api-keys',
+        label: 'API Keys',
+        icon: Key,
+        capability: 'api_keys:read',
+      },
+      {
+        href: '/audit',
+        label: 'Audit log',
+        icon: ClipboardList,
+        capability: 'audit:read',
+      },
+      { href: '/settings', label: 'Settings', icon: Settings },
+      { href: '/health', label: 'Health', icon: Activity },
+    ],
+  },
 ];
 
 export interface SidebarProps {
@@ -53,91 +113,120 @@ export interface SidebarProps {
   capabilities: string[];
 }
 
+function NavLink({
+  item,
+  active,
+  onClose,
+}: {
+  item: SidebarNavItem;
+  active: boolean;
+  onClose: () => void;
+}) {
+  const Icon = item.icon;
+
+  return (
+    <Link
+      className={clsx(
+        'relative flex h-[38px] items-center gap-3 rounded-[9px] px-3 text-[13.5px] font-medium transition-colors duration-150 focus-visible:outline-none',
+        active
+          ? 'bg-[color:var(--accent-soft)] text-foreground before:absolute before:-left-3 before:top-[9px] before:bottom-[9px] before:w-[3px] before:rounded-r before:bg-primary'
+          : 'text-default-500 hover:bg-content2/60 hover:text-foreground',
+      )}
+      href={item.href}
+      onClick={onClose}
+    >
+      <Icon className='shrink-0' size={17} strokeWidth={1.8} />
+      <span className='flex-1 truncate'>{item.label}</span>
+      {typeof item.badge === 'number' && (
+        <span className='rounded-full bg-content3 px-1.5 py-0.5 text-[10.5px] font-semibold tabular-nums text-default-600'>
+          {item.badge}
+        </span>
+      )}
+    </Link>
+  );
+}
+
 export function Sidebar({ isOpen, onClose, onLogout, capabilities }: SidebarProps) {
   const pathname = usePathname();
 
-  const visibleItems = NAV_ITEMS.filter((item) => {
-    if (!item.capability) {
-
-      return true;
-    }
-
-    return hasCapability(capabilities, item.capability);
-  });
-
   const isActive = (href: string) => {
     if (href === '/') {
-
       return pathname === '/';
     }
 
     return pathname.startsWith(href);
   };
 
+  const groups = NAV_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter(
+      (item) => !item.capability || hasCapability(capabilities, item.capability),
+    ),
+  })).filter((group) => group.items.length > 0);
+
   return (
     <>
       {isOpen && (
         <div
-          className='fixed inset-0 bg-black/60 z-40 lg:hidden'
+          className='fixed inset-0 z-40 bg-black/60 lg:hidden'
           onClick={onClose}
         />
       )}
 
       <aside
         className={clsx(
-          'fixed left-0 top-0 h-full w-[240px] bg-content1 border-r border-divider flex flex-col z-50 transition-transform duration-200',
+          'fixed left-0 top-0 z-50 flex h-full w-[248px] flex-col border-r border-divider bg-[#0C0F14] transition-transform duration-200',
           'lg:translate-x-0',
           isOpen ? 'translate-x-0' : '-translate-x-full lg:translate-x-0',
         )}
       >
-        <div className='px-6 py-5 border-b border-divider flex items-center justify-between'>
-          <div>
-            <h1 className='text-lg font-semibold tracking-tight text-foreground'>
-              Engram
-            </h1>
-            <p className='text-xs uppercase tracking-wider text-default-500 -mt-0.5'>
-              Admin
-            </p>
-          </div>
+        <div className='flex items-center justify-between px-5 pt-5 pb-4'>
+          <BrandLockup size={32} />
           <button
-            className='lg:hidden p-1 text-default-600 hover:text-foreground'
+            className='p-1 text-default-500 hover:text-foreground lg:hidden'
             onClick={onClose}
             type='button'
           >
-            <X className='w-5 h-5' />
+            <X className='h-5 w-5' />
           </button>
         </div>
 
-        <nav className='flex-1 px-3 py-4 space-y-1'>
-          {visibleItems.map((item) => {
-            const Icon = item.icon;
-            const active = isActive(item.href);
+        <div className='px-4 pb-2'>
+          <button
+            type='button'
+            className='flex h-[38px] w-full items-center gap-2.5 rounded-[10px] border border-divider-strong bg-content1 px-3 text-default-500 transition-colors hover:text-foreground'
+          >
+            <Search size={16} strokeWidth={1.8} className='shrink-0' />
+            <span className='flex-1 text-left text-[13px]'>Search…</span>
+            <span className='key-cap'>⌘K</span>
+          </button>
+        </div>
 
-            return (
-              <Link
-                key={item.href}
-                className={clsx(
-                  active
-                    ? 'relative flex items-center gap-3 h-10 px-3 rounded-medium text-sm bg-content2 text-foreground transition-colors duration-150 focus-visible:outline-none before:absolute before:left-0 before:top-2 before:bottom-2 before:w-0.5 before:bg-foreground before:rounded-r'
-                    : 'flex items-center gap-3 h-10 px-3 rounded-medium text-sm text-default-700 hover:text-foreground hover:bg-content2/50 transition-colors duration-150 focus-visible:outline-none',
-                )}
-                href={item.href}
-                onClick={onClose}
-              >
-                <Icon className='w-5 h-5' />
-                {item.label}
-              </Link>
-            );
-          })}
+        <nav className='flex-1 space-y-5 overflow-y-auto px-4 py-4'>
+          {groups.map((group) => (
+            <div key={group.title} className='space-y-1'>
+              <p className='px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-default-400'>
+                {group.title}
+              </p>
+              {group.items.map((item) => (
+                <NavLink
+                  key={item.href}
+                  item={item}
+                  active={isActive(item.href)}
+                  onClose={onClose}
+                />
+              ))}
+            </div>
+          ))}
         </nav>
 
-        <div className='px-3 py-4 border-t border-divider'>
+        <div className='border-t border-divider px-4 py-3'>
           <button
-            className='flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium text-default-600 hover:bg-content2 hover:text-foreground transition-colors w-full'
+            className='flex h-[38px] w-full items-center gap-3 rounded-[9px] px-3 text-[13.5px] font-medium text-default-500 transition-colors hover:bg-content2/60 hover:text-foreground'
             onClick={onLogout}
             type='button'
           >
-            <LogOut className='w-5 h-5' />
+            <LogOut size={17} strokeWidth={1.8} className='shrink-0' />
             Sign out
           </button>
         </div>
