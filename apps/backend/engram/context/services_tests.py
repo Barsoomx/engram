@@ -7,7 +7,19 @@ from datetime import UTC, datetime
 
 import pytest
 
+from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
+    Identity,
+    OrganizationMembership,
+    ProjectGrant,
+    Role,
+)
+from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.services import (
+    BuildContextBundle,
+    ContextBundleInput,
     RetrievalMatch,
     _pack_to_budget,
     _semantic_retrieval_matches_python,
@@ -19,21 +31,30 @@ from engram.context.services import (
     lexical_retrieval_ranks,
     resolve_lexical_fusion_enabled,
     resolve_lexical_recall_enabled,
+    resolve_require_provenance_enabled,
     resolve_retrieval_strategy,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
 from engram.core.models import (
+    Agent,
+    AgentSession,
     Memory,
     MemoryStatus,
     MemoryVersion,
+    Observation,
     Organization,
     OrganizationSettings,
     Project,
+    ProjectTeam,
     RetrievalDocument,
+    Team,
     VectorField,
+    VisibilityScope,
 )
 from engram.model_policy.services import generated_embedding
+
+PROVENANCE_RAW_KEY = 'egk_test_services_provenance_0123456789abcdefghijklmnopqrstuvwxyz'
 
 
 @dataclass
@@ -854,3 +875,250 @@ def test_resolve_lexical_recall_enabled_true_when_set(
     OrganizationSettings.objects.create(organization=organization, lexical_recall_enabled=True)
 
     assert resolve_lexical_recall_enabled(organization) is True
+
+
+@pytest.mark.django_db
+def test_resolve_require_provenance_enabled_defaults_false(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+
+    assert resolve_require_provenance_enabled(organization) is False
+
+
+@pytest.mark.django_db
+def test_resolve_require_provenance_enabled_true_when_set(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+    OrganizationSettings.objects.create(organization=organization, require_provenance=True)
+
+    assert resolve_require_provenance_enabled(organization) is True
+
+
+def _provenance_project_scope() -> tuple[Organization, Team, Project, ApiKey]:
+    organization = Organization.objects.create(name='Engram Provenance', slug='engram-provenance')
+    team = Team.objects.create(organization=organization, name='Platform', slug='platform')
+    project = Project.objects.create(organization=organization, name='Backend', slug='backend')
+    ProjectTeam.objects.create(organization=organization, team=team, project=project)
+    owner = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-context-provenance',
+        display_name='Context service account',
+    )
+    role = Role.objects.get(code='developer')
+    OrganizationMembership.objects.create(organization=organization, identity=owner, role=role)
+    ProjectGrant.objects.create(organization=organization, project=project, identity=owner, role=role)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=owner,
+        name='Context key',
+        key_prefix=api_key_prefix(PROVENANCE_RAW_KEY),
+        key_hash=hash_api_key(PROVENANCE_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(PROVENANCE_RAW_KEY),
+        team=team,
+        project=project,
+    )
+    ApiKeyCapability.objects.create(
+        api_key=api_key,
+        capability=Capability.objects.get(code='memories:read'),
+    )
+
+    return organization, team, project, api_key
+
+
+def _create_memory_document(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+    file_paths: list[str],
+    source_observation: Observation | None = None,
+) -> RetrievalDocument:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={'file_paths': file_paths},
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=f'{title}-hash',
+        source_observation=source_observation,
+    )
+
+    return RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        file_paths=file_paths,
+        full_text=f'{title}\n\n{body}',
+    )
+
+
+def _context_bundle_input(
+    project: Project,
+    team: Team,
+    *,
+    file_paths: tuple[str, ...],
+    request_id: str,
+    session_id: str,
+    raw_key: str = PROVENANCE_RAW_KEY,
+) -> ContextBundleInput:
+    return ContextBundleInput(
+        raw_key=raw_key,
+        project_id=project.id,
+        team_id=team.id,
+        agent_runtime='codex',
+        agent_version='0.1.0',
+        agent_external_id='codex-local',
+        session_id=session_id,
+        request_id=request_id,
+        correlation_id=f'correlation-{request_id}',
+        trace_id=f'trace-{request_id}',
+        repository_url='',
+        repository_root='',
+        branch='',
+        cwd='',
+        query='retrieval latency and provenance',
+        file_paths=file_paths,
+        symbols=(),
+        limit=5,
+        token_budget=None,
+        purpose='session_start',
+    )
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_records_non_null_retrieval_latency_ms() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Latency memory',
+        body='Retrieval latency should be measured for every bundle build.',
+        file_paths=['apps/backend/engram/context/services.py'],
+    )
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=('apps/backend/engram/context/services.py',),
+            request_id='request-latency-1',
+            session_id='session-latency-1',
+        ),
+    )
+
+    assert result.bundle.retrieval_latency_ms is not None
+    assert result.bundle.retrieval_latency_ms >= 0
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_excludes_unprovenanced_memory_when_required() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    OrganizationSettings.objects.create(organization=organization, require_provenance=True)
+    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-provenance')
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='session-provenance-source',
+        runtime='codex',
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        observation_type='decision',
+        title='Provenance source',
+        content_hash='observation-provenance-hash',
+    )
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Provenanced memory',
+        body='Provenanced memory has a source observation.',
+        file_paths=['apps/backend/engram/context/services.py'],
+        source_observation=observation,
+    )
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Unprovenanced memory',
+        body='Unprovenanced memory has no source observation.',
+        file_paths=['apps/backend/engram/context/views.py'],
+    )
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(
+                'apps/backend/engram/context/services.py',
+                'apps/backend/engram/context/views.py',
+            ),
+            request_id='request-provenance-required-1',
+            session_id='session-provenance-required-1',
+        ),
+    )
+
+    titles = {match.document.memory.title for match in result.matches}
+    assert titles == {'Provenanced memory'}
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_includes_unprovenanced_memory_when_not_required() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Provenanced memory',
+        body='Provenanced memory has a source observation.',
+        file_paths=['apps/backend/engram/context/services.py'],
+    )
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Unprovenanced memory',
+        body='Unprovenanced memory has no source observation.',
+        file_paths=['apps/backend/engram/context/views.py'],
+    )
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(
+                'apps/backend/engram/context/services.py',
+                'apps/backend/engram/context/views.py',
+            ),
+            request_id='request-provenance-not-required-1',
+            session_id='session-provenance-not-required-1',
+        ),
+    )
+
+    titles = {match.document.memory.title for match in result.matches}
+    assert titles == {'Provenanced memory', 'Unprovenanced memory'}

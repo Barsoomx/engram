@@ -139,7 +139,6 @@ class Organization(TimestampedModel):
 class OrganizationSettings(TimestampedModel):
     organization = models.OneToOneField(Organization, on_delete=models.CASCADE, related_name='settings')
     hybrid_retrieval_enabled = models.BooleanField(default=True)
-    # require_provenance is persisted but provenance-based ranking enforcement is deferred
     require_provenance = models.BooleanField(default=False)
     distillation_auto_approve_threshold = models.DecimalField(
         max_digits=4,
@@ -718,6 +717,7 @@ class ContextBundle(TimestampedModel):
     selected_count = models.PositiveIntegerField(default=0)
     status = models.CharField(max_length=40, choices=ContextBundleStatus.choices, default=ContextBundleStatus.CREATED)
     metadata = models.JSONField(default=dict, blank=True)
+    retrieval_latency_ms = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         constraints = [
