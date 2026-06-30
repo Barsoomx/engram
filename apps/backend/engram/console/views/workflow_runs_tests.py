@@ -317,9 +317,8 @@ def test_rerun_creates_chained_run_triggers_digest_and_audits(
     f_admin_client: APIClient,
     f_admin_org: Organization,
 ) -> None:
-    from engram.memory.memory_digest_tests import create_digest_policy, create_source_memory
-
     from engram.context.context_api_tests import create_project_scope
+    from engram.memory.memory_digest_tests import create_digest_policy, create_source_memory
 
     org, team, project, _owner, _api_key = create_project_scope()
 
