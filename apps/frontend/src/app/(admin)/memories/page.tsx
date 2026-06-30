@@ -164,7 +164,7 @@ export default function MemoriesPage() {
         params.team_id = activeTeamId;
       }
 
-      const response = await client.get<MemoriesResponse>('/v1/inspection/memories/', { params });
+      const response = await client.get<MemoriesResponse>('/v1/inspection/memories', { params });
 
       return response.data;
     },
