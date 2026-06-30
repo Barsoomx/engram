@@ -812,6 +812,7 @@ class WorkflowRunType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
     SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
+    WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
 
 
 class WorkflowRunStatus(models.TextChoices):
