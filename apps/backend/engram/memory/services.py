@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 import structlog
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -21,6 +22,8 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Observation,
+    Organization,
+    OrganizationSettings,
     Project,
     RetrievalDocument,
     VisibilityScope,
@@ -318,6 +321,25 @@ class ProcessObservationRecorded:
         evidence = candidate.evidence[0]
 
         return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
+
+
+def is_auto_promotable(confidence: Decimal | None, threshold: Decimal) -> bool:
+    return confidence is not None and confidence >= threshold
+
+
+def resolve_auto_approve_threshold(organization: Organization, override: Decimal | None = None) -> Decimal:
+    if override is not None:
+        return override
+
+    org_threshold = (
+        OrganizationSettings.objects.filter(organization=organization)
+        .values_list('distillation_auto_approve_threshold', flat=True)
+        .first()
+    )
+    if org_threshold is not None:
+        return org_threshold
+
+    return Decimal(str(settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD))
 
 
 def memory_candidate_content_hash(observation: Observation) -> str:
