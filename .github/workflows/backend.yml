@@ -78,3 +78,9 @@ jobs:
 
       - name: Run MCP tests
         run: PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v
+
+      - name: Run Claude plugin contract tests
+        run: PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v
+
+      - name: Run Codex plugin contract tests
+        run: PYTHONPATH=packages/codex-plugin python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v

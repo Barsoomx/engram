@@ -47,6 +47,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-end --agent codex --response-format codex",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }

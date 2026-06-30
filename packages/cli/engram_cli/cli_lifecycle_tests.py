@@ -219,6 +219,10 @@ class CliLifecycleTests(unittest.TestCase):
                 codex_hook["commands"]["Decision"],
             )
             self.assertEqual(
+                "engram hook session-end --agent codex --response-format codex",
+                codex_hook["commands"]["SessionEnd"],
+            )
+            self.assertEqual(
                 "engram hook session-start --agent claude_code --response-format claude-code",
                 claude_hook["commands"]["SessionStart"],
             )
@@ -233,6 +237,10 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(
                 "engram hook decision --agent claude_code --response-format claude-code",
                 claude_hook["commands"]["Decision"],
+            )
+            self.assertEqual(
+                "engram hook session-end --agent claude_code --response-format claude-code",
+                claude_hook["commands"]["SessionEnd"],
             )
 
     def test_connect_fingerprint_uses_only_derived_material_for_short_keys(
@@ -801,6 +809,105 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual("accepted", body["status"])
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_session_end_posts_connected_event_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "session-end-request-1",
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "event_id": "session-end-event-1",
+                        "request_id": "session-end-request-1",
+                        "payload": {"reason": "agent stopped"},
+                        "observation": {"type": "session_end", "title": "session ended"},
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, len(transport.calls))
+            call = transport.calls[0]
+            payload = call["payload"]
+            self.assertEqual("POST", call["method"])
+            self.assertEqual(
+                "https://engram.example/v1/hooks/session-end", call["url"]
+            )
+            self.assertEqual("session_end", payload["event_type"])
+            self.assertEqual("session-end-event-1", payload["idempotency_key"])
+            self.assertEqual({"reason": "agent stopped"}, payload["payload"])
+            self.assertEqual(
+                {"type": "session_end", "title": "session ended"},
+                payload["observation"],
+            )
+            body = json.loads(stdout)
+            self.assertEqual("accepted", body["status"])
+            self.assertNotIn(RAW_KEY, stdout)
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_hook_session_end_non_2xx_response_exits_with_1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        500,
+                        {"code": "server_error", "detail": "Internal Server Error"},
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-1",
+                        "event_id": "session-end-event-2",
+                    },
+                ),
+            )
+
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--agent",
+                    "claude_code",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("server_error", stderr)
 
     def test_hook_session_start_posts_event_then_requests_context_with_connected_scope(
         self,
