@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 
 import pytest
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -802,3 +804,392 @@ def test_inspection_requires_project_id() -> None:
 
     assert response.status_code == 400
     assert response.json()['project_id']['code'] == ['inspection_project_required']
+
+
+@pytest.mark.django_db
+def test_memory_list_pagination_limit_and_offset() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    for i in range(4):
+        create_approved_memory_document(
+            organization,
+            team,
+            project,
+            title=f'Memory pagination {i}',
+            body='Body.',
+            visibility_scope=VisibilityScope.TEAM,
+        )
+    client = APIClient()
+
+    page_one = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'limit': '2', 'offset': '0'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+    page_two = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'limit': '2', 'offset': '2'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert page_one.status_code == 200
+    body_one = page_one.json()
+    assert body_one['count'] == 4
+    assert len(body_one['items']) == 2
+
+    assert page_two.status_code == 200
+    body_two = page_two.json()
+    assert body_two['count'] == 4
+    assert len(body_two['items']) == 2
+
+    ids_one = {i['id'] for i in body_one['items']}
+    ids_two = {i['id'] for i in body_two['items']}
+    assert ids_one.isdisjoint(ids_two)
+
+
+@pytest.mark.django_db
+def test_memory_list_filter_by_status() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    approved, _v, _d = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Approved memory',
+        body='Approved.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    archived, _va, _da = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Archived memory',
+        body='Archived.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    archived.status = 'archived'
+    archived.save(update_fields=['status', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'status': 'approved'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 1
+    assert body['items'][0]['id'] == str(approved.id)
+
+
+@pytest.mark.django_db
+def test_memory_list_filter_by_kind() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    digest, _vd, _dd = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest memory',
+        body='Body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    digest.metadata = {'kind': 'digest'}
+    digest.save(update_fields=['metadata', 'updated_at'])
+    snippet, _vs, _ds = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Snippet memory',
+        body='Body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    snippet.metadata = {'kind': 'snippet'}
+    snippet.save(update_fields=['metadata', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'kind': 'digest'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 1
+    assert body['items'][0]['id'] == str(digest.id)
+
+
+@pytest.mark.django_db
+def test_audit_list_filter_by_event_type() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    retrieved = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-1',
+        target_type='memory',
+        target_id='target-1',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-filter-event-type-1',
+    )
+    AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryCreated',
+        actor_type='api_key',
+        actor_id='actor-2',
+        target_type='memory',
+        target_id='target-2',
+        capability='memories:write',
+        result=AuditResult.ALLOWED,
+        request_id='req-filter-event-type-2',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id), 'event_type': 'MemoryRetrieved'},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 1
+    assert body['items'][0]['id'] == str(retrieved.id)
+
+
+@pytest.mark.django_db
+def test_audit_list_filter_by_correlation_id() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    target_event = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-corr',
+        target_type='memory',
+        target_id='target-corr',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-corr-target-123',
+    )
+    AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-corr-2',
+        target_type='memory',
+        target_id='target-corr-2',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-corr-other-456',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id), 'correlation_id': 'req-corr-target-123'},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 1
+    assert body['items'][0]['id'] == str(target_event.id)
+
+
+@pytest.mark.django_db
+def test_audit_list_filter_by_since_until() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    now = timezone.now()
+    old_event = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-since',
+        target_type='memory',
+        target_id='target-since-old',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-since-old',
+    )
+    old_event.created_at = now - timedelta(days=10)
+    old_event.save(update_fields=['created_at'])
+    new_event = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-since-new',
+        target_type='memory',
+        target_id='target-since-new',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-since-new',
+    )
+    new_event.created_at = now - timedelta(days=1)
+    new_event.save(update_fields=['created_at'])
+    since_str = (now - timedelta(days=5)).isoformat()
+    until_str = now.isoformat()
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id), 'since': since_str, 'until': until_str},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    ids = {item['id'] for item in body['items']}
+    assert str(new_event.id) in ids
+    assert str(old_event.id) not in ids
+
+
+@pytest.mark.django_db
+def test_audit_detail_returns_event_with_name_maps() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, api_key = scope
+    create_audit_key(scope)
+    ae = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id=str(api_key.id),
+        target_type='project',
+        target_id=str(project.id),
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-detail-audit',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/audit-events/{ae.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['id'] == str(ae.id)
+    assert body['event_type'] == 'MemoryRetrieved'
+    assert 'actor_display' in body
+    assert 'target_display' in body
+
+
+@pytest.mark.django_db
+def test_audit_detail_cross_org_returns_404() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    other_org = Organization.objects.create(name='Other', slug='other-audit-detail')
+    other_project = Project.objects.create(organization=other_org, name='Other', slug='other-audit-p')
+    other_ae = AuditEvent.objects.create(
+        organization=other_org,
+        project=other_project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='other-actor',
+        target_type='memory',
+        target_id='other-target',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-cross-org-audit',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/audit-events/{other_ae.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'audit_event_not_found'
+
+
+@pytest.mark.django_db
+def test_audit_detail_missing_capability_returns_403() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    ae = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-no-cap',
+        target_type='memory',
+        target_id='target-no-cap',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-no-cap-audit',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/audit-events/{ae.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_context_bundle_list_filter_by_since_until() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    now = timezone.now()
+    old_bundle = create_context_bundle(team, request_id='req-old-bundle')
+    old_bundle.created_at = now - timedelta(days=10)
+    old_bundle.save(update_fields=['created_at'])
+    agent = old_bundle.agent
+    session = old_bundle.session
+    new_bundle = ContextBundle.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        request_id='req-new-bundle',
+        purpose='session_start',
+        query_text='new bundle query',
+        rendered_text='new bundle rendered',
+        authorization_scope={},
+        selected_count=0,
+    )
+    new_bundle.created_at = now - timedelta(days=1)
+    new_bundle.save(update_fields=['created_at'])
+    since_str = (now - timedelta(days=5)).isoformat()
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/context-bundles',
+        {'project_id': str(project.id), 'since': since_str},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    ids = {item['id'] for item in body['items']}
+    assert str(new_bundle.id) in ids
+    assert str(old_bundle.id) not in ids
