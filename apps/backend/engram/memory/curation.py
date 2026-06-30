@@ -40,8 +40,6 @@ from engram.model_policy.services import (
 
 logger = structlog.get_logger(__name__)
 
-_MIN_SIGNAL_CHARS = 24
-
 
 @dataclass(frozen=True)
 class CurateMemoryCandidateInput:
@@ -86,8 +84,6 @@ def resolve_near_dup_threshold(organization: Organization) -> Decimal:
 def is_low_signal(candidate: MemoryCandidate) -> bool:
     body = redact_text(candidate.body).strip()
     if not body:
-        return True
-    if len(body) < _MIN_SIGNAL_CHARS:
         return True
     if body == redact_text(candidate.title).strip():
         return True
@@ -167,6 +163,7 @@ def supersede_memory_system(
     correlation_id: str = '',
     score: float | None = None,
 ) -> MemoryLink | None:
+    loser = Memory.objects.select_for_update().get(id=loser.id)
     if loser.stale:
         return None
 

@@ -203,6 +203,12 @@ class DistillSession:
                     self._classify_existing(candidate, auto_promoted, queued)
                     continue
                 if is_auto_promotable(candidate_input.confidence, threshold):
+                    # Follow-up: the curator's embedding call (and the near-dup IndexMemoryVersion embed) run inside
+                    # this transaction while the AgentSession select_for_update lock is held, partially
+                    # re-introducing the long-transaction-during-external-call risk that moved the synthesis call
+                    # out of the write phase. Embedding latency (~100-500ms) matches the existing
+                    # ProcessObservationRecorded pattern; a future optimization pre-computes candidate embeddings
+                    # outside the lock.
                     curation = CurateMemoryCandidate().execute(
                         CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
                     )

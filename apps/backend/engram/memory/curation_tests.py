@@ -127,15 +127,17 @@ def set_curator_settings(organization: Organization, *, enabled: bool = True, th
     )
 
 
-def test_is_low_signal_flags_short_empty_and_title_echo_bodies() -> None:
+def test_is_low_signal_flags_empty_and_title_echo_bodies() -> None:
     assert is_low_signal(MemoryCandidate(title='t', body='')) is True
     assert is_low_signal(MemoryCandidate(title='t', body='   ')) is True
-    assert is_low_signal(MemoryCandidate(title='t', body='too short')) is True
     assert is_low_signal(MemoryCandidate(title=_LONG_BODY, body=_LONG_BODY)) is True
 
 
-def test_is_low_signal_passes_substantive_body() -> None:
+def test_is_low_signal_passes_substantive_and_short_legitimate_bodies() -> None:
     assert is_low_signal(MemoryCandidate(title='Retrieval ranking', body=_LONG_BODY)) is False
+    assert is_low_signal(MemoryCandidate(title='Networking', body='Use port 8443 not 8080')) is False
+    assert is_low_signal(MemoryCandidate(title='Install', body='Run npm ci not npm i')) is False
+    assert is_low_signal(MemoryCandidate(title='Database host', body='DB_HOST=prod')) is False
 
 
 def test_find_near_duplicate_returns_highest_above_threshold() -> None:
@@ -262,6 +264,64 @@ def test_curate_promotes_clean_candidate_and_indexes_document() -> None:
     assert candidate.status == CandidateStatus.PROMOTED
     assert Memory.objects.filter(stale=False).count() == 1
     assert RetrievalDocument.objects.filter(memory=result.memory).exists()
+
+
+@pytest.mark.django_db
+def test_curate_promotes_short_legitimate_one_liner() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Networking port',
+        body='Use port 8443 not 8080',
+        content_hash='hash-one-liner',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert result.memory is not None
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert Memory.objects.filter(stale=False).count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_does_not_supersede_memory_in_another_org() -> None:
+    org_a, team_a, project_a = create_scope()
+    create_embedding_policy(org_a, team_a, project_a)
+    set_curator_settings(org_a)
+    _org_b, team_b, project_b = create_scope(suffix='2')
+    create_embedding_policy(_org_b, team_b, project_b)
+    foreign = promote_candidate(
+        create_candidate(
+            _org_b,
+            team_b,
+            project_b,
+            title='Retrieval ranking',
+            body=_LONG_BODY,
+            content_hash='hash-foreign',
+        ),
+    )
+    candidate = create_candidate(
+        org_a,
+        team_a,
+        project_a,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-candidate',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    foreign.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert result.superseded_memory is None
+    assert foreign.stale is False
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
 
 
 @pytest.mark.django_db
