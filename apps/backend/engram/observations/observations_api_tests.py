@@ -4,13 +4,24 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
+from django.contrib.auth.models import User
 from django.utils import timezone
+from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from engram.access.models import ApiKey, ApiKeyCapability, Capability
+from engram.access.auth_services import external_id_for_user
+from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
+    Identity,
+    IdentityType,
+    OrganizationMembership,
+    Role,
+)
 from engram.access.services import hash_api_key
 from engram.context.context_api_tests import RAW_KEY, auth_headers, create_project_scope
-from engram.core.models import Agent, AgentSession, Observation, Project, Runtime
+from engram.core.models import Agent, AgentSession, Observation, Organization, Project, Runtime
 
 
 def grant_observations_read(raw_key: str) -> None:
@@ -296,3 +307,97 @@ def test_observation_detail_missing_capability_returns_403() -> None:
     )
 
     assert response.status_code == 403
+
+
+def _make_session_admin(organization: Organization) -> str:
+    user = User.objects.create_user('session-obs-admin', password='admin-obs-pass-123')  # noqa: S106
+    identity, _ = Identity.objects.get_or_create(
+        organization=organization,
+        identity_type=IdentityType.USER,
+        external_id=external_id_for_user(user),
+        defaults={'display_name': 'Session obs admin'},
+    )
+    role = Role.objects.get(code='organization_admin')
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role)
+
+    return Token.objects.get_or_create(user=user)[0].key
+
+
+def _session_headers(token: str, organization: Organization) -> dict[str, str]:
+    return {
+        'HTTP_AUTHORIZATION': f'Token {token}',
+        'HTTP_X_ENGRAM_ORGANIZATION': str(organization.id),
+    }
+
+
+@pytest.mark.django_db
+def test_session_admin_can_list_observations() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    token = _make_session_admin(organization)
+    obs = create_observation(organization, team, project, content_hash='h-sess-list')
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'limit': 10},
+        **_session_headers(token, organization),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert 'request_id' in body
+    ids = [item['observation_id'] for item in body['items']]
+    assert str(obs.id) in ids
+
+
+@pytest.mark.django_db
+def test_session_admin_can_get_observation_detail() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    token = _make_session_admin(organization)
+    obs = create_observation(
+        organization,
+        team,
+        project,
+        title=f'Session detail {RAW_KEY}',
+        content_hash='h-sess-detail',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id)},
+        **_session_headers(token, organization),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['observation_id'] == str(obs.id)
+    assert body['title'] == 'Session detail [REDACTED]'
+    assert 'request_id' in body
+    assert RAW_KEY not in str(body)
+
+
+@pytest.mark.django_db
+def test_session_user_lacking_observations_read_gets_403() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    user = User.objects.create_user('limited-obs-sess', password='pass-limited-456')  # noqa: S106
+    identity, _ = Identity.objects.get_or_create(
+        organization=organization,
+        identity_type=IdentityType.USER,
+        external_id=external_id_for_user(user),
+        defaults={'display_name': 'Limited session'},
+    )
+    limited_role = Role.objects.create(code='limited-obs-sess-role', name='Limited obs test')
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=limited_role)
+    token = Token.objects.get_or_create(user=user)[0].key
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id)},
+        HTTP_AUTHORIZATION=f'Token {token}',
+        HTTP_X_ENGRAM_ORGANIZATION=str(organization.id),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'missing_capability'
