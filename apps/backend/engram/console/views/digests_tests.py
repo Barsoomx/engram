@@ -279,6 +279,64 @@ def test_get_weekly_digest_changelog_flattens_buckets(
 
 
 @pytest.mark.django_db
+def test_get_weekly_digest_threads_team_id_into_service_input(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team_id = uuid.uuid4()
+
+    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
+        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
+
+        response = f_read_client.get(
+            '/v1/admin/digests/weekly',
+            {'project_id': str(f_project.id), 'team_id': str(team_id)},
+        )
+
+    assert response.status_code == 200
+
+    called_input = m_service_cls.return_value.execute.call_args[0][0]
+
+    assert called_input.team_id == team_id
+
+
+@pytest.mark.django_db
+def test_get_weekly_digest_without_team_id_passes_none(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
+        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
+
+        response = f_read_client.get(
+            '/v1/admin/digests/weekly',
+            {'project_id': str(f_project.id)},
+        )
+
+    assert response.status_code == 200
+
+    called_input = m_service_cls.return_value.execute.call_args[0][0]
+
+    assert called_input.team_id is None
+
+
+@pytest.mark.django_db
+def test_get_weekly_digest_rejects_invalid_team_id(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'team_id': 'not-a-uuid'},
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
 def test_get_weekly_digest_requires_project_id(
     f_read_client: APIClient,
     f_org: Organization,

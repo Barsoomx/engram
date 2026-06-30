@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import uuid
 
 import pytest
 from django.utils import timezone
@@ -12,6 +13,7 @@ from engram.core.models import (
     MemoryStatus,
     Organization,
     Project,
+    Team,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
@@ -44,6 +46,7 @@ def _make_memory(
     title: str = 'mem',
     status: str = MemoryStatus.APPROVED,
     refuted: bool = False,
+    team: Team | None = None,
 ) -> Memory:
     return Memory.objects.create(
         organization=org,
@@ -52,6 +55,7 @@ def _make_memory(
         body='body',
         status=status,
         refuted=refuted,
+        team=team,
     )
 
 
@@ -83,12 +87,14 @@ def _run(
     org: Organization,
     project: Project,
     window_days: int = 7,
+    team_id: uuid.UUID | None = None,
 ) -> WeeklyDigestResult:
     return BuildWeeklyStructuredDigest().execute(
         WeeklyDigestInput(
             organization_id=org.id,
             project_id=project.id,
             window_days=window_days,
+            team_id=team_id,
         ),
     )
 
@@ -410,3 +416,81 @@ def test_different_projects_isolated(
     assert str(mem_in_project.id) in all_ids
 
     assert str(mem_in_other.id) not in all_ids
+
+
+@pytest.mark.django_db
+def test_team_id_restricts_added_bucket_to_that_team(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team_a = Team.objects.create(organization=f_org, name='Team A', slug='team-a')
+
+    team_b = Team.objects.create(organization=f_org, name='Team B', slug='team-b')
+
+    mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
+
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+
+    mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
+
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
+
+    result = _run(f_org, f_project, team_id=team_a.id)
+
+    all_ids = [item['id'] for items in result.memory_changes.values() for item in items]
+
+    assert str(mem_team_a.id) in all_ids
+
+    assert str(mem_team_b.id) not in all_ids
+
+
+@pytest.mark.django_db
+def test_without_team_id_all_project_memories_considered(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team_a = Team.objects.create(organization=f_org, name='Team A', slug='team-a')
+
+    team_b = Team.objects.create(organization=f_org, name='Team B', slug='team-b')
+
+    mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
+
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+
+    mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
+
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
+
+    result = _run(f_org, f_project)
+
+    all_ids = [item['id'] for items in result.memory_changes.values() for item in items]
+
+    assert str(mem_team_a.id) in all_ids
+
+    assert str(mem_team_b.id) in all_ids
+
+
+@pytest.mark.django_db
+def test_team_scoped_digest_has_independent_content_hash_from_unscoped(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team_a = Team.objects.create(organization=f_org, name='Team A', slug='team-a')
+
+    mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
+
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+
+    mem_no_team = _make_memory(f_org, f_project, title='no-team-mem')
+
+    Memory.objects.filter(id=mem_no_team.id).update(created_at=_in_window())
+
+    unscoped_result = _run(f_org, f_project)
+
+    team_scoped_result = _run(f_org, f_project, team_id=team_a.id)
+
+    assert unscoped_result.digest_memory.id != team_scoped_result.digest_memory.id
+
+    team_scoped_ids = [item['id'] for items in team_scoped_result.memory_changes.values() for item in items]
+
+    assert str(mem_no_team.id) not in team_scoped_ids
