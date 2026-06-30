@@ -273,6 +273,10 @@ class AgentSession(TimestampedModel):
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'status']),
+            models.Index(
+                fields=['organization', 'project', 'updated_at'],
+                name='core_session_updated_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'external_session_id']
 
@@ -388,6 +392,10 @@ class Observation(TimestampedModel):
         indexes = [
             models.Index(fields=['organization', 'project', 'observation_type']),
             models.Index(fields=['organization', 'project', 'content_hash']),
+            models.Index(
+                fields=['organization', 'project', 'observed_at', 'created_at'],
+                name='core_observation_created_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
@@ -532,11 +540,24 @@ class Memory(TimestampedModel):
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
+    kind = models.CharField(max_length=40, blank=True, default='')
 
     class Meta:
         indexes = [
             models.Index(fields=['organization', 'project', 'status']),
             models.Index(fields=['organization', 'project', 'visibility_scope']),
+            models.Index(
+                fields=['organization', 'project', 'status', 'updated_at'],
+                name='core_memory_status_updated_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'created_at'],
+                name='core_memory_created_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'kind'],
+                name='core_memory_kind_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'title']
 
@@ -547,6 +568,12 @@ class Memory(TimestampedModel):
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
         raise_scope_errors(errors)
+
+    def save(self, *args: object, **kwargs: object) -> None:
+        if not self.kind and self.metadata.get('kind'):
+            self.kind = self.metadata['kind']
+
+        super().save(*args, **kwargs)
 
     def __str__(self) -> str:
         return self.title
@@ -700,6 +727,10 @@ class ContextBundle(TimestampedModel):
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'purpose']),
+            models.Index(
+                fields=['organization', 'project', 'created_at'],
+                name='core_ctxbundle_created_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
@@ -783,6 +814,14 @@ class AuditEvent(TimestampedModel):
         indexes = [
             models.Index(fields=['organization', 'project', 'event_type']),
             models.Index(fields=['organization', 'result']),
+            models.Index(
+                fields=['organization', 'created_at'],
+                name='core_audit_org_created_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'created_at'],
+                name='core_audit_proj_created_idx',
+            ),
         ]
         ordering = ['organization_id', 'created_at']
 
