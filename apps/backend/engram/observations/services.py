@@ -4,20 +4,18 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from engram.access.services import ResolveApiKeyScope
+from engram.access.services import EffectiveScope
 from engram.core.models import Observation, Organization, Project
 from engram.core.redaction import redact_value
 
 
 @dataclass(frozen=True)
 class ObservationListInput:
-    raw_key: str
+    scope: EffectiveScope
     project_id: uuid.UUID
     team_id: uuid.UUID | None
     limit: int
     offset: int
-    request_id: str
-    correlation_id: str
     observation_type: str | None = None
     session_id: uuid.UUID | None = None
     since: datetime | None = None
@@ -26,11 +24,10 @@ class ObservationListInput:
 
 @dataclass(frozen=True)
 class ObservationDetailInput:
-    raw_key: str
+    scope: EffectiveScope
     project_id: uuid.UUID
     team_id: uuid.UUID | None
     observation_id: uuid.UUID
-    request_id: str
 
 
 def observation_response(observation: Observation) -> dict[str, object]:
@@ -59,17 +56,7 @@ class ObservationListResult:
 
 class ListObservations:
     def execute(self, data: ObservationListInput) -> ObservationListResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='observations:read',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='observation_list',
-            target_id='list',
-        )
-        organization = Organization.objects.get(id=scope.organization_id)
+        organization = Organization.objects.get(id=data.scope.organization_id)
         project = Project.objects.get(organization=organization, id=data.project_id)
         queryset = Observation.objects.filter(organization=organization, project=project)
         if data.team_id is not None:
@@ -92,17 +79,7 @@ class ListObservations:
 
 class GetObservation:
     def execute(self, data: ObservationDetailInput) -> Observation:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='observations:read',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id='',
-            target_type='observation',
-            target_id=str(data.observation_id),
-        )
-        organization = Organization.objects.get(id=scope.organization_id)
+        organization = Organization.objects.get(id=data.scope.organization_id)
         project = Project.objects.get(organization=organization, id=data.project_id)
         queryset = Observation.objects.filter(organization=organization, project=project, id=data.observation_id)
         if data.team_id is not None:
