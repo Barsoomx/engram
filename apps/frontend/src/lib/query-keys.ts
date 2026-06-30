@@ -50,4 +50,25 @@ export const adminQueryKeys = {
       fromVersion,
       toVersion,
     ] as const,
+
+  metricsOverview: (orgId: string | null) =>
+    ['admin', orgId, 'metrics', 'overview'] as const,
+
+  memoryIngest: (orgId: string | null) =>
+    ['admin', orgId, 'metrics', 'memory-ingest'] as const,
+
+  sessions: (orgId: string | null) =>
+    ['admin', orgId, 'metrics', 'sessions'] as const,
+
+  activity: (orgId: string | null) =>
+    ['admin', orgId, 'metrics', 'activity'] as const,
+
+  opsOverview: (orgId: string | null) =>
+    ['admin', orgId, 'ops', 'overview'] as const,
+
+  settingsRetrieval: (orgId: string | null) =>
+    ['admin', orgId, 'settings', 'retrieval'] as const,
+
+  settingsEmbedding: (orgId: string | null) =>
+    ['admin', orgId, 'settings', 'embedding'] as const,
 };

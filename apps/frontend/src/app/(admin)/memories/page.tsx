@@ -1,11 +1,27 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
+import { AlertTriangle, Database, Search, SlidersHorizontal } from 'lucide-react';
+import Link from 'next/link';
 import * as React from 'react';
 
+import { ConfidenceTrack } from '@/components/ui/confidence-track';
+import { EmptyState } from '@/components/ui/empty-state';
+import { KindBadge, KindDot } from '@/components/ui/kind-badge';
+import { PageHeader } from '@/components/ui/page-header';
+import { useProjects } from '@/hooks/use-projects';
 import { apiClient } from '@/lib/auth';
+import { formatRelativeTime, resolveKind, type MemoryKind } from '@/lib/design';
+import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
+
+type MemoryMetadata = {
+  kind?: string | null;
+  source?: string | null;
+  agent?: string | null;
+  project?: string | null;
+};
 
 type MemoryItem = {
   id: string;
@@ -17,10 +33,19 @@ type MemoryItem = {
   visibility_scope: string;
   current_version: number;
   confidence: string | null;
+  confidence_percent?: number | null;
   stale: boolean;
   refuted: boolean;
   created_at: string | null;
   updated_at: string | null;
+  metadata?: MemoryMetadata | null;
+  kind?: string | null;
+  tags?: string[];
+  file_paths?: string[];
+  captured_by?: unknown;
+  project_name?: string;
+  project_slug?: string;
+  authorized_for_injection?: boolean;
 };
 
 type MemoriesResponse = {
@@ -28,47 +53,105 @@ type MemoriesResponse = {
   items: MemoryItem[];
 };
 
-function StatusBadge({ status }: { status: string }) {
-  const tone =
-    status === 'active' ? 'text-success-500' : status === 'stale' ? 'text-warning-500' : 'text-default-500';
+type KindFilter = MemoryKind | 'all';
 
-  return <strong className={tone}>{status}</strong>;
+const KIND_FILTERS: { key: KindFilter; label: string }[] = [
+  { key: 'all', label: 'All' },
+  { key: 'decision', label: 'Decisions' },
+  { key: 'convention', label: 'Conventions' },
+  { key: 'gotcha', label: 'Gotchas' },
+  { key: 'architecture', label: 'Architecture' },
+];
+
+function confidencePct(value: string | null): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const pct = parsed <= 1 ? parsed * 100 : parsed;
+
+  return Math.max(0, Math.min(100, Math.round(pct)));
 }
 
-function MemoriesTable({ items }: { items: MemoryItem[] }) {
+function MemoryCard({
+  memory,
+  projectLabel,
+}: {
+  memory: MemoryItem;
+  projectLabel: string;
+}) {
+  const kind = resolveKind(memory.kind ?? memory.metadata?.kind);
+  const source = memory.file_paths?.[0] ?? memory.metadata?.source ?? '—';
+  const agent = memory.metadata?.agent ?? null;
+  const project = memory.project_name ?? memory.project_slug ?? memory.metadata?.project ?? projectLabel;
+  const pct = memory.confidence_percent ?? confidencePct(memory.confidence);
+
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>ID</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Title</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Visibility</th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((memory) => (
-            <tr key={memory.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 font-mono text-xs text-default-700 break-all'>
-                {memory.id}
-              </td>
-              <td className='py-2 px-3 text-foreground'>{memory.title || '(untitled)'}</td>
-              <td className='py-2 px-3'>
-                <StatusBadge status={memory.status} />
-              </td>
-              <td className='py-2 px-3 text-default-700'>{memory.visibility_scope}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <Link
+      href={`/memories/${memory.id}`}
+      className='surface-card block px-[22px] py-[19px] transition-all duration-150 hover:-translate-y-px hover:border-divider-strong hover:bg-content2'
+    >
+      <div className='flex items-center justify-between gap-3'>
+        <div className='flex min-w-0 items-center gap-2.5'>
+          <KindBadge kind={kind} />
+          <span className='truncate font-mono text-[12px] text-default-400'>
+            {source}
+          </span>
+        </div>
+        <span className='shrink-0 text-[12px] text-default-400'>
+          {formatRelativeTime(memory.updated_at ?? memory.created_at)}
+        </span>
+      </div>
+
+      <h3 className='mt-3 text-[16px] font-semibold leading-[1.3] tracking-[-0.01em] text-foreground'>
+        {memory.title || '(untitled)'}
+      </h3>
+
+      {memory.body && (
+        <p className='mt-1.5 line-clamp-2 max-w-[74ch] text-[13.5px] leading-relaxed text-default-500'>
+          {memory.body}
+        </p>
+      )}
+
+      <div className='mt-4 flex items-center justify-between gap-3'>
+        <div className='flex min-w-0 items-center gap-2 text-[12px] text-default-500'>
+          <KindDot kind={kind} size={8} />
+          <span className='truncate'>{project}</span>
+          {agent && (
+            <>
+              <span className='text-default-400'>·</span>
+              <span className='truncate'>{agent}</span>
+            </>
+          )}
+        </div>
+        {pct !== null && (
+          <div className='flex shrink-0 items-center gap-2.5'>
+            <span className='tnum font-mono text-[12px] text-default-400'>
+              {pct}% conf
+            </span>
+            <ConfidenceTrack value={pct} />
+          </div>
+        )}
+      </div>
+    </Link>
   );
 }
 
 export default function MemoriesPage() {
+  const activeOrgId = useOrgStore((s) => s.activeOrgId);
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
+  const [search, setSearch] = React.useState('');
+  const [kindFilter, setKindFilter] = React.useState<KindFilter>('all');
+
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
 
   const query = useQuery<MemoriesResponse>({
     queryKey: ['inspection', 'memories', activeProjectId, activeTeamId],
@@ -87,47 +170,147 @@ export default function MemoriesPage() {
     },
   });
 
+  const projectLabel = React.useMemo(() => {
+    const project = projectsQuery.data?.results.find(
+      (p) => p.id === activeProjectId,
+    );
+
+    return project?.slug ?? '—';
+  }, [projectsQuery.data, activeProjectId]);
+
+  const items = React.useMemo(() => query.data?.items ?? [], [query.data]);
+
+  const filtered = React.useMemo(() => {
+    const q = search.trim().toLowerCase();
+
+    return items.filter((memory) => {
+      if (kindFilter !== 'all' && resolveKind(memory.kind ?? memory.metadata?.kind) !== kindFilter) {
+        return false;
+      }
+
+      if (!q) {
+        return true;
+      }
+
+      const haystack = [
+        memory.title,
+        memory.body,
+        memory.metadata?.source ?? '',
+        memory.metadata?.agent ?? '',
+      ]
+        .join(' ')
+        .toLowerCase();
+
+      return haystack.includes(q);
+    });
+  }, [items, search, kindFilter]);
+
   if (!activeProjectId) {
     return (
-      <section>
-        <h1 className='text-2xl font-semibold text-foreground'>Memories</h1>
-        <p className='mt-4 text-sm text-default-500'>
-          Select a project to view memories.
-        </p>
+      <section className='space-y-6'>
+        <PageHeader
+          title='Memories'
+          subtitle='Engineering knowledge captured by your agents, ready to inject.'
+        />
+        <EmptyState
+          title='Select a project'
+          description='Choose a project from the switcher above to view its captured memories.'
+          icon={<Database className='h-6 w-6' />}
+        />
       </section>
     );
   }
 
   return (
-    <section className='space-y-4'>
-      <div>
-        <h1 className='text-2xl font-semibold text-foreground'>Memories</h1>
-        <p className='text-xs text-default-500 mt-1 font-mono'>
-          {process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000'}
-          /v1/inspection/memories/
-        </p>
+    <section className='space-y-6'>
+      <PageHeader
+        title='Memories'
+        subtitle='Engineering knowledge captured by your agents, ready to inject.'
+        actions={
+          <button
+            type='button'
+            className='inline-flex h-10 items-center gap-2 rounded-[11px] border border-divider-strong bg-content1 px-4 text-[13.5px] font-medium text-default-700 transition-colors hover:bg-content2'
+          >
+            <SlidersHorizontal size={16} strokeWidth={1.8} />
+            Filters
+          </button>
+        }
+      />
+
+      <div className='space-y-3'>
+        <div className='flex items-center gap-2.5 rounded-[12px] border border-divider-strong bg-content1 px-3.5 transition-colors focus-within:border-primary'>
+          <Search size={17} strokeWidth={1.8} className='shrink-0 text-default-400' />
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder='Search memories, tags, files…'
+            className='h-12 w-full bg-transparent text-[14px] text-foreground outline-none placeholder:text-default-400'
+          />
+        </div>
+        <div className='flex flex-wrap gap-2'>
+          {KIND_FILTERS.map((filter) => {
+            const active = kindFilter === filter.key;
+
+            return (
+              <button
+                key={filter.key}
+                type='button'
+                onClick={() => setKindFilter(filter.key)}
+                className={
+                  active
+                    ? 'rounded-[9px] bg-foreground px-3.5 py-2 text-[13px] font-medium text-background transition-colors'
+                    : 'rounded-[9px] border border-divider-strong px-3.5 py-2 text-[13px] font-medium text-default-500 transition-colors hover:text-foreground'
+                }
+              >
+                {filter.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
-      {query.isLoading && <p className='text-default-500'>Loading memories...</p>}
+      {query.isLoading && (
+        <div className='space-y-3'>
+          {Array.from({ length: 4 }).map((_, index) => (
+            <div
+              key={index}
+              className='surface-card h-[150px] animate-pulse bg-content1'
+            />
+          ))}
+        </div>
+      )}
 
       {query.isError && (
-        <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-          {query.error instanceof Error ? query.error.message : 'Failed to load memories.'}
-        </pre>
+        <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
+          <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
+          <p className='text-[13px] leading-relaxed text-danger'>
+            {query.error instanceof Error ? query.error.message : 'Failed to load memories.'}
+          </p>
+        </div>
       )}
 
-      {query.data && (
-        <>
-          <p className='text-sm text-default-500'>Total: {query.data.count}</p>
-          {query.data.items.length > 0 ? (
-            <div className='surface-card p-2'>
-              <MemoriesTable items={query.data.items} />
-            </div>
-          ) : (
-            <p className='text-default-500'>No memories found for this project.</p>
-          )}
-        </>
-      )}
+      {query.data &&
+        (filtered.length > 0 ? (
+          <div className='space-y-3'>
+            {filtered.map((memory) => (
+              <MemoryCard
+                key={memory.id}
+                memory={memory}
+                projectLabel={projectLabel}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            title={items.length === 0 ? 'No memories yet' : 'No matching memories'}
+            description={
+              items.length === 0
+                ? 'Memories captured by your agents for this project will appear here.'
+                : 'Try a different search term or kind filter.'
+            }
+            icon={<Database className='h-6 w-6' />}
+          />
+        ))}
     </section>
   );
 }

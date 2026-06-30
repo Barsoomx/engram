@@ -1,8 +1,12 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
+import { Eye } from 'lucide-react';
 import * as React from 'react';
 
+import { EmptyState } from '@/components/ui/empty-state';
+import { PageHeader } from '@/components/ui/page-header';
+import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { apiClient } from '@/lib/auth';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
@@ -75,44 +79,71 @@ export default function ObservationsPage() {
 
   if (!activeProjectId) {
     return (
-      <section>
-        <h1 className='text-2xl font-semibold text-foreground'>Observations</h1>
-        <p className='mt-4 text-sm text-default-500'>
-          Select a project to view observations.
-        </p>
+      <section className='space-y-6'>
+        <PageHeader
+          title='Observations'
+          subtitle='Raw agent observations captured for the active project.'
+        />
+        <EmptyState
+          title='No project selected'
+          description='Select a project to view its observations.'
+          icon={<Eye className='w-6 h-6' />}
+        />
       </section>
     );
   }
 
+  const items = query.data?.items ?? [];
+
   return (
-    <section className='space-y-4'>
-      <div>
-        <h1 className='text-2xl font-semibold text-foreground'>Observations</h1>
-        <p className='text-xs text-default-500 mt-1 font-mono'>
-          {process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000'}
-          /v1/observations/
-        </p>
+    <section className='space-y-6'>
+      <PageHeader
+        title='Observations'
+        subtitle='Raw agent observations captured for the active project.'
+      />
+
+      <div className='surface-card p-2'>
+        {query.isLoading ? (
+          <table className='w-full border-collapse text-left text-sm'>
+            <thead>
+              <tr className='border-b border-divider'>
+                {Array.from({ length: 4 }).map((_, index) => (
+                  <th
+                    key={index}
+                    className='py-2 px-3 text-default-500 font-medium'
+                  >
+                    <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <TableRowSkeleton columns={4} />
+          </table>
+        ) : items.length === 0 ? (
+          <EmptyState
+            title='No observations'
+            description='No observations have been recorded for this project yet.'
+            icon={<Eye className='w-6 h-6' />}
+          />
+        ) : (
+          <ObservationsTable items={items} />
+        )}
       </div>
 
-      {query.isLoading && <p className='text-default-500'>Loading observations...</p>}
+      {items.length > 0 && (
+        <div className='flex items-center justify-between text-xs text-default-500'>
+          <p>
+            Showing {items.length} observation{items.length === 1 ? '' : 's'}.
+          </p>
+        </div>
+      )}
 
       {query.isError && (
         <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-          {query.error instanceof Error ? query.error.message : 'Failed to load observations.'}
+          {query.error instanceof Error
+            ? query.error.message
+            : 'Failed to load observations.'}
         </pre>
-      )}
-
-      {query.data && (
-        <>
-          <p className='text-sm text-default-500'>Items: {query.data.items.length}</p>
-          {query.data.items.length > 0 ? (
-            <div className='surface-card p-2'>
-              <ObservationsTable items={query.data.items} />
-            </div>
-          ) : (
-            <p className='text-default-500'>No observations found for this project.</p>
-          )}
-        </>
       )}
     </section>
   );
