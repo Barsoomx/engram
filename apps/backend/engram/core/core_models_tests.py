@@ -643,6 +643,73 @@ def test_audit_event_rejects_cross_scope_project_on_create() -> None:
 
 
 @pytest.mark.django_db
+def test_memory_kind_is_populated_from_metadata_on_create() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Digest memory',
+        body='Daily digest body.',
+        metadata={'kind': 'digest'},
+    )
+
+    assert memory.kind == 'digest'
+
+
+@pytest.mark.django_db
+def test_memory_kind_defaults_to_empty_string_when_metadata_has_no_kind() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Plain memory',
+        body='No kind here.',
+    )
+
+    assert memory.kind == ''
+
+
+def index_field_sets(model: type) -> set[tuple[str, ...]]:
+    return {tuple(index.fields) for index in model._meta.indexes}
+
+
+def test_observation_has_observed_at_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'observed_at', 'created_at') in index_field_sets(Observation)
+
+
+def test_audit_event_has_organization_created_at_composite_index() -> None:
+    assert ('organization', 'created_at') in index_field_sets(AuditEvent)
+
+
+def test_audit_event_has_organization_project_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'created_at') in index_field_sets(AuditEvent)
+
+
+def test_memory_has_status_updated_at_composite_index() -> None:
+    assert ('organization', 'project', 'status', 'updated_at') in index_field_sets(Memory)
+
+
+def test_memory_has_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'created_at') in index_field_sets(Memory)
+
+
+def test_memory_has_kind_composite_index() -> None:
+    assert ('organization', 'project', 'kind') in index_field_sets(Memory)
+
+
+def test_context_bundle_has_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'created_at') in index_field_sets(ContextBundle)
+
+
+def test_agent_session_has_updated_at_composite_index() -> None:
+    assert ('organization', 'project', 'updated_at') in index_field_sets(AgentSession)
+
+
+@pytest.mark.django_db
 def test_retrieval_document_defaults_to_empty_embedding_vector() -> None:
     organization = Organization.objects.create(name='Org', slug='org-embedding')
     project = Project.objects.create(organization=organization, name='P', slug='p-embedding')
