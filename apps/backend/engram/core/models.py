@@ -805,6 +805,7 @@ class MemoryLink(TimestampedModel):
 class WorkflowRunType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
+    WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
 
 
 class WorkflowRunStatus(models.TextChoices):
