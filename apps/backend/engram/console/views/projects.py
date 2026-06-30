@@ -44,15 +44,19 @@ class ProjectViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        return Project.objects.filter(
-            organization=self.request.active_organization,
-            archived_at__isnull=True,
-        ).annotate(
-            memory_count=Count(
-                'memories',
-                filter=Q(memories__status=MemoryStatus.APPROVED),
+        return (
+            Project.objects.filter(
+                organization=self.request.active_organization,
+                archived_at__isnull=True,
             )
-        ).order_by('-created_at')
+            .annotate(
+                memory_count=Count(
+                    'memories',
+                    filter=Q(memories__status=MemoryStatus.APPROVED),
+                )
+            )
+            .order_by('-created_at')
+        )
 
     def get_serializer_context(self) -> dict:
         context = super().get_serializer_context()

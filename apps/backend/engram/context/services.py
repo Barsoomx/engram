@@ -20,6 +20,7 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Organization,
+    OrganizationSettings,
     Project,
     RetrievalDocument,
     Team,
@@ -688,6 +689,10 @@ class BuildContextBundle:
         )
         if len(exact_matches) >= data.limit:
             return tuple(exact_matches[: data.limit]), False, None
+
+        org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+        if not org_settings.hybrid_retrieval_enabled:
+            return tuple(exact_matches), False, None
 
         embedding_result = self._resolve_query_embedding(data, organization, project, team)
         if embedding_result is None:

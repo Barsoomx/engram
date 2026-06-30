@@ -9,6 +9,11 @@ from engram.console.views.organizations import OrganizationViewSet
 from engram.console.views.projects import ProjectViewSet
 from engram.console.views.roles import RoleViewSet
 from engram.console.views.search_debug import SearchDebugView
+from engram.console.views.settings import (
+    EmbeddingSettingsView,
+    PurgeOrganizationMemoryView,
+    RetrievalSettingsView,
+)
 from engram.console.views.teams import TeamViewSet
 from engram.console.views.workflow_runs import WorkflowRunViewSet
 
@@ -26,4 +31,7 @@ router.register('memory-review', MemoryReviewViewSet, basename='admin-memory-rev
 urlpatterns = router.urls + [
     path('search-debug/', SearchDebugView.as_view(), name='admin-search-debug'),
     path('ops/overview', OpsOverviewView.as_view(), name='admin-ops-overview'),
+    path('settings/retrieval', RetrievalSettingsView.as_view(), name='admin-settings-retrieval'),
+    path('settings/embedding', EmbeddingSettingsView.as_view(), name='admin-settings-embedding'),
+    path('settings/purge', PurgeOrganizationMemoryView.as_view(), name='admin-settings-purge'),
 ]
