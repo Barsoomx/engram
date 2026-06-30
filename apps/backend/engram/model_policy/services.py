@@ -36,9 +36,10 @@ NON_PRODUCTION_ENVIRONMENTS = {'dev', 'development', 'local', 'test'}
 
 
 class ModelPolicyError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
         super().__init__(message)
         self.code = code
+        self.retryable = retryable
 
 
 class ProviderSecretError(Exception):
@@ -703,9 +704,18 @@ class OpenAICompatibleGateway:
             with self._opener(request, timeout=30) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
-            raise ModelPolicyError('provider_http_error', f'provider returned {error.code}') from error
+            retryable = error.code == 429 or error.code >= 500
+            raise ModelPolicyError(
+                'provider_http_error',
+                f'provider returned {error.code}',
+                retryable=retryable,
+            ) from error
         except urllib.error.URLError as error:
-            raise ModelPolicyError('provider_unreachable', f'provider unreachable: {error.reason}') from error
+            raise ModelPolicyError(
+                'provider_unreachable',
+                f'provider unreachable: {error.reason}',
+                retryable=True,
+            ) from error
 
 
 def _split_completion(content: str) -> tuple[str, str]:
@@ -835,9 +845,18 @@ class AnthropicMessagesGateway:
             with self._opener(request, timeout=30) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
-            raise ModelPolicyError('provider_http_error', f'provider returned {error.code}') from error
+            retryable = error.code == 429 or error.code >= 500
+            raise ModelPolicyError(
+                'provider_http_error',
+                f'provider returned {error.code}',
+                retryable=retryable,
+            ) from error
         except urllib.error.URLError as error:
-            raise ModelPolicyError('provider_unreachable', f'provider unreachable: {error.reason}') from error
+            raise ModelPolicyError(
+                'provider_unreachable',
+                f'provider unreachable: {error.reason}',
+                retryable=True,
+            ) from error
 
 
 def get_provider_gateway(

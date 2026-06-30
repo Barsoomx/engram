@@ -323,3 +323,141 @@ def test_anthropic_gateway_embed_is_unsupported() -> None:
                 text='text',
             ),
         )
+
+
+@pytest.mark.django_db
+def test_openai_gateway_classifies_5xx_as_retryable() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(urllib.error.HTTPError('url', 503, 'service unavailable', {}, None))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='classify-503',
+                trace_id='classify-503',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.django_db
+def test_openai_gateway_classifies_429_as_retryable() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(urllib.error.HTTPError('url', 429, 'too many requests', {}, None))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='classify-429',
+                trace_id='classify-429',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.django_db
+def test_openai_gateway_classifies_400_as_terminal() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(urllib.error.HTTPError('url', 400, 'bad request', {}, None))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='classify-400',
+                trace_id='classify-400',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is False
+
+
+@pytest.mark.django_db
+def test_openai_gateway_classifies_url_error_as_retryable() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(urllib.error.URLError('timed out'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='classify-timeout',
+                trace_id='classify-timeout',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_classifies_5xx_as_retryable() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    opener = _opener_raising(urllib.error.HTTPError('url', 500, 'internal server error', {}, None))
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='anthropic-classify-500',
+                trace_id='anthropic-classify-500',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is True
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_classifies_401_as_terminal() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    opener = _opener_raising(urllib.error.HTTPError('url', 401, 'unauthorized', {}, None))
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        gateway.call(
+            ProviderCallInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                policy=policy,
+                request_id='anthropic-classify-401',
+                trace_id='anthropic-classify-401',
+                prompt='prompt',
+            ),
+        )
+
+    assert exc_info.value.retryable is False

@@ -54,7 +54,9 @@ class MemoryCandidateWorkerResult:
 
 
 class MemoryWorkerError(Exception):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -287,7 +289,7 @@ class ProcessObservationRecorded:
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
-            raise MemoryWorkerError(redact_error(str(error))) from error
+            raise MemoryWorkerError(redact_error(str(error)), retryable=getattr(error, 'retryable', False)) from error
 
         provenance = {
             'provider_call_id': str(provider_result.call_record_id),
@@ -799,6 +801,10 @@ class GenerateDigest:
         )
         if not sources:
             raise MemoryWorkerError('no approved source memories found for digest')
+        content_hash = digest_content_hash(project.id, data.memory_ids)
+        existing = self._find_existing(project, content_hash)
+        if existing is not None:
+            return existing
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
                 organization_id=project.organization_id,
@@ -821,8 +827,10 @@ class GenerateDigest:
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
-            raise MemoryWorkerError(f'digest provider unavailable: {error}') from error
-        content_hash = digest_content_hash(project.id, data.memory_ids)
+            raise MemoryWorkerError(
+                f'digest provider unavailable: {error}',
+                retryable=getattr(error, 'retryable', False),
+            ) from error
         with transaction.atomic():
             memory = Memory.objects.create(
                 organization=project.organization,
@@ -879,6 +887,32 @@ class GenerateDigest:
             memory_version=version,
             retrieval_document=retrieval_document,
             provider_call_id=provider_result.call_record_id,
+        )
+
+    def _find_existing(self, project: Project, content_hash: str) -> DigestResult | None:
+        existing_memory = Memory.objects.filter(
+            organization=project.organization,
+            project=project,
+            metadata__kind='digest',
+            metadata__content_hash=content_hash,
+        ).first()
+        if existing_memory is None:
+            return None
+
+        existing_version = MemoryVersion.objects.filter(memory=existing_memory).order_by('version').first()
+        existing_doc = RetrievalDocument.objects.filter(memory=existing_memory).first()
+        if existing_version is None or existing_doc is None:
+            return None
+
+        metadata = existing_memory.metadata if isinstance(existing_memory.metadata, dict) else {}
+        call_id_str = metadata.get('provider_call_id')
+        provider_call_id = uuid.UUID(call_id_str) if call_id_str else existing_version.id
+
+        return DigestResult(
+            memory=existing_memory,
+            memory_version=existing_version,
+            retrieval_document=existing_doc,
+            provider_call_id=provider_call_id,
         )
 
 
