@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Database, Search, SlidersHorizontal } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Database, Search, SlidersHorizontal } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -15,6 +15,8 @@ import { formatRelativeTime, resolveKind, type MemoryKind } from '@/lib/design';
 import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
+
+const LIMIT = 50;
 
 type MemoryMetadata = {
   kind?: string | null;
@@ -151,6 +153,19 @@ export default function MemoriesPage() {
   const [search, setSearch] = React.useState('');
   const [kindFilter, setKindFilter] = React.useState<KindFilter>('all');
 
+  const [extraItems, setExtraItems] = React.useState<MemoryItem[]>([]);
+  const [nextOffset, setNextOffset] = React.useState(LIMIT);
+  const [serverCount, setServerCount] = React.useState<number | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = React.useState(false);
+  const [loadMoreError, setLoadMoreError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setExtraItems([]);
+    setNextOffset(LIMIT);
+    setServerCount(null);
+    setLoadMoreError(null);
+  }, [activeProjectId, activeTeamId]);
+
   const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
 
   const query = useQuery<MemoriesResponse>({
@@ -158,7 +173,10 @@ export default function MemoriesPage() {
     enabled: Boolean(activeProjectId),
     queryFn: async () => {
       const client = apiClient();
-      const params: Record<string, string> = { project_id: activeProjectId ?? '' };
+      const params: Record<string, string> = {
+        project_id: activeProjectId ?? '',
+        limit: String(LIMIT),
+      };
 
       if (activeTeamId) {
         params.team_id = activeTeamId;
@@ -170,6 +188,20 @@ export default function MemoriesPage() {
     },
   });
 
+  React.useEffect(() => {
+    if (query.data) {
+      setServerCount(query.data.count);
+    }
+  }, [query.data]);
+
+  const allItems = React.useMemo(
+    () => [...(query.data?.items ?? []), ...extraItems],
+    [query.data, extraItems],
+  );
+
+  const totalCount = serverCount ?? query.data?.count ?? 0;
+  const hasMore = allItems.length < totalCount;
+
   const projectLabel = React.useMemo(() => {
     const project = projectsQuery.data?.results.find(
       (p) => p.id === activeProjectId,
@@ -178,12 +210,10 @@ export default function MemoriesPage() {
     return project?.slug ?? '—';
   }, [projectsQuery.data, activeProjectId]);
 
-  const items = React.useMemo(() => query.data?.items ?? [], [query.data]);
-
   const filtered = React.useMemo(() => {
     const q = search.trim().toLowerCase();
 
-    return items.filter((memory) => {
+    return allItems.filter((memory) => {
       if (kindFilter !== 'all' && resolveKind(memory.kind ?? memory.metadata?.kind) !== kindFilter) {
         return false;
       }
@@ -203,7 +233,39 @@ export default function MemoriesPage() {
 
       return haystack.includes(q);
     });
-  }, [items, search, kindFilter]);
+  }, [allItems, search, kindFilter]);
+
+  const loadMore = async () => {
+    if (isLoadingMore || !activeProjectId) {
+      return;
+    }
+
+    setIsLoadingMore(true);
+    setLoadMoreError(null);
+
+    try {
+      const client = apiClient();
+      const params: Record<string, string> = {
+        project_id: activeProjectId,
+        limit: String(LIMIT),
+        offset: String(nextOffset),
+      };
+
+      if (activeTeamId) {
+        params.team_id = activeTeamId;
+      }
+
+      const res = await client.get<MemoriesResponse>('/v1/inspection/memories', { params });
+
+      setExtraItems((prev) => [...prev, ...res.data.items]);
+      setServerCount(res.data.count);
+      setNextOffset((prev) => prev + LIMIT);
+    } catch (err) {
+      setLoadMoreError(err instanceof Error ? err.message : 'Failed to load more memories.');
+    } finally {
+      setIsLoadingMore(false);
+    }
+  };
 
   if (!activeProjectId) {
     return (
@@ -299,12 +361,46 @@ export default function MemoriesPage() {
                 projectLabel={projectLabel}
               />
             ))}
+
+            {loadMoreError && (
+              <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
+                <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
+                <p className='text-[13px] leading-relaxed text-danger'>{loadMoreError}</p>
+              </div>
+            )}
+
+            {hasMore && (
+              <button
+                type='button'
+                onClick={loadMore}
+                disabled={isLoadingMore}
+                className='flex w-full items-center justify-center gap-2 rounded-[12px] border border-divider-strong bg-content1 py-3 text-[13.5px] font-medium text-default-600 transition-colors hover:bg-content2 disabled:cursor-wait disabled:opacity-60'
+              >
+                {isLoadingMore ? (
+                  <span className='animate-pulse'>Loading…</span>
+                ) : (
+                  <>
+                    <ChevronDown size={16} strokeWidth={1.8} />
+                    Load more
+                    <span className='ml-1 text-default-400'>
+                      ({totalCount - allItems.length} remaining)
+                    </span>
+                  </>
+                )}
+              </button>
+            )}
+
+            {!hasMore && allItems.length > LIMIT && (
+              <p className='tnum text-center text-[12px] text-default-400'>
+                All {totalCount} memories loaded
+              </p>
+            )}
           </div>
         ) : (
           <EmptyState
-            title={items.length === 0 ? 'No memories yet' : 'No matching memories'}
+            title={allItems.length === 0 ? 'No memories yet' : 'No matching memories'}
             description={
-              items.length === 0
+              allItems.length === 0
                 ? 'Memories captured by your agents for this project will appear here.'
                 : 'Try a different search term or kind filter.'
             }
