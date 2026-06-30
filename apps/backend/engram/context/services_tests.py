@@ -19,6 +19,7 @@ from engram.context.services import (
     lexical_retrieval_ranks,
     resolve_lexical_fusion_enabled,
     resolve_lexical_recall_enabled,
+    resolve_retrieval_strategy,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
@@ -813,6 +814,27 @@ def test_fuse_retrieval_legs_includes_lexical_only_without_semantic() -> None:
     fused = fuse_retrieval_legs([], [first, second])
 
     assert [match.document.id for match in fused] == [first.document.id, second.document.id]
+
+
+def test_resolve_retrieval_strategy_semantic_when_any_semantic_match() -> None:
+    matches = [
+        _fusion_match('exact', score=60),
+        _fusion_match('semantic', score=30),
+        _fusion_match('lexical', score=20),
+    ]
+
+    assert resolve_retrieval_strategy(matches) == 'semantic_fallback'
+
+
+def test_resolve_retrieval_strategy_lexical_when_only_lexical_tail() -> None:
+    matches = [_fusion_match('exact', score=60), _fusion_match('lexical', score=20)]
+
+    assert resolve_retrieval_strategy(matches) == 'lexical_recall'
+
+
+def test_resolve_retrieval_strategy_exact_without_tail() -> None:
+    assert resolve_retrieval_strategy([_fusion_match('exact', score=60)]) == 'exact'
+    assert resolve_retrieval_strategy([]) == 'exact'
 
 
 @pytest.mark.django_db

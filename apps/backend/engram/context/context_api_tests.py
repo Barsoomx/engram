@@ -1077,6 +1077,8 @@ def test_context_bundle_flag_off_lexical_recall_is_byte_identical() -> None:
     assert [item['inclusion_reason'] for item in items] == ['exact match: authorization']
     assert str(fuzzy.id) not in {item['retrieval_document_id'] for item in items}
     assert all(not item['inclusion_reason'].startswith('lexical match:') for item in items)
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'exact'
 
 
 @pytest.mark.django_db
@@ -1099,6 +1101,10 @@ def test_context_bundle_flag_on_surfaces_fuzzy_lexical_only_document() -> None:
     assert str(fuzzy.id) in item_ids
     fuzzy_item = next(item for item in items if item['retrieval_document_id'] == str(fuzzy.id))
     assert fuzzy_item['inclusion_reason'].startswith('lexical match:')
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'lexical_recall'
+    audit = AuditEvent.objects.get(event_type='MemoryRetrieved', target_id=str(bundle.id))
+    assert audit.metadata['retrieval_strategy'] == 'lexical_recall'
 
 
 @pytest.mark.skipif(VectorField is None, reason='pgvector not installed')

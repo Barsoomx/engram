@@ -635,6 +635,15 @@ def fuse_retrieval_legs(
     )
 
 
+def resolve_retrieval_strategy(matches: tuple[RetrievalMatch, ...] | list[RetrievalMatch]) -> str:
+    if any(match.score == 30 for match in matches):
+        return 'semantic_fallback'
+    if any(match.score == 20 for match in matches):
+        return 'lexical_recall'
+
+    return 'exact'
+
+
 def resolve_query_embedding(
     query: str,
     file_paths: tuple[str, ...],
@@ -820,7 +829,8 @@ class BuildContextBundle:
             for i, m in enumerate(kept, start=1)
         )
         query_result = redact_value(data.query)
-        metadata: dict[str, object] = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
+        retrieval_strategy = resolve_retrieval_strategy(matches)
+        metadata: dict[str, object] = {'retrieval_strategy': retrieval_strategy}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
         if has_semantic and embedding_result is not None:
@@ -848,7 +858,15 @@ class BuildContextBundle:
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
-            self._audit_retrieval(bundle, persisted_matches, scope, data, has_semantic, embedding_result)
+            self._audit_retrieval(
+                bundle,
+                persisted_matches,
+                scope,
+                data,
+                has_semantic,
+                embedding_result,
+                retrieval_strategy,
+            )
 
         bundle = ContextBundle.objects.prefetch_related(
             'items__retrieval_document__memory',
@@ -1128,10 +1146,11 @@ class BuildContextBundle:
         data: ContextBundleInput,
         has_semantic: bool,
         embedding_result: EmbeddingCallResult | None,
+        retrieval_strategy: str,
     ) -> None:
         metadata = {
             'selected_count': len(matches),
-            'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact',
+            'retrieval_strategy': retrieval_strategy,
             'scope_filters': {
                 'organization_id': str(scope.organization_id),
                 'project_ids': [str(project_id) for project_id in scope.project_ids],
