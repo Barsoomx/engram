@@ -408,31 +408,32 @@ class CreateModelPolicy:
         elif data.scope == PolicyScope.TEAM:
             project = None
 
-        policy = ModelPolicy.objects.create(
-            organization_id=data.organization_id,
-            team=team,
-            project=project,
-            name=data.name,
-            scope=data.scope,
-            task_type=data.task_type,
-            provider=data.provider,
-            model=data.model,
-            secret=secret,
-            version=1,
-            metadata={'base_url': data.base_url} if data.base_url else {},
-        )
-        audit_model_policy_event(
-            organization_id=data.organization_id,
-            project_id=data.project_id,
-            team_id=data.team_id,
-            actor_id=data.actor_id,
-            event_type='ModelPolicyCreated',
-            target_type='model_policy',
-            target_id=str(policy.id),
-            capability='model_policy:*',
-            request_id=data.request_id,
-            metadata={'provider': data.provider, 'model': data.model, 'task_type': data.task_type},
-        )
+        with transaction.atomic():
+            policy = ModelPolicy.objects.create(
+                organization_id=data.organization_id,
+                team=team,
+                project=project,
+                name=data.name,
+                scope=data.scope,
+                task_type=data.task_type,
+                provider=data.provider,
+                model=data.model,
+                secret=secret,
+                version=1,
+                metadata={'base_url': data.base_url} if data.base_url else {},
+            )
+            audit_model_policy_event(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                actor_id=data.actor_id,
+                event_type='ModelPolicyCreated',
+                target_type='model_policy',
+                target_id=str(policy.id),
+                capability='model_policy:*',
+                request_id=data.request_id,
+                metadata={'provider': data.provider, 'model': data.model, 'task_type': data.task_type},
+            )
 
         return policy
 
@@ -822,6 +823,9 @@ def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
 def default_base_url(provider: str) -> str:
     if provider == 'deepseek':
         return 'https://api.deepseek.com/v1'
+
+    if provider == 'anthropic':
+        return 'https://api.anthropic.com'
 
     return 'https://api.openai.com/v1'
 
