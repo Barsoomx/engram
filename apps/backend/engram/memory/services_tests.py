@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from engram.memory.services import derive_observation_confidence
+import pytest
+
+from engram.core.models import RetrievalDocument
+from engram.memory.memory_worker_tests import create_memory_candidate, create_observation_recorded_scope
+from engram.memory.services import (
+    PromoteMemoryCandidate,
+    PromoteMemoryCandidateInput,
+    derive_observation_confidence,
+)
 
 
 class _ObservationStub:
@@ -199,3 +207,19 @@ def test_derive_observation_confidence_facts_plus_files_produces_point_seven() -
     result = derive_observation_confidence(obs)  # type: ignore[arg-type]
 
     assert result == Decimal('0.700')
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_existing_result_skips_reindex_for_stale_memory() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    candidate = create_memory_candidate(observation)
+    first = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+    first.memory.stale = True
+    first.memory.save(update_fields=['stale', 'updated_at'])
+    candidate.refresh_from_db()
+
+    second = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert second.duplicate is True
+    assert second.retrieval_document.id == first.retrieval_document.id
+    assert RetrievalDocument.objects.count() == 1

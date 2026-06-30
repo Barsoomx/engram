@@ -530,7 +530,10 @@ class PromoteMemoryCandidate:
     def _existing_result(self, candidate: MemoryCandidate) -> PromoteMemoryCandidateResult:
         memory = candidate.promoted_memory
         version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
-        retrieval_document = self._index_memory_version(candidate, version)
+        if memory.stale or memory.refuted:
+            retrieval_document = self._existing_retrieval_document(version)
+        else:
+            retrieval_document = self._index_memory_version(candidate, version)
 
         return PromoteMemoryCandidateResult(
             candidate=candidate,
@@ -539,6 +542,15 @@ class PromoteMemoryCandidate:
             retrieval_document=retrieval_document,
             duplicate=True,
         )
+
+    def _existing_retrieval_document(self, version: MemoryVersion) -> RetrievalDocument:
+        document = RetrievalDocument.objects.filter(memory_version=version).first()
+        if document is None:
+            raise MemoryWorkerError(
+                'memory version has no retrieval document and cannot be reindexed while stale or refuted',
+            )
+
+        return document
 
     def _index_memory_version(self, candidate: MemoryCandidate, version: MemoryVersion) -> RetrievalDocument:
         index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
@@ -692,6 +704,9 @@ class UpdateMemoryBody:
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
             ensure_memory_team_scope(memory, scope)
+            if memory.stale or memory.refuted:
+                raise MemoryVersionError('memory_not_editable', 'Memory is stale or refuted and cannot be edited')
+
             latest_version = memory.versions.order_by('-version').first()
             if latest_version is not None and latest_version.body == data.body:
                 retrieval_document = self._index_version(latest_version)
