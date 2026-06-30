@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import pytest
-
 from engram.context.services import RetrievalMatch, _pack_to_budget, estimate_tokens
 
 
