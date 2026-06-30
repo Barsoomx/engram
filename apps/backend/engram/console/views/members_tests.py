@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
@@ -601,6 +603,174 @@ def test_invited_member_has_status_invited(
     assert response.status_code == 201
 
     assert response.data['status'] == 'invited'
+
+
+@pytest.mark.django_db
+def test_activate_sets_status_active_and_writes_audit(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    membership = OrganizationMembership.objects.create(
+        organization=f_owned_org,
+        identity=Identity.objects.create(
+            organization=f_owned_org,
+            identity_type=IdentityType.USER,
+            external_id='hank@acme.test',
+            display_name='Hank',
+        ),
+        role=_make_role('developer'),
+        status='invited',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{membership.id}/activate/')
+
+    assert response.status_code == 200
+
+    assert response.data['status'] == 'active'
+
+    membership.refresh_from_db()
+
+    assert membership.status == 'active'
+
+    audit = AuditEvent.objects.filter(
+        organization=f_owned_org,
+        event_type='MemberActivated',
+    )
+
+    assert audit.count() == 1
+
+    event = audit.get()
+
+    assert event.target_type == 'member'
+
+    assert event.target_id == str(membership.id)
+
+
+@pytest.mark.django_db
+def test_activate_allows_member_to_resolve_scope(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    invited_user = _make_user('invited')
+    identity = _make_identity(invited_user, f_owned_org)
+    membership = OrganizationMembership.objects.create(
+        organization=f_owned_org,
+        identity=identity,
+        role=_make_role('organization_owner'),
+        status='invited',
+    )
+
+    from rest_framework.authtoken.models import Token
+
+    invited_token = Token.objects.get_or_create(user=invited_user)[0].key
+
+    invited_client = _auth_client(invited_token, org=f_owned_org)
+
+    pre_response = invited_client.get('/v1/admin/members/')
+
+    assert pre_response.status_code == 403
+
+    owner_client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    activate_response = owner_client.post(f'/v1/admin/members/{membership.id}/activate/')
+
+    assert activate_response.status_code == 200
+
+    post_response = invited_client.get('/v1/admin/members/')
+
+    assert post_response.status_code == 200
+
+
+@pytest.mark.django_db
+def test_activate_is_idempotent_for_already_active_member(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{f_owner_membership.id}/activate/')
+
+    assert response.status_code == 200
+
+    f_owner_membership.refresh_from_db()
+
+    assert f_owner_membership.status == 'active'
+
+    audit = AuditEvent.objects.filter(
+        organization=f_owned_org,
+        event_type='MemberActivated',
+    )
+
+    assert audit.count() == 0
+
+
+@pytest.mark.django_db
+def test_activate_returns_404_for_other_org_member(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_other_org: Organization,
+) -> None:
+    other_membership = OrganizationMembership.objects.create(
+        organization=f_other_org,
+        identity=Identity.objects.create(
+            organization=f_other_org,
+            identity_type=IdentityType.USER,
+            external_id='ivan@globex.test',
+            display_name='Ivan',
+        ),
+        role=_make_role('developer'),
+        status='invited',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{other_membership.id}/activate/')
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_activate_returns_404_for_unknown_member(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{uuid.uuid4()}/activate/')
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_activate_denied_without_admin_capability(
+    f_developer_user_token: str,
+) -> None:
+    org = Organization.objects.create(name='Devact', slug='devact')
+    membership = OrganizationMembership.objects.create(
+        organization=org,
+        identity=Identity.objects.create(
+            organization=org,
+            identity_type=IdentityType.USER,
+            external_id='jane@devact.test',
+            display_name='Jane',
+        ),
+        role=_make_role('developer'),
+        status='invited',
+    )
+    _make_membership(User.objects.get(username='dev'), org, role_code='developer')
+
+    client = _auth_client(f_developer_user_token, org=org)
+
+    response = client.post(f'/v1/admin/members/{membership.id}/activate/')
+
+    assert response.status_code == 403
+
+    membership.refresh_from_db()
+
+    assert membership.status == 'invited'
 
 
 @pytest.mark.django_db

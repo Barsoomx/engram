@@ -166,6 +166,42 @@ def set_member_role(membership: OrganizationMembership, role: Role) -> Organizat
     return membership
 
 
+class MemberNotFoundError(Exception):
+    pass
+
+
+@transaction.atomic
+def activate_member(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    membership_id: uuid.UUID,
+) -> OrganizationMembership:
+    membership = (
+        OrganizationMembership.objects.select_for_update().filter(organization=organization, id=membership_id).first()
+    )
+
+    if membership is None:
+        raise MemberNotFoundError('member not found')
+
+    if membership.status == MembershipStatus.ACTIVE:
+        return membership
+
+    membership.status = MembershipStatus.ACTIVE
+
+    membership.save(update_fields=['status', 'updated_at'])
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemberActivated',
+        target_type='member',
+        target_id=str(membership.id),
+    )
+
+    return membership
+
+
 @transaction.atomic
 def remove_member(membership: OrganizationMembership) -> OrganizationMembership:
     is_current_owner = membership.role.code == OWNER_ROLE_CODE and membership.active

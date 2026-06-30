@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from rest_framework import mixins, viewsets
+from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -18,6 +19,7 @@ from engram.console.serializers.members import (
     MemberWriteSerializer,
 )
 from engram.console.services import (
+    activate_member,
     audit_admin_action,
     invite_member,
     remove_member,
@@ -114,6 +116,20 @@ class MemberViewSet(
                 'new_role': new_role.code,
             },
         )
+
+    @action(detail=True, methods=['post'])
+    def activate(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        membership = self.get_object()
+
+        membership = activate_member(
+            organization=self.request.active_organization,
+            actor_identity=self.request.user_identity,
+            membership_id=membership.id,
+        )
+
+        serializer = self.get_serializer(membership)
+
+        return Response(serializer.data)
 
     def destroy(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         membership = self.get_object()
