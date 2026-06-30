@@ -177,27 +177,29 @@ def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, .
 
 class DistillSession:
     def execute(self, data: DistillSessionInput) -> DistillSessionResult:
-        with transaction.atomic():
-            session = self._lock_session(data.session_id)
-            observations = self._session_observations(session)
-            if not observations:
-                return DistillSessionResult(session=session, auto_promoted=(), queued_for_review=())
+        session = self._load_session(data.session_id)
+        observations = self._session_observations(session)
+        if not observations:
+            return DistillSessionResult(session=session, auto_promoted=(), queued_for_review=())
 
-            correlation_id = data.correlation_id or data.request_id or str(session.id)
-            structlog.contextvars.bind_contextvars(
-                correlation_id=correlation_id,
-                session_id=str(session.id),
-            )
-            prompt = session_distillation_prompt(observations)
-            provider_result, resolved = self._synthesize(session, prompt, correlation_id)
-            synthesized = parse_synthesized_candidates(provider_result.generated_body)
-            threshold = resolve_auto_approve_threshold(session.organization, data.auto_approve_threshold)
-            provenance = self._provenance(provider_result, resolved)
+        correlation_id = data.correlation_id or data.request_id or str(session.id)
+        structlog.contextvars.bind_contextvars(
+            correlation_id=correlation_id,
+            session_id=str(session.id),
+        )
+        prompt = session_distillation_prompt(observations)
+        provider_result, resolved = self._synthesize(session, prompt, correlation_id)
+        synthesized = parse_synthesized_candidates(provider_result.generated_body)
+        provenance = self._provenance(provider_result, resolved)
+
+        with transaction.atomic():
+            locked_session = self._lock_session(data.session_id)
+            threshold = resolve_auto_approve_threshold(locked_session.organization, data.auto_approve_threshold)
 
             auto_promoted: list[Memory] = []
             queued: list[MemoryCandidate] = []
             for candidate_input in synthesized:
-                candidate, created = self._get_or_create_candidate(session, candidate_input, provenance)
+                candidate, created = self._get_or_create_candidate(locked_session, candidate_input, provenance)
                 if not created:
                     self._classify_existing(candidate, auto_promoted, queued)
                     continue
@@ -207,15 +209,21 @@ class DistillSession:
                     )
                     auto_promoted.append(promotion.memory)
                 else:
-                    self._audit_held(session, candidate, candidate_input.confidence, threshold, data)
+                    self._audit_held(locked_session, candidate, candidate_input.confidence, threshold, data)
                     queued.append(candidate)
 
             return DistillSessionResult(
-                session=session,
+                session=locked_session,
                 auto_promoted=tuple(auto_promoted),
                 queued_for_review=tuple(queued),
                 provider_call_ids=(str(provider_result.call_record_id),),
             )
+
+    def _load_session(self, session_id: uuid.UUID) -> AgentSession:
+        try:
+            return AgentSession.objects.select_related('organization', 'project', 'team').get(id=session_id)
+        except AgentSession.DoesNotExist as error:
+            raise MemoryWorkerError('session not found') from error
 
     def _lock_session(self, session_id: uuid.UUID) -> AgentSession:
         try:
@@ -351,6 +359,8 @@ class DistillSession:
         auto_promoted: list[Memory],
         queued: list[MemoryCandidate],
     ) -> None:
+        # Distillation re-runs are propose-only: an already-held candidate is never re-gated here even if the
+        # threshold was later lowered. Promoting held candidates is the review queue's responsibility.
         if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
             auto_promoted.append(candidate.promoted_memory)
 

@@ -34,7 +34,14 @@ from engram.memory.distillation import (
     session_distillation_prompt,
     session_distillation_system_prompt,
 )
+from engram.memory.services import PromoteMemoryCandidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import _completion_body
+
+
+@pytest.fixture
+def m_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    return monkeypatch
 
 
 def create_session_scope(*, suffix: str = '1') -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -219,6 +226,23 @@ def test_parse_synthesized_candidates_falls_back_on_invalid_json() -> None:
     assert candidates[0].body == 'not json at all'
 
 
+def test_parse_synthesized_candidates_reads_full_real_gateway_output() -> None:
+    pretty_json = json.dumps(
+        [
+            {'title': 'migration', 'body': 'added 0042', 'confidence': 0.91, 'supporting_observation_ids': ['a']},
+            {'title': 'flaky test', 'body': 'retry pytest', 'confidence': 0.42, 'supporting_observation_ids': ['b']},
+        ],
+        indent=2,
+    )
+
+    candidates = parse_synthesized_candidates(_completion_body(pretty_json, 'candidates'))
+
+    assert len(candidates) == 2
+    assert candidates[0].title == 'migration'
+    assert candidates[0].confidence == Decimal('0.910')
+    assert candidates[1].confidence == Decimal('0.420')
+
+
 def test_parse_synthesized_candidates_clamps_confidence_to_unit_interval() -> None:
     raw = json.dumps(
         [
@@ -276,6 +300,25 @@ def test_distill_session_falls_back_to_generation_policy_when_no_curation_policy
     assert len(result.auto_promoted) + len(result.queued_for_review) == 2
     provider_call = ProviderCallRecord.objects.get()
     assert provider_call.task_type == 'generation'
+
+
+@pytest.mark.django_db
+def test_distill_session_makes_provider_call_outside_write_transaction(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+
+    def m_raise(self: PromoteMemoryCandidate, data: object) -> object:
+        raise RuntimeError('write phase boom')
+
+    m_monkeypatch.setattr(PromoteMemoryCandidate, 'execute', m_raise)
+
+    with pytest.raises(RuntimeError, match='write phase boom'):
+        DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
+    assert MemoryCandidate.objects.count() == 0
 
 
 @pytest.mark.django_db
