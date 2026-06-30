@@ -31,6 +31,7 @@ from engram.core.models import (
     ProjectTeam,
     RetrievalDocument,
     Team,
+    VectorField,
     VisibilityScope,
 )
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
@@ -930,6 +931,37 @@ def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
     assert audit.metadata['retrieval_strategy'] == 'semantic_fallback'
     assert audit.metadata['semantic_provider_call_id'] == bundle.metadata['semantic_provider_call_id']
     assert audit.metadata['semantic_document_ids'] == [items[0]['retrieval_document_id']]
+
+
+@pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
+@pytest.mark.django_db
+def test_index_memory_version_populates_embedding_pgvector() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-pgvector-1',
+    )
+
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = RetrievalDocument.objects.get(memory_version=version)
+    assert document.embedding_vector
+    assert document.embedding_pgvector is not None
+    assert list(document.embedding_pgvector) == pytest.approx(document.embedding_vector, abs=1e-5)
 
 
 @pytest.mark.django_db

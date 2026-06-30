@@ -626,6 +626,13 @@ class RetrievalDocument(TimestampedModel):
         ]
         ordering = ['organization_id', 'project_id', 'memory_id']
 
+    def clean_fields(self, exclude: object = None) -> None:
+        excluded = set(exclude or ())
+        if VectorField is not None:
+            excluded.add('embedding_pgvector')
+
+        super().clean_fields(exclude=excluded)
+
     def clean(self) -> None:
         errors: dict[str, list[str]] = {}
         if self.project_id:

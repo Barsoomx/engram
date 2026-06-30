@@ -46,6 +46,36 @@ def test_embedding_pgvector_field_optional_when_pgvector_missing() -> None:
 
 
 @pytest.mark.django_db
+def test_retrieval_document_resave_with_populated_pgvector_does_not_raise() -> None:
+    if not _has_pgvector():
+        pytest.skip('pgvector not installed')
+
+    organization = Organization.objects.create(name='Engram', slug='engram')
+    project = Project.objects.create(organization=organization, name='Backend', slug='backend')
+    memory = Memory.objects.create(organization=organization, project=project, title='Memory', body='body')
+    version = MemoryVersion.objects.create(
+        organization=organization, project=project, memory=memory, version=1, body='body', content_hash='hash'
+    )
+    embedding = [round(0.01 * index, 6) for index in range(64)]
+    document = RetrievalDocument(
+        organization=organization,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        full_text='text',
+        embedding_vector=embedding,
+        embedding_pgvector=embedding,
+    )
+    document.save()
+
+    refreshed = RetrievalDocument.objects.get(id=document.id)
+    refreshed.full_text = 'updated'
+    refreshed.save()
+
+    assert RetrievalDocument.objects.get(id=document.id).full_text == 'updated'
+
+
+@pytest.mark.django_db
 def test_retrieval_document_stores_embedding_vector_via_jsonfield() -> None:
     organization = Organization.objects.create(name='Engram', slug='engram')
     project = Project.objects.create(organization=organization, name='Backend', slug='backend')
