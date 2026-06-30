@@ -19,7 +19,7 @@ from engram.access.models import (
     TeamMembership,
 )
 from engram.access.services import EffectiveScope
-from engram.core.models import Organization, Project
+from engram.core.models import Organization, Project, Team
 
 DEFAULT_ORGANIZATION_SLUG = 'default'
 DEFAULT_ORGANIZATION_NAME = 'Default organization'
@@ -28,6 +28,7 @@ DEFAULT_OWNER_ROLE_CODE = 'organization_owner'
 USER_IDENTITY_EXTERNAL_ID_PREFIX = 'django-user:'
 
 PROJECT_ADMIN_CAPABILITIES = {'projects:*', 'policy:admin'}
+TEAM_ADMIN_CAPABILITIES = {'teams:*'}
 
 
 class AuthError(Exception):
@@ -167,7 +168,7 @@ def resolve_user_scope(user: User) -> EffectiveScope:
     organization = membership.organization
     capabilities = _user_capability_codes(organization, identity)
     project_ids = _user_project_ids(organization, identity, capabilities)
-    team_ids = _user_team_ids(organization, identity)
+    team_ids = _user_team_ids(organization, identity, capabilities)
 
     return EffectiveScope(
         organization_id=organization.id,
@@ -221,7 +222,7 @@ def resolve_user_scope_for_organization(
 
     capabilities = _user_capability_codes(organization, identity)
     project_ids = _user_project_ids(organization, identity, capabilities)
-    team_ids = _user_team_ids(organization, identity)
+    team_ids = _user_team_ids(organization, identity, capabilities)
 
     return EffectiveScope(
         organization_id=organization.id,
@@ -288,7 +289,14 @@ def _user_project_ids(
     return tuple(sorted(granted))
 
 
-def _user_team_ids(organization: Organization, identity: Identity) -> tuple[uuid.UUID, ...]:
+def _user_team_ids(
+    organization: Organization,
+    identity: Identity,
+    capabilities: set[str],
+) -> tuple[uuid.UUID, ...]:
+    if TEAM_ADMIN_CAPABILITIES & capabilities:
+        return tuple(Team.objects.filter(organization=organization).values_list('id', flat=True))
+
     return tuple(
         TeamMembership.objects.filter(
             organization=organization,
