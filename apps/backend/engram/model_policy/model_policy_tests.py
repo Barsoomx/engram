@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from decimal import Decimal
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
@@ -666,6 +668,69 @@ def test_fake_provider_gateway_returns_deterministic_generated_candidate_content
     assert result.generated_body == expected_generated_body(prompt)
     assert 'pytest failure fixed' not in result.generated_title
     assert 'pytest failed on missing memory worker' not in result.generated_body
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_returns_deterministic_candidate_array_for_candidates_kind() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Curation policy',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='distill-session:session-1:curation',
+        trace_id='trace-distill-candidates-1',
+        prompt='Session observations:\n- Title: pytest fixed\n  Body: now exits 0',
+        response_kind='candidates',
+    )
+
+    result = FakeProviderGateway().call(data)
+
+    candidates = json.loads(result.generated_body)
+
+    assert isinstance(candidates, list)
+    assert len(candidates) == 2
+    assert sorted(Decimal(str(item['confidence'])) for item in candidates) == [Decimal('0.4'), Decimal('0.9')]
+    for item in candidates:
+        assert item['title']
+        assert item['body']
+        assert 'supporting_observation_ids' in item
+
+    replay = FakeProviderGateway().call(data)
+
+    assert replay.generated_body == result.generated_body
+    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
 
 
 def test_generated_embedding_is_deterministic_and_normalized() -> None:

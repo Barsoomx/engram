@@ -122,6 +122,7 @@ class ProviderCallInput:
     trace_id: str
     prompt: str
     system_prompt: str = ''
+    response_kind: str = 'single'
 
 
 @dataclass(frozen=True)
@@ -649,7 +650,7 @@ class FakeProviderGateway:
         )
         if existing_record is not None:
             redacted_prompt = redact_value(data.prompt)
-            generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+            generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -661,7 +662,7 @@ class FakeProviderGateway:
             )
 
         redacted_prompt = redact_value(data.prompt)
-        generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+        generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
         prompt_was_redacted = redacted_prompt.redacted or '[REDACTED]' in data.prompt
         token_count = len(data.prompt.split())
         record = ProviderCallRecord.objects.create(
@@ -757,6 +758,34 @@ def generated_candidate_content(prompt: str) -> tuple[str, str]:
     digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
 
     return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'
+
+
+def generated_candidates_payload(prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    candidates = [
+        {
+            'title': f'Provider-synthesized memory {digest} high',
+            'body': f'Provider-synthesized candidate body {digest} high',
+            'confidence': 0.9,
+            'supporting_observation_ids': [],
+        },
+        {
+            'title': f'Provider-synthesized memory {digest} low',
+            'body': f'Provider-synthesized candidate body {digest} low',
+            'confidence': 0.4,
+            'supporting_observation_ids': [],
+        },
+    ]
+
+    return json.dumps(candidates)
+
+
+def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
+    title, body = generated_candidate_content(prompt)
+    if data.response_kind == 'candidates':
+        return title, generated_candidates_payload(prompt)
+
+    return title, body
 
 
 def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
