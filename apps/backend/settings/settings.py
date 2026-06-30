@@ -175,6 +175,10 @@ ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = Decimal(
     os.environ.get('ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD', '0.800'),
 )
 
+ENGRAM_NEAR_DUP_THRESHOLD = Decimal(
+    os.environ.get('ENGRAM_NEAR_DUP_THRESHOLD', '0.850'),
+)
+
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',

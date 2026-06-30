@@ -59,6 +59,7 @@ class MemoryCandidateWorkerResult:
     memory_version: MemoryVersion | None = None
     retrieval_document: RetrievalDocument | None = None
     held_for_review: bool = False
+    curated_decision: str = ''
 
 
 class MemoryWorkerError(Exception):
@@ -216,16 +217,19 @@ class ProcessObservationRecorded:
             threshold = resolve_auto_approve_threshold(observation.organization)
             already_promoted = candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id is not None
             if already_promoted or is_auto_promotable(candidate.confidence, threshold):
-                promotion = PromoteMemoryCandidate().execute(
-                    PromoteMemoryCandidateInput(candidate_id=candidate.id),
+                from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
+
+                curation = CurateMemoryCandidate().execute(
+                    CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
                 )
 
                 return MemoryCandidateWorkerResult(
-                    candidate=promotion.candidate,
-                    duplicate=not candidate_created or promotion.duplicate,
-                    memory=promotion.memory,
-                    memory_version=promotion.memory_version,
-                    retrieval_document=promotion.retrieval_document,
+                    candidate=curation.candidate,
+                    duplicate=not candidate_created or curation.duplicate,
+                    memory=curation.memory,
+                    memory_version=curation.memory_version,
+                    retrieval_document=curation.retrieval_document,
+                    curated_decision=curation.decision,
                 )
 
             if candidate_created:

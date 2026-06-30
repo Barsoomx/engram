@@ -23,10 +23,9 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
 )
+from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.services import (
     MemoryWorkerError,
-    PromoteMemoryCandidate,
-    PromoteMemoryCandidateInput,
     is_auto_promotable,
     redact_error,
     redact_text,
@@ -204,10 +203,17 @@ class DistillSession:
                     self._classify_existing(candidate, auto_promoted, queued)
                     continue
                 if is_auto_promotable(candidate_input.confidence, threshold):
-                    promotion = PromoteMemoryCandidate().execute(
-                        PromoteMemoryCandidateInput(candidate_id=candidate.id),
+                    # Follow-up: the curator's embedding call (and the near-dup IndexMemoryVersion embed) run inside
+                    # this transaction while the AgentSession select_for_update lock is held, partially
+                    # re-introducing the long-transaction-during-external-call risk that moved the synthesis call
+                    # out of the write phase. Embedding latency (~100-500ms) matches the existing
+                    # ProcessObservationRecorded pattern; a future optimization pre-computes candidate embeddings
+                    # outside the lock.
+                    curation = CurateMemoryCandidate().execute(
+                        CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
                     )
-                    auto_promoted.append(promotion.memory)
+                    if curation.memory is not None:
+                        auto_promoted.append(curation.memory)
                 else:
                     self._audit_held(locked_session, candidate, candidate_input.confidence, threshold, data)
                     queued.append(candidate)
