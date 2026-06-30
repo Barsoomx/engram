@@ -5,10 +5,11 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
+import structlog
 from django.db import transaction
 from django.utils import timezone
 
-from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     AuditEvent,
@@ -82,7 +83,7 @@ class PromoteMemoryCandidateResult:
 
 @dataclass(frozen=True)
 class MemoryFeedbackInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -120,16 +121,7 @@ class MemoryFeedbackError(Exception):
 
 class RecordMemoryFeedback:
     def execute(self, data: MemoryFeedbackInput) -> MemoryFeedbackResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = self._lock_memory(data, scope)
             self._ensure_team_scope(memory, scope)
@@ -207,7 +199,12 @@ class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
-            generated = self._generate_candidate(observation)
+            correlation_id = self._originating_correlation_id(observation)
+            structlog.contextvars.bind_contextvars(
+                correlation_id=correlation_id,
+                observation_id=str(data.observation_id),
+            )
+            generated = self._generate_candidate(observation, correlation_id=correlation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             promotion = PromoteMemoryCandidate().execute(
                 PromoteMemoryCandidateInput(candidate_id=candidate.id),
@@ -220,6 +217,13 @@ class ProcessObservationRecorded:
                 retrieval_document=promotion.retrieval_document,
                 duplicate=not candidate_created or promotion.duplicate,
             )
+
+    def _originating_correlation_id(self, observation: Observation) -> str:
+        raw = observation.raw_event
+        if raw is not None:
+            return raw.correlation_id or raw.request_id or str(observation.id)
+
+        return str(observation.id)
 
     def _lock_observation(self, observation_id: uuid.UUID) -> Observation:
         try:
@@ -267,7 +271,7 @@ class ProcessObservationRecorded:
 
         return candidate, True
 
-    def _generate_candidate(self, observation: Observation) -> GeneratedMemoryCandidate:
+    def _generate_candidate(self, observation: Observation, *, correlation_id: str = '') -> GeneratedMemoryCandidate:
         try:
             resolved = ResolveModelPolicy().execute(
                 ResolveModelPolicyInput(
@@ -284,8 +288,9 @@ class ProcessObservationRecorded:
                     team_id=observation.team_id,
                     policy=resolved.policy,
                     request_id=f'memory-worker:{observation.id}:generation',
-                    trace_id=f'memory-worker:{observation.id}',
+                    trace_id=correlation_id or f'memory-worker:{observation.id}',
                     prompt=provider_prompt(observation),
+                    system_prompt=distillation_system_prompt(),
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
@@ -350,6 +355,24 @@ def candidate_evidence(
     return [
         evidence,
     ]
+
+
+def distillation_system_prompt() -> str:
+    return (
+        'You are a memory distillation engine for software engineering sessions.\n'
+        'Given structured observation data, produce a concise, durable, runtime-neutral engineering memory.\n'
+        '\n'
+        'Rules:\n'
+        '- Output the Title on the first line (single line, under 255 characters).\n'
+        '- Output the Body on the remaining lines.\n'
+        '- Preserve exact identifiers verbatim: file paths, function names, class names, '
+        'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
+        '- Be concise. Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
+        '- Do not invent facts not present in the input.\n'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '- The Title must stand alone as a searchable summary.\n'
+        '- The Body must be self-contained for future retrieval.'
+    )
 
 
 def provider_prompt(observation: Observation) -> str:
@@ -450,15 +473,32 @@ class PromoteMemoryCandidate:
         return document
 
     def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
-        metadata = {
+        metadata: dict[str, object] = {
             'source': 'memory_candidate',
             'memory_candidate_id': str(candidate.id),
             'evidence': candidate.evidence,
             'file_paths': self._candidate_file_paths(candidate),
         }
         metadata.update(self._provider_provenance(candidate))
+        captured_by = self._captured_by(candidate)
+        if captured_by is not None:
+            metadata['captured_by'] = captured_by
 
         return metadata
+
+    def _captured_by(self, candidate: MemoryCandidate) -> dict[str, object] | None:
+        observation = candidate.source_observation
+        if observation is None:
+            return None
+
+        agent = observation.agent
+        if agent is None:
+            return None
+
+        return {
+            'agent_runtime': agent.runtime,
+            'agent_external_id': redact_text(agent.external_id),
+        }
 
     def _provider_provenance(self, candidate: MemoryCandidate) -> dict[str, object]:
         if not candidate.evidence:
@@ -497,7 +537,7 @@ class PromoteMemoryCandidate:
 
 @dataclass(frozen=True)
 class UpdateMemoryBodyInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -568,16 +608,7 @@ def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
 
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
             ensure_memory_team_scope(memory, scope)
@@ -655,8 +686,58 @@ class UpdateMemoryBody:
 
 
 @dataclass(frozen=True)
+class MemoryDiffInput:
+    scope: EffectiveScope
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    from_version: int
+    to_version: int
+
+
+class MemoryDiffError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ResolveMemoryDiff:
+    def execute(self, data: MemoryDiffInput) -> dict[str, object]:
+        scope = data.scope
+        memory = Memory.objects.filter(
+            organization_id=scope.organization_id,
+            project_id=data.project_id,
+            id=data.memory_id,
+        ).first()
+        if memory is None:
+            raise MemoryDiffError('memory_not_found', 'Memory was not found')
+
+        ensure_memory_team_scope(memory, scope)
+        from_slice = self._get_version(memory, data.from_version)
+        to_slice = self._get_version(memory, data.to_version)
+
+        return {
+            'from': self._version_slice(from_slice),
+            'to': self._version_slice(to_slice),
+        }
+
+    def _get_version(self, memory: Memory, version_number: int) -> MemoryVersion:
+        version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()
+        if version is None:
+            raise MemoryDiffError('version_not_found', f'Memory version {version_number} was not found')
+
+        return version
+
+    def _version_slice(self, version: MemoryVersion) -> dict[str, object]:
+        return {
+            'version': version.version,
+            'body': redact_text(version.body),
+            'created_at': version.created_at,
+        }
+
+
+@dataclass(frozen=True)
 class MemoryLinkInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -686,16 +767,7 @@ class MemoryLinkResult:
 
 class RecordMemoryLink:
     def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory_link',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
             ensure_memory_team_scope(memory, scope)
@@ -776,6 +848,23 @@ class DigestResult:
         }
 
 
+def digest_system_prompt() -> str:
+    return (
+        'You are a memory synthesis engine for software engineering sessions.\n'
+        'Given a list of approved engineering memories, produce a daily digest.\n'
+        '\n'
+        'Rules:\n'
+        '- Output the Title on the first line (single line, under 255 characters) summarising the digest theme.\n'
+        '- Output the Body on the remaining lines.\n'
+        '- In the Body, consolidate and de-duplicate related memories. Group by theme.\n'
+        '- Highlight decisions, changes, and risks explicitly.\n'
+        '- Be concise. Drop redundant detail.\n'
+        '- Do not invent facts not present in the source memories.\n'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '- The output must be parseable: Title on the first non-empty line, Body on subsequent lines.'
+    )
+
+
 def digest_prompt(sources: tuple[Memory, ...]) -> str:
     lines = [f'- {source.title}: {source.body}' for source in sources]
 
@@ -824,6 +913,7 @@ class GenerateDigest:
                     request_id=data.request_id,
                     trace_id=data.request_id,
                     prompt=prompt,
+                    system_prompt=digest_system_prompt(),
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:

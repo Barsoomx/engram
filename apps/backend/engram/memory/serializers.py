@@ -69,3 +69,10 @@ class MemoryLinkSerializer(serializers.Serializer):
 class MemoryLinkQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class MemoryDiffQuerySerializer(serializers.Serializer):
+    from_version = serializers.IntegerField(min_value=1)
+    to_version = serializers.IntegerField(min_value=1)
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)

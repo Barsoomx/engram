@@ -4,23 +4,34 @@ import uuid
 from typing import Any
 
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from engram.access.models import ApiKey, Identity
+from engram.access.request_scope import resolve_request_scope
 from engram.access.services import AccessDeniedError
-from engram.context.views import access_error_response, bearer_key
-from engram.core.models import AuditEvent, ContextBundle, ContextBundleItem, Memory, MemoryVersion, RetrievalDocument
+from engram.context.views import access_error_response
+from engram.core.models import (
+    AuditEvent,
+    ContextBundle,
+    ContextBundleItem,
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Project,
+    RetrievalDocument,
+    Team,
+)
 from engram.core.redaction import redact_value
 from engram.inspection.serializers import InspectionQuerySerializer
 from engram.inspection.services import (
     InspectionNotFoundError,
     InspectionScope,
-    InspectionScopeInput,
     ListInspectionAuditEvents,
     ListInspectionContextBundles,
     ListInspectionMemories,
-    ResolveInspectionScope,
 )
 
 NOT_FOUND_STATUS = {
@@ -31,7 +42,7 @@ NOT_FOUND_STATUS = {
 
 
 class InspectionBaseView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
     required_capability = ''
     target_type = ''
@@ -41,16 +52,17 @@ class InspectionBaseView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        return ResolveInspectionScope().execute(
-            InspectionScopeInput(
-                raw_key=bearer_key(request),
-                required_capability=self.required_capability,
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type=self.target_type,
-                target_id=target_id,
-            ),
+        scope = resolve_request_scope(
+            request,
+            required_capability=self.required_capability,
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type=self.target_type,
+            target_id=target_id,
         )
+        project = Project.objects.get(organization_id=scope.organization_id, id=data['project_id'])
+
+        return InspectionScope(project=project, scope=scope)
 
 
 class MemoryInspectionListView(InspectionBaseView):
@@ -59,7 +71,8 @@ class MemoryInspectionListView(InspectionBaseView):
 
     def get(self, request: Request) -> Response:
         try:
-            memories = ListInspectionMemories().execute(self._inspection_scope(request, 'list'))
+            inspection_scope = self._inspection_scope(request, 'list')
+            memories = ListInspectionMemories().execute(inspection_scope)
         except AccessDeniedError as error:
             return access_error_response(error)
 
@@ -68,19 +81,34 @@ class MemoryInspectionListView(InspectionBaseView):
         return Response({'count': len(items), 'items': items})
 
 
+class MemoryInspectionCountView(InspectionBaseView):
+    required_capability = 'memories:admin'
+    target_type = 'memory'
+
+    def get(self, request: Request) -> Response:
+        try:
+            inspection_scope = self._inspection_scope(request, 'count')
+            count = ListInspectionMemories().count(inspection_scope)
+        except AccessDeniedError as error:
+            return access_error_response(error)
+
+        return Response({'count': count})
+
+
 class MemoryInspectionDetailView(InspectionBaseView):
     required_capability = 'memories:admin'
     target_type = 'memory'
 
     def get(self, request: Request, memory_id: uuid.UUID) -> Response:
         try:
-            memory = ListInspectionMemories().detail(self._inspection_scope(request, str(memory_id)), memory_id)
+            inspection_scope = self._inspection_scope(request, str(memory_id))
+            memory = ListInspectionMemories().detail(inspection_scope, memory_id)
         except AccessDeniedError as error:
             return access_error_response(error)
         except InspectionNotFoundError as error:
             return not_found_response(error)
 
-        return Response(memory_response(memory, include_detail=True))
+        return Response(memory_response(memory, include_detail=True, inspection_scope=inspection_scope))
 
 
 class ContextBundleInspectionListView(InspectionBaseView):
@@ -119,11 +147,19 @@ class AuditEventInspectionListView(InspectionBaseView):
 
     def get(self, request: Request) -> Response:
         try:
-            audit_events = ListInspectionAuditEvents().execute(self._inspection_scope(request, 'list'))
+            inspection_scope = self._inspection_scope(request, 'list')
+            audit_events = list(ListInspectionAuditEvents().execute(inspection_scope))
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        items = [audit_event_response(audit_event) for audit_event in audit_events]
+        org_id = inspection_scope.scope.organization_id
+        actor_name_map = _batch_resolve_actor_names(audit_events, org_id)
+        target_name_map = _batch_resolve_target_names(audit_events, org_id)
+
+        items = [
+            audit_event_response(ae, actor_name_map=actor_name_map, target_name_map=target_name_map)
+            for ae in audit_events
+        ]
 
         return Response({'count': len(items), 'items': items})
 
@@ -150,10 +186,25 @@ def timestamp(value: object) -> str | None:
     return value.isoformat()
 
 
-def memory_response(memory: Memory, *, include_detail: bool) -> dict[str, object]:
+def memory_response(
+    memory: Memory,
+    *,
+    include_detail: bool,
+    inspection_scope: InspectionScope | None = None,
+) -> dict[str, object]:
+    metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    kind = metadata.get('kind') or None
+    tags = metadata.get('tags', [])
+    file_paths = redacted(metadata.get('file_paths', []))
+    confidence = memory.confidence
+    confidence_percent: float | None = round(float(confidence) * 100, 1) if confidence is not None else None
+    authorized_for_injection = memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted
+
     response: dict[str, object] = {
         'id': str(memory.id),
         'project_id': str(memory.project_id),
+        'project_name': memory.project.name,
+        'project_slug': memory.project.slug,
         'team_id': str(memory.team_id) if memory.team_id else None,
         'title': redacted_text(memory.title),
         'body': redacted_text(memory.body),
@@ -161,8 +212,14 @@ def memory_response(memory: Memory, *, include_detail: bool) -> dict[str, object
         'visibility_scope': memory.visibility_scope,
         'current_version': memory.current_version,
         'confidence': str(memory.confidence) if memory.confidence is not None else None,
+        'confidence_percent': confidence_percent,
         'stale': memory.stale,
         'refuted': memory.refuted,
+        'authorized_for_injection': authorized_for_injection,
+        'kind': kind,
+        'tags': redacted(tags),
+        'file_paths': file_paths,
+        'captured_by': redacted(metadata.get('captured_by')),
         'metadata': redacted(memory.metadata),
         'created_at': timestamp(memory.created_at),
         'updated_at': timestamp(memory.updated_at),
@@ -172,6 +229,18 @@ def memory_response(memory: Memory, *, include_detail: bool) -> dict[str, object
         response['retrieval_documents'] = [
             retrieval_document_response(document) for document in memory.retrieval_documents.all()
         ]
+        if inspection_scope is not None:
+            related_list = ListInspectionMemories().related_memories(inspection_scope, memory.id)
+            response['related'] = [
+                {
+                    'id': str(m.id),
+                    'title': redacted_text(m.title),
+                    'link_type': lt,
+                }
+                for m, lt in related_list
+            ]
+        else:
+            response['related'] = []
 
     return response
 
@@ -252,7 +321,20 @@ def context_bundle_item_response(item: ContextBundleItem) -> dict[str, object]:
     }
 
 
-def audit_event_response(audit_event: AuditEvent) -> dict[str, Any]:
+def audit_event_response(
+    audit_event: AuditEvent,
+    *,
+    actor_name_map: dict[str, str | None] | None = None,
+    target_name_map: dict[tuple[str, str], str | None] | None = None,
+) -> dict[str, Any]:
+    actor_display: str | None = None
+    if actor_name_map is not None:
+        actor_display = actor_name_map.get(audit_event.actor_id)
+
+    target_display: str | None = None
+    if target_name_map is not None:
+        target_display = target_name_map.get((audit_event.target_type, audit_event.target_id))
+
     return {
         'id': str(audit_event.id),
         'project_id': str(audit_event.project_id) if audit_event.project_id else None,
@@ -260,8 +342,10 @@ def audit_event_response(audit_event: AuditEvent) -> dict[str, Any]:
         'event_type': audit_event.event_type,
         'actor_type': audit_event.actor_type,
         'actor_id': redacted_text(audit_event.actor_id),
+        'actor_display': actor_display,
         'target_type': audit_event.target_type,
         'target_id': redacted_text(audit_event.target_id),
+        'target_display': target_display,
         'capability': audit_event.capability,
         'result': audit_event.result,
         'request_id': redacted_text(audit_event.request_id),
@@ -270,3 +354,114 @@ def audit_event_response(audit_event: AuditEvent) -> dict[str, Any]:
         'created_at': timestamp(audit_event.created_at),
         'updated_at': timestamp(audit_event.updated_at),
     }
+
+
+def _batch_resolve_actor_names(
+    events: list[AuditEvent],
+    organization_id: uuid.UUID,
+) -> dict[str, str | None]:
+    name_map: dict[str, str | None] = {}
+
+    api_key_ids = _valid_uuids({e.actor_id for e in events if e.actor_type == 'api_key'})
+    if api_key_ids:
+        keys = ApiKey.objects.filter(
+            organization_id=organization_id,
+            id__in=api_key_ids,
+        ).select_related('owner_identity')
+        for key in keys:
+            name_map[str(key.id)] = key.owner_identity.display_name
+
+    identity_ids = _valid_uuids({e.actor_id for e in events if e.actor_type == 'identity'})
+    if identity_ids:
+        identities = Identity.objects.filter(
+            organization_id=organization_id,
+            id__in=identity_ids,
+        )
+        for ident in identities:
+            name_map[str(ident.id)] = ident.display_name
+
+    return name_map
+
+
+def _batch_resolve_target_names(
+    events: list[AuditEvent],
+    organization_id: uuid.UUID,
+) -> dict[tuple[str, str], str | None]:
+    by_type: dict[str, set[str]] = {}
+    for e in events:
+        if e.target_type and e.target_id:
+            by_type.setdefault(e.target_type, set()).add(e.target_id)
+
+    name_map: dict[tuple[str, str], str | None] = {}
+    _resolve_memory_targets(by_type, organization_id, name_map)
+    _resolve_project_targets(by_type, organization_id, name_map)
+    _resolve_team_targets(by_type, organization_id, name_map)
+    _resolve_identity_targets(by_type, organization_id, name_map)
+
+    return name_map
+
+
+def _resolve_memory_targets(
+    by_type: dict[str, set[str]],
+    organization_id: uuid.UUID,
+    name_map: dict[tuple[str, str], str | None],
+) -> None:
+    ids = _valid_uuids(by_type.get('memory', set()))
+    if not ids:
+        return
+
+    for m in Memory.objects.filter(organization_id=organization_id, id__in=ids).only('id', 'title'):
+        name_map[('memory', str(m.id))] = redacted_text(m.title)
+
+
+def _resolve_project_targets(
+    by_type: dict[str, set[str]],
+    organization_id: uuid.UUID,
+    name_map: dict[tuple[str, str], str | None],
+) -> None:
+    ids = _valid_uuids(by_type.get('project', set()))
+    if not ids:
+        return
+
+    for p in Project.objects.filter(organization_id=organization_id, id__in=ids).only('id', 'name'):
+        name_map[('project', str(p.id))] = p.name
+
+
+def _resolve_team_targets(
+    by_type: dict[str, set[str]],
+    organization_id: uuid.UUID,
+    name_map: dict[tuple[str, str], str | None],
+) -> None:
+    ids = _valid_uuids(by_type.get('team', set()))
+    if not ids:
+        return
+
+    for t in Team.objects.filter(organization_id=organization_id, id__in=ids).only('id', 'name'):
+        name_map[('team', str(t.id))] = t.name
+
+
+def _resolve_identity_targets(
+    by_type: dict[str, set[str]],
+    organization_id: uuid.UUID,
+    name_map: dict[tuple[str, str], str | None],
+) -> None:
+    ids = _valid_uuids(by_type.get('identity', set()))
+    if not ids:
+        return
+
+    for ident in Identity.objects.filter(
+        organization_id=organization_id,
+        id__in=ids,
+    ).only('id', 'display_name'):
+        name_map[('identity', str(ident.id))] = ident.display_name
+
+
+def _valid_uuids(raw_ids: set[str]) -> list[uuid.UUID]:
+    result = []
+    for raw in raw_ids:
+        try:
+            result.append(uuid.UUID(str(raw)))
+        except ValueError:
+            pass
+
+    return result

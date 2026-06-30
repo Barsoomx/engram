@@ -121,6 +121,7 @@ class ProviderCallInput:
     request_id: str
     trace_id: str
     prompt: str
+    system_prompt: str = ''
 
 
 @dataclass(frozen=True)
@@ -585,7 +586,7 @@ class OpenAICompatibleGateway:
                 generated_body=body,
             )
 
-        content = self._chat_completion(policy.model, prompt_text)
+        content = self._chat_completion(policy.model, prompt_text, system_prompt=data.system_prompt)
         title, body = _split_completion(content)
         record = self._record_call(
             data,
@@ -675,11 +676,15 @@ class OpenAICompatibleGateway:
             metadata={'prompt_retained': False, 'transport': 'http'},
         )
 
-    def _chat_completion(self, model: str, prompt: str) -> str:
+    def _chat_completion(self, model: str, prompt: str, system_prompt: str = '') -> str:
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({'role': 'system', 'content': system_prompt})
+        messages.append({'role': 'user', 'content': prompt})
         payload = json.dumps(
             {
                 'model': model,
-                'messages': [{'role': 'user', 'content': prompt}],
+                'messages': messages,
                 'temperature': 0.2,
             },
         ).encode()
@@ -752,7 +757,7 @@ class AnthropicMessagesGateway:
                 generated_body=body,
             )
 
-        content = self._messages(policy.model, prompt_text)
+        content = self._messages(policy.model, prompt_text, system_prompt=data.system_prompt)
         title, body = _split_completion(content)
         record = self._record_call(
             data,
@@ -818,14 +823,15 @@ class AnthropicMessagesGateway:
             metadata={'prompt_retained': False, 'transport': 'http-anthropic'},
         )
 
-    def _messages(self, model: str, prompt: str) -> str:
-        payload = json.dumps(
-            {
-                'model': model,
-                'max_tokens': 1024,
-                'messages': [{'role': 'user', 'content': prompt}],
-            },
-        ).encode()
+    def _messages(self, model: str, prompt: str, system_prompt: str = '') -> str:
+        payload_dict: dict[str, object] = {
+            'model': model,
+            'max_tokens': 1024,
+            'messages': [{'role': 'user', 'content': prompt}],
+        }
+        if system_prompt:
+            payload_dict['system'] = system_prompt
+        payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/v1/messages', payload)
 
         return str(response['content'][0]['text'])

@@ -6,15 +6,18 @@ from typing import Any
 from django.db.models import Q, QuerySet
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
-from engram.context.views import access_error_response, bearer_key
+from engram.access.request_scope import resolve_request_scope
+from engram.access.services import AccessDeniedError, EffectiveScope
+from engram.context.views import access_error_response
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
+    ModelPolicyQuerySerializer,
     ModelPolicyResolveSerializer,
     ProviderSecretCreateSerializer,
     ProviderSecretDisableSerializer,
@@ -44,7 +47,7 @@ ERROR_STATUS = {
 
 
 class ModelPolicyBaseView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def _scope(
@@ -58,11 +61,11 @@ class ModelPolicyBaseView(APIView):
         target_id: str,
         request_id: str = '',
     ) -> EffectiveScope:
-        return ResolveApiKeyScope().execute(
-            raw_key=bearer_key(request),
+        return resolve_request_scope(
+            request,
             required_capability=required_capability,
-            requested_project_id=project_id,
-            requested_team_id=team_id,
+            project_id=project_id,
+            team_id=team_id,
             request_id=request_id,
             target_type=target_type,
             target_id=target_id,
@@ -70,6 +73,28 @@ class ModelPolicyBaseView(APIView):
 
 
 class ProviderSecretListView(ModelPolicyBaseView):
+    def get(self, request: Request) -> Response:
+        serializer = ProviderSecretQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='secrets:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='provider_secret',
+                target_id='list',
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+
+        secrets = list(scoped_secrets(scope).order_by('-created_at'))
+
+        items = [provider_secret_response(secret) for secret in secrets]
+
+        return Response({'count': len(items), 'items': items})
+
     def post(self, request: Request) -> Response:
         serializer = ProviderSecretCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -198,6 +223,31 @@ class ProviderSecretDisableView(ModelPolicyBaseView):
 
 
 class ModelPolicyListView(ModelPolicyBaseView):
+    def get(self, request: Request) -> Response:
+        serializer = ModelPolicyQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='model_policy:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='model_policy',
+                target_id='list',
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+
+        policies = scoped_policies(scope)
+        task_type = data.get('task_type')
+        if task_type:
+            policies = policies.filter(task_type=task_type)
+
+        items = [model_policy_response(policy) for policy in policies.order_by('-created_at')]
+
+        return Response({'count': len(items), 'items': items})
+
     def post(self, request: Request) -> Response:
         serializer = ModelPolicyCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -286,6 +336,12 @@ def provider_secret_response(secret: ProviderSecret) -> dict[str, Any]:
 
 def scoped_secrets(scope: EffectiveScope) -> QuerySet[ProviderSecret]:
     return ProviderSecret.objects.filter(organization_id=scope.organization_id).filter(
+        Q(team__isnull=True) | Q(team_id__in=scope.team_ids),
+    )
+
+
+def scoped_policies(scope: EffectiveScope) -> QuerySet[ModelPolicy]:
+    return ModelPolicy.objects.filter(organization_id=scope.organization_id).filter(
         Q(team__isnull=True) | Q(team_id__in=scope.team_ids),
     )
 

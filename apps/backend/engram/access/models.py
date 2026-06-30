@@ -87,11 +87,22 @@ class RoleCapability(TimestampedModel):
         return f'{self.role_id}:{self.capability_id}'
 
 
+class MembershipStatus(models.TextChoices):
+    ACTIVE = 'active', 'Active'
+    INVITED = 'invited', 'Invited'
+    SUSPENDED = 'suspended', 'Suspended'
+
+
 class OrganizationMembership(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='organization_memberships')
     identity = models.ForeignKey(Identity, on_delete=models.CASCADE, related_name='organization_memberships')
     role = models.ForeignKey(Role, on_delete=models.PROTECT, related_name='organization_memberships')
     active = models.BooleanField(default=True)
+    status = models.CharField(
+        max_length=40,
+        choices=MembershipStatus.choices,
+        default=MembershipStatus.ACTIVE,
+    )
 
     class Meta:
         constraints = [

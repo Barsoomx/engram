@@ -791,3 +791,120 @@ def test_fake_provider_gateway_embed_refuses_disabled_secret() -> None:
                 text='text',
             ),
         )
+
+
+def _create_secret(client: APIClient, project: object, team: Team, name: str, provider: str) -> str:
+    response = client.post(
+        '/v1/model-policy/secrets',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': name,
+            'provider': provider,
+            'scope': 'team',
+            'raw_secret': RAW_PROVIDER_SECRET,
+            'request_id': f'request-secret-{name}',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+
+    return response.json()['id']
+
+
+@pytest.mark.django_db
+def test_provider_secret_list_returns_scoped_secrets_without_raw_secret() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    _create_secret(client, project, team, 'Team OpenAI', 'openai')
+    _create_secret(client, project, team, 'Team Anthropic', 'anthropic')
+
+    denied = client.get(
+        '/v1/model-policy/secrets',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(),
+    )
+
+    assert denied.status_code == 403
+
+    response = client.get(
+        '/v1/model-policy/secrets',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body['count'] == 2
+    items = body['items']
+    assert len(items) == 2
+    assert {item['name'] for item in items} == {'Team OpenAI', 'Team Anthropic'}
+    assert RAW_PROVIDER_SECRET not in str(body)
+    assert all('raw_secret' not in item for item in items)
+
+
+@pytest.mark.django_db
+def test_model_policy_list_returns_scoped_policies_and_filters_by_task_type() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    secret_id = _create_secret(client, project, team, 'Team OpenAI', 'openai')
+
+    created = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Generation policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-create-list',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert created.status_code == 201
+
+    denied = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(),
+    )
+
+    assert denied.status_code == 403
+
+    response = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body['count'] == 1
+    items = body['items']
+    assert len(items) == 1
+    assert items[0]['task_type'] == 'generation'
+    assert items[0]['model'] == 'gpt-4o-mini'
+
+    filtered = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id), 'task_type': 'digest'},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert filtered.status_code == 200
+    assert filtered.json() == {'count': 0, 'items': []}

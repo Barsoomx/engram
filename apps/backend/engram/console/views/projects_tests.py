@@ -6,7 +6,7 @@ from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
 from engram.access.models import Identity, IdentityType, OrganizationMembership, Role
-from engram.core.models import AuditEvent, Organization, Project
+from engram.core.models import AuditEvent, Memory, MemoryStatus, Organization, Project
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -138,9 +138,12 @@ def test_list_returns_active_projects_with_pagination(
         'default_branch',
         'created_at',
         'updated_at',
+        'memory_count',
     }
 
     assert project['slug'] == 'platform'
+
+    assert project['memory_count'] == 0
 
 
 @pytest.mark.django_db
@@ -376,3 +379,44 @@ def test_delete_denied_without_admin_capability(
     project.refresh_from_db()
 
     assert project.archived_at is None
+
+
+@pytest.mark.django_db
+def test_list_includes_memory_count_of_approved_memories(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owned_project: Project,
+) -> None:
+    Memory.objects.create(
+        organization=f_owned_org,
+        project=f_owned_project,
+        title='First memory',
+        body='Body 1',
+        status=MemoryStatus.APPROVED,
+    )
+
+    Memory.objects.create(
+        organization=f_owned_org,
+        project=f_owned_project,
+        title='Second memory',
+        body='Body 2',
+        status=MemoryStatus.APPROVED,
+    )
+
+    Memory.objects.create(
+        organization=f_owned_org,
+        project=f_owned_project,
+        title='Refuted memory',
+        body='Body 3',
+        status='refuted',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/projects/')
+
+    assert response.status_code == 200
+
+    project = response.data['results'][0]
+
+    assert project['memory_count'] == 2

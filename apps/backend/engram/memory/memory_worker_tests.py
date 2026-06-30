@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+import structlog
 from django.core.management import call_command
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
@@ -38,6 +39,9 @@ from engram.memory.services import (
     ProcessObservationRecorded,
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
+    digest_prompt,
+    digest_system_prompt,
+    distillation_system_prompt,
     memory_candidate_content_hash,
     provider_prompt,
 )
@@ -568,6 +572,10 @@ def test_promote_memory_candidate_creates_memory_version_and_retrieval_document(
         'memory_candidate_id': str(candidate.id),
         'evidence': candidate.evidence,
         'file_paths': observation.files_read + observation.files_modified,
+        'captured_by': {
+            'agent_runtime': observation.agent.runtime,
+            'agent_external_id': observation.agent.external_id,
+        },
     }
     assert version.memory_id == memory.id
     assert version.version == 1
@@ -806,3 +814,151 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
     assert Memory.objects.count() == 1
     assert MemoryCandidate.objects.count() == 1
     assert MemoryVersion.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_correlation_id_from_raw_event_propagates_to_provider_call_trace_id() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'originating-corr-id-abc123'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == 'originating-corr-id-abc123'
+
+
+@pytest.mark.django_db
+def test_correlation_id_falls_back_to_request_id_when_correlation_id_empty() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = ''
+    raw_event.request_id = 'originating-request-id-xyz'
+    raw_event.save(update_fields=['correlation_id', 'request_id', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == 'originating-request-id-xyz'
+
+
+@pytest.mark.django_db
+def test_correlation_id_falls_back_to_observation_id_when_no_raw_event() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.raw_event = None
+    observation.save(update_fields=['raw_event', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == str(observation.id)
+
+
+@pytest.mark.django_db
+def test_process_observation_recorded_binds_correlation_id_to_structlog_context() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'ctx-bind-corr-id-test'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    structlog.contextvars.clear_contextvars()
+    execute_worker(observation)
+
+    ctx = structlog.contextvars.get_contextvars()
+    assert ctx.get('correlation_id') == 'ctx-bind-corr-id-test'
+    assert ctx.get('observation_id') == str(observation.id)
+
+    structlog.contextvars.clear_contextvars()
+
+
+@pytest.mark.django_db
+def test_process_observation_recorded_task_clears_context_before_execution() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'task-corr-id'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    structlog.contextvars.bind_contextvars(stale_key='stale_value')
+
+    process_observation_recorded.run(str(observation.id))
+
+    ctx = structlog.contextvars.get_contextvars()
+    assert 'stale_key' not in ctx
+    assert 'correlation_id' not in ctx
+
+
+def test_distillation_system_prompt_contains_instructions() -> None:
+    prompt = distillation_system_prompt()
+
+    assert 'Title' in prompt
+    assert 'Body' in prompt
+    assert 'verbatim' in prompt
+    assert 'invent' in prompt
+
+
+def test_distillation_system_prompt_is_runtime_neutral() -> None:
+    prompt = distillation_system_prompt()
+
+    for brand in ('Claude', 'Codex', 'claude-mem', 'OpenAI', 'GPT', 'Anthropic'):
+        assert brand not in prompt
+
+
+@pytest.mark.django_db
+def test_provider_prompt_preserves_exact_file_path_identifier() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    observation.files_read = ['apps/backend/engram/core/models.py']
+    observation.files_modified = ['apps/backend/engram/memory/services.py']
+    observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])
+
+    prompt = provider_prompt(observation)
+
+    assert 'apps/backend/engram/core/models.py' in prompt
+    assert 'apps/backend/engram/memory/services.py' in prompt
+
+
+def test_digest_system_prompt_contains_instructions() -> None:
+    prompt = digest_system_prompt()
+
+    assert 'Title' in prompt
+    assert 'Body' in prompt
+    assert 'de-duplicate' in prompt
+    assert 'invent' in prompt
+
+
+def test_digest_system_prompt_is_runtime_neutral() -> None:
+    prompt = digest_system_prompt()
+
+    for brand in ('Claude', 'Codex', 'claude-mem', 'OpenAI', 'GPT', 'Anthropic'):
+        assert brand not in prompt
+
+
+@pytest.mark.django_db
+def test_digest_prompt_lists_source_titles_and_bodies() -> None:
+    organization, team, project, _session, _raw_event, _observation = create_observation_recorded_scope()
+    source_a = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Fix missing migration',
+        body='Added 0042_user_schema migration for NOT NULL column',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    source_b = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Update CI cache key',
+        body='Changed poetry.lock hash in .github/workflows/ci.yml',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+
+    prompt = digest_prompt((source_a, source_b))
+
+    assert 'Fix missing migration' in prompt
+    assert 'Added 0042_user_schema migration' in prompt
+    assert 'Update CI cache key' in prompt
+    assert 'Changed poetry.lock hash' in prompt
