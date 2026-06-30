@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+from engram.access.services import EffectiveScope
+from engram.context.context_api_tests import create_approved_memory_document, create_project_scope
+from engram.core.models import AuditEvent, AuditResult, MemoryStatus
+from engram.inspection.services import InspectionScope, ListInspectionAuditEvents, ListInspectionMemories
+
+
+def create_inspection_scope_models() -> tuple[object, object, object]:
+    organization, team, project, _owner, _api_key = create_project_scope()
+
+    return organization, team, project
+
+
+def _effective_scope(organization: object, team: object) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=(team.id,),
+        capabilities=(),
+        actor_type='api_key',
+        actor_id='svc-inspection-test',
+    )
+
+
+@pytest.mark.django_db
+def test_list_audit_events_filters_by_correlation_id_field() -> None:
+    organization, team, project = create_inspection_scope_models()
+    matching = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-correlation-match',
+        target_type='memory',
+        target_id='target-correlation-match',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='request-correlation-match',
+        correlation_id='correlation-real-123',
+    )
+    AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='actor-request-id-coincidence',
+        target_type='memory',
+        target_id='target-request-id-coincidence',
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='correlation-real-123',
+        correlation_id='correlation-different-456',
+    )
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        correlation_id='correlation-real-123',
+    )
+
+    results = list(ListInspectionAuditEvents().execute(inspection_scope))
+
+    assert [ae.id for ae in results] == [matching.id]
+
+
+@pytest.mark.django_db
+def test_list_inspection_memories_count_defaults_to_approved_only() -> None:
+    organization, team, project = create_inspection_scope_models()
+    create_approved_memory_document(organization, team, project, title='Approved memory')
+    archived, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Archived memory',
+    )
+    archived.status = MemoryStatus.ARCHIVED
+    archived.save(update_fields=['status', 'updated_at'])
+    inspection_scope = InspectionScope(project=project, scope=_effective_scope(organization, team))
+
+    count = ListInspectionMemories().count(inspection_scope)
+
+    assert count == 1
+
+
+@pytest.mark.django_db
+def test_list_inspection_memories_count_honors_status_param() -> None:
+    organization, team, project = create_inspection_scope_models()
+    create_approved_memory_document(organization, team, project, title='Approved memory')
+    for index in range(2):
+        archived, _version, _document = create_approved_memory_document(
+            organization,
+            team,
+            project,
+            title=f'Archived memory {index}',
+        )
+        archived.status = MemoryStatus.ARCHIVED
+        archived.save(update_fields=['status', 'updated_at'])
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        status=MemoryStatus.ARCHIVED,
+    )
+
+    count = ListInspectionMemories().count(inspection_scope)
+
+    assert count == 2
+
+
+@pytest.mark.django_db
+def test_list_inspection_memories_count_honors_kind_param() -> None:
+    organization, team, project = create_inspection_scope_models()
+    digest, _digest_version, _digest_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest memory',
+    )
+    digest.metadata = {'kind': 'digest'}
+    digest.save(update_fields=['metadata', 'updated_at'])
+    snippet, _snippet_version, _snippet_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Snippet memory',
+    )
+    snippet.metadata = {'kind': 'snippet'}
+    snippet.save(update_fields=['metadata', 'updated_at'])
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        kind='digest',
+    )
+
+    count = ListInspectionMemories().count(inspection_scope)
+
+    assert count == 1

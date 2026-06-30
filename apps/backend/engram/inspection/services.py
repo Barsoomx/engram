@@ -87,15 +87,15 @@ class ListInspectionMemories:
         return memory
 
     def count(self, inspection_scope: InspectionScope) -> int:
-        return (
-            Memory.objects.filter(
-                organization_id=inspection_scope.scope.organization_id,
-                project=inspection_scope.project,
-                status=MemoryStatus.APPROVED,
-            )
-            .filter(inspection_scope.team_filter)
-            .count()
-        )
+        qs = Memory.objects.filter(
+            organization_id=inspection_scope.scope.organization_id,
+            project=inspection_scope.project,
+        ).filter(inspection_scope.team_filter)
+        qs = qs.filter(status=inspection_scope.status or MemoryStatus.APPROVED)
+        if inspection_scope.kind:
+            qs = qs.filter(metadata__kind=inspection_scope.kind)
+
+        return qs.count()
 
     def related_memories(
         self,
@@ -234,7 +234,7 @@ class ListInspectionAuditEvents:
         if inspection_scope.event_type:
             qs = qs.filter(event_type=inspection_scope.event_type)
         if inspection_scope.correlation_id:
-            qs = qs.filter(request_id=inspection_scope.correlation_id)
+            qs = qs.filter(correlation_id=inspection_scope.correlation_id)
         if inspection_scope.since:
             qs = qs.filter(created_at__gte=inspection_scope.since)
         if inspection_scope.until:

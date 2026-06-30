@@ -1031,6 +1031,7 @@ def test_audit_list_filter_by_correlation_id() -> None:
         capability='memories:read',
         result=AuditResult.ALLOWED,
         request_id='req-corr-target-123',
+        correlation_id='correlation-target-123',
     )
     AuditEvent.objects.create(
         organization=organization,
@@ -1042,13 +1043,14 @@ def test_audit_list_filter_by_correlation_id() -> None:
         target_id='target-corr-2',
         capability='memories:read',
         result=AuditResult.ALLOWED,
-        request_id='req-corr-other-456',
+        request_id='correlation-target-123',
+        correlation_id='correlation-other-456',
     )
     client = APIClient()
 
     response = client.get(
         '/v1/inspection/audit-events',
-        {'project_id': str(project.id), 'correlation_id': 'req-corr-target-123'},
+        {'project_id': str(project.id), 'correlation_id': 'correlation-target-123'},
         **auth_headers(AUDIT_RAW_KEY),
     )
 
