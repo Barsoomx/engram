@@ -7,7 +7,7 @@ from rest_framework.request import Request
 
 from engram.access.auth_services import AuthError, resolve_user_scope_for_organization
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
-from engram.core.models import Organization
+from engram.core.models import AuditEvent, AuditResult, Organization
 
 _ORGANIZATION_HEADER = 'HTTP_X_ENGRAM_ORGANIZATION'
 
@@ -29,6 +29,8 @@ def resolve_request_scope(
             required_capability=required_capability,
             project_id=project_id,
             team_id=team_id,
+            target_type=target_type,
+            target_id=target_id,
         )
 
     return _bearer_scope(
@@ -48,6 +50,8 @@ def _session_scope(
     required_capability: str,
     project_id: uuid.UUID | None,
     team_id: uuid.UUID | None,
+    target_type: str = '',
+    target_id: str = '',
 ) -> EffectiveScope:
     user: User = request.user
     if not user or not user.is_authenticated:
@@ -66,22 +70,85 @@ def _session_scope(
     except AuthError:
         raise AccessDeniedError('not_a_member', 'User is not a member of this organization') from None
 
-    _check_capability(scope, required_capability)
+    reason = _session_denial_reason(scope, required_capability, project_id, team_id)
+    _audit_session_scope(
+        organization=organization,
+        user=user,
+        required_capability=required_capability,
+        project_id=project_id,
+        target_type=target_type,
+        target_id=target_id,
+        reason=reason,
+        capabilities=scope.capabilities,
+    )
+    if reason:
+        raise AccessDeniedError(reason, _SESSION_DENIAL_MESSAGES[reason])
+
+    narrowed_project_ids = (project_id,) if project_id is not None else scope.project_ids
+    narrowed_team_ids = (team_id,) if team_id is not None else scope.team_ids
+
+    return EffectiveScope(
+        organization_id=scope.organization_id,
+        identity_id=scope.identity_id,
+        api_key_id=scope.api_key_id,
+        project_ids=narrowed_project_ids,
+        team_ids=narrowed_team_ids,
+        capabilities=scope.capabilities,
+        actor_type=scope.actor_type,
+        actor_id=scope.actor_id,
+    )
+
+
+_SESSION_DENIAL_MESSAGES = {
+    'missing_capability': 'User lacks the required capability',
+    'project_scope_denied': 'User cannot access requested project',
+    'team_scope_denied': 'User cannot access requested team',
+}
+
+
+def _session_denial_reason(
+    scope: EffectiveScope,
+    required_capability: str,
+    project_id: uuid.UUID | None,
+    team_id: uuid.UUID | None,
+) -> str:
+    prefix = required_capability.split(':')[0]
+    if required_capability not in scope.capabilities and f'{prefix}:*' not in scope.capabilities:
+        return 'missing_capability'
 
     if project_id is not None and project_id not in scope.project_ids:
-        raise AccessDeniedError('project_scope_denied', 'User cannot access requested project')
+        return 'project_scope_denied'
 
     if team_id is not None and team_id not in scope.team_ids:
-        raise AccessDeniedError('team_scope_denied', 'User cannot access requested team')
+        return 'team_scope_denied'
 
-    return scope
+    return ''
 
 
-def _check_capability(scope: EffectiveScope, required_capability: str) -> None:
-    prefix = required_capability.split(':')[0]
-    wildcard = f'{prefix}:*'
-    if required_capability not in scope.capabilities and wildcard not in scope.capabilities:
-        raise AccessDeniedError('missing_capability', 'User lacks the required capability')
+def _audit_session_scope(
+    *,
+    organization: Organization,
+    user: User,
+    required_capability: str,
+    project_id: uuid.UUID | None,
+    target_type: str,
+    target_id: str,
+    reason: str,
+    capabilities: tuple[str, ...],
+) -> None:
+    allowed = reason == ''
+    AuditEvent.objects.create(
+        organization=organization,
+        project_id=project_id if allowed and project_id is not None else None,
+        event_type='AccessScopeResolved',
+        actor_type='user',
+        actor_id=str(user.id),
+        target_type=target_type,
+        target_id=target_id,
+        capability=required_capability,
+        result=AuditResult.ALLOWED if allowed else AuditResult.DENIED,
+        metadata={'reason': reason or 'allowed', 'effective_capabilities': sorted(capabilities)},
+    )
 
 
 def _organization_by_header(header: str) -> Organization | None:

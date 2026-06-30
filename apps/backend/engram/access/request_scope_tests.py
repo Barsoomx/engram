@@ -262,3 +262,96 @@ def test_unauthenticated_token_header_returns_401() -> None:
     )
 
     assert response.status_code == 401
+
+
+@pytest.mark.django_db
+def test_session_scope_narrows_to_requested_project() -> None:
+    from rest_framework.test import APIRequestFactory
+
+    from engram.access.request_scope import resolve_request_scope
+
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    Project.objects.create(organization=organization, name='Second', slug='second')
+    user, token = _make_admin_session(organization)
+
+    request = APIRequestFactory().get(
+        '/v1/inspection/memories',
+        HTTP_AUTHORIZATION=f'Token {token}',
+        HTTP_X_ENGRAM_ORGANIZATION=organization.slug,
+    )
+    request.user = user
+
+    scope = resolve_request_scope(
+        request,
+        required_capability='memories:admin',
+        project_id=project.id,
+    )
+
+    assert scope.project_ids == (project.id,)
+
+
+@pytest.mark.django_db
+def test_session_scope_writes_audit_on_allow() -> None:
+    from rest_framework.test import APIRequestFactory
+
+    from engram.access.request_scope import resolve_request_scope
+    from engram.core.models import AuditEvent, AuditResult
+
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    user, token = _make_admin_session(organization)
+
+    request = APIRequestFactory().get(
+        '/x', HTTP_AUTHORIZATION=f'Token {token}', HTTP_X_ENGRAM_ORGANIZATION=organization.slug
+    )
+    request.user = user
+
+    resolve_request_scope(
+        request, required_capability='memories:admin', project_id=project.id, target_type='memory', target_id='list'
+    )
+
+    event = AuditEvent.objects.filter(
+        organization=organization,
+        event_type='AccessScopeResolved',
+        actor_type='user',
+        result=AuditResult.ALLOWED,
+    ).first()
+    assert event is not None
+    assert event.capability == 'memories:admin'
+    assert event.actor_id == str(user.id)
+
+
+@pytest.mark.django_db
+def test_session_scope_writes_audit_on_deny() -> None:
+    from rest_framework.test import APIRequestFactory
+
+    from engram.access.request_scope import resolve_request_scope
+    from engram.access.services import AccessDeniedError
+    from engram.core.models import AuditEvent, AuditResult
+
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    other_org = Organization.objects.create(name='Deny Org', slug='deny-org')
+    other_project = Project.objects.create(organization=other_org, name='Deny P', slug='deny-p')
+    user, token = _make_admin_session(organization)
+
+    request = APIRequestFactory().get(
+        '/x', HTTP_AUTHORIZATION=f'Token {token}', HTTP_X_ENGRAM_ORGANIZATION=organization.slug
+    )
+    request.user = user
+
+    with pytest.raises(AccessDeniedError) as exc:
+        resolve_request_scope(
+            request,
+            required_capability='memories:admin',
+            project_id=other_project.id,
+            target_type='memory',
+            target_id='list',
+        )
+
+    assert exc.value.code == 'project_scope_denied'
+    event = AuditEvent.objects.filter(
+        organization=organization,
+        event_type='AccessScopeResolved',
+        actor_type='user',
+        result=AuditResult.DENIED,
+    ).first()
+    assert event is not None
