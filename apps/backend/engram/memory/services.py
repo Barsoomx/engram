@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
+import structlog
 from django.db import transaction
 from django.utils import timezone
 
@@ -207,7 +208,12 @@ class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
-            generated = self._generate_candidate(observation)
+            correlation_id = self._originating_correlation_id(observation)
+            structlog.contextvars.bind_contextvars(
+                correlation_id=correlation_id,
+                observation_id=str(data.observation_id),
+            )
+            generated = self._generate_candidate(observation, correlation_id=correlation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             promotion = PromoteMemoryCandidate().execute(
                 PromoteMemoryCandidateInput(candidate_id=candidate.id),
@@ -220,6 +226,13 @@ class ProcessObservationRecorded:
                 retrieval_document=promotion.retrieval_document,
                 duplicate=not candidate_created or promotion.duplicate,
             )
+
+    def _originating_correlation_id(self, observation: Observation) -> str:
+        raw = observation.raw_event
+        if raw is not None:
+            return raw.correlation_id or raw.request_id or str(observation.id)
+
+        return str(observation.id)
 
     def _lock_observation(self, observation_id: uuid.UUID) -> Observation:
         try:
@@ -267,7 +280,7 @@ class ProcessObservationRecorded:
 
         return candidate, True
 
-    def _generate_candidate(self, observation: Observation) -> GeneratedMemoryCandidate:
+    def _generate_candidate(self, observation: Observation, *, correlation_id: str = '') -> GeneratedMemoryCandidate:
         try:
             resolved = ResolveModelPolicy().execute(
                 ResolveModelPolicyInput(
@@ -284,7 +297,7 @@ class ProcessObservationRecorded:
                     team_id=observation.team_id,
                     policy=resolved.policy,
                     request_id=f'memory-worker:{observation.id}:generation',
-                    trace_id=f'memory-worker:{observation.id}',
+                    trace_id=correlation_id or f'memory-worker:{observation.id}',
                     prompt=provider_prompt(observation),
                 ),
             )

@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+import structlog
 from django.core.management import call_command
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
@@ -806,3 +807,76 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
     assert Memory.objects.count() == 1
     assert MemoryCandidate.objects.count() == 1
     assert MemoryVersion.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_correlation_id_from_raw_event_propagates_to_provider_call_trace_id() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'originating-corr-id-abc123'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == 'originating-corr-id-abc123'
+
+
+@pytest.mark.django_db
+def test_correlation_id_falls_back_to_request_id_when_correlation_id_empty() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = ''
+    raw_event.request_id = 'originating-request-id-xyz'
+    raw_event.save(update_fields=['correlation_id', 'request_id', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == 'originating-request-id-xyz'
+
+
+@pytest.mark.django_db
+def test_correlation_id_falls_back_to_observation_id_when_no_raw_event() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.raw_event = None
+    observation.save(update_fields=['raw_event', 'updated_at'])
+
+    execute_worker(observation)
+
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.trace_id == str(observation.id)
+
+
+@pytest.mark.django_db
+def test_process_observation_recorded_binds_correlation_id_to_structlog_context() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'ctx-bind-corr-id-test'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    structlog.contextvars.clear_contextvars()
+    execute_worker(observation)
+
+    ctx = structlog.contextvars.get_contextvars()
+    assert ctx.get('correlation_id') == 'ctx-bind-corr-id-test'
+    assert ctx.get('observation_id') == str(observation.id)
+
+    structlog.contextvars.clear_contextvars()
+
+
+@pytest.mark.django_db
+def test_process_observation_recorded_task_clears_context_before_execution() -> None:
+    organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    raw_event.correlation_id = 'task-corr-id'
+    raw_event.save(update_fields=['correlation_id', 'updated_at'])
+
+    structlog.contextvars.bind_contextvars(stale_key='stale_value')
+
+    process_observation_recorded.run(str(observation.id))
+
+    ctx = structlog.contextvars.get_contextvars()
+    assert 'stale_key' not in ctx
+    assert 'correlation_id' not in ctx

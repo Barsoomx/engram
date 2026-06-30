@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from datetime import timedelta
 
+import structlog
 from django.utils import timezone
 
 from engram.celery_app import app
@@ -26,6 +27,7 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed observation id') from error
 
+    structlog.contextvars.clear_contextvars()
     try:
         result = ProcessObservationRecorded().execute(
             MemoryCandidateWorkerInput(observation_id=parsed_observation_id),
@@ -35,6 +37,8 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
             countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
             raise self.retry(exc=exc, countdown=countdown) from None
         raise
+    finally:
+        structlog.contextvars.clear_contextvars()
 
     return str(result.memory.id)
 
@@ -54,19 +58,26 @@ def generate_daily_digest(
         raise MemoryWorkerError('malformed daily digest input') from error
 
     request_id = f'daily-digest:{parsed_project_id}'
-
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        correlation_id=request_id,
+        request_id=request_id,
+    )
     try:
         result = run_daily_digest_with_tracking(
             organization_id=parsed_organization_id,
             project_id=parsed_project_id,
             memory_ids=parsed_memory_ids,
             request_id=request_id,
+            correlation_id=request_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:
             countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
             raise self.retry(exc=exc, countdown=countdown) from None
         raise
+    finally:
+        structlog.contextvars.clear_contextvars()
 
     return str(result.memory.id)
 
