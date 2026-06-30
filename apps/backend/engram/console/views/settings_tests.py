@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from django.contrib.auth.models import User
+from django.db import DatabaseError
+from django.db.models.query import QuerySet
 from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
@@ -17,7 +21,10 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import (
+    Agent,
+    AgentSession,
     AuditEvent,
+    ContextBundle,
     Memory,
     MemoryCandidate,
     MemoryStatus,
@@ -27,6 +34,8 @@ from engram.core.models import (
     Project,
     ProjectTeam,
     RetrievalDocument,
+    Runtime,
+    SessionStatus,
     Team,
     VisibilityScope,
 )
@@ -200,6 +209,74 @@ def test_retrieval_settings_put_requires_org_admin(f_reader_client: APIClient) -
     )
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_get_returns_extended_defaults(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['lexical_recall_enabled'] is False
+    assert body['lexical_fusion_enabled'] is False
+    assert body['curator_llm_judge_enabled'] is False
+    assert body['near_dup_threshold'] == pytest.approx(0.850)
+    assert body['distillation_auto_approve_threshold'] is None
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_round_trip_extended(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {
+            'lexical_recall_enabled': True,
+            'lexical_fusion_enabled': True,
+            'curator_llm_judge_enabled': True,
+            'near_dup_threshold': 0.9,
+            'distillation_auto_approve_threshold': 0.75,
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['lexical_recall_enabled'] is True
+    assert body['lexical_fusion_enabled'] is True
+    assert body['curator_llm_judge_enabled'] is True
+    assert body['near_dup_threshold'] == pytest.approx(0.9)
+    assert body['distillation_auto_approve_threshold'] == pytest.approx(0.75)
+
+    get_response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert get_response.status_code == 200
+    get_body = get_response.json()
+    assert get_body['lexical_recall_enabled'] is True
+    assert get_body['lexical_fusion_enabled'] is True
+    assert get_body['curator_llm_judge_enabled'] is True
+    assert get_body['near_dup_threshold'] == pytest.approx(0.9)
+    assert get_body['distillation_auto_approve_threshold'] == pytest.approx(0.75)
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_rejects_out_of_range_near_dup_threshold(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'near_dup_threshold': 1.5},
+        format='json',
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_rejects_out_of_range_auto_approve_threshold(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': -0.1},
+        format='json',
+    )
+
+    assert response.status_code == 400
 
 
 # ─── Hybrid retrieval gating in BuildContextBundle ───────────────────────────
@@ -544,6 +621,78 @@ def test_purge_writes_audit_event_before_deletion(f_memories_admin_client: APICl
     assert audit.metadata['memory_candidate_count'] == 0
     assert audit.metadata['retrieval_document_count'] == 0
     assert Memory.objects.filter(organization=org).count() == 0
+
+
+@pytest.mark.django_db
+def test_purge_forced_failure_leaves_no_audit_row(f_memories_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='purge-org')
+    project = Project.objects.create(organization=org, name='Proj', slug='purge-proj-fail')
+    Memory.objects.create(
+        organization=org,
+        project=project,
+        title='To purge',
+        body='body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+
+    original_delete = QuerySet.delete
+
+    def _raising_delete(self: QuerySet) -> tuple[int, dict[str, int]]:
+        if self.model is Memory:
+            raise DatabaseError('forced failure')
+
+        return original_delete(self)
+
+    with patch.object(QuerySet, 'delete', _raising_delete):
+        response = f_memories_admin_client.post(
+            '/v1/admin/settings/purge',
+            {'confirmation': 'purge-org'},
+            format='json',
+        )
+
+    assert response.status_code == 500
+    assert not AuditEvent.objects.filter(event_type='OrganizationMemoryPurged').exists()
+    assert Memory.objects.filter(organization=org).count() == 1
+
+
+@pytest.mark.django_db
+def test_purge_response_includes_context_bundle_counts(f_memories_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='purge-org')
+    project = Project.objects.create(organization=org, name='Proj', slug='purge-proj-bundle')
+    agent = Agent.objects.create(
+        organization=org,
+        runtime=Runtime.UNKNOWN,
+        external_id='agent-1',
+        display_name='agent-1',
+    )
+    session = AgentSession.objects.create(
+        organization=org,
+        project=project,
+        agent=agent,
+        external_session_id='sess-1',
+        runtime=Runtime.UNKNOWN,
+        status=SessionStatus.ACTIVE,
+    )
+    ContextBundle.objects.create(
+        organization=org,
+        project=project,
+        agent=agent,
+        session=session,
+        request_id='req-1',
+        purpose='context',
+    )
+
+    response = f_memories_admin_client.post(
+        '/v1/admin/settings/purge',
+        {'confirmation': 'purge-org'},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['deleted']['context_bundles'] == 1
+    assert ContextBundle.objects.filter(organization=org).count() == 0
 
 
 @pytest.mark.django_db

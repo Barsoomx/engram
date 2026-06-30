@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+
 from django.db import transaction
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -21,6 +23,38 @@ from engram.core.models import (
 )
 from engram.model_policy.models import ModelPolicy, PolicyScope, ProviderSecret
 
+_BOOLEAN_SETTINGS_FIELDS = (
+    'hybrid_retrieval_enabled',
+    'require_provenance',
+    'lexical_recall_enabled',
+    'lexical_fusion_enabled',
+    'curator_llm_judge_enabled',
+)
+
+
+def _parse_unit_threshold(raw: object) -> Decimal:
+    try:
+        value = Decimal(str(raw))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError('threshold must be a number') from exc
+
+    if value < 0 or value > 1:
+        raise ValueError('threshold must be between 0 and 1')
+
+    return value
+
+
+def _serialize_retrieval_settings(settings: OrganizationSettings) -> dict:
+    return {
+        'hybrid_retrieval_enabled': settings.hybrid_retrieval_enabled,
+        'require_provenance': settings.require_provenance,
+        'lexical_recall_enabled': settings.lexical_recall_enabled,
+        'lexical_fusion_enabled': settings.lexical_fusion_enabled,
+        'curator_llm_judge_enabled': settings.curator_llm_judge_enabled,
+        'near_dup_threshold': settings.near_dup_threshold,
+        'distillation_auto_approve_threshold': settings.distillation_auto_approve_threshold,
+    }
+
 
 class RetrievalSettingsView(APIView):
     def get_permissions(self) -> list[BasePermission]:
@@ -35,24 +69,39 @@ class RetrievalSettingsView(APIView):
             organization=request.active_organization,
         )
 
-        return Response(
-            {
-                'hybrid_retrieval_enabled': settings.hybrid_retrieval_enabled,
-                'require_provenance': settings.require_provenance,
-            }
-        )
+        return Response(_serialize_retrieval_settings(settings))
 
     def put(self, request: Request) -> Response:
         settings, _ = OrganizationSettings.objects.get_or_create(
             organization=request.active_organization,
         )
         update_fields = ['updated_at']
-        if 'hybrid_retrieval_enabled' in request.data:
-            settings.hybrid_retrieval_enabled = bool(request.data['hybrid_retrieval_enabled'])
-            update_fields.append('hybrid_retrieval_enabled')
-        if 'require_provenance' in request.data:
-            settings.require_provenance = bool(request.data['require_provenance'])
-            update_fields.append('require_provenance')
+
+        for field in _BOOLEAN_SETTINGS_FIELDS:
+            if field in request.data:
+                setattr(settings, field, bool(request.data[field]))
+                update_fields.append(field)
+
+        if 'near_dup_threshold' in request.data:
+            try:
+                settings.near_dup_threshold = _parse_unit_threshold(request.data['near_dup_threshold'])
+            except ValueError as exc:
+                return Response({'error': str(exc)}, status=HTTP_400_BAD_REQUEST)
+
+            update_fields.append('near_dup_threshold')
+
+        if 'distillation_auto_approve_threshold' in request.data:
+            raw_threshold = request.data['distillation_auto_approve_threshold']
+            if raw_threshold is None:
+                settings.distillation_auto_approve_threshold = None
+            else:
+                try:
+                    settings.distillation_auto_approve_threshold = _parse_unit_threshold(raw_threshold)
+                except ValueError as exc:
+                    return Response({'error': str(exc)}, status=HTTP_400_BAD_REQUEST)
+
+            update_fields.append('distillation_auto_approve_threshold')
+
         settings.save(update_fields=update_fields)
 
         audit_admin_action(
@@ -63,12 +112,7 @@ class RetrievalSettingsView(APIView):
             target_id=str(settings.id),
         )
 
-        return Response(
-            {
-                'hybrid_retrieval_enabled': settings.hybrid_retrieval_enabled,
-                'require_provenance': settings.require_provenance,
-            }
-        )
+        return Response(_serialize_retrieval_settings(settings))
 
 
 class EmbeddingSettingsView(APIView):
@@ -164,29 +208,33 @@ class PurgeOrganizationMemoryView(APIView):
                 status=HTTP_400_BAD_REQUEST,
             )
 
-        memory_count = Memory.objects.filter(organization=organization).count()
-        candidate_count = MemoryCandidate.objects.filter(organization=organization).count()
-        doc_count = RetrievalDocument.objects.filter(organization=organization).count()
-
-        AuditEvent.objects.create(
-            organization=organization,
-            event_type='OrganizationMemoryPurged',
-            actor_type='user',
-            actor_id=str(request.user_identity.id),
-            target_type='organization',
-            target_id=str(organization.id),
-            metadata={
-                'memory_count': memory_count,
-                'memory_candidate_count': candidate_count,
-                'retrieval_document_count': doc_count,
-            },
-        )
-
         with transaction.atomic():
+            memory_count = Memory.objects.filter(organization=organization).count()
+            candidate_count = MemoryCandidate.objects.filter(organization=organization).count()
+            doc_count = RetrievalDocument.objects.filter(organization=organization).count()
+            bundle_item_count = ContextBundleItem.objects.filter(organization=organization).count()
+            bundle_count = ContextBundle.objects.filter(organization=organization).count()
+
             ContextBundleItem.objects.filter(organization=organization).delete()
             ContextBundle.objects.filter(organization=organization).delete()
             MemoryCandidate.objects.filter(organization=organization).delete()
             Memory.objects.filter(organization=organization).delete()
+
+            AuditEvent.objects.create(
+                organization=organization,
+                event_type='OrganizationMemoryPurged',
+                actor_type='user',
+                actor_id=str(request.user_identity.id),
+                target_type='organization',
+                target_id=str(organization.id),
+                metadata={
+                    'memory_count': memory_count,
+                    'memory_candidate_count': candidate_count,
+                    'retrieval_document_count': doc_count,
+                    'context_bundle_count': bundle_count,
+                    'context_bundle_item_count': bundle_item_count,
+                },
+            )
 
         return Response(
             {
@@ -194,6 +242,8 @@ class PurgeOrganizationMemoryView(APIView):
                     'memories': memory_count,
                     'memory_candidates': candidate_count,
                     'retrieval_documents': doc_count,
+                    'context_bundles': bundle_count,
+                    'context_bundle_items': bundle_item_count,
                 }
             }
         )
