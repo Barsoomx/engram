@@ -29,6 +29,8 @@ class ProviderSecretDisableSerializer(serializers.Serializer):
 class ProviderSecretQuerySerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
+    limit = serializers.IntegerField(required=False, default=50, min_value=1, max_value=200)
+    offset = serializers.IntegerField(required=False, default=0, min_value=0)
 
 
 class ModelPolicyCreateSerializer(serializers.Serializer):
@@ -61,3 +63,40 @@ class ModelPolicyQuerySerializer(serializers.Serializer):
         choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
         required=False,
     )
+    limit = serializers.IntegerField(required=False, default=50, min_value=1, max_value=200)
+    offset = serializers.IntegerField(required=False, default=0, min_value=0)
+
+
+class ModelPolicyUpdateSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    name = serializers.CharField(max_length=255, required=False)
+    provider = serializers.ChoiceField(choices=('anthropic', 'openai'), required=False)
+    model = serializers.CharField(max_length=120, required=False)
+    secret_id = serializers.UUIDField(required=False)
+    active = serializers.BooleanField(required=False)
+    fallback_enabled = serializers.BooleanField(required=False)
+    task_type = serializers.ChoiceField(
+        choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
+        required=False,
+    )
+    request_id = serializers.CharField(max_length=255)
+
+
+class ModelPolicyDisableSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    request_id = serializers.CharField(max_length=255)
+
+
+class ProviderSecretEnableSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    request_id = serializers.CharField(max_length=255)
+
+
+class ProviderSecretUpdateSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    name = serializers.CharField(max_length=255)
+    request_id = serializers.CharField(max_length=255)
