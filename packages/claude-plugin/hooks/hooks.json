@@ -47,6 +47,18 @@
           }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "engram hook session-end --agent claude_code --response-format claude-code",
+            "timeout": 60
+          }
+        ]
+      }
     ]
   }
 }
