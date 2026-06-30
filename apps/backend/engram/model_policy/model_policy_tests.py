@@ -841,10 +841,12 @@ def test_provider_secret_list_returns_scoped_secrets_without_raw_secret() -> Non
     assert response.status_code == 200
 
     body = response.json()
-    assert len(body) == 2
-    assert {item['name'] for item in body} == {'Team OpenAI', 'Team Anthropic'}
+    assert body['count'] == 2
+    items = body['items']
+    assert len(items) == 2
+    assert {item['name'] for item in items} == {'Team OpenAI', 'Team Anthropic'}
     assert RAW_PROVIDER_SECRET not in str(body)
-    assert all('raw_secret' not in item for item in body)
+    assert all('raw_secret' not in item for item in items)
 
 
 @pytest.mark.django_db
@@ -892,9 +894,11 @@ def test_model_policy_list_returns_scoped_policies_and_filters_by_task_type() ->
     assert response.status_code == 200
 
     body = response.json()
-    assert len(body) == 1
-    assert body[0]['task_type'] == 'generation'
-    assert body[0]['model'] == 'gpt-4o-mini'
+    assert body['count'] == 1
+    items = body['items']
+    assert len(items) == 1
+    assert items[0]['task_type'] == 'generation'
+    assert items[0]['model'] == 'gpt-4o-mini'
 
     filtered = client.get(
         '/v1/model-policy/policies',
@@ -903,4 +907,4 @@ def test_model_policy_list_returns_scoped_policies_and_filters_by_task_type() ->
     )
 
     assert filtered.status_code == 200
-    assert filtered.json() == []
+    assert filtered.json() == {'count': 0, 'items': []}

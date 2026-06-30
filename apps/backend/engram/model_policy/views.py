@@ -89,9 +89,11 @@ class ProviderSecretListView(ModelPolicyBaseView):
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        secrets = scoped_secrets(scope).order_by('-created_at')
+        secrets = list(scoped_secrets(scope).order_by('-created_at'))
 
-        return Response([provider_secret_response(secret) for secret in secrets])
+        items = [provider_secret_response(secret) for secret in secrets]
+
+        return Response({'count': len(items), 'items': items})
 
     def post(self, request: Request) -> Response:
         serializer = ProviderSecretCreateSerializer(data=request.data)
@@ -242,7 +244,9 @@ class ModelPolicyListView(ModelPolicyBaseView):
         if task_type:
             policies = policies.filter(task_type=task_type)
 
-        return Response([model_policy_response(policy) for policy in policies.order_by('-created_at')])
+        items = [model_policy_response(policy) for policy in policies.order_by('-created_at')]
+
+        return Response({'count': len(items), 'items': items})
 
     def post(self, request: Request) -> Response:
         serializer = ModelPolicyCreateSerializer(data=request.data)

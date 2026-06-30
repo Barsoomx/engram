@@ -15,18 +15,22 @@ from engram.context.views import access_error_response
 from engram.core.models import MemoryLink
 from engram.core.redaction import redact_value
 from engram.memory.serializers import (
+    MemoryDiffQuerySerializer,
     MemoryFeedbackSerializer,
     MemoryLinkQuerySerializer,
     MemoryLinkSerializer,
     MemoryVersionSerializer,
 )
 from engram.memory.services import (
+    MemoryDiffError,
+    MemoryDiffInput,
     MemoryFeedbackError,
     MemoryFeedbackInput,
     MemoryLinkInput,
     MemoryVersionError,
     RecordMemoryFeedback,
     RecordMemoryLink,
+    ResolveMemoryDiff,
     UpdateMemoryBody,
     UpdateMemoryBodyInput,
 )
@@ -36,6 +40,10 @@ MEMORY_FEEDBACK_STATUS = {
 }
 MEMORY_VERSION_STATUS = {
     'memory_not_found': status.HTTP_404_NOT_FOUND,
+}
+MEMORY_DIFF_STATUS = {
+    'memory_not_found': status.HTTP_404_NOT_FOUND,
+    'version_not_found': status.HTTP_404_NOT_FOUND,
 }
 
 
@@ -142,13 +150,17 @@ class MemoryLinksView(APIView):
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        links = MemoryLink.objects.filter(
-            organization_id=scope.organization_id,
-            project_id=data['project_id'],
-            memory_id=memory_id,
-        ).order_by('link_type', 'target')
+        links = list(
+            MemoryLink.objects.filter(
+                organization_id=scope.organization_id,
+                project_id=data['project_id'],
+                memory_id=memory_id,
+            ).order_by('link_type', 'target')
+        )
 
-        return Response({'items': [self._link_response(link) for link in links]})
+        items = [self._link_response(link) for link in links]
+
+        return Response({'count': len(items), 'items': items})
 
     def post(self, request: Request, memory_id: uuid.UUID) -> Response:
         serializer = MemoryLinkSerializer(data=request.data)
@@ -198,3 +210,38 @@ class MemoryLinksView(APIView):
             'label': str(redact_value(link.label).value),
             'created_at': link.created_at.isoformat() if link.created_at else None,
         }
+
+
+class MemoryDiffView(APIView):
+    authentication_classes: list[type] = [TokenAuthentication]
+    permission_classes: list[type] = []
+
+    def get(self, request: Request, memory_id: uuid.UUID) -> Response:
+        serializer = MemoryDiffQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = resolve_request_scope(
+                request,
+                required_capability='memories:read',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+            )
+            result = ResolveMemoryDiff().execute(
+                MemoryDiffInput(
+                    scope=scope,
+                    memory_id=memory_id,
+                    project_id=data['project_id'],
+                    from_version=data['from_version'],
+                    to_version=data['to_version'],
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except MemoryDiffError as error:
+            return Response(
+                {'code': error.code, 'detail': str(error)},
+                status=MEMORY_DIFF_STATUS.get(error.code, status.HTTP_400_BAD_REQUEST),
+            )
+
+        return Response(result)

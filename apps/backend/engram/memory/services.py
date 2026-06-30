@@ -669,6 +669,56 @@ class UpdateMemoryBody:
 
 
 @dataclass(frozen=True)
+class MemoryDiffInput:
+    scope: EffectiveScope
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    from_version: int
+    to_version: int
+
+
+class MemoryDiffError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class ResolveMemoryDiff:
+    def execute(self, data: MemoryDiffInput) -> dict[str, object]:
+        scope = data.scope
+        memory = Memory.objects.filter(
+            organization_id=scope.organization_id,
+            project_id=data.project_id,
+            id=data.memory_id,
+        ).first()
+        if memory is None:
+            raise MemoryDiffError('memory_not_found', 'Memory was not found')
+
+        ensure_memory_team_scope(memory, scope)
+        from_slice = self._get_version(memory, data.from_version)
+        to_slice = self._get_version(memory, data.to_version)
+
+        return {
+            'from': self._version_slice(from_slice),
+            'to': self._version_slice(to_slice),
+        }
+
+    def _get_version(self, memory: Memory, version_number: int) -> MemoryVersion:
+        version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()
+        if version is None:
+            raise MemoryDiffError('version_not_found', f'Memory version {version_number} was not found')
+
+        return version
+
+    def _version_slice(self, version: MemoryVersion) -> dict[str, object]:
+        return {
+            'version': version.version,
+            'body': redact_text(version.body),
+            'created_at': version.created_at,
+        }
+
+
+@dataclass(frozen=True)
 class MemoryLinkInput:
     scope: EffectiveScope
     memory_id: uuid.UUID
