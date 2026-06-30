@@ -7,7 +7,9 @@ import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { OrgSwitcher } from '@/components/layout/org-switcher';
+import { ProjectSwitcher } from '@/components/layout/project-switcher';
 import { Sidebar } from '@/components/layout/sidebar';
+import { TeamSwitcher } from '@/components/layout/team-switcher';
 import { clearToken, fetchMe, getToken, hasCapability, logout, type MeResponse } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
 
@@ -102,9 +104,15 @@ export default function AdminShellLayout({
       </div>
 
       <header className='hidden lg:flex h-14 items-center justify-between px-8 border-b border-divider bg-content1/50 backdrop-blur'>
-        <div className='flex items-center'>
+        <div className='flex items-center gap-3'>
           {profile && hasCapability(profile.capabilities, 'organizations:read') && (
             <OrgSwitcher orgId={activeOrgId} />
+          )}
+          {profile && hasCapability(profile.capabilities, 'projects:read') && (
+            <ProjectSwitcher />
+          )}
+          {profile && hasCapability(profile.capabilities, 'teams:read') && (
+            <TeamSwitcher />
           )}
         </div>
         {profile && (

@@ -4,6 +4,8 @@ import { useQuery } from '@tanstack/react-query';
 import * as React from 'react';
 
 import { apiClient } from '@/lib/auth';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 type ObservationItem = {
   observation_id: string;
@@ -20,22 +22,6 @@ type ObservationsResponse = {
   request_id: string;
   items: ObservationItem[];
 };
-
-const PROJECT_ID = process.env.NEXT_PUBLIC_ENGRAM_PROJECT_ID ?? '';
-const TEAM_ID = process.env.NEXT_PUBLIC_ENGRAM_TEAM_ID ?? '';
-
-async function fetchObservations(): Promise<ObservationsResponse> {
-  const client = apiClient();
-  const params: Record<string, string> = { project_id: PROJECT_ID };
-
-  if (TEAM_ID) {
-    params.team_id = TEAM_ID;
-  }
-
-  const response = await client.get<ObservationsResponse>('/v1/observations/', { params });
-
-  return response.data;
-}
 
 function ObservationsTable({ items }: { items: ObservationItem[] }) {
   return (
@@ -67,19 +53,33 @@ function ObservationsTable({ items }: { items: ObservationItem[] }) {
 }
 
 export default function ObservationsPage() {
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
   const query = useQuery<ObservationsResponse>({
-    queryKey: ['observations', PROJECT_ID, TEAM_ID],
-    enabled: Boolean(PROJECT_ID),
-    queryFn: fetchObservations,
+    queryKey: ['observations', activeProjectId, activeTeamId],
+    enabled: Boolean(activeProjectId),
+    queryFn: async () => {
+      const client = apiClient();
+      const params: Record<string, string> = { project_id: activeProjectId ?? '' };
+
+      if (activeTeamId) {
+        params.team_id = activeTeamId;
+      }
+
+      const response = await client.get<ObservationsResponse>('/v1/observations/', { params });
+
+      return response.data;
+    },
   });
 
-  if (!PROJECT_ID) {
+  if (!activeProjectId) {
     return (
       <section>
         <h1 className='text-2xl font-semibold text-foreground'>Observations</h1>
-        <pre className='mt-4 text-sm text-default-500 bg-content2/50 rounded-medium p-3'>
-          NEXT_PUBLIC_ENGRAM_PROJECT_ID is not set.
-        </pre>
+        <p className='mt-4 text-sm text-default-500'>
+          Select a project to view observations.
+        </p>
       </section>
     );
   }
