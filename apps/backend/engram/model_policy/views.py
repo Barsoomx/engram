@@ -6,12 +6,14 @@ from typing import Any
 from django.db.models import Q, QuerySet
 from django.shortcuts import get_object_or_404
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
-from engram.context.views import access_error_response, bearer_key
+from engram.access.request_scope import resolve_request_scope
+from engram.access.services import AccessDeniedError, EffectiveScope
+from engram.context.views import access_error_response
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
@@ -45,7 +47,7 @@ ERROR_STATUS = {
 
 
 class ModelPolicyBaseView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def _scope(
@@ -59,11 +61,11 @@ class ModelPolicyBaseView(APIView):
         target_id: str,
         request_id: str = '',
     ) -> EffectiveScope:
-        return ResolveApiKeyScope().execute(
-            raw_key=bearer_key(request),
+        return resolve_request_scope(
+            request,
             required_capability=required_capability,
-            requested_project_id=project_id,
-            requested_team_id=team_id,
+            project_id=project_id,
+            team_id=team_id,
             request_id=request_id,
             target_type=target_type,
             target_id=target_id,

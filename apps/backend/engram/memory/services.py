@@ -9,7 +9,7 @@ import structlog
 from django.db import transaction
 from django.utils import timezone
 
-from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     AuditEvent,
@@ -83,7 +83,7 @@ class PromoteMemoryCandidateResult:
 
 @dataclass(frozen=True)
 class MemoryFeedbackInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -121,16 +121,7 @@ class MemoryFeedbackError(Exception):
 
 class RecordMemoryFeedback:
     def execute(self, data: MemoryFeedbackInput) -> MemoryFeedbackResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = self._lock_memory(data, scope)
             self._ensure_team_scope(memory, scope)
@@ -529,7 +520,7 @@ class PromoteMemoryCandidate:
 
 @dataclass(frozen=True)
 class UpdateMemoryBodyInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -600,16 +591,7 @@ def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
 
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
             ensure_memory_team_scope(memory, scope)
@@ -688,7 +670,7 @@ class UpdateMemoryBody:
 
 @dataclass(frozen=True)
 class MemoryLinkInput:
-    raw_key: str
+    scope: EffectiveScope
     memory_id: uuid.UUID
     project_id: uuid.UUID
     team_id: uuid.UUID | None
@@ -718,16 +700,7 @@ class MemoryLinkResult:
 
 class RecordMemoryLink:
     def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='memories:review',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            target_type='memory_link',
-            target_id=str(data.memory_id),
-        )
+        scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
             ensure_memory_team_scope(memory, scope)
