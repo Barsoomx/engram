@@ -247,6 +247,7 @@ class AgentSession(TimestampedModel):
     external_session_id = models.CharField(max_length=255)
     content_session_id = models.CharField(max_length=255, blank=True)
     memory_session_id = models.CharField(max_length=255, blank=True)
+    model_id = models.CharField(max_length=120, blank=True, default='')
     runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
     platform_source = models.CharField(max_length=80, blank=True)
     repository_url = models.TextField(blank=True)
