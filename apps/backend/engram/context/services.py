@@ -537,12 +537,20 @@ class BuildContextBundle:
             project,
             team,
         )
+        kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
+        tokens_used = sum(
+            estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
+            for i, m in enumerate(kept, start=1)
+        )
         query_result = redact_value(data.query)
-        metadata = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
+        metadata: dict[str, object] = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
         if has_semantic and embedding_result is not None:
             metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
+        metadata['token_budget'] = data.token_budget
+        metadata['tokens_used'] = tokens_used
+        metadata['dropped_for_budget'] = len(budget_dropped)
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -556,10 +564,10 @@ class BuildContextBundle:
                 query_text=str(query_result.value),
                 authorization_scope=self._authorization_scope(scope),
                 token_budget=data.token_budget,
-                selected_count=len(matches),
+                selected_count=len(kept),
                 metadata=metadata,
             )
-            persisted_matches = self._create_items(bundle, matches)
+            persisted_matches = self._create_items(bundle, kept)
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
