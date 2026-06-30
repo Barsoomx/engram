@@ -1,7 +1,7 @@
 from django.db import migrations
 
 try:
-    from pgvector.django import VectorField
+    from pgvector.django import VectorExtension, VectorField
 
     _HAS_PGVECTOR = True
 except ImportError:
@@ -15,11 +15,11 @@ class Migration(migrations.Migration):
 
     operations = (
         [
-            migrations.CreateExtension(name='vector'),
+            VectorExtension(),
             migrations.AddField(
                 model_name='retrievaldocument',
                 name='embedding_pgvector',
-                field=VectorField(dimensions=64, null=True, blank=True) if _HAS_PGVECTOR else migrations.RunSQL.noop,
+                field=VectorField(dimensions=64, null=True, blank=True),
             ),
         ]
         if _HAS_PGVECTOR
