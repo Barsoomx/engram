@@ -12,10 +12,13 @@ from engram.context.services import (
     _pack_to_budget,
     _semantic_retrieval_matches_python,
     estimate_tokens,
+    fuse_retrieval_legs,
     fuse_semantic_lexical,
     lexical_fusion_matches,
+    lexical_recall_matches,
     lexical_retrieval_ranks,
     resolve_lexical_fusion_enabled,
+    resolve_lexical_recall_enabled,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
@@ -637,3 +640,175 @@ def test_resolve_lexical_fusion_enabled_true_when_set(
     OrganizationSettings.objects.create(organization=organization, lexical_fusion_enabled=True)
 
     assert resolve_lexical_fusion_enabled(organization) is True
+
+
+# lexical recall (pg_trgm + FTS)
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_recall_matches_surfaces_trigram_near_document(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    fuzzy = _seed_document(
+        organization,
+        project,
+        title='authorisation',
+        body='authorisation',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    assert 'authorization' not in fuzzy.full_text.casefold()
+
+    matches = lexical_recall_matches((fuzzy,), set(), 'authorization')
+
+    assert [match.document.id for match in matches] == [fuzzy.id]
+    assert matches[0].score == 20
+    assert matches[0].inclusion_reason.startswith('lexical match:')
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_recall_matches_excludes_already_matched(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    fuzzy = _seed_document(
+        organization,
+        project,
+        title='authorisation',
+        body='authorisation',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+
+    assert lexical_recall_matches((fuzzy,), {fuzzy.id}, 'authorization') == []
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_recall_matches_empty_query_returns_empty(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    fuzzy = _seed_document(
+        organization,
+        project,
+        title='authorisation',
+        body='authorisation',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+
+    assert lexical_recall_matches((fuzzy,), set(), '   ') == []
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_recall_matches_orders_by_relevance(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    strong = _seed_document(
+        organization,
+        project,
+        title='strong',
+        body='alpha alpha alpha alpha',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    weak = _seed_document(
+        organization,
+        project,
+        title='weak',
+        body='alpha',
+        embedding=_basis_vector(1),
+        sequence=2,
+    )
+
+    matches = lexical_recall_matches((weak, strong), set(), 'alpha')
+
+    assert [match.document.id for match in matches] == [strong.id, weak.id]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_recall_matches_only_over_passed_documents(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    included = _seed_document(
+        organization,
+        project,
+        title='alpha included',
+        body='alpha alpha',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    excluded = _seed_document(
+        organization,
+        project,
+        title='alpha excluded',
+        body='alpha alpha',
+        embedding=_basis_vector(1),
+        sequence=2,
+    )
+
+    matches = lexical_recall_matches((included,), set(), 'alpha')
+
+    matched_ids = {match.document.id for match in matches}
+    assert included.id in matched_ids
+    assert excluded.id not in matched_ids
+
+
+def test_fuse_retrieval_legs_ranks_union_deterministically() -> None:
+    both = _fusion_match('both')
+    semantic_only = _fusion_match('semantic_only')
+    lexical_only = _fusion_match('lexical_only', score=20)
+    both_lexical = RetrievalMatch(
+        document=both.document,
+        score=20,
+        matched_terms=(),
+        inclusion_reason='lexical match: trigram 0.50',
+    )
+    semantic_matches = [both, semantic_only]
+    lexical_matches = [both_lexical, lexical_only]
+
+    fused = fuse_retrieval_legs(semantic_matches, lexical_matches)
+
+    assert [match.document.id for match in fused] == [
+        both.document.id,
+        semantic_only.document.id,
+        lexical_only.document.id,
+    ]
+    assert fused[0].score == 30
+    assert lexical_only.document.id in {match.document.id for match in fused}
+
+
+def test_fuse_retrieval_legs_includes_lexical_only_without_semantic() -> None:
+    first = _fusion_match('first', score=20)
+    second = _fusion_match('second', score=20)
+
+    fused = fuse_retrieval_legs([], [first, second])
+
+    assert [match.document.id for match in fused] == [first.document.id, second.document.id]
+
+
+@pytest.mark.django_db
+def test_resolve_lexical_recall_enabled_defaults_false(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+
+    assert resolve_lexical_recall_enabled(organization) is False
+
+
+@pytest.mark.django_db
+def test_resolve_lexical_recall_enabled_true_when_set(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+    OrganizationSettings.objects.create(organization=organization, lexical_recall_enabled=True)
+
+    assert resolve_lexical_recall_enabled(organization) is True
