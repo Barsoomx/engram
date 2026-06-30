@@ -7,6 +7,7 @@ from engram.hooks.views import (
     PostToolUseView,
     SessionEndView,
     SessionStartHookView,
+    UserPromptSubmitView,
 )
 
 urlpatterns = [
@@ -16,4 +17,5 @@ urlpatterns = [
     path('error', ErrorHookView.as_view(), name='hook-error'),
     path('decision', DecisionHookView.as_view(), name='hook-decision'),
     path('session-end', SessionEndView.as_view(), name='hook-session-end'),
+    path('user-prompt-submit', UserPromptSubmitView.as_view(), name='hook-user-prompt-submit'),
 ]

@@ -107,6 +107,11 @@ class ContextBundleResult:
                 'hookEventName': 'SessionStart',
                 'additionalContext': rendered_context,
             }
+        elif self.bundle.purpose == 'user_prompt_submit':
+            hook_specific_output = {
+                'hookEventName': 'UserPromptSubmit',
+                'additionalContext': rendered_context,
+            }
 
         return {
             'status': self.bundle.status,

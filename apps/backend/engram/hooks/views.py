@@ -155,3 +155,7 @@ class DecisionHookView(HookIngestView):
 
 class SessionEndView(HookIngestView):
     expected_event_type = 'session_end'
+
+
+class UserPromptSubmitView(HookIngestView):
+    expected_event_type = 'user_prompt_submit'
