@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+import structlog
+from django.core.cache import cache
 from django.db.models import Avg, Count, Max, Q
 from django.db.models.functions import TruncDate
 from django.utils import timezone
@@ -20,10 +22,13 @@ from engram.core.models import (
     RawEventEnvelope,
 )
 
+logger = structlog.get_logger(__name__)
+
 ACTIVE_SESSION_THRESHOLD_MINUTES = 15
 CONNECTED_AGENTS_WINDOW_HOURS = 24
 SESSIONS_DEFAULT_LIMIT = 50
 ACTIVITY_DEFAULT_LIMIT = 50
+OVERVIEW_METRICS_CACHE_TTL_SECONDS = 30
 
 
 def _project_scope_filter(organization: Organization, scope: EffectiveScope) -> Q:
@@ -34,7 +39,46 @@ def _is_full_org_admin(scope: EffectiveScope) -> bool:
     return bool(PROJECT_ADMIN_CAPABILITIES & set(scope.capabilities))
 
 
+def _overview_metrics_cache_key(organization: Organization, scope: EffectiveScope) -> str:
+    project_ids = ','.join(sorted(str(project_id) for project_id in scope.project_ids))
+    team_ids = ','.join(sorted(str(team_id) for team_id in scope.team_ids))
+    return f'console:overview_metrics:{organization.id}:{project_ids}:{team_ids}'
+
+
 def get_overview_metrics(
+    organization: Organization,
+    scope: EffectiveScope,
+) -> dict[str, Any]:
+    cache_key = _overview_metrics_cache_key(organization, scope)
+
+    try:
+        cached = cache.get(cache_key)
+    except Exception as e:
+        logger.warning(
+            'can not get overview metrics from cache',
+            cache_key=cache_key,
+            error=e,
+        )
+        cached = None
+
+    if cached is not None:
+        return cached
+
+    metrics = _compute_overview_metrics(organization, scope)
+
+    try:
+        cache.set(cache_key, metrics, OVERVIEW_METRICS_CACHE_TTL_SECONDS)
+    except Exception as e:
+        logger.warning(
+            'can not set overview metrics to cache',
+            cache_key=cache_key,
+            error=e,
+        )
+
+    return metrics
+
+
+def _compute_overview_metrics(
     organization: Organization,
     scope: EffectiveScope,
 ) -> dict[str, Any]:
