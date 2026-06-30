@@ -31,3 +31,7 @@ private/
 goal.md
 AGENTS.md
 CLAUDE.md
+design_*
+
+# Local-only repository governance checks (pre-commit); not shipped in the repo
+.githooks/
