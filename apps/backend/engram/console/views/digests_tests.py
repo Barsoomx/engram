@@ -227,6 +227,27 @@ def test_get_weekly_digest_returns_expected_structure(
 
 
 @pytest.mark.django_db
+def test_get_weekly_digest_returns_digest_memory_id(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    result = _fake_weekly_result(f_project)
+
+    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
+        m_service_cls.return_value.execute.return_value = result
+
+        response = f_read_client.get(
+            '/v1/admin/digests/weekly',
+            {'project_id': str(f_project.id)},
+        )
+
+    assert response.status_code == 200
+
+    assert response.data['digest_memory_id'] == str(result.digest_memory.id)
+
+
+@pytest.mark.django_db
 def test_get_weekly_digest_changelog_flattens_buckets(
     f_read_client: APIClient,
     f_org: Organization,

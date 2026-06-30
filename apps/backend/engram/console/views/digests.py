@@ -72,6 +72,7 @@ class WeeklyDigestView(APIView):
 
         return Response(
             {
+                'digest_memory_id': str(result.digest_memory.id),
                 'window_start': metadata.get('window_start'),
                 'window_end': metadata.get('window_end'),
                 'window_days': metadata.get('window_days'),

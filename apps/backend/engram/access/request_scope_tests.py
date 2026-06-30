@@ -126,6 +126,32 @@ def test_session_admin_can_list_audit_events() -> None:
 
 
 @pytest.mark.django_db
+def test_session_admin_can_dry_run_hooks() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    _user, token = _make_admin_session(organization)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/hooks/dry-run',
+        {
+            'project_id': str(project.id),
+            'agent_runtime': 'codex',
+            'request_id': 'dry-run-session-1',
+        },
+        format='json',
+        **_session_headers(token, organization.slug),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['status'] == 'ok'
+    assert body['request_id'] == 'dry-run-session-1'
+    assert body['scope']['organization_id'] == str(organization.id)
+    assert 'observations:write' in body['scope']['capabilities']
+    assert body['server'] == {'health': 'ok'}
+
+
+@pytest.mark.django_db
 def test_session_user_without_capability_is_denied_secrets() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     _user, token = _make_developer_session(organization)

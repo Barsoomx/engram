@@ -3,13 +3,15 @@ from __future__ import annotations
 from typing import Any
 
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from engram.access.request_scope import resolve_request_scope
 from engram.access.services import AccessDeniedError
 from engram.hooks.serializers import HookDryRunSerializer, HookEventSerializer
-from engram.hooks.services import HookDryRunInput, HookEventInput, IngestHookEvent, VerifyHookDryRun
+from engram.hooks.services import HookEventInput, IngestHookEvent
 
 ACCESS_STATUS = {
     'invalid_key': status.HTTP_401_UNAUTHORIZED,
@@ -40,33 +42,30 @@ def access_error_response(error: AccessDeniedError) -> Response:
 
 
 class HookDryRunView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def post(self, request: Request) -> Response:
         serializer = HookDryRunSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+        request_id = data.get('request_id', '')
+
         try:
-            result = VerifyHookDryRun().execute(
-                HookDryRunInput(
-                    raw_key=bearer_key(request),
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    agent_runtime=data['agent_runtime'],
-                    agent_version=data.get('agent_version', ''),
-                    request_id=data.get('request_id', ''),
-                ),
+            scope = resolve_request_scope(
+                request,
+                required_capability='observations:write',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                request_id=request_id,
             )
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        scope = result.scope
-
         return Response(
             {
                 'status': 'ok',
-                'request_id': result.request_id,
+                'request_id': request_id,
                 'resolved_actor': {'type': scope.actor_type, 'id': scope.actor_id},
                 'scope': {
                     'organization_id': str(scope.organization_id),
