@@ -15,6 +15,7 @@ from engram.access.models import (
     Capability,
     Identity,
     IdentityType,
+    MembershipStatus,
     OrganizationMembership,
     Role,
 )
@@ -144,6 +145,7 @@ def invite_member(
         organization=organization,
         identity=identity,
         role=role,
+        status=MembershipStatus.INVITED,
     )
 
 

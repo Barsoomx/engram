@@ -110,7 +110,7 @@ def test_list_returns_member_organizations_with_pagination(f_owner_user_token: s
 
     org = response.data['results'][0]
 
-    assert set(org.keys()) == {'id', 'name', 'slug', 'created_at', 'updated_at'}
+    assert set(org.keys()) == {'id', 'name', 'slug', 'created_at', 'updated_at', 'member_count', 'viewer_role'}
 
     assert org['slug'] == 'acme'
 
@@ -222,3 +222,54 @@ def test_patch_denied_without_admin_capability(
     )
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_list_includes_member_count(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    Identity.objects.create(
+        organization=f_owned_org,
+        identity_type=IdentityType.USER,
+        external_id='extra@acme.test',
+        display_name='Extra',
+    )
+
+    OrganizationMembership.objects.create(
+        organization=f_owned_org,
+        identity=Identity.objects.create(
+            organization=f_owned_org,
+            identity_type=IdentityType.USER,
+            external_id='second@acme.test',
+            display_name='Second',
+        ),
+        role=_make_role('developer'),
+    )
+
+    client = _auth_client(f_owner_user_token)
+
+    response = client.get('/v1/admin/organizations/')
+
+    assert response.status_code == 200
+
+    org = response.data['results'][0]
+
+    assert org['member_count'] == 2
+
+
+@pytest.mark.django_db
+def test_list_includes_viewer_role(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_user: User,
+) -> None:
+    client = _auth_client(f_owner_user_token)
+
+    response = client.get('/v1/admin/organizations/')
+
+    assert response.status_code == 200
+
+    org = response.data['results'][0]
+
+    assert org['viewer_role'] == 'organization_owner'

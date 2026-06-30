@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Subquery
 from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.serializers import BaseSerializer
 
 from engram.access.auth_services import external_id_for_user
-from engram.access.models import Identity, IdentityType
+from engram.access.models import Identity, IdentityType, OrganizationMembership
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.organizations import (
@@ -50,10 +51,35 @@ class OrganizationViewSet(
                 external_id=external_id_for_user(self.request.user),
             ).values('id')
 
-            return Organization.objects.filter(
-                organization_memberships__identity_id__in=identity_ids,
-                organization_memberships__active=True,
-            ).distinct()
+            member_count_sq = Subquery(
+                OrganizationMembership.objects.filter(
+                    organization_id=OuterRef('id'),
+                    active=True,
+                )
+                .values('organization_id')
+                .annotate(cnt=Count('id'))
+                .values('cnt'),
+                output_field=IntegerField(),
+            )
+
+            return (
+                Organization.objects.filter(
+                    organization_memberships__identity_id__in=identity_ids,
+                    organization_memberships__active=True,
+                )
+                .distinct()
+                .annotate(member_count=member_count_sq)
+                .prefetch_related(
+                    Prefetch(
+                        'organization_memberships',
+                        queryset=OrganizationMembership.objects.filter(
+                            identity_id__in=identity_ids,
+                            active=True,
+                        ).select_related('role'),
+                        to_attr='viewer_memberships',
+                    )
+                )
+            )
 
         return Organization.objects.filter(
             organization_memberships__identity=self.request.user_identity,

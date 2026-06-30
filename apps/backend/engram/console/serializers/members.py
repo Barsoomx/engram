@@ -8,6 +8,7 @@ from engram.core.models import Organization
 
 class MemberReadSerializer(serializers.ModelSerializer):
     role = serializers.SerializerMethodField()
+    role_name = serializers.CharField(source='role.name', read_only=True)
     identity_type = serializers.CharField(source='identity.identity_type')
 
     external_id = serializers.CharField(source='identity.external_id')
@@ -25,7 +26,9 @@ class MemberReadSerializer(serializers.ModelSerializer):
             'email',
             'identity_type',
             'active',
+            'status',
             'role',
+            'role_name',
         ]
 
     def get_role(self, obj: OrganizationMembership) -> str:
