@@ -71,6 +71,16 @@ accept_content = ['json']
 result_serializer = 'json'
 enable_utc = True
 
+task_routes = {
+    'engram.memory.process_observation_recorded': {'queue': QUEUE_NEAR_REALTIME},
+    'engram.memory.distill_session': {'queue': QUEUE_NEAR_REALTIME},
+    'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
+    'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},
+}
+
+task_soft_time_limit = 120
+task_time_limit = 180
+
 task_queues = (
     Queue(
         QUEUE_REALTIME,
