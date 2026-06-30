@@ -218,3 +218,25 @@ def test_update_memory_body_is_idempotent_for_same_body() -> None:
     assert first.json()['current_version'] == 2
     assert second.json()['current_version'] == 2
     assert MemoryVersion.objects.filter(memory=memory).count() == 2
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('stale_field', ['stale', 'refuted'])
+def test_update_memory_body_rejects_stale_or_refuted_memory(stale_field: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    setattr(memory, stale_field, True)
+    memory.save(update_fields=[stale_field, 'updated_at'])
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'memory_not_editable'
+    assert MemoryVersion.objects.filter(memory=memory).count() == 1
