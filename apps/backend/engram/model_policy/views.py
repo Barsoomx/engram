@@ -92,7 +92,7 @@ class ProviderSecretListView(ModelPolicyBaseView):
         try:
             scope = self._scope(
                 request,
-                required_capability='secrets:*',
+                required_capability='secrets:read',
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
                 target_type='provider_secret',
@@ -153,7 +153,7 @@ class ProviderSecretDetailView(ModelPolicyBaseView):
         try:
             scope = self._scope(
                 request,
-                required_capability='secrets:*',
+                required_capability='secrets:read',
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
                 target_type='provider_secret',
@@ -277,7 +277,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
         try:
             scope = self._scope(
                 request,
-                required_capability='model_policy:*',
+                required_capability='model_policy:read',
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
                 target_type='model_policy',
@@ -345,7 +345,7 @@ class ModelPolicyResolveView(ModelPolicyBaseView):
         try:
             scope = self._scope(
                 request,
-                required_capability='model_policy:*',
+                required_capability='model_policy:read',
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
                 target_type='model_policy',
@@ -375,7 +375,7 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
         try:
             scope = self._scope(
                 request,
-                required_capability='model_policy:*',
+                required_capability='model_policy:read',
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
                 target_type='model_policy',

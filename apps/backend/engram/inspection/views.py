@@ -77,7 +77,7 @@ class InspectionBaseView(APIView):
 
 
 class MemoryInspectionListView(InspectionBaseView):
-    required_capability = 'memories:admin'
+    required_capability = 'memories:read'
     target_type = 'memory'
 
     def get(self, request: Request) -> Response:
@@ -96,7 +96,7 @@ class MemoryInspectionListView(InspectionBaseView):
 
 
 class MemoryInspectionCountView(InspectionBaseView):
-    required_capability = 'memories:admin'
+    required_capability = 'memories:read'
     target_type = 'memory'
 
     def get(self, request: Request) -> Response:
@@ -110,7 +110,7 @@ class MemoryInspectionCountView(InspectionBaseView):
 
 
 class MemoryInspectionDetailView(InspectionBaseView):
-    required_capability = 'memories:admin'
+    required_capability = 'memories:read'
     target_type = 'memory'
 
     def get(self, request: Request, memory_id: uuid.UUID) -> Response:
@@ -126,7 +126,7 @@ class MemoryInspectionDetailView(InspectionBaseView):
 
 
 class ContextBundleInspectionListView(InspectionBaseView):
-    required_capability = 'memories:admin'
+    required_capability = 'context:read'
     target_type = 'context_bundle'
 
     def get(self, request: Request) -> Response:
@@ -145,7 +145,7 @@ class ContextBundleInspectionListView(InspectionBaseView):
 
 
 class ContextBundleInspectionDetailView(InspectionBaseView):
-    required_capability = 'memories:admin'
+    required_capability = 'context:read'
     target_type = 'context_bundle'
 
     def get(self, request: Request, bundle_id: uuid.UUID) -> Response:
