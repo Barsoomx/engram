@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -126,3 +127,172 @@ def test_list_observations_filters_by_team() -> None:
     items = response.json()['items']
     assert len(items) == 1
     assert items[0]['title'] == 'In team'
+
+
+@pytest.mark.django_db
+def test_observation_list_offset_paginates() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    for i in range(4):
+        create_observation(organization, team, project, title=f'Obs {i}', content_hash=f'h-page-{i}')
+    client = APIClient()
+
+    page_one = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'limit': 2, 'offset': 0},
+        **auth_headers(),
+    )
+    page_two = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'limit': 2, 'offset': 2},
+        **auth_headers(),
+    )
+
+    assert page_one.status_code == 200
+    assert len(page_one.json()['items']) == 2
+    assert page_two.status_code == 200
+    assert len(page_two.json()['items']) == 2
+    ids_one = {i['observation_id'] for i in page_one.json()['items']}
+    ids_two = {i['observation_id'] for i in page_two.json()['items']}
+    assert ids_one.isdisjoint(ids_two)
+
+
+@pytest.mark.django_db
+def test_observation_list_filter_by_observation_type() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    tool_obs = create_observation(organization, team, project, title='Tool obs', content_hash='h-tool-type')
+    agent = tool_obs.agent
+    session = tool_obs.session
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        observation_type='code_review',
+        title='Code review obs',
+        body='Body.',
+        content_hash='h-code-type',
+        observed_at=timezone.now(),
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'observation_type': 'tool_use', 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    assert len(items) == 1
+    assert items[0]['observation_id'] == str(tool_obs.id)
+
+
+@pytest.mark.django_db
+def test_observation_list_filter_by_session_id() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    obs_a = create_observation(organization, team, project, title='Session A obs', content_hash='h-sess-a')
+    obs_b = create_observation(organization, team, project, title='Session B obs', content_hash='h-sess-b')
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'session_id': str(obs_a.session_id), 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    ids = {i['observation_id'] for i in items}
+    assert str(obs_a.id) in ids
+    assert str(obs_b.id) not in ids
+
+
+@pytest.mark.django_db
+def test_observation_list_filter_by_since_until() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    now = timezone.now()
+    old_obs = create_observation(organization, team, project, title='Old obs', content_hash='h-since-old')
+    old_obs.created_at = now - timedelta(days=10)
+    old_obs.save(update_fields=['created_at'])
+    new_obs = create_observation(organization, team, project, title='New obs', content_hash='h-since-new')
+    new_obs.created_at = now - timedelta(days=1)
+    new_obs.save(update_fields=['created_at'])
+    since_str = (now - timedelta(days=5)).isoformat()
+    until_str = now.isoformat()
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'since': since_str, 'until': until_str, 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    ids = {i['observation_id'] for i in response.json()['items']}
+    assert str(new_obs.id) in ids
+    assert str(old_obs.id) not in ids
+
+
+@pytest.mark.django_db
+def test_observation_detail_returns_observation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    obs = create_observation(
+        organization,
+        team,
+        project,
+        title=f'Detail obs {RAW_KEY}',
+        content_hash='h-detail-obs',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['observation_id'] == str(obs.id)
+    assert body['title'] == 'Detail obs [REDACTED]'
+    assert RAW_KEY not in str(body)
+    assert 'request_id' in body
+
+
+@pytest.mark.django_db
+def test_observation_detail_cross_project_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    other_project = Project.objects.create(organization=organization, name='Other proj', slug='other-obs-detail')
+    obs = create_observation(organization, team, other_project, title='Other proj obs', content_hash='h-cross-proj')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'observation_not_found'
+
+
+@pytest.mark.django_db
+def test_observation_detail_missing_capability_returns_403() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    obs = create_observation(organization, team, project, title='No cap obs', content_hash='h-no-cap-obs')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403

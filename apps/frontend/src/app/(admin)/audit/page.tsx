@@ -222,7 +222,7 @@ export default function AuditPage() {
         params.team_id = activeTeamId;
       }
 
-      const response = await client.get<AuditEventsResponse>('/v1/inspection/audit-events/', { params });
+      const response = await client.get<AuditEventsResponse>('/v1/inspection/audit-events', { params });
 
       return response.data;
     },

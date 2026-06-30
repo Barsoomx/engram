@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from django.db.models import Prefetch, Q, QuerySet
 
@@ -39,6 +40,14 @@ class InspectionScopeInput:
 class InspectionScope:
     project: Project
     scope: EffectiveScope
+    limit: int = 50
+    offset: int = 0
+    status: str | None = None
+    kind: str | None = None
+    event_type: str | None = None
+    correlation_id: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
 
     @property
     def team_filter(self) -> Q:
@@ -62,7 +71,13 @@ class ResolveInspectionScope:
 
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
-        return self._base_queryset(inspection_scope).order_by('created_at', 'id')
+        qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
+        if inspection_scope.status:
+            qs = qs.filter(status=inspection_scope.status)
+        if inspection_scope.kind:
+            qs = qs.filter(metadata__kind=inspection_scope.kind)
+
+        return qs
 
     def detail(self, inspection_scope: InspectionScope, memory_id: uuid.UUID) -> Memory:
         memory = self._base_queryset(inspection_scope).filter(id=memory_id).first()
@@ -165,7 +180,13 @@ class ListInspectionMemories:
 
 class ListInspectionContextBundles:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[ContextBundle]:
-        return self._base_queryset(inspection_scope).order_by('created_at', 'id')
+        qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
+        if inspection_scope.since:
+            qs = qs.filter(created_at__gte=inspection_scope.since)
+        if inspection_scope.until:
+            qs = qs.filter(created_at__lt=inspection_scope.until)
+
+        return qs
 
     def detail(self, inspection_scope: InspectionScope, bundle_id: uuid.UUID) -> ContextBundle:
         bundle = self._base_queryset(inspection_scope).filter(id=bundle_id).first()
@@ -197,7 +218,7 @@ class ListInspectionContextBundles:
 
 class ListInspectionAuditEvents:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[AuditEvent]:
-        return (
+        qs = (
             AuditEvent.objects.filter(
                 organization_id=inspection_scope.scope.organization_id,
                 project=inspection_scope.project,
@@ -210,3 +231,28 @@ class ListInspectionAuditEvents:
             )
             .order_by('created_at', 'id')
         )
+        if inspection_scope.event_type:
+            qs = qs.filter(event_type=inspection_scope.event_type)
+        if inspection_scope.correlation_id:
+            qs = qs.filter(request_id=inspection_scope.correlation_id)
+        if inspection_scope.since:
+            qs = qs.filter(created_at__gte=inspection_scope.since)
+        if inspection_scope.until:
+            qs = qs.filter(created_at__lt=inspection_scope.until)
+
+        return qs
+
+    def detail(self, inspection_scope: InspectionScope, audit_event_id: uuid.UUID) -> AuditEvent:
+        ae = (
+            AuditEvent.objects.filter(
+                organization_id=inspection_scope.scope.organization_id,
+                project=inspection_scope.project,
+                id=audit_event_id,
+            )
+            .filter(inspection_scope.team_filter)
+            .first()
+        )
+        if ae is None:
+            raise InspectionNotFoundError('audit_event_not_found', 'Audit event was not found')
+
+        return ae
