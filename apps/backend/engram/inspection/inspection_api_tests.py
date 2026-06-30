@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from rest_framework.test import APIClient
 
-from engram.access.models import ApiKeyCapability, Capability, Identity, OrganizationMembership, ProjectGrant, Role
+from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
+    Identity,
+    OrganizationMembership,
+    ProjectGrant,
+    Role,
+)
 from engram.context.context_api_tests import (
     RAW_KEY,
     auth_headers,
@@ -18,6 +28,10 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    MemoryLink,
+    Organization,
+    Project,
+    ProjectTeam,
     Runtime,
     Team,
     VisibilityScope,
@@ -203,6 +217,260 @@ def test_memory_inspection_lists_authorized_memories_and_redacts_detail_metadata
 
 
 @pytest.mark.django_db
+def test_memory_inspection_returns_enriched_payload_fields() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Enriched memory',
+        body='Enriched body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    memory.confidence = '0.750'
+    memory.metadata = {
+        'kind': 'digest',
+        'tags': ['auth', 'retrieval'],
+        'file_paths': ['apps/backend/engram/core/models.py'],
+    }
+    memory.save(update_fields=['confidence', 'metadata', 'updated_at'])
+    client = APIClient()
+
+    list_response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+    detail_response = client.get(
+        f'/v1/inspection/memories/{memory.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert list_response.status_code == 200
+    item = next(i for i in list_response.json()['items'] if i['id'] == str(memory.id))
+    assert item['kind'] == 'digest'
+    assert item['tags'] == ['auth', 'retrieval']
+    assert item['file_paths'] == ['apps/backend/engram/core/models.py']
+    assert item['confidence_percent'] == 75.0
+    assert item['authorized_for_injection'] is True
+    assert item['project_name'] == project.name
+    assert item['project_slug'] == project.slug
+    assert item['captured_by'] is None
+
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail['kind'] == 'digest'
+    assert detail['tags'] == ['auth', 'retrieval']
+    assert detail['file_paths'] == ['apps/backend/engram/core/models.py']
+    assert detail['confidence_percent'] == 75.0
+    assert detail['authorized_for_injection'] is True
+    assert detail['project_name'] == project.name
+    assert detail['project_slug'] == project.slug
+    assert 'related' in detail
+
+
+@pytest.mark.django_db
+def test_memory_inspection_authorized_for_injection_false_when_stale() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Stale memory',
+        body='Stale body.',
+    )
+    memory.stale = True
+    memory.save(update_fields=['stale', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    item = next(i for i in response.json()['items'] if i['id'] == str(memory.id))
+    assert item['authorized_for_injection'] is False
+
+
+@pytest.mark.django_db
+def test_memory_inspection_confidence_percent_null_when_absent() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='No confidence memory',
+        body='Body.',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    item = next(i for i in response.json()['items'] if i['id'] == str(memory.id))
+    assert item['confidence_percent'] is None
+    assert item['confidence'] is None
+
+
+@pytest.mark.django_db
+def test_memory_inspection_related_memories_on_detail() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory_a, _va, _da = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Memory A',
+        body='Body A.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    memory_b, _vb, _db = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Memory B',
+        body='Body B.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory_a,
+        link_type='narrowed_by',
+        target=str(memory_b.id),
+        label='narrowed',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory_a.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    detail = response.json()
+    related_ids = {r['id'] for r in detail['related']}
+    assert str(memory_b.id) in related_ids
+    link_types = {r['link_type'] for r in detail['related'] if r['id'] == str(memory_b.id)}
+    assert 'narrowed_by' in link_types
+
+
+@pytest.mark.django_db
+def test_memory_inspection_related_memories_excludes_other_team() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    other_team = Team.objects.create(organization=organization, name='Other', slug='other-rel')
+    project.team_links.create(organization=organization, team=other_team)
+    memory_a, _va, _da = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Memory A related',
+        body='Body A.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    other_memory, _vo, _do = create_approved_memory_document(
+        organization,
+        other_team,
+        project,
+        title='Other team memory related',
+        body='Should not appear.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory_a,
+        link_type='narrowed_by',
+        target=str(other_memory.id),
+        label='narrowed',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory_a.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    related_ids = {r['id'] for r in response.json()['related']}
+    assert str(other_memory.id) not in related_ids
+
+
+@pytest.mark.django_db
+def test_memory_inspection_count_endpoint_returns_approved_count() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Approved one',
+        body='Approved.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Approved two',
+        body='Approved.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    archived = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Archived memory',
+        body='Archived.',
+        visibility_scope=VisibilityScope.TEAM,
+    )[0]
+    archived.status = 'archived'
+    archived.save(update_fields=['status', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories/count',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 2
+
+
+@pytest.mark.django_db
+def test_memory_inspection_count_requires_admin_capability() -> None:
+    create_project_scope()
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories/count',
+        {'project_id': str(uuid.uuid4())},
+        **auth_headers(),
+    )
+
+    assert response.status_code in (400, 403)
+
+
+@pytest.mark.django_db
 def test_context_bundle_inspection_returns_items_and_hides_other_team_bundles() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
@@ -305,6 +573,224 @@ def test_audit_inspection_requires_audit_read_and_redacts_metadata() -> None:
 
     assert second_allowed_response.status_code == 200
     assert [item['id'] for item in second_allowed_response.json()['items']] == [str(audit.id)]
+
+
+@pytest.mark.django_db
+def test_audit_inspection_resolves_actor_display_name_for_api_key() -> None:
+    scope = create_project_scope()
+    organization, team, project, owner, api_key = scope
+    create_audit_key(scope)
+    audit = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id=str(api_key.id),
+        target_type='memory',
+        target_id=str(uuid.uuid4()),
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-actor-display',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    item = next(i for i in response.json()['items'] if i['id'] == str(audit.id))
+    assert item['actor_display'] == owner.display_name
+    assert 'actor_display' in item
+    assert 'target_display' in item
+
+
+@pytest.mark.django_db
+def test_audit_inspection_resolves_target_display_name_for_memory() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Target memory title',
+        body='Body.',
+    )
+    audit = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id='non-uuid-actor',
+        target_type='memory',
+        target_id=str(memory.id),
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-target-display',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    item = next(i for i in response.json()['items'] if i['id'] == str(audit.id))
+    assert item['target_display'] == 'Target memory title'
+    assert item['actor_display'] is None
+
+
+@pytest.mark.django_db
+def test_audit_inspection_actor_target_display_is_n_plus_1_bounded() -> None:
+    scope = create_project_scope()
+    organization, team, project, owner, api_key = scope
+    create_audit_key(scope)
+    for i in range(5):
+        AuditEvent.objects.create(
+            organization=organization,
+            project=project,
+            event_type='MemoryRetrieved',
+            actor_type='api_key',
+            actor_id=str(api_key.id),
+            target_type='project',
+            target_id=str(project.id),
+            capability='memories:read',
+            result=AuditResult.ALLOWED,
+            request_id=f'req-bounded-{i}',
+        )
+    client = APIClient()
+
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    with CaptureQueriesContext(connection) as ctx:
+        response = client.get(
+            '/v1/inspection/audit-events',
+            {'project_id': str(project.id)},
+            **auth_headers(AUDIT_RAW_KEY),
+        )
+
+    assert response.status_code == 200
+    n_events = 5
+    api_key_queries = [q for q in ctx.captured_queries if 'access_apikey' in q['sql'].lower()]
+    # Batch resolution does 1 query per actor type regardless of event count.
+    # Auth overhead adds a few more queries. N+1 for api_key would add n_events extra.
+    # Bound: auth overhead + 1 batch < auth overhead + n_events (N+1 minimum).
+    assert len(api_key_queries) <= n_events  # batch: ~4; N+1: ~8 — catches regression
+
+
+@pytest.mark.django_db
+def test_cross_tenant_isolation_audit_name_resolution() -> None:
+    scope_a = create_project_scope()
+    organization_a, team_a, project_a, owner_a, api_key_a = scope_a
+    create_audit_key(scope_a)
+
+    organization_b = Organization.objects.create(name='Other Org', slug='other-org-ct')
+    team_b = Team.objects.create(organization=organization_b, name='Platform B', slug='platform-b')
+    project_b = Project.objects.create(
+        organization=organization_b,
+        name='Backend B',
+        slug='backend-b',
+    )
+    ProjectTeam.objects.create(organization=organization_b, team=team_b, project=project_b)
+    owner_b = Identity.objects.create(
+        organization=organization_b,
+        identity_type='service_account',
+        external_id='svc-b',
+        display_name='Org B Identity Should Not Appear',
+    )
+    api_key_b = ApiKey.objects.create(
+        organization=organization_b,
+        owner_identity=owner_b,
+        name='Key B',
+        key_prefix='egk_test_b_',
+        key_hash='hash_b_cross_tenant_test',
+        key_fingerprint='fp_b_cross_tenant_test',
+    )
+
+    audit = AuditEvent.objects.create(
+        organization=organization_a,
+        project=project_a,
+        event_type='MemoryRetrieved',
+        actor_type='api_key',
+        actor_id=str(api_key_b.id),
+        target_type='memory',
+        target_id=str(uuid.uuid4()),
+        capability='memories:read',
+        result=AuditResult.ALLOWED,
+        request_id='req-cross-tenant',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project_a.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    item = next(i for i in response.json()['items'] if i['id'] == str(audit.id))
+    assert item['actor_display'] is None
+    assert 'Org B Identity Should Not Appear' not in str(response.json())
+
+
+@pytest.mark.django_db
+def test_cross_tenant_isolation_related_memories() -> None:
+    scope_a = create_project_scope()
+    organization_a, team_a, project_a, _owner_a, _api_key_a = scope_a
+    create_memory_admin_key(scope_a)
+
+    organization_b = Organization.objects.create(name='Other Org Mem', slug='other-org-mem-ct')
+    team_b = Team.objects.create(organization=organization_b, name='Platform B', slug='platform-b-mem')
+    project_b = Project.objects.create(
+        organization=organization_b,
+        name='Backend B',
+        slug='backend-b-mem',
+    )
+    ProjectTeam.objects.create(organization=organization_b, team=team_b, project=project_b)
+
+    memory_a, _va, _da = create_approved_memory_document(
+        organization_a,
+        team_a,
+        project_a,
+        title='Org A memory',
+        body='Org A body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    memory_b, _vb, _db = create_approved_memory_document(
+        organization_b,
+        team_b,
+        project_b,
+        title='Org B secret memory should not appear',
+        body='Org B secret body.',
+    )
+    MemoryLink.objects.create(
+        organization=organization_a,
+        project=project_a,
+        memory=memory_a,
+        link_type='narrowed_by',
+        target=str(memory_b.id),
+        label='cross-tenant link',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory_a.id}',
+        {'project_id': str(project_a.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    related_ids = {r['id'] for r in response.json()['related']}
+    assert str(memory_b.id) not in related_ids
+    assert 'Org B secret memory should not appear' not in str(response.json())
 
 
 @pytest.mark.django_db

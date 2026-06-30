@@ -11,6 +11,8 @@ from engram.core.models import (
     ContextBundle,
     ContextBundleItem,
     Memory,
+    MemoryLink,
+    MemoryStatus,
     MemoryVersion,
     Project,
     RetrievalDocument,
@@ -69,6 +71,83 @@ class ListInspectionMemories:
 
         return memory
 
+    def count(self, inspection_scope: InspectionScope) -> int:
+        return (
+            Memory.objects.filter(
+                organization_id=inspection_scope.scope.organization_id,
+                project=inspection_scope.project,
+                status=MemoryStatus.APPROVED,
+            )
+            .filter(inspection_scope.team_filter)
+            .count()
+        )
+
+    def related_memories(
+        self,
+        inspection_scope: InspectionScope,
+        memory_id: uuid.UUID,
+    ) -> list[tuple[Memory, str | None]]:
+        org_id = inspection_scope.scope.organization_id
+        project = inspection_scope.project
+        team_filter = inspection_scope.team_filter
+
+        outgoing_links = list(
+            MemoryLink.objects.filter(
+                organization_id=org_id,
+                project=project,
+                memory_id=memory_id,
+            )
+        )
+        incoming_links = list(
+            MemoryLink.objects.filter(
+                organization_id=org_id,
+                project=project,
+                target=str(memory_id),
+            ).exclude(memory_id=memory_id)
+        )
+
+        related_id_to_link_type: dict[uuid.UUID, str | None] = {}
+        for link in outgoing_links:
+            try:
+                target_id = uuid.UUID(str(link.target))
+                if target_id != memory_id:
+                    related_id_to_link_type[target_id] = link.link_type
+            except ValueError:
+                pass
+
+        for link in incoming_links:
+            mid = link.memory_id
+            if mid not in related_id_to_link_type:
+                related_id_to_link_type[mid] = link.link_type
+
+        result: list[tuple[Memory, str | None]] = []
+        if related_id_to_link_type:
+            linked = list(
+                Memory.objects.filter(
+                    organization_id=org_id,
+                    project=project,
+                    id__in=related_id_to_link_type.keys(),
+                )
+                .filter(team_filter)
+                .only('id', 'title')[:10]
+            )
+            result = [(m, related_id_to_link_type.get(m.id)) for m in linked]
+
+        if len(result) < 10:
+            existing_ids = {m.id for m, _ in result} | {memory_id}
+            siblings = list(
+                Memory.objects.filter(
+                    organization_id=org_id,
+                    project=project,
+                )
+                .filter(team_filter)
+                .exclude(id__in=existing_ids)
+                .only('id', 'title')[: 10 - len(result)]
+            )
+            result.extend((m, None) for m in siblings)
+
+        return result
+
     def _base_queryset(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
         return (
             Memory.objects.filter(
@@ -76,6 +155,7 @@ class ListInspectionMemories:
                 project=inspection_scope.project,
             )
             .filter(inspection_scope.team_filter)
+            .select_related('project')
             .prefetch_related(
                 Prefetch('versions', queryset=MemoryVersion.objects.order_by('version')),
                 Prefetch('retrieval_documents', queryset=RetrievalDocument.objects.order_by('created_at', 'id')),
