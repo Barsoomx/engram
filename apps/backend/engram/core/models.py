@@ -7,8 +7,9 @@ from django.core.exceptions import ValidationError
 from django.db import models
 
 try:
-    from pgvector.django import VectorField
+    from pgvector.django import HnswIndex, VectorField
 except ImportError:
+    HnswIndex = None
     VectorField = None
 
 
@@ -631,6 +632,19 @@ class RetrievalDocument(TimestampedModel):
         indexes = [
             models.Index(fields=['organization', 'project', 'visibility_scope']),
             models.Index(fields=['organization', 'project', 'stale', 'refuted']),
+            *(
+                [
+                    HnswIndex(
+                        name='core_retdoc_emb_hnsw',
+                        fields=['embedding_pgvector'],
+                        opclasses=['vector_cosine_ops'],
+                        m=16,
+                        ef_construction=64,
+                    ),
+                ]
+                if VectorField is not None
+                else []
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'memory_id']
 
