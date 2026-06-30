@@ -196,6 +196,41 @@ def redact_text(value: object) -> str:
     return str(redact_value(value).value)
 
 
+def estimate_tokens(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def _pack_to_budget(
+    matches: tuple[RetrievalMatch, ...],
+    token_budget: int | None,
+    limit: int,
+) -> tuple[tuple[RetrievalMatch, ...], tuple[RetrievalMatch, ...]]:
+    if token_budget is None:
+        return matches[:limit], matches[limit:]
+
+    kept: list[RetrievalMatch] = []
+    dropped: list[RetrievalMatch] = []
+    tokens_used = 0
+
+    for match in matches:
+        if len(kept) >= limit:
+            dropped.append(match)
+            continue
+
+        memory = match.document.memory
+        index = len(kept) + 1
+        block = f'- [M{index}] {redact_text(memory.title)}\n  {redact_text(memory.body)}'
+        cost = estimate_tokens(block)
+
+        if not kept or tokens_used + cost <= token_budget:
+            kept.append(match)
+            tokens_used += cost
+        else:
+            dropped.append(match)
+
+    return tuple(kept), tuple(dropped)
+
+
 SEMANTIC_MIN_SIMILARITY = 0.3
 
 
