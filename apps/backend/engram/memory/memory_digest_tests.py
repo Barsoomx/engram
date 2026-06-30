@@ -124,3 +124,23 @@ def test_generate_digest_wraps_provider_failure_as_worker_error() -> None:
             DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-fail'),
         )
     assert Memory.objects.filter(metadata__kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_generate_digest_is_idempotent_on_replay() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    source = create_source_memory(organization, team, project, title='Idempotent source')
+    digest_input = DigestInput(
+        project_id=project.id,
+        memory_ids=(source.id,),
+        request_id='digest-idem-1',
+    )
+
+    result1 = GenerateDigest().execute(digest_input)
+    result2 = GenerateDigest().execute(digest_input)
+
+    assert Memory.objects.filter(metadata__kind='digest', project=project).count() == 1
+    assert result2.memory.id == result1.memory.id
+    assert result2.memory_version.id == result1.memory_version.id
+    assert result2.retrieval_document.id == result1.retrieval_document.id

@@ -15,23 +15,33 @@ from engram.memory.services import (
     run_daily_digest_with_tracking,
 )
 
+_RETRY_BACKOFF_BASE = 5
+_MAX_RETRIES = 3
 
-@app.task(name='engram.memory.process_observation_recorded')
-def process_observation_recorded(observation_id: object) -> str:
+
+@app.task(bind=True, name='engram.memory.process_observation_recorded', max_retries=_MAX_RETRIES)
+def process_observation_recorded(self: object, observation_id: object) -> str:
     try:
         parsed_observation_id = uuid.UUID(observation_id)
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed observation id') from error
 
-    result = ProcessObservationRecorded().execute(
-        MemoryCandidateWorkerInput(observation_id=parsed_observation_id),
-    )
+    try:
+        result = ProcessObservationRecorded().execute(
+            MemoryCandidateWorkerInput(observation_id=parsed_observation_id),
+        )
+    except MemoryWorkerError as exc:
+        if exc.retryable:
+            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
+            raise self.retry(exc=exc, countdown=countdown) from None
+        raise
 
     return str(result.memory.id)
 
 
-@app.task(name='engram.memory.generate_daily_digest')
+@app.task(bind=True, name='engram.memory.generate_daily_digest', max_retries=_MAX_RETRIES)
 def generate_daily_digest(
+    self: object,
     organization_id: object,
     project_id: object,
     memory_ids: list[str],
@@ -45,12 +55,18 @@ def generate_daily_digest(
 
     request_id = f'daily-digest:{parsed_project_id}'
 
-    result = run_daily_digest_with_tracking(
-        organization_id=parsed_organization_id,
-        project_id=parsed_project_id,
-        memory_ids=parsed_memory_ids,
-        request_id=request_id,
-    )
+    try:
+        result = run_daily_digest_with_tracking(
+            organization_id=parsed_organization_id,
+            project_id=parsed_project_id,
+            memory_ids=parsed_memory_ids,
+            request_id=request_id,
+        )
+    except MemoryWorkerError as exc:
+        if exc.retryable:
+            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
+            raise self.retry(exc=exc, countdown=countdown) from None
+        raise
 
     return str(result.memory.id)
 
