@@ -1,6 +1,7 @@
 from django.urls import path
 
 from engram.inspection.views import (
+    AuditEventInspectionDetailView,
     AuditEventInspectionListView,
     ContextBundleInspectionDetailView,
     ContextBundleInspectionListView,
@@ -20,4 +21,9 @@ urlpatterns = [
         name='inspection-context-bundle-detail',
     ),
     path('audit-events', AuditEventInspectionListView.as_view(), name='inspection-audit-events'),
+    path(
+        'audit-events/<uuid:audit_event_id>',
+        AuditEventInspectionDetailView.as_view(),
+        name='inspection-audit-event-detail',
+    ),
 ]

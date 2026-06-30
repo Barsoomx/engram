@@ -809,7 +809,7 @@ export default function MemoryDetailPage() {
         queryParams.team_id = activeTeamId;
       }
 
-      const response = await client.get<MemoryDetail>(`/v1/inspection/memories/${id}/`, { params: queryParams });
+      const response = await client.get<MemoryDetail>(`/v1/inspection/memories/${id}`, { params: queryParams });
 
       return response.data;
     },
