@@ -5,10 +5,10 @@ import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { apiClient, clearToken, fetchMe, logout, type MeResponse } from '@/lib/auth';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 const API_URL = process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000';
-const PROJECT_ID = process.env.NEXT_PUBLIC_ENGRAM_PROJECT_ID ?? '';
-const TEAM_ID = process.env.NEXT_PUBLIC_ENGRAM_TEAM_ID ?? '';
 
 type HealthStatus = {
   ok: boolean;
@@ -49,6 +49,8 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
 
 export default function SettingsPage() {
   const router = useRouter();
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
 
   const meQuery = useQuery<MeResponse>({
     queryKey: ['auth', 'me'],
@@ -136,11 +138,11 @@ export default function SettingsPage() {
           <DetailRow label='API URL'>
             <span className='font-mono text-xs'>{API_URL}</span>
           </DetailRow>
-          <DetailRow label='Project ID'>
-            <span className='font-mono text-xs'>{PROJECT_ID || '(not set)'}</span>
+          <DetailRow label='Active Project'>
+            <span className='font-mono text-xs'>{activeProjectId || '(not set)'}</span>
           </DetailRow>
-          <DetailRow label='Team ID'>
-            <span className='font-mono text-xs'>{TEAM_ID || '(not set)'}</span>
+          <DetailRow label='Active Team'>
+            <span className='font-mono text-xs'>{activeTeamId || '(not set)'}</span>
           </DetailRow>
         </dl>
       </div>

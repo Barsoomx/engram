@@ -4,6 +4,8 @@ import { useQuery } from '@tanstack/react-query';
 import * as React from 'react';
 
 import { apiClient } from '@/lib/auth';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 type MemoryItem = {
   id: string;
@@ -25,22 +27,6 @@ type MemoriesResponse = {
   count: number;
   items: MemoryItem[];
 };
-
-const PROJECT_ID = process.env.NEXT_PUBLIC_ENGRAM_PROJECT_ID ?? '';
-const TEAM_ID = process.env.NEXT_PUBLIC_ENGRAM_TEAM_ID ?? '';
-
-async function fetchMemories(): Promise<MemoriesResponse> {
-  const client = apiClient();
-  const params: Record<string, string> = { project_id: PROJECT_ID };
-
-  if (TEAM_ID) {
-    params.team_id = TEAM_ID;
-  }
-
-  const response = await client.get<MemoriesResponse>('/v1/inspection/memories/', { params });
-
-  return response.data;
-}
 
 function StatusBadge({ status }: { status: string }) {
   const tone =
@@ -81,19 +67,33 @@ function MemoriesTable({ items }: { items: MemoryItem[] }) {
 }
 
 export default function MemoriesPage() {
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
   const query = useQuery<MemoriesResponse>({
-    queryKey: ['inspection', 'memories', PROJECT_ID, TEAM_ID],
-    enabled: Boolean(PROJECT_ID),
-    queryFn: fetchMemories,
+    queryKey: ['inspection', 'memories', activeProjectId, activeTeamId],
+    enabled: Boolean(activeProjectId),
+    queryFn: async () => {
+      const client = apiClient();
+      const params: Record<string, string> = { project_id: activeProjectId ?? '' };
+
+      if (activeTeamId) {
+        params.team_id = activeTeamId;
+      }
+
+      const response = await client.get<MemoriesResponse>('/v1/inspection/memories/', { params });
+
+      return response.data;
+    },
   });
 
-  if (!PROJECT_ID) {
+  if (!activeProjectId) {
     return (
       <section>
         <h1 className='text-2xl font-semibold text-foreground'>Memories</h1>
-        <pre className='mt-4 text-sm text-default-500 bg-content2/50 rounded-medium p-3'>
-          NEXT_PUBLIC_ENGRAM_PROJECT_ID is not set.
-        </pre>
+        <p className='mt-4 text-sm text-default-500'>
+          Select a project to view memories.
+        </p>
       </section>
     );
   }

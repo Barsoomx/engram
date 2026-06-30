@@ -6,6 +6,8 @@ import { useParams } from 'next/navigation';
 import * as React from 'react';
 
 import { apiClient } from '@/lib/auth';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 type MemoryVersion = {
   version: number;
@@ -39,22 +41,6 @@ type MemoryDetail = {
   versions: MemoryVersion[];
   retrieval_documents: RetrievalDocument[];
 };
-
-const PROJECT_ID = process.env.NEXT_PUBLIC_ENGRAM_PROJECT_ID ?? '';
-const TEAM_ID = process.env.NEXT_PUBLIC_ENGRAM_TEAM_ID ?? '';
-
-async function fetchMemoryDetail(id: string): Promise<MemoryDetail> {
-  const client = apiClient();
-  const params: Record<string, string> = { project_id: PROJECT_ID };
-
-  if (TEAM_ID) {
-    params.team_id = TEAM_ID;
-  }
-
-  const response = await client.get<MemoryDetail>(`/v1/inspection/memories/${id}/`, { params });
-
-  return response.data;
-}
 
 function StatusBadge({ status }: { status: string }) {
   const tone =
@@ -152,19 +138,33 @@ export default function MemoryDetailPage() {
   const params = useParams<{ id: string }>();
   const id = params?.id ?? '';
 
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
   const query = useQuery<MemoryDetail>({
-    queryKey: ['inspection', 'memories', id, PROJECT_ID, TEAM_ID],
-    enabled: Boolean(PROJECT_ID) && Boolean(id),
-    queryFn: () => fetchMemoryDetail(id),
+    queryKey: ['inspection', 'memories', id, activeProjectId, activeTeamId],
+    enabled: Boolean(activeProjectId) && Boolean(id),
+    queryFn: async () => {
+      const client = apiClient();
+      const queryParams: Record<string, string> = { project_id: activeProjectId ?? '' };
+
+      if (activeTeamId) {
+        queryParams.team_id = activeTeamId;
+      }
+
+      const response = await client.get<MemoryDetail>(`/v1/inspection/memories/${id}/`, { params: queryParams });
+
+      return response.data;
+    },
   });
 
-  if (!PROJECT_ID) {
+  if (!activeProjectId) {
     return (
       <section>
         <h1 className='text-2xl font-semibold text-foreground'>Memory detail</h1>
-        <pre className='mt-4 text-sm text-default-500 bg-content2/50 rounded-medium p-3'>
-          NEXT_PUBLIC_ENGRAM_PROJECT_ID is not set.
-        </pre>
+        <p className='mt-4 text-sm text-default-500'>
+          Select a project to view memory details.
+        </p>
       </section>
     );
   }

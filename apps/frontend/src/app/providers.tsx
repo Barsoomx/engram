@@ -8,6 +8,8 @@ import * as React from 'react';
 
 import { getToken } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 export interface ProvidersProps {
   children: React.ReactNode;
@@ -28,6 +30,8 @@ export function Providers({ children }: ProvidersProps) {
   );
 
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
+  const activeProjectId = useProjectStore((state) => state.activeProjectId);
+  const activeTeamId = useTeamStore((state) => state.activeTeamId);
   const [activeToken, setActiveToken] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -48,7 +52,7 @@ export function Providers({ children }: ProvidersProps) {
 
   React.useEffect(() => {
     queryClient.clear();
-  }, [activeOrgId, activeToken, queryClient]);
+  }, [activeOrgId, activeProjectId, activeTeamId, activeToken, queryClient]);
 
   return (
     <HeroUIProvider navigate={router.push}>
