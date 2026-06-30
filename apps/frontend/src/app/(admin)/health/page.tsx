@@ -3,6 +3,8 @@
 import { useQuery } from '@tanstack/react-query';
 import * as React from 'react';
 
+import { PageHeader } from '@/components/ui/page-header';
+import { PulseDot } from '@/components/ui/pulse-dot';
 import { apiClient } from '@/lib/auth';
 
 const API_URL = process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000';
@@ -44,26 +46,50 @@ export default function HealthPage() {
 
   const health = query.data;
 
+  const statusColor = query.isLoading
+    ? '#666C77'
+    : health?.ok
+      ? '#3DD9AC'
+      : '#FB6E72';
+
   return (
-    <section className='space-y-4'>
-      <div>
-        <h1 className='text-2xl font-semibold text-foreground'>Backend Health</h1>
-        <p className='text-xs text-default-500 mt-1 font-mono'>
+    <section className='space-y-6'>
+      <PageHeader
+        title='Backend Health'
+        subtitle='Liveness probe for the Engram API, refreshed every 30 seconds.'
+      />
+
+      <div className='surface-card space-y-4 p-5'>
+        <div className='flex items-center justify-between gap-4'>
+          <div className='flex items-center gap-2.5'>
+            <PulseDot color={statusColor} pulse={Boolean(health?.ok)} />
+            <span className='text-[13.5px] text-default-700'>Status</span>
+          </div>
+          <span
+            className={`text-[13.5px] font-semibold ${
+              health?.ok
+                ? 'text-success'
+                : query.isLoading
+                  ? 'text-default-400'
+                  : 'text-danger'
+            }`}
+          >
+            {query.isLoading ? 'checking…' : health?.ok ? 'Healthy' : 'Unhealthy'}
+          </span>
+        </div>
+
+        <p className='font-mono text-[12px] text-default-400'>
           {API_URL}/-/healthz/
         </p>
-      </div>
 
-      <div className='surface-card p-5'>
-        <p className='text-sm'>
-          Status:{' '}
-          <strong className={health?.ok ? 'text-success-500' : 'text-danger-500'}>
-            {query.isLoading ? 'checking...' : health?.ok ? 'healthy' : 'unhealthy'}
-          </strong>
-        </p>
-        <h2 className='text-base font-semibold text-foreground mt-4 mb-2'>Response</h2>
-        <pre className='text-xs font-mono text-default-700 bg-content2/50 rounded-medium p-3 overflow-auto'>
-          {query.isLoading ? 'loading...' : health?.detail || '(empty)'}
-        </pre>
+        <div className='space-y-2'>
+          <p className='text-[10.5px] font-semibold uppercase tracking-[0.12em] text-default-400'>
+            Response
+          </p>
+          <pre className='overflow-auto rounded-[10px] border border-divider bg-content2/50 p-3 font-mono text-xs text-default-700'>
+            {query.isLoading ? 'loading…' : health?.detail || '(empty)'}
+          </pre>
+        </div>
       </div>
     </section>
   );

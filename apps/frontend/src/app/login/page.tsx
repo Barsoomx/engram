@@ -1,10 +1,12 @@
 'use client';
 
-import { Button, Card, CardBody, Input } from '@heroui/react';
-import { LogIn } from 'lucide-react';
+import { Button, Input } from '@heroui/react';
+import { Github, Lock, User } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
+import { BrandMark } from '@/components/brand/brand-logo';
+import { PrimaryButton } from '@/components/ui/primary-button';
 import { extractAuthError, getToken, login } from '@/lib/auth';
 
 export default function LoginPage() {
@@ -42,38 +44,51 @@ export default function LoginPage() {
     }
   };
 
-  return (
-    <div className='min-h-screen flex items-center justify-center px-4 auth-bg'>
-      <Card className='w-full max-w-sm'>
-        <CardBody className='p-8'>
-          <div className='flex flex-col items-center mb-6'>
-            <div className='w-12 h-12 rounded-xl bg-primary/15 flex items-center justify-center mb-3'>
-              <LogIn className='w-6 h-6 text-primary' />
-            </div>
-            <h1 className='text-xl font-semibold text-foreground'>
-              Engram Admin
-            </h1>
-            <p className='text-sm text-default-500 mt-1'>
-              Sign in to the admin console
-            </p>
-          </div>
+  const fieldClassNames = {
+    label: 'text-[12px] font-medium text-default-500 pb-1.5',
+    inputWrapper:
+      'h-[46px] rounded-[10px] border border-divider-strong bg-content2 shadow-none data-[hover=true]:bg-content2 group-data-[focus=true]:border-primary group-data-[focus=true]:bg-content2',
+    innerWrapper: 'gap-2.5',
+    input: 'text-[13.5px] text-foreground placeholder:text-default-400',
+  } as const;
 
+  return (
+    <div className='auth-bg flex min-h-screen items-center justify-center px-4'>
+      <div className='relative z-10 w-full max-w-[392px] animate-fade-up'>
+        <div className='flex flex-col items-center text-center'>
+          <BrandMark size={52} />
+          <h1 className='mt-5 text-[21px] font-semibold tracking-[-0.02em] text-foreground'>
+            Welcome back
+          </h1>
+          <p className='mt-1.5 text-[13.5px] text-default-500'>
+            Sign in to the Engram console
+          </p>
+        </div>
+
+        <div className='surface-card mt-7 rounded-[20px] p-7 shadow-login-card'>
           <form className='flex flex-col gap-4' onSubmit={handleSubmit}>
             <Input
               autoComplete='username'
-              isClearable
+              classNames={fieldClassNames}
               label='Username'
               labelPlacement='outside'
               placeholder='Enter username'
+              startContent={
+                <User className='shrink-0 text-default-400' size={16} strokeWidth={1.8} />
+              }
               value={username}
               variant='bordered'
               onValueChange={setUsername}
             />
             <Input
               autoComplete='current-password'
+              classNames={fieldClassNames}
               label='Password'
               labelPlacement='outside'
               placeholder='Enter password'
+              startContent={
+                <Lock className='shrink-0 text-default-400' size={16} strokeWidth={1.8} />
+              }
               type='password'
               value={password}
               variant='bordered'
@@ -81,23 +96,50 @@ export default function LoginPage() {
             />
 
             {error && (
-              <p className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium px-3 py-2'>
+              <p className='rounded-[10px] border border-danger-500/25 bg-danger-500/10 px-3 py-2 text-[12.5px] text-danger-500'>
                 {error}
               </p>
             )}
 
-            <Button
-              className='mt-2'
-              color='primary'
+            <PrimaryButton
+              className='mt-1 w-full'
+              fullWidth
               isDisabled={isSubmitting}
               isLoading={isSubmitting}
               type='submit'
             >
               Sign in
-            </Button>
+            </PrimaryButton>
           </form>
-        </CardBody>
-      </Card>
+
+          <div className='my-5 flex items-center gap-3'>
+            <span className='h-px flex-1 bg-divider-strong' />
+            <span className='text-[11px] font-medium uppercase tracking-[0.12em] text-default-400'>
+              OR
+            </span>
+            <span className='h-px flex-1 bg-divider-strong' />
+          </div>
+
+          <div className='flex flex-col items-center gap-1.5'>
+            <Button
+              className='h-11 w-full rounded-[11px] border-divider-strong bg-content1 text-[13.5px] font-medium text-default-700 data-[hover=true]:bg-content2'
+              disableRipple
+              fullWidth
+              isDisabled
+              startContent={<Github size={17} strokeWidth={1.8} />}
+              type='button'
+              variant='bordered'
+            >
+              Continue with GitHub
+            </Button>
+            <span className='text-[11.5px] text-default-400'>SSO coming soon</span>
+          </div>
+        </div>
+
+        <p className='mt-6 text-center text-[12px] text-default-400'>
+          Engram · engineering memory for AI agents
+        </p>
+      </div>
     </div>
   );
 }

@@ -9,7 +9,9 @@ PASSWORD_HASHERS = [
 ]
 DATABASES = {
     'default': {
-        **database_config(os.environ.get('ENGRAM_DATABASE_URL', 'sqlite:///:memory:')),  # noqa: F405
+        **database_config(  # noqa: F405
+            os.environ.get('ENGRAM_DATABASE_URL', 'postgresql://engram:engram@localhost:5432/engram'),
+        ),
         'CONN_MAX_AGE': 0,
         'CONN_HEALTH_CHECKS': False,
     },
