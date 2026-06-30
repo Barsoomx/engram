@@ -9,7 +9,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.status import HTTP_200_OK, HTTP_400_BAD_REQUEST
 
-from engram.access.models import ApiKey
+from engram.access.models import ApiKey, Capability
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.api_keys import (
@@ -75,6 +75,24 @@ class ApiKeyViewSet(
         serializer.is_valid(raise_exception=True)
 
         requested_capabilities = list(serializer.validated_data['capabilities'])
+
+        known_codes = set(
+            Capability.objects.filter(code__in=requested_capabilities).values_list(
+                'code',
+                flat=True,
+            ),
+        )
+
+        unknown_codes = sorted(set(requested_capabilities) - known_codes)
+
+        if unknown_codes:
+            return Response(
+                {
+                    'detail': f'unknown capabilities: {unknown_codes}',
+                    'code': 'unknown_capability',
+                },
+                status=HTTP_400_BAD_REQUEST,
+            )
 
         try:
             _issuer_can_grant(
