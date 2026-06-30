@@ -49,12 +49,31 @@ review checks that there is **no bypass path** and **no privilege-escalation**.
 - Full suite: 496 passed, 6 skipped; `ruff check` / `format --check` clean;
   `makemigrations --check` clean.
 
-## Findings
+## Findings (independent adversarial review pass — both fixed)
 
-None. No bypass path or escalation identified. The `organization_suspended` code
-is surfaced cleanly on the bearer/session realms (403 via `ACCESS_STATUS`); the
-console realm returns a generic 403 (DRF permission), which is acceptable — the
-frontend reads `status` from the org list to render a suspended state.
+An adversarial reviewer (separate agent) probed for bypass paths and found two
+issues, both fixed in this branch:
+
+- **F1 (medium) — wrong status code on hook endpoints.** `hooks/views.py` kept its
+  own duplicate `ACCESS_STATUS` dict, missing `organization_suspended`, so a
+  suspended org's agent hooks were *denied but returned 401 instead of 403* (could
+  trigger re-auth retry loops instead of recognizing the block). Fixed: added
+  `'organization_suspended': 403` to the hooks map; regression test
+  `test_hook_dry_run_denied_when_organization_suspended`. (Enforcement itself was
+  never bypassed — the bearer check denies; only the HTTP code was wrong.)
+- **F2 (low) — suspended-org visibility had no `status` to read.** The org *list*
+  endpoint (`IsAuthenticated` only) intentionally stays reachable for suspended
+  orgs so the UI can redirect to billing — but `OrganizationReadSerializer` did
+  not expose `status`, so the documented "frontend shows suspended state" UX could
+  not actually work. Fixed: added the read-only `status` field to the org payload
+  (write serializer unchanged → tenants still cannot set status); regression test
+  `test_suspended_organization_still_listed_with_status`. No operational data
+  (memories/projects/keys) is exposed via the list.
+
+No bypass path or privilege-escalation remains. The `organization_suspended` code
+is now surfaced as 403 on the bearer/session/hook realms; the console realm
+returns a generic 403 (DRF permission), acceptable because the frontend reads
+`status` from the org list to render the suspended state.
 
 ## Follow-up (out of scope, roadmap)
 

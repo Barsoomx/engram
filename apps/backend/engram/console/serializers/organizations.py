@@ -11,8 +11,8 @@ class OrganizationReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Organization
-        fields = ['id', 'name', 'slug', 'created_at', 'updated_at', 'member_count', 'viewer_role']
-        read_only_fields = ['id', 'name', 'slug', 'created_at', 'updated_at', 'member_count', 'viewer_role']
+        fields = ['id', 'name', 'slug', 'status', 'created_at', 'updated_at', 'member_count', 'viewer_role']
+        read_only_fields = ['id', 'name', 'slug', 'status', 'created_at', 'updated_at', 'member_count', 'viewer_role']
 
     def get_member_count(self, obj: Organization) -> int | None:
         value = getattr(obj, 'member_count', None)

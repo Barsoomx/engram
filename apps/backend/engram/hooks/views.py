@@ -20,6 +20,7 @@ ACCESS_STATUS = {
     'missing_capability': status.HTTP_403_FORBIDDEN,
     'project_scope_denied': status.HTTP_403_FORBIDDEN,
     'team_scope_denied': status.HTTP_403_FORBIDDEN,
+    'organization_suspended': status.HTTP_403_FORBIDDEN,
 }
 
 
