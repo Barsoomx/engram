@@ -12,12 +12,15 @@ from rest_framework.test import APIClient
 from engram.access.models import ApiKeyCapability, Capability, Identity, OrganizationMembership, ProjectGrant, Role
 from engram.context.context_api_tests import auth_headers, create_project_scope, create_scoped_api_key
 from engram.core.models import AuditEvent, Team
+from engram.model_policy import services
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
+    CreateModelPolicy,
     EmbeddingCallInput,
     FakeProviderGateway,
     ModelPolicyError,
+    ModelPolicyInput,
     ProviderCallInput,
     ProviderSecretError,
     ResolveModelPolicy,
@@ -1713,3 +1716,40 @@ def test_reader_role_can_read_secrets_and_policies_but_denied_mutations() -> Non
     for resp in denied_mutations:
         assert resp.status_code == 403
         assert resp.json()['code'] == 'missing_capability'
+
+
+@pytest.mark.django_db
+def test_create_model_policy_rolls_back_policy_when_audit_write_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=None,
+        name='Org OpenAI',
+        provider='openai',
+        scope='organization',
+        current_version=1,
+    )
+
+    def m_audit_raising(**_kwargs: object) -> None:
+        raise RuntimeError('boom')
+
+    monkeypatch.setattr(services, 'audit_model_policy_event', m_audit_raising)
+
+    with pytest.raises(RuntimeError, match='boom'):
+        CreateModelPolicy().execute(
+            ModelPolicyInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                name='Org policy',
+                scope='organization',
+                task_type='generation',
+                provider='openai',
+                model='gpt-4o-mini',
+                secret_id=secret.id,
+                request_id='request-policy-atomic-1',
+                actor_id='svc-test',
+            ),
+        )
+
+    assert ModelPolicy.objects.filter(name='Org policy').count() == 0

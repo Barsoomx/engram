@@ -641,3 +641,28 @@ def test_existing_policy_no_base_url_resolves_to_provider_default() -> None:
     resolved = _resolve_base_url(policy)
 
     assert resolved == 'https://api.openai.com/v1'
+
+
+def test_default_base_url_anthropic() -> None:
+    assert default_base_url('anthropic') == 'https://api.anthropic.com'
+
+
+@pytest.mark.django_db
+def test_get_provider_gateway_anthropic_returns_anthropic_host_with_blank_metadata_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        provider='anthropic',
+        base_url='',
+        raw_key='anthropic-key',
+    )
+    monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+
+    gateway = get_provider_gateway(policy)
+
+    assert isinstance(gateway, AnthropicMessagesGateway)
+    assert gateway._base_url == 'https://api.anthropic.com'
+    assert gateway._api_key == 'anthropic-key'
