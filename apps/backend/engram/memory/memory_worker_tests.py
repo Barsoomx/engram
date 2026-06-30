@@ -347,12 +347,12 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     assert candidate.body != observation.body
     assert candidate.status == CandidateStatus.PROPOSED
     assert candidate.visibility_scope == VisibilityScope.PROJECT
-    assert candidate.confidence == Decimal('0.500')
+    assert candidate.confidence == Decimal('0.600')
     assert Memory.objects.count() == 0
     held_audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert held_audit.actor_type == 'system'
     assert held_audit.target_id == str(candidate.id)
-    assert held_audit.metadata['confidence'] == '0.500'
+    assert held_audit.metadata['confidence'] == '0.600'
     assert held_audit.metadata['threshold'] == '0.800'
     assert candidate.content_hash == memory_candidate_content_hash(observation)
     assert candidate.evidence == [
@@ -1105,3 +1105,39 @@ def test_digest_prompt_lists_source_titles_and_bodies() -> None:
     assert 'Added 0042_user_schema migration' in prompt
     assert 'Update CI cache key' in prompt
     assert 'Changed poetry.lock hash' in prompt
+
+
+@pytest.mark.django_db
+def test_rich_observation_auto_promotes_at_default_threshold() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.observation_type = 'decision'
+    observation.facts = ['use postgres for reliability']
+    observation.narrative = 'We decided to use postgres.'
+    observation.concepts = ['database']
+    observation.save(update_fields=['observation_type', 'facts', 'narrative', 'concepts', 'updated_at'])
+
+    result = execute_worker(observation)
+
+    candidate = MemoryCandidate.objects.get()
+    assert candidate.confidence == Decimal('0.950')
+    assert result.held_for_review is False
+    assert result.curated_decision is not None
+    assert result.memory is not None
+
+
+@pytest.mark.django_db
+def test_thin_observation_held_at_default_threshold() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.files_read = []
+    observation.files_modified = []
+    observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])
+
+    result = execute_worker(observation)
+
+    candidate = MemoryCandidate.objects.get()
+    assert candidate.confidence == Decimal('0.500')
+    assert result.held_for_review is True
+    assert result.memory is None
+    assert candidate.status == CandidateStatus.PROPOSED

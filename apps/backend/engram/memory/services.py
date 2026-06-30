@@ -289,7 +289,7 @@ class ProcessObservationRecorded:
             visibility_scope=VisibilityScope.PROJECT,
             evidence=generated.evidence,
             content_hash=candidate_hash,
-            confidence=Decimal('0.500'),
+            confidence=derive_observation_confidence(observation),
         )
 
         return candidate, True
@@ -359,6 +359,26 @@ class ProcessObservationRecorded:
                 'observation_id': str(observation.id),
             },
         )
+
+
+_DURABLE_OBSERVATION_TYPES = frozenset({'decision', 'architecture', 'convention', 'gotcha'})
+
+
+def derive_observation_confidence(observation: Observation) -> Decimal:
+    score = Decimal('0.50')
+    if observation.facts:
+        score += Decimal('0.10')
+    if observation.files_read or observation.files_modified:
+        score += Decimal('0.10')
+    if observation.narrative.strip():
+        score += Decimal('0.10')
+    if observation.concepts:
+        score += Decimal('0.05')
+    if observation.observation_type in _DURABLE_OBSERVATION_TYPES:
+        score += Decimal('0.10')
+    score = max(Decimal('0'), min(Decimal('1'), score))
+
+    return score.quantize(Decimal('0.001'))
 
 
 def is_auto_promotable(confidence: Decimal | None, threshold: Decimal) -> bool:

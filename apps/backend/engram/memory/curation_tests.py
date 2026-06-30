@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -24,13 +25,17 @@ from engram.core.models import (
 from engram.memory.curation import (
     CurateMemoryCandidate,
     CurateMemoryCandidateInput,
+    curation_judge_prompt,
     embed_candidate,
     find_near_duplicate,
     is_low_signal,
+    parse_curation_decision,
+    resolve_curator_llm_judge_enabled,
     supersede_memory_system,
 )
 from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import FakeProviderGateway, ProviderCallInput, ProviderCallResult
 
 _LONG_BODY = 'The retrieval pipeline ranks documents by cosine similarity over embeddings.'
 
@@ -120,11 +125,112 @@ def promote_candidate(candidate: MemoryCandidate) -> Memory:
     return result.memory
 
 
-def set_curator_settings(organization: Organization, *, enabled: bool = True, threshold: str = '0.850') -> None:
+def set_curator_settings(
+    organization: Organization,
+    *,
+    enabled: bool = True,
+    threshold: str = '0.850',
+    llm_judge_enabled: bool = False,
+) -> None:
     OrganizationSettings.objects.update_or_create(
         organization=organization,
-        defaults={'curator_enabled': enabled, 'near_dup_threshold': Decimal(threshold)},
+        defaults={
+            'curator_enabled': enabled,
+            'near_dup_threshold': Decimal(threshold),
+            'curator_llm_judge_enabled': llm_judge_enabled,
+        },
     )
+
+
+def create_curation_policy(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    task_type: str = 'curation',
+) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name=f'Team {task_type} Anthropic',
+        provider='anthropic',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-curation-secret',
+        hmac_digest='curation-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name=f'{task_type} policy',
+        scope='project',
+        task_type=task_type,
+        provider='anthropic',
+        model='claude-judge',
+        secret=secret,
+        version=1,
+    )
+
+
+def seed_existing_and_duplicate(
+    organization: Organization,
+    team: Team,
+    project: Project,
+) -> tuple[Memory, MemoryCandidate]:
+    existing = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Retrieval ranking',
+            body=_LONG_BODY,
+            content_hash='hash-existing',
+        ),
+    )
+    duplicate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-duplicate',
+    )
+
+    return existing, duplicate
+
+
+class _JudgeGatewayStub(FakeProviderGateway):
+    def __init__(self, body: str) -> None:
+        self._body = body
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        return ProviderCallResult(
+            provider=data.policy.provider,
+            model=data.policy.model,
+            call_record_id=uuid.uuid4(),
+            redaction_state='clean',
+            generated_title='',
+            generated_body=self._body,
+        )
+
+
+class _ExplodingJudgeGateway(FakeProviderGateway):
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        raise AssertionError('the LLM judge must not be consulted on this path')
+
+
+def patch_judge_gateway(monkeypatch: pytest.MonkeyPatch, gateway: FakeProviderGateway) -> None:
+    monkeypatch.setattr('engram.memory.curation.get_provider_gateway', lambda *_, **__: gateway)
 
 
 def test_is_low_signal_flags_empty_and_title_echo_bodies() -> None:
@@ -486,3 +592,174 @@ def test_curate_reindexes_existing_memory_embedding_for_dedup() -> None:
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=document.memory_version_id))
 
     assert len(RetrievalDocument.objects.get(memory=existing).embedding_vector) == 64
+
+
+@pytest.mark.django_db
+def test_resolve_curator_llm_judge_enabled_defaults_false_without_settings() -> None:
+    organization, _team, _project = create_scope()
+
+    assert resolve_curator_llm_judge_enabled(organization) is False
+
+
+@pytest.mark.django_db
+def test_resolve_curator_llm_judge_enabled_reads_stored_value() -> None:
+    organization, _team, _project = create_scope()
+    set_curator_settings(organization, llm_judge_enabled=True)
+
+    assert resolve_curator_llm_judge_enabled(organization) is True
+
+
+def test_parse_curation_decision_reads_known_decisions() -> None:
+    assert parse_curation_decision('{"decision": "merge"}') == 'merge'
+    assert parse_curation_decision('{"decision": "keep_both"}') == 'keep_both'
+    assert parse_curation_decision('{"decision": "reject"}') == 'reject'
+
+
+def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable() -> None:
+    assert parse_curation_decision('not json at all') == 'keep_both'
+    assert parse_curation_decision('{"decision": "explode"}') == 'keep_both'
+    assert parse_curation_decision('[]') == 'keep_both'
+    assert parse_curation_decision('{}') == 'keep_both'
+
+
+def test_curation_judge_prompt_redacts_secrets() -> None:
+    candidate = MemoryCandidate(title='Deploy', body='Authenticate with sk-abcdef0123456789')
+    memory = Memory(title='Old deploy', body='Rotated token egk_abcdef0123456789 last week')
+
+    prompt = curation_judge_prompt(candidate, memory)
+
+    assert 'sk-abcdef0123456789' not in prompt
+    assert 'egk_abcdef0123456789' not in prompt
+    assert '[REDACTED]' in prompt
+
+
+@pytest.mark.django_db
+def test_curate_judge_keep_both_promotes_clean_without_supersede() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    duplicate.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert result.memory is not None
+    assert existing.stale is False
+    assert duplicate.status == CandidateStatus.PROMOTED
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+    assert Memory.objects.filter(stale=False).count() == 2
+
+
+@pytest.mark.django_db
+def test_curate_judge_merge_supersedes_near_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "merge"}'))
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert result.decision == 'superseded'
+    assert result.superseded_memory is not None
+    assert result.superseded_memory.id == existing.id
+    assert existing.stale is True
+    link = MemoryLink.objects.get(link_type=LinkType.SUPERSEDED_BY)
+    assert link.memory_id == existing.id
+    assert AuditEvent.objects.filter(event_type='MemorySuperseded').count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_judge_reject_rejects_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "reject"}'))
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    duplicate.refresh_from_db()
+    assert result.decision == 'rejected'
+    assert result.memory is None
+    assert duplicate.status == CandidateStatus.REJECTED
+    assert existing.stale is False
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+    audit = AuditEvent.objects.get(event_type='MemoryAutoRejected', target_id=str(duplicate.id))
+    assert audit.metadata['reason'] == 'near_dup_judge_reject'
+
+
+@pytest.mark.django_db
+def test_curate_judge_unparseable_defaults_to_keep_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('totally not json'))
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert result.memory is not None
+    assert existing.stale is False
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_curate_judge_without_policy_defaults_to_keep_both() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert result.memory is not None
+    assert existing.stale is False
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_curate_gray_band_without_judge_promotes_clean(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=False)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _ExplodingJudgeGateway())
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert existing.stale is False
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='0.850', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _ExplodingJudgeGateway())
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert result.decision == 'superseded'
+    assert result.superseded_memory is not None
+    assert result.superseded_memory.id == existing.id
+    assert existing.stale is True

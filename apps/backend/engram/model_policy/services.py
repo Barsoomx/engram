@@ -780,10 +780,16 @@ def generated_candidates_payload(prompt: str) -> str:
     return json.dumps(candidates)
 
 
+def generated_curation_judgment_payload() -> str:
+    return json.dumps({'decision': 'keep_both'})
+
+
 def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
     title, body = generated_candidate_content(prompt)
     if data.response_kind == 'candidates':
         return title, generated_candidates_payload(prompt)
+    if data.response_kind == 'curation_judgment':
+        return title, generated_curation_judgment_payload()
 
     return title, body
 
@@ -980,14 +986,14 @@ def _split_completion(content: str) -> tuple[str, str]:
 
 
 def _completion_body(content: str, response_kind: str) -> str:
-    if response_kind == 'candidates':
+    if response_kind in ('candidates', 'curation_judgment'):
         return content
 
     return _split_completion(content)[1]
 
 
 def _completion_title(content: str, response_kind: str) -> str:
-    if response_kind == 'candidates':
+    if response_kind in ('candidates', 'curation_judgment'):
         return ''
 
     return _split_completion(content)[0]

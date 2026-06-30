@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
 from django.db import transaction
 from django.utils import timezone
 
@@ -418,6 +419,108 @@ def semantic_retrieval_matches(
     return _semantic_retrieval_matches_python(documents, exact_matches, query_vector)
 
 
+RECIPROCAL_RANK_FUSION_K = 60
+
+
+def resolve_lexical_fusion_enabled(organization: Organization) -> bool:
+    enabled = (
+        OrganizationSettings.objects.filter(organization=organization)
+        .values_list('lexical_fusion_enabled', flat=True)
+        .first()
+    )
+    if enabled is None:
+        return False
+
+    return enabled
+
+
+def _lexical_search_query(query: str) -> SearchQuery | None:
+    tokens = request_query_terms(query)
+    if not tokens:
+        return None
+
+    search_query: SearchQuery | None = None
+    for token in tokens:
+        clause = SearchQuery(token, search_type='plain')
+        search_query = clause if search_query is None else search_query | clause
+
+    return search_query
+
+
+def lexical_retrieval_ranks(
+    documents: tuple[RetrievalDocument, ...],
+    query: str,
+) -> dict[uuid.UUID, int]:
+    if not documents:
+        return {}
+
+    search_query = _lexical_search_query(query)
+    if search_query is None:
+        return {}
+
+    document_ids = [document.id for document in documents]
+    scored = dict(
+        RetrievalDocument.objects.filter(id__in=document_ids)
+        .annotate(lexical_rank=SearchRank(SearchVector('full_text'), search_query))
+        .filter(lexical_rank__gt=0)
+        .values_list('id', 'lexical_rank'),
+    )
+    if not scored:
+        return {}
+
+    documents_by_id = {document.id: document for document in documents}
+    ordered = sorted(
+        scored,
+        key=lambda document_id: (
+            -scored[document_id],
+            -documents_by_id[document_id].updated_at.timestamp(),
+            documents_by_id[document_id].memory.title.casefold(),
+            str(document_id),
+        ),
+    )
+
+    return {document_id: position for position, document_id in enumerate(ordered, start=1)}
+
+
+def fuse_semantic_lexical(
+    semantic_matches: list[RetrievalMatch],
+    lexical_ranks: dict[uuid.UUID, int],
+) -> list[RetrievalMatch]:
+    semantic_ranks = {match.document.id: position for position, match in enumerate(semantic_matches, start=1)}
+
+    def _rrf_score(match: RetrievalMatch) -> float:
+        score = 1.0 / (RECIPROCAL_RANK_FUSION_K + semantic_ranks[match.document.id])
+        lexical_rank = lexical_ranks.get(match.document.id)
+        if lexical_rank is not None:
+            score += 1.0 / (RECIPROCAL_RANK_FUSION_K + lexical_rank)
+
+        return score
+
+    return sorted(
+        semantic_matches,
+        key=lambda match: (
+            -_rrf_score(match),
+            -match.score,
+            -match.document.updated_at.timestamp(),
+            match.document.memory.title.casefold(),
+            str(match.document.id),
+        ),
+    )
+
+
+def lexical_fusion_matches(
+    semantic_matches: list[RetrievalMatch],
+    query: str,
+) -> list[RetrievalMatch]:
+    if not semantic_matches:
+        return semantic_matches
+
+    candidate_documents = tuple(match.document for match in semantic_matches)
+    lexical_ranks = lexical_retrieval_ranks(candidate_documents, query)
+
+    return fuse_semantic_lexical(semantic_matches, lexical_ranks)
+
+
 def resolve_query_embedding(
     query: str,
     file_paths: tuple[str, ...],
@@ -803,6 +906,8 @@ class BuildContextBundle:
 
         query_vector = list(embedding_result.embedding)
         semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
+        if org_settings.lexical_fusion_enabled:
+            semantic_matches = lexical_fusion_matches(semantic_matches, data.query)
 
         return (
             tuple((exact_matches + list(semantic_matches))[: data.limit]),
