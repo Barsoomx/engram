@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
@@ -373,6 +375,54 @@ def test_rerun_creates_chained_run_triggers_digest_and_audits(
     )
 
     assert audit.count() == 1
+
+
+@pytest.mark.django_db
+def test_rerun_dispatches_weekly_digest_for_weekly_run_type(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(
+        f_admin_org,
+        project,
+        run_type=WorkflowRunType.WEEKLY_DIGEST,
+        request_id='weekly-original',
+    )
+
+    with (
+        patch('engram.console.views.workflow_runs.run_weekly_digest_with_tracking') as m_weekly,
+        patch('engram.console.views.workflow_runs.run_daily_digest_with_tracking') as m_daily,
+    ):
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 200
+
+    m_weekly.assert_called_once()
+
+    m_daily.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_rerun_returns_400_for_unsupported_run_type(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(
+        f_admin_org,
+        project,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        request_id='unsupported-original',
+    )
+
+    response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 400
+
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
 
 
 @pytest.mark.django_db

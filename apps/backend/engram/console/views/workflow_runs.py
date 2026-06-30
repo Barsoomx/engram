@@ -16,8 +16,14 @@ from engram.console.serializers.workflow_runs import (
     WorkflowRunListSerializer,
 )
 from engram.console.services import audit_admin_action
-from engram.core.models import WorkflowRun
-from engram.memory.services import DAILY_DIGEST_WINDOW_DAYS, run_daily_digest_with_tracking
+from engram.core.models import WorkflowRun, WorkflowRunType
+from engram.memory.distillation import run_session_distillation_with_tracking
+from engram.memory.services import (
+    DAILY_DIGEST_WINDOW_DAYS,
+    WEEKLY_DIGEST_WINDOW_DAYS,
+    run_daily_digest_with_tracking,
+    run_weekly_digest_with_tracking,
+)
 
 
 class WorkflowRunViewSet(
@@ -100,27 +106,57 @@ class WorkflowRunViewSet(
 
         input_snapshot = run.input_snapshot or {}
 
-        raw_memory_ids = input_snapshot.get('memory_ids') or []
-
-        try:
-            memory_ids = tuple(uuid.UUID(str(value)) for value in raw_memory_ids)
-        except (AttributeError, TypeError, ValueError):
-            return Response(
-                {'detail': 'invalid memory_ids in input_snapshot'},
-                status=400,
-            )
-
-        window_days = input_snapshot.get('window_days', DAILY_DIGEST_WINDOW_DAYS)
-
         request_id = f'workflow-rerun:{run.id}'
 
-        result = run_daily_digest_with_tracking(
-            organization_id=run.organization_id,
-            project_id=run.project_id,
-            memory_ids=memory_ids,
-            window_days=int(window_days),
-            request_id=request_id,
-        )
+        if run.run_type == WorkflowRunType.DAILY_DIGEST:
+            raw_memory_ids = input_snapshot.get('memory_ids') or []
+
+            try:
+                memory_ids = tuple(uuid.UUID(str(value)) for value in raw_memory_ids)
+            except (AttributeError, TypeError, ValueError):
+                return Response(
+                    {'detail': 'invalid memory_ids in input_snapshot'},
+                    status=400,
+                )
+
+            window_days = input_snapshot.get('window_days', DAILY_DIGEST_WINDOW_DAYS)
+
+            run_daily_digest_with_tracking(
+                organization_id=run.organization_id,
+                project_id=run.project_id,
+                memory_ids=memory_ids,
+                window_days=int(window_days),
+                request_id=request_id,
+            )
+        elif run.run_type == WorkflowRunType.WEEKLY_DIGEST:
+            window_days = input_snapshot.get('window_days', WEEKLY_DIGEST_WINDOW_DAYS)
+
+            run_weekly_digest_with_tracking(
+                organization_id=run.organization_id,
+                project_id=run.project_id,
+                window_days=int(window_days),
+                request_id=request_id,
+            )
+        elif run.run_type == WorkflowRunType.SESSION_DISTILLATION:
+            raw_session_id = input_snapshot.get('session_id')
+
+            try:
+                session_id = uuid.UUID(str(raw_session_id))
+            except (AttributeError, TypeError, ValueError):
+                return Response(
+                    {'detail': 'invalid session_id in input_snapshot'},
+                    status=400,
+                )
+
+            run_session_distillation_with_tracking(
+                session_id=session_id,
+                request_id=request_id,
+            )
+        else:
+            return Response(
+                {'detail': f'rerun is not supported for run_type {run.run_type}'},
+                status=400,
+            )
 
         new_run = (
             WorkflowRun.objects.filter(
@@ -136,6 +172,8 @@ class WorkflowRunViewSet(
 
             new_run.save(update_fields=['rerun_of', 'updated_at'])
 
+        result_memory_id = str(new_run.result_memory_id) if new_run and new_run.result_memory_id else None
+
         audit_admin_action(
             organization=run.organization,
             actor_identity=request.user_identity,
@@ -144,14 +182,14 @@ class WorkflowRunViewSet(
             target_id=str(run.id),
             metadata={
                 'new_run_id': str(new_run.id) if new_run else None,
-                'result_memory_id': str(result.memory.id),
+                'result_memory_id': result_memory_id,
             },
         )
 
         return Response(
             {
                 'run_id': str(new_run.id) if new_run else None,
-                'result_memory_id': str(result.memory.id),
+                'result_memory_id': result_memory_id,
             },
             status=200,
         )
