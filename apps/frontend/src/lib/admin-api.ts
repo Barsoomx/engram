@@ -5,8 +5,11 @@ export type Organization = {
   id: string;
   name: string;
   slug: string;
+  status?: string;
   created_at: string;
   updated_at: string;
+  member_count?: number | null;
+  viewer_role?: string | null;
 };
 
 export type Paginated<T> = {
@@ -140,6 +143,7 @@ export type Project = {
   organization: string;
   repository_url: string;
   default_branch: string;
+  memory_count?: number;
   created_at: string;
   updated_at: string;
   archived_at: string | null;
@@ -212,6 +216,8 @@ export async function listRoles(
   return response.data;
 }
 
+export type MembershipStatus = 'active' | 'invited' | 'suspended';
+
 export type Member = {
   id: string;
   external_id: string;
@@ -219,7 +225,9 @@ export type Member = {
   email: string;
   identity_type: string;
   active: boolean;
+  status?: MembershipStatus;
   role: string;
+  role_name?: string;
 };
 
 export type MemberInviteInput = {

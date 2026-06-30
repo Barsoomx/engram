@@ -1,0 +1,79 @@
+import { apiClient } from '@/lib/auth';
+
+export type RetrievalSettings = {
+  hybrid_retrieval_enabled: boolean;
+  require_provenance: boolean;
+};
+
+export type EmbeddingSettings = {
+  provider: string | null;
+  model: string | null;
+};
+
+export type EmbeddingSettingsInput = {
+  provider: string;
+  model: string;
+  secret_id: string;
+};
+
+export type PurgeResult = {
+  deleted: {
+    memories: number;
+    memory_candidates: number;
+    retrieval_documents: number;
+  };
+};
+
+export async function getRetrievalSettings(): Promise<RetrievalSettings> {
+  const client = apiClient();
+  const response = await client.get<RetrievalSettings>(
+    '/v1/admin/settings/retrieval',
+  );
+
+  return response.data;
+}
+
+export async function updateRetrievalSettings(
+  input: RetrievalSettings,
+): Promise<RetrievalSettings> {
+  const client = apiClient();
+  const response = await client.put<RetrievalSettings>(
+    '/v1/admin/settings/retrieval',
+    input,
+  );
+
+  return response.data;
+}
+
+export async function getEmbeddingSettings(): Promise<EmbeddingSettings> {
+  const client = apiClient();
+  const response = await client.get<EmbeddingSettings>(
+    '/v1/admin/settings/embedding',
+  );
+
+  return response.data;
+}
+
+export async function updateEmbeddingSettings(
+  input: EmbeddingSettingsInput,
+): Promise<EmbeddingSettings> {
+  const client = apiClient();
+  const response = await client.put<EmbeddingSettings>(
+    '/v1/admin/settings/embedding',
+    input,
+  );
+
+  return response.data;
+}
+
+export async function purgeOrganizationMemory(
+  confirmation: string,
+): Promise<PurgeResult> {
+  const client = apiClient();
+  const response = await client.post<PurgeResult>(
+    '/v1/admin/settings/purge',
+    { confirmation },
+  );
+
+  return response.data;
+}
