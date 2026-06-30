@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db.models import Count, Q
 from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -16,7 +17,7 @@ from engram.console.serializers.projects import (
     ProjectWriteSerializer,
 )
 from engram.console.services import archive_project, audit_admin_action, create_project
-from engram.core.models import Project
+from engram.core.models import MemoryStatus, Project
 
 
 class ProjectViewSet(
@@ -46,6 +47,11 @@ class ProjectViewSet(
         return Project.objects.filter(
             organization=self.request.active_organization,
             archived_at__isnull=True,
+        ).annotate(
+            memory_count=Count(
+                'memories',
+                filter=Q(memories__status=MemoryStatus.APPROVED),
+            )
         )
 
     def get_serializer_context(self) -> dict:

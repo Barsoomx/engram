@@ -6,6 +6,8 @@ from engram.core.models import Organization, Project
 
 
 class ProjectReadSerializer(serializers.ModelSerializer):
+    memory_count = serializers.IntegerField(read_only=True, default=0)
+
     class Meta:
         model = Project
         fields = [
@@ -16,6 +18,7 @@ class ProjectReadSerializer(serializers.ModelSerializer):
             'default_branch',
             'created_at',
             'updated_at',
+            'memory_count',
         ]
         read_only_fields = [
             'id',
@@ -25,6 +28,7 @@ class ProjectReadSerializer(serializers.ModelSerializer):
             'default_branch',
             'created_at',
             'updated_at',
+            'memory_count',
         ]
 
 

@@ -127,7 +127,9 @@ def test_list_returns_members_with_role_and_active(
         'email',
         'identity_type',
         'active',
+        'status',
         'role',
+        'role_name',
     }
 
     assert member['identity_type'] == 'user'
@@ -558,3 +560,62 @@ def test_read_serializer_never_returns_credentials(
     for forbidden in ('password', 'key_hash', 'token', 'secret'):
         assert forbidden not in member
         assert forbidden not in str(member).lower()
+
+
+@pytest.mark.django_db
+def test_list_includes_role_name(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/members/')
+
+    assert response.status_code == 200
+
+    member = response.data['results'][0]
+
+    assert 'role_name' in member
+
+    assert member['role_name'] == f_owner_membership.role.name
+
+
+@pytest.mark.django_db
+def test_invited_member_has_status_invited(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(
+        '/v1/admin/members/',
+        {
+            'external_id': 'new@acme.test',
+            'display_name': 'New Member',
+            'email': 'new@acme.test',
+            'role': 'developer',
+        },
+    )
+
+    assert response.status_code == 201
+
+    assert response.data['status'] == 'invited'
+
+
+@pytest.mark.django_db
+def test_existing_membership_defaults_status_active() -> None:
+    org = Organization.objects.create(name='Status Org', slug='status-org')
+
+    membership = OrganizationMembership.objects.create(
+        organization=org,
+        identity=Identity.objects.create(
+            organization=org,
+            identity_type=IdentityType.USER,
+            external_id='direct@status-org.test',
+            display_name='Direct',
+        ),
+        role=_make_role('developer'),
+    )
+
+    assert membership.status == 'active'
