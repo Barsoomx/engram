@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import uuid
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from decimal import Decimal
 import structlog
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope
@@ -16,6 +18,7 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
     MemoryLink,
@@ -1126,6 +1129,294 @@ def run_daily_digest_with_tracking(
             'finished_at',
             'result_memory',
             'provider_call_ids',
+            'updated_at',
+        ],
+    )
+
+    return result
+
+
+WEEKLY_DIGEST_WINDOW_DAYS = 7
+
+
+@dataclass(frozen=True)
+class WeeklyDigestInput:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    window_days: int = WEEKLY_DIGEST_WINDOW_DAYS
+    request_id: str = ''
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class WeeklyDigestResult:
+    digest_memory: Memory
+    counts: dict[str, int]
+    memory_changes: dict[str, list[dict]]
+    ready: bool
+
+
+def weekly_digest_content_hash(
+    project_id: uuid.UUID,
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+) -> str:
+    material = f'{project_id}:{window_start.isoformat()}:{window_end.isoformat()}'
+
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+class BuildWeeklyStructuredDigest:
+    def execute(self, data: WeeklyDigestInput) -> WeeklyDigestResult:
+        project = Project.objects.get(id=data.project_id, organization_id=data.organization_id)
+
+        now = timezone.now().replace(second=0, microsecond=0)
+
+        window_start = now - datetime.timedelta(days=data.window_days)
+
+        window_end = now
+
+        content_hash = weekly_digest_content_hash(project.id, window_start, window_end)
+
+        existing = self._find_existing(project, content_hash)
+
+        if existing is not None:
+            return existing
+
+        memory_changes, counts = self._build_buckets(project, window_start, window_end)
+
+        with transaction.atomic():
+            digest_memory = Memory.objects.create(
+                organization=project.organization,
+                project=project,
+                title=f'Weekly Structured Digest {window_start.date()} to {window_end.date()}',
+                body=(f'Structured weekly digest covering {data.window_days} days ending {window_end.date()}.'),
+                status=MemoryStatus.APPROVED,
+                visibility_scope=VisibilityScope.PROJECT,
+                metadata={
+                    'kind': 'digest',
+                    'digest_kind': 'weekly_structured',
+                    'window_start': window_start.isoformat(),
+                    'window_end': window_end.isoformat(),
+                    'window_days': data.window_days,
+                    'memory_changes': memory_changes,
+                    'counts': counts,
+                    'content_hash': content_hash,
+                    'ready': False,
+                    'reviewed_at': None,
+                },
+            )
+
+        return WeeklyDigestResult(
+            digest_memory=digest_memory,
+            counts=counts,
+            memory_changes=memory_changes,
+            ready=False,
+        )
+
+    def _find_existing(self, project: Project, content_hash: str) -> WeeklyDigestResult | None:
+        existing = Memory.objects.filter(
+            organization=project.organization,
+            project=project,
+            metadata__kind='digest',
+            metadata__digest_kind='weekly_structured',
+            metadata__content_hash=content_hash,
+        ).first()
+
+        if existing is None:
+            return None
+
+        metadata = existing.metadata if isinstance(existing.metadata, dict) else {}
+
+        return WeeklyDigestResult(
+            digest_memory=existing,
+            counts=metadata.get('counts', {}),
+            memory_changes=metadata.get('memory_changes', {}),
+            ready=metadata.get('ready', False),
+        )
+
+    def _build_buckets(
+        self,
+        project: Project,
+        window_start: datetime.datetime,
+        window_end: datetime.datetime,
+    ) -> tuple[dict, dict]:
+        org = project.organization
+
+        refuted_qs = Memory.objects.filter(
+            organization=org,
+            project=project,
+            updated_at__gte=window_start,
+            updated_at__lt=window_end,
+        ).filter(Q(status=MemoryStatus.REFUTED) | Q(refuted=True))
+
+        refuted_items = list(refuted_qs)
+
+        refuted_ids = {m.id for m in refuted_items}
+
+        retired_qs = Memory.objects.filter(
+            organization=org,
+            project=project,
+            status=MemoryStatus.ARCHIVED,
+            updated_at__gte=window_start,
+            updated_at__lt=window_end,
+        ).exclude(id__in=refuted_ids)
+
+        retired_items = list(retired_qs)
+
+        retired_ids = {m.id for m in retired_items}
+
+        superseded_links = list(
+            MemoryLink.objects.filter(
+                organization=org,
+                project=project,
+                link_type=LinkType.SUPERSEDED_BY,
+                created_at__gte=window_start,
+                created_at__lt=window_end,
+            )
+        )
+
+        superseded_candidate_ids = {link.memory_id for link in superseded_links}
+
+        superseded_ids = superseded_candidate_ids - refuted_ids - retired_ids
+
+        superseded_link_time: dict[uuid.UUID, datetime.datetime] = {}
+
+        for link in superseded_links:
+            if link.memory_id in superseded_ids and link.memory_id not in superseded_link_time:
+                superseded_link_time[link.memory_id] = link.created_at
+
+        merged_links = list(
+            MemoryLink.objects.filter(
+                organization=org,
+                project=project,
+                link_type=LinkType.NARROWED_BY,
+                created_at__gte=window_start,
+                created_at__lt=window_end,
+            )
+        )
+
+        merged_candidate_ids = {link.memory_id for link in merged_links}
+
+        merged_ids = merged_candidate_ids - refuted_ids - retired_ids - superseded_ids
+
+        merged_link_time: dict[uuid.UUID, datetime.datetime] = {}
+
+        for link in merged_links:
+            if link.memory_id in merged_ids and link.memory_id not in merged_link_time:
+                merged_link_time[link.memory_id] = link.created_at
+
+        excluded_from_added = refuted_ids | retired_ids | superseded_ids | merged_ids
+
+        added_qs = Memory.objects.filter(
+            organization=org,
+            project=project,
+            created_at__gte=window_start,
+            created_at__lt=window_end,
+        ).exclude(id__in=excluded_from_added)
+
+        added_items = list(added_qs)
+
+        link_memory_ids = superseded_ids | merged_ids
+
+        link_memories: dict[uuid.UUID, Memory] = {}
+
+        if link_memory_ids:
+            link_memories = {
+                m.id: m
+                for m in Memory.objects.filter(
+                    organization=org,
+                    project=project,
+                    id__in=link_memory_ids,
+                )
+            }
+
+        def _item(m: Memory, at: datetime.datetime) -> dict:
+            return {
+                'id': str(m.id),
+                'title': redact_text(m.title),
+                'at': at.isoformat(),
+            }
+
+        memory_changes: dict[str, list[dict]] = {
+            'refuted': [_item(m, m.updated_at) for m in refuted_items],
+            'retired': [_item(m, m.updated_at) for m in retired_items],
+            'superseded': [
+                _item(link_memories[mid], superseded_link_time[mid])
+                for mid in superseded_ids
+                if mid in link_memories and mid in superseded_link_time
+            ],
+            'merged': [
+                _item(link_memories[mid], merged_link_time[mid])
+                for mid in merged_ids
+                if mid in link_memories and mid in merged_link_time
+            ],
+            'added': [_item(m, m.created_at) for m in added_items],
+        }
+
+        counts: dict[str, int] = {bucket: len(items) for bucket, items in memory_changes.items()}
+
+        return memory_changes, counts
+
+
+def run_weekly_digest_with_tracking(
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    *,
+    window_days: int = WEEKLY_DIGEST_WINDOW_DAYS,
+    request_id: str = '',
+    correlation_id: str = '',
+) -> WeeklyDigestResult:
+    project = Project.objects.get(id=project_id, organization_id=organization_id)
+
+    run = WorkflowRun.objects.create(
+        organization=project.organization,
+        project=project,
+        run_type=WorkflowRunType.WEEKLY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={'window_days': window_days},
+        request_id=request_id,
+        correlation_id=correlation_id,
+    )
+
+    run.status = WorkflowRunStatus.RUNNING
+
+    run.started_at = timezone.now()
+
+    run.save(update_fields=['status', 'started_at', 'updated_at'])
+
+    try:
+        result = BuildWeeklyStructuredDigest().execute(
+            WeeklyDigestInput(
+                organization_id=organization_id,
+                project_id=project_id,
+                window_days=window_days,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            ),
+        )
+    except Exception as error:
+        run.status = WorkflowRunStatus.FAILED
+
+        run.failure_reason = str(error)[:1024]
+
+        run.finished_at = timezone.now()
+
+        run.save(update_fields=['status', 'failure_reason', 'finished_at', 'updated_at'])
+
+        raise
+
+    run.status = WorkflowRunStatus.SUCCEEDED
+
+    run.finished_at = timezone.now()
+
+    run.result_memory = result.digest_memory
+
+    run.save(
+        update_fields=[
+            'status',
+            'finished_at',
+            'result_memory',
             'updated_at',
         ],
     )
