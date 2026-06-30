@@ -645,6 +645,18 @@ def test_resolve_lexical_fusion_enabled_true_when_set(
 # lexical recall (pg_trgm + FTS)
 
 
+_FUZZY_RECALL_BODY = (
+    'The retrieval pipeline resolves the effective api key scope, then ranks candidate memories '
+    'and packs them into a context bundle for the agent. Tenant isolation is enforced and the '
+    'authorisation gate runs before any ranking happens, so unapproved memory never reaches the model.'
+)
+_UNRELATED_RECALL_BODY = (
+    'Boil a large pot of salted water, add the dried pasta, and stir occasionally. Cook until al dente, '
+    'reserve a cup of the starchy liquid, then drain and toss the noodles with warm tomato sauce and '
+    'fresh basil before serving.'
+)
+
+
 @pytestmark_pgvector
 @pytest.mark.django_db
 def test_lexical_recall_matches_surfaces_trigram_near_document(
@@ -654,18 +666,26 @@ def test_lexical_recall_matches_surfaces_trigram_near_document(
     fuzzy = _seed_document(
         organization,
         project,
-        title='authorisation',
-        body='authorisation',
+        title='Access control playbook',
+        body=_FUZZY_RECALL_BODY,
         embedding=_basis_vector(0),
         sequence=1,
     )
+    unrelated = _seed_document(
+        organization,
+        project,
+        title='Pasta recipe',
+        body=_UNRELATED_RECALL_BODY,
+        embedding=_basis_vector(1),
+        sequence=2,
+    )
     assert 'authorization' not in fuzzy.full_text.casefold()
 
-    matches = lexical_recall_matches((fuzzy,), set(), 'authorization')
+    matches = lexical_recall_matches((fuzzy, unrelated), set(), 'authorization')
 
     assert [match.document.id for match in matches] == [fuzzy.id]
     assert matches[0].score == 20
-    assert matches[0].inclusion_reason.startswith('lexical match:')
+    assert matches[0].inclusion_reason.startswith('lexical match: trigram')
 
 
 @pytestmark_pgvector

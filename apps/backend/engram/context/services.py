@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
-from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramSimilarity
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -527,7 +527,7 @@ def lexical_fusion_matches(
     return fuse_semantic_lexical(semantic_matches, lexical_ranks)
 
 
-TRIGRAM_MIN_SIMILARITY = 0.3
+TRIGRAM_MIN_SIMILARITY = 0.4
 
 
 def resolve_lexical_recall_enabled(organization: Organization) -> bool:
@@ -561,7 +561,7 @@ def lexical_recall_matches(
         for row in RetrievalDocument.objects.filter(id__in=candidate_ids)
         .annotate(
             ts=SearchRank(SearchVector('full_text'), search_query),
-            trgm=TrigramSimilarity('full_text', query),
+            trgm=TrigramWordSimilarity(query, 'full_text'),
         )
         .filter(Q(ts__gt=0) | Q(trgm__gte=TRIGRAM_MIN_SIMILARITY))
         .values_list('id', 'ts', 'trgm')
