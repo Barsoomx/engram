@@ -31,6 +31,7 @@ from engram.core.models import (
     ProjectTeam,
     RetrievalDocument,
     Team,
+    VectorField,
     VisibilityScope,
 )
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
@@ -932,6 +933,37 @@ def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
     assert audit.metadata['semantic_document_ids'] == [items[0]['retrieval_document_id']]
 
 
+@pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
+@pytest.mark.django_db
+def test_index_memory_version_populates_embedding_pgvector() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Colour behaviour optimisation',
+        body='Colour behaviour optimisation',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-pgvector-1',
+    )
+
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = RetrievalDocument.objects.get(memory_version=version)
+    assert document.embedding_vector
+    assert document.embedding_pgvector is not None
+    assert list(document.embedding_pgvector) == pytest.approx(document.embedding_vector, abs=1e-5)
+
+
 @pytest.mark.django_db
 def test_context_bundle_keeps_exact_strategy_when_limit_filled() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
@@ -976,6 +1008,139 @@ def test_context_bundle_keeps_exact_strategy_when_limit_filled() -> None:
     assert bundle.metadata['retrieval_strategy'] == 'exact'
     assert 'semantic_provider_call_id' not in bundle.metadata
     assert body['items']
+
+
+@pytest.mark.django_db
+def test_bundle_metadata_always_includes_token_budget_fields() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, token_budget=2000),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get()
+    assert bundle.metadata['token_budget'] == 2000
+    assert bundle.metadata['tokens_used'] > 0
+    assert bundle.metadata['dropped_for_budget'] == 0
+    assert bundle.selected_count == 1
+
+
+@pytest.mark.django_db
+def test_bundle_small_token_budget_trims_lower_ranked_matches() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    # memory1: file_path match -> score 100 -> rank 1
+    memory1, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='A',
+        body='B',
+        file_paths=['src/rank1.py'],
+        symbols=[],
+        exact_terms=[],
+    )
+    # memory2: symbol match -> score 80 -> rank 2
+    _memory2, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='C',
+        body='D',
+        file_paths=[],
+        symbols=['RankTwo'],
+        exact_terms=[],
+    )
+    client = APIClient()
+    # block for rank-1: "- [M1] A\n  B" = 12 chars = 3 tokens
+    # block for rank-2: "- [M2] C\n  D" = 12 chars = 3 tokens
+    # budget=4 fits rank-1 (3<=4) but not both (3+3=6>4)
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='',
+            file_paths=['src/rank1.py'],
+            symbols=['RankTwo'],
+            token_budget=4,
+            request_id='req-token-trim',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get(request_id='req-token-trim')
+    assert bundle.selected_count == 1
+    assert bundle.metadata['token_budget'] == 4
+    assert bundle.metadata['dropped_for_budget'] == 1
+    assert bundle.metadata['tokens_used'] <= 4
+    assert ContextBundleItem.objects.filter(bundle=bundle).count() == 1
+    item = ContextBundleItem.objects.get(bundle=bundle)
+    assert item.memory_id == memory1.id
+
+
+@pytest.mark.django_db
+def test_bundle_over_budget_top_match_is_kept() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='BigMemory',
+        body='B' * 800,
+        file_paths=['src/big.py'],
+        symbols=[],
+        exact_terms=[],
+    )
+    client = APIClient()
+    # The single match costs ~200 tokens; budget=1 < cost but it must still be kept
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='',
+            file_paths=['src/big.py'],
+            symbols=[],
+            token_budget=1,
+            request_id='req-over-budget',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get(request_id='req-over-budget')
+    assert bundle.selected_count == 1
+    assert bundle.metadata['dropped_for_budget'] == 0
+    assert bundle.metadata['tokens_used'] > 1
+
+
+@pytest.mark.django_db
+def test_bundle_none_token_budget_metadata_present() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, token_budget=None),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get()
+    assert bundle.metadata['token_budget'] is None
+    assert 'tokens_used' in bundle.metadata
+    assert bundle.metadata['dropped_for_budget'] == 0
 
 
 @pytest.mark.django_db

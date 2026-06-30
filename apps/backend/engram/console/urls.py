@@ -2,6 +2,7 @@ from django.urls import path
 from rest_framework.routers import DefaultRouter
 
 from engram.console.views.api_keys import ApiKeyViewSet
+from engram.console.views.audit_log import AuditEventViewSet
 from engram.console.views.digests import DigestReviewView, WeeklyDigestView
 from engram.console.views.members import MemberViewSet
 from engram.console.views.memory_review import MemoryReviewViewSet
@@ -34,6 +35,7 @@ router.register('roles', RoleViewSet, basename='admin-role')
 router.register('api-keys', ApiKeyViewSet, basename='admin-api-key')
 router.register('workflow-runs', WorkflowRunViewSet, basename='admin-workflow-run')
 router.register('memory-review', MemoryReviewViewSet, basename='admin-memory-review')
+router.register('audit-events', AuditEventViewSet, basename='admin-audit-event')
 
 urlpatterns = router.urls + [
     path('digests/weekly', WeeklyDigestView.as_view(), name='admin-digests-weekly'),

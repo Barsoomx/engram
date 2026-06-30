@@ -20,8 +20,10 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Observation,
@@ -234,6 +236,68 @@ def create_embedding_policy(organization: Organization, team: Team, project: Pro
     )
 
 
+def create_sibling_observation(base: Observation, *, suffix: str) -> Observation:
+    raw_event = RawEventEnvelope.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        agent=base.agent,
+        session=base.session,
+        event_type='post_tool_use',
+        source_adapter=Runtime.CODEX,
+        client_event_id=f'event-{suffix}',
+        idempotency_key=f'idem-{suffix}',
+        content_hash=f'hash-event-{suffix}',
+        runtime=Runtime.CODEX,
+        payload_schema_version='v1',
+        payload={'tool_name': 'bash'},
+        headers={},
+        request_id=f'request-event-{suffix}',
+        actor_type='api_key',
+        actor_id=f'api-key-{suffix}',
+    )
+
+    return Observation.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        agent=base.agent,
+        session=base.session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title=base.title,
+        body=base.body,
+        files_read=base.files_read,
+        files_modified=base.files_modified,
+        content_hash=f'hash-observation-{suffix}',
+        redaction_metadata={'redacted': True},
+        source_metadata={'event_type': 'post_tool_use'},
+        observed_at=timezone.now(),
+    )
+
+
+def seed_provenanced_candidate(
+    observation: Observation,
+    *,
+    title: str,
+    body: str,
+    confidence: str = '0.900',
+) -> MemoryCandidate:
+    return MemoryCandidate.objects.create(
+        organization=observation.organization,
+        project=observation.project,
+        team=observation.team,
+        source_observation=observation,
+        title=title,
+        body=body,
+        status=CandidateStatus.PROPOSED,
+        visibility_scope=VisibilityScope.PROJECT,
+        evidence=[{'observation_id': str(observation.id), 'provider_call_id': f'seed-{observation.id}'}],
+        content_hash=memory_candidate_content_hash(observation),
+        confidence=Decimal(confidence),
+    )
+
+
 def create_memory_candidate(observation: Observation) -> MemoryCandidate:
     return MemoryCandidate.objects.create(
         organization=observation.organization,
@@ -327,6 +391,7 @@ def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval(
     provider_call = ProviderCallRecord.objects.get()
 
     assert result.duplicate is False
+    assert result.curated_decision == 'promoted'
     assert result.candidate.id == candidate.id
     assert result.memory.id == memory.id
     assert result.memory_version.id == version.id
@@ -749,8 +814,11 @@ def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
     second_document = RetrievalDocument.objects.get()
     assert second_document.embedding_vector == first_vector
     assert second_document.embedding_reference == first_reference
-    embedding_calls = ProviderCallRecord.objects.filter(task_type='embedding')
-    assert embedding_calls.count() == 1
+    indexer_calls = ProviderCallRecord.objects.filter(
+        task_type='embedding',
+        request_id=f'memory-indexer:{first_document.memory_version_id}:embedding',
+    )
+    assert indexer_calls.count() == 1
 
 
 @pytest.mark.django_db
@@ -841,6 +909,54 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
     assert Memory.objects.count() == 1
     assert MemoryCandidate.objects.count() == 1
     assert MemoryVersion.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_observation_recorded_worker_auto_rejects_low_signal_candidate() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
+    candidate = seed_provenanced_candidate(observation, title='noise', body='noise')
+
+    result = execute_worker(observation)
+
+    candidate.refresh_from_db()
+    assert result.curated_decision == 'rejected'
+    assert result.memory is None
+    assert candidate.status == CandidateStatus.REJECTED
+    assert Memory.objects.count() == 0
+    assert RetrievalDocument.objects.count() == 0
+    reject_audit = AuditEvent.objects.get(event_type='MemoryAutoRejected')
+    assert reject_audit.actor_type == 'system'
+    assert reject_audit.target_id == str(candidate.id)
+
+
+@pytest.mark.django_db
+def test_observation_recorded_worker_supersedes_semantic_near_duplicate() -> None:
+    organization, team, project, _session, _raw_event, first_observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+    enable_auto_promote(organization)
+    shared_title = 'Retrieval ranking pipeline'
+    shared_body = 'The retrieval pipeline ranks documents by cosine similarity over embeddings.'
+    seed_provenanced_candidate(first_observation, title=shared_title, body=shared_body)
+    first_result = execute_worker(first_observation)
+
+    second_observation = create_sibling_observation(first_observation, suffix='neardup')
+    seed_provenanced_candidate(second_observation, title=shared_title, body=shared_body)
+
+    second_result = execute_worker(second_observation)
+
+    first_result.memory.refresh_from_db()
+    assert first_result.curated_decision == 'promoted'
+    assert second_result.curated_decision == 'superseded'
+    assert second_result.memory.id != first_result.memory.id
+    assert first_result.memory.stale is True
+    link = MemoryLink.objects.get(link_type=LinkType.SUPERSEDED_BY)
+    assert link.memory_id == first_result.memory.id
+    assert link.target == str(second_result.memory.id)
+    assert AuditEvent.objects.filter(event_type='MemorySuperseded').count() == 1
+    assert Memory.objects.filter(stale=False).count() == 1
 
 
 @pytest.mark.django_db

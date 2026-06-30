@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import models
@@ -144,6 +145,12 @@ class OrganizationSettings(TimestampedModel):
         decimal_places=3,
         null=True,
         blank=True,
+    )
+    curator_enabled = models.BooleanField(default=True)
+    near_dup_threshold = models.DecimalField(
+        max_digits=4,
+        decimal_places=3,
+        default=Decimal('0.850'),
     )
 
     def __str__(self) -> str:
@@ -625,6 +632,13 @@ class RetrievalDocument(TimestampedModel):
             models.Index(fields=['organization', 'project', 'stale', 'refuted']),
         ]
         ordering = ['organization_id', 'project_id', 'memory_id']
+
+    def clean_fields(self, exclude: object = None) -> None:
+        excluded = set(exclude or ())
+        if VectorField is not None:
+            excluded.add('embedding_pgvector')
+
+        super().clean_fields(exclude=excluded)
 
     def clean(self) -> None:
         errors: dict[str, list[str]] = {}

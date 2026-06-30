@@ -24,6 +24,7 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
     Team,
+    VectorField,
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
@@ -36,6 +37,11 @@ from engram.model_policy.services import (
     ResolveModelPolicyInput,
     get_provider_gateway,
 )
+
+try:
+    from pgvector.django import CosineDistance
+except ImportError:
+    CosineDistance = None
 
 logger = structlog.get_logger(__name__)
 
@@ -196,6 +202,41 @@ def redact_text(value: object) -> str:
     return str(redact_value(value).value)
 
 
+def estimate_tokens(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def _pack_to_budget(
+    matches: tuple[RetrievalMatch, ...],
+    token_budget: int | None,
+    limit: int,
+) -> tuple[tuple[RetrievalMatch, ...], tuple[RetrievalMatch, ...]]:
+    if token_budget is None:
+        return matches[:limit], matches[limit:]
+
+    kept: list[RetrievalMatch] = []
+    dropped: list[RetrievalMatch] = []
+    tokens_used = 0
+
+    for match in matches:
+        if len(kept) >= limit:
+            dropped.append(match)
+            continue
+
+        memory = match.document.memory
+        index = len(kept) + 1
+        block = f'- [M{index}] {redact_text(memory.title)}\n  {redact_text(memory.body)}'
+        cost = estimate_tokens(block)
+
+        if not kept or tokens_used + cost <= token_budget:
+            kept.append(match)
+            tokens_used += cost
+        else:
+            dropped.append(match)
+
+    return tuple(kept), tuple(dropped)
+
+
 SEMANTIC_MIN_SIMILARITY = 0.3
 
 
@@ -298,7 +339,10 @@ def score_retrieval_document(
     return None
 
 
-def semantic_retrieval_matches(
+PGVECTOR_FLOOR_DISTANCE_EPSILON = 1e-6
+
+
+def _semantic_retrieval_matches_python(
     documents: tuple[RetrievalDocument, ...],
     exact_matches: list[RetrievalMatch],
     query_vector: list[float],
@@ -325,6 +369,53 @@ def semantic_retrieval_matches(
     scored.sort(key=lambda item: -item[0])
 
     return [match for _similarity, match in scored]
+
+
+def semantic_retrieval_matches_pgvector(
+    documents: tuple[RetrievalDocument, ...],
+    exact_matches: list[RetrievalMatch],
+    query_vector: list[float],
+) -> list[RetrievalMatch]:
+    already_matched = {match.document.id for match in exact_matches}
+    pgvector_ids = [
+        document.id
+        for document in documents
+        if document.id not in already_matched and document.embedding_vector and document.embedding_pgvector is not None
+    ]
+    passing_ids: set[uuid.UUID] = set()
+    if pgvector_ids and CosineDistance is not None and any(query_vector):
+        max_distance = (1 - SEMANTIC_MIN_SIMILARITY) + PGVECTOR_FLOOR_DISTANCE_EPSILON
+        passing_ids = set(
+            RetrievalDocument.objects.filter(id__in=pgvector_ids)
+            .annotate(distance=CosineDistance('embedding_pgvector', query_vector))
+            .filter(distance__lte=max_distance)
+            .values_list('id', flat=True),
+        )
+
+    candidates = tuple(
+        document for document in documents if document.embedding_pgvector is None or document.id in passing_ids
+    )
+
+    return _semantic_retrieval_matches_python(candidates, exact_matches, query_vector)
+
+
+def semantic_retrieval_matches(
+    documents: tuple[RetrievalDocument, ...],
+    exact_matches: list[RetrievalMatch],
+    query_vector: list[float],
+) -> list[RetrievalMatch]:
+    already_matched = {match.document.id for match in exact_matches}
+    use_pgvector = (
+        VectorField is not None
+        and CosineDistance is not None
+        and any(
+            document.id not in already_matched and document.embedding_pgvector is not None for document in documents
+        )
+    )
+    if use_pgvector:
+        return semantic_retrieval_matches_pgvector(documents, exact_matches, query_vector)
+
+    return _semantic_retrieval_matches_python(documents, exact_matches, query_vector)
 
 
 def resolve_query_embedding(
@@ -467,7 +558,11 @@ class IndexMemoryVersion:
 
         document.embedding_vector = list(result.embedding)
         document.embedding_reference = f'provider:{result.call_record_id}'
-        document.save(update_fields=['embedding_vector', 'embedding_reference', 'updated_at'])
+        update_fields = ['embedding_vector', 'embedding_reference', 'updated_at']
+        if VectorField is not None:
+            document.embedding_pgvector = list(result.embedding)
+            update_fields.append('embedding_pgvector')
+        document.save(update_fields=update_fields)
 
 
 class BuildContextBundle:
@@ -502,12 +597,20 @@ class BuildContextBundle:
             project,
             team,
         )
+        kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
+        tokens_used = sum(
+            estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
+            for i, m in enumerate(kept, start=1)
+        )
         query_result = redact_value(data.query)
-        metadata = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
+        metadata: dict[str, object] = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
         if has_semantic and embedding_result is not None:
             metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
+        metadata['token_budget'] = data.token_budget
+        metadata['tokens_used'] = tokens_used
+        metadata['dropped_for_budget'] = len(budget_dropped)
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -521,10 +624,10 @@ class BuildContextBundle:
                 query_text=str(query_result.value),
                 authorization_scope=self._authorization_scope(scope),
                 token_budget=data.token_budget,
-                selected_count=len(matches),
+                selected_count=len(kept),
                 metadata=metadata,
             )
-            persisted_matches = self._create_items(bundle, matches)
+            persisted_matches = self._create_items(bundle, kept)
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
