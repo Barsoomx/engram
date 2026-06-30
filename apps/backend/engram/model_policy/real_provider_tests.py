@@ -461,3 +461,109 @@ def test_anthropic_gateway_classifies_401_as_terminal() -> None:
         )
 
     assert exc_info.value.retryable is False
+
+
+@pytest.mark.django_db
+def test_openai_compatible_gateway_sends_system_role_when_system_prompt_set() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {
+        'choices': [{'message': {'content': 'Title\nBody'}}],
+    }
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='sys-prompt-openai-1',
+            trace_id='sys-prompt-openai-1',
+            prompt='user content',
+            system_prompt='system instruction',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    assert sent['messages'][0] == {'role': 'system', 'content': 'system instruction'}
+    assert sent['messages'][1] == {'role': 'user', 'content': 'user content'}
+
+
+@pytest.mark.django_db
+def test_openai_compatible_gateway_omits_system_role_when_system_prompt_empty() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {
+        'choices': [{'message': {'content': 'Title\nBody'}}],
+    }
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='no-sys-prompt-openai-1',
+            trace_id='no-sys-prompt-openai-1',
+            prompt='user content',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    assert len(sent['messages']) == 1
+    assert sent['messages'][0]['role'] == 'user'
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_sends_system_field_when_system_prompt_set() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    response = {'content': [{'type': 'text', 'text': 'Title\nBody'}]}
+    opener = _opener_returning(json.dumps(response).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='sys-prompt-anthropic-1',
+            trace_id='sys-prompt-anthropic-1',
+            prompt='user content',
+            system_prompt='system instruction',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    assert sent['system'] == 'system instruction'
+    assert sent['messages'] == [{'role': 'user', 'content': 'user content'}]
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_omits_system_field_when_system_prompt_empty() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    response = {'content': [{'type': 'text', 'text': 'Title\nBody'}]}
+    opener = _opener_returning(json.dumps(response).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='no-sys-prompt-anthropic-1',
+            trace_id='no-sys-prompt-anthropic-1',
+            prompt='user content',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    assert 'system' not in sent
+    assert sent['messages'] == [{'role': 'user', 'content': 'user content'}]

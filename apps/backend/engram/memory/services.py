@@ -286,6 +286,7 @@ class ProcessObservationRecorded:
                     request_id=f'memory-worker:{observation.id}:generation',
                     trace_id=f'memory-worker:{observation.id}',
                     prompt=provider_prompt(observation),
+                    system_prompt=distillation_system_prompt(),
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
@@ -350,6 +351,24 @@ def candidate_evidence(
     return [
         evidence,
     ]
+
+
+def distillation_system_prompt() -> str:
+    return (
+        'You are a memory distillation engine for software engineering sessions.\n'
+        'Given structured observation data, produce a concise, durable, runtime-neutral engineering memory.\n'
+        '\n'
+        'Rules:\n'
+        '- Output the Title on the first line (single line, under 255 characters).\n'
+        '- Output the Body on the remaining lines.\n'
+        '- Preserve exact identifiers verbatim: file paths, function names, class names, '
+        'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
+        '- Be concise. Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
+        '- Do not invent facts not present in the input.\n'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '- The Title must stand alone as a searchable summary.\n'
+        '- The Body must be self-contained for future retrieval.'
+    )
 
 
 def provider_prompt(observation: Observation) -> str:
@@ -776,6 +795,23 @@ class DigestResult:
         }
 
 
+def digest_system_prompt() -> str:
+    return (
+        'You are a memory synthesis engine for software engineering sessions.\n'
+        'Given a list of approved engineering memories, produce a daily digest.\n'
+        '\n'
+        'Rules:\n'
+        '- Output the Title on the first line (single line, under 255 characters) summarising the digest theme.\n'
+        '- Output the Body on the remaining lines.\n'
+        '- In the Body, consolidate and de-duplicate related memories. Group by theme.\n'
+        '- Highlight decisions, changes, and risks explicitly.\n'
+        '- Be concise. Drop redundant detail.\n'
+        '- Do not invent facts not present in the source memories.\n'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '- The output must be parseable: Title on the first non-empty line, Body on subsequent lines.'
+    )
+
+
 def digest_prompt(sources: tuple[Memory, ...]) -> str:
     lines = [f'- {source.title}: {source.body}' for source in sources]
 
@@ -824,6 +860,7 @@ class GenerateDigest:
                     request_id=data.request_id,
                     trace_id=data.request_id,
                     prompt=prompt,
+                    system_prompt=digest_system_prompt(),
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
