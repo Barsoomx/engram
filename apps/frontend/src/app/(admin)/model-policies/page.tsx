@@ -14,10 +14,11 @@ import {
 } from '@heroui/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, Cpu, Plus, Sparkles } from 'lucide-react';
+import { AlertTriangle, Ban, Cpu, Eye, Plus, Sparkles } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
@@ -25,6 +26,7 @@ import { PulseDot } from '@/components/ui/pulse-dot';
 import { fetchMe, type MeResponse } from '@/lib/auth';
 import {
   createModelPolicy,
+  disableModelPolicy,
   genRequestId,
   listModelPolicies,
   POLICY_TASK_TYPES,
@@ -51,7 +53,7 @@ const PROVIDER_LABELS: Record<SecretProvider, string> = {
 };
 
 const GRID =
-  'minmax(0,1.3fr) minmax(0,0.9fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,1fr)';
+  'minmax(0,1.3fr) minmax(0,0.9fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,1fr) auto';
 
 function humanizeTask(value: string): string {
   return value
@@ -128,11 +130,20 @@ function ColumnHeader() {
       <span>Model</span>
       <span>Scope</span>
       <span>Status</span>
+      <span className='sr-only'>Actions</span>
     </div>
   );
 }
 
-function PoliciesTable({ items }: { items: ModelPolicy[] }) {
+function PoliciesTable({
+  items,
+  onDisable,
+  onSelect,
+}: {
+  items: ModelPolicy[];
+  onDisable: (policy: ModelPolicy) => void;
+  onSelect: (policy: ModelPolicy) => void;
+}) {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
@@ -168,6 +179,27 @@ function PoliciesTable({ items }: { items: ModelPolicy[] }) {
                 active={policy.active}
                 fallbackEnabled={policy.fallback_enabled}
               />
+              <div className='flex items-center justify-end gap-2'>
+                <Button
+                  size='sm'
+                  variant='flat'
+                  startContent={<Eye className='h-3.5 w-3.5' />}
+                  onPress={() => onSelect(policy)}
+                >
+                  View
+                </Button>
+                {policy.active && (
+                  <Button
+                    size='sm'
+                    color='danger'
+                    variant='flat'
+                    startContent={<Ban className='h-3.5 w-3.5' />}
+                    onPress={() => onDisable(policy)}
+                  >
+                    Disable
+                  </Button>
+                )}
+              </div>
             </div>
           ))}
         </div>
@@ -197,6 +229,9 @@ function PoliciesTableSkeleton() {
               <span className='h-3 w-32 rounded-medium bg-content2' />
               <span className='h-5 w-16 rounded-[7px] bg-content2' />
               <span className='h-3 w-16 rounded-medium bg-content2' />
+              <div className='flex items-center justify-end gap-2'>
+                <span className='h-8 w-14 rounded-medium bg-content2' />
+              </div>
             </div>
           ))}
         </div>
@@ -535,6 +570,76 @@ function ResolveField({
   );
 }
 
+function PolicyDetailModal({
+  isOpen,
+  policy,
+  onClose,
+}: {
+  isOpen: boolean;
+  policy: ModelPolicy | null;
+  onClose: () => void;
+}) {
+  return (
+    <Modal isOpen={isOpen} onClose={onClose} placement='center' size='lg'>
+      <ModalContent>
+        {() => (
+          <>
+            <ModalHeader className='flex flex-col gap-1 text-foreground'>
+              {policy?.name ?? 'Policy details'}
+            </ModalHeader>
+            <ModalBody>
+              {policy && (
+                <div className='space-y-4'>
+                  <div className='flex flex-wrap items-center gap-2'>
+                    <TaskPill task={policy.task_type} />
+                    <ScopePill scope={policy.scope} />
+                    <StatusCell
+                      active={policy.active}
+                      fallbackEnabled={policy.fallback_enabled}
+                    />
+                  </div>
+                  <div className='grid grid-cols-2 gap-x-4 gap-y-3'>
+                    <ResolveField label='Provider'>
+                      {PROVIDER_LABELS[policy.provider] ?? policy.provider}
+                    </ResolveField>
+                    <ResolveField label='Model' mono>
+                      {policy.model}
+                    </ResolveField>
+                    <ResolveField label='Version' mono>
+                      {`v${policy.version}`}
+                    </ResolveField>
+                    <ResolveField label='Secret ID' mono>
+                      {policy.secret_id}
+                    </ResolveField>
+                    {policy.project_id && (
+                      <ResolveField label='Project ID' mono>
+                        {policy.project_id}
+                      </ResolveField>
+                    )}
+                    {policy.team_id && (
+                      <ResolveField label='Team ID' mono>
+                        {policy.team_id}
+                      </ResolveField>
+                    )}
+                    <ResolveField label='Policy ID' mono>
+                      {policy.id}
+                    </ResolveField>
+                  </div>
+                </div>
+              )}
+            </ModalBody>
+            <ModalFooter>
+              <Button color='default' variant='light' onPress={onClose}>
+                Close
+              </Button>
+            </ModalFooter>
+          </>
+        )}
+      </ModalContent>
+    </Modal>
+  );
+}
+
 export default function ModelPoliciesPage() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
@@ -615,6 +720,42 @@ export default function ModelPoliciesPage() {
       });
     },
   });
+
+  const [detailPolicy, setDetailPolicy] = React.useState<ModelPolicy | null>(
+    null,
+  );
+  const [disablePolicyTarget, setDisablePolicyTarget] =
+    React.useState<ModelPolicy | null>(null);
+
+  const disablePolicyMutation = useMutation({
+    mutationFn: (policyId: string) =>
+      disableModelPolicy(policyId, {
+        project_id: activeProjectId ?? '',
+        team_id: activeTeamId ?? null,
+        request_id: genRequestId(),
+      }),
+  });
+
+  async function handleDisablePolicy() {
+    if (!disablePolicyTarget) {
+
+      return;
+    }
+
+    try {
+      await disablePolicyMutation.mutateAsync(disablePolicyTarget.id);
+      queryClient.invalidateQueries({ queryKey: ['model-policy', 'policies'] });
+      addToast({ title: 'Policy disabled', color: 'success' });
+      setDisablePolicyTarget(null);
+    } catch (error) {
+      addToast({
+        title: 'Failed to disable policy',
+        description: errorDetail(error, 'Unexpected error.'),
+        color: 'danger',
+      });
+      setDisablePolicyTarget(null);
+    }
+  }
 
   async function handleCreate(input: {
     name: string;
@@ -712,7 +853,11 @@ export default function ModelPoliciesPage() {
               }
             />
           ) : (
-            <PoliciesTable items={items} />
+            <PoliciesTable
+              items={items}
+              onDisable={setDisablePolicyTarget}
+              onSelect={setDetailPolicy}
+            />
           )}
 
           {items.length > 0 && (
@@ -738,6 +883,27 @@ export default function ModelPoliciesPage() {
             error={createError}
             onClose={() => setCreateOpen(false)}
             onSubmit={handleCreate}
+          />
+
+          <PolicyDetailModal
+            isOpen={detailPolicy !== null}
+            policy={detailPolicy}
+            onClose={() => setDetailPolicy(null)}
+          />
+
+          <ConfirmDialog
+            isOpen={disablePolicyTarget !== null}
+            title='Disable policy'
+            description={
+              disablePolicyTarget
+                ? `Disable "${disablePolicyTarget.name}"? Requests routing to this task type will fall through to the next policy or fail.`
+                : undefined
+            }
+            confirmLabel='Disable'
+            confirmColor='danger'
+            isLoading={disablePolicyMutation.isPending}
+            onClose={() => setDisablePolicyTarget(null)}
+            onConfirm={handleDisablePolicy}
           />
         </section>
       )}
