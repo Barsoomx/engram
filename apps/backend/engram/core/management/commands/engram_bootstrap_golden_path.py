@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandParser
@@ -17,7 +18,7 @@ from engram.access.models import (
     Role,
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
-from engram.core.models import Organization, Project, ProjectTeam, Team
+from engram.core.models import Organization, OrganizationSettings, Project, ProjectTeam, Team
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import SECRET_KEY_VERSION, encrypt_secret, secret_fingerprint, secret_hmac
 
@@ -50,6 +51,10 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
         organization, _created = Organization.objects.update_or_create(
             slug='engram-e2e',
             defaults={'name': 'Engram E2E'},
+        )
+        OrganizationSettings.objects.update_or_create(
+            organization=organization,
+            defaults={'distillation_auto_approve_threshold': Decimal('0.000')},
         )
         team, _created = Team.objects.update_or_create(
             organization=organization,
