@@ -17,6 +17,7 @@ from engram.access.models import (
     RoleCapability,
     TeamMembership,
 )
+from engram.access.organization_access import organization_access_blocked
 from engram.core.models import AuditEvent, AuditResult, Project, ProjectTeam, Team
 
 API_KEY_PREFIX_LENGTH = 12
@@ -70,6 +71,9 @@ class ResolveApiKeyScope:
         key = self._find_key(raw_key)
         if key is None:
             raise AccessDeniedError('invalid_key', 'API key is invalid')
+
+        if organization_access_blocked(key.organization):
+            raise AccessDeniedError('organization_suspended', 'Organization is suspended')
 
         state_error = self._state_error(key)
         if state_error:

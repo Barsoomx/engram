@@ -6,6 +6,7 @@ from django.contrib.auth.models import User
 from rest_framework.request import Request
 
 from engram.access.auth_services import AuthError, resolve_user_scope_for_organization
+from engram.access.organization_access import organization_access_blocked
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.core.models import Organization
 
@@ -60,6 +61,9 @@ def _session_scope(
     organization = _organization_by_header(raw_header)
     if organization is None:
         raise AccessDeniedError('organization_not_found', 'Organization not found')
+
+    if organization_access_blocked(organization):
+        raise AccessDeniedError('organization_suspended', 'Organization is suspended')
 
     try:
         scope = resolve_user_scope_for_organization(user, organization)
