@@ -122,6 +122,7 @@ class ProviderCallInput:
     trace_id: str
     prompt: str
     system_prompt: str = ''
+    response_kind: str = 'single'
 
 
 @dataclass(frozen=True)
@@ -649,7 +650,7 @@ class FakeProviderGateway:
         )
         if existing_record is not None:
             redacted_prompt = redact_value(data.prompt)
-            generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+            generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -661,7 +662,7 @@ class FakeProviderGateway:
             )
 
         redacted_prompt = redact_value(data.prompt)
-        generated_title, generated_body = generated_candidate_content(str(redacted_prompt.value))
+        generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
         prompt_was_redacted = redacted_prompt.redacted or '[REDACTED]' in data.prompt
         token_count = len(data.prompt.split())
         record = ProviderCallRecord.objects.create(
@@ -759,6 +760,34 @@ def generated_candidate_content(prompt: str) -> tuple[str, str]:
     return f'Provider-generated memory {digest}', f'Provider-generated candidate body {digest}'
 
 
+def generated_candidates_payload(prompt: str) -> str:
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    candidates = [
+        {
+            'title': f'Provider-synthesized memory {digest} high',
+            'body': f'Provider-synthesized candidate body {digest} high',
+            'confidence': 0.9,
+            'supporting_observation_ids': [],
+        },
+        {
+            'title': f'Provider-synthesized memory {digest} low',
+            'body': f'Provider-synthesized candidate body {digest} low',
+            'confidence': 0.4,
+            'supporting_observation_ids': [],
+        },
+    ]
+
+    return json.dumps(candidates)
+
+
+def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
+    title, body = generated_candidate_content(prompt)
+    if data.response_kind == 'candidates':
+        return title, generated_candidates_payload(prompt)
+
+    return title, body
+
+
 def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
     return Fernet(encryption_key()).decrypt(envelope.ciphertext.encode()).decode()
 
@@ -789,7 +818,8 @@ class OpenAICompatibleGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -801,7 +831,8 @@ class OpenAICompatibleGateway:
             )
 
         content = self._chat_completion(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,
@@ -948,6 +979,20 @@ def _split_completion(content: str) -> tuple[str, str]:
     return lines[0][:255], '\n'.join(lines[1:])
 
 
+def _completion_body(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return content
+
+    return _split_completion(content)[1]
+
+
+def _completion_title(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return ''
+
+    return _split_completion(content)[0]
+
+
 class AnthropicMessagesGateway:
     def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
         self._base_url = base_url.rstrip('/')
@@ -960,7 +1005,8 @@ class AnthropicMessagesGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -972,7 +1018,8 @@ class AnthropicMessagesGateway:
             )
 
         content = self._messages(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,

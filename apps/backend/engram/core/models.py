@@ -139,6 +139,12 @@ class OrganizationSettings(TimestampedModel):
     hybrid_retrieval_enabled = models.BooleanField(default=True)
     # require_provenance is persisted but provenance-based ranking enforcement is deferred
     require_provenance = models.BooleanField(default=False)
+    distillation_auto_approve_threshold = models.DecimalField(
+        max_digits=4,
+        decimal_places=3,
+        null=True,
+        blank=True,
+    )
 
     def __str__(self) -> str:
         return f'settings:{self.organization_id}'
@@ -805,6 +811,7 @@ class MemoryLink(TimestampedModel):
 class WorkflowRunType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
+    SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
 
 
 class WorkflowRunStatus(models.TextChoices):

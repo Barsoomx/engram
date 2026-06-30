@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -169,6 +170,10 @@ CELERY_RESULT_BACKEND = os.environ.get('ENGRAM_CELERY_RESULT_BACKEND', ENGRAM_RE
 CELERY_TASK_IGNORE_RESULT = True
 CELERY_OUTBOX_APP = 'engram.celery_app.app'
 DJANGO_STRUCTLOG_CELERY_ENABLED = True
+
+ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = Decimal(
+    os.environ.get('ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD', '0.800'),
+)
 
 CACHES = {
     'default': {

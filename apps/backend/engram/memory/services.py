@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 import structlog
+from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
@@ -21,6 +22,8 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Observation,
+    Organization,
+    OrganizationSettings,
     Project,
     RetrievalDocument,
     VisibilityScope,
@@ -48,10 +51,11 @@ class MemoryCandidateWorkerInput:
 @dataclass(frozen=True)
 class MemoryCandidateWorkerResult:
     candidate: MemoryCandidate
-    memory: Memory
-    memory_version: MemoryVersion
-    retrieval_document: RetrievalDocument
     duplicate: bool
+    memory: Memory | None = None
+    memory_version: MemoryVersion | None = None
+    retrieval_document: RetrievalDocument | None = None
+    held_for_review: bool = False
 
 
 class MemoryWorkerError(Exception):
@@ -206,16 +210,28 @@ class ProcessObservationRecorded:
             )
             generated = self._generate_candidate(observation, correlation_id=correlation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation, generated)
-            promotion = PromoteMemoryCandidate().execute(
-                PromoteMemoryCandidateInput(candidate_id=candidate.id),
-            )
+            threshold = resolve_auto_approve_threshold(observation.organization)
+            already_promoted = candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id is not None
+            if already_promoted or is_auto_promotable(candidate.confidence, threshold):
+                promotion = PromoteMemoryCandidate().execute(
+                    PromoteMemoryCandidateInput(candidate_id=candidate.id),
+                )
+
+                return MemoryCandidateWorkerResult(
+                    candidate=promotion.candidate,
+                    duplicate=not candidate_created or promotion.duplicate,
+                    memory=promotion.memory,
+                    memory_version=promotion.memory_version,
+                    retrieval_document=promotion.retrieval_document,
+                )
+
+            if candidate_created:
+                self._audit_held(observation, candidate, threshold)
 
             return MemoryCandidateWorkerResult(
-                candidate=promotion.candidate,
-                memory=promotion.memory,
-                memory_version=promotion.memory_version,
-                retrieval_document=promotion.retrieval_document,
-                duplicate=not candidate_created or promotion.duplicate,
+                candidate=candidate,
+                duplicate=not candidate_created,
+                held_for_review=True,
             )
 
     def _originating_correlation_id(self, observation: Observation) -> str:
@@ -318,6 +334,43 @@ class ProcessObservationRecorded:
         evidence = candidate.evidence[0]
 
         return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
+
+    def _audit_held(self, observation: Observation, candidate: MemoryCandidate, threshold: Decimal) -> None:
+        AuditEvent.objects.create(
+            organization=observation.organization,
+            project=observation.project,
+            team=observation.team,
+            event_type='MemoryCandidateHeldForReview',
+            actor_type='system',
+            target_type='memory_candidate',
+            target_id=str(candidate.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            metadata={
+                'confidence': str(candidate.confidence),
+                'threshold': str(threshold),
+                'observation_id': str(observation.id),
+            },
+        )
+
+
+def is_auto_promotable(confidence: Decimal | None, threshold: Decimal) -> bool:
+    return confidence is not None and confidence >= threshold
+
+
+def resolve_auto_approve_threshold(organization: Organization, override: Decimal | None = None) -> Decimal:
+    if override is not None:
+        return override
+
+    org_threshold = (
+        OrganizationSettings.objects.filter(organization=organization)
+        .values_list('distillation_auto_approve_threshold', flat=True)
+        .first()
+    )
+    if org_threshold is not None:
+        return org_threshold
+
+    return Decimal(str(settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD))
 
 
 def memory_candidate_content_hash(observation: Observation) -> str:
