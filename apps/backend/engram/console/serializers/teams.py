@@ -8,8 +8,8 @@ from engram.core.models import Organization, Team
 class TeamReadSerializer(serializers.ModelSerializer):
     class Meta:
         model = Team
-        fields = ['id', 'name', 'slug', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'name', 'slug', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'slug', 'created_at', 'updated_at', 'archived_at', 'organization']
+        read_only_fields = ['id', 'name', 'slug', 'created_at', 'updated_at', 'archived_at', 'organization']
 
 
 class TeamWriteSerializer(serializers.ModelSerializer):
