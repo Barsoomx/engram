@@ -55,12 +55,26 @@ class WeeklyDigestView(APIView):
         except (TypeError, ValueError):
             window_days = WEEKLY_DIGEST_WINDOW_DAYS
 
+        team_id_raw = request.query_params.get('team_id')
+
+        team_id: uuid.UUID | None = None
+
+        if team_id_raw:
+            try:
+                team_id = uuid.UUID(str(team_id_raw))
+            except ValueError:
+                return Response(
+                    {'detail': 'team_id must be a valid UUID'},
+                    status=HTTP_400_BAD_REQUEST,
+                )
+
         try:
             result = BuildWeeklyStructuredDigest().execute(
                 WeeklyDigestInput(
                     organization_id=organization.id,
                     project_id=project_id,
                     window_days=window_days,
+                    team_id=team_id,
                 ),
             )
         except Project.DoesNotExist:

@@ -9,7 +9,7 @@ from decimal import Decimal
 import structlog
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, QuerySet
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope
@@ -1183,6 +1183,7 @@ class WeeklyDigestInput:
     organization_id: uuid.UUID
     project_id: uuid.UUID
     window_days: int = WEEKLY_DIGEST_WINDOW_DAYS
+    team_id: uuid.UUID | None = None
     request_id: str = ''
     correlation_id: str = ''
 
@@ -1199,8 +1200,9 @@ def weekly_digest_content_hash(
     project_id: uuid.UUID,
     window_start: datetime.datetime,
     window_end: datetime.datetime,
+    team_id: uuid.UUID | None = None,
 ) -> str:
-    material = f'{project_id}:{window_start.isoformat()}:{window_end.isoformat()}'
+    material = f'{project_id}:{window_start.isoformat()}:{window_end.isoformat()}:{team_id or ""}'
 
     return hashlib.sha256(material.encode()).hexdigest()
 
@@ -1215,14 +1217,14 @@ class BuildWeeklyStructuredDigest:
 
         window_end = now
 
-        content_hash = weekly_digest_content_hash(project.id, window_start, window_end)
+        content_hash = weekly_digest_content_hash(project.id, window_start, window_end, data.team_id)
 
         existing = self._find_existing(project, content_hash)
 
         if existing is not None:
             return existing
 
-        memory_changes, counts = self._build_buckets(project, window_start, window_end)
+        memory_changes, counts = self._build_buckets(project, window_start, window_end, data.team_id)
 
         with transaction.atomic():
             digest_memory = Memory.objects.create(
@@ -1274,11 +1276,18 @@ class BuildWeeklyStructuredDigest:
             ready=metadata.get('ready', False),
         )
 
+    def _scope_to_team(self, queryset: QuerySet[Memory], team_id: uuid.UUID | None) -> QuerySet[Memory]:
+        if team_id is None:
+            return queryset
+
+        return queryset.filter(team_id=team_id)
+
     def _build_buckets(
         self,
         project: Project,
         window_start: datetime.datetime,
         window_end: datetime.datetime,
+        team_id: uuid.UUID | None = None,
     ) -> tuple[dict, dict]:
         org = project.organization
 
@@ -1288,6 +1297,8 @@ class BuildWeeklyStructuredDigest:
             updated_at__gte=window_start,
             updated_at__lt=window_end,
         ).filter(Q(status=MemoryStatus.REFUTED) | Q(refuted=True))
+
+        refuted_qs = self._scope_to_team(refuted_qs, team_id)
 
         refuted_items = list(refuted_qs)
 
@@ -1300,6 +1311,8 @@ class BuildWeeklyStructuredDigest:
             updated_at__gte=window_start,
             updated_at__lt=window_end,
         ).exclude(id__in=refuted_ids)
+
+        retired_qs = self._scope_to_team(retired_qs, team_id)
 
         retired_items = list(retired_qs)
 
@@ -1354,6 +1367,8 @@ class BuildWeeklyStructuredDigest:
             created_at__lt=window_end,
         ).exclude(id__in=excluded_from_added)
 
+        added_qs = self._scope_to_team(added_qs, team_id)
+
         added_items = list(added_qs)
 
         link_memory_ids = superseded_ids | merged_ids
@@ -1361,14 +1376,15 @@ class BuildWeeklyStructuredDigest:
         link_memories: dict[uuid.UUID, Memory] = {}
 
         if link_memory_ids:
-            link_memories = {
-                m.id: m
-                for m in Memory.objects.filter(
-                    organization=org,
-                    project=project,
-                    id__in=link_memory_ids,
-                )
-            }
+            link_memories_qs = Memory.objects.filter(
+                organization=org,
+                project=project,
+                id__in=link_memory_ids,
+            )
+
+            link_memories_qs = self._scope_to_team(link_memories_qs, team_id)
+
+            link_memories = {m.id: m for m in link_memories_qs}
 
         def _item(m: Memory, at: datetime.datetime) -> dict:
             return {
