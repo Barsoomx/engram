@@ -17,18 +17,26 @@ from engram.context.views import access_error_response
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
+    ModelPolicyDisableSerializer,
     ModelPolicyQuerySerializer,
     ModelPolicyResolveSerializer,
+    ModelPolicyUpdateSerializer,
     ProviderSecretCreateSerializer,
     ProviderSecretDisableSerializer,
+    ProviderSecretEnableSerializer,
     ProviderSecretQuerySerializer,
     ProviderSecretRotateSerializer,
+    ProviderSecretUpdateSerializer,
 )
 from engram.model_policy.services import (
     CreateModelPolicy,
     CreateProviderSecret,
+    DisableModelPolicy,
+    DisableModelPolicyInput,
     DisableProviderSecret,
     DisableProviderSecretInput,
+    EnableProviderSecret,
+    EnableProviderSecretInput,
     ModelPolicyError,
     ModelPolicyInput,
     ProviderSecretInput,
@@ -36,6 +44,10 @@ from engram.model_policy.services import (
     ResolveModelPolicyInput,
     RotateProviderSecret,
     RotateProviderSecretInput,
+    UpdateModelPolicy,
+    UpdateModelPolicyInput,
+    UpdateProviderSecret,
+    UpdateProviderSecretInput,
 )
 
 ERROR_STATUS = {
@@ -89,11 +101,13 @@ class ProviderSecretListView(ModelPolicyBaseView):
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        secrets = list(scoped_secrets(scope).order_by('-created_at'))
+        limit = data.get('limit', 50)
+        offset = data.get('offset', 0)
+        queryset = scoped_secrets(scope).order_by('-created_at')
+        total_count = queryset.count()
+        items = [provider_secret_response(s) for s in queryset[offset : offset + limit]]
 
-        items = [provider_secret_response(secret) for secret in secrets]
-
-        return Response({'count': len(items), 'items': items})
+        return Response({'count': total_count, 'items': items})
 
     def post(self, request: Request) -> Response:
         serializer = ProviderSecretCreateSerializer(data=request.data)
@@ -149,6 +163,39 @@ class ProviderSecretDetailView(ModelPolicyBaseView):
             return access_error_response(error)
 
         secret = get_object_or_404(scoped_secrets(scope), id=secret_id)
+
+        return Response(provider_secret_response(secret))
+
+    def patch(self, request: Request, secret_id: uuid.UUID) -> Response:
+        serializer = ProviderSecretUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='secrets:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='provider_secret',
+                target_id=str(secret_id),
+                request_id=data['request_id'],
+            )
+            secret = UpdateProviderSecret().execute(
+                UpdateProviderSecretInput(
+                    organization_id=scope.organization_id,
+                    project_id=data['project_id'],
+                    team_id=data.get('team_id'),
+                    secret_id=secret_id,
+                    name=data['name'],
+                    request_id=data['request_id'],
+                    actor_id=scope.actor_id,
+                    allowed_team_ids=scope.team_ids,
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except ModelPolicyError as error:
+            return error_response(error)
 
         return Response(provider_secret_response(secret))
 
@@ -244,9 +291,13 @@ class ModelPolicyListView(ModelPolicyBaseView):
         if task_type:
             policies = policies.filter(task_type=task_type)
 
-        items = [model_policy_response(policy) for policy in policies.order_by('-created_at')]
+        limit = data.get('limit', 50)
+        offset = data.get('offset', 0)
+        queryset = policies.order_by('-created_at')
+        total_count = queryset.count()
+        items = [model_policy_response(p) for p in queryset[offset : offset + limit]]
 
-        return Response({'count': len(items), 'items': items})
+        return Response({'count': total_count, 'items': items})
 
     def post(self, request: Request) -> Response:
         serializer = ModelPolicyCreateSerializer(data=request.data)
@@ -314,6 +365,135 @@ class ModelPolicyResolveView(ModelPolicyBaseView):
             return error_response(error)
 
         return Response(model_policy_response(resolved.policy))
+
+
+class ModelPolicyDetailView(ModelPolicyBaseView):
+    def get(self, request: Request, policy_id: uuid.UUID) -> Response:
+        serializer = ModelPolicyQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='model_policy:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='model_policy',
+                target_id=str(policy_id),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+
+        policy = get_object_or_404(scoped_policies(scope), id=policy_id)
+
+        return Response(model_policy_response(policy))
+
+    def patch(self, request: Request, policy_id: uuid.UUID) -> Response:
+        serializer = ModelPolicyUpdateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='model_policy:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='model_policy',
+                target_id=str(policy_id),
+                request_id=data['request_id'],
+            )
+            policy = UpdateModelPolicy().execute(
+                UpdateModelPolicyInput(
+                    organization_id=scope.organization_id,
+                    project_id=data['project_id'],
+                    team_id=data.get('team_id'),
+                    policy_id=policy_id,
+                    request_id=data['request_id'],
+                    actor_id=scope.actor_id,
+                    allowed_team_ids=scope.team_ids,
+                    name=data.get('name'),
+                    provider=data.get('provider'),
+                    model=data.get('model'),
+                    secret_id=data.get('secret_id'),
+                    active=data.get('active'),
+                    fallback_enabled=data.get('fallback_enabled'),
+                    task_type=data.get('task_type'),
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except ModelPolicyError as error:
+            return error_response(error)
+
+        return Response(model_policy_response(policy))
+
+
+class ModelPolicyDisableView(ModelPolicyBaseView):
+    def post(self, request: Request, policy_id: uuid.UUID) -> Response:
+        serializer = ModelPolicyDisableSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='model_policy:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='model_policy',
+                target_id=str(policy_id),
+                request_id=data['request_id'],
+            )
+            policy = DisableModelPolicy().execute(
+                DisableModelPolicyInput(
+                    organization_id=scope.organization_id,
+                    project_id=data['project_id'],
+                    team_id=data.get('team_id'),
+                    policy_id=policy_id,
+                    request_id=data['request_id'],
+                    actor_id=scope.actor_id,
+                    allowed_team_ids=scope.team_ids,
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except ModelPolicyError as error:
+            return error_response(error)
+
+        return Response(model_policy_response(policy))
+
+
+class ProviderSecretEnableView(ModelPolicyBaseView):
+    def post(self, request: Request, secret_id: uuid.UUID) -> Response:
+        serializer = ProviderSecretEnableSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            scope = self._scope(
+                request,
+                required_capability='secrets:*',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='provider_secret',
+                target_id=str(secret_id),
+                request_id=data['request_id'],
+            )
+            secret = EnableProviderSecret().execute(
+                EnableProviderSecretInput(
+                    organization_id=scope.organization_id,
+                    project_id=data['project_id'],
+                    team_id=data.get('team_id'),
+                    secret_id=secret_id,
+                    request_id=data['request_id'],
+                    actor_id=scope.actor_id,
+                    allowed_team_ids=scope.team_ids,
+                ),
+            )
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except ModelPolicyError as error:
+            return error_response(error)
+
+        return Response(provider_secret_response(secret))
 
 
 def provider_secret_response(secret: ProviderSecret) -> dict[str, Any]:

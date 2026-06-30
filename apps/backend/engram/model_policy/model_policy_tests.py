@@ -908,3 +908,387 @@ def test_model_policy_list_returns_scoped_policies_and_filters_by_task_type() ->
 
     assert filtered.status_code == 200
     assert filtered.json() == {'count': 0, 'items': []}
+
+
+def _create_policy(
+    client: APIClient,
+    project: object,
+    team: Team,
+    name: str,
+    secret_id: str,
+    task_type: str = 'generation',
+) -> str:
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': name,
+            'scope': 'team',
+            'task_type': task_type,
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': f'request-policy-{name}',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+
+    return response.json()['id']
+
+
+@pytest.mark.django_db
+def test_model_policy_detail_get_returns_policy_and_hides_cross_team() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI A', 'openai')
+    policy_id = _create_policy(client, project, team, 'Team Generation', secret_id)
+
+    response = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['policy_id'] == policy_id
+
+    other_team = Team.objects.create(organization=organization, name='Other', slug='other-detail')
+    other_secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=other_team,
+        name='Other OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    other_policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=other_team,
+        name='Other policy',
+        scope='team',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4o-mini',
+        secret=other_secret,
+        version=1,
+    )
+
+    cross_team_response = client.get(
+        f'/v1/model-policy/policies/{other_policy.id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert cross_team_response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_model_policy_update_changes_fields_increments_version_and_writes_audit() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI B', 'openai')
+    policy_id = _create_policy(client, project, team, 'Original Name', secret_id)
+
+    response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Updated Name',
+            'model': 'gpt-4.1-mini',
+            'request_id': 'request-policy-update-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['name'] == 'Updated Name'
+    assert body['model'] == 'gpt-4.1-mini'
+    assert body['version'] == 2
+
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.name == 'Updated Name'
+    assert policy.model == 'gpt-4.1-mini'
+    assert policy.version == 2
+
+    assert AuditEvent.objects.filter(
+        target_id=str(policy_id),
+        event_type='ModelPolicyUpdated',
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_model_policy_update_rejects_cross_scope_secret_rescope() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI C', 'openai')
+    policy_id = _create_policy(client, project, team, 'Team Policy C', secret_id)
+
+    other_team = Team.objects.create(organization=organization, name='Other C', slug='other-c')
+    other_secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=other_team,
+        name='Other OpenAI C',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+
+    response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'secret_id': str(other_secret.id),
+            'request_id': 'request-policy-update-cross-scope',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code in (400, 403)
+    assert response.json()['code'] == 'policy_scope_mismatch'
+
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert str(policy.secret_id) == secret_id
+
+
+@pytest.mark.django_db
+def test_model_policy_disable_sets_inactive_idempotent_and_stops_resolution() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI D', 'openai')
+    policy_id = _create_policy(client, project, team, 'Team Policy D', secret_id, 'generation')
+
+    response = client.post(
+        f'/v1/model-policy/policies/{policy_id}/disable',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'request_id': 'request-policy-disable-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['active'] is False
+
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.active is False
+
+    with pytest.raises(ModelPolicyError, match='Model policy was not found'):
+        ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team.id,
+                task_type='generation',
+            ),
+        )
+
+    second_response = client.post(
+        f'/v1/model-policy/policies/{policy_id}/disable',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'request_id': 'request-policy-disable-2',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert second_response.status_code == 200
+    assert second_response.json()['active'] is False
+
+
+@pytest.mark.django_db
+def test_provider_secret_enable_restores_active_and_allows_resolution() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI E', 'openai')
+    policy_id = _create_policy(client, project, team, 'Team Policy E', secret_id, 'generation')
+
+    client.post(
+        f'/v1/model-policy/secrets/{secret_id}/disable',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'request_id': 'request-secret-disable-e',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    with pytest.raises(ModelPolicyError, match='Model policy was not found'):
+        ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team.id,
+                task_type='generation',
+            ),
+        )
+
+    enable_response = client.post(
+        f'/v1/model-policy/secrets/{secret_id}/enable',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'request_id': 'request-secret-enable-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert enable_response.status_code == 200
+    assert enable_response.json()['active'] is True
+
+    secret = ProviderSecret.objects.get(id=secret_id)
+    assert secret.active is True
+
+    _ = policy_id
+    resolved = ResolveModelPolicy().execute(
+        ResolveModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+            task_type='generation',
+        ),
+    )
+    assert resolved.policy.active is True
+
+
+@pytest.mark.django_db
+def test_provider_secret_rename_changes_name_without_touching_fingerprint_or_version() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Original Secret Name', 'openai')
+
+    secret_before = ProviderSecret.objects.get(id=secret_id)
+    original_fingerprint = secret_before.secret_fingerprint
+    original_version = secret_before.current_version
+
+    response = client.patch(
+        f'/v1/model-policy/secrets/{secret_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Renamed Secret',
+            'request_id': 'request-secret-rename-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['name'] == 'Renamed Secret'
+
+    secret_after = ProviderSecret.objects.get(id=secret_id)
+    assert secret_after.name == 'Renamed Secret'
+    assert secret_after.secret_fingerprint == original_fingerprint
+    assert secret_after.current_version == original_version
+
+    assert AuditEvent.objects.filter(
+        target_id=str(secret_id),
+        event_type='ProviderSecretRenamed',
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_model_policy_list_pagination_slices_correctly() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI F', 'openai')
+
+    _create_policy(client, project, team, 'Policy F1', secret_id, 'generation')
+    _create_policy(client, project, team, 'Policy F2', secret_id, 'embedding')
+    _create_policy(client, project, team, 'Policy F3', secret_id, 'curation')
+
+    page1 = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id), 'limit': '2', 'offset': '0'},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert page1.status_code == 200
+    body1 = page1.json()
+    assert body1['count'] == 3
+    assert len(body1['items']) == 2
+
+    page2 = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id), 'limit': '2', 'offset': '2'},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert page2.status_code == 200
+    body2 = page2.json()
+    assert body2['count'] == 3
+    assert len(body2['items']) == 1
+
+
+@pytest.mark.django_db
+def test_new_mutating_endpoints_require_model_policy_capability() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI G', 'openai')
+    policy_id = _create_policy(client, project, team, 'Team Policy G', secret_id)
+
+    base_params = {'project_id': str(project.id), 'team_id': str(team.id), 'request_id': 'req-cap-check'}
+
+    get_detail = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(),
+    )
+    patch_policy = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {**base_params, 'name': 'New Name'},
+        format='json',
+        **auth_headers(),
+    )
+    disable_policy = client.post(
+        f'/v1/model-policy/policies/{policy_id}/disable',
+        base_params,
+        format='json',
+        **auth_headers(),
+    )
+    enable_secret = client.post(
+        f'/v1/model-policy/secrets/{secret_id}/enable',
+        base_params,
+        format='json',
+        **auth_headers(),
+    )
+    patch_secret = client.patch(
+        f'/v1/model-policy/secrets/{secret_id}',
+        {**base_params, 'name': 'New Name'},
+        format='json',
+        **auth_headers(),
+    )
+
+    for resp in (get_detail, patch_policy, disable_policy, enable_secret, patch_secret):
+        assert resp.status_code == 403
+        assert resp.json()['code'] == 'missing_capability'
