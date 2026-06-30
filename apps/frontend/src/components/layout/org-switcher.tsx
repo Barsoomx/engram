@@ -47,7 +47,7 @@ export interface OrgSwitcherProps {
 
 export function OrgSwitcher({ orgId }: OrgSwitcherProps) {
   const router = useRouter();
-  const query = useOrganizations(orgId, { enabled: Boolean(orgId) });
+  const query = useOrganizations(orgId);
   const setActiveOrg = useOrgStore((state) => state.setActiveOrg);
   const open = useSwitcherStore((s) => s.openMenu === 'org');
   const toggle = useSwitcherStore((s) => s.toggle);
@@ -55,12 +55,14 @@ export function OrgSwitcher({ orgId }: OrgSwitcherProps) {
   const data = query.data;
 
   React.useEffect(() => {
-    if (!query.isSuccess || !data || data.results.length === 0) {
+    if (!query.isSuccess || !data) {
       return;
     }
 
-    if (!useOrgStore.getState().activeOrgId) {
-      setActiveOrg(data.results[0].id);
+    const current = useOrgStore.getState().activeOrgId;
+
+    if (!current || !data.results.some((org) => org.id === current)) {
+      setActiveOrg(data.results[0]?.id ?? null);
     }
   }, [query.isSuccess, data, setActiveOrg]);
 

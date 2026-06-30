@@ -15,6 +15,7 @@ import {
   useSessions,
 } from '@/hooks/use-metrics';
 import { apiClient } from '@/lib/auth';
+import { getWeeklyDigest, type WeeklyDigest } from '@/lib/console-api';
 import { avatarColor, formatRelativeTime } from '@/lib/design';
 import type {
   ActivityEvent,
@@ -22,6 +23,8 @@ import type {
   MetricsSession,
 } from '@/lib/metrics-api';
 import { useOrgStore } from '@/lib/org-store';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 type HealthStatus = {
   ok: boolean;
@@ -325,6 +328,17 @@ function RecentActivity({
 }
 
 function WeeklyDigest() {
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
+  const digestQuery = useQuery<WeeklyDigest>({
+    queryKey: ['digests', 'weekly', activeProjectId, activeTeamId],
+    queryFn: () => getWeeklyDigest({ projectId: activeProjectId!, teamId: activeTeamId }),
+    enabled: !!activeProjectId,
+  });
+
+  const digest = digestQuery.data;
+
   return (
     <div className='relative overflow-hidden rounded-[18px] border border-primary/25 bg-primary-soft p-5'>
       <div className='flex items-center gap-3'>
@@ -333,22 +347,55 @@ function WeeklyDigest() {
         </span>
         <div>
           <div className='text-[14.5px] font-semibold text-foreground'>Weekly digest</div>
-          <div className='mt-0.5 text-[12px] text-primary-300'>Coming soon</div>
+          {digest && (
+            <div className='mt-0.5 text-[12px] text-primary-300'>
+              {digest.ready ? 'Ready' : 'Generating…'}
+            </div>
+          )}
         </div>
       </div>
-      <p className='mt-3.5 text-[13px] leading-relaxed text-default-500'>
-        A weekly summary of memories merged and retired across your organization will appear here once
-        digest reporting is enabled on the backend.
-      </p>
-      <button
-        type='button'
-        disabled
-        className='mt-4 inline-flex cursor-not-allowed items-center gap-1.5 rounded-[10px] border border-primary/20 bg-primary/5 px-3.5 py-2 text-[12.5px] font-semibold text-primary-300/60'
-      >
-        Review digest
-        <ArrowRight size={14} strokeWidth={2.2} />
-      </button>
-      <span className='mt-2 block text-[11px] text-default-400'>Preview · not yet available</span>
+
+      {!activeProjectId ? (
+        <p className='mt-3 text-[12.5px] text-default-400'>
+          Select a project to see the weekly digest.
+        </p>
+      ) : digestQuery.isLoading ? (
+        <div className='mt-3 h-[52px] animate-pulse rounded-[10px] bg-primary/10' />
+      ) : digest ? (
+        <>
+          <p className='mt-3 text-[13px] text-default-500'>
+            {digest.counts.added} added · {digest.counts.retired} retired this week
+          </p>
+          {digest.changelog.slice(0, 3).length > 0 && (
+            <div className='mt-3 space-y-1.5'>
+              {digest.changelog.slice(0, 3).map((item) => (
+                <div
+                  key={item.id}
+                  className='flex items-center gap-2 rounded-[8px] bg-primary/5 px-3 py-2'
+                >
+                  <span className='min-w-0 flex-1 truncate text-[12px] font-medium text-foreground'>
+                    {item.title || '(untitled)'}
+                  </span>
+                  <span className='shrink-0 text-[11px] text-default-400'>
+                    {formatRelativeTime(item.at)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+          <Link
+            href='/digests'
+            className='mt-4 inline-flex items-center gap-1.5 rounded-[10px] border border-primary/20 bg-primary/5 px-3.5 py-2 text-[12.5px] font-semibold text-primary-300 transition-colors hover:bg-primary/10'
+          >
+            View digest
+            <ArrowRight size={14} strokeWidth={2.2} />
+          </Link>
+        </>
+      ) : (
+        <p className='mt-3 text-[12.5px] text-default-400'>
+          No digest available for this project yet.
+        </p>
+      )}
     </div>
   );
 }

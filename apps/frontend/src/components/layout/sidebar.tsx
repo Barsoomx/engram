@@ -6,6 +6,7 @@ import {
   BadgeCheck,
   Boxes,
   Building2,
+  CalendarClock,
   ClipboardList,
   Cpu,
   Database,
@@ -20,6 +21,7 @@ import {
   Settings,
   ShieldCheck,
   Users,
+  Webhook,
   Workflow,
   X,
 } from 'lucide-react';
@@ -69,10 +71,22 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         capability: 'memories:read',
       },
       {
+        href: '/hook-debug',
+        label: 'Hook Debugger',
+        icon: Webhook,
+        capability: 'api_keys:read',
+      },
+      {
         href: '/context-bundles',
         label: 'Context Bundles',
         icon: Boxes,
         capability: 'memories:admin',
+      },
+      {
+        href: '/digests',
+        label: 'Weekly Digest',
+        icon: CalendarClock,
+        capability: 'memories:read',
       },
       {
         href: '/workflow-runs',

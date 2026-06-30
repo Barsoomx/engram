@@ -14,7 +14,7 @@ import {
 } from '@heroui/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
-import { Ban, Info, KeyRound, Plus, RefreshCw } from 'lucide-react';
+import { Ban, Info, KeyRound, Plus, Power, RefreshCw } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
@@ -27,6 +27,7 @@ import { fetchMe, type MeResponse } from '@/lib/auth';
 import {
   createProviderSecret,
   disableProviderSecret,
+  enableProviderSecret,
   genRequestId,
   listProviderSecrets,
   rotateProviderSecret,
@@ -102,10 +103,12 @@ function SecretsTable({
   items,
   onRotate,
   onDisable,
+  onEnable,
 }: {
   items: ProviderSecret[];
   onRotate: (secret: ProviderSecret) => void;
   onDisable: (secret: ProviderSecret) => void;
+  onEnable: (secret: ProviderSecret) => void;
 }) {
   return (
     <div className='surface-card overflow-hidden'>
@@ -159,25 +162,37 @@ function SecretsTable({
                 )}
               </div>
               <div className='flex items-center justify-end gap-2'>
-                <Button
-                  size='sm'
-                  variant='flat'
-                  startContent={<RefreshCw className='h-3.5 w-3.5' />}
-                  onPress={() => onRotate(secret)}
-                  isDisabled={!secret.active}
-                >
-                  Rotate
-                </Button>
-                <Button
-                  size='sm'
-                  color='danger'
-                  variant='flat'
-                  startContent={<Ban className='h-3.5 w-3.5' />}
-                  onPress={() => onDisable(secret)}
-                  isDisabled={!secret.active}
-                >
-                  Disable
-                </Button>
+                {secret.active ? (
+                  <>
+                    <Button
+                      size='sm'
+                      variant='flat'
+                      startContent={<RefreshCw className='h-3.5 w-3.5' />}
+                      onPress={() => onRotate(secret)}
+                    >
+                      Rotate
+                    </Button>
+                    <Button
+                      size='sm'
+                      color='danger'
+                      variant='flat'
+                      startContent={<Ban className='h-3.5 w-3.5' />}
+                      onPress={() => onDisable(secret)}
+                    >
+                      Disable
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    size='sm'
+                    color='success'
+                    variant='flat'
+                    startContent={<Power className='h-3.5 w-3.5' />}
+                    onPress={() => onEnable(secret)}
+                  >
+                    Enable
+                  </Button>
+                )}
               </div>
             </div>
           ))}
@@ -564,6 +579,14 @@ export default function SecretsPage() {
         request_id: genRequestId(),
       }),
   });
+  const enableMutation = useMutation({
+    mutationFn: (secretId: string) =>
+      enableProviderSecret(secretId, {
+        project_id: activeProjectId ?? '',
+        team_id: activeTeamId,
+        request_id: genRequestId(),
+      }),
+  });
 
   function invalidateSecrets() {
     queryClient.invalidateQueries({ queryKey: ['model-policy', 'secrets'] });
@@ -621,6 +644,20 @@ export default function SecretsPage() {
       setRotateError(extractDetail(error, 'Failed to rotate secret.'));
 
       return false;
+    }
+  }
+
+  async function handleEnable(secret: ProviderSecret) {
+    try {
+      await enableMutation.mutateAsync(secret.id);
+      invalidateSecrets();
+      addToast({ title: 'Secret enabled', color: 'success' });
+    } catch (error) {
+      addToast({
+        title: 'Failed to enable secret',
+        description: extractDetail(error, 'Unexpected error.'),
+        color: 'danger',
+      });
     }
   }
 
@@ -724,6 +761,7 @@ export default function SecretsPage() {
             items={items}
             onRotate={openRotate}
             onDisable={setDisableTarget}
+            onEnable={handleEnable}
           />
         )}
 

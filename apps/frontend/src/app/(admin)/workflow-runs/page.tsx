@@ -204,9 +204,9 @@ function FiltersBar({
           onChange({ project_id: typeof next === 'string' ? next : undefined });
         }}
       >
-        {(project: Project) => (
+        {projects.map((project) => (
           <SelectItem key={project.id}>{project.name}</SelectItem>
-        )}
+        ))}
       </Select>
 
       <Select

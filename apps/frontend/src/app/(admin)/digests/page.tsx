@@ -1,0 +1,264 @@
+'use client';
+
+import { useMutation, useQuery } from '@tanstack/react-query';
+import { BookOpen, Calendar, CheckCircle2, XCircle } from 'lucide-react';
+import * as React from 'react';
+
+import { CapabilityGate } from '@/components/ui/capability-gate';
+import { EmptyState } from '@/components/ui/empty-state';
+import { PageHeader } from '@/components/ui/page-header';
+import { fetchMe, type MeResponse } from '@/lib/auth';
+import {
+  getWeeklyDigest,
+  reviewDigest,
+  type DigestChangelogItem,
+  type DigestCounts,
+  type WeeklyDigest,
+} from '@/lib/console-api';
+import { formatRelativeTime } from '@/lib/design';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
+
+function formatDateRange(start: string | null, end: string | null): string {
+  if (!start && !end) {
+    return 'This week';
+  }
+
+  const fmt = (iso: string | null): string => {
+    if (!iso) {
+      return '—';
+    }
+
+    const d = new Date(iso);
+
+    return Number.isNaN(d.getTime())
+      ? iso
+      : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  };
+
+  return `${fmt(start)} – ${fmt(end)}`;
+}
+
+type BucketKey = 'added' | 'merged' | 'superseded' | 'retired' | 'refuted';
+
+const BUCKET_STYLES: Record<BucketKey, { label: string; bg: string; text: string }> = {
+  added: { label: 'Added', bg: 'bg-success/10', text: 'text-success' },
+  merged: { label: 'Merged', bg: 'bg-primary/10', text: 'text-primary-300' },
+  superseded: { label: 'Superseded', bg: 'bg-warning/10', text: 'text-warning' },
+  retired: { label: 'Retired', bg: 'bg-content3', text: 'text-default-600' },
+  refuted: { label: 'Refuted', bg: 'bg-danger/10', text: 'text-danger' },
+};
+
+const BUCKET_ORDER: BucketKey[] = ['added', 'merged', 'superseded', 'retired', 'refuted'];
+
+function bucketStyle(bucket: string): { label: string; bg: string; text: string } {
+  return (
+    BUCKET_STYLES[bucket as BucketKey] ?? {
+      label: bucket,
+      bg: 'bg-content3',
+      text: 'text-default-500',
+    }
+  );
+}
+
+function CountTile({
+  label,
+  value,
+  bg,
+  text,
+}: {
+  label: string;
+  value: number;
+  bg: string;
+  text: string;
+}) {
+  return (
+    <div className='surface-card flex flex-col gap-2.5 p-[18px]'>
+      <span
+        className={`inline-flex w-fit rounded-[6px] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em] ${bg} ${text}`}
+      >
+        {label}
+      </span>
+      <span className='tnum text-[27px] font-semibold leading-none tracking-[-0.02em] text-foreground'>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function ChangelogRow({ item }: { item: DigestChangelogItem }) {
+  const style = bucketStyle(item.bucket);
+
+  return (
+    <div className='flex items-center gap-3 border-b border-divider py-3 last:border-b-0'>
+      <span
+        className={`shrink-0 rounded-[7px] px-2 py-0.5 text-[11px] font-semibold ${style.bg} ${style.text}`}
+      >
+        {style.label}
+      </span>
+      <span className='min-w-0 flex-1 truncate text-[13.5px] font-medium text-foreground'>
+        {item.title || '(untitled)'}
+      </span>
+      <span className='shrink-0 text-[11.5px] text-default-400'>
+        {formatRelativeTime(item.at)}
+      </span>
+    </div>
+  );
+}
+
+function DigestSkeleton() {
+  return (
+    <div className='space-y-5'>
+      <div className='grid gap-3 sm:grid-cols-3 lg:grid-cols-5'>
+        {Array.from({ length: 5 }).map((_, i) => (
+          <div key={i} className='surface-card h-[88px] animate-pulse bg-content1' />
+        ))}
+      </div>
+      <div className='surface-card h-[280px] animate-pulse bg-content1' />
+    </div>
+  );
+}
+
+function DigestContent({
+  digest,
+  onReviewed,
+}: {
+  digest: WeeklyDigest;
+  onReviewed: () => void;
+}) {
+  const { counts, changelog, window_start, window_end, ready } = digest;
+
+  const reviewMutation = useMutation({
+    mutationFn: () => reviewDigest(digest.digest_memory_id),
+    onSuccess: () => onReviewed(),
+  });
+
+  const reviewed = ready || reviewMutation.isSuccess;
+
+  return (
+    <div className='space-y-5'>
+      <div className='flex items-center justify-between gap-3'>
+        <div className='flex items-center gap-2 text-[13px] text-default-500'>
+          <Calendar className='h-4 w-4' strokeWidth={1.8} />
+          <span>{formatDateRange(window_start, window_end)}</span>
+        </div>
+        <span
+          className={`inline-flex items-center gap-1.5 rounded-[8px] px-2.5 py-1 text-[11.5px] font-semibold ${
+            ready ? 'bg-success/10 text-success' : 'bg-content3 text-default-500'
+          }`}
+        >
+          <CheckCircle2 className='h-3.5 w-3.5' strokeWidth={2} />
+          {ready ? 'Ready' : 'Not ready'}
+        </span>
+      </div>
+
+      <div className='grid gap-3 sm:grid-cols-3 lg:grid-cols-5'>
+        {BUCKET_ORDER.map((key) => {
+          const style = BUCKET_STYLES[key];
+
+          return (
+            <CountTile
+              key={key}
+              label={style.label}
+              value={(counts as DigestCounts)[key]}
+              bg={style.bg}
+              text={style.text}
+            />
+          );
+        })}
+      </div>
+
+      <div className='surface-card p-[22px]'>
+        <h3 className='text-[14.5px] font-semibold text-foreground'>Changelog</h3>
+        <p className='mt-0.5 mb-3 text-[12px] text-default-500'>
+          All memory changes in this window, newest first.
+        </p>
+        {changelog.length > 0 ? (
+          <div>
+            {changelog.map((item) => (
+              <ChangelogRow key={item.id} item={item} />
+            ))}
+          </div>
+        ) : (
+          <p className='py-6 text-center text-[13px] text-default-400'>
+            No changes recorded in this window.
+          </p>
+        )}
+        {reviewed ? (
+          <p className='mt-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-success'>
+            <CheckCircle2 className='h-4 w-4' strokeWidth={2} />
+            Digest reviewed
+          </p>
+        ) : (
+          <div className='mt-4 flex items-center gap-3'>
+            <button
+              type='button'
+              onClick={() => reviewMutation.mutate()}
+              disabled={reviewMutation.isPending}
+              className='inline-flex items-center gap-1.5 rounded-[10px] border border-primary/30 bg-primary/10 px-3.5 py-2 text-[12.5px] font-semibold text-primary-300 transition-colors hover:bg-primary/20 disabled:cursor-wait disabled:opacity-60'
+            >
+              <CheckCircle2 className='h-4 w-4' strokeWidth={2} />
+              {reviewMutation.isPending ? 'Marking…' : 'Mark reviewed'}
+            </button>
+            {reviewMutation.isError && (
+              <span className='text-[12px] text-danger'>Failed to mark reviewed.</span>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function DigestsPage() {
+  const activeProjectId = useProjectStore((s) => s.activeProjectId);
+  const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
+  const meQuery = useQuery<MeResponse>({
+    queryKey: ['auth', 'me'],
+    queryFn: fetchMe,
+  });
+  const capabilities = React.useMemo(
+    () => meQuery.data?.capabilities ?? [],
+    [meQuery.data?.capabilities],
+  );
+
+  const digestQuery = useQuery<WeeklyDigest>({
+    queryKey: ['digests', 'weekly', activeProjectId, activeTeamId],
+    queryFn: () => getWeeklyDigest({ projectId: activeProjectId!, teamId: activeTeamId }),
+    enabled: !!activeProjectId,
+  });
+
+  return (
+    <CapabilityGate capabilities={capabilities} required='memories:read'>
+      <section className='space-y-6'>
+        <PageHeader
+          title='Weekly Digest'
+          subtitle='Memory changes merged, retired, and refuted across your project this week.'
+        />
+
+        {!activeProjectId ? (
+          <EmptyState
+            title='Select a project'
+            description='Choose a project from the switcher above to view its weekly digest.'
+            icon={<BookOpen className='h-6 w-6' />}
+          />
+        ) : digestQuery.isLoading ? (
+          <DigestSkeleton />
+        ) : digestQuery.isError ? (
+          <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
+            <XCircle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
+            <p className='text-[13px] leading-relaxed text-danger'>
+              Failed to load digest. Please try again.
+            </p>
+          </div>
+        ) : digestQuery.data ? (
+          <DigestContent
+            digest={digestQuery.data}
+            onReviewed={() => digestQuery.refetch()}
+          />
+        ) : null}
+      </section>
+    </CapabilityGate>
+  );
+}
