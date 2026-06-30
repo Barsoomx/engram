@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -542,6 +543,18 @@ def resolve_lexical_recall_enabled(organization: Organization) -> bool:
     return enabled
 
 
+def resolve_require_provenance_enabled(organization: Organization) -> bool:
+    enabled = (
+        OrganizationSettings.objects.filter(organization=organization)
+        .values_list('require_provenance', flat=True)
+        .first()
+    )
+    if enabled is None:
+        return False
+
+    return enabled
+
+
 def lexical_recall_matches(
     documents: tuple[RetrievalDocument, ...],
     already_matched_ids: set[uuid.UUID],
@@ -815,6 +828,7 @@ class BuildContextBundle:
         team = self._resolve_team(organization, data.team_id, scope)
         agent = self._get_or_create_agent(organization, data)
         session = self._get_or_create_session(organization, project, team, agent, data)
+        retrieval_started_at = time.monotonic()
         authorized_documents = self._authorized_documents(organization, project, scope)
         matches, has_semantic, embedding_result = self._rank_matches(
             authorized_documents,
@@ -824,6 +838,7 @@ class BuildContextBundle:
             team,
         )
         kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
+        retrieval_latency_ms = round((time.monotonic() - retrieval_started_at) * 1000)
         tokens_used = sum(
             estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
             for i, m in enumerate(kept, start=1)
@@ -853,6 +868,7 @@ class BuildContextBundle:
                 token_budget=data.token_budget,
                 selected_count=len(kept),
                 metadata=metadata,
+                retrieval_latency_ms=retrieval_latency_ms,
             )
             persisted_matches = self._create_items(bundle, kept)
             bundle.rendered_text = self._render_context(persisted_matches)
@@ -1001,7 +1017,13 @@ class BuildContextBundle:
         project: Project,
         scope: EffectiveScope,
     ) -> tuple[RetrievalDocument, ...]:
-        return authorized_retrieval_documents(organization, project, scope)
+        documents = authorized_retrieval_documents(organization, project, scope)
+        if resolve_require_provenance_enabled(organization):
+            documents = tuple(
+                document for document in documents if document.memory_version.source_observation_id is not None
+            )
+
+        return documents
 
     def _rank_matches(
         self,

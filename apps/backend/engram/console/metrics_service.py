@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
-from django.db.models import Count, Max, Q
+from django.db.models import Avg, Count, Max, Q
 from django.db.models.functions import TruncDate
 from django.utils import timezone
 
@@ -69,14 +69,20 @@ def get_overview_metrics(
         AgentSession.objects.filter(base, updated_at__gte=twenty_four_hours_ago).values('agent_id').distinct().count()
     )
 
+    avg_retrieval_latency_ms = ContextBundle.objects.filter(
+        base,
+        created_at__gte=seven_days_ago,
+        retrieval_latency_ms__isnull=False,
+    ).aggregate(avg_latency=Avg('retrieval_latency_ms'))['avg_latency']
+
     return {
         'memories_indexed': memories_total,
         'memories_indexed_delta': memories_current_7d - memories_prior_7d,
         'context_bundles_7d': bundles_current_7d,
         'context_bundles_7d_delta': bundles_current_7d - bundles_prior_7d,
         'connected_agents': connected_agents,
-        'avg_retrieval_latency_ms': None,
-        'avg_retrieval_latency_measured': False,
+        'avg_retrieval_latency_ms': avg_retrieval_latency_ms,
+        'avg_retrieval_latency_measured': avg_retrieval_latency_ms is not None,
     }
 
 
