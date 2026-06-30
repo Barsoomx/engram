@@ -52,7 +52,7 @@ class ProjectViewSet(
                 'memories',
                 filter=Q(memories__status=MemoryStatus.APPROVED),
             )
-        )
+        ).order_by('-created_at')
 
     def get_serializer_context(self) -> dict:
         context = super().get_serializer_context()
