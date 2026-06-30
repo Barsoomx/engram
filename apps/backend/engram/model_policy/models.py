@@ -208,6 +208,7 @@ class ProviderCallRecord(TimestampedModel):
         indexes = [
             models.Index(fields=['organization', 'project', 'task_type']),
             models.Index(fields=['organization', 'provider', 'model']),
+            models.Index(fields=['organization', 'project', 'task_type', 'request_id']),
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
