@@ -445,3 +445,154 @@ export const POLICY_TASK_TYPES: PolicyTaskType[] = [
 ];
 
 export const SECRET_PROVIDERS: SecretProvider[] = ['anthropic', 'openai'];
+
+export interface ModelPolicyActionInput {
+  project_id: string;
+  team_id?: string | null;
+  request_id: string;
+}
+
+export async function getModelPolicy(
+  policyId: string,
+  scope: ScopeParams,
+): Promise<ModelPolicy> {
+  const response = await apiClient().get<ModelPolicy>(
+    `/v1/model-policy/policies/${policyId}`,
+    { params: scopeQuery(scope) },
+  );
+
+  return response.data;
+}
+
+export async function disableModelPolicy(
+  policyId: string,
+  body: ModelPolicyActionInput,
+): Promise<ModelPolicy> {
+  const response = await apiClient().post<ModelPolicy>(
+    `/v1/model-policy/policies/${policyId}/disable`,
+    body,
+  );
+
+  return response.data;
+}
+
+export async function enableProviderSecret(
+  secretId: string,
+  body: ProviderSecretDisableInput,
+): Promise<ProviderSecret> {
+  const response = await apiClient().post<ProviderSecret>(
+    `/v1/model-policy/secrets/${secretId}/enable`,
+    body,
+  );
+
+  return response.data;
+}
+
+/* ------------------------------- Weekly digest ---------------------------- */
+
+export interface DigestBucketItem {
+  id: string;
+  title: string;
+  at: string;
+}
+
+export interface DigestChangelogItem {
+  id: string;
+  title: string;
+  bucket: string;
+  at: string;
+}
+
+export interface DigestCounts {
+  refuted: number;
+  retired: number;
+  superseded: number;
+  merged: number;
+  added: number;
+}
+
+export interface WeeklyDigest {
+  window_start: string | null;
+  window_end: string | null;
+  window_days: number;
+  counts: DigestCounts;
+  memory_changes: Record<string, DigestBucketItem[]>;
+  changelog: DigestChangelogItem[];
+  ready: boolean;
+}
+
+export async function getWeeklyDigest(
+  scope: ScopeParams,
+  windowDays?: number,
+): Promise<WeeklyDigest> {
+  const params: Record<string, string> = scopeQuery(scope);
+
+  if (windowDays && windowDays > 0) {
+    params.window_days = String(windowDays);
+  }
+
+  const response = await apiClient().get<WeeklyDigest>(
+    '/v1/admin/digests/weekly',
+    { params },
+  );
+
+  return response.data;
+}
+
+export interface DigestReviewResult {
+  memory_id: string;
+  reviewed: boolean;
+  ready: boolean;
+}
+
+export async function reviewDigest(
+  memoryId: string,
+): Promise<DigestReviewResult> {
+  const response = await apiClient().post<DigestReviewResult>(
+    `/v1/admin/digests/${memoryId}/review`,
+    {},
+  );
+
+  return response.data;
+}
+
+/* -------------------------------- Hook dry-run ---------------------------- */
+
+export interface HookDryRunInput {
+  project_id: string;
+  team_id?: string | null;
+  agent_runtime: string;
+  agent_version?: string;
+  request_id?: string;
+}
+
+export interface HookDryRunResult {
+  status: string;
+  request_id: string;
+  resolved_actor: {
+    type: string;
+    id: string;
+  };
+  scope: {
+    organization_id: string;
+    project_ids: string[];
+    team_ids: string[];
+    capabilities: string[];
+  };
+  server: {
+    health: string;
+  };
+}
+
+export async function dryRunHook(
+  apiKey: string,
+  body: HookDryRunInput,
+): Promise<HookDryRunResult> {
+  const response = await apiClient().post<HookDryRunResult>(
+    '/v1/hooks/dry-run',
+    body,
+    { headers: { Authorization: `Bearer ${apiKey}` } },
+  );
+
+  return response.data;
+}
