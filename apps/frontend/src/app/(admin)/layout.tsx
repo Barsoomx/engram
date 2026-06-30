@@ -1,6 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
+import axios from 'axios';
 import { Bell, Menu } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
@@ -86,6 +87,17 @@ export default function AdminShellLayout({
       router.replace('/login');
     }
   }, [hasToken, router]);
+
+  React.useEffect(() => {
+    if (
+      meQuery.isError &&
+      axios.isAxiosError(meQuery.error) &&
+      meQuery.error.response?.status === 401
+    ) {
+      clearToken();
+      setHasToken(false);
+    }
+  }, [meQuery.isError, meQuery.error]);
 
   const handleLogout = React.useCallback(async () => {
     try {
