@@ -74,10 +74,13 @@ The plugin registers the following Claude Code hook events. Each event calls
 | `Error`        | `*`                | `engram hook error --agent claude_code --response-format claude-code`                    | 60          |
 | `Decision`     | `*`                | `engram hook decision --agent claude_code --response-format claude-code`                 | 60          |
 | `SessionEnd`   | `*`                | `engram hook session-end --agent claude_code --response-format claude-code`              | 60          |
+| `UserPromptSubmit` | `*`            | `engram hook user-prompt-submit --agent claude_code --response-format claude-code`       | 60          |
 
-Hook lifecycle ordering: `SessionStart → PostToolUse* → Decision/Error → SessionEnd`.
+Hook lifecycle ordering: `SessionStart → UserPromptSubmit* → PostToolUse* → Decision/Error → SessionEnd`.
 
-Existing installs need a plugin re-install or version bump before `SessionEnd` fires.
+`UserPromptSubmit` fires on every user prompt: it records the prompt as an observation and injects a fresh per-turn context bundle (`additionalContext`) into the agent.
+
+Existing installs need a plugin re-install or version bump before `SessionEnd` and `UserPromptSubmit` fire.
 
 ### How hooks call the CLI
 

@@ -866,3 +866,34 @@ def test_hook_dry_run_denied_when_organization_suspended() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'organization_suspended'
+
+
+@pytest.mark.django_db
+def test_user_prompt_submit_hook_persists_event_and_queues_worker_task() -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='user_prompt_submit',
+        event_id='user-prompt-submit-event-1',
+        idempotency_key='user-prompt-submit-idempotency-1',
+        payload={'prompt': 'how does authorization work?'},
+        observation={
+            'type': 'user_prompt_submit',
+            'title': 'User prompt submitted',
+            'body': 'how does authorization work?',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/user-prompt-submit', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    body = response.json()
+    assert RawEventEnvelope.objects.get().event_type == 'user_prompt_submit'
+    assert Observation.objects.get().observation_type == 'user_prompt_submit'
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
+    assert queued.kwargs == {}

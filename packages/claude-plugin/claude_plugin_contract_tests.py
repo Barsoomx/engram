@@ -14,7 +14,7 @@ REQUIRED_PACKAGE_FILES = (
     PLUGIN_MANIFEST_PATH,
     HOOK_MANIFEST_PATH,
 )
-REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd")
+REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd", "UserPromptSubmit")
 
 
 class ClaudePluginContractTests(unittest.TestCase):

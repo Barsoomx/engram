@@ -1241,3 +1241,32 @@ def test_context_bundle_skips_semantic_fallback_without_embedding_policy() -> No
     bundle = ContextBundle.objects.get(request_id='request-context-1')
     assert bundle.metadata['retrieval_strategy'] == 'exact'
     assert body['items'] == []
+
+
+@pytest.mark.django_db
+def test_user_prompt_submit_returns_cited_exact_context_and_persists_bundle() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    memory, version, document = create_approved_memory_document(_organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/user-prompt-submit',
+        valid_context_payload(project, team, request_id='request-ups-1'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['status'] == 'created'
+    assert body['request_id'] == 'request-ups-1'
+    assert body['purpose'] == 'user_prompt_submit'
+    assert body['context_bundle_id']
+    assert body['hook_specific_output'] == {
+        'hookEventName': 'UserPromptSubmit',
+        'additionalContext': body['rendered_context'],
+    }
+    assert 'M1' in body['rendered_context']
+    assert memory.title in body['rendered_context']
+    bundle = ContextBundle.objects.get(request_id='request-ups-1')
+    assert bundle.purpose == 'user_prompt_submit'
