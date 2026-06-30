@@ -7,7 +7,7 @@ class ProviderSecretCreateSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(max_length=255)
-    provider = serializers.ChoiceField(choices=('anthropic', 'openai'))
+    provider = serializers.ChoiceField(choices=('anthropic', 'openai', 'deepseek'))
     scope = serializers.ChoiceField(choices=('organization', 'team'))
     raw_secret = serializers.CharField(max_length=4096, write_only=True)
     request_id = serializers.CharField(max_length=255)
@@ -42,9 +42,10 @@ class ModelPolicyCreateSerializer(serializers.Serializer):
     task_type = serializers.ChoiceField(
         choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
     )
-    provider = serializers.ChoiceField(choices=('anthropic', 'openai'))
+    provider = serializers.ChoiceField(choices=('anthropic', 'openai', 'deepseek'))
     model = serializers.CharField(max_length=120)
     secret_id = serializers.UUIDField()
+    base_url = serializers.URLField(required=False, allow_blank=True, max_length=500)
     request_id = serializers.CharField(max_length=255)
 
 
@@ -71,7 +72,7 @@ class ModelPolicyUpdateSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(max_length=255, required=False)
-    provider = serializers.ChoiceField(choices=('anthropic', 'openai'), required=False)
+    provider = serializers.ChoiceField(choices=('anthropic', 'openai', 'deepseek'), required=False)
     model = serializers.CharField(max_length=120, required=False)
     secret_id = serializers.UUIDField(required=False)
     active = serializers.BooleanField(required=False)
@@ -80,6 +81,7 @@ class ModelPolicyUpdateSerializer(serializers.Serializer):
         choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
         required=False,
     )
+    base_url = serializers.URLField(required=False, allow_blank=True, max_length=500)
     request_id = serializers.CharField(max_length=255)
 
 

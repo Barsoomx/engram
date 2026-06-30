@@ -327,6 +327,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
                     request_id=data['request_id'],
                     actor_id=scope.actor_id,
                     scope_team_id=data.get('scope_team_id'),
+                    base_url=data.get('base_url', ''),
                 ),
             )
         except AccessDeniedError as error:
@@ -418,6 +419,7 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
                     active=data.get('active'),
                     fallback_enabled=data.get('fallback_enabled'),
                     task_type=data.get('task_type'),
+                    base_url=data.get('base_url'),
                 ),
             )
         except AccessDeniedError as error:
