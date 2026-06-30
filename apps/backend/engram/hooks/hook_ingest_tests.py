@@ -3,7 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from django.db import transaction
+from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
+from pytest_django.fixtures import DjangoCaptureOnCommitCallbacks
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -28,7 +31,7 @@ from engram.core.models import (
     SessionStatus,
     Team,
 )
-from engram.hooks.services import IngestHookEvent
+from engram.hooks.services import HookEventInput, IngestHookEvent
 
 RAW_KEY = 'egk_test_hook_ingest_0123456789abcdefghijklmnopqrstuvwxyz'
 HOOK_PAYLOAD_MAX_BYTES = 65536
@@ -40,6 +43,13 @@ HOOK_PATH_LIST_MAX_ITEMS = 100
 @pytest.fixture
 def m_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
+
+
+@pytest.fixture
+def f_capture_on_commit(
+    django_capture_on_commit_callbacks: DjangoCaptureOnCommitCallbacks,
+) -> DjangoCaptureOnCommitCallbacks:
+    return django_capture_on_commit_callbacks
 
 
 def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKey]:
@@ -127,6 +137,43 @@ def valid_hook_payload(project: Project, team: Team, **overrides: Any) -> dict[s
     payload.update(overrides)
 
     return payload
+
+
+def hook_event_input(project: Project, team: Team, **overrides: Any) -> HookEventInput:
+    fields = {
+        'raw_key': RAW_KEY,
+        'project_id': project.id,
+        'team_id': team.id,
+        'agent_runtime': 'codex',
+        'agent_version': '0.1.0',
+        'agent_external_id': 'codex-local',
+        'session_id': 'session-1',
+        'event_id': 'event-1',
+        'idempotency_key': 'idem-1',
+        'event_type': 'post_tool_use',
+        'payload_schema_version': 'v1',
+        'sequence_number': 1,
+        'occurred_at': timezone.now(),
+        'content_hash': 'hash-event-1',
+        'request_id': 'request-event-1',
+        'correlation_id': '',
+        'trace_id': '',
+        'repository_url': 'https://example.test/engram.git',
+        'repository_root': '/workspace/engram',
+        'branch': 'master',
+        'cwd': '/workspace/engram',
+        'payload': {'tool_name': 'bash', 'tool_input': {'command': 'pytest'}},
+        'observation': {
+            'type': 'tool_use',
+            'title': 'bash completed',
+            'body': 'pytest exited 0',
+            'files_read': [],
+            'files_modified': [],
+        },
+    }
+    fields.update(overrides)
+
+    return HookEventInput(**fields)
 
 
 @pytest.mark.django_db
@@ -260,36 +307,39 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_ta
 
 
 @pytest.mark.django_db
-def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox() -> None:
+def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
     provider_secret = 'sk-test-secret123456789'
 
-    response = client.post(
-        '/v1/hooks/post-tool-use',
-        valid_hook_payload(
-            project,
-            team,
-            payload={
-                'tool_name': 'bash',
-                'authorization': f'Bearer {RAW_KEY}',
-                'tool_input': {
-                    'api_key': provider_secret,
-                    'command': f'echo {provider_secret}',
+    with f_capture_on_commit(execute=True):
+        response = client.post(
+            '/v1/hooks/post-tool-use',
+            valid_hook_payload(
+                project,
+                team,
+                payload={
+                    'tool_name': 'bash',
+                    'authorization': f'Bearer {RAW_KEY}',
+                    'tool_input': {
+                        'api_key': provider_secret,
+                        'command': f'echo {provider_secret}',
+                    },
+                    'tool_response': {'stdout': f'token={RAW_KEY}'},
                 },
-                'tool_response': {'stdout': f'token={RAW_KEY}'},
-            },
-            observation={
-                'type': 'tool_use',
-                'title': 'bash printed a token',
-                'body': f'output contained {provider_secret} and {RAW_KEY}',
-                'files_read': [],
-                'files_modified': [],
-            },
-        ),
-        format='json',
-        **auth_headers(),
-    )
+                observation={
+                    'type': 'tool_use',
+                    'title': 'bash printed a token',
+                    'body': f'output contained {provider_secret} and {RAW_KEY}',
+                    'files_read': [],
+                    'files_modified': [],
+                },
+            ),
+            format='json',
+            **auth_headers(),
+        )
 
     assert response.status_code == 202
     body = response.json()
@@ -304,7 +354,53 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox() -> None:
 
 
 @pytest.mark.django_db
-def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task() -> None:
+def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+
+    with transaction.atomic():
+        IngestHookEvent().execute(data)
+
+        assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_ingest_hook_event_does_not_dispatch_worker_tasks_when_transaction_rolls_back() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+
+    class RollbackSentinelError(Exception):
+        pass
+
+    with pytest.raises(RollbackSentinelError):
+        with transaction.atomic():
+            IngestHookEvent().execute(data)
+            raise RollbackSentinelError
+
+    assert CeleryOutbox.objects.count() == 0
+    assert RawEventEnvelope.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_ingest_hook_event_dispatches_worker_task_exactly_once_on_commit(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+
+    with f_capture_on_commit(execute=True):
+        with transaction.atomic():
+            result = IngestHookEvent().execute(data)
+
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 1
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
+    assert queued.args == [str(result.observation.id)]
+
+
+@pytest.mark.django_db
+def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     organization, project, team, raw_key = create_hook_scope()
     payload = valid_hook_payload(
         project,
@@ -322,7 +418,8 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task() ->
         },
     )
 
-    response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
     body = response.json()
@@ -335,7 +432,9 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task() ->
 
 
 @pytest.mark.django_db
-def test_error_hook_persists_error_event_and_queues_worker_task() -> None:
+def test_error_hook_persists_error_event_and_queues_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     payload = valid_hook_payload(
         project,
@@ -353,7 +452,8 @@ def test_error_hook_persists_error_event_and_queues_worker_task() -> None:
         },
     )
 
-    response = APIClient().post('/v1/hooks/error', payload, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/error', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
     body = response.json()
@@ -366,7 +466,9 @@ def test_error_hook_persists_error_event_and_queues_worker_task() -> None:
 
 
 @pytest.mark.django_db
-def test_decision_hook_persists_decision_event_and_queues_worker_task() -> None:
+def test_decision_hook_persists_decision_event_and_queues_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     payload = valid_hook_payload(
         project,
@@ -384,7 +486,8 @@ def test_decision_hook_persists_decision_event_and_queues_worker_task() -> None:
         },
     )
 
-    response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
     body = response.json()
@@ -425,7 +528,9 @@ def test_hook_event_endpoint_rejects_mismatched_event_type_before_writes() -> No
 
 
 @pytest.mark.django_db
-def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worker_task() -> None:
+def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
     payload = valid_hook_payload(
@@ -443,7 +548,6 @@ def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worke
             'files_modified': [],
         },
     )
-    first = client.post('/v1/hooks/error', payload, format='json', **auth_headers())
     replay = {
         **payload,
         'event_id': 'error-replay-event-2',
@@ -451,7 +555,9 @@ def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worke
         'observation': {**payload['observation'], 'title': 'should not create'},
     }
 
-    second = client.post('/v1/hooks/error', replay, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        first = client.post('/v1/hooks/error', payload, format='json', **auth_headers())
+        second = client.post('/v1/hooks/error', replay, format='json', **auth_headers())
 
     assert first.status_code == 202
     assert second.status_code == 202
@@ -575,11 +681,12 @@ def test_post_tool_use_uses_key_bound_team_when_request_omits_team_id() -> None:
 
 
 @pytest.mark.django_db
-def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows() -> None:
+def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
     payload = valid_hook_payload(project, team)
-    first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
     replay = {
         **payload,
         'event_id': 'event-2',
@@ -587,7 +694,9 @@ def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows() -> None
         'observation': {**payload['observation'], 'title': 'should not create'},
     }
 
-    second = client.post('/v1/hooks/post-tool-use', replay, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+        second = client.post('/v1/hooks/post-tool-use', replay, format='json', **auth_headers())
 
     assert first.status_code == 202
     assert second.status_code == 202
@@ -599,17 +708,20 @@ def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows() -> None
 
 
 @pytest.mark.django_db
-def test_post_tool_use_replay_by_session_event_id_returns_existing_rows() -> None:
+def test_post_tool_use_replay_by_session_event_id_returns_existing_rows(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
     payload = valid_hook_payload(project, team)
-    first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
     replay = {
         **payload,
         'idempotency_key': 'idem-2',
     }
 
-    second = client.post('/v1/hooks/post-tool-use', replay, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+        second = client.post('/v1/hooks/post-tool-use', replay, format='json', **auth_headers())
 
     assert first.status_code == 202
     assert second.status_code == 202
@@ -797,7 +909,9 @@ def test_post_tool_use_rejects_malformed_payload() -> None:
 
 
 @pytest.mark.django_db
-def test_session_end_marks_session_ended_and_writes_durable_event() -> None:
+def test_session_end_marks_session_ended_and_writes_durable_event(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
     payload = valid_hook_payload(
@@ -817,7 +931,8 @@ def test_session_end_marks_session_ended_and_writes_durable_event() -> None:
         },
     )
 
-    response = client.post('/v1/hooks/session-end', payload, format='json', **auth_headers())
+    with f_capture_on_commit(execute=True):
+        response = client.post('/v1/hooks/session-end', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
     session = AgentSession.objects.get()
@@ -869,7 +984,9 @@ def test_hook_dry_run_denied_when_organization_suspended() -> None:
 
 
 @pytest.mark.django_db
-def test_user_prompt_submit_hook_persists_event_and_queues_worker_task() -> None:
+def test_user_prompt_submit_hook_persists_event_and_queues_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
     organization, project, team, raw_key = create_hook_scope()
     payload = valid_hook_payload(
         project,
@@ -887,7 +1004,8 @@ def test_user_prompt_submit_hook_persists_event_and_queues_worker_task() -> None
         },
     )
 
-    response = APIClient().post('/v1/hooks/user-prompt-submit', payload, format='json', **auth_headers(raw_key))
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/user-prompt-submit', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
     body = response.json()

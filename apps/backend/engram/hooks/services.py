@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
+import structlog
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -20,6 +21,8 @@ from engram.core.models import (
 )
 from engram.core.redaction import RedactionResult, redact_value
 from engram.memory.tasks import distill_session, process_observation_recorded
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -162,9 +165,21 @@ class IngestHookEvent:
                     source_id=data.event_id,
                     defaults={'citation': data.event_id, 'metadata': {'event_type': data.event_type}},
                 )
-                process_observation_recorded.delay(str(observation.id))
+                observation_id = str(observation.id)
+                transaction.on_commit(lambda: process_observation_recorded.delay(observation_id))
                 if data.event_type == 'session_end':
-                    distill_session.delay(str(session.id))
+                    session_id = str(session.id)
+                    transaction.on_commit(lambda: distill_session.delay(session_id))
+
+                logger.info(
+                    'hook_event_ingested',
+                    organization_id=str(organization.id),
+                    project_id=str(project.id),
+                    session_id=str(session.id),
+                    event_type=data.event_type,
+                    observation_id=observation_id,
+                    duplicate=False,
+                )
 
                 return HookIngestResult(
                     request_id=data.request_id,
