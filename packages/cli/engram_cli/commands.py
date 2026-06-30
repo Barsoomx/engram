@@ -659,6 +659,26 @@ def run_hook(
                 path="/v1/hooks/session-end",
                 event_type="session_end",
             )
+        elif args.hook_command == "user-prompt-submit":
+            hook_status, hook_body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path="/v1/hooks/user-prompt-submit",
+                event_type="user_prompt_submit",
+            )
+            if hook_status < 200 or hook_status >= 300:
+                raise error_from_body(hook_body, fallback="http_error")
+            status, body = post_json(
+                transport=active_transport,
+                server_url=server_url,
+                path="/v1/context/user-prompt-submit",
+                api_key=api_key,
+                payload=build_user_prompt_submit_payload(config, runtime, input_payload),
+            )
         else:
             raise CliError(
                 "invalid_response",
@@ -921,10 +941,66 @@ def format_hook_response(
                 "additionalContext": rendered,
             },
         }
+    if hook_command == "user-prompt-submit":
+        rendered = as_string(body.get("rendered_context"))
+        if response_format == "claude-code":
+            return {
+                "systemMessage": rendered,
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": rendered,
+                },
+            }
+
+        return {
+            "continue": True,
+            "systemMessage": rendered,
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": rendered,
+            },
+        }
     if response_format == "claude-code":
         return {}
 
     return {"continue": True}
+
+
+def build_user_prompt_submit_payload(
+    config: dict[str, object],
+    runtime: str,
+    input_payload: dict[str, object],
+) -> dict[str, object]:
+    request_payload = base_hook_payload(config, runtime, input_payload)
+    request_payload.update(
+        {
+            "session_id": required_payload_string(input_payload, "session_id"),
+            "request_id": payload_string(input_payload, "request_id")
+            or f"engram-cli-{uuid.uuid4()}",
+            "query": payload_string(input_payload, "query"),
+            "file_paths": list_value(input_payload.get("file_paths")),
+            "symbols": list_value(input_payload.get("symbols")),
+        },
+    )
+    for field in ("limit", "token_budget"):
+        value = input_payload.get(field)
+        if isinstance(value, int):
+            request_payload[field] = value
+    copy_optional_strings(
+        request_payload,
+        input_payload,
+        (
+            "agent_external_id",
+            "correlation_id",
+            "trace_id",
+            "repository_url",
+            "repository_root",
+            "branch",
+            "cwd",
+        ),
+    )
+
+    return request_payload
 
 
 def build_session_start_payload(
@@ -1165,6 +1241,10 @@ def write_local_state(
                 ),
                 "SessionEnd": (
                     f"engram hook session-end --agent {runtime} "
+                    f"--response-format {response_format_for_runtime(runtime)}"
+                ),
+                "UserPromptSubmit": (
+                    f"engram hook user-prompt-submit --agent {runtime} "
                     f"--response-format {response_format_for_runtime(runtime)}"
                 ),
             },

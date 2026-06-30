@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     hook = subparsers.add_parser("hook")
     hook_subparsers = hook.add_subparsers(dest="hook_command")
-    for command in ("post-tool-use", "session-start", "error", "decision", "session-end"):
+    for command in ("post-tool-use", "session-start", "error", "decision", "session-end", "user-prompt-submit"):
         hook_command = hook_subparsers.add_parser(command)
         hook_command.add_argument(
             "--agent", choices=("codex", "claude-code", "claude_code")
