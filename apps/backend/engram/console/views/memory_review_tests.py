@@ -966,3 +966,101 @@ def test_action_approbe_requires_reason(
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_retrieve_candidate_by_id(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 200
+
+    assert response.data['type'] == 'candidate'
+
+    assert response.data['id'] == str(candidate.id)
+
+
+@pytest.mark.django_db
+def test_retrieve_memory_by_id(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get(f'/v1/admin/memory-review/{memory.id}/')
+
+    assert response.status_code == 200
+
+    assert response.data['type'] == 'memory'
+
+    assert response.data['id'] == str(memory.id)
+
+
+@pytest.mark.django_db
+def test_retrieve_unknown_id_returns_404(
+    f_admin_token: str,
+    f_admin_org: Organization,
+) -> None:
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/00000000-0000-0000-0000-000000000001/')
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_retrieve_foreign_org_item_returns_404(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_foreign_org: Organization,
+) -> None:
+    foreign_project = Project.objects.create(
+        organization=f_foreign_org,
+        name='FP2',
+        slug='fp2',
+    )
+
+    candidate = _make_candidate(f_foreign_org, foreign_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_retrieve_denied_without_review_capability() -> None:
+    user = _make_user('noreview')
+
+    org = Organization.objects.create(name='Noreview', slug='noreview')
+
+    identity = _make_identity(user, org)
+
+    role = _make_role_with_capabilities('noreview_role', ('observations:read',))
+
+    OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
+
+    from rest_framework.authtoken.models import Token
+
+    token = Token.objects.get_or_create(user=user)[0].key
+
+    project = Project.objects.create(organization=org, name='NR', slug='nr')
+
+    candidate = _make_candidate(org, project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(token, org)
+
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 403
