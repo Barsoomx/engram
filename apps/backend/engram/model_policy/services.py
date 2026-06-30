@@ -604,7 +604,8 @@ class OpenAICompatibleGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -616,7 +617,8 @@ class OpenAICompatibleGateway:
             )
 
         content = self._chat_completion(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,
@@ -763,6 +765,20 @@ def _split_completion(content: str) -> tuple[str, str]:
     return lines[0][:255], '\n'.join(lines[1:])
 
 
+def _completion_body(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return content
+
+    return _split_completion(content)[1]
+
+
+def _completion_title(content: str, response_kind: str) -> str:
+    if response_kind == 'candidates':
+        return ''
+
+    return _split_completion(content)[0]
+
+
 class AnthropicMessagesGateway:
     def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
         self._base_url = base_url.rstrip('/')
@@ -775,7 +791,8 @@ class AnthropicMessagesGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
         if existing_record is not None:
-            title, body = _split_completion(prompt_text)
+            title = _completion_title(prompt_text, data.response_kind)
+            body = _completion_body(prompt_text, data.response_kind)
 
             return ProviderCallResult(
                 provider=existing_record.provider,
@@ -787,7 +804,8 @@ class AnthropicMessagesGateway:
             )
 
         content = self._messages(policy.model, prompt_text, system_prompt=data.system_prompt)
-        title, body = _split_completion(content)
+        title = _completion_title(content, data.response_kind)
+        body = _completion_body(content, data.response_kind)
         record = self._record_call(
             data,
             policy,

@@ -22,6 +22,8 @@ from engram.model_policy.services import (
     ProviderSecretError,
     ResolveModelPolicy,
     ResolveModelPolicyInput,
+    _completion_body,
+    _completion_title,
     encryption_key,
     generated_embedding,
 )
@@ -731,6 +733,31 @@ def test_fake_provider_gateway_returns_deterministic_candidate_array_for_candida
 
     assert replay.generated_body == result.generated_body
     assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
+
+
+def test_completion_body_passes_through_full_output_for_candidates_kind() -> None:
+    pretty_json = json.dumps(
+        [
+            {'title': 'high', 'body': 'b1', 'confidence': 0.9, 'supporting_observation_ids': []},
+            {'title': 'low', 'body': 'b2', 'confidence': 0.4, 'supporting_observation_ids': []},
+        ],
+        indent=2,
+    )
+
+    body = _completion_body(pretty_json, 'candidates')
+
+    assert body == pretty_json
+    assert _completion_title(pretty_json, 'candidates') == ''
+    parsed = json.loads(body)
+    assert len(parsed) == 2
+    assert sorted(Decimal(str(item['confidence'])) for item in parsed) == [Decimal('0.4'), Decimal('0.9')]
+
+
+def test_completion_body_and_title_split_first_line_for_single_kind() -> None:
+    content = 'Title line\nBody line one\nBody line two'
+
+    assert _completion_title(content, 'single') == 'Title line'
+    assert _completion_body(content, 'single') == 'Body line one\nBody line two'
 
 
 def test_generated_embedding_is_deterministic_and_normalized() -> None:
