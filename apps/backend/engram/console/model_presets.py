@@ -17,13 +17,6 @@ PRESETS: list[dict[str, Any]] = [
                 'key_slot': 'anthropic',
             },
             {
-                'task_type': 'admin_assistant',
-                'provider': 'anthropic',
-                'model': 'claude-3-5-sonnet-latest',
-                'base_url': '',
-                'key_slot': 'anthropic',
-            },
-            {
                 'task_type': 'curation',
                 'provider': 'anthropic',
                 'model': 'claude-3-5-haiku-latest',
@@ -32,13 +25,6 @@ PRESETS: list[dict[str, Any]] = [
             },
             {
                 'task_type': 'digest',
-                'provider': 'anthropic',
-                'model': 'claude-3-5-haiku-latest',
-                'base_url': '',
-                'key_slot': 'anthropic',
-            },
-            {
-                'task_type': 'rerank',
                 'provider': 'anthropic',
                 'model': 'claude-3-5-haiku-latest',
                 'base_url': '',
@@ -67,13 +53,6 @@ PRESETS: list[dict[str, Any]] = [
                 'key_slot': 'openai',
             },
             {
-                'task_type': 'admin_assistant',
-                'provider': 'openai',
-                'model': 'gpt-4o',
-                'base_url': '',
-                'key_slot': 'openai',
-            },
-            {
                 'task_type': 'curation',
                 'provider': 'openai',
                 'model': 'gpt-4o-mini',
@@ -82,13 +61,6 @@ PRESETS: list[dict[str, Any]] = [
             },
             {
                 'task_type': 'digest',
-                'provider': 'openai',
-                'model': 'gpt-4o-mini',
-                'base_url': '',
-                'key_slot': 'openai',
-            },
-            {
-                'task_type': 'rerank',
                 'provider': 'openai',
                 'model': 'gpt-4o-mini',
                 'base_url': '',
@@ -117,13 +89,6 @@ PRESETS: list[dict[str, Any]] = [
                 'key_slot': 'deepseek',
             },
             {
-                'task_type': 'admin_assistant',
-                'provider': 'deepseek',
-                'model': 'deepseek-chat',
-                'base_url': '',
-                'key_slot': 'deepseek',
-            },
-            {
                 'task_type': 'curation',
                 'provider': 'deepseek',
                 'model': 'deepseek-chat',
@@ -134,13 +99,6 @@ PRESETS: list[dict[str, Any]] = [
                 'task_type': 'digest',
                 'provider': 'deepseek',
                 'model': 'deepseek-chat',
-                'base_url': '',
-                'key_slot': 'deepseek',
-            },
-            {
-                'task_type': 'rerank',
-                'provider': 'deepseek',
-                'model': 'deepseek-reasoner',
                 'base_url': '',
                 'key_slot': 'deepseek',
             },
@@ -167,13 +125,6 @@ PRESETS: list[dict[str, Any]] = [
                 'key_slot': 'glm',
             },
             {
-                'task_type': 'admin_assistant',
-                'provider': 'openai',
-                'model': 'glm-4-plus',
-                'base_url': 'https://open.bigmodel.cn/api/paas/v4',
-                'key_slot': 'glm',
-            },
-            {
                 'task_type': 'curation',
                 'provider': 'openai',
                 'model': 'glm-4-flash',
@@ -182,13 +133,6 @@ PRESETS: list[dict[str, Any]] = [
             },
             {
                 'task_type': 'digest',
-                'provider': 'openai',
-                'model': 'glm-4-flash',
-                'base_url': 'https://open.bigmodel.cn/api/paas/v4',
-                'key_slot': 'glm',
-            },
-            {
-                'task_type': 'rerank',
                 'provider': 'openai',
                 'model': 'glm-4-flash',
                 'base_url': 'https://open.bigmodel.cn/api/paas/v4',
@@ -207,4 +151,4 @@ PRESETS: list[dict[str, Any]] = [
 
 PRESET_BY_KEY: dict[str, dict] = {p['key']: p for p in PRESETS}
 
-ALL_TASK_TYPES = ('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant')
+ALL_TASK_TYPES = ('generation', 'embedding', 'curation', 'digest')

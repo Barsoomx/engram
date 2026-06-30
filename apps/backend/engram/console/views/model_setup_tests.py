@@ -104,7 +104,7 @@ def test_status_no_policies_returns_all_unconfigured(
     assert response.status_code == 200
     body = response.json()
     assert body['ready'] is False
-    assert len(body['task_types']) == 6
+    assert len(body['task_types']) == 4
     for tt in body['task_types']:
         assert tt['configured'] is False
         assert tt['policy_id'] is None
@@ -203,14 +203,14 @@ def test_presets_returns_four_presets(f_admin_client: APIClient) -> None:
 
 
 @pytest.mark.django_db
-def test_presets_each_has_six_task_types(f_admin_client: APIClient) -> None:
+def test_presets_each_has_four_task_types(f_admin_client: APIClient) -> None:
     response = f_admin_client.get('/v1/admin/model-setup/presets')
 
     body = response.json()
     for preset in body['presets']:
-        assert len(preset['task_models']) == 6, f'preset {preset["key"]} has wrong task count'
+        assert len(preset['task_models']) == 4, f'preset {preset["key"]} has wrong task count'
         task_types = {tm['task_type'] for tm in preset['task_models']}
-        assert task_types == {'generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'}
+        assert task_types == {'generation', 'embedding', 'curation', 'digest'}
 
 
 @pytest.mark.django_db
@@ -246,7 +246,7 @@ def test_apply_deepseek_openai_creates_secrets_and_policies(
     assert response.status_code == 200
     body = response.json()
     assert len(body['created_secret_ids']) == 2
-    assert len(body['created_policy_ids']) == 6
+    assert len(body['created_policy_ids']) == 4
     assert body['status']['ready'] is True
     for tt in body['status']['task_types']:
         assert tt['configured'] is True
@@ -354,7 +354,7 @@ def test_apply_rerun_disables_prior_active_policies(
         organization=f_setup_org,
         active=True,
     ).count()
-    assert active_count == 6
+    assert active_count == 4
 
 
 @pytest.mark.django_db
