@@ -648,6 +648,17 @@ def run_hook(
                 path="/v1/hooks/decision",
                 event_type="decision",
             )
+        elif args.hook_command == "session-end":
+            status, body = send_hook_event(
+                active_transport,
+                server_url=server_url,
+                api_key=api_key,
+                config=config,
+                runtime=runtime,
+                input_payload=input_payload,
+                path="/v1/hooks/session-end",
+                event_type="session_end",
+            )
         else:
             raise CliError(
                 "invalid_response",
@@ -1150,6 +1161,10 @@ def write_local_state(
                 ),
                 "Decision": (
                     f"engram hook decision --agent {runtime} "
+                    f"--response-format {response_format_for_runtime(runtime)}"
+                ),
+                "SessionEnd": (
+                    f"engram hook session-end --agent {runtime} "
                     f"--response-format {response_format_for_runtime(runtime)}"
                 ),
             },
