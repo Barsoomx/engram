@@ -193,7 +193,7 @@ def run_scheduled_weekly_digests() -> dict[str, int]:
                 status=MemoryStatus.APPROVED,
                 updated_at__gte=weekly_window_start,
             )
-            .exclude(metadata__contains={'kind': 'digest'})
+            .exclude(kind='digest')
             .exists()
         )
         if not has_approved:
@@ -246,6 +246,6 @@ def _recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
             status=MemoryStatus.APPROVED,
             updated_at__gte=window_start,
         )
-        .exclude(metadata__contains={'kind': 'digest'})
+        .exclude(kind='digest')
         .values_list('id', flat=True),
     )

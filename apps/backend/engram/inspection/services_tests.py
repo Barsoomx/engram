@@ -124,7 +124,8 @@ def test_list_inspection_memories_count_honors_kind_param() -> None:
         title='Digest memory',
     )
     digest.metadata = {'kind': 'digest'}
-    digest.save(update_fields=['metadata', 'updated_at'])
+    digest.kind = 'digest'
+    digest.save(update_fields=['metadata', 'kind', 'updated_at'])
     snippet, _snippet_version, _snippet_document = create_approved_memory_document(
         organization,
         team,
@@ -132,7 +133,8 @@ def test_list_inspection_memories_count_honors_kind_param() -> None:
         title='Snippet memory',
     )
     snippet.metadata = {'kind': 'snippet'}
-    snippet.save(update_fields=['metadata', 'updated_at'])
+    snippet.kind = 'snippet'
+    snippet.save(update_fields=['metadata', 'kind', 'updated_at'])
     inspection_scope = InspectionScope(
         project=project,
         scope=_effective_scope(organization, team),

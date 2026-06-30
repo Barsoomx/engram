@@ -947,7 +947,8 @@ def test_memory_list_filter_by_kind() -> None:
         visibility_scope=VisibilityScope.TEAM,
     )
     digest.metadata = {'kind': 'digest'}
-    digest.save(update_fields=['metadata', 'updated_at'])
+    digest.kind = 'digest'
+    digest.save(update_fields=['metadata', 'kind', 'updated_at'])
     snippet, _vs, _ds = create_approved_memory_document(
         organization,
         team,
@@ -957,7 +958,8 @@ def test_memory_list_filter_by_kind() -> None:
         visibility_scope=VisibilityScope.TEAM,
     )
     snippet.metadata = {'kind': 'snippet'}
-    snippet.save(update_fields=['metadata', 'updated_at'])
+    snippet.kind = 'snippet'
+    snippet.save(update_fields=['metadata', 'kind', 'updated_at'])
     client = APIClient()
 
     response = client.get(

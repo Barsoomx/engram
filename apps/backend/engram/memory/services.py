@@ -1078,7 +1078,7 @@ class GenerateDigest:
         existing_memory = Memory.objects.filter(
             organization=project.organization,
             project=project,
-            metadata__kind='digest',
+            kind='digest',
             metadata__content_hash=content_hash,
         ).first()
         if existing_memory is None:
@@ -1259,7 +1259,7 @@ class BuildWeeklyStructuredDigest:
         existing = Memory.objects.filter(
             organization=project.organization,
             project=project,
-            metadata__kind='digest',
+            kind='digest',
             metadata__digest_kind='weekly_structured',
             metadata__content_hash=content_hash,
         ).first()
