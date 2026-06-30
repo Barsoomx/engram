@@ -12,6 +12,7 @@ from engram.console.views.metrics import (
     MetricsOverviewView,
     MetricsSessionsView,
 )
+from engram.console.views.model_setup import ApplyPresetView, ModelPresetsView, ModelSetupStatusView
 from engram.console.views.ops import OpsOverviewView
 from engram.console.views.organizations import OrganizationViewSet
 from engram.console.views.projects import ProjectViewSet
@@ -49,4 +50,7 @@ urlpatterns = router.urls + [
     path('metrics/memory-ingest', MetricsMemoryIngestView.as_view(), name='admin-metrics-memory-ingest'),
     path('metrics/sessions', MetricsSessionsView.as_view(), name='admin-metrics-sessions'),
     path('metrics/activity', MetricsActivityView.as_view(), name='admin-metrics-activity'),
+    path('model-setup/status', ModelSetupStatusView.as_view(), name='admin-model-setup-status'),
+    path('model-setup/presets', ModelPresetsView.as_view(), name='admin-model-setup-presets'),
+    path('model-setup/apply', ApplyPresetView.as_view(), name='admin-model-setup-apply'),
 ]
