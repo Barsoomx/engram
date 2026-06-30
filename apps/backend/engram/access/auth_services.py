@@ -12,6 +12,7 @@ from rest_framework.authtoken.models import Token
 from engram.access.models import (
     Identity,
     IdentityType,
+    MembershipStatus,
     OrganizationMembership,
     ProjectGrant,
     Role,
@@ -153,10 +154,14 @@ def resolve_user_scope(user: User) -> EffectiveScope:
     if identity is None:
         raise AuthError('identity_missing', 'User identity is not linked')
 
+    if not identity.active:
+        raise AuthError('identity_missing', 'User identity is not linked')
+
     membership = (
         OrganizationMembership.objects.filter(
             identity=identity,
             active=True,
+            status=MembershipStatus.ACTIVE,
         )
         .select_related('organization')
         .order_by('created_at')
@@ -217,6 +222,7 @@ def resolve_user_scope_for_organization(
         organization=organization,
         identity=identity,
         active=True,
+        status=MembershipStatus.ACTIVE,
     ).exists():
         raise AuthError('membership_missing', 'User has no active membership in organization')
 
@@ -242,6 +248,7 @@ def _user_capability_codes(organization: Organization, identity: Identity) -> se
             organization=organization,
             identity=identity,
             active=True,
+            status=MembershipStatus.ACTIVE,
         ).values_list('role_id', flat=True),
     )
     role_ids.extend(
