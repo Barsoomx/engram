@@ -149,6 +149,7 @@ class OrganizationSettings(TimestampedModel):
     )
     curator_enabled = models.BooleanField(default=True)
     curator_llm_judge_enabled = models.BooleanField(default=False)
+    lexical_fusion_enabled = models.BooleanField(default=False)
     near_dup_threshold = models.DecimalField(
         max_digits=4,
         decimal_places=3,
