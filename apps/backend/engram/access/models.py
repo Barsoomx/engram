@@ -202,6 +202,7 @@ class ApiKey(TimestampedModel):
             models.Index(fields=['organization', 'key_prefix']),
             models.Index(fields=['organization', 'project', 'active']),
             models.Index(fields=['organization', 'owner_identity']),
+            models.Index(fields=['key_prefix']),
         ]
         ordering = ['organization_id', 'name']
 
