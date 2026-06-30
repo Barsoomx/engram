@@ -27,6 +27,7 @@ from engram.core.models import (
     MemoryVersion,
     Observation,
     Organization,
+    OrganizationSettings,
     Project,
     ProjectTeam,
     RetrievalDocument,
@@ -931,6 +932,62 @@ def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
     assert audit.metadata['retrieval_strategy'] == 'semantic_fallback'
     assert audit.metadata['semantic_provider_call_id'] == bundle.metadata['semantic_provider_call_id']
     assert audit.metadata['semantic_document_ids'] == [items[0]['retrieval_document_id']]
+
+
+@pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
+@pytest.mark.django_db
+def test_context_bundle_applies_lexical_fusion_when_enabled() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    OrganizationSettings.objects.create(organization=organization, lexical_fusion_enabled=True)
+    for index, (title, body) in enumerate(
+        (
+            ('Colour behaviour optimisation', 'Colour behaviour optimisation'),
+            ('Behaviour optimisation colour', 'Behaviour optimisation colour'),
+        ),
+        start=1,
+    ):
+        memory = Memory.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            title=title,
+            body=body,
+            status=MemoryStatus.APPROVED,
+            visibility_scope=VisibilityScope.PROJECT,
+        )
+        version = MemoryVersion.objects.create(
+            organization=organization,
+            project=project,
+            memory=memory,
+            version=1,
+            body=body,
+            content_hash=f'hash-fusion-{index}',
+        )
+        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='color behavior optimization',
+            file_paths=[],
+            symbols=[],
+            limit=5,
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    bundle = ContextBundle.objects.get(request_id='request-context-1')
+    assert bundle.metadata['retrieval_strategy'] == 'semantic_fallback'
+    items = response.json()['items']
+    assert len(items) == 2
+    assert all(item['inclusion_reason'].startswith('semantic match: cosine') for item in items)
+    assert sorted(item['title'] for item in items) == ['Behaviour optimisation colour', 'Colour behaviour optimisation']
 
 
 @pytest.mark.skipif(VectorField is None, reason='pgvector not installed')

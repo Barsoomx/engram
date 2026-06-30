@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pytest
 
@@ -10,6 +12,10 @@ from engram.context.services import (
     _pack_to_budget,
     _semantic_retrieval_matches_python,
     estimate_tokens,
+    fuse_semantic_lexical,
+    lexical_fusion_matches,
+    lexical_retrieval_ranks,
+    resolve_lexical_fusion_enabled,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
@@ -18,6 +24,7 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Organization,
+    OrganizationSettings,
     Project,
     RetrievalDocument,
     VectorField,
@@ -463,3 +470,170 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
 
     assert [match.document.id for match in matches] == [document.id]
     assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
+
+
+# lexical fusion (RRF)
+
+
+_FIXED_TS = datetime(2026, 6, 30, 12, 0, tzinfo=UTC)
+
+
+@dataclass
+class _FusionMemoryStub:
+    title: str
+
+
+@dataclass
+class _FusionDocumentStub:
+    id: uuid.UUID
+    updated_at: datetime
+    memory: _FusionMemoryStub
+
+
+def _fusion_match(title: str, score: int = 30) -> RetrievalMatch:
+    return RetrievalMatch(
+        document=_FusionDocumentStub(  # type: ignore[arg-type]
+            id=uuid.uuid4(),
+            updated_at=_FIXED_TS,
+            memory=_FusionMemoryStub(title=title),
+        ),
+        score=score,
+        matched_terms=(),
+        inclusion_reason='semantic match: cosine 0.90',
+    )
+
+
+def test_fuse_semantic_lexical_blends_ranks_deterministically() -> None:
+    both = _fusion_match('both')
+    semantic_only = _fusion_match('semantic_only')
+    lexical_strong = _fusion_match('lexical_strong')
+    semantic_matches = [both, semantic_only, lexical_strong]
+    lexical_ranks = {both.document.id: 1, lexical_strong.document.id: 2}
+
+    fused = fuse_semantic_lexical(semantic_matches, lexical_ranks)
+
+    assert [match.document.id for match in fused] == [
+        both.document.id,
+        lexical_strong.document.id,
+        semantic_only.document.id,
+    ]
+    assert fused[0].document.id == both.document.id
+
+
+def test_fuse_semantic_lexical_empty_lexical_preserves_semantic_order() -> None:
+    first = _fusion_match('first')
+    second = _fusion_match('second')
+    third = _fusion_match('third')
+    semantic_matches = [first, second, third]
+
+    fused = fuse_semantic_lexical(semantic_matches, {})
+
+    assert [match.document.id for match in fused] == [match.document.id for match in semantic_matches]
+
+
+def test_fuse_semantic_lexical_keeps_inclusion_reasons() -> None:
+    first = _fusion_match('first')
+    second = _fusion_match('second')
+
+    fused = fuse_semantic_lexical([first, second], {second.document.id: 1})
+
+    assert {match.inclusion_reason for match in fused} == {'semantic match: cosine 0.90'}
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_retrieval_ranks_orders_by_fts_relevance(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    strong = _seed_document(
+        organization,
+        project,
+        title='strong',
+        body='alpha alpha alpha alpha',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    weak = _seed_document(
+        organization,
+        project,
+        title='weak',
+        body='alpha',
+        embedding=_basis_vector(1),
+        sequence=2,
+    )
+    absent = _seed_document(
+        organization,
+        project,
+        title='absent',
+        body='gamma gamma',
+        embedding=_basis_vector(2),
+        sequence=3,
+    )
+
+    ranks = lexical_retrieval_ranks((strong, weak, absent), 'alpha')
+
+    assert ranks == {strong.id: 1, weak.id: 2}
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_lexical_fusion_matches_reorders_by_combined_relevance(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    both = _seed_document(
+        organization,
+        project,
+        title='both',
+        body='alpha alpha alpha alpha',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    semantic_only = _seed_document(
+        organization,
+        project,
+        title='semantic_only',
+        body='gamma gamma',
+        embedding=_blend_vector(0, 1, 0.75),
+        sequence=2,
+    )
+    lexical_strong = _seed_document(
+        organization,
+        project,
+        title='lexical_strong',
+        body='alpha',
+        embedding=_blend_vector(0, 1, math.sqrt(3.0)),
+        sequence=3,
+    )
+    documents = (semantic_only, lexical_strong, both)
+
+    semantic_matches = semantic_retrieval_matches(documents, [], query_vector)
+    assert [match.document.id for match in semantic_matches] == [both.id, semantic_only.id, lexical_strong.id]
+
+    fused = lexical_fusion_matches(semantic_matches, 'alpha')
+
+    fused_ids = [match.document.id for match in fused]
+    assert fused_ids == [both.id, lexical_strong.id, semantic_only.id]
+    assert fused_ids.index(both.id) < fused_ids.index(semantic_only.id)
+    assert all(match.inclusion_reason.startswith('semantic match: cosine') for match in fused)
+
+
+@pytest.mark.django_db
+def test_resolve_lexical_fusion_enabled_defaults_false(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+
+    assert resolve_lexical_fusion_enabled(organization) is False
+
+
+@pytest.mark.django_db
+def test_resolve_lexical_fusion_enabled_true_when_set(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, _project = f_scope
+    OrganizationSettings.objects.create(organization=organization, lexical_fusion_enabled=True)
+
+    assert resolve_lexical_fusion_enabled(organization) is True
