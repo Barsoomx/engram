@@ -990,6 +990,117 @@ def test_context_bundle_applies_lexical_fusion_when_enabled() -> None:
     assert sorted(item['title'] for item in items) == ['Behaviour optimisation colour', 'Colour behaviour optimisation']
 
 
+def _seed_recall_document(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+    exact_terms: list[str],
+    sequence: int,
+) -> RetrievalDocument:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=f'recall-hash-{sequence}',
+    )
+
+    return RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        source_observation_ids=[],
+        file_paths=[],
+        symbols=[],
+        exact_terms=exact_terms,
+        full_text=f'{title}\n\n{body}',
+    )
+
+
+def _seed_lexical_recall_scope() -> tuple[Organization, Team, Project, RetrievalDocument, RetrievalDocument]:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    anchor = _seed_recall_document(
+        organization,
+        team,
+        project,
+        title='Authorization anchor',
+        body='Authorization anchor',
+        exact_terms=['authorization'],
+        sequence=1,
+    )
+    fuzzy = _seed_recall_document(
+        organization,
+        team,
+        project,
+        title='authorisation',
+        body='authorisation',
+        exact_terms=[],
+        sequence=2,
+    )
+
+    return organization, team, project, anchor, fuzzy
+
+
+@pytest.mark.django_db
+def test_context_bundle_flag_off_lexical_recall_is_byte_identical() -> None:
+    organization, team, project, anchor, fuzzy = _seed_lexical_recall_scope()
+    assert 'authorization' not in fuzzy.full_text.casefold()
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, query='authorization', file_paths=[], symbols=[], limit=5),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    assert [item['retrieval_document_id'] for item in items] == [str(anchor.id)]
+    assert [item['inclusion_reason'] for item in items] == ['exact match: authorization']
+    assert str(fuzzy.id) not in {item['retrieval_document_id'] for item in items}
+    assert all(not item['inclusion_reason'].startswith('lexical match:') for item in items)
+
+
+@pytest.mark.django_db
+def test_context_bundle_flag_on_surfaces_fuzzy_lexical_only_document() -> None:
+    organization, team, project, anchor, fuzzy = _seed_lexical_recall_scope()
+    OrganizationSettings.objects.create(organization=organization, lexical_recall_enabled=True)
+
+    client = APIClient()
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, query='authorization', file_paths=[], symbols=[], limit=5),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    item_ids = {item['retrieval_document_id'] for item in items}
+    assert str(anchor.id) in item_ids
+    assert str(fuzzy.id) in item_ids
+    fuzzy_item = next(item for item in items if item['retrieval_document_id'] == str(fuzzy.id))
+    assert fuzzy_item['inclusion_reason'].startswith('lexical match:')
+
+
 @pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
 @pytest.mark.django_db
 def test_index_memory_version_populates_embedding_pgvector() -> None:
