@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('model_policy', '0001_initial'),
     ]
@@ -13,16 +12,22 @@ class Migration(migrations.Migration):
         migrations.AlterField(
             model_name='modelpolicy',
             name='provider',
-            field=models.CharField(choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40),
+            field=models.CharField(
+                choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40
+            ),
         ),
         migrations.AlterField(
             model_name='providercallrecord',
             name='provider',
-            field=models.CharField(choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40),
+            field=models.CharField(
+                choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40
+            ),
         ),
         migrations.AlterField(
             model_name='providersecret',
             name='provider',
-            field=models.CharField(choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40),
+            field=models.CharField(
+                choices=[('anthropic', 'Anthropic'), ('openai', 'OpenAI'), ('deepseek', 'DeepSeek')], max_length=40
+            ),
         ),
     ]
