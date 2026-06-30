@@ -121,6 +121,16 @@ class Organization(TimestampedModel):
         return self.slug
 
 
+class OrganizationSettings(TimestampedModel):
+    organization = models.OneToOneField(Organization, on_delete=models.CASCADE, related_name='settings')
+    hybrid_retrieval_enabled = models.BooleanField(default=True)
+    # require_provenance is persisted but provenance-based ranking enforcement is deferred
+    require_provenance = models.BooleanField(default=False)
+
+    def __str__(self) -> str:
+        return f'settings:{self.organization_id}'
+
+
 class Team(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='teams')
     name = models.CharField(max_length=255)
