@@ -20,6 +20,7 @@ class ObservationListInput:
     session_id: uuid.UUID | None = None
     since: datetime | None = None
     until: datetime | None = None
+    correlation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,12 +35,25 @@ def observation_response(observation: Observation) -> dict[str, object]:
     return {
         'observation_id': str(observation.id),
         'session_id': str(observation.session_id),
+        'team_id': str(observation.team_id) if observation.team_id else None,
         'observation_type': observation.observation_type,
         'title': str(redact_value(observation.title).value),
+        'subtitle': str(redact_value(observation.subtitle).value),
         'body': str(redact_value(observation.body).value),
+        'facts': redact_value(observation.facts).value,
+        'narrative': str(redact_value(observation.narrative).value),
+        'concepts': redact_value(observation.concepts).value,
         'files_read': redact_value(observation.files_read).value,
         'files_modified': redact_value(observation.files_modified).value,
+        'prompt_number': observation.prompt_number,
+        'content_hash': observation.content_hash,
+        'generation_key': observation.generation_key,
+        'generated_model': observation.generated_model,
+        'redaction_metadata': redact_value(observation.redaction_metadata).value,
+        'source_metadata': redact_value(observation.source_metadata).value,
         'observed_at': observation.observed_at.isoformat() if observation.observed_at else None,
+        'created_at': observation.created_at.isoformat(),
+        'updated_at': observation.updated_at.isoformat(),
     }
 
 
@@ -69,6 +83,8 @@ class ListObservations:
             queryset = queryset.filter(created_at__gte=data.since)
         if data.until is not None:
             queryset = queryset.filter(created_at__lt=data.until)
+        if data.correlation_id:
+            queryset = queryset.filter(raw_event__correlation_id=data.correlation_id)
 
         offset = data.offset
         limit = data.limit
