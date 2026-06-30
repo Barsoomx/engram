@@ -16,7 +16,7 @@ from engram.console.serializers.workflow_runs import (
     WorkflowRunListSerializer,
 )
 from engram.console.services import audit_admin_action
-from engram.core.models import WorkflowRun, WorkflowRunStatus, WorkflowRunType
+from engram.core.models import WorkflowRun
 from engram.memory.services import DAILY_DIGEST_WINDOW_DAYS, run_daily_digest_with_tracking
 
 
@@ -122,10 +122,14 @@ class WorkflowRunViewSet(
             request_id=request_id,
         )
 
-        new_run = WorkflowRun.objects.filter(
-            organization_id=run.organization_id,
-            request_id=request_id,
-        ).order_by('-created_at').first()
+        new_run = (
+            WorkflowRun.objects.filter(
+                organization_id=run.organization_id,
+                request_id=request_id,
+            )
+            .order_by('-created_at')
+            .first()
+        )
 
         if new_run is not None:
             new_run.rerun_of = run

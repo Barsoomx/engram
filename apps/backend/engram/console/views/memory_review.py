@@ -46,7 +46,6 @@ from engram.core.models import (
     MemoryVersion,
 )
 
-
 REVIEW_MEMORY_STATUSES = (
     MemoryStatus.CONFLICT,
     MemoryStatus.REFUTED,
@@ -111,12 +110,10 @@ class MemoryReviewViewSet(
                 status=HTTP_400_BAD_REQUEST,
             )
 
-        memory = (
-            Memory.objects.filter(
-                organization=organization,
-                id=memory_id,
-            ).first()
-        )
+        memory = Memory.objects.filter(
+            organization=organization,
+            id=memory_id,
+        ).first()
 
         if memory is None:
             return Response(status=HTTP_404_NOT_FOUND)
@@ -231,10 +228,14 @@ class MemoryReviewViewSet(
         return queryset
 
     def _filtered_memories(self, request: Request, organization: Any) -> Any:
-        queryset = Memory.objects.filter(organization=organization).filter(
-            Q(status__in=REVIEW_MEMORY_STATUSES)
-            | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD),
-        ).select_related('project', 'team')
+        queryset = (
+            Memory.objects.filter(organization=organization)
+            .filter(
+                Q(status__in=REVIEW_MEMORY_STATUSES)
+                | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD),
+            )
+            .select_related('project', 'team')
+        )
 
         queryset = self._apply_common_filters(request, queryset, candidate=False)
 
@@ -248,7 +249,7 @@ class MemoryReviewViewSet(
 
         return queryset
 
-    def _apply_common_filters(
+    def _apply_common_filters(  # noqa: C901
         self,
         request: Request,
         queryset: Any,
@@ -345,7 +346,7 @@ class MemoryReviewViewSet(
             'items': page_items,
         }
 
-    def _apply_action(
+    def _apply_action(  # noqa: C901
         self,
         organization: Any,
         actor_identity: Any,
@@ -455,9 +456,7 @@ class MemoryReviewViewSet(
         raise MemoryReviewError('unknown_action', f'unknown action {action_name!r}')
 
     def _version_or_404(self, memory: Memory, version_number: int) -> MemoryVersion:
-        version = (
-            MemoryVersion.objects.filter(memory=memory, version=version_number).first()
-        )
+        version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()
 
         if version is None:
             raise MemoryReviewError(
@@ -475,7 +474,6 @@ class MemoryReviewViewSet(
             raise MemoryReviewError('id_required', 'id is required', status=HTTP_400_BAD_REQUEST)
 
         try:
-
             return uuid.UUID(str(raw))
 
         except ValueError as error:
@@ -492,7 +490,6 @@ class MemoryReviewViewSet(
             return None
 
         try:
-
             return int(raw)
 
         except ValueError:

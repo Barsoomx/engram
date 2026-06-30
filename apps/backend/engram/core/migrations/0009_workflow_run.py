@@ -6,7 +6,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('core', '0008_project_archived_at'),
     ]
@@ -18,8 +17,29 @@ class Migration(migrations.Migration):
                 ('id', models.UUIDField(default=uuid.uuid4, editable=False, primary_key=True, serialize=False)),
                 ('created_at', models.DateTimeField(auto_now_add=True)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
-                ('run_type', models.CharField(choices=[('daily_digest', 'Daily Digest'), ('observation_processing', 'Observation Processing')], max_length=40)),
-                ('status', models.CharField(choices=[('queued', 'Queued'), ('running', 'Running'), ('succeeded', 'Succeeded'), ('failed', 'Failed')], default='queued', max_length=40)),
+                (
+                    'run_type',
+                    models.CharField(
+                        choices=[
+                            ('daily_digest', 'Daily Digest'),
+                            ('observation_processing', 'Observation Processing'),
+                        ],
+                        max_length=40,
+                    ),
+                ),
+                (
+                    'status',
+                    models.CharField(
+                        choices=[
+                            ('queued', 'Queued'),
+                            ('running', 'Running'),
+                            ('succeeded', 'Succeeded'),
+                            ('failed', 'Failed'),
+                        ],
+                        default='queued',
+                        max_length=40,
+                    ),
+                ),
                 ('input_snapshot', models.JSONField(blank=True, default=dict)),
                 ('provider_call_ids', models.JSONField(blank=True, default=list)),
                 ('escalation', models.BooleanField(default=False)),
@@ -28,15 +48,57 @@ class Migration(migrations.Migration):
                 ('correlation_id', models.CharField(blank=True, max_length=255)),
                 ('started_at', models.DateTimeField(blank=True, null=True)),
                 ('finished_at', models.DateTimeField(blank=True, null=True)),
-                ('organization', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='workflow_runs', to='core.organization')),
-                ('project', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='workflow_runs', to='core.project')),
-                ('rerun_of', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='reruns', to='core.workflowrun')),
-                ('result_memory', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='workflow_runs', to='core.memory')),
-                ('team', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='workflow_runs', to='core.team')),
+                (
+                    'organization',
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE,
+                        related_name='workflow_runs',
+                        to='core.organization',
+                    ),
+                ),
+                (
+                    'project',
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.CASCADE, related_name='workflow_runs', to='core.project'
+                    ),
+                ),
+                (
+                    'rerun_of',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name='reruns',
+                        to='core.workflowrun',
+                    ),
+                ),
+                (
+                    'result_memory',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.SET_NULL,
+                        related_name='workflow_runs',
+                        to='core.memory',
+                    ),
+                ),
+                (
+                    'team',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='workflow_runs',
+                        to='core.team',
+                    ),
+                ),
             ],
             options={
                 'ordering': ['organization_id', '-created_at'],
-                'indexes': [models.Index(fields=['organization', 'status'], name='core_workfl_organiz_523486_idx'), models.Index(fields=['organization', 'created_at'], name='core_workfl_organiz_bb631e_idx')],
+                'indexes': [
+                    models.Index(fields=['organization', 'status'], name='core_workfl_organiz_523486_idx'),
+                    models.Index(fields=['organization', 'created_at'], name='core_workfl_organiz_bb631e_idx'),
+                ],
             },
         ),
     ]

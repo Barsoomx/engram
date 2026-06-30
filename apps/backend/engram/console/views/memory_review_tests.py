@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 from django.contrib.auth.models import User
@@ -178,7 +178,7 @@ def _make_candidate(
     visibility_scope: str = VisibilityScope.PROJECT,
     evidence: list | None = None,
     source_observation: Observation | None = None,
-    created_at=None,
+    created_at: datetime | None = None,
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
 
@@ -214,7 +214,7 @@ def _make_memory(
     visibility_scope: str = VisibilityScope.PROJECT,
     body: str = 'memory body',
     title: str = 'memory',
-    created_at=None,
+    created_at: datetime | None = None,
 ) -> Memory:
     counter = Memory.objects.count()
 
@@ -532,9 +532,9 @@ def test_diff_returns_from_and_to_versions(
 ) -> None:
     memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
 
-    v1 = _make_version(memory, 1, 'first body')
+    _make_version(memory, 1, 'first body')
 
-    v2 = _make_version(memory, 2, 'second body')
+    _make_version(memory, 2, 'second body')
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -867,11 +867,14 @@ def test_bulk_archive_by_ids(
 
     assert m2.status == MemoryStatus.ARCHIVED
 
-    assert AuditEvent.objects.filter(
-        organization=f_admin_org,
-        event_type='MemoryReviewed',
-        metadata__action='archive',
-    ).count() == 2
+    assert (
+        AuditEvent.objects.filter(
+            organization=f_admin_org,
+            event_type='MemoryReviewed',
+            metadata__action='archive',
+        ).count()
+        == 2
+    )
 
 
 @pytest.mark.django_db
