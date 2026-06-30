@@ -24,6 +24,7 @@ ACCESS_STATUS = {
     'organization_required': status.HTTP_400_BAD_REQUEST,
     'organization_not_found': status.HTTP_404_NOT_FOUND,
     'not_a_member': status.HTTP_403_FORBIDDEN,
+    'organization_suspended': status.HTTP_403_FORBIDDEN,
 }
 
 

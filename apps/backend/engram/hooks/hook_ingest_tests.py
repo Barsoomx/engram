@@ -833,3 +833,29 @@ def test_session_end_marks_session_ended_and_writes_durable_event() -> None:
     assert queued.task_name == 'engram.memory.process_observation_recorded'
     assert queued.args == [response.json()['observation_id']]
     assert queued.kwargs == {}
+
+
+@pytest.mark.django_db
+def test_hook_dry_run_denied_when_organization_suspended() -> None:
+    from engram.core.models import OrganizationStatus
+
+    organization, team, project, _owner, _api_key = create_project_scope()
+    organization.status = OrganizationStatus.SUSPENDED
+    organization.save(update_fields=['status', 'updated_at'])
+    client = APIClient()
+
+    response = client.post(
+        '/v1/hooks/dry-run',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'agent_runtime': 'codex',
+            'agent_version': '0.1.0',
+            'request_id': 'dry-run-suspended',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'organization_suspended'

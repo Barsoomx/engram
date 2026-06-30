@@ -6,7 +6,7 @@ from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
 from engram.access.models import Identity, IdentityType, OrganizationMembership, Role
-from engram.core.models import AuditEvent, Organization
+from engram.core.models import AuditEvent, Organization, OrganizationStatus
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -110,7 +110,16 @@ def test_list_returns_member_organizations_with_pagination(f_owner_user_token: s
 
     org = response.data['results'][0]
 
-    assert set(org.keys()) == {'id', 'name', 'slug', 'created_at', 'updated_at', 'member_count', 'viewer_role'}
+    assert set(org.keys()) == {
+        'id',
+        'name',
+        'slug',
+        'status',
+        'created_at',
+        'updated_at',
+        'member_count',
+        'viewer_role',
+    }
 
     assert org['slug'] == 'acme'
 
@@ -273,3 +282,17 @@ def test_list_includes_viewer_role(
     org = response.data['results'][0]
 
     assert org['viewer_role'] == 'organization_owner'
+
+
+@pytest.mark.django_db
+def test_suspended_organization_still_listed_with_status(f_owner_user_token: str) -> None:
+    organization = Organization.objects.get(slug='acme')
+    organization.status = OrganizationStatus.SUSPENDED
+    organization.save(update_fields=['status', 'updated_at'])
+    client = _auth_client(f_owner_user_token)
+
+    response = client.get('/v1/admin/organizations/')
+
+    assert response.status_code == 200
+    org = response.data['results'][0]
+    assert org['status'] == 'suspended'

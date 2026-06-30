@@ -110,9 +110,22 @@ def raise_scope_errors(errors: dict[str, list[str]]) -> None:
         raise ValidationError(errors)
 
 
+class OrganizationStatus(models.TextChoices):
+    ACTIVE = 'active', 'Active'
+    TRIALING = 'trialing', 'Trialing'
+    PAST_DUE = 'past_due', 'Past due'
+    SUSPENDED = 'suspended', 'Suspended'
+    PENDING_DELETE = 'pending_delete', 'Pending delete'
+
+
 class Organization(TimestampedModel):
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=120, unique=True)
+    status = models.CharField(
+        max_length=20,
+        choices=OrganizationStatus.choices,
+        default=OrganizationStatus.ACTIVE,
+    )
 
     class Meta:
         ordering = ['slug']

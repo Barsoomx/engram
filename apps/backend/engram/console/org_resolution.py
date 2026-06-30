@@ -12,6 +12,7 @@ from engram.access.auth_services import (
     resolve_user_scope_for_organization,
 )
 from engram.access.models import Identity, IdentityType, OrganizationMembership
+from engram.access.organization_access import organization_access_blocked
 from engram.core.models import Organization
 
 ORGANIZATION_HEADER = 'HTTP_X_ENGRAM_ORGANIZATION'
@@ -103,6 +104,9 @@ class ActiveOrganizationPermission(BasePermission):
         try:
             organization = resolve_active_organization(request)
         except (OrganizationRequiredError, OrganizationNotMemberError):
+            return False
+
+        if organization_access_blocked(organization):
             return False
 
         identity = _user_identity_in_organization(request.user, organization)
