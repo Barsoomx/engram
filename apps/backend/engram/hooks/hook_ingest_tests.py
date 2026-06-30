@@ -829,10 +829,17 @@ def test_session_end_marks_session_ended_and_writes_durable_event() -> None:
     assert raw_event.event_type == 'session_end'
     assert observation.observation_type == 'session_end'
     assert response.json()['agent_session_id'] == str(session.id)
-    queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [response.json()['observation_id']]
-    assert queued.kwargs == {}
+    outbox_tasks = {row.task_name: row for row in CeleryOutbox.objects.all()}
+    assert set(outbox_tasks) == {
+        'engram.memory.process_observation_recorded',
+        'engram.memory.distill_session',
+    }
+    process_task = outbox_tasks['engram.memory.process_observation_recorded']
+    assert process_task.args == [response.json()['observation_id']]
+    assert process_task.kwargs == {}
+    distill_task = outbox_tasks['engram.memory.distill_session']
+    assert distill_task.args == [str(session.id)]
+    assert distill_task.kwargs == {}
 
 
 @pytest.mark.django_db
