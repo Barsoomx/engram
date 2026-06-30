@@ -73,6 +73,11 @@ The plugin registers the following Claude Code hook events. Each event calls
 | `PostToolUse`  | `*`                | `engram hook post-tool-use --agent claude_code --response-format claude-code`            | 120         |
 | `Error`        | `*`                | `engram hook error --agent claude_code --response-format claude-code`                    | 60          |
 | `Decision`     | `*`                | `engram hook decision --agent claude_code --response-format claude-code`                 | 60          |
+| `SessionEnd`   | `*`                | `engram hook session-end --agent claude_code --response-format claude-code`              | 60          |
+
+Hook lifecycle ordering: `SessionStart → PostToolUse* → Decision/Error → SessionEnd`.
+
+Existing installs need a plugin re-install or version bump before `SessionEnd` fires.
 
 ### How hooks call the CLI
 

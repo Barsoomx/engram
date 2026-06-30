@@ -73,6 +73,11 @@ The plugin registers the following Codex hook events. Each event calls
 | `PostToolUse`  | `.*`               | `engram hook post-tool-use --agent codex --response-format codex`        | 120         |
 | `Error`        | `.*`               | `engram hook error --agent codex --response-format codex`                | 60          |
 | `Decision`     | `.*`               | `engram hook decision --agent codex --response-format codex`             | 60          |
+| `SessionEnd`   | `.*`               | `engram hook session-end --agent codex --response-format codex`          | 60          |
+
+Hook lifecycle ordering: `SessionStart → PostToolUse* → Decision/Error → SessionEnd`.
+
+Existing installs need a plugin re-install or version bump before `SessionEnd` fires.
 
 ### How hooks call the CLI
 
