@@ -7,12 +7,15 @@ from engram.access.services import EffectiveScope, ResolveApiKeyScope
 from engram.context.services import (
     RetrievalMatch,
     authorized_retrieval_documents,
+    fuse_retrieval_legs,
+    lexical_fusion_matches,
+    lexical_recall_matches,
     redact_text,
     resolve_query_embedding,
     score_retrieval_document,
     semantic_retrieval_matches,
 )
-from engram.core.models import Organization, Project, Team
+from engram.core.models import Organization, OrganizationSettings, Project, Team
 
 
 @dataclass(frozen=True)
@@ -77,12 +80,12 @@ class SearchMemories:
         project = Project.objects.get(organization=organization, id=data.project_id)
         documents = authorized_retrieval_documents(organization, project, scope)
         has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
-        matches: list[RetrievalMatch] = []
+        exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = score_retrieval_document(document, data.query, data.file_paths, data.symbols, has_request_terms)
             if match is not None:
-                matches.append(match)
-        matches.sort(
+                exact_matches.append(match)
+        exact_matches.sort(
             key=lambda match: (
                 -match.score,
                 -match.document.updated_at.timestamp(),
@@ -90,8 +93,12 @@ class SearchMemories:
                 str(match.document.id),
             ),
         )
-        if len(matches) >= data.limit:
-            return SearchResult(matches=tuple(matches[: data.limit]))
+        if len(exact_matches) >= data.limit:
+            return SearchResult(matches=tuple(exact_matches[: data.limit]))
+
+        org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+        if not org_settings.hybrid_retrieval_enabled:
+            return SearchResult(matches=tuple(exact_matches))
 
         embedding_result = resolve_query_embedding(
             data.query,
@@ -103,11 +110,23 @@ class SearchMemories:
             data.request_id,
             data.request_id,
         )
-        if embedding_result is not None:
-            query_vector = list(embedding_result.embedding)
-            matches = list(matches) + semantic_retrieval_matches(documents, matches, query_vector)
+        if embedding_result is None:
+            return SearchResult(matches=tuple(exact_matches))
 
-        return SearchResult(matches=tuple(matches[: data.limit]))
+        query_vector = list(embedding_result.embedding)
+        semantic_matches = semantic_retrieval_matches(documents, exact_matches, query_vector)
+        if org_settings.lexical_recall_enabled:
+            already_matched_ids = {match.document.id for match in exact_matches} | {
+                match.document.id for match in semantic_matches
+            }
+            lexical_matches = lexical_recall_matches(documents, already_matched_ids, data.query)
+            tail = fuse_retrieval_legs(semantic_matches, lexical_matches)
+        elif org_settings.lexical_fusion_enabled:
+            tail = lexical_fusion_matches(semantic_matches, data.query)
+        else:
+            tail = semantic_matches
+
+        return SearchResult(matches=tuple((exact_matches + list(tail))[: data.limit]))
 
     def _resolve_team(self, data: SearchInput, scope: EffectiveScope) -> Team | None:
         selected_team_id = data.team_id

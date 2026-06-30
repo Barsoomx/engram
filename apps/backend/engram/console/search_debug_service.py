@@ -7,12 +7,14 @@ from engram.access.services import EffectiveScope
 from engram.context.services import (
     SEMANTIC_MIN_SIMILARITY,
     cosine_similarity,
+    lexical_recall_matches,
     resolve_query_embedding,
     score_retrieval_document,
 )
 from engram.core.models import (
     MemoryStatus,
     Organization,
+    OrganizationSettings,
     Project,
     RetrievalDocument,
     Team,
@@ -57,6 +59,8 @@ class SearchDebugResult:
     exact_matches: list[DebugMatch]
     semantic_enabled: bool
     semantic_candidates: list[DebugSemanticCandidate]
+    lexical_enabled: bool
+    lexical_candidates: list[DebugMatch]
     packed_context: list[DebugPackedItem]
     excluded: list[DebugExcluded]
 
@@ -94,13 +98,21 @@ class ReplaySearchDebug:
         scored, scoring_excluded = self._score_authorized(authorized, query, file_paths, symbols, has_request_terms)
         excluded.extend(scoring_excluded)
 
-        semantic_enabled, semantic_candidates = self._build_semantic_candidates(
-            authorized, scored, query, file_paths, symbols, organization, project, team
+        org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+
+        semantic_enabled, semantic_candidates, semantic_matched_ids = self._build_semantic_candidates(
+            authorized, scored, query, file_paths, symbols, organization, project, team, org_settings
         )
 
-        combined: list[tuple[uuid.UUID, str]] = [(doc.memory_id, doc.memory.title) for doc, _, _ in scored] + [
-            (c.memory_id, c.title) for c in semantic_candidates
-        ]
+        lexical_enabled, lexical_candidates = self._build_lexical_candidates(
+            authorized, scored, semantic_matched_ids, query, org_settings
+        )
+
+        combined: list[tuple[uuid.UUID, str]] = (
+            [(doc.memory_id, doc.memory.title) for doc, _, _ in scored]
+            + [(c.memory_id, c.title) for c in semantic_candidates]
+            + [(c.memory_id, c.title) for c in lexical_candidates]
+        )
 
         packed_context, budget_excluded = self._pack(combined)
         excluded.extend(budget_excluded)
@@ -121,6 +133,8 @@ class ReplaySearchDebug:
             exact_matches=exact_matches,
             semantic_enabled=semantic_enabled,
             semantic_candidates=semantic_candidates,
+            lexical_enabled=lexical_enabled,
+            lexical_candidates=lexical_candidates,
             packed_context=packed_context,
             excluded=excluded,
         )
@@ -193,7 +207,11 @@ class ReplaySearchDebug:
         organization: Organization,
         project: Project,
         team: Team | None,
-    ) -> tuple[bool, list[DebugSemanticCandidate]]:
+        org_settings: OrganizationSettings,
+    ) -> tuple[bool, list[DebugSemanticCandidate], set[uuid.UUID]]:
+        if not org_settings.hybrid_retrieval_enabled:
+            return False, [], set()
+
         embedding_result = resolve_query_embedding(
             query,
             file_paths,
@@ -206,7 +224,7 @@ class ReplaySearchDebug:
         )
 
         if embedding_result is None:
-            return False, []
+            return False, [], set()
 
         query_vector = list(embedding_result.embedding)
         already_matched_ids = {doc.id for doc, _, _ in scored}
@@ -227,6 +245,32 @@ class ReplaySearchDebug:
                 score=round(similarity, 4),
             )
             for similarity, doc in semantic_scored
+        ]
+        semantic_matched_ids = {doc.id for _similarity, doc in semantic_scored}
+
+        return True, candidates, semantic_matched_ids
+
+    def _build_lexical_candidates(
+        self,
+        authorized: list[RetrievalDocument],
+        scored: list[tuple[RetrievalDocument, int, str]],
+        semantic_matched_ids: set[uuid.UUID],
+        query: str,
+        org_settings: OrganizationSettings,
+    ) -> tuple[bool, list[DebugMatch]]:
+        if not org_settings.lexical_recall_enabled:
+            return False, []
+
+        already_matched_ids = {doc.id for doc, _, _ in scored} | semantic_matched_ids
+        matches = lexical_recall_matches(tuple(authorized), already_matched_ids, query)
+        candidates = [
+            DebugMatch(
+                memory_id=match.document.memory_id,
+                title=match.document.memory.title,
+                score=match.score,
+                matched_on=match.inclusion_reason,
+            )
+            for match in matches
         ]
 
         return True, candidates
