@@ -23,7 +23,13 @@ _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
 
 
-@app.task(bind=True, name='engram.memory.process_observation_recorded', max_retries=_MAX_RETRIES)
+@app.task(
+    bind=True,
+    name='engram.memory.process_observation_recorded',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def process_observation_recorded(self: object, observation_id: object) -> str:
     try:
         parsed_observation_id = uuid.UUID(observation_id)
@@ -49,7 +55,13 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     return str(result.candidate.id)
 
 
-@app.task(bind=True, name='engram.memory.distill_session', max_retries=_MAX_RETRIES)
+@app.task(
+    bind=True,
+    name='engram.memory.distill_session',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def distill_session(self: object, session_id: object) -> str:
     try:
         parsed_session_id = uuid.UUID(str(session_id))
@@ -79,7 +91,13 @@ def distill_session(self: object, session_id: object) -> str:
     return str(result.session.id)
 
 
-@app.task(bind=True, name='engram.memory.generate_daily_digest', max_retries=_MAX_RETRIES)
+@app.task(
+    bind=True,
+    name='engram.memory.generate_daily_digest',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def generate_daily_digest(
     self: object,
     organization_id: object,
@@ -118,7 +136,13 @@ def generate_daily_digest(
     return str(result.memory.id)
 
 
-@app.task(bind=True, name='engram.memory.generate_weekly_digest', max_retries=_MAX_RETRIES)
+@app.task(
+    bind=True,
+    name='engram.memory.generate_weekly_digest',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
 def generate_weekly_digest(
     self: object,
     organization_id: object,
