@@ -143,10 +143,10 @@ class ClaudeMemImporter:
             detected_tables = self._detected_tables(connection)
             all_tables = self._all_tables(connection)
             schema_versions = self._schema_versions(connection, detected_tables)
-            counts = self._count_tables(connection, detected_tables)
+            import_rows = self._import_rows(connection, detected_tables)
+            counts = self._count_tables(connection, detected_tables, import_rows)
             unsupported = self._unsupported_tables(connection, all_tables)
             self._validate_single_source_project(connection, detected_tables)
-            import_rows = self._import_rows(connection, detected_tables) if import_input.apply else {}
 
         report['source'] = {
             **report['source'],
@@ -255,17 +255,57 @@ class ClaudeMemImporter:
         self,
         connection: sqlite3.Connection,
         detected_tables: list[str],
+        import_rows: dict[str, list[dict[str, object]]],
     ) -> dict[str, dict[str, int]]:
         counts = self._zero_counts()
+        session_keys = self._session_keys(import_rows.get('sdk_sessions', []))
         for table, fields in self._expected_counts.items():
             if table not in detected_tables:
                 continue
 
             row_count = self._table_row_count(connection, table)
             for field in fields:
-                counts[table][field] = row_count
+                if field == 'seen' or field == 'unsupported':
+                    counts[table][field] = row_count
+                else:
+                    counts[table][field] = self._importable_count(table, import_rows, session_keys)
 
         return counts
+
+    def _session_keys(self, session_rows: list[dict[str, object]]) -> set[str]:
+        keys: set[str] = set()
+        for row in session_rows:
+            content_session_id = str(row.get('content_session_id') or '')
+            if content_session_id:
+                keys.add(content_session_id)
+            memory_session_id = str(row.get('memory_session_id') or '')
+            if memory_session_id:
+                keys.add(memory_session_id)
+
+        return keys
+
+    def _importable_count(
+        self,
+        table: str,
+        import_rows: dict[str, list[dict[str, object]]],
+        session_keys: set[str],
+    ) -> int:
+        if table == 'sdk_sessions':
+            return len(import_rows.get('sdk_sessions', []))
+
+        if table == 'user_prompts':
+            return sum(
+                1
+                for row in import_rows.get('user_prompts', [])
+                if str(row.get('content_session_id') or '') in session_keys
+            )
+
+        if table in ('observations', 'session_summaries'):
+            return sum(
+                1 for row in import_rows.get(table, []) if str(row.get('memory_session_id') or '') in session_keys
+            )
+
+        return 0
 
     def _unsupported_tables(
         self,
@@ -407,7 +447,7 @@ class ClaudeMemImporter:
             redacted = redacted or sessions_redacted
 
             for prompt in rows['user_prompts']:
-                raw_event, created, prompt_result = self._import_prompt(
+                raw_event, created, prompt_result, prompt_unsupported = self._import_prompt(
                     import_input,
                     organization,
                     project,
@@ -416,6 +456,8 @@ class ClaudeMemImporter:
                     prompt,
                 )
                 redacted = redacted or prompt_result.redacted
+                if prompt_unsupported is not None:
+                    report['unsupported'].append(prompt_unsupported)
                 if raw_event is None:
                     continue
                 if created:
@@ -524,7 +566,7 @@ class ClaudeMemImporter:
         team: Team | None,
         sessions: dict[str, AgentSession],
         row: dict[str, object],
-    ) -> tuple[RawEventEnvelope | None, bool, RedactionResult]:
+    ) -> tuple[RawEventEnvelope | None, bool, RedactionResult, dict[str, str] | None]:
         session = sessions.get(str(row.get('content_session_id') or ''))
         source_id = self._prompt_source_id(import_input, row)
         payload_result = redact_value(
@@ -537,7 +579,16 @@ class ClaudeMemImporter:
             },
         )
         if session is None:
-            return None, False, payload_result
+            return (
+                None,
+                False,
+                payload_result,
+                {
+                    'source_type': 'user_prompts',
+                    'source_id': source_id,
+                    'reason': 'missing_source_session',
+                },
+            )
 
         raw_event, created = self._get_or_create_raw_event(
             organization=organization,
@@ -551,7 +602,7 @@ class ClaudeMemImporter:
             redacted=payload_result.redacted,
         )
 
-        return raw_event, created, payload_result
+        return raw_event, created, payload_result, None
 
     def _import_observation_memory(
         self,
