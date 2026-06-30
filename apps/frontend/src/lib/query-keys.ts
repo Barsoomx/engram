@@ -74,4 +74,10 @@ export const adminQueryKeys = {
 
   auditEvents: (orgId: string | null, params?: ListParams) =>
     ['admin', orgId, 'audit-events', params ?? {}] as const,
+
+  modelSetupStatus: (orgId: string | null, projectId: string | null) =>
+    ['admin', orgId, 'model-setup', 'status', projectId] as const,
+
+  modelPresets: (orgId: string | null) =>
+    ['admin', orgId, 'model-setup', 'presets'] as const,
 };

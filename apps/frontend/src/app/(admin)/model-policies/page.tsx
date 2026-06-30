@@ -50,6 +50,7 @@ const SCOPE_OPTIONS: { key: PolicyScope; label: string }[] = [
 const PROVIDER_LABELS: Record<SecretProvider, string> = {
   anthropic: 'Anthropic',
   openai: 'OpenAI',
+  deepseek: 'DeepSeek',
 };
 
 const GRID =
@@ -252,6 +253,7 @@ interface CreatePolicyModalProps {
     provider: SecretProvider;
     model: string;
     secret_id: string;
+    base_url?: string;
   }) => Promise<boolean>;
 }
 
@@ -268,6 +270,7 @@ function CreatePolicyModal({
   const [provider, setProvider] = React.useState<SecretProvider>('anthropic');
   const [model, setModel] = React.useState('');
   const [secretId, setSecretId] = React.useState('');
+  const [baseUrl, setBaseUrl] = React.useState('');
 
   React.useEffect(() => {
     if (!isOpen) {
@@ -277,6 +280,7 @@ function CreatePolicyModal({
       setProvider('anthropic');
       setModel('');
       setSecretId('');
+      setBaseUrl('');
     }
   }, [isOpen]);
 
@@ -299,6 +303,7 @@ function CreatePolicyModal({
       provider,
       model: model.trim(),
       secret_id: secretId.trim(),
+      base_url: baseUrl.trim() || undefined,
     });
 
     if (ok) {
@@ -407,6 +412,16 @@ function CreatePolicyModal({
                   onValueChange={setSecretId}
                   isDisabled={isPending}
                   description='Reference an existing provider secret by its id.'
+                  classNames={{ input: 'font-mono text-xs' }}
+                />
+                <Input
+                  label='Base URL (optional)'
+                  labelPlacement='outside'
+                  placeholder='https://api.deepseek.com/v1 or https://open.bigmodel.cn/api/paas/v4 (leave blank for default)'
+                  value={baseUrl}
+                  onValueChange={setBaseUrl}
+                  isDisabled={isPending}
+                  description='For GLM / self-hosted / OpenAI-compatible endpoints. Leave blank to use the provider default.'
                   classNames={{ input: 'font-mono text-xs' }}
                 />
                 {error && (
@@ -764,6 +779,7 @@ export default function ModelPoliciesPage() {
     provider: SecretProvider;
     model: string;
     secret_id: string;
+    base_url?: string;
   }): Promise<boolean> {
     setCreateError(null);
 
@@ -778,6 +794,7 @@ export default function ModelPoliciesPage() {
         model: input.model,
         secret_id: input.secret_id,
         request_id: genRequestId(),
+        base_url: input.base_url,
       });
 
       return true;

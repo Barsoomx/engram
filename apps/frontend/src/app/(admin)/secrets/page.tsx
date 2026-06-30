@@ -70,13 +70,28 @@ function humanize(value: string): string {
 }
 
 function providerLabel(provider: SecretProvider): string {
-  return provider === 'anthropic' ? 'Anthropic' : 'OpenAI';
+  if (provider === 'anthropic') {
+
+    return 'Anthropic';
+  }
+
+  if (provider === 'deepseek') {
+
+    return 'DeepSeek';
+  }
+
+  return 'OpenAI';
 }
 
 function providerPillClass(provider: SecretProvider): string {
   if (provider === 'anthropic') {
 
     return 'bg-primary-soft text-primary-300';
+  }
+
+  if (provider === 'deepseek') {
+
+    return 'bg-[rgba(100,181,246,0.15)] text-blue-400';
   }
 
   return 'bg-[rgba(61,217,172,0.13)] text-success';

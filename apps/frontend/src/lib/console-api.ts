@@ -244,7 +244,7 @@ export async function recordMemoryFeedback(
 
 /* ------------------------------ Provider secrets -------------------------- */
 
-export type SecretProvider = 'anthropic' | 'openai';
+export type SecretProvider = 'anthropic' | 'openai' | 'deepseek';
 export type SecretScope = 'organization' | 'team';
 
 export interface ProviderSecret {
@@ -378,6 +378,7 @@ export interface ModelPolicyCreateInput {
   model: string;
   secret_id: string;
   request_id: string;
+  base_url?: string;
 }
 
 export interface ModelPolicyResolveParams {
@@ -444,7 +445,7 @@ export const POLICY_TASK_TYPES: PolicyTaskType[] = [
   'admin_assistant',
 ];
 
-export const SECRET_PROVIDERS: SecretProvider[] = ['anthropic', 'openai'];
+export const SECRET_PROVIDERS: SecretProvider[] = ['anthropic', 'openai', 'deepseek'];
 
 export interface ModelPolicyActionInput {
   project_id: string;
@@ -600,4 +601,76 @@ export async function dryRunHook(
   );
 
   return response.data;
+}
+
+/* ------------------------------- Model setup ------------------------------ */
+
+export type TaskTypeStatus = {
+  task_type: string;
+  configured: boolean;
+  policy_id: string | null;
+  provider: string | null;
+  model: string | null;
+  secret_active: boolean;
+};
+
+export type ModelSetupStatus = {
+  task_types: TaskTypeStatus[];
+  ready: boolean;
+  secrets: { id: string; name: string; provider: string; active: boolean }[];
+};
+
+export type PresetTaskModel = {
+  task_type: string;
+  provider: string;
+  model: string;
+  base_url: string;
+  key_slot: string;
+};
+
+export type ModelPreset = {
+  key: string;
+  name: string;
+  description: string;
+  providers_needed: string[];
+  task_models: PresetTaskModel[];
+};
+
+export type ApplyPresetRequest = {
+  project_id: string;
+  team_id?: string | null;
+  scope: 'organization' | 'project' | 'team';
+  preset_key: string;
+  provider_keys: Record<string, string>;
+  request_id: string;
+};
+
+export async function getModelSetupStatus(
+  projectId: string,
+  teamId?: string | null,
+): Promise<ModelSetupStatus> {
+  const params: Record<string, string> = { project_id: projectId };
+
+  if (teamId) {
+    params.team_id = teamId;
+  }
+
+  const response = await apiClient().get<ModelSetupStatus>(
+    '/v1/admin/model-setup/status',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function getModelPresets(): Promise<{ presets: ModelPreset[] }> {
+  const response = await apiClient().get<{ presets: ModelPreset[] }>(
+    '/v1/admin/model-setup/presets',
+  );
+
+  return response.data;
+}
+
+export async function applyPreset(req: ApplyPresetRequest): Promise<void> {
+  await apiClient().post('/v1/admin/model-setup/apply', req);
 }

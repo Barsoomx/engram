@@ -20,6 +20,7 @@ import {
   SearchCode,
   Settings,
   ShieldCheck,
+  SlidersHorizontal,
   Users,
   Webhook,
   Workflow,
@@ -109,6 +110,12 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         href: '/model-policies',
         label: 'Model Policies',
         icon: Cpu,
+        capability: 'model_policy:*',
+      },
+      {
+        href: '/model-setup',
+        label: 'Model Setup',
+        icon: SlidersHorizontal,
         capability: 'model_policy:*',
       },
       {
