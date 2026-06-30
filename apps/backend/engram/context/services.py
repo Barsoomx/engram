@@ -5,8 +5,9 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
-from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector
+from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
@@ -526,6 +527,123 @@ def lexical_fusion_matches(
     return fuse_semantic_lexical(semantic_matches, lexical_ranks)
 
 
+TRIGRAM_MIN_SIMILARITY = 0.4
+
+
+def resolve_lexical_recall_enabled(organization: Organization) -> bool:
+    enabled = (
+        OrganizationSettings.objects.filter(organization=organization)
+        .values_list('lexical_recall_enabled', flat=True)
+        .first()
+    )
+    if enabled is None:
+        return False
+
+    return enabled
+
+
+def lexical_recall_matches(
+    documents: tuple[RetrievalDocument, ...],
+    already_matched_ids: set[uuid.UUID],
+    query: str,
+) -> list[RetrievalMatch]:
+    candidate_documents = tuple(document for document in documents if document.id not in already_matched_ids)
+    if not candidate_documents:
+        return []
+
+    search_query = _lexical_search_query(query)
+    if search_query is None:
+        return []
+
+    candidate_ids = [document.id for document in candidate_documents]
+    signals = {
+        row[0]: (float(row[1]), float(row[2]))
+        for row in RetrievalDocument.objects.filter(id__in=candidate_ids)
+        .annotate(
+            ts=SearchRank(SearchVector('full_text'), search_query),
+            trgm=TrigramWordSimilarity(query, 'full_text'),
+        )
+        .filter(Q(ts__gt=0) | Q(trgm__gte=TRIGRAM_MIN_SIMILARITY))
+        .values_list('id', 'ts', 'trgm')
+    }
+    if not signals:
+        return []
+
+    documents_by_id = {document.id: document for document in candidate_documents}
+    ordered_ids = sorted(
+        signals,
+        key=lambda document_id: (
+            -signals[document_id][0],
+            -signals[document_id][1],
+            -documents_by_id[document_id].updated_at.timestamp(),
+            documents_by_id[document_id].memory.title.casefold(),
+            str(document_id),
+        ),
+    )
+    matches: list[RetrievalMatch] = []
+    for document_id in ordered_ids:
+        ts, trgm = signals[document_id]
+        if ts > 0:
+            matched_term = f'ts_rank {ts:.3f}'
+        else:
+            matched_term = f'trigram {trgm:.2f}'
+        matches.append(
+            RetrievalMatch(
+                document=documents_by_id[document_id],
+                score=20,
+                matched_terms=(matched_term,),
+                inclusion_reason=f'lexical match: {matched_term}',
+            ),
+        )
+
+    return matches
+
+
+def fuse_retrieval_legs(
+    semantic_matches: list[RetrievalMatch],
+    lexical_matches: list[RetrievalMatch],
+) -> list[RetrievalMatch]:
+    semantic_ranks = {match.document.id: position for position, match in enumerate(semantic_matches, start=1)}
+    lexical_ranks = {match.document.id: position for position, match in enumerate(lexical_matches, start=1)}
+
+    fused_by_id: dict[uuid.UUID, RetrievalMatch] = {}
+    for match in semantic_matches:
+        fused_by_id[match.document.id] = match
+    for match in lexical_matches:
+        fused_by_id.setdefault(match.document.id, match)
+
+    def _rrf_score(match: RetrievalMatch) -> float:
+        score = 0.0
+        semantic_rank = semantic_ranks.get(match.document.id)
+        if semantic_rank is not None:
+            score += 1.0 / (RECIPROCAL_RANK_FUSION_K + semantic_rank)
+        lexical_rank = lexical_ranks.get(match.document.id)
+        if lexical_rank is not None:
+            score += 1.0 / (RECIPROCAL_RANK_FUSION_K + lexical_rank)
+
+        return score
+
+    return sorted(
+        fused_by_id.values(),
+        key=lambda match: (
+            -_rrf_score(match),
+            -match.score,
+            -match.document.updated_at.timestamp(),
+            match.document.memory.title.casefold(),
+            str(match.document.id),
+        ),
+    )
+
+
+def resolve_retrieval_strategy(matches: tuple[RetrievalMatch, ...] | list[RetrievalMatch]) -> str:
+    if any(match.score == 30 for match in matches):
+        return 'semantic_fallback'
+    if any(match.score == 20 for match in matches):
+        return 'lexical_recall'
+
+    return 'exact'
+
+
 def resolve_query_embedding(
     query: str,
     file_paths: tuple[str, ...],
@@ -711,7 +829,8 @@ class BuildContextBundle:
             for i, m in enumerate(kept, start=1)
         )
         query_result = redact_value(data.query)
-        metadata: dict[str, object] = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
+        retrieval_strategy = resolve_retrieval_strategy(matches)
+        metadata: dict[str, object] = {'retrieval_strategy': retrieval_strategy}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
         if has_semantic and embedding_result is not None:
@@ -739,7 +858,15 @@ class BuildContextBundle:
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
-            self._audit_retrieval(bundle, persisted_matches, scope, data, has_semantic, embedding_result)
+            self._audit_retrieval(
+                bundle,
+                persisted_matches,
+                scope,
+                data,
+                has_semantic,
+                embedding_result,
+                retrieval_strategy,
+            )
 
         bundle = ContextBundle.objects.prefetch_related(
             'items__retrieval_document__memory',
@@ -911,12 +1038,20 @@ class BuildContextBundle:
 
         query_vector = list(embedding_result.embedding)
         semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
-        if org_settings.lexical_fusion_enabled:
-            semantic_matches = lexical_fusion_matches(semantic_matches, data.query)
+        if org_settings.lexical_recall_enabled:
+            already_matched_ids = {match.document.id for match in exact_matches} | {
+                match.document.id for match in semantic_matches
+            }
+            lexical_matches = lexical_recall_matches(documents, already_matched_ids, data.query)
+            tail = fuse_retrieval_legs(semantic_matches, lexical_matches)
+        elif org_settings.lexical_fusion_enabled:
+            tail = lexical_fusion_matches(semantic_matches, data.query)
+        else:
+            tail = semantic_matches
 
         return (
-            tuple((exact_matches + list(semantic_matches))[: data.limit]),
-            bool(semantic_matches),
+            tuple((exact_matches + list(tail))[: data.limit]),
+            bool(tail),
             embedding_result,
         )
 
@@ -1011,10 +1146,11 @@ class BuildContextBundle:
         data: ContextBundleInput,
         has_semantic: bool,
         embedding_result: EmbeddingCallResult | None,
+        retrieval_strategy: str,
     ) -> None:
         metadata = {
             'selected_count': len(matches),
-            'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact',
+            'retrieval_strategy': retrieval_strategy,
             'scope_filters': {
                 'organization_id': str(scope.organization_id),
                 'project_ids': [str(project_id) for project_id in scope.project_ids],
