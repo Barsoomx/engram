@@ -181,7 +181,7 @@ function BundleDetailContent({ data }: { data: ContextBundleDetail }) {
             <div className='space-y-3 border-t border-divider pt-4'>
               <MetaRow
                 label='Token budget'
-                value={data.token_budget.toLocaleString()}
+                value={data.token_budget?.toLocaleString() ?? '—'}
                 mono
               />
               <MetaRow
@@ -224,7 +224,7 @@ export default function ContextBundleDetailPage() {
   });
 
   return (
-    <CapabilityGate capabilities={capabilities} required='memories:admin'>
+    <CapabilityGate capabilities={capabilities} required='context:read'>
       <section className='animate-fade-up space-y-6'>
         <BackLink />
 

@@ -332,7 +332,9 @@ function IssueModal({
       onClose={handleClose}
       placement='center'
       size='lg'
+      scrollBehavior='inside'
       isDismissable={!isIssuing}
+      isKeyboardDismissDisabled={isIssuing}
       hideCloseButton={isIssuing}
     >
       <ModalContent>

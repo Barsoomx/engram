@@ -456,6 +456,7 @@ function MemberModal({
                   label='Role'
                   labelPlacement='outside'
                   placeholder='Select a role'
+                  items={roleItems}
                   selectedKeys={role ? new Set([role]) : new Set()}
                   isDisabled={isPending || roleItems.length === 0}
                   description={
