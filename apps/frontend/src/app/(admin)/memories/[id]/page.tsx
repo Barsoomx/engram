@@ -1,14 +1,38 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
-import { Check, ChevronLeft } from 'lucide-react';
+import {
+  addToast,
+  Button,
+  Input,
+  Modal,
+  ModalBody,
+  ModalContent,
+  ModalFooter,
+  ModalHeader,
+  Select,
+  SelectItem,
+} from '@heroui/react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import axios from 'axios';
+import { AlertTriangle, Ban, Check, ChevronLeft, Clock, Link2, Plus } from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
+import * as React from 'react';
 
 import { ConfidenceTrack } from '@/components/ui/confidence-track';
 import { KindBadge, KindDot } from '@/components/ui/kind-badge';
 import { PrimaryButton } from '@/components/ui/primary-button';
-import { apiClient } from '@/lib/auth';
+import { apiClient, fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
+import {
+  addMemoryLink,
+  genRequestId,
+  listMemoryLinks,
+  recordMemoryFeedback,
+  type MemoryFeedbackAction,
+  type MemoryLink,
+  type MemoryLinkType,
+  type ScopeParams,
+} from '@/lib/console-api';
 import { KIND_STYLES, formatRelativeTime, resolveKind } from '@/lib/design';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
@@ -51,6 +75,32 @@ type RelatedItem = {
   title: string;
   mono: boolean;
 };
+
+const LINK_TYPES: MemoryLinkType[] = ['file', 'symbol', 'commit', 'issue'];
+
+const LINK_TYPE_PILL: Record<MemoryLinkType, string> = {
+  file: 'bg-[rgba(107,166,255,0.13)] text-info',
+  symbol: 'bg-primary-soft text-primary-300',
+  commit: 'bg-[rgba(61,217,172,0.13)] text-success',
+  issue: 'bg-[rgba(242,183,101,0.14)] text-warning',
+};
+
+function linkTypeLabel(type: MemoryLinkType): string {
+  return type[0].toUpperCase() + type.slice(1);
+}
+
+function extractDetail(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    const data = error.response?.data as { detail?: string } | undefined;
+
+    if (data?.detail) {
+
+      return data.detail;
+    }
+  }
+
+  return fallback;
+}
 
 function metaString(meta: Record<string, unknown> | null, key: string): string | null {
   const value = meta?.[key];
@@ -127,7 +177,449 @@ function ProvenanceRow({
   );
 }
 
-function MemoryDetailContent({ data }: { data: MemoryDetail }) {
+interface AddLinkInput {
+  link_type: MemoryLinkType;
+  target: string;
+  label: string;
+}
+
+function AddLinkModal({
+  isOpen,
+  isPending,
+  error,
+  onClose,
+  onSubmit,
+}: {
+  isOpen: boolean;
+  isPending: boolean;
+  error: string | null;
+  onClose: () => void;
+  onSubmit: (input: AddLinkInput) => Promise<boolean>;
+}) {
+  const [linkType, setLinkType] = React.useState<MemoryLinkType>('file');
+  const [target, setTarget] = React.useState('');
+  const [label, setLabel] = React.useState('');
+
+  React.useEffect(() => {
+    if (!isOpen) {
+      setLinkType('file');
+      setTarget('');
+      setLabel('');
+    }
+  }, [isOpen]);
+
+  const canSubmit = target.trim().length > 0 && !isPending;
+
+  async function handleSubmit() {
+    if (!canSubmit) {
+
+      return;
+    }
+
+    const ok = await onSubmit({
+      link_type: linkType,
+      target: target.trim(),
+      label: label.trim(),
+    });
+
+    if (ok) {
+      onClose();
+    }
+  }
+
+  return (
+    <Modal
+      isOpen={isOpen}
+      onClose={onClose}
+      placement='center'
+      isDismissable={!isPending}
+      hideCloseButton={isPending}
+    >
+      <ModalContent>
+        {() => (
+          <>
+            <ModalHeader className='flex flex-col gap-1 text-foreground'>
+              Add link
+            </ModalHeader>
+            <ModalBody>
+              <div className='space-y-4'>
+                <Select
+                  label='Type'
+                  labelPlacement='outside'
+                  placeholder='Select a link type'
+                  selectedKeys={new Set([linkType])}
+                  isDisabled={isPending}
+                  onSelectionChange={(keys) => {
+                    const next = Array.from(keys)[0];
+
+                    if (typeof next === 'string') {
+                      setLinkType(next as MemoryLinkType);
+                    }
+                  }}
+                >
+                  {LINK_TYPES.map((value) => (
+                    <SelectItem key={value}>{linkTypeLabel(value)}</SelectItem>
+                  ))}
+                </Select>
+                <Input
+                  label='Target'
+                  labelPlacement='outside'
+                  placeholder='src/app/page.tsx · resolveKind · a1b2c3d · #142'
+                  value={target}
+                  onValueChange={setTarget}
+                  maxLength={1024}
+                  isDisabled={isPending}
+                />
+                <Input
+                  label='Label'
+                  labelPlacement='outside'
+                  placeholder='Optional human-readable label'
+                  value={label}
+                  onValueChange={setLabel}
+                  maxLength={255}
+                  isDisabled={isPending}
+                />
+                {error && (
+                  <div className='flex items-start gap-2.5 rounded-[12px] border border-danger/30 bg-danger/5 px-3.5 py-3'>
+                    <AlertTriangle className='mt-0.5 h-4 w-4 shrink-0 text-danger' />
+                    <p className='text-[13px] leading-relaxed text-danger'>{error}</p>
+                  </div>
+                )}
+              </div>
+            </ModalBody>
+            <ModalFooter>
+              <Button
+                color='default'
+                variant='light'
+                onPress={onClose}
+                isDisabled={isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                color='primary'
+                onPress={handleSubmit}
+                isDisabled={!canSubmit}
+                isLoading={isPending}
+              >
+                Add link
+              </Button>
+            </ModalFooter>
+          </>
+        )}
+      </ModalContent>
+    </Modal>
+  );
+}
+
+function LinksCard({
+  memoryId,
+  scope,
+  canReview,
+}: {
+  memoryId: string;
+  scope: ScopeParams;
+  canReview: boolean;
+}) {
+  const queryClient = useQueryClient();
+
+  const linksQuery = useQuery<MemoryLink[]>({
+    queryKey: ['memory-links', memoryId, scope.projectId, scope.teamId],
+    enabled: Boolean(scope.projectId) && Boolean(memoryId),
+    queryFn: async () => {
+      try {
+
+        return await listMemoryLinks(memoryId, scope);
+      } catch (error) {
+        if (axios.isAxiosError(error) && error.response?.status === 404) {
+
+          return [];
+        }
+
+        throw error;
+      }
+    },
+  });
+
+  const [addOpen, setAddOpen] = React.useState(false);
+  const [addError, setAddError] = React.useState<string | null>(null);
+
+  const addMutation = useMutation({
+    mutationFn: (input: AddLinkInput) =>
+      addMemoryLink(memoryId, {
+        project_id: scope.projectId,
+        team_id: scope.teamId,
+        link_type: input.link_type,
+        target: input.target,
+        label: input.label,
+        request_id: genRequestId(),
+      }),
+  });
+
+  async function handleAdd(input: AddLinkInput): Promise<boolean> {
+    setAddError(null);
+
+    try {
+      await addMutation.mutateAsync(input);
+      queryClient.invalidateQueries({ queryKey: ['memory-links', memoryId] });
+      addToast({ title: 'Link added', color: 'success' });
+
+      return true;
+    } catch (error) {
+      setAddError(extractDetail(error, 'Failed to add link.'));
+
+      return false;
+    }
+  }
+
+  function openAdd() {
+    setAddError(null);
+    setAddOpen(true);
+  }
+
+  const links = linksQuery.data ?? [];
+
+  return (
+    <div className='space-y-3'>
+      <div className='flex items-center justify-between'>
+        <h2 className='flex items-center gap-2 text-[14.5px] font-semibold text-foreground'>
+          <Link2 size={15} strokeWidth={1.8} className='text-default-400' />
+          Links
+          {links.length > 0 && (
+            <span className='tnum text-[12px] font-normal text-default-400'>{links.length}</span>
+          )}
+        </h2>
+        {canReview && (
+          <Button
+            size='sm'
+            variant='flat'
+            startContent={<Plus className='h-3.5 w-3.5' />}
+            onPress={openAdd}
+          >
+            Add link
+          </Button>
+        )}
+      </div>
+
+      {linksQuery.isLoading ? (
+        <div className='space-y-2'>
+          {Array.from({ length: 2 }).map((_, index) => (
+            <div key={index} className='surface-card h-[46px] animate-pulse bg-content1' />
+          ))}
+        </div>
+      ) : linksQuery.isError ? (
+        <div className='flex items-start gap-2.5 rounded-[12px] border border-danger/30 bg-danger/5 px-3.5 py-3'>
+          <AlertTriangle className='mt-0.5 h-4 w-4 shrink-0 text-danger' />
+          <p className='text-[13px] leading-relaxed text-danger'>
+            {linksQuery.error instanceof Error ? linksQuery.error.message : 'Failed to load links.'}
+          </p>
+        </div>
+      ) : links.length === 0 ? (
+        <p className='text-[13px] text-default-500'>No links yet.</p>
+      ) : (
+        <div className='space-y-2'>
+          {links.map((link) => (
+            <div
+              key={link.link_id}
+              className='surface-card flex items-center gap-3 px-4 py-3 transition-colors hover:bg-content2'
+            >
+              <span
+                className={`shrink-0 rounded-[7px] px-2 py-0.5 text-[11px] font-medium ${LINK_TYPE_PILL[link.link_type]}`}
+              >
+                {linkTypeLabel(link.link_type)}
+              </span>
+              <span className='min-w-0 flex-1 truncate font-mono text-[12px] text-default-500'>
+                {link.target}
+              </span>
+              {link.label && (
+                <span className='max-w-[42%] shrink-0 truncate text-[12px] text-default-400'>
+                  {link.label}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <AddLinkModal
+        isOpen={addOpen}
+        isPending={addMutation.isPending}
+        error={addError}
+        onClose={() => setAddOpen(false)}
+        onSubmit={handleAdd}
+      />
+    </div>
+  );
+}
+
+function FeedbackActions({
+  memoryId,
+  scope,
+  stale,
+  refuted,
+}: {
+  memoryId: string;
+  scope: ScopeParams;
+  stale: boolean;
+  refuted: boolean;
+}) {
+  const queryClient = useQueryClient();
+  const [action, setAction] = React.useState<MemoryFeedbackAction | null>(null);
+  const [reason, setReason] = React.useState('');
+  const [error, setError] = React.useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: (payload: { action: MemoryFeedbackAction; reason: string }) =>
+      recordMemoryFeedback(memoryId, {
+        project_id: scope.projectId,
+        team_id: scope.teamId,
+        action: payload.action,
+        reason: payload.reason,
+        request_id: genRequestId(),
+      }),
+  });
+
+  function open(next: MemoryFeedbackAction) {
+    setAction(next);
+    setReason('');
+    setError(null);
+  }
+
+  function close() {
+    if (mutation.isPending) {
+
+      return;
+    }
+
+    setAction(null);
+  }
+
+  async function handleSubmit() {
+    if (!action || reason.trim().length === 0 || mutation.isPending) {
+
+      return;
+    }
+
+    setError(null);
+
+    try {
+      const result = await mutation.mutateAsync({ action, reason: reason.trim() });
+      queryClient.invalidateQueries({ queryKey: ['inspection', 'memories'] });
+      addToast({
+        title: result.already_applied
+          ? 'Already applied'
+          : action === 'stale'
+            ? 'Marked stale'
+            : 'Marked refuted',
+        color: 'success',
+      });
+      setAction(null);
+    } catch (err) {
+      setError(extractDetail(err, 'Failed to record feedback.'));
+    }
+  }
+
+  return (
+    <div className='surface-card space-y-3 p-[22px]'>
+      <span className='block text-[10.5px] font-semibold uppercase tracking-[0.12em] text-default-400'>
+        Review
+      </span>
+      <div className='grid grid-cols-2 gap-2'>
+        <Button
+          size='sm'
+          variant='flat'
+          color='warning'
+          startContent={<Clock className='h-3.5 w-3.5' />}
+          onPress={() => open('stale')}
+          isDisabled={stale}
+        >
+          {stale ? 'Stale' : 'Mark stale'}
+        </Button>
+        <Button
+          size='sm'
+          variant='flat'
+          color='danger'
+          startContent={<Ban className='h-3.5 w-3.5' />}
+          onPress={() => open('refuted')}
+          isDisabled={refuted}
+        >
+          {refuted ? 'Refuted' : 'Mark refuted'}
+        </Button>
+      </div>
+
+      <Modal
+        isOpen={action !== null}
+        onClose={close}
+        placement='center'
+        isDismissable={!mutation.isPending}
+        hideCloseButton={mutation.isPending}
+      >
+        <ModalContent>
+          {() => (
+            <>
+              <ModalHeader className='flex flex-col gap-1 text-foreground'>
+                {action === 'stale' ? 'Mark memory stale' : 'Mark memory refuted'}
+              </ModalHeader>
+              <ModalBody>
+                <div className='space-y-4'>
+                  <p className='text-[13px] leading-relaxed text-default-500'>
+                    {action === 'stale'
+                      ? 'Flag this memory as out of date. It will be deprioritized for injection.'
+                      : 'Flag this memory as refuted. It will be withheld from injection.'}
+                  </p>
+                  <Input
+                    label='Reason'
+                    labelPlacement='outside'
+                    placeholder='Why is this memory no longer valid?'
+                    value={reason}
+                    onValueChange={setReason}
+                    maxLength={1024}
+                    isDisabled={mutation.isPending}
+                    isRequired
+                  />
+                  {error && (
+                    <div className='flex items-start gap-2.5 rounded-[12px] border border-danger/30 bg-danger/5 px-3.5 py-3'>
+                      <AlertTriangle className='mt-0.5 h-4 w-4 shrink-0 text-danger' />
+                      <p className='text-[13px] leading-relaxed text-danger'>{error}</p>
+                    </div>
+                  )}
+                </div>
+              </ModalBody>
+              <ModalFooter>
+                <Button
+                  color='default'
+                  variant='light'
+                  onPress={close}
+                  isDisabled={mutation.isPending}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  color={action === 'stale' ? 'warning' : 'danger'}
+                  onPress={handleSubmit}
+                  isDisabled={reason.trim().length === 0 || mutation.isPending}
+                  isLoading={mutation.isPending}
+                >
+                  {action === 'stale' ? 'Mark stale' : 'Mark refuted'}
+                </Button>
+              </ModalFooter>
+            </>
+          )}
+        </ModalContent>
+      </Modal>
+    </div>
+  );
+}
+
+function MemoryDetailContent({
+  data,
+  scope,
+  canReview,
+}: {
+  data: MemoryDetail;
+  scope: ScopeParams;
+  canReview: boolean;
+}) {
   const meta = data.metadata;
   const kind = resolveKind(metaString(meta, 'kind'));
   const source = metaString(meta, 'source') ?? '—';
@@ -204,6 +696,8 @@ function MemoryDetailContent({ data }: { data: MemoryDetail }) {
             </div>
           </div>
         )}
+
+        <LinksCard memoryId={data.id} scope={scope} canReview={canReview} />
       </div>
 
       <div className='space-y-4'>
@@ -241,6 +735,15 @@ function MemoryDetailContent({ data }: { data: MemoryDetail }) {
           </span>
         </div>
 
+        {canReview && (
+          <FeedbackActions
+            memoryId={data.id}
+            scope={scope}
+            stale={data.stale}
+            refuted={data.refuted}
+          />
+        )}
+
         <PrimaryButton className='w-full'>Add to context bundle</PrimaryButton>
       </div>
     </div>
@@ -253,6 +756,23 @@ export default function MemoryDetailPage() {
 
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
+
+  const meQuery = useQuery<MeResponse>({
+    queryKey: ['auth', 'me'],
+    queryFn: fetchMe,
+  });
+
+  const capabilities = React.useMemo(
+    () => meQuery.data?.capabilities ?? [],
+    [meQuery.data?.capabilities],
+  );
+
+  const canReview = hasCapability(capabilities, 'memories:review');
+
+  const scope = React.useMemo<ScopeParams>(
+    () => ({ projectId: activeProjectId ?? '', teamId: activeTeamId }),
+    [activeProjectId, activeTeamId],
+  );
 
   const query = useQuery<MemoryDetail>({
     queryKey: ['inspection', 'memories', id, activeProjectId, activeTeamId],
@@ -297,7 +817,9 @@ export default function MemoryDetailPage() {
         </div>
       )}
 
-      {query.data && <MemoryDetailContent data={query.data} />}
+      {query.data && (
+        <MemoryDetailContent data={query.data} scope={scope} canReview={canReview} />
+      )}
     </section>
   );
 }

@@ -4,15 +4,19 @@ import clsx from 'clsx';
 import {
   Activity,
   BadgeCheck,
+  Boxes,
   Building2,
   ClipboardList,
+  Cpu,
   Database,
   FolderTree,
   Key,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   ScrollText,
   Search,
+  SearchCode,
   Settings,
   ShieldCheck,
   Users,
@@ -59,6 +63,18 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         capability: 'projects:read',
       },
       {
+        href: '/search-debug',
+        label: 'Search Debugger',
+        icon: SearchCode,
+        capability: 'memories:read',
+      },
+      {
+        href: '/context-bundles',
+        label: 'Context Bundles',
+        icon: Boxes,
+        capability: 'memories:admin',
+      },
+      {
         href: '/workflow-runs',
         label: 'Workflow Runs',
         icon: Workflow,
@@ -69,6 +85,18 @@ const NAV_GROUPS: SidebarNavGroup[] = [
   {
     title: 'Administration',
     items: [
+      {
+        href: '/secrets',
+        label: 'Secrets',
+        icon: KeyRound,
+        capability: 'secrets:*',
+      },
+      {
+        href: '/model-policies',
+        label: 'Model Policies',
+        icon: Cpu,
+        capability: 'model_policy:*',
+      },
       {
         href: '/organizations',
         label: 'Organizations',
