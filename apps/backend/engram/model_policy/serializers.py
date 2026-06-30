@@ -52,3 +52,12 @@ class ModelPolicyResolveSerializer(serializers.Serializer):
     task_type = serializers.ChoiceField(
         choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
     )
+
+
+class ModelPolicyQuerySerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    task_type = serializers.ChoiceField(
+        choices=('generation', 'embedding', 'curation', 'digest', 'rerank', 'admin_assistant'),
+        required=False,
+    )
