@@ -290,6 +290,7 @@ class IngestHookEvent:
         agent: Agent,
         data: HookEventInput,
     ) -> AgentSession:
+        model_id = data.payload.get('model_id') if data.event_type == 'session_start' else None
         session, _created = AgentSession.objects.get_or_create(
             organization=organization,
             project=project,
@@ -304,6 +305,7 @@ class IngestHookEvent:
                 'branch': data.branch,
                 'cwd': data.cwd,
                 'started_at': data.occurred_at or timezone.now(),
+                'model_id': model_id or '',
             },
         )
         update_fields = []
@@ -316,6 +318,7 @@ class IngestHookEvent:
             ('repository_root', data.repository_root),
             ('branch', data.branch),
             ('cwd', data.cwd),
+            *((('model_id', model_id),) if isinstance(model_id, str) and model_id else ()),
         ):
             if getattr(session, field) != value:
                 setattr(session, field, value)

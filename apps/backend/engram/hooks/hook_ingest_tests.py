@@ -984,6 +984,119 @@ def test_hook_dry_run_denied_when_organization_suspended() -> None:
 
 
 @pytest.mark.django_db
+def test_pre_tool_use_ingests_raw_event_observation_source_and_queues_worker_task(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='pre_tool_use',
+        event_id='pre-tool-use-event-1',
+        idempotency_key='pre-tool-use-idempotency-1',
+        observation={
+            'type': 'pre_tool_use',
+            'title': 'bash about to run',
+            'body': 'about to run pytest',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    with f_capture_on_commit(execute=True):
+        response = client.post('/v1/hooks/pre-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body['status'] == 'accepted'
+    assert body['duplicate'] is False
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    assert raw_event.event_type == 'pre_tool_use'
+    assert observation.observation_type == 'pre_tool_use'
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == 'engram.memory.process_observation_recorded'
+    assert queued.args == [body['observation_id']]
+
+
+@pytest.mark.django_db
+def test_pre_tool_use_rejects_mismatched_event_type_before_writes() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='post_tool_use',
+        event_id='pre-tool-use-mismatch-event-1',
+        idempotency_key='pre-tool-use-mismatch-idempotency-1',
+    )
+
+    response = APIClient().post('/v1/hooks/pre-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 400
+    assert response.json() == {'event_type': ['Expected pre_tool_use.']}
+    assert RawEventEnvelope.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_hook_with_model_id_persists_it_on_agent_session(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='session_start',
+        event_id='session-start-model-id-event-1',
+        idempotency_key='session-start-model-id-idempotency-1',
+        payload={'trigger': 'startup', 'cwd': '/workspace/engram', 'model_id': 'claude-sonnet-4-5'},
+        observation={
+            'type': 'session_start',
+            'title': 'Session started',
+            'body': 'Agent session started for backend work.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    session = AgentSession.objects.get()
+    assert session.model_id == 'claude-sonnet-4-5'
+
+
+@pytest.mark.django_db
+def test_session_start_hook_without_model_id_keeps_it_blank(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='session_start',
+        event_id='session-start-no-model-id-event-1',
+        idempotency_key='session-start-no-model-id-idempotency-1',
+        payload={'trigger': 'startup', 'cwd': '/workspace/engram'},
+        observation={
+            'type': 'session_start',
+            'title': 'Session started',
+            'body': 'Agent session started for backend work.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    with f_capture_on_commit(execute=True):
+        response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    session = AgentSession.objects.get()
+    assert session.model_id == ''
+
+
+@pytest.mark.django_db
 def test_user_prompt_submit_hook_persists_event_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:

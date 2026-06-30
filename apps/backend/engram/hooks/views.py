@@ -137,6 +137,10 @@ class HookIngestView(APIView):
         )
 
 
+class PreToolUseView(HookIngestView):
+    expected_event_type = 'pre_tool_use'
+
+
 class PostToolUseView(HookIngestView):
     expected_event_type = 'post_tool_use'
 

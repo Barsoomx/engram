@@ -136,7 +136,7 @@ def get_sessions(
             {
                 'session_id': str(session.id),
                 'agent_name': agent_name,
-                'model_id': '',
+                'model_id': session.model_id,
                 'status': status,
                 'last_seen': last_seen.isoformat(),
             }
