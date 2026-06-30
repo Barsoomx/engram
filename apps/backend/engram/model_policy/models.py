@@ -18,6 +18,7 @@ from engram.core.models import (
 class Provider(models.TextChoices):
     ANTHROPIC = 'anthropic', 'Anthropic'
     OPENAI = 'openai', 'OpenAI'
+    DEEPSEEK = 'deepseek', 'DeepSeek'
 
 
 class SecretScope(models.TextChoices):

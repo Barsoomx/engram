@@ -97,6 +97,7 @@ class ModelPolicyInput:
     request_id: str
     actor_id: str
     scope_team_id: uuid.UUID | None = None
+    base_url: str = ''
 
 
 @dataclass(frozen=True)
@@ -356,6 +357,7 @@ class UpdateModelPolicyInput:
     active: bool | None = None
     fallback_enabled: bool | None = None
     task_type: str | None = None
+    base_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -417,6 +419,7 @@ class CreateModelPolicy:
             model=data.model,
             secret=secret,
             version=1,
+            metadata={'base_url': data.base_url} if data.base_url else {},
         )
         audit_model_policy_event(
             organization_id=data.organization_id,
@@ -471,6 +474,23 @@ class UpdateModelPolicy:
         policy.secret = secret
         update_fields.append('secret_id')
 
+    def _apply_base_url_update(
+        self,
+        policy: ModelPolicy,
+        data: UpdateModelPolicyInput,
+        update_fields: list[str],
+    ) -> None:
+        if data.base_url is None:
+            return
+
+        current = dict(policy.metadata or {})
+        if data.base_url:
+            current['base_url'] = data.base_url
+        else:
+            current.pop('base_url', None)
+        policy.metadata = current
+        update_fields.append('metadata')
+
     def execute(self, data: UpdateModelPolicyInput) -> ModelPolicy:
         with transaction.atomic():
             try:
@@ -486,6 +506,7 @@ class UpdateModelPolicy:
             update_fields: list[str] = ['version', 'updated_at']
             self._apply_scalar_updates(policy, data, update_fields)
             self._apply_secret_update(policy, data, update_fields)
+            self._apply_base_url_update(policy, data, update_fields)
 
             policy.version += 1
             policy.save(update_fields=update_fields)
@@ -799,8 +820,8 @@ def decrypt_secret(envelope: ProviderSecretEnvelope) -> str:
 
 
 def default_base_url(provider: str) -> str:
-    if provider == 'openai':
-        return 'https://api.openai.com/v1'
+    if provider == 'deepseek':
+        return 'https://api.deepseek.com/v1'
 
     return 'https://api.openai.com/v1'
 

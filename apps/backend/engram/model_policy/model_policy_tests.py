@@ -24,6 +24,7 @@ from engram.model_policy.services import (
     ResolveModelPolicyInput,
     _completion_body,
     _completion_title,
+    _resolve_base_url,
     encryption_key,
     generated_embedding,
 )
@@ -1406,6 +1407,191 @@ def test_new_mutating_endpoints_require_model_policy_capability() -> None:
     for resp in (get_detail, patch_policy, disable_policy, enable_secret, patch_secret):
         assert resp.status_code == 403
         assert resp.json()['code'] == 'missing_capability'
+
+
+@pytest.mark.django_db
+def test_provider_secret_create_accepts_deepseek_provider() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/model-policy/secrets',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Team DeepSeek',
+            'provider': 'deepseek',
+            'scope': 'team',
+            'raw_secret': RAW_PROVIDER_SECRET,
+            'request_id': 'request-secret-deepseek-create-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['provider'] == 'deepseek'
+
+
+@pytest.mark.django_db
+def test_model_policy_create_accepts_deepseek_provider() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team DeepSeek DS', 'deepseek')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'DeepSeek generation policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'deepseek',
+            'model': 'deepseek-chat',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-deepseek-create-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['provider'] == 'deepseek'
+
+
+@pytest.mark.django_db
+def test_model_policy_create_with_base_url_stores_in_metadata() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI GLM', 'openai')
+
+    glm_url = 'https://open.bigmodel.cn/api/paas/v4'
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'GLM generation policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'glm-4-flash',
+            'secret_id': secret_id,
+            'base_url': glm_url,
+            'request_id': 'request-policy-glm-base-url-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.metadata.get('base_url') == glm_url
+    assert _resolve_base_url(policy) == glm_url
+
+
+@pytest.mark.django_db
+def test_model_policy_create_without_base_url_has_empty_metadata() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI No URL', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Standard policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-no-base-url-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert 'base_url' not in policy.metadata
+
+
+@pytest.mark.django_db
+def test_model_policy_update_base_url_sets_metadata_key() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Update', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy to update URL', secret_id)
+
+    new_url = 'https://proxy.example.com/openai/v1'
+    response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'base_url': new_url,
+            'request_id': 'request-policy-update-base-url-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.metadata.get('base_url') == new_url
+    assert _resolve_base_url(policy) == new_url
+
+
+@pytest.mark.django_db
+def test_model_policy_update_base_url_empty_clears_metadata_key() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Clear', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy to clear URL', secret_id)
+
+    client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'base_url': 'https://proxy.example.com/openai/v1',
+            'request_id': 'request-policy-set-base-url-2',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    clear_response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'base_url': '',
+            'request_id': 'request-policy-clear-base-url-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert clear_response.status_code == 200
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert 'base_url' not in policy.metadata
+    assert _resolve_base_url(policy) == 'https://api.openai.com/v1'
 
 
 @pytest.mark.django_db

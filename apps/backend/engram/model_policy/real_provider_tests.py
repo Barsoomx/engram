@@ -16,6 +16,8 @@ from engram.model_policy.services import (
     OpenAICompatibleGateway,
     ProviderCallInput,
     ProviderSecretError,
+    _resolve_base_url,
+    default_base_url,
     encrypt_secret,
     get_provider_gateway,
 )
@@ -567,3 +569,75 @@ def test_anthropic_gateway_omits_system_field_when_system_prompt_empty() -> None
     sent = json.loads(opener.requests[0].data)
     assert 'system' not in sent
     assert sent['messages'] == [{'role': 'user', 'content': 'user content'}]
+
+
+def test_default_base_url_deepseek() -> None:
+    assert default_base_url('deepseek') == 'https://api.deepseek.com/v1'
+
+
+def test_default_base_url_openai_unchanged() -> None:
+    assert default_base_url('openai') == 'https://api.openai.com/v1'
+
+
+@pytest.mark.django_db
+def test_get_provider_gateway_deepseek_returns_openai_compatible_with_default_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek', base_url='', raw_key='ds-key')
+    monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+
+    gateway = get_provider_gateway(policy)
+
+    assert isinstance(gateway, OpenAICompatibleGateway)
+    assert gateway._base_url == 'https://api.deepseek.com/v1'
+    assert gateway._api_key == 'ds-key'
+
+
+@pytest.mark.django_db
+def test_deepseek_policy_metadata_base_url_override_used_by_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        provider='deepseek',
+        base_url='https://custom.deepseek.proxy/v1',
+        raw_key='ds-key-override',
+    )
+    monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+
+    gateway = get_provider_gateway(policy)
+
+    assert isinstance(gateway, OpenAICompatibleGateway)
+    assert gateway._base_url == 'https://custom.deepseek.proxy/v1'
+
+
+@pytest.mark.django_db
+def test_existing_policy_no_base_url_resolves_to_provider_default() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=None,
+        name='Org OpenAI',
+        provider='openai',
+        scope='organization',
+        current_version=1,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=None,
+        project=project,
+        name='No metadata policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4o-mini',
+        secret=secret,
+        version=1,
+    )
+
+    resolved = _resolve_base_url(policy)
+
+    assert resolved == 'https://api.openai.com/v1'
