@@ -4,11 +4,13 @@ from engram.inspection.views import (
     AuditEventInspectionListView,
     ContextBundleInspectionDetailView,
     ContextBundleInspectionListView,
+    MemoryInspectionCountView,
     MemoryInspectionDetailView,
     MemoryInspectionListView,
 )
 
 urlpatterns = [
+    path('memories/count', MemoryInspectionCountView.as_view(), name='inspection-memories-count'),
     path('memories', MemoryInspectionListView.as_view(), name='inspection-memories'),
     path('memories/<uuid:memory_id>', MemoryInspectionDetailView.as_view(), name='inspection-memory-detail'),
     path('context-bundles', ContextBundleInspectionListView.as_view(), name='inspection-context-bundles'),

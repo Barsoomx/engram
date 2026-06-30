@@ -572,6 +572,10 @@ def test_promote_memory_candidate_creates_memory_version_and_retrieval_document(
         'memory_candidate_id': str(candidate.id),
         'evidence': candidate.evidence,
         'file_paths': observation.files_read + observation.files_modified,
+        'captured_by': {
+            'agent_runtime': observation.agent.runtime,
+            'agent_external_id': observation.agent.external_id,
+        },
     }
     assert version.memory_id == memory.id
     assert version.version == 1

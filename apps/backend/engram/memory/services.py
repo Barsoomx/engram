@@ -473,15 +473,32 @@ class PromoteMemoryCandidate:
         return document
 
     def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
-        metadata = {
+        metadata: dict[str, object] = {
             'source': 'memory_candidate',
             'memory_candidate_id': str(candidate.id),
             'evidence': candidate.evidence,
             'file_paths': self._candidate_file_paths(candidate),
         }
         metadata.update(self._provider_provenance(candidate))
+        captured_by = self._captured_by(candidate)
+        if captured_by is not None:
+            metadata['captured_by'] = captured_by
 
         return metadata
+
+    def _captured_by(self, candidate: MemoryCandidate) -> dict[str, object] | None:
+        observation = candidate.source_observation
+        if observation is None:
+            return None
+
+        agent = observation.agent
+        if agent is None:
+            return None
+
+        return {
+            'agent_runtime': agent.runtime,
+            'agent_external_id': redact_text(agent.external_id),
+        }
 
     def _provider_provenance(self, candidate: MemoryCandidate) -> dict[str, object]:
         if not candidate.evidence:
