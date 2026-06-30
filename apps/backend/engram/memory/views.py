@@ -4,12 +4,14 @@ import uuid
 from typing import Any
 
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from engram.access.services import AccessDeniedError, ResolveApiKeyScope
-from engram.context.views import access_error_response, bearer_key
+from engram.access.request_scope import resolve_request_scope
+from engram.access.services import AccessDeniedError, EffectiveScope
+from engram.context.views import access_error_response
 from engram.core.models import MemoryLink
 from engram.core.redaction import redact_value
 from engram.memory.serializers import (
@@ -38,7 +40,7 @@ MEMORY_VERSION_STATUS = {
 
 
 class MemoryFeedbackView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def post(self, request: Request, memory_id: uuid.UUID) -> Response:
@@ -46,7 +48,16 @@ class MemoryFeedbackView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            result = RecordMemoryFeedback().execute(self._input(request, memory_id, data))
+            scope = resolve_request_scope(
+                request,
+                required_capability='memories:review',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='memory',
+                target_id=str(memory_id),
+                request_id=data['request_id'],
+            )
+            result = RecordMemoryFeedback().execute(self._input(memory_id, data, scope))
         except AccessDeniedError as error:
             return access_error_response(error)
         except MemoryFeedbackError as error:
@@ -57,9 +68,9 @@ class MemoryFeedbackView(APIView):
 
         return Response(result.to_response())
 
-    def _input(self, request: Request, memory_id: uuid.UUID, data: dict[str, Any]) -> MemoryFeedbackInput:
+    def _input(self, memory_id: uuid.UUID, data: dict[str, Any], scope: EffectiveScope) -> MemoryFeedbackInput:
         return MemoryFeedbackInput(
-            raw_key=bearer_key(request),
+            scope=scope,
             memory_id=memory_id,
             project_id=data['project_id'],
             team_id=data.get('team_id'),
@@ -71,7 +82,7 @@ class MemoryFeedbackView(APIView):
 
 
 class MemoryVersionView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def post(self, request: Request, memory_id: uuid.UUID) -> Response:
@@ -79,9 +90,18 @@ class MemoryVersionView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
+            scope = resolve_request_scope(
+                request,
+                required_capability='memories:review',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='memory',
+                target_id=str(memory_id),
+                request_id=data['request_id'],
+            )
             result = UpdateMemoryBody().execute(
                 UpdateMemoryBodyInput(
-                    raw_key=bearer_key(request),
+                    scope=scope,
                     memory_id=memory_id,
                     project_id=data['project_id'],
                     team_id=data.get('team_id'),
@@ -103,7 +123,7 @@ class MemoryVersionView(APIView):
 
 
 class MemoryLinksView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
     def get(self, request: Request, memory_id: uuid.UUID) -> Response:
@@ -111,12 +131,11 @@ class MemoryLinksView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
-            scope = ResolveApiKeyScope().execute(
-                raw_key=bearer_key(request),
+            scope = resolve_request_scope(
+                request,
                 required_capability='memories:read',
-                requested_project_id=data['project_id'],
-                requested_team_id=data.get('team_id'),
-                request_id=f'links-{uuid.uuid4()}',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
                 target_type='memory_link',
                 target_id=str(memory_id),
             )
@@ -136,9 +155,18 @@ class MemoryLinksView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         try:
+            scope = resolve_request_scope(
+                request,
+                required_capability='memories:review',
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                target_type='memory_link',
+                target_id=str(memory_id),
+                request_id=data['request_id'],
+            )
             result = RecordMemoryLink().execute(
                 MemoryLinkInput(
-                    raw_key=bearer_key(request),
+                    scope=scope,
                     memory_id=memory_id,
                     project_id=data['project_id'],
                     team_id=data.get('team_id'),

@@ -4,23 +4,31 @@ import uuid
 from typing import Any
 
 from rest_framework import status
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from engram.access.request_scope import resolve_request_scope
 from engram.access.services import AccessDeniedError
-from engram.context.views import access_error_response, bearer_key
-from engram.core.models import AuditEvent, ContextBundle, ContextBundleItem, Memory, MemoryVersion, RetrievalDocument
+from engram.context.views import access_error_response
+from engram.core.models import (
+    AuditEvent,
+    ContextBundle,
+    ContextBundleItem,
+    Memory,
+    MemoryVersion,
+    Project,
+    RetrievalDocument,
+)
 from engram.core.redaction import redact_value
 from engram.inspection.serializers import InspectionQuerySerializer
 from engram.inspection.services import (
     InspectionNotFoundError,
     InspectionScope,
-    InspectionScopeInput,
     ListInspectionAuditEvents,
     ListInspectionContextBundles,
     ListInspectionMemories,
-    ResolveInspectionScope,
 )
 
 NOT_FOUND_STATUS = {
@@ -31,7 +39,7 @@ NOT_FOUND_STATUS = {
 
 
 class InspectionBaseView(APIView):
-    authentication_classes: list[type] = []
+    authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
     required_capability = ''
     target_type = ''
@@ -41,16 +49,17 @@ class InspectionBaseView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        return ResolveInspectionScope().execute(
-            InspectionScopeInput(
-                raw_key=bearer_key(request),
-                required_capability=self.required_capability,
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type=self.target_type,
-                target_id=target_id,
-            ),
+        scope = resolve_request_scope(
+            request,
+            required_capability=self.required_capability,
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type=self.target_type,
+            target_id=target_id,
         )
+        project = Project.objects.get(organization_id=scope.organization_id, id=data['project_id'])
+
+        return InspectionScope(project=project, scope=scope)
 
 
 class MemoryInspectionListView(InspectionBaseView):
