@@ -75,7 +75,7 @@ class ListInspectionMemories:
         if inspection_scope.status:
             qs = qs.filter(status=inspection_scope.status)
         if inspection_scope.kind:
-            qs = qs.filter(metadata__kind=inspection_scope.kind)
+            qs = qs.filter(kind=inspection_scope.kind)
 
         return qs
 
@@ -93,7 +93,7 @@ class ListInspectionMemories:
         ).filter(inspection_scope.team_filter)
         qs = qs.filter(status=inspection_scope.status or MemoryStatus.APPROVED)
         if inspection_scope.kind:
-            qs = qs.filter(metadata__kind=inspection_scope.kind)
+            qs = qs.filter(kind=inspection_scope.kind)
 
         return qs.count()
 
