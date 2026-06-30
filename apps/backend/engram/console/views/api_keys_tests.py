@@ -277,6 +277,30 @@ def test_issue_rejects_capability_outside_issuer_scope(
 
 
 @pytest.mark.django_db
+def test_issue_rejects_unknown_capability_code(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(
+        '/v1/admin/api-keys/',
+        {
+            'name': 'Bogus key',
+            'capabilities': ['api_keys:nonexistent_capability'],
+        },
+    )
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'unknown_capability'
+
+    assert 'api_keys:nonexistent_capability' in response.data['detail']
+
+    assert not ApiKey.objects.filter(name='Bogus key').exists()
+
+
+@pytest.mark.django_db
 def test_issue_allows_wildcard_issuer_capability(
     f_owner_user_token: str,
     f_owned_org: Organization,
