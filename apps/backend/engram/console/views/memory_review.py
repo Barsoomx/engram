@@ -94,6 +94,26 @@ class MemoryReviewViewSet(
             },
         )
 
+    def retrieve(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        organization = request.active_organization
+
+        item_id = self._uuid_kwarg(kwargs)
+
+        try:
+            item = get_review_candidate_or_404(organization, item_id)
+
+        except MemoryReviewError:
+            try:
+                item = get_review_memory_or_404(organization, item_id)
+
+            except MemoryReviewError as error:
+                return Response(
+                    {'code': error.code, 'detail': str(error)},
+                    status=HTTP_404_NOT_FOUND,
+                )
+
+        return Response(queue_item_payload(item), status=HTTP_200_OK)
+
     @action(detail=True, methods=['get'], url_path='diff')
     def diff(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         organization = request.active_organization
