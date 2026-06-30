@@ -29,6 +29,7 @@ from engram.model_policy.services import (
 )
 
 POLICY_RAW_KEY = 'egk_test_model_policy_admin_0123456789abcdefghijklmnopqrstuvwxyz'
+READER_MP_RAW_KEY = 'egk_reader_mp_0123456789abcdefghijklmnopqrstuvwxyz'
 RAW_PROVIDER_SECRET = 'sk-test_model_policy_secret_1234567890abcdef'
 
 
@@ -61,13 +62,34 @@ def create_policy_admin_key(project_team_scope: tuple[object, Team, object, obje
         project,
         admin,
         raw_key=POLICY_RAW_KEY,
-        capabilities=('secrets:*', 'model_policy:*', 'projects:*', 'teams:*'),
+        capabilities=('secrets:*', 'model_policy:*', 'projects:*', 'teams:*', 'secrets:read', 'model_policy:read'),
     )
     for code in ('secrets:*', 'model_policy:*'):
         ApiKeyCapability.objects.get_or_create(
             api_key=api_key,
             capability=Capability.objects.get(code=code),
         )
+
+
+def create_reader_mp_key(project_team_scope: tuple[object, Team, object, object, object]) -> None:
+    organization, team, project, _owner, _api_key = project_team_scope
+    reader = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-mp-reader',
+        display_name='Model policy reader',
+    )
+    reader_role = Role.objects.get(code='auditor')
+    OrganizationMembership.objects.create(organization=organization, identity=reader, role=reader_role)
+    ProjectGrant.objects.create(organization=organization, project=project, identity=reader, role=reader_role)
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        reader,
+        raw_key=READER_MP_RAW_KEY,
+        capabilities=('secrets:read', 'model_policy:read'),
+    )
 
 
 @pytest.mark.django_db
@@ -1382,5 +1404,126 @@ def test_new_mutating_endpoints_require_model_policy_capability() -> None:
     )
 
     for resp in (get_detail, patch_policy, disable_policy, enable_secret, patch_secret):
+        assert resp.status_code == 403
+        assert resp.json()['code'] == 'missing_capability'
+
+
+@pytest.mark.django_db
+def test_reader_role_can_read_secrets_and_policies_but_denied_mutations() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    create_reader_mp_key(scope)
+    client = APIClient()
+
+    secret_id = _create_secret(client, project, team, 'Reader Secret', 'openai')
+    policy_id = _create_policy(client, project, team, 'Reader Policy', secret_id)
+
+    list_secrets = client.get(
+        '/v1/model-policy/secrets',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    detail_secret = client.get(
+        f'/v1/model-policy/secrets/{secret_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    list_policies = client.get(
+        '/v1/model-policy/policies',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    detail_policy = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    resolve_policy = client.get(
+        '/v1/model-policy/resolve',
+        {'project_id': str(project.id), 'team_id': str(team.id), 'task_type': 'generation'},
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+
+    assert list_secrets.status_code == 200
+    assert list_secrets.json()['count'] == 1
+    assert detail_secret.status_code == 200
+    assert detail_secret.json()['id'] == secret_id
+    assert list_policies.status_code == 200
+    assert list_policies.json()['count'] == 1
+    assert detail_policy.status_code == 200
+    assert detail_policy.json()['policy_id'] == policy_id
+    assert resolve_policy.status_code == 200
+
+    base_params = {'project_id': str(project.id), 'team_id': str(team.id), 'request_id': 'req-reader-mut'}
+
+    post_secret = client.post(
+        '/v1/model-policy/secrets',
+        {**base_params, 'name': 'Bad', 'provider': 'openai', 'scope': 'team', 'raw_secret': 'sk-x'},
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    patch_secret = client.patch(
+        f'/v1/model-policy/secrets/{secret_id}',
+        {**base_params, 'name': 'Bad'},
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    rotate_secret = client.post(
+        f'/v1/model-policy/secrets/{secret_id}/rotate',
+        {**base_params, 'raw_secret': 'sk-rotated'},
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    disable_secret = client.post(
+        f'/v1/model-policy/secrets/{secret_id}/disable',
+        base_params,
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    enable_secret = client.post(
+        f'/v1/model-policy/secrets/{secret_id}/enable',
+        base_params,
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    post_policy = client.post(
+        '/v1/model-policy/policies',
+        {
+            **base_params,
+            'name': 'Bad',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4.1',
+            'secret_id': secret_id,
+        },
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    patch_policy = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {**base_params, 'name': 'Bad'},
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+    disable_policy = client.post(
+        f'/v1/model-policy/policies/{policy_id}/disable',
+        base_params,
+        format='json',
+        **auth_headers(READER_MP_RAW_KEY),
+    )
+
+    denied_mutations = (
+        post_secret,
+        patch_secret,
+        rotate_secret,
+        disable_secret,
+        enable_secret,
+        post_policy,
+        patch_policy,
+        disable_policy,
+    )
+    for resp in denied_mutations:
         assert resp.status_code == 403
         assert resp.json()['code'] == 'missing_capability'

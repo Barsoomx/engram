@@ -138,7 +138,7 @@ def test_session_user_without_capability_is_denied_secrets() -> None:
     )
 
     assert response.status_code == 403
-    assert response.json()['code'] == 'missing_capability'
+    assert response.json()['code'] == 'project_scope_denied'
 
 
 @pytest.mark.django_db
@@ -154,7 +154,7 @@ def test_session_user_without_capability_is_denied_inspection() -> None:
     )
 
     assert response.status_code == 403
-    assert response.json()['code'] == 'missing_capability'
+    assert response.json()['code'] == 'project_scope_denied'
 
 
 @pytest.mark.django_db
@@ -209,8 +209,7 @@ def test_bearer_api_key_path_still_works_after_session_support_added() -> None:
         **auth_headers(RAW_KEY),
     )
 
-    assert response.status_code == 403
-    assert response.json()['code'] == 'missing_capability'
+    assert response.status_code == 200
 
 
 @pytest.mark.django_db

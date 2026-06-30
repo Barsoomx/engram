@@ -41,6 +41,7 @@ from engram.core.models import (
 
 AUDIT_RAW_KEY = 'egk_test_inspection_audit_0123456789abcdefghijklmnopqrstuvwxyz'
 INSPECTION_RAW_KEY = 'egk_test_inspection_admin_0123456789abcdefghijklmnopqrstuvwxyz'
+READER_INSP_RAW_KEY = 'egk_reader_insp_0123456789abcdefghijklmnopqrstu'
 
 
 def create_memory_admin_key(project_team_scope: tuple[object, Team, object, object, object]) -> None:
@@ -60,11 +61,32 @@ def create_memory_admin_key(project_team_scope: tuple[object, Team, object, obje
         project,
         admin,
         raw_key=INSPECTION_RAW_KEY,
-        capabilities=('memories:read', 'memories:admin'),
+        capabilities=('memories:read', 'memories:admin', 'context:read'),
     )
     ApiKeyCapability.objects.get_or_create(
         api_key=api_key,
         capability=Capability.objects.get(code='memories:admin'),
+    )
+
+
+def create_reader_insp_key(project_team_scope: tuple[object, Team, object, object, object]) -> None:
+    organization, team, project, _owner, _api_key = project_team_scope
+    reader = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-insp-reader',
+        display_name='Inspection reader',
+    )
+    reader_role = Role.objects.get(code='auditor')
+    OrganizationMembership.objects.create(organization=organization, identity=reader, role=reader_role)
+    ProjectGrant.objects.create(organization=organization, project=project, identity=reader, role=reader_role)
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        reader,
+        raw_key=READER_INSP_RAW_KEY,
+        capabilities=('memories:read', 'context:read'),
     )
 
 
@@ -180,10 +202,36 @@ def test_memory_inspection_lists_authorized_memories_and_redacts_detail_metadata
     project_memory.save(update_fields=['metadata', 'updated_at'])
     client = APIClient()
 
+    no_read_key_raw = 'egk_deny_mem_rd_0123456789abcdefghijklmnopqrstuv'
+    no_read_ident = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-deny-mem-rd',
+        display_name='Deny Mem Read',
+    )
+    OrganizationMembership.objects.create(
+        organization=organization,
+        identity=no_read_ident,
+        role=Role.objects.get(code='auditor'),
+    )
+    ProjectGrant.objects.create(
+        organization=organization,
+        project=project,
+        identity=no_read_ident,
+        role=Role.objects.get(code='auditor'),
+    )
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        no_read_ident,
+        raw_key=no_read_key_raw,
+        capabilities=('audit:read',),
+    )
     denied_response = client.get(
         '/v1/inspection/memories',
         {'project_id': str(project.id)},
-        **auth_headers(),
+        HTTP_AUTHORIZATION=f'Bearer {no_read_key_raw}',
     )
     response = client.get(
         '/v1/inspection/memories',
@@ -1193,3 +1241,117 @@ def test_context_bundle_list_filter_by_since_until() -> None:
     ids = {item['id'] for item in body['items']}
     assert str(new_bundle.id) in ids
     assert str(old_bundle.id) not in ids
+
+
+@pytest.mark.django_db
+def test_reader_role_can_inspect_memories_count_and_context_bundles() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    create_reader_insp_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Reader visible memory',
+        body='Visible body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    bundle = create_context_bundle(team)
+    client = APIClient()
+
+    mem_list = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        **auth_headers(READER_INSP_RAW_KEY),
+    )
+    mem_detail = client.get(
+        f'/v1/inspection/memories/{memory.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(READER_INSP_RAW_KEY),
+    )
+    mem_count = client.get(
+        '/v1/inspection/memories/count',
+        {'project_id': str(project.id)},
+        **auth_headers(READER_INSP_RAW_KEY),
+    )
+    ctx_list = client.get(
+        '/v1/inspection/context-bundles',
+        {'project_id': str(project.id)},
+        **auth_headers(READER_INSP_RAW_KEY),
+    )
+    ctx_detail = client.get(
+        f'/v1/inspection/context-bundles/{bundle.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(READER_INSP_RAW_KEY),
+    )
+
+    assert mem_list.status_code == 200
+    mem_ids = {item['id'] for item in mem_list.json()['items']}
+    assert str(memory.id) in mem_ids
+    assert mem_detail.status_code == 200
+    assert mem_detail.json()['id'] == str(memory.id)
+    assert mem_count.status_code == 200
+    assert mem_count.json()['count'] >= 1
+    assert ctx_list.status_code == 200
+    assert ctx_detail.status_code == 200
+
+
+@pytest.mark.django_db
+def test_reader_denied_without_required_read_capability() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Auth memory',
+        body='Body.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    create_context_bundle(team)
+
+    no_cap_raw = 'egk_no_cap_rd_000000123456789abcdefghijklmnopqrstuv'
+    no_cap_ident = Identity.objects.create(
+        organization=organization,
+        identity_type='service_account',
+        external_id='svc-no-cap-rd',
+        display_name='No Cap Read',
+    )
+    OrganizationMembership.objects.create(
+        organization=organization,
+        identity=no_cap_ident,
+        role=Role.objects.get(code='auditor'),
+    )
+    ProjectGrant.objects.create(
+        organization=organization,
+        project=project,
+        identity=no_cap_ident,
+        role=Role.objects.get(code='auditor'),
+    )
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        no_cap_ident,
+        raw_key=no_cap_raw,
+        capabilities=('audit:read',),
+    )
+    client = APIClient()
+
+    denied_mem = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        HTTP_AUTHORIZATION=f'Bearer {no_cap_raw}',
+    )
+    denied_ctx = client.get(
+        '/v1/inspection/context-bundles',
+        {'project_id': str(project.id)},
+        HTTP_AUTHORIZATION=f'Bearer {no_cap_raw}',
+    )
+
+    assert denied_mem.status_code == 403
+    assert denied_mem.json()['code'] == 'missing_capability'
+    assert denied_ctx.status_code == 403
+    assert denied_ctx.json()['code'] == 'missing_capability'
