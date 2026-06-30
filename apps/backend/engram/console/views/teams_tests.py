@@ -126,9 +126,21 @@ def test_list_returns_active_teams_with_pagination(
 
     team = response.data['results'][0]
 
-    assert set(team.keys()) == {'id', 'name', 'slug', 'created_at', 'updated_at'}
+    assert set(team.keys()) == {
+        'id',
+        'name',
+        'slug',
+        'created_at',
+        'updated_at',
+        'archived_at',
+        'organization',
+    }
 
     assert team['slug'] == 'platform'
+
+    assert team['archived_at'] is None
+
+    assert team['organization'] == f_owned_org.id
 
 
 @pytest.mark.django_db

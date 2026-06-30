@@ -19,6 +19,8 @@ class ProjectReadSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
             'memory_count',
+            'archived_at',
+            'organization',
         ]
         read_only_fields = [
             'id',
@@ -29,6 +31,8 @@ class ProjectReadSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
             'memory_count',
+            'archived_at',
+            'organization',
         ]
 
 

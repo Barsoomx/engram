@@ -139,11 +139,17 @@ def test_list_returns_active_projects_with_pagination(
         'created_at',
         'updated_at',
         'memory_count',
+        'archived_at',
+        'organization',
     }
 
     assert project['slug'] == 'platform'
 
     assert project['memory_count'] == 0
+
+    assert project['archived_at'] is None
+
+    assert project['organization'] == f_owned_org.id
 
 
 @pytest.mark.django_db
