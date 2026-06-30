@@ -3,7 +3,6 @@
 import {
   addToast,
   Button,
-  Chip,
   Input,
   Modal,
   ModalBody,
@@ -27,8 +26,10 @@ import * as React from 'react';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { InitialTile } from '@/components/ui/initial-tile';
 import { PageHeader } from '@/components/ui/page-header';
-import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { PrimaryButton } from '@/components/ui/primary-button';
+import { PulseDot } from '@/components/ui/pulse-dot';
 import {
   useDeactivateMember,
   useInviteMember,
@@ -107,86 +108,170 @@ function getPrimaryIdentity(member: Member): string {
   return member.external_id || '—';
 }
 
+function getSeed(member: Member): string {
+  return member.email?.trim() || member.external_id || member.id;
+}
+
+function humanizeRole(role: string): string {
+  return role
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+function rolePillClass(role: string): string {
+  const value = role.toLowerCase();
+
+  if (value.includes('owner')) {
+
+    return 'bg-primary-soft text-primary-300';
+  }
+
+  if (value.includes('admin')) {
+
+    return 'bg-[rgba(107,166,255,0.13)] text-info';
+  }
+
+  return 'bg-content3 text-default-500';
+}
+
+function gridColumns(canAdmin: boolean): string {
+  return canAdmin
+    ? 'minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) auto'
+    : 'minmax(0,2fr) minmax(0,1fr) minmax(0,1fr)';
+}
+
+function ColumnHeader({ canAdmin }: { canAdmin: boolean }) {
+  return (
+    <div
+      className='grid items-center gap-4 border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'
+      style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+    >
+      <span>Member</span>
+      <span>Role</span>
+      <span>Status</span>
+      {canAdmin && <span className='sr-only'>Actions</span>}
+    </div>
+  );
+}
+
 function MembersTable({
   items,
   canAdmin,
+  roleNames,
   onChangeRole,
   onDeactivate,
 }: {
   items: Member[];
   canAdmin: boolean;
+  roleNames: Map<string, string>;
   onChangeRole: (member: Member) => void;
   onDeactivate: (member: Member) => void;
 }) {
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Member</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>
-              Identity
-            </th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Role</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            {canAdmin && (
-              <th className='py-2 px-3 text-default-500 font-medium text-right'>
-                Actions
-              </th>
-            )}
-          </tr>
-        </thead>
-        <tbody>
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[640px]'>
+          <ColumnHeader canAdmin={canAdmin} />
           {items.map((member) => (
-            <tr key={member.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 text-foreground'>
-                {getDisplayName(member)}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {getPrimaryIdentity(member)}
-              </td>
-              <td className='py-2 px-3'>
-                <Chip size='sm' variant='flat' className='font-mono'>
-                  {member.role}
-                </Chip>
-              </td>
-              <td className='py-2 px-3'>
-                <Chip
-                  size='sm'
-                  color={member.active ? 'success' : 'default'}
-                  variant='flat'
+            <div
+              key={member.id}
+              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
+              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                <InitialTile
+                  name={getDisplayName(member)}
+                  seed={getSeed(member)}
+                  size={34}
+                />
+                <div className='flex min-w-0 flex-col'>
+                  <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                    {getDisplayName(member)}
+                  </span>
+                  <span className='truncate font-mono text-[11.5px] text-default-400'>
+                    {getPrimaryIdentity(member)}
+                  </span>
+                </div>
+              </div>
+              <div className='min-w-0'>
+                <span
+                  className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${rolePillClass(member.role)}`}
                 >
+                  {roleNames.get(member.role) ?? humanizeRole(member.role)}
+                </span>
+              </div>
+              <div className='flex items-center gap-2'>
+                <PulseDot
+                  color={member.active ? '#3DD9AC' : '#666C77'}
+                  pulse={member.active}
+                />
+                <span className='text-[12px] text-default-500'>
                   {member.active ? 'Active' : 'Inactive'}
-                </Chip>
-              </td>
+                </span>
+              </div>
               {canAdmin && (
-                <td className='py-2 px-3'>
-                  <div className='flex items-center justify-end gap-2'>
-                    <Button
-                      size='sm'
-                      variant='flat'
-                      startContent={<UserCog className='w-3.5 h-3.5' />}
-                      onPress={() => onChangeRole(member)}
-                    >
-                      Change role
-                    </Button>
-                    <Button
-                      size='sm'
-                      color='danger'
-                      variant='flat'
-                      startContent={<UserMinus className='w-3.5 h-3.5' />}
-                      onPress={() => onDeactivate(member)}
-                      isDisabled={!member.active}
-                    >
-                      Deactivate
-                    </Button>
-                  </div>
-                </td>
+                <div className='flex items-center justify-end gap-2'>
+                  <Button
+                    size='sm'
+                    variant='flat'
+                    startContent={<UserCog className='w-3.5 h-3.5' />}
+                    onPress={() => onChangeRole(member)}
+                  >
+                    Change role
+                  </Button>
+                  <Button
+                    size='sm'
+                    color='danger'
+                    variant='flat'
+                    startContent={<UserMinus className='w-3.5 h-3.5' />}
+                    onPress={() => onDeactivate(member)}
+                    isDisabled={!member.active}
+                  >
+                    Deactivate
+                  </Button>
+                </div>
               )}
-            </tr>
+            </div>
           ))}
-        </tbody>
-      </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MembersTableSkeleton({ canAdmin }: { canAdmin: boolean }) {
+  return (
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[640px]'>
+          <ColumnHeader canAdmin={canAdmin} />
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div
+              key={index}
+              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 last:border-b-0'
+              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                <span className='h-[34px] w-[34px] shrink-0 rounded-[10px] bg-content2' />
+                <div className='flex flex-col gap-1.5'>
+                  <span className='h-3.5 w-28 rounded-medium bg-content2' />
+                  <span className='h-3 w-36 rounded-medium bg-content2' />
+                </div>
+              </div>
+              <span className='h-5 w-16 rounded-[7px] bg-content2' />
+              <span className='h-3 w-14 rounded-medium bg-content2' />
+              {canAdmin && (
+                <div className='flex items-center justify-end gap-2'>
+                  <span className='h-8 w-20 rounded-medium bg-content2' />
+                  <span className='h-8 w-24 rounded-medium bg-content2' />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -425,6 +510,16 @@ export default function MembersPage() {
     [rolesQuery.data?.results],
   );
 
+  const roleNames = React.useMemo(() => {
+    const map = new Map<string, string>();
+
+    for (const role of roles) {
+      map.set(role.code, role.name);
+    }
+
+    return map;
+  }, [roles]);
+
   function openInvite() {
     setModalMode('invite');
     setMemberTarget(null);
@@ -530,69 +625,52 @@ export default function MembersPage() {
           subtitle='Invite members, assign roles, and deactivate access within this organization.'
           actions={
             canAdmin ? (
-              <Button
-                color='primary'
+              <PrimaryButton
                 startContent={<UserPlus className='w-4 h-4' />}
                 onPress={openInvite}
                 isDisabled={!meLoaded}
               >
                 Invite member
-              </Button>
+              </PrimaryButton>
             ) : null
           }
         />
 
-        <div className='surface-card p-2'>
-          {isLoading ? (
-            <table className='w-full border-collapse text-left text-sm'>
-              <thead>
-                <tr className='border-b border-divider'>
-                  {Array.from({ length: canAdmin ? 5 : 4 }).map((_, index) => (
-                    <th
-                      key={index}
-                      className='py-2 px-3 text-default-500 font-medium'
-                    >
-                      <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <TableRowSkeleton columns={canAdmin ? 5 : 4} />
-            </table>
-          ) : items.length === 0 ? (
-            <EmptyState
-              title='No members yet'
-              description='Invite the first member to grant them access to this organization.'
-              icon={<Users className='w-6 h-6' />}
-              action={
-                canAdmin ? (
-                  <Button
-                    color='primary'
-                    startContent={<UserPlus className='w-4 h-4' />}
-                    onPress={openInvite}
-                  >
-                    Invite member
-                  </Button>
-                ) : undefined
-              }
-            />
-          ) : (
-            <MembersTable
-              items={items}
-              canAdmin={canAdmin}
-              onChangeRole={openChangeRole}
-              onDeactivate={setDeactivateTarget}
-            />
-          )}
-        </div>
+        {isLoading ? (
+          <MembersTableSkeleton canAdmin={canAdmin} />
+        ) : items.length === 0 ? (
+          <EmptyState
+            title='No members yet'
+            description='Invite the first member to grant them access to this organization.'
+            icon={<Users className='w-6 h-6' />}
+            action={
+              canAdmin ? (
+                <PrimaryButton
+                  startContent={<UserPlus className='w-4 h-4' />}
+                  onPress={openInvite}
+                >
+                  Invite member
+                </PrimaryButton>
+              ) : undefined
+            }
+          />
+        ) : (
+          <MembersTable
+            items={items}
+            canAdmin={canAdmin}
+            roleNames={roleNames}
+            onChangeRole={openChangeRole}
+            onDeactivate={setDeactivateTarget}
+          />
+        )}
 
         {items.length > 0 && (
-          <div className='flex items-center justify-between text-xs text-default-500'>
+          <div className='flex items-center justify-between text-[12px] text-default-400'>
             <p>
               Showing {items.length} member{items.length === 1 ? '' : 's'}.
             </p>
             {canAdmin && (
-              <p className='flex items-center gap-1'>
+              <p className='flex items-center gap-1.5'>
                 <ShieldCheck className='w-3.5 h-3.5' />
                 Deactivating is restricted to administrators.
               </p>
@@ -601,7 +679,7 @@ export default function MembersPage() {
         )}
 
         {membersQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
+          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
             {membersQuery.error instanceof Error
               ? membersQuery.error.message
               : 'Failed to load members.'}
