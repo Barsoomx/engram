@@ -2,9 +2,27 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg: #0a0c11;
+  --panel: #101319;
+  --panel2: #161a21;
+  --panel3: #1c212a;
+  --line: rgba(255, 255, 255, 0.065);
+  --line2: rgba(255, 255, 255, 0.11);
+  --fg: #eceef2;
+  --mut: #9197a2;
+  --mut2: #666c77;
+  --accent: #7c5cff;
+  --accent2: #a78bff;
+  --accent-soft: rgba(124, 92, 255, 0.13);
+  --primary-soft: rgba(124, 92, 255, 0.13);
+  --primary-grad: linear-gradient(150deg, #8b6bff, #6a4dff);
+  --brand-grad: linear-gradient(150deg, #9277ff, #5a3df2);
+}
+
 @layer base {
   html {
-    background: hsl(var(--heroui-background));
+    background: var(--bg);
   }
 
   html.dark {
@@ -13,27 +31,130 @@
 
   body {
     -webkit-font-smoothing: antialiased;
-    background: hsl(var(--heroui-background));
-    color: hsl(var(--heroui-foreground));
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--bg);
+    color: var(--fg);
+    font-feature-settings: 'cv11', 'ss01';
+    letter-spacing: -0.005em;
+  }
+
+  ::selection {
+    background: rgba(124, 92, 255, 0.32);
+    color: #fff;
   }
 
   *:focus-visible {
     outline: none;
+    box-shadow: 0 0 0 2px rgba(124, 92, 255, 0.5);
+    border-radius: 8px;
+  }
+
+  /* Scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    border-radius: 999px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.18);
+    background-clip: padding-box;
   }
 }
 
 @layer components {
   .surface-card {
-    background-color: hsl(var(--heroui-content1));
-    border: 1px solid hsl(var(--heroui-divider));
+    background-color: var(--panel);
+    border: 1px solid var(--line);
     border-radius: 16px;
+  }
+
+  .hairline {
+    border-color: var(--line);
+  }
+
+  .hairline-strong {
+    border-color: var(--line2);
+  }
+
+  /* Premium gradient CTA */
+  .btn-premium {
+    background-image: var(--primary-grad);
+    box-shadow:
+      0 8px 22px -8px rgba(124, 92, 255, 0.6),
+      inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    color: #fff;
+    transition:
+      filter 0.16s var(--ease, cubic-bezier(0.22, 1, 0.36, 1)),
+      transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .btn-premium:hover {
+    filter: brightness(1.07);
+    transform: translateY(-1px);
+  }
+
+  .btn-premium:active {
+    transform: translateY(0);
+  }
+
+  /* Mono keycap chip (⌘K etc.) */
+  .key-cap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: 18px;
+    min-width: 18px;
+    padding: 0 5px;
+    border: 1px solid var(--line2);
+    border-radius: 5px;
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 10.5px;
+    line-height: 1;
+    color: var(--mut);
+    background: rgba(255, 255, 255, 0.02);
+  }
+
+  .top-bar-blur {
+    background: rgba(10, 12, 17, 0.72);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+  }
+}
+
+@layer utilities {
+  .text-mut {
+    color: var(--mut);
+  }
+
+  .text-mut2 {
+    color: var(--mut2);
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums;
   }
 }
 
 @keyframes fade-up {
   from {
     opacity: 0;
-    transform: translateY(8px);
+    transform: translateY(10px);
   }
   to {
     opacity: 1;
@@ -43,4 +164,62 @@
 
 .animate-fade-up {
   animation: fade-up 320ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes bar-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+.animate-bar-grow {
+  transform-origin: bottom;
+  animation: bar-grow 500ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.pulse-dot {
+  animation: pulse-dot 2.4s ease-in-out infinite;
+}
+
+/* Login ambient background */
+.auth-bg {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.auth-bg::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(620px 420px at 30% 18%, rgba(124, 92, 255, 0.18), transparent 70%),
+    radial-gradient(560px 420px at 78% 82%, rgba(107, 166, 255, 0.12), transparent 72%);
+  pointer-events: none;
+}
+
+.auth-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(620px 520px at 50% 42%, #000, transparent 75%);
+  -webkit-mask-image: radial-gradient(620px 520px at 50% 42%, #000, transparent 75%);
+  pointer-events: none;
 }

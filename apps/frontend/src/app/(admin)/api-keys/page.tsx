@@ -28,11 +28,13 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
-import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { PrimaryButton } from '@/components/ui/primary-button';
+import { PulseDot } from '@/components/ui/pulse-dot';
 import { useApiKeys, useIssueApiKey, useRevokeApiKey } from '@/hooks/use-api-keys';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
-import { useOrgStore } from '@/lib/org-store';
 import type { ApiKey } from '@/lib/admin-api';
+import { formatRelativeTime } from '@/lib/design';
+import { useOrgStore } from '@/lib/org-store';
 
 const KNOWN_CAPABILITY_SUBCODES: Record<string, readonly string[]> = {
   api_keys: ['read', 'issue', 'revoke'],
@@ -70,22 +72,9 @@ function expandGrantableCapabilities(capabilities: string[]): string[] {
   return Array.from(grantable).sort();
 }
 
-function formatDateTime(value: string | null): string {
-  if (!value) {
+type KeyStatus = 'active' | 'revoked' | 'expired';
 
-    return '—';
-  }
-
-  try {
-
-    return new Date(value).toLocaleString();
-  } catch {
-
-    return value;
-  }
-}
-
-function deriveStatus(key: ApiKey): 'active' | 'revoked' | 'expired' {
+function deriveStatus(key: ApiKey): KeyStatus {
   if (key.revoked_at) {
 
     return 'revoked';
@@ -103,20 +92,56 @@ function deriveStatus(key: ApiKey): 'active' | 'revoked' | 'expired' {
   return 'active';
 }
 
-const STATUS_STYLES: Record<string, string> = {
-  active: 'text-success-600 bg-success-100/60 dark:bg-success-500/15',
-  revoked: 'text-danger-600 bg-danger-100/60 dark:bg-danger-500/15',
-  expired: 'text-warning-600 bg-warning-100/60 dark:bg-warning-500/15',
+function deriveScope(key: ApiKey): string {
+  if (key.capabilities.length === 0) {
+
+    return '—';
+  }
+
+  if (key.capabilities.length === 1) {
+
+    return key.capabilities[0];
+  }
+
+  return 'multiple';
+}
+
+const STATUS_META: Record<KeyStatus, { label: string; color: string; text: string }> = {
+  active: { label: 'Active', color: '#3DD9AC', text: 'text-success' },
+  revoked: { label: 'Revoked', color: '#FB6E72', text: 'text-danger' },
+  expired: { label: 'Expired', color: '#F2B765', text: 'text-warning' },
 };
 
-function StatusBadge({ status }: { status: 'active' | 'revoked' | 'expired' }) {
+function StatusCell({ status }: { status: KeyStatus }) {
+  const meta = STATUS_META[status];
+
   return (
-    <span
-      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_STYLES[status]}`}
-    >
-      <span className='inline-block w-1.5 h-1.5 rounded-full bg-current' />
-      <span className='capitalize'>{status}</span>
+    <span className={`inline-flex items-center gap-2 text-[12px] font-medium ${meta.text}`}>
+      <PulseDot color={meta.color} size={7} pulse={status === 'active'} />
+      {meta.label}
     </span>
+  );
+}
+
+function gridColumns(canRevoke: boolean): string {
+  return canRevoke
+    ? 'minmax(0,1.2fr) minmax(0,1.3fr) minmax(0,1.1fr) minmax(0,0.8fr) minmax(0,0.8fr) auto'
+    : 'minmax(0,1.2fr) minmax(0,1.3fr) minmax(0,1.1fr) minmax(0,0.8fr) minmax(0,0.8fr)';
+}
+
+function ColumnHeader({ canRevoke }: { canRevoke: boolean }) {
+  return (
+    <div
+      className='grid items-center gap-4 border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'
+      style={{ gridTemplateColumns: gridColumns(canRevoke) }}
+    >
+      <span>Name</span>
+      <span>Key</span>
+      <span>Scope</span>
+      <span>Last used</span>
+      <span>Status</span>
+      {canRevoke && <span className='sr-only'>Actions</span>}
+    </div>
   );
 }
 
@@ -130,64 +155,41 @@ function ApiKeysTable({
   onRevoke: (key: ApiKey) => void;
 }) {
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Prefix</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Fingerprint</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Owner</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Capabilities</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Last used</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            {canRevoke && (
-              <th className='py-2 px-3 text-default-500 font-medium text-right'>
-                Actions
-              </th>
-            )}
-          </tr>
-        </thead>
-        <tbody>
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[720px]'>
+          <ColumnHeader canRevoke={canRevoke} />
           {items.map((key) => {
             const status = deriveStatus(key);
 
             return (
-              <tr key={key.id} className='border-b border-divider/50'>
-                <td className='py-2 px-3 text-foreground'>{key.name}</td>
-                <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              <div
+                key={key.id}
+                className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
+                style={{ gridTemplateColumns: gridColumns(canRevoke) }}
+              >
+                <div className='flex min-w-0 items-center gap-3'>
+                  <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
+                    <KeyRound className='h-[15px] w-[15px]' strokeWidth={1.8} />
+                  </span>
+                  <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                    {key.name}
+                  </span>
+                </div>
+                <span className='truncate font-mono text-[12px] text-default-500'>
                   {key.key_prefix}…
-                </td>
-                <td className='py-2 px-3 font-mono text-xs text-default-500'>
-                  {key.key_fingerprint}
-                </td>
-                <td className='py-2 px-3 text-default-700'>
-                  {key.owner_identity?.display_name ?? '—'}
-                </td>
-                <td className='py-2 px-3'>
-                  <ul className='flex flex-wrap gap-1'>
-                    {key.capabilities.map((capability) => (
-                      <li
-                        key={capability}
-                        className='text-xs px-1.5 py-0.5 rounded-medium bg-content2 text-foreground'
-                      >
-                        {capability}
-                      </li>
-                    ))}
-                  </ul>
-                </td>
-                <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                  {formatDateTime(key.created_at)}
-                </td>
-                <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                  {formatDateTime(key.last_used_at)}
-                </td>
-                <td className='py-2 px-3'>
-                  <StatusBadge status={status} />
-                </td>
+                </span>
+                <div className='min-w-0'>
+                  <span className='inline-block max-w-full truncate rounded-[7px] bg-primary-soft px-2 py-0.5 align-middle font-mono text-[11.5px] leading-5 text-primary-300'>
+                    {deriveScope(key)}
+                  </span>
+                </div>
+                <span className='whitespace-nowrap text-[12px] text-default-400'>
+                  {formatRelativeTime(key.last_used_at)}
+                </span>
+                <StatusCell status={status} />
                 {canRevoke && (
-                  <td className='py-2 px-3 text-right'>
+                  <div className='flex items-center justify-end'>
                     <Button
                       size='sm'
                       color='danger'
@@ -198,13 +200,46 @@ function ApiKeysTable({
                     >
                       Revoke
                     </Button>
-                  </td>
+                  </div>
                 )}
-              </tr>
+              </div>
             );
           })}
-        </tbody>
-      </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ApiKeysTableSkeleton({ canRevoke }: { canRevoke: boolean }) {
+  return (
+    <div className='surface-card overflow-hidden'>
+      <div className='overflow-x-auto'>
+        <div className='min-w-[720px]'>
+          <ColumnHeader canRevoke={canRevoke} />
+          {Array.from({ length: 6 }).map((_, index) => (
+            <div
+              key={index}
+              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 last:border-b-0'
+              style={{ gridTemplateColumns: gridColumns(canRevoke) }}
+            >
+              <div className='flex min-w-0 items-center gap-3'>
+                <span className='h-[30px] w-[30px] shrink-0 rounded-[9px] bg-content2' />
+                <span className='h-3.5 w-28 rounded-medium bg-content2' />
+              </div>
+              <span className='h-3 w-24 rounded-medium bg-content2' />
+              <span className='h-5 w-20 rounded-[7px] bg-content2' />
+              <span className='h-3 w-12 rounded-medium bg-content2' />
+              <span className='h-3 w-16 rounded-medium bg-content2' />
+              {canRevoke && (
+                <div className='flex items-center justify-end'>
+                  <span className='h-8 w-20 rounded-medium bg-content2' />
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -506,65 +541,50 @@ export default function ApiKeysPage() {
           subtitle='Provision and revoke organization API keys.'
           actions={
             canIssue ? (
-              <Button
-                color='primary'
+              <PrimaryButton
                 startContent={<Plus className='w-4 h-4' />}
                 onPress={() => setIssueOpen(true)}
                 isDisabled={!meLoaded}
               >
                 Issue key
-              </Button>
+              </PrimaryButton>
             ) : null
           }
         />
 
-        <div className='surface-card p-2'>
-          {isLoading ? (
-            <table className='w-full border-collapse text-left text-sm'>
-              <thead>
-                <tr className='border-b border-divider'>
-                  {Array.from({ length: 8 }).map((_, index) => (
-                    <th key={index} className='py-2 px-3 text-default-500 font-medium'>
-                      <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <TableRowSkeleton columns={8} />
-            </table>
-          ) : items.length === 0 ? (
-            <EmptyState
-              title='No API keys yet'
-              description='Issue a key to enable programmatic access for this organization.'
-              icon={<KeyRound className='w-6 h-6' />}
-              action={
-                canIssue ? (
-                  <Button
-                    color='primary'
-                    startContent={<Plus className='w-4 h-4' />}
-                    onPress={() => setIssueOpen(true)}
-                  >
-                    Issue key
-                  </Button>
-                ) : undefined
-              }
-            />
-          ) : (
-            <ApiKeysTable
-              items={items}
-              canRevoke={canRevoke}
-              onRevoke={setRevokeTarget}
-            />
-          )}
-        </div>
+        {isLoading ? (
+          <ApiKeysTableSkeleton canRevoke={canRevoke} />
+        ) : items.length === 0 ? (
+          <EmptyState
+            title='No API keys yet'
+            description='Issue a key to enable programmatic access for this organization.'
+            icon={<KeyRound className='w-6 h-6' />}
+            action={
+              canIssue ? (
+                <PrimaryButton
+                  startContent={<Plus className='w-4 h-4' />}
+                  onPress={() => setIssueOpen(true)}
+                >
+                  Issue key
+                </PrimaryButton>
+              ) : undefined
+            }
+          />
+        ) : (
+          <ApiKeysTable
+            items={items}
+            canRevoke={canRevoke}
+            onRevoke={setRevokeTarget}
+          />
+        )}
 
         {items.length > 0 && (
-          <div className='flex items-center justify-between text-xs text-default-500'>
+          <div className='flex items-center justify-between text-[12px] text-default-400'>
             <p>
               Showing {items.length} key{items.length === 1 ? '' : 's'}.
             </p>
             {canRevoke && (
-              <p className='flex items-center gap-1'>
+              <p className='flex items-center gap-1.5'>
                 <ShieldCheck className='w-3.5 h-3.5' />
                 Revoke is permanent and cannot be undone.
               </p>
@@ -573,7 +593,7 @@ export default function ApiKeysPage() {
         )}
 
         {keysQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
+          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
             {keysQuery.error instanceof Error
               ? keysQuery.error.message
               : 'Failed to load API keys.'}
