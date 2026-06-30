@@ -73,7 +73,7 @@ def test_session_admin_can_list_secrets_with_token_auth() -> None:
     )
 
     assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    assert response.json() == {'count': 0, 'items': []}
 
 
 @pytest.mark.django_db
@@ -89,7 +89,7 @@ def test_session_admin_can_list_policies_with_token_auth() -> None:
     )
 
     assert response.status_code == 200
-    assert isinstance(response.json(), list)
+    assert response.json() == {'count': 0, 'items': []}
 
 
 @pytest.mark.django_db
