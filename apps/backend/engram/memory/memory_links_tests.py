@@ -67,7 +67,9 @@ def test_create_and_list_memory_link() -> None:
         **auth_headers(),
     )
     assert listed.status_code == 200
-    items = listed.json()['items']
+    listed_body = listed.json()
+    assert listed_body['count'] == 1
+    items = listed_body['items']
     assert len(items) == 1
     assert items[0]['link_id'] == body['link_id']
     assert items[0]['target'] == 'apps/backend/engram/memory/services.py'

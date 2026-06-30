@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from engram.console.views.api_keys import ApiKeyViewSet
 from engram.console.views.members import MemberViewSet
 from engram.console.views.memory_review import MemoryReviewViewSet
+from engram.console.views.ops import OpsOverviewView
 from engram.console.views.organizations import OrganizationViewSet
 from engram.console.views.projects import ProjectViewSet
 from engram.console.views.roles import RoleViewSet
@@ -24,4 +25,5 @@ router.register('memory-review', MemoryReviewViewSet, basename='admin-memory-rev
 
 urlpatterns = router.urls + [
     path('search-debug/', SearchDebugView.as_view(), name='admin-search-debug'),
+    path('ops/overview', OpsOverviewView.as_view(), name='admin-ops-overview'),
 ]
