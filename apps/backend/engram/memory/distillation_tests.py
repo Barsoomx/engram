@@ -12,8 +12,10 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     Observation,
     Organization,
@@ -183,6 +185,40 @@ def create_generation_policy(organization: Organization, team: Team, project: Pr
     )
 
 
+def create_embedding_policy(organization: Organization, team: Team, project: Project) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team Embedding OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-embedding-secret',
+        hmac_digest='embedding-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
+
+
 def test_session_distillation_system_prompt_requests_json_array_and_is_runtime_neutral() -> None:
     prompt = session_distillation_system_prompt()
 
@@ -287,6 +323,24 @@ def test_distill_session_auto_promotes_high_confidence_and_holds_low_confidence(
     assert audit.target_id == str(held.id)
     assert audit.metadata['confidence'] == '0.400'
     assert audit.metadata['threshold'] == '0.800'
+
+
+@pytest.mark.django_db
+def test_distill_session_promotes_clean_candidate_through_curator_with_embeddings() -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert len(result.auto_promoted) == 1
+    memory = result.auto_promoted[0]
+    assert memory.stale is False
+    document = RetrievalDocument.objects.get(memory=memory)
+    assert len(document.embedding_vector) == 64
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+    assert AuditEvent.objects.filter(event_type='MemoryAutoRejected').count() == 0
 
 
 @pytest.mark.django_db
