@@ -570,8 +570,11 @@ class Memory(TimestampedModel):
         raise_scope_errors(errors)
 
     def save(self, *args: object, **kwargs: object) -> None:
-        if not self.kind and self.metadata.get('kind'):
-            self.kind = self.metadata['kind']
+        self.kind = self.metadata.get('kind', '') if isinstance(self.metadata, dict) else ''
+
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'metadata' in update_fields and 'kind' not in update_fields:
+            kwargs['update_fields'] = (*update_fields, 'kind')
 
         super().save(*args, **kwargs)
 

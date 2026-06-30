@@ -673,6 +673,66 @@ def test_memory_kind_defaults_to_empty_string_when_metadata_has_no_kind() -> Non
     assert memory.kind == ''
 
 
+@pytest.mark.django_db
+def test_memory_kind_update_field_save_persists_kind_column() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Digest memory',
+        body='Daily digest body.',
+        metadata={'kind': 'digest'},
+    )
+
+    memory.metadata = {'kind': 'summary'}
+    memory.save(update_fields=['metadata'])
+
+    refreshed = Memory.objects.get(pk=memory.pk)
+    assert refreshed.kind == 'summary'
+
+
+@pytest.mark.django_db
+def test_memory_kind_update_field_save_clears_kind_column() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Digest memory',
+        body='Daily digest body.',
+        metadata={'kind': 'digest'},
+    )
+
+    memory.metadata = {}
+    memory.save(update_fields=['metadata'])
+
+    refreshed = Memory.objects.get(pk=memory.pk)
+    assert refreshed.kind == ''
+
+
+@pytest.mark.django_db
+def test_memory_kind_full_save_mirrors_changed_metadata_kind() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Digest memory',
+        body='Daily digest body.',
+        metadata={'kind': 'digest'},
+    )
+
+    memory.metadata = {'kind': 'summary'}
+    memory.save()
+
+    refreshed = Memory.objects.get(pk=memory.pk)
+    assert refreshed.kind == 'summary'
+
+
 def index_field_sets(model: type) -> set[tuple[str, ...]]:
     return {tuple(index.fields) for index in model._meta.indexes}
 
