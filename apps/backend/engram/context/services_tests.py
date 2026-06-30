@@ -1,8 +1,28 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-from engram.context.services import RetrievalMatch, _pack_to_budget, estimate_tokens
+import pytest
+
+from engram.context.services import (
+    RetrievalMatch,
+    _pack_to_budget,
+    _semantic_retrieval_matches_python,
+    estimate_tokens,
+    semantic_retrieval_matches,
+    semantic_retrieval_matches_pgvector,
+)
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Organization,
+    Project,
+    RetrievalDocument,
+    VectorField,
+)
+from engram.model_policy.services import generated_embedding
 
 
 @dataclass
@@ -149,3 +169,297 @@ def test_pack_to_budget_two_fit_three_dropped() -> None:
     assert kept[0] is matches[0]
     assert kept[1] is matches[1]
     assert dropped[0] is matches[2]
+
+
+# semantic_retrieval_matches_pgvector
+
+
+pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
+
+
+def _basis_vector(index: int) -> list[float]:
+    vector = [0.0] * 64
+    vector[index] = 1.0
+
+    return vector
+
+
+def _blend_vector(primary: int, secondary: int, weight: float) -> list[float]:
+    vector = [0.0] * 64
+    vector[primary] = 1.0
+    vector[secondary] = weight
+    norm = math.sqrt(1.0 + weight * weight)
+
+    return [component / norm for component in vector]
+
+
+def _seed_document(
+    organization: Organization,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+    embedding: list[float],
+    sequence: int,
+    with_pgvector: bool = True,
+) -> RetrievalDocument:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=f'hash-{sequence}',
+    )
+    document = RetrievalDocument(
+        organization=organization,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        full_text=f'{title}\n\n{body}',
+        embedding_vector=embedding,
+    )
+    if with_pgvector and VectorField is not None:
+        document.embedding_pgvector = embedding
+    document.save()
+
+    return document
+
+
+@pytest.fixture
+def f_scope() -> tuple[Organization, Project]:
+    organization = Organization.objects.create(name='Engram', slug='engram')
+    project = Project.objects.create(organization=organization, name='Backend', slug='backend')
+
+    return organization, project
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_pgvector_returns_matches_in_descending_similarity(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    near = _seed_document(
+        organization,
+        project,
+        title='near',
+        body='near',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    mid = _seed_document(
+        organization,
+        project,
+        title='mid',
+        body='mid',
+        embedding=_blend_vector(0, 1, 0.75),
+        sequence=2,
+    )
+    low = _seed_document(
+        organization,
+        project,
+        title='low',
+        body='low',
+        embedding=_blend_vector(0, 1, math.sqrt(3.0)),
+        sequence=3,
+    )
+    documents = (mid, low, near)
+
+    matches = semantic_retrieval_matches_pgvector(documents, [], query_vector)
+
+    assert [match.document.id for match in matches] == [near.id, mid.id, low.id]
+    assert [match.inclusion_reason for match in matches] == [
+        'semantic match: cosine 1.00',
+        'semantic match: cosine 0.80',
+        'semantic match: cosine 0.50',
+    ]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_pgvector_excludes_documents_below_floor(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    above = _seed_document(
+        organization,
+        project,
+        title='above',
+        body='above',
+        embedding=_blend_vector(0, 1, 0.75),
+        sequence=1,
+    )
+    below = _seed_document(
+        organization,
+        project,
+        title='below',
+        body='below',
+        embedding=_blend_vector(0, 1, math.sqrt(24.0)),
+        sequence=2,
+    )
+    orthogonal = _seed_document(
+        organization,
+        project,
+        title='orthogonal',
+        body='orthogonal',
+        embedding=_basis_vector(1),
+        sequence=3,
+    )
+
+    matches = semantic_retrieval_matches_pgvector((above, below, orthogonal), [], query_vector)
+
+    assert [match.document.id for match in matches] == [above.id]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_pgvector_excludes_already_matched(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    first = _seed_document(
+        organization,
+        project,
+        title='first',
+        body='first',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    second = _seed_document(
+        organization,
+        project,
+        title='second',
+        body='second',
+        embedding=_blend_vector(0, 1, 0.75),
+        sequence=2,
+    )
+    exact = [
+        RetrievalMatch(document=first, score=100, matched_terms=(), inclusion_reason='exact match: first'),
+    ]
+
+    matches = semantic_retrieval_matches_pgvector((first, second), exact, query_vector)
+
+    assert [match.document.id for match in matches] == [second.id]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_pgvector_preserves_tie_break_input_order(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    left = _seed_document(
+        organization,
+        project,
+        title='left',
+        body='left',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    right = _seed_document(
+        organization,
+        project,
+        title='right',
+        body='right',
+        embedding=_basis_vector(0),
+        sequence=2,
+    )
+
+    forward = semantic_retrieval_matches_pgvector((left, right), [], query_vector)
+    reverse = semantic_retrieval_matches_pgvector((right, left), [], query_vector)
+
+    assert [match.document.id for match in forward] == [left.id, right.id]
+    assert [match.document.id for match in reverse] == [right.id, left.id]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_pgvector_and_python_paths_are_identical(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = generated_embedding('authorization before ranking protects context bundles')
+    seeds = [
+        ('Authorization before ranking', 'Authorization before ranking protects context bundles.'),
+        ('Ranking pipeline', 'Ranking pipeline orders authorized retrieval documents deterministically.'),
+        ('Token budget packing', 'Token budget packing trims lower ranked context bundle items.'),
+        ('Provider secret rotation', 'Provider secret rotation narrows api key scope for tenants.'),
+        ('Unrelated cooking note', 'A recipe for sourdough bread with rye flour and water.'),
+    ]
+    documents = tuple(
+        _seed_document(
+            organization,
+            project,
+            title=title,
+            body=body,
+            embedding=generated_embedding(f'{title}\n\n{body}'),
+            sequence=index,
+        )
+        for index, (title, body) in enumerate(seeds)
+    )
+
+    pgvector_matches = semantic_retrieval_matches_pgvector(documents, [], query_vector)
+    python_matches = _semantic_retrieval_matches_python(documents, [], query_vector)
+
+    assert [match.document.id for match in pgvector_matches] == [match.document.id for match in python_matches]
+    assert [match.inclusion_reason for match in pgvector_matches] == [
+        match.inclusion_reason for match in python_matches
+    ]
+    assert [match.matched_terms for match in pgvector_matches] == [match.matched_terms for match in python_matches]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_dispatcher_uses_pgvector_when_column_populated(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    document = _seed_document(
+        organization,
+        project,
+        title='near',
+        body='near',
+        embedding=_basis_vector(0),
+        sequence=1,
+        with_pgvector=True,
+    )
+
+    matches = semantic_retrieval_matches((document,), [], query_vector)
+
+    assert [match.document.id for match in matches] == [document.id]
+
+
+@pytest.mark.django_db
+def test_dispatcher_falls_back_to_python_without_pgvector_column(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    query_vector = _basis_vector(0)
+    document = _seed_document(
+        organization,
+        project,
+        title='near',
+        body='near',
+        embedding=_basis_vector(0),
+        sequence=1,
+        with_pgvector=False,
+    )
+    assert document.embedding_pgvector is None if VectorField is not None else True
+
+    matches = semantic_retrieval_matches((document,), [], query_vector)
+
+    assert [match.document.id for match in matches] == [document.id]
+    assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'

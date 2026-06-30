@@ -24,6 +24,7 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
     Team,
+    VectorField,
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
@@ -36,6 +37,11 @@ from engram.model_policy.services import (
     ResolveModelPolicyInput,
     get_provider_gateway,
 )
+
+try:
+    from pgvector.django import CosineDistance
+except ImportError:
+    CosineDistance = None
 
 logger = structlog.get_logger(__name__)
 
@@ -333,7 +339,10 @@ def score_retrieval_document(
     return None
 
 
-def semantic_retrieval_matches(
+PGVECTOR_FLOOR_DISTANCE_EPSILON = 1e-6
+
+
+def _semantic_retrieval_matches_python(
     documents: tuple[RetrievalDocument, ...],
     exact_matches: list[RetrievalMatch],
     query_vector: list[float],
@@ -360,6 +369,53 @@ def semantic_retrieval_matches(
     scored.sort(key=lambda item: -item[0])
 
     return [match for _similarity, match in scored]
+
+
+def semantic_retrieval_matches_pgvector(
+    documents: tuple[RetrievalDocument, ...],
+    exact_matches: list[RetrievalMatch],
+    query_vector: list[float],
+) -> list[RetrievalMatch]:
+    already_matched = {match.document.id for match in exact_matches}
+    pgvector_ids = [
+        document.id
+        for document in documents
+        if document.id not in already_matched and document.embedding_vector and document.embedding_pgvector is not None
+    ]
+    passing_ids: set[uuid.UUID] = set()
+    if pgvector_ids and CosineDistance is not None and any(query_vector):
+        max_distance = (1 - SEMANTIC_MIN_SIMILARITY) + PGVECTOR_FLOOR_DISTANCE_EPSILON
+        passing_ids = set(
+            RetrievalDocument.objects.filter(id__in=pgvector_ids)
+            .annotate(distance=CosineDistance('embedding_pgvector', query_vector))
+            .filter(distance__lte=max_distance)
+            .values_list('id', flat=True),
+        )
+
+    candidates = tuple(
+        document for document in documents if document.embedding_pgvector is None or document.id in passing_ids
+    )
+
+    return _semantic_retrieval_matches_python(candidates, exact_matches, query_vector)
+
+
+def semantic_retrieval_matches(
+    documents: tuple[RetrievalDocument, ...],
+    exact_matches: list[RetrievalMatch],
+    query_vector: list[float],
+) -> list[RetrievalMatch]:
+    already_matched = {match.document.id for match in exact_matches}
+    use_pgvector = (
+        VectorField is not None
+        and CosineDistance is not None
+        and any(
+            document.id not in already_matched and document.embedding_pgvector is not None for document in documents
+        )
+    )
+    if use_pgvector:
+        return semantic_retrieval_matches_pgvector(documents, exact_matches, query_vector)
+
+    return _semantic_retrieval_matches_python(documents, exact_matches, query_vector)
 
 
 def resolve_query_embedding(
@@ -502,7 +558,11 @@ class IndexMemoryVersion:
 
         document.embedding_vector = list(result.embedding)
         document.embedding_reference = f'provider:{result.call_record_id}'
-        document.save(update_fields=['embedding_vector', 'embedding_reference', 'updated_at'])
+        update_fields = ['embedding_vector', 'embedding_reference', 'updated_at']
+        if VectorField is not None:
+            document.embedding_pgvector = list(result.embedding)
+            update_fields.append('embedding_pgvector')
+        document.save(update_fields=update_fields)
 
 
 class BuildContextBundle:
