@@ -62,7 +62,18 @@ class InspectionBaseView(APIView):
         )
         project = Project.objects.get(organization_id=scope.organization_id, id=data['project_id'])
 
-        return InspectionScope(project=project, scope=scope)
+        return InspectionScope(
+            project=project,
+            scope=scope,
+            limit=data.get('limit', 50),
+            offset=data.get('offset', 0),
+            status=data.get('status') or None,
+            kind=data.get('kind') or None,
+            event_type=data.get('event_type') or None,
+            correlation_id=data.get('correlation_id') or None,
+            since=data.get('since'),
+            until=data.get('until'),
+        )
 
 
 class MemoryInspectionListView(InspectionBaseView):
@@ -72,13 +83,16 @@ class MemoryInspectionListView(InspectionBaseView):
     def get(self, request: Request) -> Response:
         try:
             inspection_scope = self._inspection_scope(request, 'list')
-            memories = ListInspectionMemories().execute(inspection_scope)
+            qs = ListInspectionMemories().execute(inspection_scope)
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        items = [memory_response(memory, include_detail=False) for memory in memories]
+        total = qs.count()
+        limit = inspection_scope.limit
+        offset = inspection_scope.offset
+        items = [memory_response(memory, include_detail=False) for memory in qs[offset : offset + limit]]
 
-        return Response({'count': len(items), 'items': items})
+        return Response({'count': total, 'items': items})
 
 
 class MemoryInspectionCountView(InspectionBaseView):
@@ -117,13 +131,17 @@ class ContextBundleInspectionListView(InspectionBaseView):
 
     def get(self, request: Request) -> Response:
         try:
-            bundles = ListInspectionContextBundles().execute(self._inspection_scope(request, 'list'))
+            inspection_scope = self._inspection_scope(request, 'list')
+            qs = ListInspectionContextBundles().execute(inspection_scope)
         except AccessDeniedError as error:
             return access_error_response(error)
 
-        items = [context_bundle_response(bundle, include_detail=False) for bundle in bundles]
+        total = qs.count()
+        limit = inspection_scope.limit
+        offset = inspection_scope.offset
+        items = [context_bundle_response(bundle, include_detail=False) for bundle in qs[offset : offset + limit]]
 
-        return Response({'count': len(items), 'items': items})
+        return Response({'count': total, 'items': items})
 
 
 class ContextBundleInspectionDetailView(InspectionBaseView):
@@ -148,10 +166,14 @@ class AuditEventInspectionListView(InspectionBaseView):
     def get(self, request: Request) -> Response:
         try:
             inspection_scope = self._inspection_scope(request, 'list')
-            audit_events = list(ListInspectionAuditEvents().execute(inspection_scope))
+            qs = ListInspectionAuditEvents().execute(inspection_scope)
         except AccessDeniedError as error:
             return access_error_response(error)
 
+        total = qs.count()
+        limit = inspection_scope.limit
+        offset = inspection_scope.offset
+        audit_events = list(qs[offset : offset + limit])
         org_id = inspection_scope.scope.organization_id
         actor_name_map = _batch_resolve_actor_names(audit_events, org_id)
         target_name_map = _batch_resolve_target_names(audit_events, org_id)
@@ -161,7 +183,27 @@ class AuditEventInspectionListView(InspectionBaseView):
             for ae in audit_events
         ]
 
-        return Response({'count': len(items), 'items': items})
+        return Response({'count': total, 'items': items})
+
+
+class AuditEventInspectionDetailView(InspectionBaseView):
+    required_capability = 'audit:read'
+    target_type = 'audit_event'
+
+    def get(self, request: Request, audit_event_id: uuid.UUID) -> Response:
+        try:
+            inspection_scope = self._inspection_scope(request, str(audit_event_id))
+            ae = ListInspectionAuditEvents().detail(inspection_scope, audit_event_id)
+        except AccessDeniedError as error:
+            return access_error_response(error)
+        except InspectionNotFoundError as error:
+            return not_found_response(error)
+
+        org_id = inspection_scope.scope.organization_id
+        actor_name_map = _batch_resolve_actor_names([ae], org_id)
+        target_name_map = _batch_resolve_target_names([ae], org_id)
+
+        return Response(audit_event_response(ae, actor_name_map=actor_name_map, target_name_map=target_name_map))
 
 
 def not_found_response(error: InspectionNotFoundError) -> Response:
