@@ -75,6 +75,17 @@ export function apiClient(): AxiosInstance {
     instance.defaults.headers.common[ORG_HEADER] = activeOrgId;
   }
 
+  instance.interceptors.request.use((config) => {
+    const params = config.params as Record<string, unknown> | undefined;
+
+    if (params && params.pageSize !== undefined) {
+      const { pageSize, ...rest } = params;
+      config.params = { ...rest, page_size: pageSize };
+    }
+
+    return config;
+  });
+
   return instance;
 }
 
