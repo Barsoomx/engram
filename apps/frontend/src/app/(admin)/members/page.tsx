@@ -3,6 +3,7 @@
 import {
   addToast,
   Button,
+  Chip,
   Input,
   Modal,
   ModalBody,
@@ -29,7 +30,6 @@ import { CapabilityGate } from '@/components/ui/capability-gate';
 import { InitialTile } from '@/components/ui/initial-tile';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
-import { PulseDot } from '@/components/ui/pulse-dot';
 import {
   useDeactivateMember,
   useInviteMember,
@@ -42,6 +42,7 @@ import type {
   Member,
   MemberInviteInput,
   MemberRoleInput,
+  MembershipStatus,
   Role,
 } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
@@ -136,6 +137,32 @@ function rolePillClass(role: string): string {
   return 'bg-content3 text-default-500';
 }
 
+function statusChipColor(
+  status: MembershipStatus,
+): 'success' | 'warning' | 'danger' {
+  if (status === 'active') {
+    return 'success';
+  }
+
+  if (status === 'invited') {
+    return 'warning';
+  }
+
+  return 'danger';
+}
+
+function statusLabel(status: MembershipStatus): string {
+  if (status === 'active') {
+    return 'Active';
+  }
+
+  if (status === 'invited') {
+    return 'Invited';
+  }
+
+  return 'Suspended';
+}
+
 function gridColumns(canAdmin: boolean): string {
   return canAdmin
     ? 'minmax(0,2fr) minmax(0,1fr) minmax(0,1fr) auto'
@@ -199,17 +226,23 @@ function MembersTable({
                 <span
                   className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${rolePillClass(member.role)}`}
                 >
-                  {roleNames.get(member.role) ?? humanizeRole(member.role)}
+                  {member.role_name ?? roleNames.get(member.role) ?? humanizeRole(member.role)}
                 </span>
               </div>
-              <div className='flex items-center gap-2'>
-                <PulseDot
-                  color={member.active ? '#3DD9AC' : '#666C77'}
-                  pulse={member.active}
-                />
-                <span className='text-[12px] text-default-500'>
-                  {member.active ? 'Active' : 'Inactive'}
-                </span>
+              <div>
+                {member.status ? (
+                  <Chip
+                    size='sm'
+                    variant='flat'
+                    color={statusChipColor(member.status)}
+                  >
+                    {statusLabel(member.status)}
+                  </Chip>
+                ) : (
+                  <span className='text-[12px] text-default-500'>
+                    {member.active ? 'Active' : 'Inactive'}
+                  </span>
+                )}
               </div>
               {canAdmin && (
                 <div className='flex items-center justify-end gap-2'>

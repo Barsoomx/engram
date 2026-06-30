@@ -51,6 +51,12 @@ type RetrievalDocument = {
   created_at: string | null;
 };
 
+type BackendRelated = {
+  id: string;
+  title: string;
+  link_type: string;
+};
+
 type MemoryDetail = {
   id: string;
   project_id: string;
@@ -61,6 +67,7 @@ type MemoryDetail = {
   visibility_scope: string;
   current_version: number;
   confidence: string | null;
+  confidence_percent?: number | null;
   stale: boolean;
   refuted: boolean;
   metadata: Record<string, unknown> | null;
@@ -68,6 +75,14 @@ type MemoryDetail = {
   updated_at: string | null;
   versions: MemoryVersion[];
   retrieval_documents: RetrievalDocument[];
+  kind?: string | null;
+  tags?: string[];
+  file_paths?: string[];
+  captured_by?: unknown;
+  project_name?: string;
+  project_slug?: string;
+  authorized_for_injection?: boolean;
+  related?: BackendRelated[];
 };
 
 type RelatedItem = {
@@ -125,6 +140,14 @@ function parseConfidence(value: string | null): number | null {
 }
 
 function buildRelated(data: MemoryDetail): RelatedItem[] {
+  if (data.related && data.related.length > 0) {
+    return data.related.map((item) => ({
+      key: item.id,
+      title: item.title,
+      mono: false,
+    }));
+  }
+
   if (data.retrieval_documents.length > 0) {
     return data.retrieval_documents.map((doc) => ({
       key: doc.id,
@@ -621,17 +644,18 @@ function MemoryDetailContent({
   canReview: boolean;
 }) {
   const meta = data.metadata;
-  const kind = resolveKind(metaString(meta, 'kind'));
-  const source = metaString(meta, 'source') ?? '—';
+  const kind = resolveKind(data.kind ?? metaString(meta, 'kind'));
+  const source = data.file_paths?.[0] ?? metaString(meta, 'source') ?? '—';
   const capturedBy =
+    (typeof data.captured_by === 'string' && data.captured_by.trim() ? data.captured_by.trim() : null) ??
     metaString(meta, 'captured_by') ??
     metaString(meta, 'agent') ??
     metaString(meta, 'author') ??
     '—';
   const projectName =
-    metaString(meta, 'project') ?? metaString(meta, 'project_slug') ?? data.project_id;
-  const confidencePct = parseConfidence(data.confidence);
-  const authorized = data.status === 'active' && !data.refuted && !data.stale;
+    data.project_name ?? data.project_slug ?? metaString(meta, 'project') ?? metaString(meta, 'project_slug') ?? data.project_id;
+  const confidencePct = data.confidence_percent ?? parseConfidence(data.confidence);
+  const authorized = data.authorized_for_injection ?? (data.status === 'active' && !data.refuted && !data.stale);
   const chip = authorized
     ? { text: 'Authorized for injection', color: 'text-success', bg: 'rgba(61,217,172,0.13)', icon: true }
     : data.refuted

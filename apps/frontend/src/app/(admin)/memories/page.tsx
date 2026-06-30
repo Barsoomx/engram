@@ -33,11 +33,19 @@ type MemoryItem = {
   visibility_scope: string;
   current_version: number;
   confidence: string | null;
+  confidence_percent?: number | null;
   stale: boolean;
   refuted: boolean;
   created_at: string | null;
   updated_at: string | null;
   metadata?: MemoryMetadata | null;
+  kind?: string | null;
+  tags?: string[];
+  file_paths?: string[];
+  captured_by?: unknown;
+  project_name?: string;
+  project_slug?: string;
+  authorized_for_injection?: boolean;
 };
 
 type MemoriesResponse = {
@@ -78,11 +86,11 @@ function MemoryCard({
   memory: MemoryItem;
   projectLabel: string;
 }) {
-  const kind = resolveKind(memory.metadata?.kind);
-  const source = memory.metadata?.source ?? '—';
+  const kind = resolveKind(memory.kind ?? memory.metadata?.kind);
+  const source = memory.file_paths?.[0] ?? memory.metadata?.source ?? '—';
   const agent = memory.metadata?.agent ?? null;
-  const project = memory.metadata?.project ?? projectLabel;
-  const pct = confidencePct(memory.confidence);
+  const project = memory.project_name ?? memory.project_slug ?? memory.metadata?.project ?? projectLabel;
+  const pct = memory.confidence_percent ?? confidencePct(memory.confidence);
 
   return (
     <Link
@@ -176,7 +184,7 @@ export default function MemoriesPage() {
     const q = search.trim().toLowerCase();
 
     return items.filter((memory) => {
-      if (kindFilter !== 'all' && resolveKind(memory.metadata?.kind) !== kindFilter) {
+      if (kindFilter !== 'all' && resolveKind(memory.kind ?? memory.metadata?.kind) !== kindFilter) {
         return false;
       }
 

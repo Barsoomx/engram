@@ -18,6 +18,29 @@ import { useOrganizations } from '@/hooks/use-organizations';
 import { useOrgStore } from '@/lib/org-store';
 import { useSwitcherStore } from '@/lib/switcher-store';
 
+function formatOrgMeta(
+  viewer_role: string | null | undefined,
+  member_count: number | null | undefined,
+  slug: string,
+): string {
+  if (viewer_role == null && member_count == null) {
+    return slug;
+  }
+
+  const parts: string[] = [];
+
+  if (viewer_role != null) {
+    const humanized = viewer_role.replace(/^organization_/, '').replace(/_/g, ' ');
+    parts.push(humanized.charAt(0).toUpperCase() + humanized.slice(1));
+  }
+
+  if (member_count != null) {
+    parts.push(`${member_count} ${member_count === 1 ? 'member' : 'members'}`);
+  }
+
+  return parts.length > 0 ? parts.join(' · ') : slug;
+}
+
 export interface OrgSwitcherProps {
   orgId: string | null;
 }
@@ -84,7 +107,7 @@ export function OrgSwitcher({ orgId }: OrgSwitcherProps) {
                     {org.name}
                   </div>
                   <div className='truncate font-mono text-[11px] text-default-400'>
-                    {org.slug}
+                    {formatOrgMeta(org.viewer_role, org.member_count, org.slug)}
                   </div>
                 </div>
               </MenuRow>

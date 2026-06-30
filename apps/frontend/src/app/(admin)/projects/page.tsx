@@ -95,7 +95,7 @@ function ProjectsTable({
                 {project.repository_url || '—'}
               </span>
               <span className='tnum font-mono text-[12px] text-default-400'>
-                —
+                {project.memory_count != null ? project.memory_count.toLocaleString() : '—'}
               </span>
               <span className='whitespace-nowrap text-[12px] text-default-400'>
                 {formatRelativeTime(project.updated_at)}

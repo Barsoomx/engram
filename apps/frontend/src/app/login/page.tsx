@@ -120,16 +120,20 @@ export default function LoginPage() {
             <span className='h-px flex-1 bg-divider-strong' />
           </div>
 
-          <Button
-            className='h-11 w-full rounded-[11px] border-divider-strong bg-content1 text-[13.5px] font-medium text-default-700 data-[hover=true]:bg-content2'
-            disableRipple
-            fullWidth
-            startContent={<Github size={17} strokeWidth={1.8} />}
-            type='button'
-            variant='bordered'
-          >
-            Continue with GitHub
-          </Button>
+          <div className='flex flex-col items-center gap-1.5'>
+            <Button
+              className='h-11 w-full rounded-[11px] border-divider-strong bg-content1 text-[13.5px] font-medium text-default-700 data-[hover=true]:bg-content2'
+              disableRipple
+              fullWidth
+              isDisabled
+              startContent={<Github size={17} strokeWidth={1.8} />}
+              type='button'
+              variant='bordered'
+            >
+              Continue with GitHub
+            </Button>
+            <span className='text-[11.5px] text-default-400'>SSO coming soon</span>
+          </div>
         </div>
 
         <p className='mt-6 text-center text-[12px] text-default-400'>

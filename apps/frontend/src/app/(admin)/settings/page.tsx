@@ -18,8 +18,17 @@ import * as React from 'react';
 
 import { PageHeader } from '@/components/ui/page-header';
 import { PulseDot } from '@/components/ui/pulse-dot';
+import { useOrganizations } from '@/hooks/use-organizations';
+import {
+  useEmbeddingSettings,
+  usePurgeOrganizationMemory,
+  useRetrievalSettings,
+  useUpdateRetrievalSettings,
+} from '@/hooks/use-settings';
 import { apiClient, clearToken, fetchMe, logout, type MeResponse } from '@/lib/auth';
+import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
+import type { PurgeResult, RetrievalSettings } from '@/lib/settings-api';
 import { useTeamStore } from '@/lib/team-store';
 
 const API_URL = process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000';
@@ -128,14 +137,16 @@ function FauxField({ label, value }: { label: string; value: string }) {
 function Toggle({
   label,
   description,
-  defaultOn,
+  checked,
+  onChange,
+  disabled = false,
 }: {
   label: string;
   description: string;
-  defaultOn: boolean;
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  disabled?: boolean;
 }) {
-  const [on, setOn] = React.useState(defaultOn);
-
   return (
     <div className='flex items-center justify-between gap-4 py-3'>
       <div className='min-w-0'>
@@ -145,18 +156,20 @@ function Toggle({
       <button
         type='button'
         role='switch'
-        aria-checked={on}
+        aria-checked={checked}
         aria-label={label}
-        onClick={() => setOn((value) => !value)}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
         className={clsx(
           'relative h-6 w-[42px] shrink-0 rounded-full transition-colors duration-150',
-          on ? 'bg-primary' : 'bg-content3',
+          checked ? 'bg-primary' : 'bg-content3',
+          disabled && 'cursor-not-allowed opacity-60',
         )}
       >
         <span
           className={clsx(
             'absolute top-1/2 h-[18px] w-[18px] -translate-y-1/2 rounded-full bg-white shadow-sm transition-all duration-150',
-            on ? 'left-[21px]' : 'left-[3px]',
+            checked ? 'left-[21px]' : 'left-[3px]',
           )}
         />
       </button>
@@ -166,6 +179,7 @@ function Toggle({
 
 export default function SettingsPage() {
   const router = useRouter();
+  const activeOrgId = useOrgStore((s) => s.activeOrgId);
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
 
@@ -181,7 +195,43 @@ export default function SettingsPage() {
     refetchInterval: 30000,
   });
 
+  const orgsQuery = useOrganizations(activeOrgId);
+  const embeddingQuery = useEmbeddingSettings(activeOrgId);
+  const retrievalQuery = useRetrievalSettings(activeOrgId);
+  const retrievalMutation = useUpdateRetrievalSettings(activeOrgId);
+  const purgeMutation = usePurgeOrganizationMemory(activeOrgId);
+
   const [loggingOut, setLoggingOut] = React.useState(false);
+  const [purgeOpen, setPurgeOpen] = React.useState(false);
+  const [purgeConfirm, setPurgeConfirm] = React.useState('');
+  const [purgeResult, setPurgeResult] = React.useState<PurgeResult['deleted'] | null>(null);
+
+  const activeOrg = orgsQuery.data?.results.find((org) => org.id === activeOrgId);
+  const orgSlug = activeOrg?.slug ?? '';
+
+  const embedding = embeddingQuery.data;
+  const retrieval = retrievalQuery.data;
+
+  const handleRetrievalToggle = React.useCallback(
+    (key: keyof RetrievalSettings, next: boolean) => {
+      if (!retrieval) {
+        return;
+      }
+
+      retrievalMutation.mutate({ ...retrieval, [key]: next });
+    },
+    [retrieval, retrievalMutation],
+  );
+
+  const handlePurge = React.useCallback(() => {
+    purgeMutation.mutate(purgeConfirm, {
+      onSuccess: (data) => {
+        setPurgeResult(data.deleted);
+        setPurgeOpen(false);
+        setPurgeConfirm('');
+      },
+    });
+  }, [purgeConfirm, purgeMutation]);
 
   const handleLogout = React.useCallback(async () => {
     setLoggingOut(true);
@@ -305,11 +355,17 @@ export default function SettingsPage() {
           description='Embedding provider used to index and retrieve memories.'
         >
           <div className='grid gap-3 sm:grid-cols-2'>
-            <FauxField label='Provider' value='Anthropic' />
-            <FauxField label='Model' value='claude-embed-v3' />
+            <FauxField
+              label='Provider'
+              value={embeddingQuery.isLoading ? '…' : embedding?.provider ?? 'Not configured'}
+            />
+            <FauxField
+              label='Model'
+              value={embeddingQuery.isLoading ? '…' : embedding?.model ?? 'Not configured'}
+            />
           </div>
           <p className='mt-3 text-[11.5px] text-default-400'>
-            Preview · not yet configurable from the console.
+            Read-only · configure providers in Model policies.
           </p>
         </SettingsCard>
 
@@ -322,15 +378,27 @@ export default function SettingsPage() {
             <Toggle
               label='Hybrid retrieval'
               description='Combine vector similarity with keyword search.'
-              defaultOn
+              checked={retrieval?.hybrid_retrieval_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('hybrid_retrieval_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
             />
             <Toggle
               label='Require provenance'
               description='Only inject memories with a verified source.'
-              defaultOn
+              checked={retrieval?.require_provenance ?? false}
+              onChange={(next) => handleRetrievalToggle('require_provenance', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
             />
           </div>
-          <p className='mt-3 text-[11.5px] text-default-400'>Preview · not yet persisted.</p>
+          <p className='mt-3 text-[11.5px] text-default-400'>
+            {retrievalQuery.isLoading
+              ? 'Loading…'
+              : retrievalQuery.isError
+                ? 'Unavailable · requires organization admin.'
+                : retrievalMutation.isPending
+                  ? 'Saving…'
+                  : 'Changes are saved automatically.'}
+          </p>
         </SettingsCard>
 
         <SettingsCard
@@ -353,7 +421,7 @@ export default function SettingsPage() {
       </div>
 
       <div className='rounded-[16px] border border-danger/25 bg-danger/[0.04] p-[22px]'>
-        <div className='flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between'>
+        <div className='flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between'>
           <div className='flex items-start gap-3'>
             <div className='flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] bg-danger/10 text-danger'>
               <AlertTriangle size={17} strokeWidth={1.8} />
@@ -366,18 +434,71 @@ export default function SettingsPage() {
               <p className='text-[12.5px] leading-relaxed text-default-500'>
                 Permanently delete every captured memory for this organization. This cannot be undone.
               </p>
-              <p className='text-[11.5px] text-default-400'>Preview · not yet wired.</p>
             </div>
           </div>
-          <button
-            type='button'
-            disabled
-            title='Not yet available from the console'
-            className='inline-flex h-10 shrink-0 cursor-not-allowed items-center justify-center rounded-[11px] border border-danger/40 px-4 text-[13.5px] font-medium text-danger opacity-50'
-          >
-            Purge…
-          </button>
+          {!purgeOpen && (
+            <button
+              type='button'
+              onClick={() => {
+                setPurgeResult(null);
+                setPurgeOpen(true);
+              }}
+              disabled={!orgSlug}
+              className='inline-flex h-10 shrink-0 items-center justify-center rounded-[11px] border border-danger/40 px-4 text-[13.5px] font-medium text-danger transition-colors hover:bg-danger/10 disabled:cursor-not-allowed disabled:opacity-50'
+            >
+              Purge…
+            </button>
+          )}
         </div>
+
+        {purgeOpen && (
+          <div className='mt-4 space-y-3 rounded-[12px] border border-danger/30 bg-danger/[0.05] p-4'>
+            <p className='text-[12.5px] text-default-500'>
+              Type <span className='font-mono text-danger'>{orgSlug}</span> to confirm.
+            </p>
+            <input
+              autoFocus
+              value={purgeConfirm}
+              onChange={(event) => setPurgeConfirm(event.target.value)}
+              placeholder={orgSlug}
+              className='h-10 w-full rounded-[10px] border border-divider-strong bg-content2 px-3 font-mono text-[13px] text-foreground outline-none transition-colors focus:border-danger/60'
+            />
+            {purgeMutation.isError && (
+              <p className='text-[12px] text-danger'>
+                {purgeMutation.error instanceof Error ? purgeMutation.error.message : 'Purge failed.'}
+              </p>
+            )}
+            <div className='flex items-center gap-2'>
+              <button
+                type='button'
+                onClick={handlePurge}
+                disabled={purgeConfirm !== orgSlug || !orgSlug || purgeMutation.isPending}
+                className='inline-flex h-10 items-center justify-center rounded-[11px] bg-danger px-4 text-[13.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50'
+              >
+                {purgeMutation.isPending ? 'Purging…' : 'Purge permanently'}
+              </button>
+              <button
+                type='button'
+                onClick={() => {
+                  setPurgeOpen(false);
+                  setPurgeConfirm('');
+                }}
+                disabled={purgeMutation.isPending}
+                className='inline-flex h-10 items-center justify-center rounded-[11px] border border-divider px-4 text-[13.5px] font-medium text-default-600 transition-colors hover:bg-content2'
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
+
+        {purgeResult && (
+          <div className='mt-4 rounded-[12px] border border-success/30 bg-success/[0.06] p-3 text-[12.5px] text-success'>
+            Purged {purgeResult.memories.toLocaleString()} memories,{' '}
+            {purgeResult.memory_candidates.toLocaleString()} candidates, and{' '}
+            {purgeResult.retrieval_documents.toLocaleString()} retrieval documents.
+          </div>
+        )}
       </div>
     </section>
   );
