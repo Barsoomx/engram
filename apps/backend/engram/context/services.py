@@ -196,6 +196,41 @@ def redact_text(value: object) -> str:
     return str(redact_value(value).value)
 
 
+def estimate_tokens(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def _pack_to_budget(
+    matches: tuple[RetrievalMatch, ...],
+    token_budget: int | None,
+    limit: int,
+) -> tuple[tuple[RetrievalMatch, ...], tuple[RetrievalMatch, ...]]:
+    if token_budget is None:
+        return matches[:limit], matches[limit:]
+
+    kept: list[RetrievalMatch] = []
+    dropped: list[RetrievalMatch] = []
+    tokens_used = 0
+
+    for match in matches:
+        if len(kept) >= limit:
+            dropped.append(match)
+            continue
+
+        memory = match.document.memory
+        index = len(kept) + 1
+        block = f'- [M{index}] {redact_text(memory.title)}\n  {redact_text(memory.body)}'
+        cost = estimate_tokens(block)
+
+        if not kept or tokens_used + cost <= token_budget:
+            kept.append(match)
+            tokens_used += cost
+        else:
+            dropped.append(match)
+
+    return tuple(kept), tuple(dropped)
+
+
 SEMANTIC_MIN_SIMILARITY = 0.3
 
 
@@ -502,12 +537,20 @@ class BuildContextBundle:
             project,
             team,
         )
+        kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
+        tokens_used = sum(
+            estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
+            for i, m in enumerate(kept, start=1)
+        )
         query_result = redact_value(data.query)
-        metadata = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
+        metadata: dict[str, object] = {'retrieval_strategy': 'semantic_fallback' if has_semantic else 'exact'}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
         if has_semantic and embedding_result is not None:
             metadata['semantic_provider_call_id'] = str(embedding_result.call_record_id)
+        metadata['token_budget'] = data.token_budget
+        metadata['tokens_used'] = tokens_used
+        metadata['dropped_for_budget'] = len(budget_dropped)
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -521,10 +564,10 @@ class BuildContextBundle:
                 query_text=str(query_result.value),
                 authorization_scope=self._authorization_scope(scope),
                 token_budget=data.token_budget,
-                selected_count=len(matches),
+                selected_count=len(kept),
                 metadata=metadata,
             )
-            persisted_matches = self._create_items(bundle, matches)
+            persisted_matches = self._create_items(bundle, kept)
             bundle.rendered_text = self._render_context(persisted_matches)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
