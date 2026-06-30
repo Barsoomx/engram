@@ -462,6 +462,130 @@ def test_queue_filters_by_team_and_project(
 
 
 @pytest.mark.django_db
+def test_queue_filters_by_invalid_team_id_returns_400(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/?team_id=not-a-uuid')
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'invalid_filter'
+
+
+@pytest.mark.django_db
+def test_queue_filters_by_invalid_project_id_returns_400(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/?project_id=not-a-uuid')
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'invalid_filter'
+
+
+@pytest.mark.django_db
+def test_queue_filters_by_search_matches_title_and_body(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    target = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.CONFLICT,
+        title='Authentication flow notes',
+        body='describes the login handshake',
+    )
+
+    _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.CONFLICT,
+        title='Billing notes',
+        body='unrelated billing details',
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/?search=authentication')
+
+    assert response.status_code == 200
+
+    items = response.data['results']
+
+    assert len(items) == 1
+
+    assert items[0]['id'] == str(target.id)
+
+
+@pytest.mark.django_db
+def test_queue_filters_by_source_type(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    file_observation = _make_observation(f_admin_org, f_project)
+
+    ObservationSource.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        observation=file_observation,
+        source_type='file',
+        source_id='src/app.py',
+    )
+
+    web_observation = _make_observation(f_admin_org, f_project)
+
+    ObservationSource.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        observation=web_observation,
+        source_type='web',
+        source_id='https://example.com',
+    )
+
+    file_candidate = _make_candidate(
+        f_admin_org,
+        f_project,
+        status=CandidateStatus.PROPOSED,
+        source_observation=file_observation,
+    )
+
+    _make_candidate(
+        f_admin_org,
+        f_project,
+        status=CandidateStatus.PROPOSED,
+        source_observation=web_observation,
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/?source_type=file')
+
+    assert response.status_code == 200
+
+    items = response.data['results']
+
+    assert len(items) == 1
+
+    assert items[0]['id'] == str(file_candidate.id)
+
+
+@pytest.mark.django_db
 def test_queue_serializer_includes_provenance_and_citations(
     f_admin_token: str,
     f_admin_org: Organization,
