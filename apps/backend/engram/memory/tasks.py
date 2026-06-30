@@ -15,6 +15,7 @@ from engram.memory.services import (
     MemoryWorkerError,
     ProcessObservationRecorded,
     run_daily_digest_with_tracking,
+    run_weekly_digest_with_tracking,
 )
 
 _RETRY_BACKOFF_BASE = 5
@@ -114,6 +115,69 @@ def generate_daily_digest(
         structlog.contextvars.clear_contextvars()
 
     return str(result.memory.id)
+
+
+@app.task(bind=True, name='engram.memory.generate_weekly_digest', max_retries=_MAX_RETRIES)
+def generate_weekly_digest(
+    self: object,
+    organization_id: object,
+    project_id: object,
+) -> str:
+    try:
+        parsed_organization_id = uuid.UUID(str(organization_id))
+        parsed_project_id = uuid.UUID(str(project_id))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise MemoryWorkerError('malformed weekly digest input') from error
+
+    request_id = f'weekly-digest:{parsed_project_id}'
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        correlation_id=request_id,
+        request_id=request_id,
+    )
+    try:
+        result = run_weekly_digest_with_tracking(
+            organization_id=parsed_organization_id,
+            project_id=parsed_project_id,
+            request_id=request_id,
+            correlation_id=request_id,
+        )
+    except MemoryWorkerError as exc:
+        if exc.retryable:
+            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
+            raise self.retry(exc=exc, countdown=countdown) from None
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    return str(result.digest_memory.id)
+
+
+@app.task(name='engram.memory.run_scheduled_weekly_digests')
+def run_scheduled_weekly_digests() -> dict[str, int]:
+    enqueued_projects = 0
+    enqueued_tasks = 0
+
+    for project in Project.objects.all():
+        has_approved = Memory.objects.filter(
+            organization_id=project.organization_id,
+            project=project,
+            status=MemoryStatus.APPROVED,
+        ).exists()
+        if not has_approved:
+            continue
+
+        generate_weekly_digest.delay(
+            str(project.organization_id),
+            str(project.id),
+        )
+        enqueued_projects += 1
+        enqueued_tasks += 1
+
+    return {
+        'enqueued_projects': enqueued_projects,
+        'enqueued_tasks': enqueued_tasks,
+    }
 
 
 @app.task(name='engram.memory.run_scheduled_digests')
