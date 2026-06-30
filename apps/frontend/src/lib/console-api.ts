@@ -512,6 +512,7 @@ export interface DigestCounts {
 }
 
 export interface WeeklyDigest {
+  digest_memory_id: string;
   window_start: string | null;
   window_end: string | null;
   window_days: number;
@@ -585,13 +586,17 @@ export interface HookDryRunResult {
 }
 
 export async function dryRunHook(
-  apiKey: string,
   body: HookDryRunInput,
+  apiKey?: string,
 ): Promise<HookDryRunResult> {
+  const config = apiKey
+    ? { headers: { Authorization: `Bearer ${apiKey}` } }
+    : undefined;
+
   const response = await apiClient().post<HookDryRunResult>(
     '/v1/hooks/dry-run',
     body,
-    { headers: { Authorization: `Bearer ${apiKey}` } },
+    config,
   );
 
   return response.data;

@@ -31,11 +31,11 @@ function errorMessage(error: unknown): string {
     const status = error.response?.status;
 
     if (status === 401) {
-      return 'The API key is invalid or expired.';
+      return 'Authentication failed — check the API key, or your session may have expired.';
     }
 
     if (status === 403) {
-      return 'The API key does not have the observations:write capability required for the hook handshake.';
+      return 'The key or session lacks the observations:write capability required for the hook handshake.';
     }
   }
 
@@ -247,17 +247,20 @@ export default function HookDebugPage() {
 
   const probe = useMutation<HookDryRunResult, unknown, void>({
     mutationFn: () =>
-      dryRunHook(apiKey, {
-        project_id: activeProjectId!,
-        team_id: activeTeamId ?? null,
-        agent_runtime: agentRuntime,
-        agent_version: agentVersion || undefined,
-        request_id: genRequestId(),
-      }),
+      dryRunHook(
+        {
+          project_id: activeProjectId!,
+          team_id: activeTeamId ?? null,
+          agent_runtime: agentRuntime,
+          agent_version: agentVersion || undefined,
+          request_id: genRequestId(),
+        },
+        apiKey || undefined,
+      ),
   });
 
   function handleRun() {
-    if (!activeProjectId || !apiKey) {
+    if (!activeProjectId) {
       return;
     }
 
@@ -269,7 +272,7 @@ export default function HookDebugPage() {
       <section className='space-y-6'>
         <PageHeader
           title='Hook Debugger'
-          subtitle='Resolve what an agent API key is authorized to do (Bearer handshake).'
+          subtitle='Resolve what an agent key — or your console session — is authorized to do.'
         />
 
         {!activeProjectId ? (
@@ -285,6 +288,7 @@ export default function HookDebugPage() {
                 label='Agent API key'
                 labelPlacement='outside'
                 placeholder='engram_sk_...'
+                description='Leave blank to use your console session instead.'
                 type='password'
                 value={apiKey}
                 onValueChange={setApiKey}
@@ -314,7 +318,6 @@ export default function HookDebugPage() {
                   startContent={<Play className='h-4 w-4' />}
                   onPress={handleRun}
                   isLoading={probe.isPending}
-                  isDisabled={!apiKey}
                 >
                   Run handshake
                 </PrimaryButton>

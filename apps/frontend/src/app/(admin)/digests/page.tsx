@@ -1,6 +1,6 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { BookOpen, Calendar, CheckCircle2, XCircle } from 'lucide-react';
 import * as React from 'react';
 
@@ -10,6 +10,7 @@ import { PageHeader } from '@/components/ui/page-header';
 import { fetchMe, type MeResponse } from '@/lib/auth';
 import {
   getWeeklyDigest,
+  reviewDigest,
   type DigestChangelogItem,
   type DigestCounts,
   type WeeklyDigest,
@@ -118,8 +119,21 @@ function DigestSkeleton() {
   );
 }
 
-function DigestContent({ digest }: { digest: WeeklyDigest }) {
+function DigestContent({
+  digest,
+  onReviewed,
+}: {
+  digest: WeeklyDigest;
+  onReviewed: () => void;
+}) {
   const { counts, changelog, window_start, window_end, ready } = digest;
+
+  const reviewMutation = useMutation({
+    mutationFn: () => reviewDigest(digest.digest_memory_id),
+    onSuccess: () => onReviewed(),
+  });
+
+  const reviewed = ready || reviewMutation.isSuccess;
 
   return (
     <div className='space-y-5'>
@@ -170,9 +184,27 @@ function DigestContent({ digest }: { digest: WeeklyDigest }) {
             No changes recorded in this window.
           </p>
         )}
-        <p className='mt-4 text-[11.5px] text-default-400'>
-          Review unavailable — digest id not exposed by API.
-        </p>
+        {reviewed ? (
+          <p className='mt-4 inline-flex items-center gap-1.5 text-[12.5px] font-medium text-success'>
+            <CheckCircle2 className='h-4 w-4' strokeWidth={2} />
+            Digest reviewed
+          </p>
+        ) : (
+          <div className='mt-4 flex items-center gap-3'>
+            <button
+              type='button'
+              onClick={() => reviewMutation.mutate()}
+              disabled={reviewMutation.isPending}
+              className='inline-flex items-center gap-1.5 rounded-[10px] border border-primary/30 bg-primary/10 px-3.5 py-2 text-[12.5px] font-semibold text-primary-300 transition-colors hover:bg-primary/20 disabled:cursor-wait disabled:opacity-60'
+            >
+              <CheckCircle2 className='h-4 w-4' strokeWidth={2} />
+              {reviewMutation.isPending ? 'Marking…' : 'Mark reviewed'}
+            </button>
+            {reviewMutation.isError && (
+              <span className='text-[12px] text-danger'>Failed to mark reviewed.</span>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -221,7 +253,10 @@ export default function DigestsPage() {
             </p>
           </div>
         ) : digestQuery.data ? (
-          <DigestContent digest={digestQuery.data} />
+          <DigestContent
+            digest={digestQuery.data}
+            onReviewed={() => digestQuery.refetch()}
+          />
         ) : null}
       </section>
     </CapabilityGate>
