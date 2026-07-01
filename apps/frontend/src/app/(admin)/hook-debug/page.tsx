@@ -1,6 +1,6 @@
 'use client';
 
-import { Input } from '@heroui/react';
+import { Input, Select, SelectItem } from '@heroui/react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { AlertTriangle, Key, Play, Shield, Target } from 'lucide-react';
@@ -19,6 +19,12 @@ import {
 } from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
+
+const AGENT_RUNTIMES: { value: string; label: string }[] = [
+  { value: 'claude_code', label: 'Claude Code' },
+  { value: 'codex', label: 'Codex' },
+  { value: 'unknown', label: 'Unknown' },
+];
 
 function errorMessage(error: unknown): string {
   if (axios.isAxiosError(error)) {
@@ -295,14 +301,23 @@ export default function HookDebugPage() {
                 isDisabled={probe.isPending}
               />
               <div className='grid gap-4 sm:grid-cols-2'>
-                <Input
+                <Select
                   label='Agent runtime'
                   labelPlacement='outside'
-                  placeholder='claude_code'
-                  value={agentRuntime}
-                  onValueChange={setAgentRuntime}
+                  selectedKeys={new Set([agentRuntime])}
                   isDisabled={probe.isPending}
-                />
+                  onSelectionChange={(keys) => {
+                    const next = Array.from(keys)[0];
+
+                    if (typeof next === 'string') {
+                      setAgentRuntime(next);
+                    }
+                  }}
+                >
+                  {AGENT_RUNTIMES.map((option) => (
+                    <SelectItem key={option.value}>{option.label}</SelectItem>
+                  ))}
+                </Select>
                 <Input
                   label='Agent version'
                   labelPlacement='outside'

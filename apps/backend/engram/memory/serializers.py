@@ -71,6 +71,24 @@ class MemoryLinkQuerySerializer(serializers.Serializer):
     team_id = serializers.UUIDField(required=False, allow_null=True)
 
 
+class MemoryLinkDeleteSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    link_id = serializers.UUIDField()
+    request_id = serializers.CharField(max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH)
+    correlation_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH,
+    )
+
+
+class MemoryVersionQuerySerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+
+
 class MemoryDiffQuerySerializer(serializers.Serializer):
     from_version = serializers.IntegerField(min_value=1)
     to_version = serializers.IntegerField(min_value=1)
