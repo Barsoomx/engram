@@ -10,7 +10,7 @@ import {
   ModalHeader,
 } from '@heroui/react';
 import { useQuery } from '@tanstack/react-query';
-import axios from 'axios';
+import { extractApiError } from '@/lib/api-error';
 import {
   Archive,
   GitBranch,
@@ -375,15 +375,7 @@ export default function ProjectsPage() {
 
       return true;
     } catch (error) {
-      let detail: string | undefined;
-
-      if (axios.isAxiosError(error)) {
-        const data = error.response?.data as { detail?: string } | undefined;
-
-        detail = data?.detail;
-      }
-
-      setModalError(detail ?? 'Failed to save project.');
+      setModalError(extractApiError(error, 'Failed to save project.'));
 
       return false;
     }

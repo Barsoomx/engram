@@ -37,6 +37,7 @@ import {
   useRoles,
   useUpdateMemberRole,
 } from '@/hooks/use-members';
+import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type {
   Member,
@@ -68,13 +69,9 @@ function memberInitialError(error: unknown): string | null {
     return LAST_OWNER_MESSAGE;
   }
 
-  if (axios.isAxiosError(error)) {
-    const data = error.response?.data as { detail?: string } | undefined;
+  if (axios.isAxiosError(error) && error.response) {
 
-    if (data?.detail) {
-
-      return data.detail;
-    }
+    return extractApiError(error);
   }
 
   return null;

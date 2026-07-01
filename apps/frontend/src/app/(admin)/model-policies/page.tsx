@@ -23,6 +23,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
+import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createModelPolicy,
@@ -71,16 +72,7 @@ function isNotFound(error: unknown): boolean {
 }
 
 function errorDetail(error: unknown, fallback: string): string {
-  if (axios.isAxiosError(error)) {
-    const data = error.response?.data as { detail?: string } | undefined;
-
-    if (data?.detail) {
-
-      return data.detail;
-    }
-  }
-
-  return fallback;
+  return extractApiError(error, fallback);
 }
 
 function TaskPill({ task }: { task: PolicyTaskType }) {
