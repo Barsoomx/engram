@@ -1,3 +1,5 @@
+import { codecovNextJSWebpackPlugin } from '@codecov/nextjs-webpack-plugin'
+
 /** @type {import('next').NextConfig} */
 
 const isDev = process.env.NODE_ENV !== 'production'
@@ -44,6 +46,20 @@ const cspHeader = [
 
 const nextConfig = {
   reactStrictMode: true,
+  webpack: (config, options) => {
+    // Codecov bundle analysis — only active when CODECOV_TOKEN is present (CI build),
+    // so the tokenless Docker image build is a no-op.
+    config.plugins.push(
+      codecovNextJSWebpackPlugin({
+        enableBundleAnalysis: Boolean(process.env.CODECOV_TOKEN),
+        bundleName: 'engram-frontend',
+        uploadToken: process.env.CODECOV_TOKEN,
+        webpack: options.webpack,
+      }),
+    )
+
+    return config
+  },
   async headers() {
     return [
       {
