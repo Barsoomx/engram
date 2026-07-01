@@ -12,6 +12,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -35,8 +36,8 @@ from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidat
 ImportReport = dict[str, object]
 
 
-class ClaudeMemImportError(ValueError):
-    pass
+class ClaudeMemImportError(DomainError):
+    default_error_code = 'claude_mem_import_error'
 
 
 @dataclass(frozen=True)

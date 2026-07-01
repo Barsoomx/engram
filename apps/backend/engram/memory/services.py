@@ -11,9 +11,11 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
+from rest_framework import status as drf_status
 
 from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
     AuditResult,
@@ -676,9 +678,18 @@ class UpdateMemoryBodyResult:
         }
 
 
-class MemoryVersionError(Exception):
+MEMORY_VERSION_STATUS = {
+    'memory_not_found': drf_status.HTTP_404_NOT_FOUND,
+}
+
+
+class MemoryVersionError(DomainError):
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=MEMORY_VERSION_STATUS.get(code, drf_status.HTTP_400_BAD_REQUEST),
+        )
         self.code = code
 
 

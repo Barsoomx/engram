@@ -153,6 +153,7 @@ def test_domain_error_payload_matches_drf_handler_and_middleware() -> None:
     assert payload == {
         'detail': 'processing unavailable',
         'error_code': 'processing_unavailable',
+        'code': 'processing_unavailable',
     }
     assert drf_response is not None
     assert drf_response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
