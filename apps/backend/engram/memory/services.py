@@ -949,6 +949,104 @@ class RecordMemoryLink:
         )
 
 
+MEMORY_LINK_STATUS = {
+    'memory_not_found': drf_status.HTTP_404_NOT_FOUND,
+    'link_not_found': drf_status.HTTP_404_NOT_FOUND,
+}
+
+
+class MemoryLinkError(DomainError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=MEMORY_LINK_STATUS.get(code, drf_status.HTTP_400_BAD_REQUEST),
+        )
+        self.code = code
+
+
+@dataclass(frozen=True)
+class RemoveMemoryLinkInput:
+    scope: EffectiveScope
+    memory_id: uuid.UUID
+    project_id: uuid.UUID
+    team_id: uuid.UUID | None
+    link_id: uuid.UUID
+    request_id: str
+    correlation_id: str = ''
+
+
+@dataclass(frozen=True)
+class RemoveMemoryLinkResult:
+    memory: Memory
+    link_id: uuid.UUID
+    link_type: str
+
+    def to_response(self) -> dict[str, object]:
+        return {
+            'memory_id': str(self.memory.id),
+            'link_id': str(self.link_id),
+            'link_type': self.link_type,
+            'deleted': True,
+        }
+
+
+class RemoveMemoryLink:
+    def execute(self, data: RemoveMemoryLinkInput) -> RemoveMemoryLinkResult:
+        scope = data.scope
+        with transaction.atomic():
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryLinkError)
+            ensure_memory_team_scope(memory, scope)
+            link = MemoryLink.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                memory=memory,
+                id=data.link_id,
+            ).first()
+            if link is None:
+                raise MemoryLinkError('link_not_found', 'Memory link was not found')
+
+            link_type = link.link_type
+            target = link.target
+            link.delete()
+            self._audit(memory, scope, data, link_type, target)
+
+        return RemoveMemoryLinkResult(memory=memory, link_id=data.link_id, link_type=link_type)
+
+    def _audit(
+        self,
+        memory: Memory,
+        scope: EffectiveScope,
+        data: RemoveMemoryLinkInput,
+        link_type: str,
+        target: str,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=memory.organization,
+            project=memory.project,
+            team=memory.team,
+            event_type='MemoryLinkRemoved',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory_link',
+            target_id=str(data.link_id),
+            capability='memories:review',
+            result=AuditResult.ALLOWED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'memory_id': str(memory.id),
+                'link_type': link_type,
+                'target': redact_text(target),
+                'scope_filters': {
+                    'organization_id': str(scope.organization_id),
+                    'project_ids': [str(project_id) for project_id in scope.project_ids],
+                    'team_ids': [str(team_id) for team_id in scope.team_ids],
+                },
+            },
+        )
+
+
 @dataclass(frozen=True)
 class DigestInput:
     project_id: uuid.UUID

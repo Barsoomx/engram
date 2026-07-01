@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from rest_framework.test import APIClient
 
@@ -167,6 +169,83 @@ def test_create_memory_link_rejects_oversized_target() -> None:
 
     assert response.status_code == 400
     assert MemoryLink.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_removes_and_audits() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(link.id), 'request_id': 'request-link-del-1'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['link_id'] == str(link.id)
+    assert body['deleted'] is True
+    assert MemoryLink.objects.filter(id=link.id).count() == 0
+    audit = AuditEvent.objects.get(event_type='MemoryLinkRemoved', target_id=str(link.id))
+    assert audit.capability == 'memories:review'
+    assert audit.metadata['memory_id'] == str(memory.id)
+    assert RAW_KEY not in str(body)
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_returns_not_found_for_missing_link() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(uuid.uuid4()), 'request_id': 'request-link-del-missing'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'link_not_found'
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_requires_review_capability() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(link.id), 'request_id': 'request-link-del-403'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'missing_capability'
+    assert MemoryLink.objects.filter(id=link.id).count() == 1
 
 
 @pytest.mark.django_db
