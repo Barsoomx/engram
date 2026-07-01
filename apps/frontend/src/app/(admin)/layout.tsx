@@ -2,7 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Bell, Menu } from 'lucide-react';
+import { Menu } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
@@ -176,17 +176,6 @@ export default function AdminShellLayout({
           </div>
 
           <div className='flex items-center gap-3'>
-            <button
-              type='button'
-              aria-label='Notifications'
-              className='relative flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground'
-            >
-              <Bell size={17} strokeWidth={1.8} />
-              <span className='absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-primary ring-2 ring-[#0A0C11]' />
-            </button>
-
-            <span className='h-6 w-px bg-divider' />
-
             {profile && (
               <div className='flex items-center gap-2.5'>
                 <div className='text-right leading-tight'>
