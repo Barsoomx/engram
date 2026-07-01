@@ -40,6 +40,7 @@ class E2EError(Exception):
 def main() -> int:
     api_key = f'egk_e2e_{secrets.token_urlsafe(32)}'
     run_id = secrets.token_hex(8)
+    failed = True
     try:
         ensure_compose_env()
         progress('Clearing Compose state')
@@ -157,8 +158,18 @@ def main() -> int:
 
         progress('Compose golden path passed')
 
+        failed = False
+
         return 0
     finally:
+        if failed:
+            progress('Golden path failed — dumping compose logs')
+            run(
+                ['docker', 'compose', 'logs', '--no-color', '--tail=150'],
+                cwd=COMPOSE_DIR,
+                secret=api_key,
+                check=False,
+            )
         progress('Stopping Compose services')
         run(
             ['docker', 'compose', 'down', '-v'],

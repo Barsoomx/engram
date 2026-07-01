@@ -5,3 +5,26 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+
+  # Frontend (Next.js / React / TypeScript)
+  - package-ecosystem: npm
+    directory: /apps/frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Backend (Python / Poetry — pyproject.toml + poetry.lock)
+  - package-ecosystem: pip
+    directory: /apps/backend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Container base images
+  - package-ecosystem: docker
+    directories:
+      - /apps/backend
+      - /apps/frontend
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

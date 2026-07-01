@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: engram
           POSTGRES_USER: engram
@@ -31,10 +31,10 @@ jobs:
       ENGRAM_DATABASE_URL: postgresql://engram:engram@localhost:5432/engram
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
@@ -69,9 +69,36 @@ jobs:
         working-directory: apps/backend
         run: poetry run pytest engram/imports/upstream_import_tests.py -v
 
-      - name: Run backend tests
+      - name: Run backend tests with coverage
         working-directory: apps/backend
-        run: poetry run pytest -v
+        run: |
+          poetry run pip install coverage
+          poetry run coverage run --source=engram --omit='*/*_tests.py,*/migrations/*' -m pytest -v --junitxml=junit.xml -o junit_family=legacy
+
+      - name: Generate coverage report
+        working-directory: apps/backend
+        run: |
+          poetry run coverage xml
+          poetry run coverage report -m
+
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: apps/backend/coverage.xml
+          disable_search: true
+          fail_ci_if_error: true
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: apps/backend/junit.xml
+          disable_search: true
+          report_type: test_results
+          fail_ci_if_error: true
 
       - name: Run CLI tests
         run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v

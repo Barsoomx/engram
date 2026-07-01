@@ -144,7 +144,7 @@ services:
       start_period: 30s
 
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_DB: engram
       POSTGRES_USER: engram
@@ -155,10 +155,11 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # PG18+ official image stores data in a major-version subdir; mount the parent.
+      - postgres_data:/var/lib/postgresql
 
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:7.4.0-v8
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -166,11 +167,13 @@ services:
       retries: 10
 
   rabbitmq:
-    image: rabbitmq:3.13-alpine
+    image: rabbitmq:4.3.2-management-alpine
     environment:
       RABBITMQ_DEFAULT_USER: engram
       RABBITMQ_DEFAULT_PASS: engram
       RABBITMQ_DEFAULT_VHOST: engram
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-engram.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
