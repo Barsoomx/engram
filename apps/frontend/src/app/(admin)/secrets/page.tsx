@@ -117,12 +117,18 @@ function ColumnHeader() {
 function SecretsTable({
   items,
   canManage,
+  rotatePending,
+  disablePending,
+  enablePending,
   onRotate,
   onDisable,
   onEnable,
 }: {
   items: ProviderSecret[];
   canManage: boolean;
+  rotatePending: boolean;
+  disablePending: boolean;
+  enablePending: boolean;
   onRotate: (secret: ProviderSecret) => void;
   onDisable: (secret: ProviderSecret) => void;
   onEnable: (secret: ProviderSecret) => void;
@@ -187,6 +193,7 @@ function SecretsTable({
                         variant='flat'
                         startContent={<RefreshCw className='h-3.5 w-3.5' />}
                         onPress={() => onRotate(secret)}
+                        isDisabled={rotatePending}
                       >
                         Rotate
                       </Button>
@@ -196,6 +203,7 @@ function SecretsTable({
                         variant='flat'
                         startContent={<Ban className='h-3.5 w-3.5' />}
                         onPress={() => onDisable(secret)}
+                        isDisabled={disablePending}
                       >
                         Disable
                       </Button>
@@ -207,6 +215,7 @@ function SecretsTable({
                       variant='flat'
                       startContent={<Power className='h-3.5 w-3.5' />}
                       onPress={() => onEnable(secret)}
+                      isDisabled={enablePending}
                     >
                       Enable
                     </Button>
@@ -783,6 +792,9 @@ export default function SecretsPage() {
           <SecretsTable
             items={items}
             canManage={canManageSecrets}
+            rotatePending={rotateMutation.isPending}
+            disablePending={disableMutation.isPending}
+            enablePending={enableMutation.isPending}
             onRotate={openRotate}
             onDisable={setDisableTarget}
             onEnable={handleEnable}
