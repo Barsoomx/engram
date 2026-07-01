@@ -5,6 +5,14 @@ const isDev = process.env.NODE_ENV !== 'production'
 function resolveApiOrigin() {
   const raw = process.env.NEXT_PUBLIC_ENGRAM_API_URL ?? 'http://localhost:8000'
 
+  // Runtime-config placeholder (apps/frontend/entrypoint.sh): pass it through unparsed so
+  // the CSP connect-src carries the APP_* token, replaced with the real origin at
+  // container start — otherwise the placeholder would fall back to localhost and the CSP
+  // would block the real API in production.
+  if (raw.startsWith('APP_')) {
+    return raw
+  }
+
   try {
     return new URL(raw).origin
   } catch {
