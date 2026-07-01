@@ -1,6 +1,6 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronDown, ScrollText, X } from 'lucide-react';
 import * as React from 'react';
 
@@ -381,18 +381,7 @@ function AuditLog() {
     until: '',
   });
 
-  const [extraItems, setExtraItems] = React.useState<AuditEvent[]>([]);
-  const [nextPage, setNextPage] = React.useState(2);
-  const [isLoadingMore, setIsLoadingMore] = React.useState(false);
-  const [loadMoreError, setLoadMoreError] = React.useState<string | null>(null);
-
   const [selectedEvent, setSelectedEvent] = React.useState<AuditEvent | null>(null);
-
-  React.useEffect(() => {
-    setExtraItems([]);
-    setNextPage(2);
-    setLoadMoreError(null);
-  }, [appliedFilters]);
 
   const buildParams = React.useCallback(
     (page: number): AuditEventListParams => {
@@ -408,19 +397,35 @@ function AuditLog() {
     [appliedFilters],
   );
 
-  const query = useQuery({
+  const query = useInfiniteQuery({
     queryKey: adminQueryKeys.auditEvents(activeOrgId, appliedFilters),
     enabled: Boolean(activeOrgId),
-    queryFn: () => listAuditEvents(buildParams(1)),
+    initialPageParam: 1,
+    queryFn: ({ pageParam }) => listAuditEvents(buildParams(pageParam)),
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce(
+        (sum, page) => sum + page.results.length,
+        0,
+      );
+
+      return loaded < lastPage.count ? allPages.length + 1 : undefined;
+    },
   });
 
   const allItems = React.useMemo(
-    () => [...(query.data?.results ?? []), ...extraItems],
-    [query.data, extraItems],
+    () => query.data?.pages.flatMap((page) => page.results) ?? [],
+    [query.data],
   );
 
-  const totalCount = query.data?.count ?? 0;
-  const hasMore = allItems.length < totalCount;
+  const totalCount = query.data?.pages[0]?.count ?? 0;
+  const hasMore = Boolean(query.hasNextPage);
+  const isLoadingMore = query.isFetchingNextPage;
+  const loadMoreError =
+    query.isError && query.data
+      ? query.error instanceof Error
+        ? query.error.message
+        : 'Failed to load more events.'
+      : null;
 
   const hasActiveFilters =
     Boolean(appliedFilters.eventType) ||
@@ -443,26 +448,6 @@ function AuditLog() {
     setDraftSince('');
     setDraftUntil('');
     setAppliedFilters({ eventType: '', result: '', since: '', until: '' });
-  };
-
-  const loadMore = async () => {
-    if (isLoadingMore) {
-      return;
-    }
-
-    setIsLoadingMore(true);
-    setLoadMoreError(null);
-
-    try {
-      const res = await listAuditEvents(buildParams(nextPage));
-
-      setExtraItems((prev) => [...prev, ...res.results]);
-      setNextPage((prev) => prev + 1);
-    } catch (err) {
-      setLoadMoreError(err instanceof Error ? err.message : 'Failed to load more events.');
-    } finally {
-      setIsLoadingMore(false);
-    }
   };
 
   return (
@@ -546,7 +531,7 @@ function AuditLog() {
 
       {query.isLoading && <AuditSkeleton />}
 
-      {query.isError && (
+      {query.isError && !query.data && (
         <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
           <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
           <p className='text-[13px] leading-relaxed text-danger'>
@@ -570,7 +555,7 @@ function AuditLog() {
             {hasMore ? (
               <button
                 type='button'
-                onClick={loadMore}
+                onClick={() => void query.fetchNextPage()}
                 disabled={isLoadingMore}
                 className='flex w-full items-center justify-center gap-2 rounded-[12px] border border-divider-strong bg-content1 py-3 text-[13.5px] font-medium text-default-600 transition-colors hover:bg-content2 disabled:cursor-wait disabled:opacity-60'
               >

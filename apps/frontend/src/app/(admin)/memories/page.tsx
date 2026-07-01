@@ -1,6 +1,6 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery } from '@tanstack/react-query';
 import { AlertTriangle, ChevronDown, Database, Search } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
@@ -153,54 +153,51 @@ export default function MemoriesPage() {
   const [search, setSearch] = React.useState('');
   const [kindFilter, setKindFilter] = React.useState<KindFilter>('all');
 
-  const [extraItems, setExtraItems] = React.useState<MemoryItem[]>([]);
-  const [nextOffset, setNextOffset] = React.useState(LIMIT);
-  const [serverCount, setServerCount] = React.useState<number | null>(null);
-  const [isLoadingMore, setIsLoadingMore] = React.useState(false);
-  const [loadMoreError, setLoadMoreError] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    setExtraItems([]);
-    setNextOffset(LIMIT);
-    setServerCount(null);
-    setLoadMoreError(null);
-  }, [activeProjectId, activeTeamId]);
-
   const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
 
-  const query = useQuery<MemoriesResponse>({
+  const query = useInfiniteQuery({
     queryKey: ['inspection', 'memories', activeProjectId, activeTeamId],
     enabled: Boolean(activeProjectId),
-    queryFn: async () => {
-      const client = apiClient();
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
       const params: Record<string, string> = {
         project_id: activeProjectId ?? '',
         limit: String(LIMIT),
+        offset: String(pageParam),
       };
 
       if (activeTeamId) {
         params.team_id = activeTeamId;
       }
 
-      const response = await client.get<MemoriesResponse>('/v1/inspection/memories', { params });
+      const response = await apiClient().get<MemoriesResponse>(
+        '/v1/inspection/memories',
+        { params },
+      );
 
       return response.data;
     },
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce((sum, page) => sum + page.items.length, 0);
+
+      return loaded < lastPage.count ? loaded : undefined;
+    },
   });
 
-  React.useEffect(() => {
-    if (query.data) {
-      setServerCount(query.data.count);
-    }
-  }, [query.data]);
-
   const allItems = React.useMemo(
-    () => [...(query.data?.items ?? []), ...extraItems],
-    [query.data, extraItems],
+    () => query.data?.pages.flatMap((page) => page.items) ?? [],
+    [query.data],
   );
 
-  const totalCount = serverCount ?? query.data?.count ?? 0;
-  const hasMore = allItems.length < totalCount;
+  const totalCount = query.data?.pages[0]?.count ?? 0;
+  const hasMore = Boolean(query.hasNextPage);
+  const isLoadingMore = query.isFetchingNextPage;
+  const loadMoreError =
+    query.isError && query.data
+      ? query.error instanceof Error
+        ? query.error.message
+        : 'Failed to load more memories.'
+      : null;
 
   const projectLabel = React.useMemo(() => {
     const project = projectsQuery.data?.results.find(
@@ -234,38 +231,6 @@ export default function MemoriesPage() {
       return haystack.includes(q);
     });
   }, [allItems, search, kindFilter]);
-
-  const loadMore = async () => {
-    if (isLoadingMore || !activeProjectId) {
-      return;
-    }
-
-    setIsLoadingMore(true);
-    setLoadMoreError(null);
-
-    try {
-      const client = apiClient();
-      const params: Record<string, string> = {
-        project_id: activeProjectId,
-        limit: String(LIMIT),
-        offset: String(nextOffset),
-      };
-
-      if (activeTeamId) {
-        params.team_id = activeTeamId;
-      }
-
-      const res = await client.get<MemoriesResponse>('/v1/inspection/memories', { params });
-
-      setExtraItems((prev) => [...prev, ...res.data.items]);
-      setServerCount(res.data.count);
-      setNextOffset((prev) => prev + LIMIT);
-    } catch (err) {
-      setLoadMoreError(err instanceof Error ? err.message : 'Failed to load more memories.');
-    } finally {
-      setIsLoadingMore(false);
-    }
-  };
 
   if (!activeProjectId) {
     return (
@@ -333,7 +298,7 @@ export default function MemoriesPage() {
         </div>
       )}
 
-      {query.isError && (
+      {query.isError && !query.data && (
         <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
           <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
           <p className='text-[13px] leading-relaxed text-danger'>
@@ -363,7 +328,7 @@ export default function MemoriesPage() {
             {hasMore && (
               <button
                 type='button'
-                onClick={loadMore}
+                onClick={() => void query.fetchNextPage()}
                 disabled={isLoadingMore}
                 className='flex w-full items-center justify-center gap-2 rounded-[12px] border border-divider-strong bg-content1 py-3 text-[13.5px] font-medium text-default-600 transition-colors hover:bg-content2 disabled:cursor-wait disabled:opacity-60'
               >
