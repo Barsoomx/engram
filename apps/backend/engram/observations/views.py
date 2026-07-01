@@ -9,8 +9,6 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
-from engram.access.services import AccessDeniedError
-from engram.context.views import access_error_response
 from engram.observations.serializers import ObservationDetailQuerySerializer, ObservationListQuerySerializer
 from engram.observations.services import (
     GetObservation,
@@ -31,32 +29,29 @@ class ObservationListView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         request_id = str(data.get('request_id') or f'observations-{uuid.uuid4()}')
-        try:
-            scope = resolve_request_scope(
-                request,
-                required_capability='observations:read',
+        scope = resolve_request_scope(
+            request,
+            required_capability='observations:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='observation_list',
+            target_id='list',
+            request_id=request_id,
+        )
+        result = ListObservations().execute(
+            ObservationListInput(
+                scope=scope,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='observation_list',
-                target_id='list',
-                request_id=request_id,
-            )
-            result = ListObservations().execute(
-                ObservationListInput(
-                    scope=scope,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    limit=data.get('limit', 20),
-                    offset=data.get('offset', 0),
-                    observation_type=data.get('observation_type') or None,
-                    session_id=data.get('session_id'),
-                    since=data.get('since'),
-                    until=data.get('until'),
-                    correlation_id=data.get('correlation_id') or None,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+                limit=data.get('limit', 20),
+                offset=data.get('offset', 0),
+                observation_type=data.get('observation_type') or None,
+                session_id=data.get('session_id'),
+                since=data.get('since'),
+                until=data.get('until'),
+                correlation_id=data.get('correlation_id') or None,
+            ),
+        )
 
         response = result.to_response()
         response['request_id'] = request_id
@@ -91,8 +86,6 @@ class ObservationDetailView(APIView):
                     observation_id=observation_id,
                 ),
             )
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except ObservationNotFoundError as error:
             return Response(
                 {'code': error.code, 'detail': str(error)},

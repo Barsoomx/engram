@@ -18,7 +18,9 @@ from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.db.models import Q
+from rest_framework import status
 
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import AuditEvent, AuditResult, Project, Team
 from engram.core.redaction import redact_value
 from engram.model_policy.models import (
@@ -34,15 +36,26 @@ from engram.model_policy.models import (
 SECRET_KEY_VERSION = 'v1'
 NON_PRODUCTION_ENVIRONMENTS = {'dev', 'development', 'local', 'test'}
 
+ERROR_STATUS = {
+    'policy_scope_mismatch': status.HTTP_400_BAD_REQUEST,
+    'team_required': status.HTTP_400_BAD_REQUEST,
+    'model_policy_not_found': status.HTTP_404_NOT_FOUND,
+    'secret_scope_denied': status.HTTP_403_FORBIDDEN,
+}
 
-class ModelPolicyError(Exception):
+
+class ModelPolicyError(DomainError):
     def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
-        super().__init__(message)
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=ERROR_STATUS.get(code, status.HTTP_400_BAD_REQUEST),
+        )
         self.code = code
         self.retryable = retryable
 
 
-class ProviderSecretError(Exception):
+class ProviderSecretError(DomainError):
     pass
 
 

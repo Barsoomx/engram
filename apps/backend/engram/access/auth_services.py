@@ -7,6 +7,7 @@ from typing import Any
 from django.contrib.auth import authenticate as django_authenticate
 from django.contrib.auth.models import User
 from django.db import transaction
+from rest_framework import status
 from rest_framework.authtoken.models import Token
 
 from engram.access.models import (
@@ -20,6 +21,7 @@ from engram.access.models import (
     TeamMembership,
 )
 from engram.access.services import EffectiveScope
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import Organization, Project, Team
 
 DEFAULT_ORGANIZATION_SLUG = 'default'
@@ -31,11 +33,23 @@ USER_IDENTITY_EXTERNAL_ID_PREFIX = 'django-user:'
 PROJECT_ADMIN_CAPABILITIES = {'projects:*', 'policy:admin'}
 TEAM_ADMIN_CAPABILITIES = {'teams:*'}
 
+AUTH_STATUS = {
+    'invalid_credentials': status.HTTP_401_UNAUTHORIZED,
+    'inactive_user': status.HTTP_403_FORBIDDEN,
+    'invalid_token': status.HTTP_401_UNAUTHORIZED,
+    'identity_missing': status.HTTP_403_FORBIDDEN,
+    'membership_missing': status.HTTP_403_FORBIDDEN,
+    'default_role_missing': status.HTTP_500_INTERNAL_SERVER_ERROR,
+}
 
-class AuthError(Exception):
+
+class AuthError(DomainError):
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=AUTH_STATUS.get(code, status.HTTP_400_BAD_REQUEST),
+        )
         self.code = code
 
 

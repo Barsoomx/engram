@@ -64,10 +64,3 @@ class DomainError(Exception):
             fallback_status_code=400,
         )
         return 400
-
-
-class AntiFraudError(DomainError):
-    SKIP_LOGGING = False
-
-
-class BaseServiceError(Exception): ...

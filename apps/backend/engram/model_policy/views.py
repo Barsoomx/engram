@@ -12,8 +12,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
-from engram.access.services import AccessDeniedError, EffectiveScope
-from engram.context.views import access_error_response
+from engram.access.services import EffectiveScope
 from engram.model_policy.filters import ModelPolicyFilterSet
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
@@ -38,7 +37,6 @@ from engram.model_policy.services import (
     DisableProviderSecretInput,
     EnableProviderSecret,
     EnableProviderSecretInput,
-    ModelPolicyError,
     ModelPolicyInput,
     ProviderSecretInput,
     ResolveModelPolicy,
@@ -50,13 +48,6 @@ from engram.model_policy.services import (
     UpdateProviderSecret,
     UpdateProviderSecretInput,
 )
-
-ERROR_STATUS = {
-    'policy_scope_mismatch': status.HTTP_400_BAD_REQUEST,
-    'team_required': status.HTTP_400_BAD_REQUEST,
-    'model_policy_not_found': status.HTTP_404_NOT_FOUND,
-    'secret_scope_denied': status.HTTP_403_FORBIDDEN,
-}
 
 
 class ModelPolicyBaseView(APIView):
@@ -90,17 +81,14 @@ class ProviderSecretListView(ModelPolicyBaseView):
         serializer = ProviderSecretQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:read',
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id='list',
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = self._scope(
+            request,
+            required_capability='secrets:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id='list',
+        )
 
         limit = data.get('limit', 50)
         offset = data.get('offset', 0)
@@ -114,34 +102,29 @@ class ProviderSecretListView(ModelPolicyBaseView):
         serializer = ProviderSecretCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:*',
+        scope = self._scope(
+            request,
+            required_capability='secrets:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id='create',
+            request_id=data['request_id'],
+        )
+        secret = CreateProviderSecret().execute(
+            ProviderSecretInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id='create',
+                name=data['name'],
+                provider=data['provider'],
+                scope=data['scope'],
+                raw_secret=data['raw_secret'],
                 request_id=data['request_id'],
-            )
-            secret = CreateProviderSecret().execute(
-                ProviderSecretInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    name=data['name'],
-                    provider=data['provider'],
-                    scope=data['scope'],
-                    raw_secret=data['raw_secret'],
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(provider_secret_response(secret), status=status.HTTP_201_CREATED)
 
@@ -151,17 +134,14 @@ class ProviderSecretDetailView(ModelPolicyBaseView):
         serializer = ProviderSecretQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:read',
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id=str(secret_id),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = self._scope(
+            request,
+            required_capability='secrets:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id=str(secret_id),
+        )
 
         secret = get_object_or_404(scoped_secrets(scope), id=secret_id)
 
@@ -171,32 +151,27 @@ class ProviderSecretDetailView(ModelPolicyBaseView):
         serializer = ProviderSecretUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:*',
+        scope = self._scope(
+            request,
+            required_capability='secrets:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id=str(secret_id),
+            request_id=data['request_id'],
+        )
+        secret = UpdateProviderSecret().execute(
+            UpdateProviderSecretInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id=str(secret_id),
+                secret_id=secret_id,
+                name=data['name'],
                 request_id=data['request_id'],
-            )
-            secret = UpdateProviderSecret().execute(
-                UpdateProviderSecretInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    secret_id=secret_id,
-                    name=data['name'],
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(provider_secret_response(secret))
 
@@ -206,32 +181,27 @@ class ProviderSecretRotateView(ModelPolicyBaseView):
         serializer = ProviderSecretRotateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:*',
+        scope = self._scope(
+            request,
+            required_capability='secrets:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id=str(secret_id),
+            request_id=data['request_id'],
+        )
+        secret = RotateProviderSecret().execute(
+            RotateProviderSecretInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id=str(secret_id),
+                secret_id=secret_id,
+                raw_secret=data['raw_secret'],
                 request_id=data['request_id'],
-            )
-            secret = RotateProviderSecret().execute(
-                RotateProviderSecretInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    secret_id=secret_id,
-                    raw_secret=data['raw_secret'],
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(provider_secret_response(secret))
 
@@ -241,31 +211,26 @@ class ProviderSecretDisableView(ModelPolicyBaseView):
         serializer = ProviderSecretDisableSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:*',
+        scope = self._scope(
+            request,
+            required_capability='secrets:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id=str(secret_id),
+            request_id=data['request_id'],
+        )
+        secret = DisableProviderSecret().execute(
+            DisableProviderSecretInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id=str(secret_id),
+                secret_id=secret_id,
                 request_id=data['request_id'],
-            )
-            secret = DisableProviderSecret().execute(
-                DisableProviderSecretInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    secret_id=secret_id,
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(provider_secret_response(secret))
 
@@ -275,17 +240,14 @@ class ModelPolicyListView(ModelPolicyBaseView):
         serializer = ModelPolicyQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:read',
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id='list',
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = self._scope(
+            request,
+            required_capability='model_policy:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id='list',
+        )
 
         policies = scoped_policies(scope)
         policies = ModelPolicyFilterSet(data=request.query_params, queryset=policies).qs
@@ -302,37 +264,32 @@ class ModelPolicyListView(ModelPolicyBaseView):
         serializer = ModelPolicyCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:*',
+        scope = self._scope(
+            request,
+            required_capability='model_policy:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id='create',
+            request_id=data['request_id'],
+        )
+        policy = CreateModelPolicy().execute(
+            ModelPolicyInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id='create',
+                name=data['name'],
+                scope=data['scope'],
+                task_type=data['task_type'],
+                provider=data['provider'],
+                model=data['model'],
+                secret_id=data['secret_id'],
                 request_id=data['request_id'],
-            )
-            policy = CreateModelPolicy().execute(
-                ModelPolicyInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    name=data['name'],
-                    scope=data['scope'],
-                    task_type=data['task_type'],
-                    provider=data['provider'],
-                    model=data['model'],
-                    secret_id=data['secret_id'],
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    scope_team_id=data.get('scope_team_id'),
-                    base_url=data.get('base_url', ''),
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                scope_team_id=data.get('scope_team_id'),
+                base_url=data.get('base_url', ''),
+            ),
+        )
 
         return Response(model_policy_response(policy), status=status.HTTP_201_CREATED)
 
@@ -342,27 +299,22 @@ class ModelPolicyResolveView(ModelPolicyBaseView):
         serializer = ModelPolicyResolveSerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:read',
+        scope = self._scope(
+            request,
+            required_capability='model_policy:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id='resolve',
+        )
+        resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id='resolve',
-            )
-            resolved = ResolveModelPolicy().execute(
-                ResolveModelPolicyInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    task_type=data['task_type'],
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                task_type=data['task_type'],
+            ),
+        )
 
         return Response(model_policy_response(resolved.policy))
 
@@ -372,17 +324,14 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
         serializer = ModelPolicyQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:read',
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id=str(policy_id),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = self._scope(
+            request,
+            required_capability='model_policy:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id=str(policy_id),
+        )
 
         policy = get_object_or_404(scoped_policies(scope), id=policy_id)
 
@@ -392,39 +341,34 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
         serializer = ModelPolicyUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:*',
+        scope = self._scope(
+            request,
+            required_capability='model_policy:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id=str(policy_id),
+            request_id=data['request_id'],
+        )
+        policy = UpdateModelPolicy().execute(
+            UpdateModelPolicyInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id=str(policy_id),
+                policy_id=policy_id,
                 request_id=data['request_id'],
-            )
-            policy = UpdateModelPolicy().execute(
-                UpdateModelPolicyInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    policy_id=policy_id,
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                    name=data.get('name'),
-                    provider=data.get('provider'),
-                    model=data.get('model'),
-                    secret_id=data.get('secret_id'),
-                    active=data.get('active'),
-                    fallback_enabled=data.get('fallback_enabled'),
-                    task_type=data.get('task_type'),
-                    base_url=data.get('base_url'),
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+                name=data.get('name'),
+                provider=data.get('provider'),
+                model=data.get('model'),
+                secret_id=data.get('secret_id'),
+                active=data.get('active'),
+                fallback_enabled=data.get('fallback_enabled'),
+                task_type=data.get('task_type'),
+                base_url=data.get('base_url'),
+            ),
+        )
 
         return Response(model_policy_response(policy))
 
@@ -434,31 +378,26 @@ class ModelPolicyDisableView(ModelPolicyBaseView):
         serializer = ModelPolicyDisableSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='model_policy:*',
+        scope = self._scope(
+            request,
+            required_capability='model_policy:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='model_policy',
+            target_id=str(policy_id),
+            request_id=data['request_id'],
+        )
+        policy = DisableModelPolicy().execute(
+            DisableModelPolicyInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='model_policy',
-                target_id=str(policy_id),
+                policy_id=policy_id,
                 request_id=data['request_id'],
-            )
-            policy = DisableModelPolicy().execute(
-                DisableModelPolicyInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    policy_id=policy_id,
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(model_policy_response(policy))
 
@@ -468,31 +407,26 @@ class ProviderSecretEnableView(ModelPolicyBaseView):
         serializer = ProviderSecretEnableSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = self._scope(
-                request,
-                required_capability='secrets:*',
+        scope = self._scope(
+            request,
+            required_capability='secrets:*',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='provider_secret',
+            target_id=str(secret_id),
+            request_id=data['request_id'],
+        )
+        secret = EnableProviderSecret().execute(
+            EnableProviderSecretInput(
+                organization_id=scope.organization_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='provider_secret',
-                target_id=str(secret_id),
+                secret_id=secret_id,
                 request_id=data['request_id'],
-            )
-            secret = EnableProviderSecret().execute(
-                EnableProviderSecretInput(
-                    organization_id=scope.organization_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    secret_id=secret_id,
-                    request_id=data['request_id'],
-                    actor_id=scope.actor_id,
-                    allowed_team_ids=scope.team_ids,
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except ModelPolicyError as error:
-            return error_response(error)
+                actor_id=scope.actor_id,
+                allowed_team_ids=scope.team_ids,
+            ),
+        )
 
         return Response(provider_secret_response(secret))
 
@@ -544,10 +478,3 @@ def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
         'active': policy.active,
         'fallback_enabled': policy.fallback_enabled,
     }
-
-
-def error_response(error: ModelPolicyError) -> Response:
-    return Response(
-        {'code': error.code, 'detail': str(error)},
-        status=ERROR_STATUS.get(error.code, status.HTTP_400_BAD_REQUEST),
-    )

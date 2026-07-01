@@ -8,6 +8,7 @@ from typing import Any
 
 from django.db import transaction
 from django.utils import timezone
+from rest_framework import status
 
 from engram.access.models import (
     ApiKey,
@@ -25,6 +26,7 @@ from engram.access.services import (
     hash_api_key,
 )
 from engram.console.exceptions import LastOwnerError
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
     AuditResult,
@@ -218,8 +220,9 @@ def remove_member(membership: OrganizationMembership) -> OrganizationMembership:
     return membership
 
 
-class CapabilityWideningError(Exception):
-    pass
+class CapabilityWideningError(DomainError):
+    default_error_code = 'capability_widening'
+    default_status_code = status.HTTP_400_BAD_REQUEST
 
 
 def _issuer_can_grant(
@@ -313,11 +316,12 @@ def revoke_api_key(api_key: ApiKey) -> ApiKey:
 REVIEW_LOW_CONFIDENCE_THRESHOLD = '0.300'
 
 
-class MemoryReviewError(Exception):
+class MemoryReviewError(DomainError):
     def __init__(self, code: str, message: str, status: int = 400) -> None:
-        super().__init__(message)
+        super().__init__(message, error_code=code, status_code=status)
 
         self.code = code
+        self.status = status
 
         self.status = status
 

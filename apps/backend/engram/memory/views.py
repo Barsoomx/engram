@@ -10,8 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
-from engram.access.services import AccessDeniedError, EffectiveScope
-from engram.context.views import access_error_response
+from engram.access.services import EffectiveScope
 from engram.core.models import MemoryLink
 from engram.core.redaction import redact_value
 from engram.memory.serializers import (
@@ -27,7 +26,6 @@ from engram.memory.services import (
     MemoryFeedbackError,
     MemoryFeedbackInput,
     MemoryLinkInput,
-    MemoryVersionError,
     RecordMemoryFeedback,
     RecordMemoryLink,
     ResolveMemoryDiff,
@@ -36,9 +34,6 @@ from engram.memory.services import (
 )
 
 MEMORY_FEEDBACK_STATUS = {
-    'memory_not_found': status.HTTP_404_NOT_FOUND,
-}
-MEMORY_VERSION_STATUS = {
     'memory_not_found': status.HTTP_404_NOT_FOUND,
 }
 MEMORY_DIFF_STATUS = {
@@ -66,8 +61,6 @@ class MemoryFeedbackView(APIView):
                 request_id=data['request_id'],
             )
             result = RecordMemoryFeedback().execute(self._input(memory_id, data, scope))
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except MemoryFeedbackError as error:
             return Response(
                 {'code': error.code, 'detail': str(error)},
@@ -97,35 +90,27 @@ class MemoryVersionView(APIView):
         serializer = MemoryVersionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = resolve_request_scope(
-                request,
-                required_capability='memories:review',
+        scope = resolve_request_scope(
+            request,
+            required_capability='memories:review',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='memory',
+            target_id=str(memory_id),
+            request_id=data['request_id'],
+        )
+        result = UpdateMemoryBody().execute(
+            UpdateMemoryBodyInput(
+                scope=scope,
+                memory_id=memory_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='memory',
-                target_id=str(memory_id),
+                body=data['body'],
+                reason=data.get('reason', ''),
                 request_id=data['request_id'],
-            )
-            result = UpdateMemoryBody().execute(
-                UpdateMemoryBodyInput(
-                    scope=scope,
-                    memory_id=memory_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    body=data['body'],
-                    reason=data.get('reason', ''),
-                    request_id=data['request_id'],
-                    correlation_id=data.get('correlation_id', ''),
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except MemoryVersionError as error:
-            return Response(
-                {'code': error.code, 'detail': str(error)},
-                status=MEMORY_VERSION_STATUS.get(error.code, status.HTTP_400_BAD_REQUEST),
-            )
+                correlation_id=data.get('correlation_id', ''),
+            ),
+        )
 
         return Response(result.to_response())
 
@@ -138,17 +123,14 @@ class MemoryLinksView(APIView):
         serializer = MemoryLinkQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = resolve_request_scope(
-                request,
-                required_capability='memories:read',
-                project_id=data['project_id'],
-                team_id=data.get('team_id'),
-                target_type='memory_link',
-                target_id=str(memory_id),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = resolve_request_scope(
+            request,
+            required_capability='memories:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='memory_link',
+            target_id=str(memory_id),
+        )
 
         links = list(
             MemoryLink.objects.filter(
@@ -166,36 +148,28 @@ class MemoryLinksView(APIView):
         serializer = MemoryLinkSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
-        try:
-            scope = resolve_request_scope(
-                request,
-                required_capability='memories:review',
+        scope = resolve_request_scope(
+            request,
+            required_capability='memories:review',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='memory_link',
+            target_id=str(memory_id),
+            request_id=data['request_id'],
+        )
+        result = RecordMemoryLink().execute(
+            MemoryLinkInput(
+                scope=scope,
+                memory_id=memory_id,
                 project_id=data['project_id'],
                 team_id=data.get('team_id'),
-                target_type='memory_link',
-                target_id=str(memory_id),
+                link_type=data['link_type'],
+                target=data['target'],
+                label=data.get('label', ''),
                 request_id=data['request_id'],
-            )
-            result = RecordMemoryLink().execute(
-                MemoryLinkInput(
-                    scope=scope,
-                    memory_id=memory_id,
-                    project_id=data['project_id'],
-                    team_id=data.get('team_id'),
-                    link_type=data['link_type'],
-                    target=data['target'],
-                    label=data.get('label', ''),
-                    request_id=data['request_id'],
-                    correlation_id=data.get('correlation_id', ''),
-                ),
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
-        except MemoryVersionError as error:
-            return Response(
-                {'code': error.code, 'detail': str(error)},
-                status=status.HTTP_404_NOT_FOUND if error.code == 'memory_not_found' else status.HTTP_400_BAD_REQUEST,
-            )
+                correlation_id=data.get('correlation_id', ''),
+            ),
+        )
 
         return Response(
             result.to_response(),
@@ -236,8 +210,6 @@ class MemoryDiffView(APIView):
                     to_version=data['to_version'],
                 ),
             )
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except MemoryDiffError as error:
             return Response(
                 {'code': error.code, 'detail': str(error)},

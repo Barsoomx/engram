@@ -11,8 +11,6 @@ from rest_framework.views import APIView
 
 from engram.access.models import ApiKey, Identity
 from engram.access.request_scope import resolve_request_scope
-from engram.access.services import AccessDeniedError
-from engram.context.views import access_error_response
 from engram.core.models import (
     AuditEvent,
     ContextBundle,
@@ -81,11 +79,8 @@ class MemoryInspectionListView(InspectionBaseView):
     target_type = 'memory'
 
     def get(self, request: Request) -> Response:
-        try:
-            inspection_scope = self._inspection_scope(request, 'list')
-            qs = ListInspectionMemories().execute(inspection_scope)
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        inspection_scope = self._inspection_scope(request, 'list')
+        qs = ListInspectionMemories().execute(inspection_scope)
 
         total = qs.count()
         limit = inspection_scope.limit
@@ -100,11 +95,8 @@ class MemoryInspectionCountView(InspectionBaseView):
     target_type = 'memory'
 
     def get(self, request: Request) -> Response:
-        try:
-            inspection_scope = self._inspection_scope(request, 'count')
-            count = ListInspectionMemories().count(inspection_scope)
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        inspection_scope = self._inspection_scope(request, 'count')
+        count = ListInspectionMemories().count(inspection_scope)
 
         return Response({'count': count})
 
@@ -117,8 +109,6 @@ class MemoryInspectionDetailView(InspectionBaseView):
         try:
             inspection_scope = self._inspection_scope(request, str(memory_id))
             memory = ListInspectionMemories().detail(inspection_scope, memory_id)
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except InspectionNotFoundError as error:
             return not_found_response(error)
 
@@ -130,11 +120,8 @@ class ContextBundleInspectionListView(InspectionBaseView):
     target_type = 'context_bundle'
 
     def get(self, request: Request) -> Response:
-        try:
-            inspection_scope = self._inspection_scope(request, 'list')
-            qs = ListInspectionContextBundles().execute(inspection_scope)
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        inspection_scope = self._inspection_scope(request, 'list')
+        qs = ListInspectionContextBundles().execute(inspection_scope)
 
         total = qs.count()
         limit = inspection_scope.limit
@@ -151,8 +138,6 @@ class ContextBundleInspectionDetailView(InspectionBaseView):
     def get(self, request: Request, bundle_id: uuid.UUID) -> Response:
         try:
             bundle = ListInspectionContextBundles().detail(self._inspection_scope(request, str(bundle_id)), bundle_id)
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except InspectionNotFoundError as error:
             return not_found_response(error)
 
@@ -164,11 +149,8 @@ class AuditEventInspectionListView(InspectionBaseView):
     target_type = 'audit_event'
 
     def get(self, request: Request) -> Response:
-        try:
-            inspection_scope = self._inspection_scope(request, 'list')
-            qs = ListInspectionAuditEvents().execute(inspection_scope)
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        inspection_scope = self._inspection_scope(request, 'list')
+        qs = ListInspectionAuditEvents().execute(inspection_scope)
 
         total = qs.count()
         limit = inspection_scope.limit
@@ -194,8 +176,6 @@ class AuditEventInspectionDetailView(InspectionBaseView):
         try:
             inspection_scope = self._inspection_scope(request, str(audit_event_id))
             ae = ListInspectionAuditEvents().detail(inspection_scope, audit_event_id)
-        except AccessDeniedError as error:
-            return access_error_response(error)
         except InspectionNotFoundError as error:
             return not_found_response(error)
 

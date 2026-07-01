@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
+from rest_framework import status
 
 from engram.access.models import (
     ApiKey,
@@ -18,6 +19,7 @@ from engram.access.models import (
     TeamMembership,
 )
 from engram.access.organization_access import organization_access_blocked
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import AuditEvent, AuditResult, Project, ProjectTeam, Team
 
 API_KEY_PREFIX_LENGTH = 12
@@ -49,9 +51,31 @@ class EffectiveScope:
     actor_id: str
 
 
-class AccessDeniedError(Exception):
+ACCESS_STATUS = {
+    'invalid_key': status.HTTP_401_UNAUTHORIZED,
+    'inactive_key': status.HTTP_403_FORBIDDEN,
+    'revoked_key': status.HTTP_403_FORBIDDEN,
+    'expired_key': status.HTTP_403_FORBIDDEN,
+    'inactive_owner': status.HTTP_403_FORBIDDEN,
+    'missing_capability': status.HTTP_403_FORBIDDEN,
+    'project_scope_denied': status.HTTP_403_FORBIDDEN,
+    'team_scope_denied': status.HTTP_403_FORBIDDEN,
+    'invalid_session': status.HTTP_401_UNAUTHORIZED,
+    'organization_required': status.HTTP_400_BAD_REQUEST,
+    'organization_not_found': status.HTTP_404_NOT_FOUND,
+    'not_a_member': status.HTTP_403_FORBIDDEN,
+    'organization_suspended': status.HTTP_403_FORBIDDEN,
+    'missing_api_key': status.HTTP_401_UNAUTHORIZED,
+}
+
+
+class AccessDeniedError(DomainError):
     def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=ACCESS_STATUS.get(code, status.HTTP_401_UNAUTHORIZED),
+        )
         self.code = code
 
 

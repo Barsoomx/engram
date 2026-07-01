@@ -18,7 +18,6 @@ from engram.console.serializers.api_keys import (
     ApiKeyReadSerializer,
 )
 from engram.console.services import (
-    CapabilityWideningError,
     _issuer_can_grant,
     audit_admin_action,
     issue_api_key,
@@ -94,16 +93,10 @@ class ApiKeyViewSet(
                 status=HTTP_400_BAD_REQUEST,
             )
 
-        try:
-            _issuer_can_grant(
-                requested_capabilities,
-                request.effective_scope.capabilities,
-            )
-        except CapabilityWideningError as error:
-            return Response(
-                {'detail': str(error), 'code': 'capability_widening'},
-                status=HTTP_400_BAD_REQUEST,
-            )
+        _issuer_can_grant(
+            requested_capabilities,
+            request.effective_scope.capabilities,
+        )
 
         api_key, plaintext = issue_api_key(
             organization=request.active_organization,

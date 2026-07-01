@@ -116,6 +116,7 @@ def build_domain_error_payload(exc: DomainError) -> dict[str, Any]:
     response_data: dict[str, Any] = {'detail': _get_error_detail(exc)}
     if error_code is not None:
         response_data['error_code'] = error_code
+        response_data['code'] = error_code
     for field_name, field_type in MANAGER_DOMAIN_EXTRA_FIELDS.items():
         value = getattr(exc, field_name, None)
         if isinstance(value, field_type):

@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -49,8 +50,8 @@ except ImportError:
 logger = structlog.get_logger(__name__)
 
 
-class ContextIndexError(Exception):
-    pass
+class ContextIndexError(DomainError):
+    default_error_code = 'context_index_error'
 
 
 @dataclass(frozen=True)

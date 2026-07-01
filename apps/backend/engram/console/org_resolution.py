@@ -4,6 +4,7 @@ import uuid
 from typing import Any
 
 from django.contrib.auth.models import User
+from rest_framework import status
 from rest_framework.permissions import BasePermission
 
 from engram.access.auth_services import (
@@ -13,17 +14,20 @@ from engram.access.auth_services import (
 )
 from engram.access.models import Identity, IdentityType, OrganizationMembership
 from engram.access.organization_access import organization_access_blocked
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import Organization
 
 ORGANIZATION_HEADER = 'HTTP_X_ENGRAM_ORGANIZATION'
 
 
-class OrganizationRequiredError(Exception):
-    pass
+class OrganizationRequiredError(DomainError):
+    default_error_code = 'organization_required'
+    default_status_code = status.HTTP_400_BAD_REQUEST
 
 
-class OrganizationNotMemberError(Exception):
-    pass
+class OrganizationNotMemberError(DomainError):
+    default_error_code = 'not_a_member'
+    default_status_code = status.HTTP_403_FORBIDDEN
 
 
 def resolve_active_organization(request: Any) -> Organization:

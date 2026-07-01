@@ -78,14 +78,7 @@ class MemoryReviewViewSet(
         ]
 
     def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        try:
-            items = list(self._reviewable_items(request))
-
-        except MemoryReviewError as error:
-            return Response(
-                {'code': error.code, 'detail': str(error)},
-                status=error.status,
-            )
+        items = list(self._reviewable_items(request))
 
         page = self._paginate(request, items)
 
@@ -173,21 +166,14 @@ class MemoryReviewViewSet(
 
         reason = data['reason']
 
-        try:
-            result = self._apply_action(
-                organization=organization,
-                actor_identity=actor_identity,
-                item_id=item_id,
-                action_name=action_name,
-                data=data,
-                reason=reason,
-            )
-
-        except MemoryReviewError as error:
-            return Response(
-                {'code': error.code, 'detail': str(error)},
-                status=error.status,
-            )
+        result = self._apply_action(
+            organization=organization,
+            actor_identity=actor_identity,
+            item_id=item_id,
+            action_name=action_name,
+            data=data,
+            reason=reason,
+        )
 
         return Response(result, status=HTTP_200_OK)
 
