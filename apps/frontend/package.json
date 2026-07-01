@@ -25,6 +25,7 @@
     "zustand": "^5.0.14"
   },
   "devDependencies": {
+    "@codecov/nextjs-webpack-plugin": "^2.0.1",
     "@eslint/eslintrc": "^3.3.1",
     "@types/node": "20.14.10",
     "@types/react": "18.3.3",
