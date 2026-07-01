@@ -18,6 +18,11 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
 )
+from engram.inspection.filters import (
+    InspectionAuditEventFilterSet,
+    InspectionContextBundleFilterSet,
+    InspectionMemoryFilterSet,
+)
 
 
 class InspectionNotFoundError(Exception):
@@ -72,12 +77,9 @@ class ResolveInspectionScope:
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
         qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
-        if inspection_scope.status:
-            qs = qs.filter(status=inspection_scope.status)
-        if inspection_scope.kind:
-            qs = qs.filter(kind=inspection_scope.kind)
+        filter_data = {'status': inspection_scope.status, 'kind': inspection_scope.kind}
 
-        return qs
+        return InspectionMemoryFilterSet(data=filter_data, queryset=qs).qs
 
     def detail(self, inspection_scope: InspectionScope, memory_id: uuid.UUID) -> Memory:
         memory = self._base_queryset(inspection_scope).filter(id=memory_id).first()
@@ -181,12 +183,9 @@ class ListInspectionMemories:
 class ListInspectionContextBundles:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[ContextBundle]:
         qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
-        if inspection_scope.since:
-            qs = qs.filter(created_at__gte=inspection_scope.since)
-        if inspection_scope.until:
-            qs = qs.filter(created_at__lt=inspection_scope.until)
+        filter_data = {'since': inspection_scope.since, 'until': inspection_scope.until}
 
-        return qs
+        return InspectionContextBundleFilterSet(data=filter_data, queryset=qs).qs
 
     def detail(self, inspection_scope: InspectionScope, bundle_id: uuid.UUID) -> ContextBundle:
         bundle = self._base_queryset(inspection_scope).filter(id=bundle_id).first()
@@ -231,16 +230,14 @@ class ListInspectionAuditEvents:
             )
             .order_by('created_at', 'id')
         )
-        if inspection_scope.event_type:
-            qs = qs.filter(event_type=inspection_scope.event_type)
-        if inspection_scope.correlation_id:
-            qs = qs.filter(correlation_id=inspection_scope.correlation_id)
-        if inspection_scope.since:
-            qs = qs.filter(created_at__gte=inspection_scope.since)
-        if inspection_scope.until:
-            qs = qs.filter(created_at__lt=inspection_scope.until)
+        filter_data = {
+            'event_type': inspection_scope.event_type,
+            'correlation_id': inspection_scope.correlation_id,
+            'since': inspection_scope.since,
+            'until': inspection_scope.until,
+        }
 
-        return qs
+        return InspectionAuditEventFilterSet(data=filter_data, queryset=qs).qs
 
     def detail(self, inspection_scope: InspectionScope, audit_event_id: uuid.UUID) -> AuditEvent:
         ae = (

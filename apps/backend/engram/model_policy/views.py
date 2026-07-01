@@ -14,6 +14,7 @@ from rest_framework.views import APIView
 from engram.access.request_scope import resolve_request_scope
 from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.context.views import access_error_response
+from engram.model_policy.filters import ModelPolicyFilterSet
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
@@ -287,9 +288,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
             return access_error_response(error)
 
         policies = scoped_policies(scope)
-        task_type = data.get('task_type')
-        if task_type:
-            policies = policies.filter(task_type=task_type)
+        policies = ModelPolicyFilterSet(data=request.query_params, queryset=policies).qs
 
         limit = data.get('limit', 50)
         offset = data.get('offset', 0)

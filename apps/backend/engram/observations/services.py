@@ -7,6 +7,7 @@ from datetime import datetime
 from engram.access.services import EffectiveScope
 from engram.core.models import Observation, Organization, Project
 from engram.core.redaction import redact_value
+from engram.observations.filters import ObservationFilterSet
 
 
 @dataclass(frozen=True)
@@ -73,18 +74,15 @@ class ListObservations:
         organization = Organization.objects.get(id=data.scope.organization_id)
         project = Project.objects.get(organization=organization, id=data.project_id)
         queryset = Observation.objects.filter(organization=organization, project=project)
-        if data.team_id is not None:
-            queryset = queryset.filter(team_id=data.team_id)
-        if data.observation_type:
-            queryset = queryset.filter(observation_type=data.observation_type)
-        if data.session_id is not None:
-            queryset = queryset.filter(session_id=data.session_id)
-        if data.since is not None:
-            queryset = queryset.filter(created_at__gte=data.since)
-        if data.until is not None:
-            queryset = queryset.filter(created_at__lt=data.until)
-        if data.correlation_id:
-            queryset = queryset.filter(raw_event__correlation_id=data.correlation_id)
+        filter_data = {
+            'team_id': data.team_id,
+            'observation_type': data.observation_type,
+            'session_id': data.session_id,
+            'since': data.since,
+            'until': data.until,
+            'correlation_id': data.correlation_id,
+        }
+        queryset = ObservationFilterSet(data=filter_data, queryset=queryset).qs
 
         offset = data.offset
         limit = data.limit
