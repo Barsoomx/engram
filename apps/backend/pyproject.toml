@@ -6,7 +6,7 @@ python = "3.12.*"
 Django = "^5.2"
 djangorestframework = "^3.16.0"
 django-filter = "^25.1"
-drf-spectacular = "^0.28.0"
+drf-spectacular = "^0.29.0"
 psycopg = {extras = ["binary"], version = "^3.2.6"}
 redis = {extras = ["hiredis"], version = "^5.2.1"}
 celery = "^5.5.3"
@@ -23,9 +23,9 @@ django-cors-headers = "^4.9.0"
 pgvector = "^0.4.2"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^9.0.3"
+pytest = "^9.1.1"
 pytest-django = "^4.11.1"
-ruff = "^0.11.7"
+ruff = "^0.15.20"
 
 [tool.ruff]
 line-length = 120

@@ -1,30 +1,53 @@
 version: 2
 updates:
+  # --- GitHub Actions: one grouped PR (keeps codeql-action init+analyze bumping together) ---
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
 
-  # Frontend (Next.js / React / TypeScript)
+  # --- Frontend (npm): minor/patch grouped into one PR; majors come as separate PRs (visible,
+  #     decide per-case: Next/Tailwind/TypeScript majors need a real migration). 7d cooldown. ---
   - package-ecosystem: npm
     directory: /apps/frontend
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    groups:
+      frontend:
+        update-types: ["minor", "patch"]
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 8
 
-  # Backend (Python / Poetry — pyproject.toml + poetry.lock)
+  # --- Backend (pip/poetry): minor/patch grouped; majors separate. 7d cooldown. ---
   - package-ecosystem: pip
     directory: /apps/backend
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+    groups:
+      backend:
+        update-types: ["minor", "patch"]
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 8
 
-  # Container base images
+  # --- Container base images: pin the language version (python/node) — bump majors/minors
+  #     deliberately, not automatically. Only patch (security) bumps flow through. 7d cooldown. ---
   - package-ecosystem: docker
     directories:
       - /apps/backend
       - /apps/frontend
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
