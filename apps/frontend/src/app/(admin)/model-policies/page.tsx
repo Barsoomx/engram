@@ -29,10 +29,12 @@ import {
   disableModelPolicy,
   genRequestId,
   listModelPolicies,
+  listProviderSecrets,
   POLICY_TASK_TYPES,
   resolveModelPolicy,
   SECRET_PROVIDERS,
   type ModelPolicy,
+  type ProviderSecret,
   type ModelPolicyCreateInput,
   type PolicyScope,
   type PolicyTaskType,
@@ -245,6 +247,8 @@ interface CreatePolicyModalProps {
   isOpen: boolean;
   isPending: boolean;
   error: string | null;
+  projectId: string | null;
+  teamId: string | null;
   onClose: () => void;
   onSubmit: (input: {
     name: string;
@@ -261,6 +265,8 @@ function CreatePolicyModal({
   isOpen,
   isPending,
   error,
+  projectId,
+  teamId,
   onClose,
   onSubmit,
 }: CreatePolicyModalProps) {
@@ -283,6 +289,24 @@ function CreatePolicyModal({
       setBaseUrl('');
     }
   }, [isOpen]);
+
+  const secretsQuery = useQuery({
+    queryKey: ['model-policy', 'secrets', projectId, teamId],
+    queryFn: () => listProviderSecrets({ projectId: projectId ?? '', teamId }),
+    enabled: isOpen && Boolean(projectId),
+  });
+
+  const providerSecrets = React.useMemo(
+    () =>
+      (secretsQuery.data ?? []).filter(
+        (secret) => secret.provider === provider && secret.active,
+      ),
+    [secretsQuery.data, provider],
+  );
+
+  React.useEffect(() => {
+    setSecretId('');
+  }, [provider]);
 
   const canSubmit =
     name.trim().length > 0 &&
@@ -404,16 +428,29 @@ function CreatePolicyModal({
                     classNames={{ input: 'font-mono text-xs' }}
                   />
                 </div>
-                <Input
-                  label='Secret ID'
+                <Select
+                  label='Provider secret'
                   labelPlacement='outside'
-                  placeholder='Paste a provider secret id'
-                  value={secretId}
-                  onValueChange={setSecretId}
-                  isDisabled={isPending}
-                  description='Reference an existing provider secret by its id.'
-                  classNames={{ input: 'font-mono text-xs' }}
-                />
+                  items={providerSecrets}
+                  selectedKeys={secretId ? new Set([secretId]) : new Set()}
+                  isDisabled={isPending || providerSecrets.length === 0}
+                  description={
+                    providerSecrets.length === 0
+                      ? `No active ${PROVIDER_LABELS[provider]} secret — add one on the Secrets page first.`
+                      : 'Choose an existing provider secret for the selected provider.'
+                  }
+                  onSelectionChange={(keys) => {
+                    const next = Array.from(keys)[0];
+
+                    if (typeof next === 'string') {
+                      setSecretId(next);
+                    }
+                  }}
+                >
+                  {(secret: ProviderSecret) => (
+                    <SelectItem key={secret.id}>{secret.name}</SelectItem>
+                  )}
+                </Select>
                 <Input
                   label='Base URL (optional)'
                   labelPlacement='outside'
@@ -903,6 +940,8 @@ export default function ModelPoliciesPage() {
             isOpen={createOpen}
             isPending={createMutation.isPending}
             error={createError}
+            projectId={activeProjectId}
+            teamId={activeTeamId}
             onClose={() => setCreateOpen(false)}
             onSubmit={handleCreate}
           />
