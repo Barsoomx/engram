@@ -172,6 +172,8 @@ services:
       RABBITMQ_DEFAULT_USER: engram
       RABBITMQ_DEFAULT_PASS: engram
       RABBITMQ_DEFAULT_VHOST: engram
+    volumes:
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-engram.conf:ro
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
