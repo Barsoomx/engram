@@ -6,7 +6,6 @@ import clsx from 'clsx';
 import {
   Activity,
   AlertTriangle,
-  ChevronDown,
   Cpu,
   Database,
   LogOut,
@@ -25,7 +24,7 @@ import {
   useRetrievalSettings,
   useUpdateRetrievalSettings,
 } from '@/hooks/use-settings';
-import { apiClient, clearToken, fetchMe, logout, type MeResponse } from '@/lib/auth';
+import { apiClient, clearToken, fetchMe, hasCapability, logout, type MeResponse } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import type { PurgeResult, RetrievalSettings } from '@/lib/settings-api';
@@ -122,13 +121,12 @@ function InfoRow({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
-function FauxField({ label, value }: { label: string; value: string }) {
+function ReadOnlyField({ label, value }: { label: string; value: string }) {
   return (
     <div className='space-y-1.5'>
       <Eyebrow>{label}</Eyebrow>
-      <div className='flex h-10 items-center justify-between gap-2 rounded-[10px] border border-divider-strong bg-content2 px-3 text-[13px] text-default-700'>
+      <div className='flex h-10 items-center rounded-[10px] border border-divider bg-content2/60 px-3 text-[13px] text-default-700'>
         <span className='truncate'>{value}</span>
-        <ChevronDown size={15} strokeWidth={1.8} className='shrink-0 text-default-400' />
       </div>
     </div>
   );
@@ -247,6 +245,7 @@ export default function SettingsPage() {
 
   const profile = meQuery.data;
   const health = healthQuery.data;
+  const canPurge = hasCapability(profile?.capabilities ?? [], 'memories:admin');
 
   const healthState = healthQuery.isLoading ? 'checking' : health?.ok ? 'healthy' : 'unhealthy';
   const healthColor =
@@ -355,11 +354,11 @@ export default function SettingsPage() {
           description='Embedding provider used to index and retrieve memories.'
         >
           <div className='grid gap-3 sm:grid-cols-2'>
-            <FauxField
+            <ReadOnlyField
               label='Provider'
               value={embeddingQuery.isLoading ? '…' : embedding?.provider ?? 'Not configured'}
             />
-            <FauxField
+            <ReadOnlyField
               label='Model'
               value={embeddingQuery.isLoading ? '…' : embedding?.model ?? 'Not configured'}
             />
@@ -420,7 +419,8 @@ export default function SettingsPage() {
         </SettingsCard>
       </div>
 
-      <div className='rounded-[16px] border border-danger/25 bg-danger/[0.04] p-[22px]'>
+      {canPurge && (
+        <div className='rounded-[16px] border border-danger/25 bg-danger/[0.04] p-[22px]'>
         <div className='flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between'>
           <div className='flex items-start gap-3'>
             <div className='flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px] bg-danger/10 text-danger'>
@@ -499,7 +499,8 @@ export default function SettingsPage() {
             {purgeResult.retrieval_documents.toLocaleString()} retrieval documents.
           </div>
         )}
-      </div>
+        </div>
+      )}
     </section>
   );
 }

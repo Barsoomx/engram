@@ -1,9 +1,10 @@
 'use client';
 
+import { useQuery } from '@tanstack/react-query';
 import * as React from 'react';
 
 import { EmptyState } from '@/components/ui/empty-state';
-import { hasCapability } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 
 export interface CapabilityGateProps {
   capabilities: string[];
@@ -18,13 +19,21 @@ export function CapabilityGate({
   children,
   fallback,
 }: CapabilityGateProps) {
-  const allowed = hasCapability(capabilities, required);
+  const meQuery = useQuery<MeResponse>({
+    queryKey: ['auth', 'me'],
+    queryFn: fetchMe,
+  });
 
-  if (!allowed) {
+  if (meQuery.isPending) {
 
-    return (
-      <>{fallback ?? <EmptyState title='Insufficient permissions' />}</>
-    );
+    return null;
+  }
+
+  const resolved = meQuery.data?.capabilities ?? capabilities;
+
+  if (!hasCapability(resolved, required)) {
+
+    return <>{fallback ?? <EmptyState title='Insufficient permissions' />}</>;
   }
 
   return <>{children}</>;
