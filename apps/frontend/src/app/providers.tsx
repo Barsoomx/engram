@@ -7,9 +7,6 @@ import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { getToken } from '@/lib/auth';
-import { useOrgStore } from '@/lib/org-store';
-import { useProjectStore } from '@/lib/project-store';
-import { useTeamStore } from '@/lib/team-store';
 
 export interface ProvidersProps {
   children: React.ReactNode;
@@ -29,9 +26,6 @@ export function Providers({ children }: ProvidersProps) {
       }),
   );
 
-  const activeOrgId = useOrgStore((state) => state.activeOrgId);
-  const activeProjectId = useProjectStore((state) => state.activeProjectId);
-  const activeTeamId = useTeamStore((state) => state.activeTeamId);
   const [activeToken, setActiveToken] = React.useState<string | null>(null);
 
   React.useEffect(() => {
@@ -44,15 +38,17 @@ export function Providers({ children }: ProvidersProps) {
     };
 
     window.addEventListener('storage', syncToken);
+    window.addEventListener('engram:token', syncToken);
 
     return () => {
       window.removeEventListener('storage', syncToken);
+      window.removeEventListener('engram:token', syncToken);
     };
   }, []);
 
   React.useEffect(() => {
     queryClient.clear();
-  }, [activeOrgId, activeProjectId, activeTeamId, activeToken, queryClient]);
+  }, [activeToken, queryClient]);
 
   return (
     <HeroUIProvider navigate={router.push}>

@@ -21,6 +21,8 @@ import {
   type MeResponse,
 } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 function FullPageLoader() {
   return (
@@ -88,26 +90,33 @@ export default function AdminShellLayout({
     }
   }, [hasToken, router]);
 
+  const clearSession = React.useCallback(() => {
+    clearToken();
+    useOrgStore.getState().setActiveOrg(null);
+    useProjectStore.getState().setActiveProject(null);
+    useTeamStore.getState().setActiveTeam(null);
+    setHasToken(false);
+  }, []);
+
   React.useEffect(() => {
     if (
       meQuery.isError &&
       axios.isAxiosError(meQuery.error) &&
-      meQuery.error.response?.status === 401
+      (meQuery.error.response?.status === 401 ||
+        meQuery.error.response?.status === 403)
     ) {
-      clearToken();
-      setHasToken(false);
+      clearSession();
     }
-  }, [meQuery.isError, meQuery.error]);
+  }, [meQuery.isError, meQuery.error, clearSession]);
 
   const handleLogout = React.useCallback(async () => {
     try {
       await logout();
     } finally {
-      clearToken();
-      setHasToken(false);
+      clearSession();
       router.replace('/login');
     }
-  }, [router]);
+  }, [router, clearSession]);
 
   if (hasToken === null) {
     return <FullPageLoader />;
