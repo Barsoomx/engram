@@ -262,7 +262,7 @@ export default function MemoriesPage() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder='Search memories, tags, files…'
-            className='h-12 w-full bg-transparent text-[14px] text-foreground outline-none placeholder:text-default-400'
+            className='h-12 w-full bg-transparent text-[14px] text-foreground outline-hidden placeholder:text-default-400'
           />
         </div>
         <div className='flex flex-wrap gap-2'>

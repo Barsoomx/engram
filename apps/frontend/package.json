@@ -27,14 +27,14 @@
   "devDependencies": {
     "@codecov/nextjs-webpack-plugin": "^2.0.1",
     "@eslint/eslintrc": "^3.3.1",
+    "@tailwindcss/postcss": "^4.3.1",
     "@types/node": "24.13.2",
     "@types/react": "18.3.3",
     "@types/react-dom": "18.3.0",
-    "autoprefixer": "10.5.1",
     "eslint": "^9.39.1",
     "eslint-config-next": "^15.5.16",
     "postcss": "8.5.15",
-    "tailwindcss": "3.4.16",
+    "tailwindcss": "^4.3.1",
     "typescript": "5.5.3"
   }
 }

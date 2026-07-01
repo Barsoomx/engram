@@ -106,7 +106,7 @@ export function ProjectSwitcher() {
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder='Search projects…'
-                className='h-8 w-full bg-transparent text-[13px] text-foreground outline-none placeholder:text-default-400'
+                className='h-8 w-full bg-transparent text-[13px] text-foreground outline-hidden placeholder:text-default-400'
               />
             </div>
           </div>

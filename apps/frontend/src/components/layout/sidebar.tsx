@@ -175,7 +175,7 @@ function NavLink({
   return (
     <Link
       className={clsx(
-        'relative flex h-[38px] items-center gap-3 rounded-[9px] px-3 text-[13.5px] font-medium transition-colors duration-150 focus-visible:outline-none',
+        'relative flex h-[38px] items-center gap-3 rounded-[9px] px-3 text-[13.5px] font-medium transition-colors duration-150 focus-visible:outline-hidden',
         active
           ? 'bg-[color:var(--accent-soft)] text-foreground before:absolute before:-left-3 before:top-[9px] before:bottom-[9px] before:w-[3px] before:rounded-r before:bg-primary'
           : 'text-default-500 hover:bg-content2/60 hover:text-foreground',
