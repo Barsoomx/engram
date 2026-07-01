@@ -35,3 +35,4 @@ design_*
 
 # Local-only repository governance checks (pre-commit); not shipped in the repo
 .githooks/
+.claude/worktrees
