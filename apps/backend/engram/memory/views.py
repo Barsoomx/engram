@@ -11,13 +11,15 @@ from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
 from engram.access.services import EffectiveScope
-from engram.core.models import MemoryLink
+from engram.core.models import MemoryLink, MemoryVersion
 from engram.core.redaction import redact_value
 from engram.memory.serializers import (
     MemoryDiffQuerySerializer,
     MemoryFeedbackSerializer,
+    MemoryLinkDeleteSerializer,
     MemoryLinkQuerySerializer,
     MemoryLinkSerializer,
+    MemoryVersionQuerySerializer,
     MemoryVersionSerializer,
 )
 from engram.memory.services import (
@@ -28,6 +30,8 @@ from engram.memory.services import (
     MemoryLinkInput,
     RecordMemoryFeedback,
     RecordMemoryLink,
+    RemoveMemoryLink,
+    RemoveMemoryLinkInput,
     ResolveMemoryDiff,
     UpdateMemoryBody,
     UpdateMemoryBodyInput,
@@ -86,6 +90,31 @@ class MemoryVersionView(APIView):
     authentication_classes: list[type] = [TokenAuthentication]
     permission_classes: list[type] = []
 
+    def get(self, request: Request, memory_id: uuid.UUID) -> Response:
+        serializer = MemoryVersionQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        scope = resolve_request_scope(
+            request,
+            required_capability='memories:read',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='memory',
+            target_id=str(memory_id),
+        )
+
+        versions = list(
+            MemoryVersion.objects.filter(
+                organization_id=scope.organization_id,
+                project_id=data['project_id'],
+                memory_id=memory_id,
+            ).order_by('-version')
+        )
+
+        items = [self._version_response(version) for version in versions]
+
+        return Response({'count': len(items), 'items': items})
+
     def post(self, request: Request, memory_id: uuid.UUID) -> Response:
         serializer = MemoryVersionSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -113,6 +142,16 @@ class MemoryVersionView(APIView):
         )
 
         return Response(result.to_response())
+
+    def _version_response(self, version: MemoryVersion) -> dict[str, object]:
+        return {
+            'version': version.version,
+            'body': str(redact_value(version.body).value),
+            'content_hash': version.content_hash,
+            'source_observation_id': str(version.source_observation_id) if version.source_observation_id else None,
+            'source_metadata': redact_value(version.source_metadata).value,
+            'created_at': version.created_at.isoformat() if version.created_at else None,
+        }
 
 
 class MemoryLinksView(APIView):
@@ -175,6 +214,37 @@ class MemoryLinksView(APIView):
             result.to_response(),
             status=status.HTTP_201_CREATED if result.created else status.HTTP_200_OK,
         )
+
+    def delete(self, request: Request, memory_id: uuid.UUID) -> Response:
+        payload: dict[str, Any] = {}
+        payload.update(request.query_params.dict())
+        if isinstance(request.data, dict):
+            payload.update(request.data)
+        serializer = MemoryLinkDeleteSerializer(data=payload)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        scope = resolve_request_scope(
+            request,
+            required_capability='memories:review',
+            project_id=data['project_id'],
+            team_id=data.get('team_id'),
+            target_type='memory_link',
+            target_id=str(memory_id),
+            request_id=data['request_id'],
+        )
+        result = RemoveMemoryLink().execute(
+            RemoveMemoryLinkInput(
+                scope=scope,
+                memory_id=memory_id,
+                project_id=data['project_id'],
+                team_id=data.get('team_id'),
+                link_id=data['link_id'],
+                request_id=data['request_id'],
+                correlation_id=data.get('correlation_id', ''),
+            ),
+        )
+
+        return Response(result.to_response())
 
     def _link_response(self, link: MemoryLink) -> dict[str, object]:
         return {

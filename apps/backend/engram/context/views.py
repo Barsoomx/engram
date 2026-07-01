@@ -62,9 +62,5 @@ class SessionStartContextView(ContextView):
     purpose = 'session_start'
 
 
-class TaskContextView(ContextView):
-    purpose = 'task'
-
-
 class UserPromptSubmitContextView(ContextView):
     purpose = 'user_prompt_submit'
