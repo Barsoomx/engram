@@ -23,7 +23,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createProviderSecret,
   disableProviderSecret,
@@ -537,6 +537,7 @@ export default function SecretsPage() {
     () => meQuery.data?.capabilities ?? [],
     [meQuery.data?.capabilities],
   );
+  const canManageSecrets = hasCapability(capabilities, 'secrets:*');
 
   const secretsQuery = useQuery<ProviderSecret[]>({
     queryKey: ['model-policy', 'secrets', activeProjectId, activeTeamId],
@@ -730,19 +731,21 @@ export default function SecretsPage() {
   const items = secretsQuery.data ?? [];
 
   return (
-    <CapabilityGate capabilities={capabilities} required='secrets:*'>
+    <CapabilityGate capabilities={capabilities} required='secrets:read'>
       <section className='space-y-6'>
         <PageHeader
           title='Secrets'
           subtitle='Provider API keys used for model calls.'
           actions={
-            <PrimaryButton
-              startContent={<Plus className='h-4 w-4' />}
-              onPress={openAdd}
-              isDisabled={!meLoaded}
-            >
-              Add secret
-            </PrimaryButton>
+            canManageSecrets ? (
+              <PrimaryButton
+                startContent={<Plus className='h-4 w-4' />}
+                onPress={openAdd}
+                isDisabled={!meLoaded}
+              >
+                Add secret
+              </PrimaryButton>
+            ) : undefined
           }
         />
 
@@ -763,12 +766,14 @@ export default function SecretsPage() {
             description='Add a provider API key to enable model calls for this scope.'
             icon={<KeyRound className='h-6 w-6' />}
             action={
-              <PrimaryButton
-                startContent={<Plus className='h-4 w-4' />}
-                onPress={openAdd}
-              >
-                Add secret
-              </PrimaryButton>
+              canManageSecrets ? (
+                <PrimaryButton
+                  startContent={<Plus className='h-4 w-4' />}
+                  onPress={openAdd}
+                >
+                  Add secret
+                </PrimaryButton>
+              ) : undefined
             }
           />
         ) : (

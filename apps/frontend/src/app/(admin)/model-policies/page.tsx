@@ -23,7 +23,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createModelPolicy,
   disableModelPolicy,
@@ -668,6 +668,7 @@ export default function ModelPoliciesPage() {
     () => meQuery.data?.capabilities ?? [],
     [meQuery.data?.capabilities],
   );
+  const canManagePolicies = hasCapability(capabilities, 'model_policy:*');
 
   const queryClient = useQueryClient();
 
@@ -815,7 +816,7 @@ export default function ModelPoliciesPage() {
   const items = policiesQuery.data ?? [];
 
   return (
-    <CapabilityGate capabilities={capabilities} required='model_policy:*'>
+    <CapabilityGate capabilities={capabilities} required='model_policy:read'>
       {!activeProjectId ? (
         <section className='space-y-6'>
           <PageHeader
@@ -834,13 +835,15 @@ export default function ModelPoliciesPage() {
             title='Model Policies'
             subtitle='Which model serves each task type.'
             actions={
-              <PrimaryButton
-                startContent={<Plus className='h-4 w-4' />}
-                onPress={openCreate}
-                isDisabled={!meLoaded}
-              >
-                New policy
-              </PrimaryButton>
+              canManagePolicies ? (
+                <PrimaryButton
+                  startContent={<Plus className='h-4 w-4' />}
+                  onPress={openCreate}
+                  isDisabled={!meLoaded}
+                >
+                  New policy
+                </PrimaryButton>
+              ) : undefined
             }
           />
 
@@ -861,12 +864,14 @@ export default function ModelPoliciesPage() {
               description='Create a policy to route a task type to a specific provider and model.'
               icon={<Cpu className='h-6 w-6' />}
               action={
-                <PrimaryButton
-                  startContent={<Plus className='h-4 w-4' />}
-                  onPress={openCreate}
-                >
-                  New policy
-                </PrimaryButton>
+                canManagePolicies ? (
+                  <PrimaryButton
+                    startContent={<Plus className='h-4 w-4' />}
+                    onPress={openCreate}
+                  >
+                    New policy
+                  </PrimaryButton>
+                ) : undefined
               }
             />
           ) : (
