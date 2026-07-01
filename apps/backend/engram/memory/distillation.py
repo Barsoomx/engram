@@ -195,6 +195,7 @@ class DistillSession:
             locked_session = self._lock_session(data.session_id)
             threshold = resolve_auto_approve_threshold(locked_session.organization, data.auto_approve_threshold)
 
+            to_curate: list[MemoryCandidate] = []
             auto_promoted: list[Memory] = []
             queued: list[MemoryCandidate] = []
             for candidate_input in synthesized:
@@ -203,27 +204,24 @@ class DistillSession:
                     self._classify_existing(candidate, auto_promoted, queued)
                     continue
                 if is_auto_promotable(candidate_input.confidence, threshold):
-                    # Follow-up: the curator's embedding call (and the near-dup IndexMemoryVersion embed) run inside
-                    # this transaction while the AgentSession select_for_update lock is held, partially
-                    # re-introducing the long-transaction-during-external-call risk that moved the synthesis call
-                    # out of the write phase. Embedding latency (~100-500ms) matches the existing
-                    # ProcessObservationRecorded pattern; a future optimization pre-computes candidate embeddings
-                    # outside the lock.
-                    curation = CurateMemoryCandidate().execute(
-                        CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
-                    )
-                    if curation.memory is not None:
-                        auto_promoted.append(curation.memory)
+                    to_curate.append(candidate)
                 else:
                     self._audit_held(locked_session, candidate, candidate_input.confidence, threshold, data)
                     queued.append(candidate)
 
-            return DistillSessionResult(
-                session=locked_session,
-                auto_promoted=tuple(auto_promoted),
-                queued_for_review=tuple(queued),
-                provider_call_ids=(str(provider_result.call_record_id),),
+        for candidate in to_curate:
+            curation = CurateMemoryCandidate().execute(
+                CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
             )
+            if curation.memory is not None:
+                auto_promoted.append(curation.memory)
+
+        return DistillSessionResult(
+            session=locked_session,
+            auto_promoted=tuple(auto_promoted),
+            queued_for_review=tuple(queued),
+            provider_call_ids=(str(provider_result.call_record_id),),
+        )
 
     def _load_session(self, session_id: uuid.UUID) -> AgentSession:
         try:

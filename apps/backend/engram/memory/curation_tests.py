@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import threading
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
 import pytest
+from django.db import connection
 
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
@@ -763,3 +765,103 @@ def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch:
     assert result.superseded_memory is not None
     assert result.superseded_memory.id == existing.id
     assert existing.stale is True
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embed_candidate_call_has_no_open_transaction_during_curate(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-embed-no-txn',
+    )
+    observed_in_atomic: list[bool] = []
+    real_gateway = FakeProviderGateway()
+
+    class _RecordingGateway(FakeProviderGateway):
+        def embed(self, data: object) -> object:
+            observed_in_atomic.append(connection.in_atomic_block)
+
+            return real_gateway.embed(data)
+
+    monkeypatch.setattr('engram.memory.curation.get_provider_gateway', lambda *_, **__: _RecordingGateway())
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert observed_in_atomic == [False]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_judge_decision_call_has_no_open_transaction_during_curate(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    observed_in_atomic: list[bool] = []
+
+    class _RecordingJudgeGateway(FakeProviderGateway):
+        def call(self, data: ProviderCallInput) -> ProviderCallResult:
+            observed_in_atomic.append(connection.in_atomic_block)
+
+            return ProviderCallResult(
+                provider=data.policy.provider,
+                model=data.policy.model,
+                call_record_id=uuid.uuid4(),
+                redaction_state='clean',
+                generated_title='',
+                generated_body='{"decision": "keep_both"}',
+            )
+
+    patch_judge_gateway(monkeypatch, _RecordingJudgeGateway())
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    assert observed_in_atomic == [False]
+    assert existing.stale is False
+
+
+@pytest.mark.django_db(transaction=True)
+def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires real row locking on postgres')
+    organization, team, project = create_scope()
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-concurrent-curate',
+    )
+    candidate_id = candidate.id
+    results: list[object] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate_id)))
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for started in threads:
+        started.start()
+    for finished in threads:
+        finished.join(timeout=30)
+
+    assert not errors, errors
+    assert len(results) == 2
+    assert Memory.objects.count() == 1
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0

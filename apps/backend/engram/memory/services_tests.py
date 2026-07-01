@@ -3,14 +3,22 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from django.db import connection
 
 from engram.core.models import RetrievalDocument
-from engram.memory.memory_worker_tests import create_memory_candidate, create_observation_recorded_scope
+from engram.memory.memory_worker_tests import (
+    create_embedding_policy,
+    create_generation_policy,
+    create_memory_candidate,
+    create_observation_recorded_scope,
+    execute_worker,
+)
 from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     derive_observation_confidence,
 )
+from engram.model_policy.services import FakeProviderGateway
 
 
 class _ObservationStub:
@@ -223,3 +231,44 @@ def test_promote_memory_candidate_existing_result_skips_reindex_for_stale_memory
     assert second.duplicate is True
     assert second.retrieval_document.id == first.retrieval_document.id
     assert RetrievalDocument.objects.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_generate_candidate_provider_call_has_no_open_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observed_in_atomic: list[bool] = []
+    real_gateway = FakeProviderGateway()
+
+    class _RecordingGateway(FakeProviderGateway):
+        def call(self, data: object) -> object:
+            observed_in_atomic.append(connection.in_atomic_block)
+
+            return real_gateway.call(data)
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _RecordingGateway())
+
+    execute_worker(observation)
+
+    assert observed_in_atomic == [False]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_promote_memory_candidate_index_embed_has_no_open_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_embedding_policy(organization, team, project)
+    candidate = create_memory_candidate(observation)
+    observed_in_atomic: list[bool] = []
+    real_gateway = FakeProviderGateway()
+
+    class _RecordingGateway(FakeProviderGateway):
+        def embed(self, data: object) -> object:
+            observed_in_atomic.append(connection.in_atomic_block)
+
+            return real_gateway.embed(data)
+
+    monkeypatch.setattr('engram.context.services.get_provider_gateway', lambda *_, **__: _RecordingGateway())
+
+    PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert observed_in_atomic == [False]

@@ -205,41 +205,44 @@ class RecordMemoryFeedback:
 
 class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
+        observation = self._read_observation(data.observation_id)
+        correlation_id = self._originating_correlation_id(observation)
+        structlog.contextvars.bind_contextvars(
+            correlation_id=correlation_id,
+            observation_id=str(data.observation_id),
+        )
+        generated = self._generate_candidate(observation, correlation_id=correlation_id)
+
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
-            correlation_id = self._originating_correlation_id(observation)
-            structlog.contextvars.bind_contextvars(
-                correlation_id=correlation_id,
-                observation_id=str(data.observation_id),
-            )
-            generated = self._generate_candidate(observation, correlation_id=correlation_id)
             candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             threshold = resolve_auto_approve_threshold(observation.organization)
             already_promoted = candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id is not None
-            if already_promoted or is_auto_promotable(candidate.confidence, threshold):
-                from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
-
-                curation = CurateMemoryCandidate().execute(
-                    CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
-                )
-
-                return MemoryCandidateWorkerResult(
-                    candidate=curation.candidate,
-                    duplicate=not candidate_created or curation.duplicate,
-                    memory=curation.memory,
-                    memory_version=curation.memory_version,
-                    retrieval_document=curation.retrieval_document,
-                    curated_decision=curation.decision,
-                )
-
-            if candidate_created:
+            should_promote = already_promoted or is_auto_promotable(candidate.confidence, threshold)
+            if not should_promote and candidate_created:
                 self._audit_held(observation, candidate, threshold)
 
-            return MemoryCandidateWorkerResult(
-                candidate=candidate,
-                duplicate=not candidate_created,
-                held_for_review=True,
+        if should_promote:
+            from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
+
+            curation = CurateMemoryCandidate().execute(
+                CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
             )
+
+            return MemoryCandidateWorkerResult(
+                candidate=curation.candidate,
+                duplicate=not candidate_created or curation.duplicate,
+                memory=curation.memory,
+                memory_version=curation.memory_version,
+                retrieval_document=curation.retrieval_document,
+                curated_decision=curation.decision,
+            )
+
+        return MemoryCandidateWorkerResult(
+            candidate=candidate,
+            duplicate=not candidate_created,
+            held_for_review=True,
+        )
 
     def _originating_correlation_id(self, observation: Observation) -> str:
         raw = observation.raw_event
@@ -247,6 +250,14 @@ class ProcessObservationRecorded:
             return raw.correlation_id or raw.request_id or str(observation.id)
 
         return str(observation.id)
+
+    def _read_observation(self, observation_id: uuid.UUID) -> Observation:
+        try:
+            return Observation.objects.select_related('organization', 'project', 'team', 'raw_event').get(
+                id=observation_id,
+            )
+        except Observation.DoesNotExist as error:
+            raise MemoryWorkerError('observation not found') from error
 
     def _lock_observation(self, observation_id: uuid.UUID) -> Observation:
         try:
@@ -484,42 +495,22 @@ class PromoteMemoryCandidate:
         with transaction.atomic():
             candidate = self._lock_candidate(data.candidate_id)
             if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
-                return self._existing_result(candidate)
-            if candidate.status != CandidateStatus.PROPOSED:
+                memory, version, needs_index, duplicate = self._replay_state(candidate)
+            elif candidate.status != CandidateStatus.PROPOSED:
                 raise MemoryWorkerError('Only proposed memory candidates can be promoted')
+            else:
+                memory, version = self._create_memory_and_version(candidate)
+                needs_index, duplicate = True, False
 
-            memory = Memory.objects.create(
-                organization=candidate.organization,
-                project=candidate.project,
-                team=candidate.team,
-                title=candidate.title,
-                body=candidate.body,
-                status=MemoryStatus.APPROVED,
-                visibility_scope=candidate.visibility_scope,
-                confidence=candidate.confidence,
-                metadata=self._memory_metadata(candidate),
-            )
-            version = MemoryVersion.objects.create(
-                organization=candidate.organization,
-                project=candidate.project,
-                memory=memory,
-                source_observation=candidate.source_observation,
-                version=1,
-                body=candidate.body,
-                content_hash=candidate.content_hash,
-            )
-            candidate.status = CandidateStatus.PROMOTED
-            candidate.promoted_memory = memory
-            candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
-            retrieval_document = self._index_memory_version(candidate, version)
+        retrieval_document = self._resolve_retrieval_document(candidate, version, needs_index)
 
-            return PromoteMemoryCandidateResult(
-                candidate=candidate,
-                memory=memory,
-                memory_version=version,
-                retrieval_document=retrieval_document,
-                duplicate=False,
-            )
+        return PromoteMemoryCandidateResult(
+            candidate=candidate,
+            memory=memory,
+            memory_version=version,
+            retrieval_document=retrieval_document,
+            duplicate=duplicate,
+        )
 
     def _lock_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
         try:
@@ -527,21 +518,50 @@ class PromoteMemoryCandidate:
         except MemoryCandidate.DoesNotExist as error:
             raise MemoryWorkerError('memory candidate not found') from error
 
-    def _existing_result(self, candidate: MemoryCandidate) -> PromoteMemoryCandidateResult:
+    def _replay_state(self, candidate: MemoryCandidate) -> tuple[Memory, MemoryVersion, bool, bool]:
         memory = candidate.promoted_memory
         version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
-        if memory.stale or memory.refuted:
-            retrieval_document = self._existing_retrieval_document(version)
-        else:
-            retrieval_document = self._index_memory_version(candidate, version)
+        needs_index = not (memory.stale or memory.refuted)
 
-        return PromoteMemoryCandidateResult(
-            candidate=candidate,
-            memory=memory,
-            memory_version=version,
-            retrieval_document=retrieval_document,
-            duplicate=True,
+        return memory, version, needs_index, True
+
+    def _create_memory_and_version(self, candidate: MemoryCandidate) -> tuple[Memory, MemoryVersion]:
+        memory = Memory.objects.create(
+            organization=candidate.organization,
+            project=candidate.project,
+            team=candidate.team,
+            title=candidate.title,
+            body=candidate.body,
+            status=MemoryStatus.APPROVED,
+            visibility_scope=candidate.visibility_scope,
+            confidence=candidate.confidence,
+            metadata=self._memory_metadata(candidate),
         )
+        version = MemoryVersion.objects.create(
+            organization=candidate.organization,
+            project=candidate.project,
+            memory=memory,
+            source_observation=candidate.source_observation,
+            version=1,
+            body=candidate.body,
+            content_hash=candidate.content_hash,
+        )
+        candidate.status = CandidateStatus.PROMOTED
+        candidate.promoted_memory = memory
+        candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+
+        return memory, version
+
+    def _resolve_retrieval_document(
+        self,
+        candidate: MemoryCandidate,
+        version: MemoryVersion,
+        needs_index: bool,
+    ) -> RetrievalDocument:
+        if needs_index:
+            return self._index_memory_version(candidate, version)
+
+        return self._existing_retrieval_document(version)
 
     def _existing_retrieval_document(self, version: MemoryVersion) -> RetrievalDocument:
         document = RetrievalDocument.objects.filter(memory_version=version).first()

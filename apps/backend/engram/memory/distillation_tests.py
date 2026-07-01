@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from django.db import connection
 from django.utils import timezone
 
 from engram.core.models import (
@@ -38,7 +40,7 @@ from engram.memory.distillation import (
 )
 from engram.memory.services import PromoteMemoryCandidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
-from engram.model_policy.services import _completion_body
+from engram.model_policy.services import FakeProviderGateway, _completion_body
 
 
 @pytest.fixture
@@ -372,7 +374,11 @@ def test_distill_session_makes_provider_call_outside_write_transaction(m_monkeyp
         DistillSession().execute(DistillSessionInput(session_id=session.id))
 
     assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
-    assert MemoryCandidate.objects.count() == 0
+    # Candidate creation is a cheap DB-only write committed under the session lock; it is no
+    # longer rolled back by a downstream promotion failure now that the curator's provider calls
+    # (embed/judge) run after that lock is released. No Memory is created since promotion failed.
+    assert MemoryCandidate.objects.filter(project=project).count() == 2
+    assert Memory.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -441,3 +447,60 @@ def test_run_session_distillation_with_tracking_marks_failed_run_and_reraises() 
     run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
     assert run.status == WorkflowRunStatus.FAILED
     assert run.finished_at is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_distill_session_curate_embed_call_has_no_open_transaction(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    observed_in_atomic: list[bool] = []
+    real_gateway = FakeProviderGateway()
+
+    class _RecordingGateway(FakeProviderGateway):
+        def embed(self, data: object) -> object:
+            observed_in_atomic.append(connection.in_atomic_block)
+
+            return real_gateway.embed(data)
+
+    m_monkeypatch.setattr('engram.memory.curation.get_provider_gateway', lambda *_, **__: _RecordingGateway())
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert observed_in_atomic == [False]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_distill_session_concurrent_execution_creates_exactly_one_memory() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires real row locking on postgres')
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    session_id = session.id
+    results: list[object] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(DistillSession().execute(DistillSessionInput(session_id=session_id)))
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for started in threads:
+        started.start()
+    for finished in threads:
+        finished.join(timeout=30)
+
+    assert not errors, errors
+    assert len(results) == 2
+    assert MemoryCandidate.objects.filter(project=project).count() == 2
+    assert Memory.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1

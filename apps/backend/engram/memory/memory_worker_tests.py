@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import threading
 import uuid
 from decimal import Decimal
 from typing import Any
@@ -1141,3 +1142,83 @@ def test_thin_observation_held_at_default_threshold() -> None:
     assert result.held_for_review is True
     assert result.memory is None
     assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_observation_recorded_worker_concurrent_duplicate_delivery_creates_exactly_one() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires real row locking on postgres')
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    enable_auto_promote(organization)
+    observation_id = observation.id
+    results: list[Any] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(
+                ProcessObservationRecorded().execute(
+                    MemoryCandidateWorkerInput(observation_id=observation_id, worker_id='race-worker'),
+                ),
+            )
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for started in threads:
+        started.start()
+    for finished in threads:
+        finished.join(timeout=30)
+
+    assert not errors, errors
+    assert len(results) == 2
+    assert MemoryCandidate.objects.count() == 1
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_observation_recorded_worker_concurrent_duplicate_delivery_with_embedding_creates_exactly_one() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires real row locking on postgres')
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    create_embedding_policy(organization, team, project)
+    enable_auto_promote(organization)
+    observation_id = observation.id
+    results: list[Any] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(2)
+
+    def worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            results.append(
+                ProcessObservationRecorded().execute(
+                    MemoryCandidateWorkerInput(observation_id=observation_id, worker_id='race-worker'),
+                ),
+            )
+        except BaseException as error:  # noqa: BLE001
+            errors.append(error)
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for started in threads:
+        started.start()
+    for finished in threads:
+        finished.join(timeout=30)
+
+    assert not errors, errors
+    assert len(results) == 2
+    assert MemoryCandidate.objects.count() == 1
+    assert Memory.objects.count() == 1
+    assert MemoryVersion.objects.count() == 1
+    assert RetrievalDocument.objects.count() == 1
+    assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
