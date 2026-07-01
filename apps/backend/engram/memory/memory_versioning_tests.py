@@ -6,10 +6,12 @@ from rest_framework.test import APIClient
 from engram.access.models import ApiKey, ApiKeyCapability, Capability, Role, RoleCapability
 from engram.access.services import hash_api_key
 from engram.context.context_api_tests import (
+    OTHER_RAW_KEY,
     RAW_KEY,
     auth_headers,
     create_approved_memory_document,
     create_project_scope,
+    create_scoped_api_key,
 )
 from engram.core.models import AuditEvent, MemoryVersion, Project, RetrievalDocument, VisibilityScope
 
@@ -218,6 +220,72 @@ def test_update_memory_body_is_idempotent_for_same_body() -> None:
     assert first.json()['current_version'] == 2
     assert second.json()['current_version'] == 2
     assert MemoryVersion.objects.filter(memory=memory).count() == 2
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_returns_history() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=2,
+        body='Second revision describes the corrected engineering fact.',
+        content_hash='authorization-before-ranking-v2',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 2
+    items = body['items']
+    assert [item['version'] for item in items] == [2, 1]
+    assert items[0]['body'] == 'Second revision describes the corrected engineering fact.'
+    assert items[1]['version'] == 1
+    assert 'created_at' in items[0]
+    assert 'source_observation_id' in items[0]
+    assert RAW_KEY not in str(body)
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_requires_read_capability() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    create_scoped_api_key(organization, team, project, owner, raw_key=OTHER_RAW_KEY, capabilities=())
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(OTHER_RAW_KEY),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'missing_capability'
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_denies_other_project() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    other_project = Project.objects.create(organization=organization, name='Other', slug='other-project-vlist')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(other_project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
 
 
 @pytest.mark.django_db

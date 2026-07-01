@@ -5,7 +5,7 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
-from engram.context.views import TaskContextView
+from engram.context.views import ContextView
 from engram.core.observability.views import metrics
 
 urlpatterns = [
@@ -16,7 +16,7 @@ urlpatterns = [
     path('api/schema/redoc/', SpectacularRedocView.as_view(url_name='schema'), name='redoc'),
     path('v1/auth/', include('engram.access.auth_urls')),
     path('v1/admin/', include('engram.console.urls')),
-    path('v1/context', TaskContextView.as_view(), name='context-task'),
+    path('v1/context', ContextView.as_view(), name='context-task'),
     path('v1/context/', include('engram.context.urls')),
     path('v1/hooks/', include('engram.hooks.urls')),
     path('v1/inspection/', include('engram.inspection.urls')),
