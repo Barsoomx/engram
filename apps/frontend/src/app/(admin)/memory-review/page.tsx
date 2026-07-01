@@ -50,6 +50,7 @@ import type {
   MemoryReviewActionPayload,
   MemoryReviewDiffSlice,
   MemoryReviewItem,
+  MemoryReviewItemType,
 } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
 
@@ -80,6 +81,11 @@ const ACTION_META: Record<
   supersede: { label: 'Supersede', color: 'warning', icon: GitCompareArrows },
   reject: { label: 'Reject', color: 'danger', icon: ThumbsDown },
   archive: { label: 'Archive', color: 'danger', icon: Archive },
+};
+
+const ACTIONS_FOR_TYPE: Record<MemoryReviewItemType, MemoryReviewActionName[]> = {
+  candidate: ['approve', 'edit', 'narrow', 'supersede', 'reject'],
+  memory: ['archive', 'reject'],
 };
 
 function formatDateTime(value: string | null | undefined): string {
@@ -544,81 +550,32 @@ function ReviewTable({
                             <MoreHorizontal className='w-4 h-4' />
                           </Button>
                         </DropdownTrigger>
-                        <DropdownMenu aria-label='Memory review actions'>
-                          <DropdownItem
-                            key='approve'
-                            startContent={<ThumbsUp className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'approve',
-                              })
-                            }
-                          >
-                            Approve
-                          </DropdownItem>
-                          <DropdownItem
-                            key='edit'
-                            startContent={<Pencil className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'edit',
-                              })
-                            }
-                          >
-                            Edit body
-                          </DropdownItem>
-                          <DropdownItem
-                            key='narrow'
-                            startContent={<Target className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'narrow',
-                              })
-                            }
-                          >
-                            Narrow
-                          </DropdownItem>
-                          <DropdownItem
-                            key='supersede'
-                            startContent={<GitCompareArrows className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'supersede',
-                              })
-                            }
-                          >
-                            Supersede
-                          </DropdownItem>
-                          <DropdownItem
-                            key='reject'
-                            color='danger'
-                            startContent={<ThumbsDown className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'reject',
-                              })
-                            }
-                          >
-                            Reject
-                          </DropdownItem>
-                          <DropdownItem
-                            key='archive'
-                            color='danger'
-                            startContent={<Archive className='w-3.5 h-3.5' />}
-                            onAction={() =>
-                              onRowAction(item, {
-                                kind: 'action',
-                                action: 'archive',
-                              })
-                            }
-                          >
-                            Archive
-                          </DropdownItem>
+                        <DropdownMenu
+                          aria-label='Memory review actions'
+                          items={ACTIONS_FOR_TYPE[item.type].map((name) => ({
+                            id: name,
+                          }))}
+                        >
+                          {(entry) => {
+                            const meta = ACTION_META[entry.id];
+                            const Icon = meta.icon;
+
+                            return (
+                              <DropdownItem
+                                key={entry.id}
+                                color={meta.color}
+                                startContent={<Icon className='w-3.5 h-3.5' />}
+                                onAction={() =>
+                                  onRowAction(item, {
+                                    kind: 'action',
+                                    action: entry.id,
+                                  })
+                                }
+                              >
+                                {meta.label}
+                              </DropdownItem>
+                            );
+                          }}
                         </DropdownMenu>
                       </Dropdown>
                     ) : null}

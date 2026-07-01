@@ -1,6 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
+import * as React from 'react';
 import { AlertTriangle, Layers } from 'lucide-react';
 import Link from 'next/link';
 
@@ -148,6 +149,8 @@ function BundlesTableSkeleton() {
   );
 }
 
+const PAGE_SIZE = 50;
+
 export default function ContextBundlesPage() {
   const meQuery = useQuery<MeResponse>({
     queryKey: ['auth', 'me'],
@@ -157,18 +160,26 @@ export default function ContextBundlesPage() {
 
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
+  const [page, setPage] = React.useState(0);
+
+  React.useEffect(() => {
+    setPage(0);
+  }, [activeProjectId, activeTeamId]);
 
   const query = useQuery({
-    queryKey: ['inspection', 'context-bundles', activeProjectId, activeTeamId],
+    queryKey: ['inspection', 'context-bundles', activeProjectId, activeTeamId, page],
     enabled: Boolean(activeProjectId),
     queryFn: () =>
       listContextBundles({
         projectId: activeProjectId ?? '',
         teamId: activeTeamId,
+        limit: PAGE_SIZE,
+        offset: page * PAGE_SIZE,
       }),
   });
 
   const items = query.data?.items ?? [];
+  const total = query.data?.count ?? 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='context:read'>
@@ -204,9 +215,31 @@ export default function ContextBundlesPage() {
         ) : (
           <>
             <BundlesTable items={items} />
-            <p className='text-[12px] text-default-400'>
-              Showing {items.length} bundle{items.length === 1 ? '' : 's'}.
-            </p>
+            <div className='flex items-center justify-between gap-3'>
+              <p className='text-[12px] text-default-400'>
+                {total > 0
+                  ? `Showing ${page * PAGE_SIZE + 1}-${page * PAGE_SIZE + items.length} of ${total}`
+                  : `Showing ${items.length} bundle${items.length === 1 ? '' : 's'}`}
+              </p>
+              <div className='flex items-center gap-2'>
+                <button
+                  type='button'
+                  onClick={() => setPage((p) => Math.max(0, p - 1))}
+                  disabled={page === 0}
+                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                >
+                  Previous
+                </button>
+                <button
+                  type='button'
+                  onClick={() => setPage((p) => p + 1)}
+                  disabled={(page + 1) * PAGE_SIZE >= total}
+                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           </>
         )}
       </section>

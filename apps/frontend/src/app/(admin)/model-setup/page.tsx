@@ -212,7 +212,7 @@ function PresetCard({
                 key={slot}
                 className='rounded-[7px] bg-content3 px-2.5 py-0.5 text-[11.5px] font-medium text-default-500'
               >
-                {slot}
+                {slot.charAt(0).toUpperCase() + slot.slice(1)}
               </span>
             ))}
           </div>
@@ -224,7 +224,7 @@ function PresetCard({
           {preset.providers_needed.map((slot) => (
             <Input
               key={slot}
-              label={`${slot} API key`}
+              label={`${slot.charAt(0).toUpperCase() + slot.slice(1)} API key`}
               labelPlacement='outside'
               placeholder='sk-…'
               type='password'
