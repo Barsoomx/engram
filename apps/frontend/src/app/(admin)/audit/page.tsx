@@ -498,7 +498,7 @@ function AuditLog() {
             <input
               value={draftResult}
               onChange={(e) => setDraftResult(e.target.value)}
-              placeholder='success / denied'
+              placeholder='allowed / denied / recorded'
               className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none placeholder:text-default-400 focus:border-primary'
             />
           </div>

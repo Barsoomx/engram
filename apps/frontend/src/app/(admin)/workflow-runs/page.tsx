@@ -31,7 +31,8 @@ import type {
 
 const RUN_TYPE_OPTIONS: { key: WorkflowRunType; label: string }[] = [
   { key: 'daily_digest', label: 'Daily Digest' },
-  { key: 'observation_processing', label: 'Observation Processing' },
+  { key: 'session_distillation', label: 'Session Distillation' },
+  { key: 'weekly_digest', label: 'Weekly Digest' },
 ];
 
 const STATUS_OPTIONS: { key: WorkflowRunStatus; label: string }[] = [

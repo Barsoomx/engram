@@ -173,3 +173,19 @@ export const AUDIT_RESULT_COLORS: Record<string, string> = {
 export function auditResultColor(value: string | null | undefined): string {
   return AUDIT_RESULT_COLORS[(value ?? '').toLowerCase()] ?? '#8B8D93';
 }
+
+export function auditResultChipColor(
+  value: string | null | undefined,
+): 'success' | 'danger' | 'default' {
+  const v = (value ?? '').toLowerCase();
+
+  if (v === 'allowed') {
+    return 'success';
+  }
+
+  if (v === 'denied' || v === 'failed' || v === 'errored') {
+    return 'danger';
+  }
+
+  return 'default';
+}
