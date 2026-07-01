@@ -3,9 +3,9 @@
 import { useQuery } from '@tanstack/react-query';
 import { ArrowRight, Plus, Shield, Sparkles } from 'lucide-react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
+import { ConnectAgentModal } from '@/components/connect/connect-agent-modal';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
@@ -420,7 +420,7 @@ export default function DashboardPage() {
   const healthLabel = healthQuery.isLoading ? 'Checking' : healthOk ? 'Operational' : 'Degraded';
   const healthColor = healthQuery.isLoading ? '#666C77' : healthOk ? '#3DD9AC' : '#FB6E72';
 
-  const router = useRouter();
+  const [connectOpen, setConnectOpen] = React.useState(false);
   const overview = overviewQuery.data;
   const sessions = sessionsQuery.data ?? [];
   const liveCount = sessions.filter((session) => session.status === 'active').length;
@@ -468,13 +468,18 @@ export default function DashboardPage() {
             </span>
             <PrimaryButton
               type='button'
-              onPress={() => router.push('/api-keys')}
+              onPress={() => setConnectOpen(true)}
               startContent={<Plus size={16} strokeWidth={2.2} />}
             >
               Connect agent
             </PrimaryButton>
           </>
         }
+      />
+
+      <ConnectAgentModal
+        isOpen={connectOpen}
+        onClose={() => setConnectOpen(false)}
       />
 
       <div className='space-y-[14px]'>

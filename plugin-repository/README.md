@@ -1,9 +1,22 @@
 # Engram Plugin Repository
 
-This directory is the distribution index for the Engram agent plugins. It hosts
-the Claude Code plugin marketplace manifest and documents how the
-`packages/claude-plugin` and `packages/codex-plugin` packages are published,
-versioned, and installed. It owns no runtime code.
+This directory is the distribution index for the Engram agent plugins. It
+documents how the `packages/claude-plugin` and `packages/codex-plugin` packages
+are published, versioned, and installed. It owns no runtime code.
+
+The canonical Claude Code marketplace manifest now lives at the repository root:
+`.claude-plugin/marketplace.json`. That is the path `claude plugin marketplace
+add <owner/repo>` resolves, so a consumer installs Engram with:
+
+```bash
+claude plugin marketplace add Barsoomx/engram
+claude plugin install engram@engram-marketplace
+```
+
+The Claude Code plugin bundles its hook runtime, so it requires `python3 >= 3.12`
+on `PATH` (it does not require the `engram` CLI on `PATH` for the hook hot path).
+The examples below in this document describe the manifest format; the committed
+source of truth is the repo-root file.
 
 ## Role in distribution
 
@@ -13,16 +26,21 @@ memory by registering hook events:
 - `packages/claude-plugin` - Claude Code plugin (`.claude-plugin/plugin.json`).
 - `packages/codex-plugin` - Codex plugin (`.codex-plugin/plugin.json`).
 
-This repository is the install source that agent marketplaces point at. A user
-runs `engram connect` to materialize local credentials under `~/.engram`, then
-installs the plugin from this repository so the agent's hook events call back
-into `engram hook <event> --agent <runtime>`.
+The repo-root `.claude-plugin/marketplace.json` is the install source that agent
+marketplaces point at. A user runs `engram connect` (or `engram install`) to
+materialize local credentials under `~/.engram`, then installs the plugin so the
+agent's hook events call the bundled hook runtime. For the Claude Code plugin the
+hook command is `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook <event>
+--agent claude_code --response-format claude-code`, which reuses the same
+`engram_cli` runtime bundled under `packages/claude-plugin/hooks/engram_cli/`.
 
 ## Marketplace manifest format
 
 Claude Code plugin marketplaces are described by a
-`.claude-plugin/marketplace.json` manifest. The manifest is a JSON object with
-two top-level fields:
+`.claude-plugin/marketplace.json` manifest. For this repository that manifest is
+the repo-root `.claude-plugin/marketplace.json`; the `source` of each plugin is
+therefore a path relative to the repo root (for example `./packages/claude-plugin`).
+The manifest is a JSON object with two top-level fields:
 
 - `name` - marketplace identifier (string).
 - `owner` - human-readable owner name (object or string).
@@ -56,7 +74,7 @@ A concrete example covering both Engram plugins:
   "plugins": [
     {
       "name": "engram",
-      "source": "../packages/claude-plugin",
+      "source": "./packages/claude-plugin",
       "description": "Thin Engram hook adapter for Claude Code.",
       "version": "0.1.0",
       "category": "Productivity",
@@ -68,7 +86,7 @@ A concrete example covering both Engram plugins:
     },
     {
       "name": "engram-codex",
-      "source": "../packages/codex-plugin",
+      "source": "./packages/codex-plugin",
       "description": "Thin Engram hook adapter for Codex.",
       "version": "0.1.0",
       "category": "Productivity",
@@ -124,25 +142,28 @@ updates.
 
 End-to-end, installing an Engram plugin is:
 
-1. `engram connect` - interactive wizard that writes `~/.engram/config.json`,
+1. `engram connect` (or `engram install`) - writes `~/.engram/config.json`,
    `~/.engram/credentials.json`, and `~/.engram/hooks.<runtime>.json` for each
    selected runtime. Required before any hook can fire.
 2. `engram mcp install --runtime <runtime>` - (optional) registers the Engram
    MCP server with the agent for inline memory queries.
-3. Install the plugin from this marketplace:
+3. Add this marketplace and install the plugin:
 
    ```bash
    # Claude Code
+   claude plugin marketplace add Barsoomx/engram
    claude plugin install engram@engram-marketplace
    # Codex
    codex plugin install engram-codex@engram-marketplace
    ```
 
-Once installed, the agent's `SessionStart`, `PostToolUse`, `Error`, and
-`Decision` hook events call
-`engram hook <event> --agent <runtime> --response-format <format>`, which
-forwards each event to the Engram server. See each plugin's README for the
-exact hook table:
+Once installed, the agent's `SessionStart`, `PostToolUse`, `Error`, `Decision`,
+`SessionEnd`, and `UserPromptSubmit` hook events call the plugin's bundled hook
+runtime. For Claude Code that command is
+`python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook <event> --agent claude_code
+--response-format claude-code`, which requires `python3 >= 3.12` on `PATH` (not
+the `engram` CLI) and forwards each event to the Engram server. See each plugin's
+README for the exact hook table:
 
 - `packages/claude-plugin/README.md`
 - `packages/codex-plugin/README.md`
