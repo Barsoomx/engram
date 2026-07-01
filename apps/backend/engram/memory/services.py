@@ -1331,7 +1331,7 @@ def weekly_digest_content_hash(
     window_end: datetime.datetime,
     team_id: uuid.UUID | None = None,
 ) -> str:
-    material = f'{project_id}:{window_start.isoformat()}:{window_end.isoformat()}:{team_id or ""}'
+    material = f'{project_id}:{window_start.date().isoformat()}:{window_end.date().isoformat()}:{team_id or ""}'
 
     return hashlib.sha256(material.encode()).hexdigest()
 
@@ -1340,11 +1340,19 @@ class BuildWeeklyStructuredDigest:
     def execute(self, data: WeeklyDigestInput) -> WeeklyDigestResult:
         project = Project.objects.get(id=data.project_id, organization_id=data.organization_id)
 
-        now = timezone.now().replace(second=0, microsecond=0)
+        today = timezone.now().date()
 
-        window_start = now - datetime.timedelta(days=data.window_days)
+        current_monday = today - datetime.timedelta(days=today.isoweekday() - 1)
 
-        window_end = now
+        tzinfo = timezone.get_current_timezone()
+
+        window_end = datetime.datetime.combine(current_monday, datetime.time.min, tzinfo=tzinfo)
+
+        window_start = datetime.datetime.combine(
+            current_monday - datetime.timedelta(days=7),
+            datetime.time.min,
+            tzinfo=tzinfo,
+        )
 
         content_hash = weekly_digest_content_hash(project.id, window_start, window_end, data.team_id)
 
