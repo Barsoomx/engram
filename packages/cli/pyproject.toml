@@ -1,5 +1,5 @@
 [project]
-name = "engram-cli"
+name = "engram-connect"
 version = "0.1.0"
 description = "Thin Engram command-line client"
 readme = "README.md"
