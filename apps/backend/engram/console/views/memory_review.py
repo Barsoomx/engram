@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import datetime
 import uuid
 from typing import Any
 
 from django.db.models import Q
-from django.utils import timezone
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -17,6 +15,7 @@ from rest_framework.status import (
     HTTP_404_NOT_FOUND,
 )
 
+from engram.console.filters import MemoryReviewCandidateFilterSet, MemoryReviewMemoryFilterSet
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.memory_review import (
@@ -276,67 +275,21 @@ class MemoryReviewViewSet(
 
         return queryset
 
-    def _apply_common_filters(  # noqa: C901
+    def _apply_common_filters(
         self,
         request: Request,
         queryset: Any,
         *,
         candidate: bool,
     ) -> Any:
-        team_id = request.query_params.get('team_id')
+        filterset_class = MemoryReviewCandidateFilterSet if candidate else MemoryReviewMemoryFilterSet
 
-        if team_id:
-            queryset = queryset.filter(team_id=self._uuid_filter_value('team_id', team_id))
+        filterset = filterset_class(data=request.query_params, queryset=queryset)
 
-        project_id = request.query_params.get('project_id')
+        if not filterset.is_valid():
+            raise MemoryReviewError('invalid_filter', 'one or more filter parameters are invalid')
 
-        if project_id:
-            queryset = queryset.filter(project_id=self._uuid_filter_value('project_id', project_id))
-
-        visibility_scope = request.query_params.get('visibility_scope')
-
-        if visibility_scope:
-            queryset = queryset.filter(visibility_scope=visibility_scope)
-
-        search = request.query_params.get('search')
-
-        if search:
-            queryset = queryset.filter(Q(title__icontains=search) | Q(body__icontains=search))
-
-        source_type = request.query_params.get('source_type')
-
-        if source_type:
-            if candidate:
-                queryset = queryset.filter(source_observation__sources__source_type=source_type)
-
-            else:
-                queryset = queryset.filter(versions__source_observation__sources__source_type=source_type)
-
-            queryset = queryset.distinct()
-
-        confidence_gte = request.query_params.get('confidence__gte')
-
-        if confidence_gte:
-            queryset = queryset.filter(confidence__gte=confidence_gte)
-
-        confidence_lte = request.query_params.get('confidence__lte')
-
-        if confidence_lte:
-            queryset = queryset.filter(confidence__lte=confidence_lte)
-
-        age_days = request.query_params.get('age_days__gte')
-
-        if age_days:
-            try:
-                days = int(age_days)
-
-            except ValueError:
-                days = 0
-
-            if days > 0:
-                cutoff = timezone.now() - datetime.timedelta(days=days)
-
-                queryset = queryset.filter(created_at__lte=cutoff)
+        queryset = filterset.qs
 
         if candidate:
             status_param = request.query_params.get('status')
@@ -509,17 +462,6 @@ class MemoryReviewViewSet(
             )
 
         return version
-
-    def _uuid_filter_value(self, field: str, raw: str) -> uuid.UUID:
-        try:
-            return uuid.UUID(raw)
-
-        except ValueError as error:
-            raise MemoryReviewError(
-                'invalid_filter',
-                f'{field} is not a valid uuid',
-                status=HTTP_400_BAD_REQUEST,
-            ) from error
 
     def _uuid_kwarg(self, kwargs: dict[str, Any]) -> uuid.UUID:
         raw = kwargs.get('pk')

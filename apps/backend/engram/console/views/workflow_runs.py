@@ -3,12 +3,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from engram.console.filters import WorkflowRunFilterSet
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.workflow_runs import (
@@ -32,6 +34,8 @@ class WorkflowRunViewSet(
     viewsets.GenericViewSet,
 ):
     permission_classes = [IsAuthenticated]
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = WorkflowRunFilterSet
 
     def get_permissions(self) -> list[BasePermission]:
         if self.action == 'rerun':
@@ -48,51 +52,9 @@ class WorkflowRunViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        queryset = WorkflowRun.objects.filter(
+        return WorkflowRun.objects.filter(
             organization=self.request.active_organization,
         ).select_related('project', 'team', 'result_memory')
-
-        if self.action != 'list':
-            return queryset
-
-        query = self.request.query_params
-
-        run_type = query.get('run_type')
-
-        if run_type:
-            queryset = queryset.filter(run_type=run_type)
-
-        status_value = query.get('status')
-
-        if status_value:
-            queryset = queryset.filter(status=status_value)
-
-        project_id = query.get('project_id')
-
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
-
-        team_id = query.get('team_id')
-
-        if team_id:
-            queryset = queryset.filter(team_id=team_id)
-
-        escalation = query.get('escalation')
-
-        if escalation is not None and escalation != '':
-            queryset = queryset.filter(escalation=str(escalation).lower() in {'true', '1'})
-
-        created_at_gte = query.get('created_at__gte')
-
-        if created_at_gte:
-            queryset = queryset.filter(created_at__gte=created_at_gte)
-
-        created_at_lte = query.get('created_at__lte')
-
-        if created_at_lte:
-            queryset = queryset.filter(created_at__lte=created_at_lte)
-
-        return queryset
 
     def get_serializer_class(self) -> type:
         if self.action == 'retrieve':

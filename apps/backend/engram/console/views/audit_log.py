@@ -3,12 +3,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
 from engram.access.models import ApiKey, Identity
+from engram.console.filters import AuditEventFilterSet
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.audit_log import AuditEventSerializer
@@ -27,6 +29,8 @@ class AuditEventViewSet(
 ):
     permission_classes = [IsAuthenticated]
     serializer_class = AuditEventSerializer
+    filter_backends = (DjangoFilterBackend,)
+    filterset_class = AuditEventFilterSet
 
     def get_permissions(self) -> list[BasePermission]:
         return [
@@ -36,60 +40,13 @@ class AuditEventViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        queryset = (
+        return (
             AuditEvent.objects.filter(
                 organization=self.request.active_organization,
             )
             .select_related('project', 'team')
             .order_by('-created_at')
         )
-
-        if self.action != 'list':
-            return queryset
-
-        query = self.request.query_params
-
-        event_type = query.get('event_type')
-
-        if event_type:
-            queryset = queryset.filter(event_type=event_type)
-
-        result = query.get('result')
-
-        if result:
-            queryset = queryset.filter(result=result)
-
-        actor_id = query.get('actor_id')
-
-        if actor_id:
-            queryset = queryset.filter(actor_id=actor_id)
-
-        target_type = query.get('target_type')
-
-        if target_type:
-            queryset = queryset.filter(target_type=target_type)
-
-        project_id = query.get('project_id')
-
-        if project_id:
-            queryset = queryset.filter(project_id=project_id)
-
-        team_id = query.get('team_id')
-
-        if team_id:
-            queryset = queryset.filter(team_id=team_id)
-
-        created_at_gte = query.get('created_at__gte')
-
-        if created_at_gte:
-            queryset = queryset.filter(created_at__gte=created_at_gte)
-
-        created_at_lt = query.get('created_at__lt')
-
-        if created_at_lt:
-            queryset = queryset.filter(created_at__lt=created_at_lt)
-
-        return queryset
 
     def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         queryset = self.filter_queryset(self.get_queryset())
