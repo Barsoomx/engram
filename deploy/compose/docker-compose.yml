@@ -155,7 +155,8 @@ services:
       timeout: 5s
       retries: 10
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # PG18+ official image stores data in a major-version subdir; mount the parent.
+      - postgres_data:/var/lib/postgresql
 
   redis:
     image: redis/redis-stack-server:7.4.0-v8
