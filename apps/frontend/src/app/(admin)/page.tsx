@@ -3,6 +3,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { ArrowRight, Plus, Shield, Sparkles } from 'lucide-react';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { PageHeader } from '@/components/ui/page-header';
@@ -16,7 +17,7 @@ import {
 } from '@/hooks/use-metrics';
 import { apiClient } from '@/lib/auth';
 import { getWeeklyDigest, type WeeklyDigest } from '@/lib/console-api';
-import { avatarColor, formatRelativeTime } from '@/lib/design';
+import { auditResultColor, avatarColor, formatRelativeTime } from '@/lib/design';
 import type {
   ActivityEvent,
   MemoryIngestPoint,
@@ -309,7 +310,7 @@ function RecentActivity({
             >
               <span
                 className='h-2 w-2 shrink-0 rounded-full'
-                style={{ backgroundColor: event.result === 'success' ? '#3DD9AC' : '#FB6E72' }}
+                style={{ backgroundColor: auditResultColor(event.result) }}
               />
               <span className='truncate text-[13px] text-default-700'>{humanizeEvent(event.event_type)}</span>
               <span className='shrink-0 rounded-[6px] bg-content2 px-2 py-0.5 font-mono text-[11px] text-default-400'>
@@ -419,6 +420,7 @@ export default function DashboardPage() {
   const healthLabel = healthQuery.isLoading ? 'Checking' : healthOk ? 'Operational' : 'Degraded';
   const healthColor = healthQuery.isLoading ? '#666C77' : healthOk ? '#3DD9AC' : '#FB6E72';
 
+  const router = useRouter();
   const overview = overviewQuery.data;
   const sessions = sessionsQuery.data ?? [];
   const liveCount = sessions.filter((session) => session.status === 'active').length;
@@ -464,7 +466,11 @@ export default function DashboardPage() {
               <PulseDot color={healthColor} pulse={healthOk} size={7} />
               {healthLabel}
             </span>
-            <PrimaryButton type='button' startContent={<Plus size={16} strokeWidth={2.2} />}>
+            <PrimaryButton
+              type='button'
+              onPress={() => router.push('/api-keys')}
+              startContent={<Plus size={16} strokeWidth={2.2} />}
+            >
               Connect agent
             </PrimaryButton>
           </>

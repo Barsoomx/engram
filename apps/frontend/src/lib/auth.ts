@@ -42,6 +42,7 @@ export function setToken(token: string): void {
   }
 
   window.localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  window.dispatchEvent(new Event('engram:token'));
 }
 
 export function clearToken(): void {
@@ -51,6 +52,7 @@ export function clearToken(): void {
   }
 
   window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+  window.dispatchEvent(new Event('engram:token'));
 }
 
 export function apiClient(): AxiosInstance {

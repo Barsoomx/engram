@@ -313,7 +313,12 @@ export async function revokeApiKey(id: string): Promise<void> {
 
 export type WorkflowRunStatus = 'queued' | 'running' | 'succeeded' | 'failed';
 
-export type WorkflowRunType = 'daily_digest' | 'observation_processing';
+export type WorkflowRunType =
+  | 'daily_digest'
+  | 'observation_processing'
+  | 'session'
+  | 'session_distillation'
+  | 'weekly_digest';
 
 export type WorkflowRunListItem = {
   id: string;

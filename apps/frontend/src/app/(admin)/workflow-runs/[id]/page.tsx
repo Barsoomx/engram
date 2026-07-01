@@ -12,6 +12,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { useRerunWorkflowRun, useWorkflowRun } from '@/hooks/use-workflow-runs';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
+import { auditResultChipColor } from '@/lib/design';
 import { useOrgStore } from '@/lib/org-store';
 import type {
   WorkflowRunCuratorAction,
@@ -194,7 +195,7 @@ function CuratorActionsFeed({
                 <Chip
                   size='sm'
                   variant='flat'
-                  color={action.result === 'success' ? 'success' : action.result === 'denied' ? 'danger' : 'default'}
+                  color={auditResultChipColor(action.result)}
                 >
                   {action.result}
                 </Chip>
@@ -246,7 +247,7 @@ function ProviderCallsTable({
                 <Chip
                   size='sm'
                   variant='flat'
-                  color={call.result === 'success' ? 'success' : call.result === 'error' ? 'danger' : 'default'}
+                  color={auditResultChipColor(call.result)}
                 >
                   {call.result}
                 </Chip>

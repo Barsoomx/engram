@@ -88,7 +88,7 @@ function BundleRow({ bundle }: { bundle: ContextBundleListItem }) {
         {bundle.selected_count}
       </span>
       <span className='tnum font-mono text-[12px] text-default-500'>
-        {bundle.token_budget.toLocaleString()}
+        {bundle.token_budget?.toLocaleString() ?? '—'}
       </span>
       <span className='min-w-0'>
         <span className='block truncate font-mono text-[11.5px] text-default-500'>
@@ -171,7 +171,7 @@ export default function ContextBundlesPage() {
   const items = query.data?.items ?? [];
 
   return (
-    <CapabilityGate capabilities={capabilities} required='memories:admin'>
+    <CapabilityGate capabilities={capabilities} required='context:read'>
       <section className='space-y-6'>
         <PageHeader
           title='Context Bundles'

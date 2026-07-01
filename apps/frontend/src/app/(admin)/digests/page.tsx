@@ -7,7 +7,7 @@ import * as React from 'react';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   getWeeklyDigest,
   reviewDigest,
@@ -122,9 +122,11 @@ function DigestSkeleton() {
 function DigestContent({
   digest,
   onReviewed,
+  canReview,
 }: {
   digest: WeeklyDigest;
   onReviewed: () => void;
+  canReview: boolean;
 }) {
   const { counts, changelog, window_start, window_end, ready } = digest;
 
@@ -189,7 +191,7 @@ function DigestContent({
             <CheckCircle2 className='h-4 w-4' strokeWidth={2} />
             Digest reviewed
           </p>
-        ) : (
+        ) : canReview ? (
           <div className='mt-4 flex items-center gap-3'>
             <button
               type='button'
@@ -204,7 +206,7 @@ function DigestContent({
               <span className='text-[12px] text-danger'>Failed to mark reviewed.</span>
             )}
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -256,6 +258,7 @@ export default function DigestsPage() {
           <DigestContent
             digest={digestQuery.data}
             onReviewed={() => digestQuery.refetch()}
+            canReview={hasCapability(capabilities, 'memories:review')}
           />
         ) : null}
       </section>

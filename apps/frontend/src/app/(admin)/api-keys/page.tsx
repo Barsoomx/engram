@@ -38,14 +38,17 @@ import { useOrgStore } from '@/lib/org-store';
 
 const KNOWN_CAPABILITY_SUBCODES: Record<string, readonly string[]> = {
   api_keys: ['read', 'issue', 'revoke'],
-  memories: ['read', 'write', 'admin'],
-  observations: ['read', 'write', 'admin'],
-  organizations: ['read', 'write'],
-  teams: ['read', 'write', 'admin'],
-  projects: ['read', 'write', 'admin'],
-  members: ['read', 'write', 'admin'],
-  roles: ['read', 'write'],
+  memories: ['read', 'review', 'propose', 'admin'],
+  observations: ['read', 'write'],
+  organizations: ['read', 'admin'],
+  teams: ['read', 'admin'],
+  projects: ['read', 'admin'],
+  members: ['read', 'admin'],
+  roles: ['read'],
   audit: ['read'],
+  model_policy: ['read'],
+  secrets: ['read'],
+  context: ['read'],
 };
 
 function expandGrantableCapabilities(capabilities: string[]): string[] {
@@ -332,7 +335,9 @@ function IssueModal({
       onClose={handleClose}
       placement='center'
       size='lg'
+      scrollBehavior='inside'
       isDismissable={!isIssuing}
+      isKeyboardDismissDisabled={isIssuing}
       hideCloseButton={isIssuing}
     >
       <ModalContent>

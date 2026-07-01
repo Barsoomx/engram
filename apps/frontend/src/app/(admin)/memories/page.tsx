@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, ChevronDown, Database, Search, SlidersHorizontal } from 'lucide-react';
+import { AlertTriangle, ChevronDown, Database, Search } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -288,15 +288,6 @@ export default function MemoriesPage() {
       <PageHeader
         title='Memories'
         subtitle='Engineering knowledge captured by your agents, ready to inject.'
-        actions={
-          <button
-            type='button'
-            className='inline-flex h-10 items-center gap-2 rounded-[11px] border border-divider-strong bg-content1 px-4 text-[13.5px] font-medium text-default-700 transition-colors hover:bg-content2'
-          >
-            <SlidersHorizontal size={16} strokeWidth={1.8} />
-            Filters
-          </button>
-        }
       />
 
       <div className='space-y-3'>

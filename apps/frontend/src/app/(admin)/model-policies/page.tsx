@@ -23,16 +23,18 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createModelPolicy,
   disableModelPolicy,
   genRequestId,
   listModelPolicies,
+  listProviderSecrets,
   POLICY_TASK_TYPES,
   resolveModelPolicy,
   SECRET_PROVIDERS,
   type ModelPolicy,
+  type ProviderSecret,
   type ModelPolicyCreateInput,
   type PolicyScope,
   type PolicyTaskType,
@@ -138,10 +140,12 @@ function ColumnHeader() {
 
 function PoliciesTable({
   items,
+  canManage,
   onDisable,
   onSelect,
 }: {
   items: ModelPolicy[];
+  canManage: boolean;
   onDisable: (policy: ModelPolicy) => void;
   onSelect: (policy: ModelPolicy) => void;
 }) {
@@ -189,7 +193,7 @@ function PoliciesTable({
                 >
                   View
                 </Button>
-                {policy.active && (
+                {canManage && policy.active && (
                   <Button
                     size='sm'
                     color='danger'
@@ -245,6 +249,8 @@ interface CreatePolicyModalProps {
   isOpen: boolean;
   isPending: boolean;
   error: string | null;
+  projectId: string | null;
+  teamId: string | null;
   onClose: () => void;
   onSubmit: (input: {
     name: string;
@@ -261,6 +267,8 @@ function CreatePolicyModal({
   isOpen,
   isPending,
   error,
+  projectId,
+  teamId,
   onClose,
   onSubmit,
 }: CreatePolicyModalProps) {
@@ -284,10 +292,29 @@ function CreatePolicyModal({
     }
   }, [isOpen]);
 
+  const secretsQuery = useQuery({
+    queryKey: ['model-policy', 'secrets', projectId, teamId],
+    queryFn: () => listProviderSecrets({ projectId: projectId ?? '', teamId }),
+    enabled: isOpen && Boolean(projectId),
+  });
+
+  const providerSecrets = React.useMemo(
+    () =>
+      (secretsQuery.data ?? []).filter(
+        (secret) => secret.provider === provider && secret.active,
+      ),
+    [secretsQuery.data, provider],
+  );
+
+  React.useEffect(() => {
+    setSecretId('');
+  }, [provider]);
+
   const canSubmit =
     name.trim().length > 0 &&
     model.trim().length > 0 &&
     secretId.trim().length > 0 &&
+    (scope !== 'team' || Boolean(teamId)) &&
     !isPending;
 
   async function handleSubmit() {
@@ -404,16 +431,29 @@ function CreatePolicyModal({
                     classNames={{ input: 'font-mono text-xs' }}
                   />
                 </div>
-                <Input
-                  label='Secret ID'
+                <Select
+                  label='Provider secret'
                   labelPlacement='outside'
-                  placeholder='Paste a provider secret id'
-                  value={secretId}
-                  onValueChange={setSecretId}
-                  isDisabled={isPending}
-                  description='Reference an existing provider secret by its id.'
-                  classNames={{ input: 'font-mono text-xs' }}
-                />
+                  items={providerSecrets}
+                  selectedKeys={secretId ? new Set([secretId]) : new Set()}
+                  isDisabled={isPending || providerSecrets.length === 0}
+                  description={
+                    providerSecrets.length === 0
+                      ? `No active ${PROVIDER_LABELS[provider]} secret — add one on the Secrets page first.`
+                      : 'Choose an existing provider secret for the selected provider.'
+                  }
+                  onSelectionChange={(keys) => {
+                    const next = Array.from(keys)[0];
+
+                    if (typeof next === 'string') {
+                      setSecretId(next);
+                    }
+                  }}
+                >
+                  {(secret: ProviderSecret) => (
+                    <SelectItem key={secret.id}>{secret.name}</SelectItem>
+                  )}
+                </Select>
                 <Input
                   label='Base URL (optional)'
                   labelPlacement='outside'
@@ -424,6 +464,12 @@ function CreatePolicyModal({
                   description='For GLM / self-hosted / OpenAI-compatible endpoints. Leave blank to use the provider default.'
                   classNames={{ input: 'font-mono text-xs' }}
                 />
+                {scope === 'team' && !teamId && (
+                  <p className='text-[12px] text-warning'>
+                    Select a team in the top switcher to create a team-scoped
+                    policy.
+                  </p>
+                )}
                 {error && (
                   <div className='rounded-medium border border-danger-200 bg-danger-50 p-3 dark:border-danger-500/30 dark:bg-danger-500/10'>
                     <p className='text-sm text-danger-600'>{error}</p>
@@ -668,6 +714,7 @@ export default function ModelPoliciesPage() {
     () => meQuery.data?.capabilities ?? [],
     [meQuery.data?.capabilities],
   );
+  const canManagePolicies = hasCapability(capabilities, 'model_policy:*');
 
   const queryClient = useQueryClient();
 
@@ -815,7 +862,7 @@ export default function ModelPoliciesPage() {
   const items = policiesQuery.data ?? [];
 
   return (
-    <CapabilityGate capabilities={capabilities} required='model_policy:*'>
+    <CapabilityGate capabilities={capabilities} required='model_policy:read'>
       {!activeProjectId ? (
         <section className='space-y-6'>
           <PageHeader
@@ -834,13 +881,15 @@ export default function ModelPoliciesPage() {
             title='Model Policies'
             subtitle='Which model serves each task type.'
             actions={
-              <PrimaryButton
-                startContent={<Plus className='h-4 w-4' />}
-                onPress={openCreate}
-                isDisabled={!meLoaded}
-              >
-                New policy
-              </PrimaryButton>
+              canManagePolicies ? (
+                <PrimaryButton
+                  startContent={<Plus className='h-4 w-4' />}
+                  onPress={openCreate}
+                  isDisabled={!meLoaded}
+                >
+                  New policy
+                </PrimaryButton>
+              ) : undefined
             }
           />
 
@@ -861,17 +910,20 @@ export default function ModelPoliciesPage() {
               description='Create a policy to route a task type to a specific provider and model.'
               icon={<Cpu className='h-6 w-6' />}
               action={
-                <PrimaryButton
-                  startContent={<Plus className='h-4 w-4' />}
-                  onPress={openCreate}
-                >
-                  New policy
-                </PrimaryButton>
+                canManagePolicies ? (
+                  <PrimaryButton
+                    startContent={<Plus className='h-4 w-4' />}
+                    onPress={openCreate}
+                  >
+                    New policy
+                  </PrimaryButton>
+                ) : undefined
               }
             />
           ) : (
             <PoliciesTable
               items={items}
+              canManage={canManagePolicies}
               onDisable={setDisablePolicyTarget}
               onSelect={setDetailPolicy}
             />
@@ -898,6 +950,8 @@ export default function ModelPoliciesPage() {
             isOpen={createOpen}
             isPending={createMutation.isPending}
             error={createError}
+            projectId={activeProjectId}
+            teamId={activeTeamId}
             onClose={() => setCreateOpen(false)}
             onSubmit={handleCreate}
           />

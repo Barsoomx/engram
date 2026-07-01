@@ -286,7 +286,7 @@ export default function ModelSetupPage() {
     hasCapability(capabilities, 'secrets:*');
 
   const statusQuery = useQuery<ModelSetupStatus>({
-    queryKey: adminQueryKeys.modelSetupStatus(activeOrgId, activeProjectId),
+    queryKey: adminQueryKeys.modelSetupStatus(activeOrgId, activeProjectId, activeTeamId),
     enabled: Boolean(activeProjectId),
     queryFn: () =>
       getModelSetupStatus(activeProjectId ?? '', activeTeamId ?? undefined),
@@ -299,7 +299,7 @@ export default function ModelSetupPage() {
 
   function invalidateStatus() {
     queryClient.invalidateQueries({
-      queryKey: adminQueryKeys.modelSetupStatus(activeOrgId, activeProjectId),
+      queryKey: adminQueryKeys.modelSetupStatus(activeOrgId, activeProjectId, activeTeamId),
     });
   }
 

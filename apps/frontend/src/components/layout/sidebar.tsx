@@ -16,7 +16,6 @@ import {
   LayoutDashboard,
   LogOut,
   ScrollText,
-  Search,
   SearchCode,
   Settings,
   ShieldCheck,
@@ -75,13 +74,13 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         href: '/hook-debug',
         label: 'Hook Debugger',
         icon: Webhook,
-        capability: 'api_keys:read',
+        capability: 'observations:write',
       },
       {
         href: '/context-bundles',
         label: 'Context Bundles',
         icon: Boxes,
-        capability: 'memories:admin',
+        capability: 'context:read',
       },
       {
         href: '/digests',
@@ -104,19 +103,19 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         href: '/secrets',
         label: 'Secrets',
         icon: KeyRound,
-        capability: 'secrets:*',
+        capability: 'secrets:read',
       },
       {
         href: '/model-policies',
         label: 'Model Policies',
         icon: Cpu,
-        capability: 'model_policy:*',
+        capability: 'model_policy:read',
       },
       {
         href: '/model-setup',
         label: 'Model Setup',
         icon: SlidersHorizontal,
-        capability: 'model_policy:*',
+        capability: 'model_policy:read',
       },
       {
         href: '/organizations',
@@ -237,17 +236,6 @@ export function Sidebar({ isOpen, onClose, onLogout, capabilities }: SidebarProp
             type='button'
           >
             <X className='h-5 w-5' />
-          </button>
-        </div>
-
-        <div className='px-4 pb-2'>
-          <button
-            type='button'
-            className='flex h-[38px] w-full items-center gap-2.5 rounded-[10px] border border-divider-strong bg-content1 px-3 text-default-500 transition-colors hover:text-foreground'
-          >
-            <Search size={16} strokeWidth={1.8} className='shrink-0' />
-            <span className='flex-1 text-left text-[13px]'>Search…</span>
-            <span className='key-cap'>⌘K</span>
           </button>
         </div>
 

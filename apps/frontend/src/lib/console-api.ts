@@ -111,7 +111,7 @@ export interface ContextBundleListItem {
   request_id: string;
   purpose: string;
   query_text: string;
-  token_budget: number;
+  token_budget: number | null;
   selected_count: number;
   status: string;
   created_at: string | null;

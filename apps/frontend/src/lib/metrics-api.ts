@@ -29,7 +29,7 @@ export type ActivityEvent = {
   actor_id: string;
   target_type: string;
   target_id: string;
-  result: 'success' | 'failure';
+  result: 'allowed' | 'denied' | 'recorded';
   created_at: string;
 };
 

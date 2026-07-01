@@ -162,3 +162,30 @@ export function formatRelativeTime(value: string | null | undefined): string {
 
   return `${Math.round(day / 365)}y ago`;
 }
+
+export const AUDIT_RESULT_COLORS: Record<string, string> = {
+  success: '#3DD9AC',
+  allowed: '#3DD9AC',
+  recorded: '#6BA6FF',
+  denied: '#FB6E72',
+};
+
+export function auditResultColor(value: string | null | undefined): string {
+  return AUDIT_RESULT_COLORS[(value ?? '').toLowerCase()] ?? '#8B8D93';
+}
+
+export function auditResultChipColor(
+  value: string | null | undefined,
+): 'success' | 'danger' | 'default' {
+  const v = (value ?? '').toLowerCase();
+
+  if (v === 'allowed') {
+    return 'success';
+  }
+
+  if (v === 'denied' || v === 'failed' || v === 'errored') {
+    return 'danger';
+  }
+
+  return 'default';
+}

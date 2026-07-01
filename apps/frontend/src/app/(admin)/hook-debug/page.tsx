@@ -268,7 +268,7 @@ export default function HookDebugPage() {
   }
 
   return (
-    <CapabilityGate capabilities={capabilities} required='api_keys:read'>
+    <CapabilityGate capabilities={capabilities} required='observations:write'>
       <section className='space-y-6'>
         <PageHeader
           title='Hook Debugger'

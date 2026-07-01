@@ -2,7 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Bell, Menu } from 'lucide-react';
+import { Menu } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
@@ -21,6 +21,8 @@ import {
   type MeResponse,
 } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
+import { useProjectStore } from '@/lib/project-store';
+import { useTeamStore } from '@/lib/team-store';
 
 function FullPageLoader() {
   return (
@@ -88,26 +90,33 @@ export default function AdminShellLayout({
     }
   }, [hasToken, router]);
 
+  const clearSession = React.useCallback(() => {
+    clearToken();
+    useOrgStore.getState().setActiveOrg(null);
+    useProjectStore.getState().setActiveProject(null);
+    useTeamStore.getState().setActiveTeam(null);
+    setHasToken(false);
+  }, []);
+
   React.useEffect(() => {
     if (
       meQuery.isError &&
       axios.isAxiosError(meQuery.error) &&
-      meQuery.error.response?.status === 401
+      (meQuery.error.response?.status === 401 ||
+        meQuery.error.response?.status === 403)
     ) {
-      clearToken();
-      setHasToken(false);
+      clearSession();
     }
-  }, [meQuery.isError, meQuery.error]);
+  }, [meQuery.isError, meQuery.error, clearSession]);
 
   const handleLogout = React.useCallback(async () => {
     try {
       await logout();
     } finally {
-      clearToken();
-      setHasToken(false);
+      clearSession();
       router.replace('/login');
     }
-  }, [router]);
+  }, [router, clearSession]);
 
   if (hasToken === null) {
     return <FullPageLoader />;
@@ -167,17 +176,6 @@ export default function AdminShellLayout({
           </div>
 
           <div className='flex items-center gap-3'>
-            <button
-              type='button'
-              aria-label='Notifications'
-              className='relative flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground'
-            >
-              <Bell size={17} strokeWidth={1.8} />
-              <span className='absolute right-2 top-2 h-1.5 w-1.5 rounded-full bg-primary ring-2 ring-[#0A0C11]' />
-            </button>
-
-            <span className='h-6 w-px bg-divider' />
-
             {profile && (
               <div className='flex items-center gap-2.5'>
                 <div className='text-right leading-tight'>

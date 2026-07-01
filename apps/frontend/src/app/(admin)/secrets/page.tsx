@@ -23,7 +23,7 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createProviderSecret,
   disableProviderSecret,
@@ -116,11 +116,13 @@ function ColumnHeader() {
 
 function SecretsTable({
   items,
+  canManage,
   onRotate,
   onDisable,
   onEnable,
 }: {
   items: ProviderSecret[];
+  canManage: boolean;
   onRotate: (secret: ProviderSecret) => void;
   onDisable: (secret: ProviderSecret) => void;
   onEnable: (secret: ProviderSecret) => void;
@@ -177,37 +179,38 @@ function SecretsTable({
                 )}
               </div>
               <div className='flex items-center justify-end gap-2'>
-                {secret.active ? (
-                  <>
+                {canManage &&
+                  (secret.active ? (
+                    <>
+                      <Button
+                        size='sm'
+                        variant='flat'
+                        startContent={<RefreshCw className='h-3.5 w-3.5' />}
+                        onPress={() => onRotate(secret)}
+                      >
+                        Rotate
+                      </Button>
+                      <Button
+                        size='sm'
+                        color='danger'
+                        variant='flat'
+                        startContent={<Ban className='h-3.5 w-3.5' />}
+                        onPress={() => onDisable(secret)}
+                      >
+                        Disable
+                      </Button>
+                    </>
+                  ) : (
                     <Button
                       size='sm'
+                      color='success'
                       variant='flat'
-                      startContent={<RefreshCw className='h-3.5 w-3.5' />}
-                      onPress={() => onRotate(secret)}
+                      startContent={<Power className='h-3.5 w-3.5' />}
+                      onPress={() => onEnable(secret)}
                     >
-                      Rotate
+                      Enable
                     </Button>
-                    <Button
-                      size='sm'
-                      color='danger'
-                      variant='flat'
-                      startContent={<Ban className='h-3.5 w-3.5' />}
-                      onPress={() => onDisable(secret)}
-                    >
-                      Disable
-                    </Button>
-                  </>
-                ) : (
-                  <Button
-                    size='sm'
-                    color='success'
-                    variant='flat'
-                    startContent={<Power className='h-3.5 w-3.5' />}
-                    onPress={() => onEnable(secret)}
-                  >
-                    Enable
-                  </Button>
-                )}
+                  ))}
               </div>
             </div>
           ))}
@@ -537,6 +540,7 @@ export default function SecretsPage() {
     () => meQuery.data?.capabilities ?? [],
     [meQuery.data?.capabilities],
   );
+  const canManageSecrets = hasCapability(capabilities, 'secrets:*');
 
   const secretsQuery = useQuery<ProviderSecret[]>({
     queryKey: ['model-policy', 'secrets', activeProjectId, activeTeamId],
@@ -730,19 +734,21 @@ export default function SecretsPage() {
   const items = secretsQuery.data ?? [];
 
   return (
-    <CapabilityGate capabilities={capabilities} required='secrets:*'>
+    <CapabilityGate capabilities={capabilities} required='secrets:read'>
       <section className='space-y-6'>
         <PageHeader
           title='Secrets'
           subtitle='Provider API keys used for model calls.'
           actions={
-            <PrimaryButton
-              startContent={<Plus className='h-4 w-4' />}
-              onPress={openAdd}
-              isDisabled={!meLoaded}
-            >
-              Add secret
-            </PrimaryButton>
+            canManageSecrets ? (
+              <PrimaryButton
+                startContent={<Plus className='h-4 w-4' />}
+                onPress={openAdd}
+                isDisabled={!meLoaded}
+              >
+                Add secret
+              </PrimaryButton>
+            ) : undefined
           }
         />
 
@@ -763,17 +769,20 @@ export default function SecretsPage() {
             description='Add a provider API key to enable model calls for this scope.'
             icon={<KeyRound className='h-6 w-6' />}
             action={
-              <PrimaryButton
-                startContent={<Plus className='h-4 w-4' />}
-                onPress={openAdd}
-              >
-                Add secret
-              </PrimaryButton>
+              canManageSecrets ? (
+                <PrimaryButton
+                  startContent={<Plus className='h-4 w-4' />}
+                  onPress={openAdd}
+                >
+                  Add secret
+                </PrimaryButton>
+              ) : undefined
             }
           />
         ) : (
           <SecretsTable
             items={items}
+            canManage={canManageSecrets}
             onRotate={openRotate}
             onDisable={setDisableTarget}
             onEnable={handleEnable}
