@@ -29,7 +29,7 @@ plugin through the native `claude plugin` marketplace, and finishes with a
 Run it without cloning the repo via `uvx`:
 
 ```bash
-uvx --from engram-cli engram install \
+uvx --from engram-connect engram install \
   --server <URL> --api-key <KEY> --project <PROJECT_ID>
 ```
 
@@ -39,7 +39,7 @@ Before the package is published to PyPI, install straight from git or `pipx`:
 uvx --from "git+https://github.com/Barsoomx/engram.git#subdirectory=packages/cli" \
   engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
 # or:
-pipx install engram-cli
+pipx install engram-connect
 engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
 ```
 

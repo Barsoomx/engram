@@ -11,7 +11,7 @@ export function buildConnectCommand({
   apiKey: string;
   projectId: string;
 }): string {
-  return `uvx --from engram-cli engram install --server ${normalizeServerUrl(serverUrl)} --api-key ${apiKey} --project ${projectId}`;
+  return `uvx --from engram-connect engram install --server ${normalizeServerUrl(serverUrl)} --api-key ${apiKey} --project ${projectId}`;
 }
 
 export function buildConnectFallbackCommand({

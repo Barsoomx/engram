@@ -26,7 +26,7 @@ keys via the console.
   **bundle the hook runtime inside the plugin** so hooks call
   `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" ...` — no separate `engram`
   on PATH is required for the hot path. PyPI is used only to launch the
-  one-time installer (`uvx --from engram-cli engram install ...`).
+  one-time installer (`uvx --from engram-connect engram install ...`).
 - **Harness scope:** Claude Code first. Codex is a follow-up slice using the
   same template.
 - **Install mechanism:** native `claude plugin marketplace add` +
@@ -140,7 +140,7 @@ Testing (TDD, unittest, `packages/cli/engram_cli/install_tests.py`):
 - `--skip-plugin-install` → `Runner` not called; connect + doctor only; exit 0.
 - idempotent second run → exit 0.
 
-### D. PyPI packaging for `engram-cli`
+### D. PyPI packaging for `engram-connect`
 
 `packages/cli/pyproject.toml` gains publish metadata: `readme`, `license`,
 `authors`, `urls` (Homepage/Repository), classifiers, keywords. Entry point
@@ -148,11 +148,11 @@ Testing (TDD, unittest, `packages/cli/engram_cli/install_tests.py`):
 documents:
 
 ```bash
-uvx --from engram-cli engram install --server <URL> --api-key <KEY> --project <ID>
+uvx --from engram-connect engram install --server <URL> --api-key <KEY> --project <ID>
 # or, before PyPI publish:
 uvx --from "git+https://github.com/Barsoomx/engram.git#subdirectory=packages/cli" \
   engram install --server <URL> --api-key <KEY> --project <ID>
-# or: pipx install engram-cli
+# or: pipx install engram-connect
 ```
 
 The actual PyPI publish (build + twine upload) is a credentialed **release
@@ -163,7 +163,7 @@ action** performed by the maintainer; it is documented, not executed here. A
 
 - `apps/frontend/src/lib/build-connect-command.ts` — pure helper:
   `buildConnectCommand({ serverUrl, apiKey, projectId }) -> string` producing the
-  `uvx --from engram-cli engram install --server ... --api-key ... --project ...`
+  `uvx --from engram-connect engram install --server ... --api-key ... --project ...`
   line. Isolated so it is trivially correct and unit-testable later.
 - `apps/frontend/src/components/connect/connect-agent-modal.tsx`:
   - Project selector (default = active project from `useProjectStore`, options
@@ -193,7 +193,7 @@ pure helper to keep correctness inspectable.
 ```
 Dashboard "Connect agent" → ConnectAgentModal
   → POST /v1/admin/api-keys/ (scoped: memories:read, observations:write, search:query)
-  → render: uvx --from engram-cli engram install --server S --api-key K --project P
+  → render: uvx --from engram-connect engram install --server S --api-key K --project P
 Developer runs command →
   engram install:
     connect(S,K,P)  → validate (dry-run) + write ~/.engram/{config,credentials,hooks}
