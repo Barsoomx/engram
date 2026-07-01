@@ -77,8 +77,16 @@ function ObservationRow({
 }) {
   return (
     <div
-      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60`}
+      role='button'
+      tabIndex={0}
+      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60 focus:bg-content2/60 focus:outline-none`}
       onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick();
+        }
+      }}
     >
       <div className='min-w-0'>
         <TypePill type={observation.observation_type} />

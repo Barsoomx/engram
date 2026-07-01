@@ -5,6 +5,18 @@ import { Check, ChevronDown } from 'lucide-react';
 import * as React from 'react';
 
 export function SwitcherBackdrop({ onClose }: { onClose: () => void }) {
+  React.useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    };
+
+    window.addEventListener('keydown', onKey);
+
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
   return <div className='fixed inset-0 z-40' onClick={onClose} aria-hidden='true' />;
 }
 
@@ -21,6 +33,8 @@ export function SwitcherTrigger({
     <button
       type='button'
       onClick={onClick}
+      aria-haspopup='menu'
+      aria-expanded={active}
       className={clsx(
         'flex h-9 max-w-[220px] items-center gap-2 rounded-[9px] px-2 transition-colors',
         active ? 'bg-content2 text-foreground' : 'text-foreground hover:bg-content2/60',
