@@ -416,7 +416,7 @@ function CreatePolicyModal({
                   <Input
                     label='Model'
                     labelPlacement='outside'
-                    placeholder='claude-sonnet-4'
+                    placeholder='claude-sonnet-5'
                     value={model}
                     onValueChange={setModel}
                     isDisabled={isPending}
@@ -449,7 +449,7 @@ function CreatePolicyModal({
                 <Input
                   label='Base URL (optional)'
                   labelPlacement='outside'
-                  placeholder='https://api.deepseek.com/v1 or https://open.bigmodel.cn/api/paas/v4 (leave blank for default)'
+                  placeholder='https://api.deepseek.com/v1 or https://api.z.ai/api/paas/v4 (leave blank for default)'
                   value={baseUrl}
                   onValueChange={setBaseUrl}
                   isDisabled={isPending}

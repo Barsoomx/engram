@@ -306,7 +306,7 @@ def test_apply_glm_openai_uses_base_url_and_separate_secrets(
         active=True,
     )
     assert gen_policy.provider == 'openai'
-    assert gen_policy.metadata.get('base_url') == 'https://open.bigmodel.cn/api/paas/v4'
+    assert gen_policy.metadata.get('base_url') == 'https://api.z.ai/api/paas/v4'
 
     emb_policy = ModelPolicy.objects.get(
         organization=f_setup_org,
