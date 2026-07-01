@@ -473,7 +473,7 @@ function AuditLog() {
               value={draftEventType}
               onChange={(e) => setDraftEventType(e.target.value)}
               placeholder='e.g. ProjectCreated'
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none placeholder:text-default-400 focus:border-primary'
+              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden placeholder:text-default-400 focus:border-primary'
             />
           </div>
           <div className='flex min-w-[130px] flex-col gap-1.5'>
@@ -484,7 +484,7 @@ function AuditLog() {
               value={draftResult}
               onChange={(e) => setDraftResult(e.target.value)}
               placeholder='allowed / denied / recorded'
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none placeholder:text-default-400 focus:border-primary'
+              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden placeholder:text-default-400 focus:border-primary'
             />
           </div>
           <div className='flex min-w-[130px] flex-col gap-1.5'>
@@ -495,7 +495,7 @@ function AuditLog() {
               type='date'
               value={draftSince}
               onChange={(e) => setDraftSince(e.target.value)}
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none focus:border-primary'
+              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden focus:border-primary'
             />
           </div>
           <div className='flex min-w-[130px] flex-col gap-1.5'>
@@ -506,7 +506,7 @@ function AuditLog() {
               type='date'
               value={draftUntil}
               onChange={(e) => setDraftUntil(e.target.value)}
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-none focus:border-primary'
+              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden focus:border-primary'
             />
           </div>
           <div className='flex items-end gap-2'>

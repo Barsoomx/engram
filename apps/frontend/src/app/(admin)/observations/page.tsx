@@ -79,7 +79,7 @@ function ObservationRow({
     <div
       role='button'
       tabIndex={0}
-      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60 focus:bg-content2/60 focus:outline-none`}
+      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60 focus:bg-content2/60 focus:outline-hidden`}
       onClick={onClick}
       onKeyDown={(event) => {
         if (event.key === 'Enter' || event.key === ' ') {

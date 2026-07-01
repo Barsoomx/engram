@@ -166,7 +166,7 @@ function Toggle({
       >
         <span
           className={clsx(
-            'absolute top-1/2 h-[18px] w-[18px] -translate-y-1/2 rounded-full bg-white shadow-sm transition-all duration-150',
+            'absolute top-1/2 h-[18px] w-[18px] -translate-y-1/2 rounded-full bg-white shadow-xs transition-all duration-150',
             checked ? 'left-[21px]' : 'left-[3px]',
           )}
         />
@@ -461,7 +461,7 @@ export default function SettingsPage() {
               value={purgeConfirm}
               onChange={(event) => setPurgeConfirm(event.target.value)}
               placeholder={orgSlug}
-              className='h-10 w-full rounded-[10px] border border-divider-strong bg-content2 px-3 font-mono text-[13px] text-foreground outline-none transition-colors focus:border-danger/60'
+              className='h-10 w-full rounded-[10px] border border-divider-strong bg-content2 px-3 font-mono text-[13px] text-foreground outline-hidden transition-colors focus:border-danger/60'
             />
             {purgeMutation.isError && (
               <p className='text-[12px] text-danger'>
