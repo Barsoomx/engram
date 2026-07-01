@@ -26,22 +26,6 @@ logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
-class HookDryRunInput:
-    raw_key: str
-    project_id: uuid.UUID
-    team_id: uuid.UUID | None
-    agent_runtime: str
-    agent_version: str
-    request_id: str
-
-
-@dataclass(frozen=True)
-class HookDryRunResult:
-    request_id: str
-    scope: EffectiveScope
-
-
-@dataclass(frozen=True)
 class HookEventInput:
     raw_key: str
     project_id: uuid.UUID
@@ -75,21 +59,6 @@ class HookIngestResult:
     observation: Observation
     session: AgentSession
     duplicate: bool
-
-
-class VerifyHookDryRun:
-    def execute(self, data: HookDryRunInput) -> HookDryRunResult:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability='observations:write',
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            request_id=data.request_id,
-            target_type='hook_dry_run',
-            target_id=data.agent_runtime,
-        )
-
-        return HookDryRunResult(request_id=data.request_id, scope=scope)
 
 
 class IngestHookEvent:
