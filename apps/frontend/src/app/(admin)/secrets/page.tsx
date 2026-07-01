@@ -791,8 +791,8 @@ export default function SecretsPage() {
 
         <p className='flex items-center gap-1.5 text-[12px] text-default-400'>
           <Info className='h-3.5 w-3.5' />
-          Listing requires the model-policy secrets list endpoint; an empty list
-          is shown if it is unavailable.
+          If this list looks empty, the secrets service may be temporarily
+          unavailable — try refreshing.
         </p>
 
         <AddSecretModal
