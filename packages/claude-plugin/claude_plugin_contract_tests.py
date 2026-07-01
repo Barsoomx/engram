@@ -22,7 +22,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         for path in REQUIRED_PACKAGE_FILES:
             self.assertTrue(path.exists(), path)
 
-    def test_claude_hook_manifest_uses_engram_claude_code_commands(self) -> None:
+    def test_claude_hook_manifest_uses_bundled_hook_commands(self) -> None:
         self.assertTrue(PLUGIN_MANIFEST_PATH.exists(), PLUGIN_MANIFEST_PATH)
         self.assertTrue(HOOK_MANIFEST_PATH.exists(), HOOK_MANIFEST_PATH)
 
@@ -46,7 +46,7 @@ class ClaudePluginContractTests(unittest.TestCase):
 
         self.assertEqual(len(REQUIRED_HOOK_EVENTS), len(commands))
         for command in commands:
-            self.assertIn("engram hook", command)
+            self.assertIn("${CLAUDE_PLUGIN_ROOT}/hooks/hook.py", command)
             self.assertIn("--agent claude_code", command)
             self.assertIn("--response-format claude-code", command)
             self.assertNotIn("claude-mem", command)
