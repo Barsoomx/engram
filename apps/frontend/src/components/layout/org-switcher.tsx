@@ -1,6 +1,6 @@
 'use client';
 
-import { Building2, Plus, Settings } from 'lucide-react';
+import { Building2, Settings } from 'lucide-react';
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
@@ -116,14 +116,6 @@ export function OrgSwitcher({ orgId }: OrgSwitcherProps) {
             ))}
           </div>
           <DropdownDivider />
-          <MenuActionRow
-            icon={Plus}
-            label='Create organization'
-            onClick={() => {
-              close();
-              router.push('/organizations');
-            }}
-          />
           <MenuActionRow
             icon={Settings}
             label='Organization settings'
