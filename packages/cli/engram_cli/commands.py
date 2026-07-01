@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
+import subprocess
 import sys
 import uuid
 from argparse import Namespace
@@ -46,6 +48,7 @@ class CliError(Exception):
 
 
 PromptFn = Callable[[str], str]
+Runner = Callable[[list[str]], tuple[int, str, str]]
 
 DEFAULT_SERVER_URL = "http://localhost:8000"
 WIZARD_API_KEY_CAPABILITIES = (
@@ -55,6 +58,7 @@ WIZARD_API_KEY_CAPABILITIES = (
 )
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
+PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -79,6 +83,9 @@ ERROR_REMEDIATION: dict[str, str] = {
     "api_key_issue_failed": "Check server logs and key capabilities.",
     "missing_mcp_target": "Pass --claude-code-config or --claude-desktop-config.",
     "invalid_agent_target": "Use claude_code, claude_desktop, or both.",
+    "claude_cli_not_found": "Install the Claude Code CLI and ensure 'claude' is on PATH.",
+    "plugin_install_failed": "Check 'claude plugin' output and marketplace source.",
+    "python_runtime_missing": "Install python3 >= 3.12 so bundled hooks can run.",
 }
 
 
@@ -544,6 +551,97 @@ def run_doctor(
     stdout.write("All required checks passed.\n")
 
     return 0
+
+
+def subprocess_runner(cmd: list[str]) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=PLUGIN_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        note = f"command timed out after {PLUGIN_COMMAND_TIMEOUT_SECONDS}s"
+
+        return 124, _as_text(error.stdout), f"{_as_text(error.stderr)}\n{note}".strip()
+
+    return result.returncode, result.stdout, result.stderr
+
+
+def _as_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+
+    return str(value)
+
+
+def run_install(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+    *,
+    runner: Runner | None = None,
+) -> int:
+    active_transport = transport or urllib_transport
+    connect_code = run_connect_flags(args, stdout, stderr, active_transport)
+    if connect_code != 0:
+        return connect_code
+
+    try:
+        if not args.skip_plugin_install:
+            claude_bin = shutil.which(args.claude_bin or "claude")
+            if not claude_bin:
+                raise CliError(
+                    "claude_cli_not_found",
+                    "Could not find the Claude Code CLI on PATH",
+                    remediation_for("claude_cli_not_found"),
+                )
+            install_claude_plugin(
+                runner or subprocess_runner,
+                claude_bin=claude_bin,
+                marketplace_source=args.marketplace_source,
+                marketplace_name=args.marketplace_name,
+                plugin_name=args.plugin_name,
+                api_key=args.api_key or "",
+            )
+    except CliError as error:
+        emit_error(stderr, error, args.api_key or "")
+
+        return 1
+
+    return run_doctor(args, stdout, stderr, active_transport)
+
+
+def install_claude_plugin(
+    runner: Runner,
+    *,
+    claude_bin: str,
+    marketplace_source: str,
+    marketplace_name: str,
+    plugin_name: str,
+    api_key: str,
+) -> None:
+    plugin_commands = (
+        [claude_bin, "plugin", "marketplace", "add", marketplace_source],
+        [claude_bin, "plugin", "install", f"{plugin_name}@{marketplace_name}"],
+    )
+    for command in plugin_commands:
+        returncode, command_stdout, command_stderr = runner(command)
+        if returncode != 0:
+            combined = "\n".join(
+                part.strip()
+                for part in (command_stdout, command_stderr)
+                if part.strip()
+            )
+            raise CliError(
+                "plugin_install_failed",
+                redact_secret(combined or "claude plugin install failed", api_key),
+                remediation_for("plugin_install_failed"),
+            )
 
 
 def run_disconnect(args: Namespace, stdout: TextIO, _stderr: TextIO) -> int:

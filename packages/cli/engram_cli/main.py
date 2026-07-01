@@ -10,6 +10,7 @@ from engram_cli.commands import (
     run_disconnect,
     run_doctor,
     run_hook,
+    run_install,
     run_mcp_install,
     run_memory_link,
     run_memory_links,
@@ -37,6 +38,8 @@ def main(
         return int(error.code)
     if args.command == "connect":
         return run_connect(args, output, errors, transport)
+    if args.command == "install":
+        return run_install(args, output, errors, transport)
     if args.command == "doctor":
         return run_doctor(args, output, errors, transport)
     if args.command == "disconnect":
@@ -82,6 +85,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     connect.add_argument("--agent-version", default="")
     connect.add_argument("--config-dir")
+
+    install = subparsers.add_parser("install")
+    install.add_argument("--server")
+    install.add_argument("--api-key")
+    install.add_argument("--project")
+    install.add_argument("--team")
+    install.add_argument(
+        "--agent",
+        choices=("codex", "claude-code", "claude_code", "both"),
+        default="claude-code",
+    )
+    install.add_argument("--agent-version", default="")
+    install.add_argument("--config-dir")
+    install.add_argument("--marketplace-source", default="Barsoomx/engram")
+    install.add_argument("--marketplace-name", default="engram-marketplace")
+    install.add_argument("--plugin-name", default="engram")
+    install.add_argument("--claude-bin", default="claude")
+    install.add_argument("--skip-plugin-install", action="store_true")
 
     doctor = subparsers.add_parser("doctor")
     doctor.add_argument("--config-dir")

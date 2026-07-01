@@ -18,6 +18,37 @@ python -m engram_cli disconnect
 
 The package also declares an `engram` console script in `pyproject.toml`.
 
+## Plug-and-play install (`engram install`)
+
+`engram install` is the one-command onboarding path for a Claude Code harness.
+It validates the server, API key, and project scope (same dry-run as `connect`),
+writes local credentials under `~/.engram`, installs the Engram Claude Code
+plugin through the native `claude plugin` marketplace, and finishes with a
+`doctor` health check.
+
+Run it without cloning the repo via `uvx`:
+
+```bash
+uvx --from engram-cli engram install \
+  --server <URL> --api-key <KEY> --project <PROJECT_ID>
+```
+
+Before the package is published to PyPI, install straight from git or `pipx`:
+
+```bash
+uvx --from "git+https://github.com/Barsoomx/engram.git#subdirectory=packages/cli" \
+  engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
+# or:
+pipx install engram-cli
+engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
+```
+
+The plugin steps run `claude plugin marketplace add <--marketplace-source>` then
+`claude plugin install <--plugin-name>@<--marketplace-name>` using the `claude`
+binary on PATH (override with `--claude-bin`). Pass `--skip-plugin-install` to
+write credentials and run `doctor` without touching the harness. The bundled
+plugin hooks require `python3 >= 3.12` on PATH.
+
 Local state defaults to `$ENGRAM_HOME` when set, otherwise `~/.engram`.
 `connect` writes only Engram-owned config, credential, and hook-manifest files.
 `doctor` is read-only. `disconnect` removes only Engram-owned files.
