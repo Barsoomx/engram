@@ -1,12 +1,13 @@
 name: Publish images
 
-# Build the backend + frontend images and, on master, push them to the GitHub Container
-# Registry (ghcr.io) with signed SLSA build-provenance attestations. The server then pulls
-# the pre-built images (private/engram-deploy/deploy-registry.sh) instead of receiving a
-# multi-GB `docker save | ssh docker load` over a metered local link.
+# Build the backend + frontend images and, on master or a version tag, push them to the
+# GitHub Container Registry (ghcr.io) with signed SLSA build-provenance attestations. The
+# server then pulls the pre-built images (private/engram-deploy/deploy-registry.sh) instead
+# of receiving a multi-GB `docker save | ssh docker load` over a metered local link.
 #
-# On pull_request the images are BUILT but NOT pushed (validates the Dockerfiles + the
-# runtime-config placeholder build); pushing + attesting happens only on master.
+# - master push  -> tags `latest` + `sha-<short>`
+# - tag `0.1.0`  -> stable semver tags `0.1.0` + `0.1`
+# - pull_request -> BUILD only, NOT pushed (validates the Dockerfiles + placeholder build)
 #
 # The frontend image is GENERIC: NEXT_PUBLIC_* config is baked as APP_* placeholders and
 # replaced at container start (apps/frontend/entrypoint.sh) from the runtime env — so no
@@ -15,10 +16,9 @@ name: Publish images
 on:
   push:
     branches: [master]
-    paths:
-      - 'apps/backend/**'
-      - 'apps/frontend/**'
-      - '.github/workflows/publish-images.yml'
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
   pull_request:
     paths:
       - 'apps/backend/**'
@@ -62,11 +62,11 @@ jobs:
         run: echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -74,17 +74,19 @@ jobs:
 
       - name: Image metadata (tags + labels)
         id: meta
-        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
             type=raw,value=${{ github.event.inputs.extra_tag }},enable=${{ github.event.inputs.extra_tag != '' }}
 
-      - name: Build (and push on master)
+      - name: Build (and push on master / tags)
         id: build
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
@@ -100,7 +102,7 @@ jobs:
 
       - name: Attest build provenance (signed SLSA, pushed to GHCR)
         if: github.event_name != 'pull_request'
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-name: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}

@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: engram
           POSTGRES_USER: engram
@@ -69,9 +69,36 @@ jobs:
         working-directory: apps/backend
         run: poetry run pytest engram/imports/upstream_import_tests.py -v
 
-      - name: Run backend tests
+      - name: Run backend tests with coverage
         working-directory: apps/backend
-        run: poetry run pytest -v
+        run: |
+          poetry run pip install coverage
+          poetry run coverage run --source=engram --omit='*/*_tests.py,*/migrations/*' -m pytest -v --junitxml=junit.xml -o junit_family=legacy
+
+      - name: Generate coverage report
+        working-directory: apps/backend
+        run: |
+          poetry run coverage xml
+          poetry run coverage report -m
+
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: apps/backend/coverage.xml
+          disable_search: true
+          fail_ci_if_error: true
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: apps/backend/junit.xml
+          disable_search: true
+          report_type: test_results
+          fail_ci_if_error: true
 
       - name: Run CLI tests
         run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v
