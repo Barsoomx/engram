@@ -140,10 +140,12 @@ function ColumnHeader() {
 
 function PoliciesTable({
   items,
+  canManage,
   onDisable,
   onSelect,
 }: {
   items: ModelPolicy[];
+  canManage: boolean;
   onDisable: (policy: ModelPolicy) => void;
   onSelect: (policy: ModelPolicy) => void;
 }) {
@@ -191,7 +193,7 @@ function PoliciesTable({
                 >
                   View
                 </Button>
-                {policy.active && (
+                {canManage && policy.active && (
                   <Button
                     size='sm'
                     color='danger'
@@ -921,6 +923,7 @@ export default function ModelPoliciesPage() {
           ) : (
             <PoliciesTable
               items={items}
+              canManage={canManagePolicies}
               onDisable={setDisablePolicyTarget}
               onSelect={setDetailPolicy}
             />

@@ -116,11 +116,13 @@ function ColumnHeader() {
 
 function SecretsTable({
   items,
+  canManage,
   onRotate,
   onDisable,
   onEnable,
 }: {
   items: ProviderSecret[];
+  canManage: boolean;
   onRotate: (secret: ProviderSecret) => void;
   onDisable: (secret: ProviderSecret) => void;
   onEnable: (secret: ProviderSecret) => void;
@@ -177,37 +179,38 @@ function SecretsTable({
                 )}
               </div>
               <div className='flex items-center justify-end gap-2'>
-                {secret.active ? (
-                  <>
+                {canManage &&
+                  (secret.active ? (
+                    <>
+                      <Button
+                        size='sm'
+                        variant='flat'
+                        startContent={<RefreshCw className='h-3.5 w-3.5' />}
+                        onPress={() => onRotate(secret)}
+                      >
+                        Rotate
+                      </Button>
+                      <Button
+                        size='sm'
+                        color='danger'
+                        variant='flat'
+                        startContent={<Ban className='h-3.5 w-3.5' />}
+                        onPress={() => onDisable(secret)}
+                      >
+                        Disable
+                      </Button>
+                    </>
+                  ) : (
                     <Button
                       size='sm'
+                      color='success'
                       variant='flat'
-                      startContent={<RefreshCw className='h-3.5 w-3.5' />}
-                      onPress={() => onRotate(secret)}
+                      startContent={<Power className='h-3.5 w-3.5' />}
+                      onPress={() => onEnable(secret)}
                     >
-                      Rotate
+                      Enable
                     </Button>
-                    <Button
-                      size='sm'
-                      color='danger'
-                      variant='flat'
-                      startContent={<Ban className='h-3.5 w-3.5' />}
-                      onPress={() => onDisable(secret)}
-                    >
-                      Disable
-                    </Button>
-                  </>
-                ) : (
-                  <Button
-                    size='sm'
-                    color='success'
-                    variant='flat'
-                    startContent={<Power className='h-3.5 w-3.5' />}
-                    onPress={() => onEnable(secret)}
-                  >
-                    Enable
-                  </Button>
-                )}
+                  ))}
               </div>
             </div>
           ))}
@@ -779,6 +782,7 @@ export default function SecretsPage() {
         ) : (
           <SecretsTable
             items={items}
+            canManage={canManageSecrets}
             onRotate={openRotate}
             onDisable={setDisableTarget}
             onEnable={handleEnable}
