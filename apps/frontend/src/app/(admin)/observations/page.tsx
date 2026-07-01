@@ -8,7 +8,7 @@ import {
   ModalContent,
   ModalHeader,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
 import { AlertTriangle, Eye, Filter } from 'lucide-react';
 import * as React from 'react';
 
@@ -332,81 +332,56 @@ export default function ObservationsPage() {
 
   const [draft, setDraft] = React.useState<Filters>(EMPTY_FILTERS);
   const [applied, setApplied] = React.useState<Filters>(EMPTY_FILTERS);
-  const [items, setItems] = React.useState<ObservationItem[]>([]);
-  const [offset, setOffset] = React.useState(0);
-  const [hasMore, setHasMore] = React.useState(false);
-  const [isLoading, setIsLoading] = React.useState(false);
-  const [isLoadingMore, setIsLoadingMore] = React.useState(false);
-  const [fetchError, setFetchError] = React.useState<string | null>(null);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
 
-  async function fetchPage(
-    currentOffset: number,
-    filters: Filters,
-    append: boolean,
-  ) {
-    if (!activeProjectId) {
-
-      return;
-    }
-
-    if (append) {
-      setIsLoadingMore(true);
-    } else {
-      setIsLoading(true);
-    }
-
-    setFetchError(null);
-
-    try {
-      const client = apiClient();
+  const query = useInfiniteQuery({
+    queryKey: ['observations', activeProjectId, activeTeamId, applied],
+    enabled: Boolean(activeProjectId),
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
       const params: Record<string, string> = {
-        project_id: activeProjectId,
+        project_id: activeProjectId ?? '',
         limit: String(LIMIT),
-        offset: String(currentOffset),
+        offset: String(pageParam),
       };
 
       if (activeTeamId) params.team_id = activeTeamId;
-      if (filters.observation_type) params.observation_type = filters.observation_type;
-      if (filters.session_id) params.session_id = filters.session_id;
-      if (filters.since) params.since = filters.since;
-      if (filters.until) params.until = filters.until;
+      if (applied.observation_type) {
+        params.observation_type = applied.observation_type;
+      }
+      if (applied.session_id) params.session_id = applied.session_id;
+      if (applied.since) params.since = applied.since;
+      if (applied.until) params.until = applied.until;
 
-      const response = await client.get<ObservationsListResponse>(
+      const response = await apiClient().get<ObservationsListResponse>(
         '/v1/observations/',
         { params },
       );
-      const newItems = response.data.items;
 
-      if (append) {
-        setItems((prev) => [...prev, ...newItems]);
-      } else {
-        setItems(newItems);
-      }
-
-      setHasMore(newItems.length === LIMIT);
-      setOffset(currentOffset + newItems.length);
-    } catch (err) {
-      setFetchError(
-        err instanceof Error ? err.message : 'Failed to load observations.',
+      return response.data;
+    },
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce(
+        (sum, page) => sum + page.items.length,
+        0,
       );
-    } finally {
-      setIsLoading(false);
-      setIsLoadingMore(false);
-    }
-  }
 
-  React.useEffect(() => {
-    if (!activeProjectId) {
+      return lastPage.items.length === LIMIT ? loaded : undefined;
+    },
+  });
 
-      return;
-    }
-
-    setItems([]);
-    setOffset(0);
-    setHasMore(false);
-    void fetchPage(0, applied, false);
-  }, [activeProjectId, activeTeamId, applied]);
+  const items = React.useMemo(
+    () => query.data?.pages.flatMap((page) => page.items) ?? [],
+    [query.data],
+  );
+  const isLoading = query.isLoading;
+  const isLoadingMore = query.isFetchingNextPage;
+  const hasMore = Boolean(query.hasNextPage);
+  const fetchError = query.isError
+    ? query.error instanceof Error
+      ? query.error.message
+      : 'Failed to load observations.'
+    : null;
 
   function handleFilterSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -518,7 +493,7 @@ export default function ObservationsPage() {
                 <Button
                   size='sm'
                   variant='flat'
-                  onPress={() => void fetchPage(offset, applied, true)}
+                  onPress={() => void query.fetchNextPage()}
                   isLoading={isLoadingMore}
                 >
                   Load more
