@@ -708,21 +708,29 @@ export default function ModelPoliciesPage() {
   );
   const canManagePolicies = hasCapability(capabilities, 'model_policy:*');
 
+  const [policyPage, setPolicyPage] = React.useState(0);
+
+  React.useEffect(() => {
+    setPolicyPage(0);
+  }, [activeProjectId, activeTeamId]);
+
   const queryClient = useQueryClient();
 
-  const policiesQuery = useQuery<ModelPolicy[]>({
-    queryKey: ['model-policy', 'policies', activeProjectId, activeTeamId],
+  const policiesQuery = useQuery<{ count: number; items: ModelPolicy[] }>({
+    queryKey: ['model-policy', 'policies', activeProjectId, activeTeamId, policyPage],
     enabled: Boolean(activeProjectId),
     queryFn: async () => {
       try {
         return await listModelPolicies({
           projectId: activeProjectId ?? '',
           teamId: activeTeamId,
+          limit: 50,
+          offset: policyPage * 50,
         });
       } catch (error) {
         if (isNotFound(error)) {
 
-          return [];
+          return { count: 0, items: [] };
         }
 
         throw error;
@@ -851,7 +859,8 @@ export default function ModelPoliciesPage() {
 
   const meLoaded = meQuery.data !== undefined;
   const isLoading = meQuery.isLoading || policiesQuery.isLoading;
-  const items = policiesQuery.data ?? [];
+  const items = policiesQuery.data?.items ?? [];
+  const total = policiesQuery.data?.count ?? 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='model_policy:read'>
@@ -922,9 +931,31 @@ export default function ModelPoliciesPage() {
           )}
 
           {items.length > 0 && (
-            <p className='text-[12px] text-default-400'>
-              Showing {items.length} polic{items.length === 1 ? 'y' : 'ies'}.
-            </p>
+            <div className='flex items-center justify-between gap-3'>
+              <p className='text-[12px] text-default-400'>
+                {total > 0
+                  ? `Showing ${policyPage * 50 + 1}-${policyPage * 50 + items.length} of ${total}`
+                  : `Showing ${items.length} polic${items.length === 1 ? 'y' : 'ies'}`}
+              </p>
+              <div className='flex items-center gap-2'>
+                <button
+                  type='button'
+                  onClick={() => setPolicyPage((p) => Math.max(0, p - 1))}
+                  disabled={policyPage === 0}
+                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                >
+                  Previous
+                </button>
+                <button
+                  type='button'
+                  onClick={() => setPolicyPage((p) => p + 1)}
+                  disabled={(policyPage + 1) * 50 >= total}
+                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           )}
 
           <ResolveTester

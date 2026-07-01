@@ -404,16 +404,16 @@ export interface ModelPolicyResolveParams {
 
 export async function listModelPolicies(
   scope: ScopeParams,
-): Promise<ModelPolicy[]> {
+): Promise<{ count: number; items: ModelPolicy[] }> {
   try {
     const response = await apiClient().get('/v1/model-policy/policies', {
       params: scopeQuery(scope),
     });
 
-    return listEnvelope<ModelPolicy>(response.data).items;
+    return listEnvelope<ModelPolicy>(response.data);
   } catch (error) {
     if (isMissingListEndpoint(error)) {
-      return [];
+      return { count: 0, items: [] };
     }
 
     throw error;
