@@ -33,4 +33,6 @@ jobs:
 
       - name: Build frontend
         working-directory: apps/frontend
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
         run: pnpm build
