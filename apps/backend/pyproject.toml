@@ -6,7 +6,7 @@ python = "3.12.*"
 Django = "^5.2"
 djangorestframework = "^3.16.0"
 django-filter = "^25.1"
-drf-spectacular = "^0.28.0"
+drf-spectacular = "^0.29.0"
 psycopg = {extras = ["binary"], version = "^3.2.6"}
 redis = {extras = ["hiredis"], version = "^5.2.1"}
 celery = "^5.5.3"
