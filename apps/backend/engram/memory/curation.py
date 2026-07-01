@@ -275,24 +275,23 @@ def supersede_memory_system(
 
 class CurateMemoryCandidate:
     def execute(self, data: CurateMemoryCandidateInput) -> CurateMemoryCandidateResult:
-        with transaction.atomic():
-            candidate = self._lock_candidate(data.candidate_id)
-            if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
-                return self._replay(candidate)
-            if candidate.status != CandidateStatus.PROPOSED:
-                raise MemoryWorkerError('Only proposed memory candidates can be curated')
+        candidate = self._read_candidate(data.candidate_id)
+        if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
+            return self._replay(candidate)
+        if candidate.status != CandidateStatus.PROPOSED:
+            raise MemoryWorkerError('Only proposed memory candidates can be curated')
 
-            if not resolve_curator_enabled(candidate.organization):
-                return self._promote(candidate, 'passthrough')
+        if not resolve_curator_enabled(candidate.organization):
+            return self._promote(candidate, 'passthrough')
 
-            if is_low_signal(candidate):
-                return self._reject(candidate, data)
+        if is_low_signal(candidate):
+            return self._reject(candidate, data)
 
-            embedding = embed_candidate(candidate)
-            if embedding is not None:
-                return self._curate_with_embedding(candidate, embedding, data)
+        embedding = embed_candidate(candidate)
+        if embedding is not None:
+            return self._curate_with_embedding(candidate, embedding, data)
 
-            return self._promote(candidate, 'promoted')
+        return self._promote(candidate, 'promoted')
 
     def _curate_with_embedding(
         self,
@@ -381,6 +380,12 @@ class CurateMemoryCandidate:
                 ),
             )
 
+    def _read_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
+        try:
+            return MemoryCandidate.objects.select_related('organization', 'project', 'team').get(id=candidate_id)
+        except MemoryCandidate.DoesNotExist as error:
+            raise MemoryWorkerError('memory candidate not found') from error
+
     def _lock_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
         try:
             return (
@@ -423,27 +428,42 @@ class CurateMemoryCandidate:
         reason: str = 'low_signal',
         metadata_extra: dict[str, object] | None = None,
     ) -> CurateMemoryCandidateResult:
-        candidate.status = CandidateStatus.REJECTED
-        candidate.save(update_fields=['status', 'updated_at'])
-        metadata: dict[str, object] = {
-            'reason': reason,
-            'body_length': len(redact_text(candidate.body).strip()),
-        }
-        if metadata_extra:
-            metadata.update(metadata_extra)
-        AuditEvent.objects.create(
-            organization=candidate.organization,
-            project=candidate.project,
-            team=candidate.team,
-            event_type='MemoryAutoRejected',
-            actor_type='system',
-            target_type='memory_candidate',
-            target_id=str(candidate.id),
-            capability='memories:review',
-            result=AuditResult.RECORDED,
-            correlation_id=data.correlation_id,
-            metadata=metadata,
-        )
+        already_settled = False
+        with transaction.atomic():
+            locked = self._lock_candidate(candidate.id)
+            if locked.status != CandidateStatus.PROPOSED:
+                already_settled = True
+            else:
+                locked.status = CandidateStatus.REJECTED
+                locked.save(update_fields=['status', 'updated_at'])
+                metadata: dict[str, object] = {
+                    'reason': reason,
+                    'body_length': len(redact_text(locked.body).strip()),
+                }
+                if metadata_extra:
+                    metadata.update(metadata_extra)
+                AuditEvent.objects.create(
+                    organization=locked.organization,
+                    project=locked.project,
+                    team=locked.team,
+                    event_type='MemoryAutoRejected',
+                    actor_type='system',
+                    target_type='memory_candidate',
+                    target_id=str(locked.id),
+                    capability='memories:review',
+                    result=AuditResult.RECORDED,
+                    correlation_id=data.correlation_id,
+                    metadata=metadata,
+                )
+
+        if already_settled:
+            return self._reconcile_already_handled(locked)
+
+        return CurateMemoryCandidateResult(decision='rejected', candidate=locked, memory=None)
+
+    def _reconcile_already_handled(self, candidate: MemoryCandidate) -> CurateMemoryCandidateResult:
+        if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
+            return self._replay(candidate)
 
         return CurateMemoryCandidateResult(decision='rejected', candidate=candidate, memory=None)
 
@@ -456,13 +476,24 @@ class CurateMemoryCandidate:
         document, score = near_dup
         loser = document.memory
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
-        supersede_memory_system(
-            loser,
-            promotion.memory,
-            request_id=f'curator:{candidate.id}',
-            correlation_id=data.correlation_id,
-            score=score,
-        )
+        if promotion.duplicate or loser.id == promotion.memory.id:
+            return CurateMemoryCandidateResult(
+                decision='promoted',
+                candidate=promotion.candidate,
+                memory=promotion.memory,
+                memory_version=promotion.memory_version,
+                retrieval_document=promotion.retrieval_document,
+                duplicate=True,
+            )
+
+        with transaction.atomic():
+            supersede_memory_system(
+                loser,
+                promotion.memory,
+                request_id=f'curator:{candidate.id}',
+                correlation_id=data.correlation_id,
+                score=score,
+            )
 
         return CurateMemoryCandidateResult(
             decision='superseded',
