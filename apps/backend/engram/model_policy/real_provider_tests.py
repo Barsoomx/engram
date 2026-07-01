@@ -188,6 +188,78 @@ def test_openai_compatible_gateway_call_parses_completion() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize('task_type', ['curation', 'digest'])
+def test_openai_gateway_disables_thinking_for_deepseek_cheap_tiers(task_type: str) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type=task_type, provider='deepseek')
+    policy.model = 'deepseek-v4-flash'
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id=f'ds-{task_type}-1',
+            trace_id=f'ds-{task_type}-1',
+            prompt='prompt text',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['thinking'] == {'type': 'disabled'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_keeps_thinking_for_deepseek_generation() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='generation', provider='deepseek')
+    policy.model = 'deepseek-v4-pro'
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='ds-gen-1',
+            trace_id='ds-gen-1',
+            prompt='prompt text',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'thinking' not in sent_body
+
+
+@pytest.mark.django_db
+def test_openai_gateway_omits_thinking_for_non_deepseek_cheap_tier() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation', provider='openai')
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='oa-cur-1',
+            trace_id='oa-cur-1',
+            prompt='prompt text',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'thinking' not in sent_body
+
+
+@pytest.mark.django_db
 def test_openai_compatible_gateway_call_reuses_record() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)
