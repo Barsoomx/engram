@@ -6,7 +6,7 @@ from datetime import datetime
 
 from django.db.models import Prefetch, Q, QuerySet
 
-from engram.access.services import EffectiveScope, ResolveApiKeyScope
+from engram.access.services import EffectiveScope
 from engram.core.models import (
     AuditEvent,
     ContextBundle,
@@ -32,16 +32,6 @@ class InspectionNotFoundError(Exception):
 
 
 @dataclass(frozen=True)
-class InspectionScopeInput:
-    raw_key: str
-    required_capability: str
-    project_id: uuid.UUID
-    team_id: uuid.UUID | None
-    target_type: str
-    target_id: str
-
-
-@dataclass(frozen=True)
 class InspectionScope:
     project: Project
     scope: EffectiveScope
@@ -57,21 +47,6 @@ class InspectionScope:
     @property
     def team_filter(self) -> Q:
         return Q(team__isnull=True) | Q(team_id__in=self.scope.team_ids)
-
-
-class ResolveInspectionScope:
-    def execute(self, data: InspectionScopeInput) -> InspectionScope:
-        scope = ResolveApiKeyScope().execute(
-            raw_key=data.raw_key,
-            required_capability=data.required_capability,
-            requested_project_id=data.project_id,
-            requested_team_id=data.team_id,
-            target_type=data.target_type,
-            target_id=data.target_id,
-        )
-        project = Project.objects.get(organization_id=scope.organization_id, id=data.project_id)
-
-        return InspectionScope(project=project, scope=scope)
 
 
 class ListInspectionMemories:
