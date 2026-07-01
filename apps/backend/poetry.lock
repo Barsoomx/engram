@@ -649,14 +649,14 @@ pyzstd = ["pyzstd (>=0.15)"]
 
 [[package]]
 name = "django-structlog"
-version = "9.1.1"
+version = "10.1.0"
 description = "Structured Logging for Django"
 optional = false
-python-versions = ">=3.9"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "django_structlog-9.1.1-py3-none-any.whl", hash = "sha256:5b6ac3abdf6549e94ccb35160b1f10266f1627c3ac77844571235a08a1ddae66"},
-    {file = "django_structlog-9.1.1.tar.gz", hash = "sha256:14342c6c824581f1e063c88a8bc52314cd67995a3bd4a4fc8c27ea37ccd78947"},
+    {file = "django_structlog-10.1.0-py3-none-any.whl", hash = "sha256:450842bfb03887fc14469570769e515d22ea67d753848a25cdbd05405382c090"},
+    {file = "django_structlog-10.1.0.tar.gz", hash = "sha256:812f61dea873e559511f42c0f3a7cdc36d4472f6cc15460565a97e5cbe06a76d"},
 ]
 
 [package.dependencies]
@@ -2043,4 +2043,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = "3.12.*"
-content-hash = "5ad273bea1e2e35b62e0e243c72e2b94ed8da9176611f77b77616f9886b5fdb8"
+content-hash = "879325b88182f69739b06d5f331087ccff7cea198bb39ccb7611b2e1b1a8ba64"
