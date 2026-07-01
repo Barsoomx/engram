@@ -27,6 +27,7 @@ export function Providers({ children }: ProvidersProps) {
   );
 
   const [activeToken, setActiveToken] = React.useState<string | null>(null);
+  const previousTokenRef = React.useRef<string | null>(null);
 
   React.useEffect(() => {
     setActiveToken(getToken());
@@ -47,7 +48,12 @@ export function Providers({ children }: ProvidersProps) {
   }, []);
 
   React.useEffect(() => {
-    queryClient.clear();
+    const previousToken = previousTokenRef.current;
+    previousTokenRef.current = activeToken;
+
+    if (previousToken !== null && previousToken !== activeToken) {
+      queryClient.clear();
+    }
   }, [activeToken, queryClient]);
 
   return (

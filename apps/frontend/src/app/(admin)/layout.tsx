@@ -126,6 +126,10 @@ export default function AdminShellLayout({
     return <AccessGate />;
   }
 
+  if (meQuery.isPending) {
+    return <FullPageLoader />;
+  }
+
   const profile = meQuery.data;
   const roleLabel = profile ? deriveRoleLabel(profile.capabilities) : '';
 
