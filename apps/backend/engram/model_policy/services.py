@@ -843,6 +843,13 @@ def default_base_url(provider: str) -> str:
     return 'https://api.openai.com/v1'
 
 
+def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, object]:
+    if provider == 'deepseek' and task_type in ('curation', 'digest'):
+        return {'thinking': {'type': 'disabled'}}
+
+    return {}
+
+
 def _resolve_base_url(policy: ModelPolicy) -> str:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     base_url = str(metadata.get('base_url') or '').strip()
@@ -874,7 +881,12 @@ class OpenAICompatibleGateway:
                 generated_body=body,
             )
 
-        content = self._chat_completion(policy.model, prompt_text, system_prompt=data.system_prompt)
+        content = self._chat_completion(
+            policy.model,
+            prompt_text,
+            system_prompt=data.system_prompt,
+            extra=deepseek_thinking_override(policy.provider, policy.task_type),
+        )
         title = _completion_title(content, data.response_kind)
         body = _completion_body(content, data.response_kind)
         record = self._record_call(
@@ -965,18 +977,25 @@ class OpenAICompatibleGateway:
             metadata={'prompt_retained': False, 'transport': 'http'},
         )
 
-    def _chat_completion(self, model: str, prompt: str, system_prompt: str = '') -> str:
+    def _chat_completion(
+        self,
+        model: str,
+        prompt: str,
+        system_prompt: str = '',
+        extra: dict[str, object] | None = None,
+    ) -> str:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
         messages.append({'role': 'user', 'content': prompt})
-        payload = json.dumps(
-            {
-                'model': model,
-                'messages': messages,
-                'temperature': 0.2,
-            },
-        ).encode()
+        payload_dict: dict[str, object] = {
+            'model': model,
+            'messages': messages,
+            'temperature': 0.2,
+        }
+        if extra:
+            payload_dict.update(extra)
+        payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/chat/completions', payload)
 
         return str(response['choices'][0]['message']['content'])
