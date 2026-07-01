@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import uuid
+from unittest import mock
 
 import pytest
 from django.utils import timezone
@@ -75,12 +76,28 @@ def _make_link(
     )
 
 
+def _iso_week_monday(day: datetime.date) -> datetime.date:
+    return day - datetime.timedelta(days=day.isoweekday() - 1)
+
+
+def _window_start() -> datetime.datetime:
+    monday = _iso_week_monday(timezone.now().date())
+
+    return timezone.make_aware(datetime.datetime.combine(monday - datetime.timedelta(days=7), datetime.time.min))
+
+
+def _window_end() -> datetime.datetime:
+    monday = _iso_week_monday(timezone.now().date())
+
+    return timezone.make_aware(datetime.datetime.combine(monday, datetime.time.min))
+
+
 def _in_window() -> datetime.datetime:
-    return timezone.now() - datetime.timedelta(days=3)
+    return _window_start() + datetime.timedelta(days=3)
 
 
 def _out_of_window() -> datetime.datetime:
-    return timezone.now() - datetime.timedelta(days=10)
+    return _window_start() - datetime.timedelta(days=3)
 
 
 def _run(
@@ -345,6 +362,96 @@ def test_idempotent_rerun_returns_same_digest_memory(
         ).count()
         == 1
     )
+
+
+@pytest.mark.django_db
+def test_reruns_within_same_iso_week_produce_only_one_digest(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    mem = _make_memory(f_org, f_project, title='added-mem')
+
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
+    monday_this_week = _iso_week_monday(timezone.now().date())
+
+    first_instant = timezone.make_aware(datetime.datetime.combine(monday_this_week, datetime.time(9, 17)))
+
+    second_instant = timezone.make_aware(
+        datetime.datetime.combine(monday_this_week + datetime.timedelta(days=4), datetime.time(23, 45)),
+    )
+
+    with mock.patch('engram.memory.services.timezone.now', return_value=first_instant):
+        result1 = _run(f_org, f_project)
+
+    with mock.patch('engram.memory.services.timezone.now', return_value=second_instant):
+        result2 = _run(f_org, f_project)
+
+    assert result1.digest_memory.id == result2.digest_memory.id
+
+    assert (
+        Memory.objects.filter(
+            organization=f_org,
+            project=f_project,
+            metadata__kind='digest',
+            metadata__digest_kind='weekly_structured',
+        ).count()
+        == 1
+    )
+
+
+@pytest.mark.django_db
+def test_rerun_in_different_iso_week_creates_new_digest(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    monday_this_week = _iso_week_monday(timezone.now().date())
+
+    first_instant = timezone.make_aware(datetime.datetime.combine(monday_this_week, datetime.time(10, 0)))
+
+    next_week_instant = timezone.make_aware(
+        datetime.datetime.combine(monday_this_week + datetime.timedelta(days=7), datetime.time(10, 0)),
+    )
+
+    with mock.patch('engram.memory.services.timezone.now', return_value=first_instant):
+        result1 = _run(f_org, f_project)
+
+    with mock.patch('engram.memory.services.timezone.now', return_value=next_week_instant):
+        result2 = _run(f_org, f_project)
+
+    assert result1.digest_memory.id != result2.digest_memory.id
+
+    assert (
+        Memory.objects.filter(
+            organization=f_org,
+            project=f_project,
+            metadata__kind='digest',
+            metadata__digest_kind='weekly_structured',
+        ).count()
+        == 2
+    )
+
+
+@pytest.mark.django_db
+def test_window_covers_monday_to_monday_boundary_of_completed_week(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    result = _run(f_org, f_project)
+
+    window_start = datetime.datetime.fromisoformat(result.digest_memory.metadata['window_start'])
+
+    window_end = datetime.datetime.fromisoformat(result.digest_memory.metadata['window_end'])
+
+    assert window_start.isoweekday() == 1
+
+    assert window_end.isoweekday() == 1
+
+    assert window_start.time() == datetime.time.min
+
+    assert window_end.time() == datetime.time.min
+
+    assert (window_end.date() - window_start.date()).days == 7
 
 
 @pytest.mark.django_db
