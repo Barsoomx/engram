@@ -133,13 +133,16 @@ jobs:
         uses: snyk/actions/docker@8e119fbb6c251787721d34ba683ed48eba792766 # snyk/actions master @ 2026-05-27
         with:
           image: ${{ steps.scan_ref.outputs.ref }}
-          # --file lets Snyk suggest base-image upgrades; --sarif writes results for upload.
-          args: --file=${{ matrix.file }} --severity-threshold=high --sarif-file-output=snyk-${{ matrix.image }}.sarif
+          # The action's `sarif` input defaults true, so it always writes results to snyk.sarif
+          # in the workspace. Do NOT pass --sarif-file-output: it makes snyk write to a path
+          # inside the action's container that is not persisted to the host, so the upload can't
+          # find it. --file lets Snyk suggest base-image upgrades.
+          args: --file=${{ matrix.file }} --severity-threshold=high
 
       - name: Upload Snyk SARIF to code scanning
         if: ${{ always() && env.SNYK_TOKEN != '' }}
         continue-on-error: true
         uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.30.9
         with:
-          sarif_file: snyk-${{ matrix.image }}.sarif
+          sarif_file: snyk.sarif
           category: snyk-${{ matrix.image }}
