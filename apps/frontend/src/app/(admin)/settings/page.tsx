@@ -15,6 +15,7 @@ import {
 import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
+import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
 import { PulseDot } from '@/components/ui/pulse-dot';
 import { useOrganizations } from '@/hooks/use-organizations';
@@ -24,7 +25,7 @@ import {
   useRetrievalSettings,
   useUpdateRetrievalSettings,
 } from '@/hooks/use-settings';
-import { apiClient, clearToken, fetchMe, hasCapability, logout, type MeResponse } from '@/lib/auth';
+import { apiClient, clearToken, fetchMe, logout, type MeResponse } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import type { PurgeResult, RetrievalSettings } from '@/lib/settings-api';
@@ -245,7 +246,6 @@ export default function SettingsPage() {
 
   const profile = meQuery.data;
   const health = healthQuery.data;
-  const canPurge = hasCapability(profile?.capabilities ?? [], 'memories:admin');
 
   const healthState = healthQuery.isLoading ? 'checking' : health?.ok ? 'healthy' : 'unhealthy';
   const healthColor =
@@ -419,7 +419,11 @@ export default function SettingsPage() {
         </SettingsCard>
       </div>
 
-      {canPurge && (
+      <CapabilityGate
+        capabilities={profile?.capabilities ?? []}
+        required='memories:admin'
+        fallback={null}
+      >
         <div className='rounded-[16px] border border-danger/25 bg-danger/[0.04] p-[22px]'>
         <div className='flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between'>
           <div className='flex items-start gap-3'>
@@ -500,7 +504,7 @@ export default function SettingsPage() {
           </div>
         )}
         </div>
-      )}
+      </CapabilityGate>
     </section>
   );
 }

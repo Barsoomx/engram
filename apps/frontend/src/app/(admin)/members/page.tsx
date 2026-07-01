@@ -680,6 +680,12 @@ export default function MembersPage() {
 
         {isLoading ? (
           <MembersTableSkeleton canAdmin={canAdmin} />
+        ) : membersQuery.isError ? (
+          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
+            {membersQuery.error instanceof Error
+              ? membersQuery.error.message
+              : 'Failed to load members.'}
+          </pre>
         ) : items.length === 0 ? (
           <EmptyState
             title='No members yet'
@@ -738,14 +744,6 @@ export default function MembersPage() {
               </p>
             )}
           </div>
-        )}
-
-        {membersQuery.isError && (
-          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
-            {membersQuery.error instanceof Error
-              ? membersQuery.error.message
-              : 'Failed to load members.'}
-          </pre>
         )}
 
         <MemberModal
