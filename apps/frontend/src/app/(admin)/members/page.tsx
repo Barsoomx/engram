@@ -519,9 +519,19 @@ export default function MembersPage() {
     [meQuery.data?.capabilities],
   );
 
-  const params = React.useMemo(() => ({ page: 1, pageSize: 50 }), []);
+  const [memberPage, setMemberPage] = React.useState(1);
+
+  React.useEffect(() => {
+    setMemberPage(1);
+  }, [activeOrgId]);
+
+  const params = React.useMemo(
+    () => ({ page: memberPage, pageSize: 50 }),
+    [memberPage],
+  );
+  const roleParams = React.useMemo(() => ({ page: 1, pageSize: 100 }), []);
   const membersQuery = useMembers(activeOrgId, params);
-  const rolesQuery = useRoles(activeOrgId, params);
+  const rolesQuery = useRoles(activeOrgId, roleParams);
 
   const inviteMutation = useInviteMember(activeOrgId);
   const roleMutation = useUpdateMemberRole(activeOrgId);
@@ -646,6 +656,7 @@ export default function MembersPage() {
   const isLoading =
     meQuery.isLoading || membersQuery.isLoading;
   const items = membersQuery.data?.results ?? [];
+  const total = membersQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
 
   return (
@@ -697,9 +708,29 @@ export default function MembersPage() {
 
         {items.length > 0 && (
           <div className='flex items-center justify-between text-[12px] text-default-400'>
-            <p>
-              Showing {items.length} member{items.length === 1 ? '' : 's'}.
-            </p>
+            <div className='flex items-center gap-3'>
+              <p>
+                {total > 0
+                  ? `Showing ${(memberPage - 1) * 50 + 1}-${(memberPage - 1) * 50 + items.length} of ${total}`
+                  : `Showing ${items.length} member${items.length === 1 ? '' : 's'}`}
+              </p>
+              <button
+                type='button'
+                onClick={() => setMemberPage((p) => Math.max(1, p - 1))}
+                disabled={memberPage === 1}
+                className='rounded-[8px] border border-divider bg-content1 px-2.5 py-1 font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+              >
+                Previous
+              </button>
+              <button
+                type='button'
+                onClick={() => setMemberPage((p) => p + 1)}
+                disabled={memberPage * 50 >= total}
+                className='rounded-[8px] border border-divider bg-content1 px-2.5 py-1 font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+              >
+                Next
+              </button>
+            </div>
             {canAdmin && (
               <p className='flex items-center gap-1.5'>
                 <ShieldCheck className='w-3.5 h-3.5' />

@@ -20,13 +20,28 @@ export function genRequestId(): string {
 export interface ScopeParams {
   projectId: string;
   teamId?: string | null;
+  limit?: number;
+  offset?: number;
 }
 
-function scopeQuery({ projectId, teamId }: ScopeParams): Record<string, string> {
+function scopeQuery({
+  projectId,
+  teamId,
+  limit,
+  offset,
+}: ScopeParams): Record<string, string> {
   const params: Record<string, string> = { project_id: projectId };
 
   if (teamId) {
     params.team_id = teamId;
+  }
+
+  if (limit !== undefined) {
+    params.limit = String(limit);
+  }
+
+  if (offset !== undefined) {
+    params.offset = String(offset);
   }
 
   return params;
