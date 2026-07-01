@@ -312,6 +312,7 @@ function CreatePolicyModal({
     name.trim().length > 0 &&
     model.trim().length > 0 &&
     secretId.trim().length > 0 &&
+    (scope !== 'team' || Boolean(teamId)) &&
     !isPending;
 
   async function handleSubmit() {
@@ -461,6 +462,12 @@ function CreatePolicyModal({
                   description='For GLM / self-hosted / OpenAI-compatible endpoints. Leave blank to use the provider default.'
                   classNames={{ input: 'font-mono text-xs' }}
                 />
+                {scope === 'team' && !teamId && (
+                  <p className='text-[12px] text-warning'>
+                    Select a team in the top switcher to create a team-scoped
+                    policy.
+                  </p>
+                )}
                 {error && (
                   <div className='rounded-medium border border-danger-200 bg-danger-50 p-3 dark:border-danger-500/30 dark:bg-danger-500/10'>
                     <p className='text-sm text-danger-600'>{error}</p>
