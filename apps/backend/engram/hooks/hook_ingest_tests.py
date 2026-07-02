@@ -252,6 +252,32 @@ def test_hook_dry_run_denies_wrong_project() -> None:
 
 
 @pytest.mark.django_db
+def test_hook_dry_run_denied_response_matches_global_domain_error_shape() -> None:
+    organization, team, _project, _owner, _api_key = create_project_scope()
+    other_project = Project.objects.create(organization=organization, name='CLI', slug='cli')
+    client = APIClient()
+
+    response = client.post(
+        '/v1/hooks/dry-run',
+        {
+            'project_id': str(other_project.id),
+            'team_id': str(team.id),
+            'agent_runtime': 'codex',
+            'agent_version': '0.1.0',
+            'request_id': 'dry-run-shape-check',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body['code'] == 'project_scope_denied'
+    assert body['error_code'] == 'project_scope_denied'
+    assert body['detail']
+
+
+@pytest.mark.django_db
 def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_task() -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
