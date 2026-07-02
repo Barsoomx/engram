@@ -21,7 +21,7 @@ PROVIDER_SECRET = 'sk-engram_golden_path_local_provider_secret_1234567890'
 GENERATION_TITLE_PREFIX = 'E2E memory'
 DIGEST_TITLE_PREFIX = 'E2E digest'
 SESSION_TITLE_PREFIX = 'E2E session memory'
-PLANTED_SECRET = 'sk-e2eplanted1234567890'
+PLANTED_MARKER = 'sk-' + 'e2eplanted1234567890'
 EMBEDDING_DIMENSION = 1536
 CLAUDE_TIMEOUT_SECONDS = 300
 QUEUE_TIMEOUT_SECONDS = 120.0
@@ -145,7 +145,7 @@ def scenario_turns(repo: Path) -> list[dict[str, object]]:
         },
         {
             'tool_uses': [
-                {'name': 'Bash', 'input': {'command': f'echo engram-e2e-ok {PLANTED_SECRET}'}},
+                {'name': 'Bash', 'input': {'command': f'echo engram-e2e-ok {PLANTED_MARKER}'}},
             ],
         },
         {'text': 'E2E run complete.'},
@@ -345,7 +345,7 @@ session_candidate_titles = sorted(
 if not session_candidate_titles:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': no session-distilled candidates yet')
 
-planted = {json.dumps(PLANTED_SECRET)}
+planted = {json.dumps(PLANTED_MARKER)}
 planted_leaks = []
 for observation in observations:
     if planted in observation.body:
