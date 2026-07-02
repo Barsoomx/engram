@@ -252,3 +252,36 @@ class PayloadSizeBoundTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchPayloadTests(unittest.TestCase):
+    def test_project_scoped_config_sends_project_id(self) -> None:
+        from engram_cli.commands import build_search_payload
+
+        payload = build_search_payload(
+            {"project_id": "proj-1", "team_id": "team-1"},
+            query="auth",
+            file_paths=[],
+            symbols=[],
+            limit=5,
+            repository_url="git@github.com:acme/x.git",
+        )
+
+        self.assertEqual("proj-1", payload["project_id"])
+        self.assertNotIn("repository_url", payload)
+
+    def test_org_wide_config_sends_repository_url(self) -> None:
+        from engram_cli.commands import build_search_payload
+
+        payload = build_search_payload(
+            {"project_id": "", "team_id": ""},
+            query="auth",
+            file_paths=["a.py"],
+            symbols=[],
+            limit=3,
+            repository_url="git@github.com:acme/x.git",
+        )
+
+        self.assertNotIn("project_id", payload)
+        self.assertEqual("git@github.com:acme/x.git", payload["repository_url"])
+        self.assertEqual(3, payload["limit"])

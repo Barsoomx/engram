@@ -634,6 +634,181 @@ print(json.dumps({{'superseded_link': str(link.id), 'stale_memories': stale_coun
     )
 
 
+def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
+    result = run_json(
+        [sys.executable, '-m', 'engram_cli', 'search', '--query', GENERATION_TITLE_PREFIX, '--json'],
+        cwd=repo,
+        env=cli_hook_env(home),
+        secret='',
+    )
+    items = result.get('items')
+    if not isinstance(items, list) or not items:
+        raise E2EError(f'search returned no items: {result}')
+    titles = [str(item.get('title') or '') for item in items]
+    if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in titles):
+        raise E2EError(f'search did not return the promoted mock memory: {titles}')
+
+    return {'search_items': len(items)}
+
+
+def context_inclusion_reasons(home: Path, repo: Path, query: str, session_suffix: str) -> list[str]:
+    hook_input = {
+        'session_id': f'e2e-leg-{session_suffix}',
+        'repository_root': str(repo),
+        'cwd': str(repo),
+        'query': query,
+    }
+    result = run_json(
+        [sys.executable, '-m', 'engram_cli', 'hook', 'session-start', '--agent', 'claude-code'],
+        cwd=repo,
+        env=cli_hook_env(home),
+        secret='',
+        input_text=json.dumps(hook_input),
+    )
+    items = result.get('items') or []
+
+    return [str(item.get('inclusion_reason') or '') for item in items if isinstance(item, dict)]
+
+
+def set_lexical_recall(enabled: bool, *, secret: str) -> None:
+    compose_shell_json(
+        f"""
+import json
+from engram.core.models import Organization, OrganizationSettings
+
+organization = Organization.objects.get(slug='engram-e2e')
+OrganizationSettings.objects.filter(organization=organization).update(lexical_recall_enabled={enabled})
+print(json.dumps({{'lexical_recall_enabled': {enabled}}}))
+""",
+        secret=secret,
+    )
+
+
+def verify_retrieval_legs(home: Path, repo: Path, *, secret: str) -> dict[str, object]:
+    fulltext_reasons = context_inclusion_reasons(
+        home,
+        repo,
+        'durable engineering provider zebra',
+        'fulltext',
+    )
+    if not any(reason.startswith('full-text match:') for reason in fulltext_reasons):
+        raise E2EError(f'full-text retrieval leg never matched: {fulltext_reasons}')
+
+    set_lexical_recall(True, secret=secret)
+    try:
+        lexical_reasons = context_inclusion_reasons(
+            home,
+            repo,
+            'durrable enginering memmory',
+            'lexical',
+        )
+        if not any(reason.startswith('lexical match:') for reason in lexical_reasons):
+            raise E2EError(f'lexical retrieval leg never matched: {lexical_reasons}')
+    finally:
+        set_lexical_recall(False, secret=secret)
+
+    return {'fulltext_reasons': fulltext_reasons[:3], 'lexical_reasons': lexical_reasons[:3]}
+
+
+def http_post_json(url: str, payload: dict[str, object], api_key: str) -> tuple[int, dict[str, object]]:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(  # noqa: S310 - local e2e server
+        url,
+        data=json.dumps(payload).encode(),
+        headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return response.status, json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        body = error.read().decode()
+        try:
+            return error.code, json.loads(body)
+        except json.JSONDecodeError:
+            return error.code, {'raw': body[:500]}
+
+
+def verify_rbac_negatives(project_id: str, golden_key: str) -> dict[str, object]:
+    status, body = http_post_json(
+        f'{SERVER_URL}/v1/hooks/dry-run',
+        {'agent_runtime': 'claude_code', 'request_id': 'e2e-rbac-random'},
+        'egk_random_invalid_key_000000000000000000',
+    )
+    if status != 401:
+        raise E2EError(f'random key expected 401, got {status}: {body}')
+
+    status, body = http_post_json(
+        f'{SERVER_URL}/v1/hooks/dry-run',
+        {'agent_runtime': 'claude_code', 'request_id': 'e2e-rbac-cross', 'project_id': project_id},
+        golden_key,
+    )
+    if status != 403:
+        raise E2EError(f'project-bound key against foreign project expected 403, got {status}: {body}')
+
+    return {'random_key': 401, 'cross_project': 403}
+
+
+def verify_weekly_digest(*, secret: str) -> dict[str, object]:
+    result = compose_shell_json(
+        f"""
+import json
+from engram.core.models import Memory, Project, WorkflowRun
+from engram.memory.services import run_weekly_digest_with_tracking
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+result = run_weekly_digest_with_tracking(project.organization_id, project.id, request_id='e2e-weekly-1')
+run = WorkflowRun.objects.filter(project=project, run_type='weekly_digest').order_by('-created_at').first()
+weekly = (
+    Memory.objects.filter(project=project, kind='digest', metadata__digest_kind='weekly_structured')
+    .order_by('-created_at')
+    .first()
+)
+print(json.dumps({{
+    'workflow_status': run.status if run else None,
+    'weekly_memory': weekly.title if weekly else None,
+}}))
+""",
+        secret=secret,
+    )
+    if result.get('workflow_status') != 'succeeded':
+        raise E2EError(f'weekly digest workflow did not succeed: {result}')
+
+    return result
+
+
+def verify_policy_precedence(bootstrap: dict[str, object], *, secret: str) -> dict[str, object]:
+    expected_policy_id = str(bootstrap.get('organization_generation_policy_id') or '')
+    state = compose_shell_json(
+        f"""
+import json
+from engram.core.models import Project
+from engram.model_policy.models import ProviderCallRecord
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+policy_ids = sorted(
+    set(
+        str(policy_id)
+        for policy_id in ProviderCallRecord.objects.filter(project=project, task_type='generation').values_list(
+            'policy_id', flat=True,
+        )
+    ),
+)
+print(json.dumps({{'generation_policy_ids': policy_ids}}))
+""",
+        secret=secret,
+    )
+    policy_ids = state.get('generation_policy_ids') or []
+    if policy_ids != [expected_policy_id]:
+        raise E2EError(
+            f'auto-created project should resolve the ORGANIZATION generation policy {expected_policy_id}, got {policy_ids}',
+        )
+
+    return {'generation_policy': 'organization-scope'}
+
+
 def verify_session_start_context(home: Path, repo: Path) -> dict[str, object]:
     env = cli_hook_env(home)
     hook_input = {
@@ -795,6 +970,26 @@ def main() -> int:
             progress('Verifying session-start context retrieval')
             context = verify_session_start_context(home, repo)
             progress(f'Context OK: {json.dumps(context)}')
+
+            progress('Verifying search API over repo-url routing')
+            search = verify_search_api(home, repo)
+            progress(f'Search OK: {json.dumps(search)}')
+
+            progress('Verifying semantic and lexical retrieval legs')
+            legs = verify_retrieval_legs(home, repo, secret=agent_key)
+            progress(f'Retrieval legs OK: {json.dumps(legs)}')
+
+            progress('Verifying RBAC negatives')
+            rbac = verify_rbac_negatives(str(state.get('project_id')), api_key)
+            progress(f'RBAC OK: {json.dumps(rbac)}')
+
+            progress('Verifying weekly digest plumbing')
+            weekly = verify_weekly_digest(secret=agent_key)
+            progress(f'Weekly digest OK: {json.dumps(weekly)}')
+
+            progress('Verifying model policy precedence for auto-created project')
+            precedence = verify_policy_precedence(bootstrap, secret=agent_key)
+            progress(f'Policy precedence OK: {json.dumps(precedence)}')
 
             progress('Verifying replay idempotency')
             replay = verify_replay_idempotency(home, repo, secret=agent_key)

@@ -23,8 +23,10 @@ class SearchView(APIView):
         result = SearchMemories().execute(
             SearchInput(
                 raw_key=bearer_key(request),
-                project_id=data['project_id'],
+                project_id=data.get('project_id'),
                 team_id=data.get('team_id'),
+                repository_url=str(data.get('repository_url') or ''),
+                repository_root=str(data.get('repository_root') or ''),
                 query=data.get('query', ''),
                 file_paths=tuple(data.get('file_paths', [])),
                 symbols=tuple(data.get('symbols', [])),
