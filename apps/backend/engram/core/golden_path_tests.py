@@ -52,6 +52,20 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         task_type='embedding',
     )
 
+    organization_generation_policy = ModelPolicy.objects.get(
+        organization=organization,
+        team=None,
+        project=None,
+        scope='organization',
+        task_type='generation',
+    )
+    organization_embedding_policy = ModelPolicy.objects.get(
+        organization=organization,
+        team=None,
+        project=None,
+        scope='organization',
+        task_type='embedding',
+    )
     assert body == {
         'organization_id': str(organization.id),
         'team_id': str(team.id),
@@ -63,6 +77,8 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         'provider_secret_id': str(secret.id),
         'generation_policy_id': str(policy.id),
         'embedding_policy_id': str(embedding_policy.id),
+        'organization_generation_policy_id': str(organization_generation_policy.id),
+        'organization_embedding_policy_id': str(organization_embedding_policy.id),
     }
     assert ProjectTeam.objects.filter(organization=organization, team=team, project=project).exists()
     assert OrganizationMembership.objects.filter(
@@ -117,4 +133,4 @@ def test_bootstrap_golden_path_is_idempotent() -> None:
     assert ApiKeyCapability.objects.count() == 2
     assert ProviderSecret.objects.count() == 1
     assert ProviderSecretEnvelope.objects.count() == 1
-    assert ModelPolicy.objects.count() == 2
+    assert ModelPolicy.objects.count() == 6

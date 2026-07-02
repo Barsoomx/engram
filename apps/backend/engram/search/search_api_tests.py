@@ -202,3 +202,90 @@ def test_search_returns_semantic_match_when_exact_misses() -> None:
     assert len(body['items']) == 1
     assert body['items'][0]['inclusion_reason'].startswith('semantic match: cosine')
     assert body['items'][0]['memory_id'] == str(memory.id)
+
+
+AGENT_RAW_KEY = 'egk_test_search_agent_0123456789abcdefghijklmnopqrstuv'
+AGENT_CAPS = ('memories:read', 'search:query', 'projects:agent')
+
+
+def create_org_agent_key(organization: object) -> None:
+    from engram.access.models import (
+        ApiKey,
+        Identity,
+        IdentityType,
+        OrganizationMembership,
+        Role,
+        RoleCapability,
+    )
+    from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+
+    role, _ = Role.objects.get_or_create(code='organization_owner', defaults={'name': 'owner'})
+    for code in AGENT_CAPS:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.SERVICE_ACCOUNT,
+        external_id='search-agent',
+        display_name='Search agent',
+        active=True,
+    )
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role, active=True)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=identity,
+        name='search agent key',
+        key_prefix=api_key_prefix(AGENT_RAW_KEY),
+        key_hash=hash_api_key(AGENT_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(AGENT_RAW_KEY),
+        active=True,
+    )
+    for code in AGENT_CAPS:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
+
+
+@pytest.mark.django_db
+def test_search_routes_by_repository_url_without_project_id() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/search-demo.git'
+    project.save(update_fields=['repository_url'])
+    create_org_agent_key(organization)
+    memory, _version, document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {
+            'query': 'authorization ranking',
+            'file_paths': document.file_paths,
+            'symbols': [],
+            'limit': 5,
+            'repository_url': 'https://github.com/acme/search-demo',
+        },
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert len(body['items']) == 1
+    assert body['items'][0]['memory_id'] == str(memory.id)
+
+
+@pytest.mark.django_db
+def test_search_without_project_and_repository_url_is_rejected() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {'query': 'anything', 'file_paths': [], 'symbols': [], 'limit': 5},
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
