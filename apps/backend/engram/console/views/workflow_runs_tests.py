@@ -440,6 +440,58 @@ def test_rerun_denied_without_admin_capability(
 
 
 @pytest.mark.django_db
+def test_rerun_daily_digest_invalid_memory_ids_returns_invalid_rerun_snapshot(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(
+        f_admin_org,
+        project,
+        memory_ids=['not-a-uuid'],
+        request_id='invalid-memory-ids',
+    )
+
+    response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'invalid_rerun_snapshot'
+
+    assert response.data['error_code'] == 'invalid_rerun_snapshot'
+
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_rerun_session_distillation_invalid_session_id_returns_invalid_rerun_snapshot(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = WorkflowRun.objects.create(
+        organization=f_admin_org,
+        project=project,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.SUCCEEDED,
+        input_snapshot={'session_id': 'not-a-uuid'},
+        request_id='invalid-session-id',
+    )
+
+    response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'invalid_rerun_snapshot'
+
+    assert response.data['error_code'] == 'invalid_rerun_snapshot'
+
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+
+@pytest.mark.django_db
 def test_list_denied_without_read_capability() -> None:
     user = _make_user('no-cap')
 

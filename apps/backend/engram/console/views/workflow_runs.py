@@ -10,6 +10,7 @@ from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 
+from engram.console.exceptions import InvalidRerunSnapshotError
 from engram.console.filters import WorkflowRunFilterSet
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
@@ -75,11 +76,8 @@ class WorkflowRunViewSet(
 
             try:
                 memory_ids = tuple(uuid.UUID(str(value)) for value in raw_memory_ids)
-            except (AttributeError, TypeError, ValueError):
-                return Response(
-                    {'detail': 'invalid memory_ids in input_snapshot'},
-                    status=400,
-                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise InvalidRerunSnapshotError('invalid memory_ids in input_snapshot') from error
 
             window_days = input_snapshot.get('window_days', DAILY_DIGEST_WINDOW_DAYS)
 
@@ -104,11 +102,8 @@ class WorkflowRunViewSet(
 
             try:
                 session_id = uuid.UUID(str(raw_session_id))
-            except (AttributeError, TypeError, ValueError):
-                return Response(
-                    {'detail': 'invalid session_id in input_snapshot'},
-                    status=400,
-                )
+            except (AttributeError, TypeError, ValueError) as error:
+                raise InvalidRerunSnapshotError('invalid session_id in input_snapshot') from error
 
             run_session_distillation_with_tracking(
                 session_id=session_id,
