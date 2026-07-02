@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import pytest
@@ -21,6 +22,7 @@ from engram.memory.services import (
     derive_observation_confidence,
     distillation_system_prompt,
     provider_prompt,
+    strip_json_fence,
 )
 from engram.model_policy.services import FakeProviderGateway, ProviderCallResult
 
@@ -376,3 +378,34 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
         == 1
     )
     assert second_run_calls == []
+
+
+def test_strip_json_fence_removes_json_language_tagged_fence() -> None:
+    raw = '```json\n{"a": 1}\n```'
+
+    assert json.loads(strip_json_fence(raw)) == {'a': 1}
+
+
+def test_strip_json_fence_removes_bare_fence() -> None:
+    raw = '```\n{"a": 1}\n```'
+
+    assert json.loads(strip_json_fence(raw)) == {'a': 1}
+
+
+def test_strip_json_fence_returns_plain_json_unchanged() -> None:
+    raw = '{"a": 1}'
+
+    assert strip_json_fence(raw) == raw
+    assert json.loads(strip_json_fence(raw)) == {'a': 1}
+
+
+def test_strip_json_fence_handles_surrounding_whitespace() -> None:
+    raw = '  \n```json\n{"a": 1}\n```\n  '
+
+    assert json.loads(strip_json_fence(raw)) == {'a': 1}
+
+
+def test_strip_json_fence_ignores_mid_text_backticks_without_leading_fence() -> None:
+    raw = 'here is some ``` inline text that is not a fence'
+
+    assert strip_json_fence(raw) == raw

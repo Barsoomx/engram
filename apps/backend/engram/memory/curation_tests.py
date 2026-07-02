@@ -632,6 +632,10 @@ def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable()
     assert parse_curation_decision('{}') == 'keep_both'
 
 
+def test_parse_curation_decision_strips_markdown_json_fence() -> None:
+    assert parse_curation_decision('```json\n{"decision": "merge"}\n```') == 'merge'
+
+
 def test_curation_judge_system_prompt_requires_reason() -> None:
     prompt = curation_judge_system_prompt()
 
@@ -644,6 +648,10 @@ def test_parse_curation_reason_reads_reason() -> None:
     assert parse_curation_reason('{"decision": "merge"}') == ''
     assert parse_curation_reason('not json') == ''
     assert parse_curation_reason('[]') == ''
+
+
+def test_parse_curation_reason_strips_markdown_json_fence() -> None:
+    assert parse_curation_reason('```json\n{"decision": "merge", "reason": "same fact"}\n```') == 'same fact'
 
 
 @pytest.mark.django_db

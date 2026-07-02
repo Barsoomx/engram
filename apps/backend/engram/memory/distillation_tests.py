@@ -421,6 +421,28 @@ def test_parse_synthesized_candidates_object_without_memories_falls_back() -> No
     assert candidates[0].confidence == Decimal('0.500')
 
 
+def test_parse_synthesized_candidates_strips_markdown_json_fence() -> None:
+    raw = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Retry queue drops messages on Redis restart',
+                    'body': 'Consumer acks before processing in worker/queue.py.',
+                    'confidence': 0.9,
+                    'supporting_observation_ids': ['obs-1'],
+                },
+            ],
+        },
+    )
+    fenced = f'```json\n{raw}\n```'
+
+    candidates = parse_synthesized_candidates(fenced)
+
+    assert len(candidates) == 1
+    assert candidates[0].title == 'Retry queue drops messages on Redis restart'
+    assert candidates[0].confidence == Decimal('0.900')
+
+
 def test_session_distillation_system_prompt_declares_memories_object_contract() -> None:
     prompt = session_distillation_system_prompt()
 
@@ -1262,6 +1284,20 @@ def test_parse_reduced_candidates_parses_valid_memories_object() -> None:
     assert parsed[0].title == 'merged'
     assert parsed[0].confidence == Decimal('0.750')
     assert parsed[0].source_ids == (0, 2)
+
+
+def test_parse_reduced_candidates_strips_markdown_json_fence() -> None:
+    raw = json.dumps(
+        {'memories': [{'title': 'merged', 'body': 'merged body', 'confidence': 0.75, 'source_ids': [0, 2]}]},
+    )
+    fenced = f'```json\n{raw}\n```'
+
+    parsed = _parse_reduced_candidates(fenced)
+
+    assert parsed is not None
+    assert len(parsed) == 1
+    assert parsed[0].title == 'merged'
+    assert parsed[0].confidence == Decimal('0.750')
 
 
 def _reduce_scope(

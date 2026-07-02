@@ -553,6 +553,19 @@ def redact_error(message: str) -> str:
     return redact_text(message)
 
 
+def strip_json_fence(raw: str) -> str:
+    text = raw.strip()
+    if not text.startswith('```'):
+        return raw
+
+    lines = text.splitlines()
+    lines = lines[1:]
+    if lines and lines[-1].strip().startswith('```'):
+        lines = lines[:-1]
+
+    return '\n'.join(lines)
+
+
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> PromoteMemoryCandidateResult:
         with transaction.atomic():
