@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 from django.core.management import call_command
+from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
     Memory,
@@ -50,34 +51,28 @@ def create_approved_memory(
 
 
 @pytest.mark.django_db
-@pytest.mark.skip(reason='task mock needs celery eager mode')
 def test_management_command_enqueues_digest_for_project_with_recent_memories() -> None:
     organization, team, project = create_organization_project_team(slug='alpha')
     memory = create_approved_memory(organization, project, team, title='Alpha source')
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        call_command('engram_run_daily_digest')
+    call_command('engram_run_daily_digest')
 
-    m_delay.assert_called_once_with(
-        str(organization.id),
-        str(project.id),
-        [str(memory.id)],
-    )
+    outbox = CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest')
+    assert outbox.count() == 1
+    args = outbox.first().args
+    assert args == [str(organization.id), str(project.id), [str(memory.id)]]
 
 
 @pytest.mark.django_db
-@pytest.mark.skip(reason='task mock needs celery eager mode')
 def test_management_command_skips_project_without_recent_memories() -> None:
     organization, _team, project = create_organization_project_team(slug='beta')
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        call_command('engram_run_daily_digest')
+    call_command('engram_run_daily_digest')
 
-    m_delay.assert_not_called()
+    assert not CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest').exists()
 
 
 @pytest.mark.django_db
-@pytest.mark.skip(reason='task mock needs celery eager mode')
 def test_management_command_excludes_digest_memories_and_non_approved() -> None:
     organization, team, project = create_organization_project_team(slug='gamma')
     create_approved_memory(organization, project, team, title='Gamma source')
@@ -101,11 +96,11 @@ def test_management_command_excludes_digest_memories_and_non_approved() -> None:
         visibility_scope=VisibilityScope.PROJECT,
     )
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        call_command('engram_run_daily_digest')
+    call_command('engram_run_daily_digest')
 
-    assert m_delay.call_count == 1
-    _org_id, _project_id, memory_ids = m_delay.call_args.args
+    outbox = CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest')
+    assert outbox.count() == 1
+    memory_ids = outbox.first().args[2]
     assert len(memory_ids) == 1
 
 
