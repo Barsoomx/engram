@@ -806,6 +806,75 @@ class IndexMemoryVersion:
         document.save(update_fields=update_fields)
 
 
+@dataclass(frozen=True)
+class ReembedResult:
+    scanned: int
+    embedded: int
+    failed: int
+
+
+class ReembedMissingEmbeddings:
+    def execute(self, *, batch_size: int = 200) -> ReembedResult:
+        if VectorField is None:
+            return ReembedResult(scanned=0, embedded=0, failed=0)
+
+        documents = list(
+            RetrievalDocument.objects.select_related('memory')
+            .filter(embedding_pgvector__isnull=True, stale=False, refuted=False)
+            .order_by('updated_at')[: max(1, batch_size)],
+        )
+        embedded = 0
+        failed = 0
+        for document in documents:
+            if self._embed(document):
+                embedded += 1
+            else:
+                failed += 1
+
+        return ReembedResult(scanned=len(documents), embedded=embedded, failed=failed)
+
+    def _embed(self, document: RetrievalDocument) -> bool:
+        memory = document.memory
+        attempt_id = uuid.uuid4()
+        try:
+            resolved = ResolveModelPolicy().execute(
+                ResolveModelPolicyInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    task_type='embedding',
+                ),
+            )
+            result = get_provider_gateway(resolved.policy).embed(
+                EmbeddingCallInput(
+                    organization_id=memory.organization_id,
+                    project_id=memory.project_id,
+                    team_id=memory.team_id,
+                    policy=resolved.policy,
+                    request_id=f'memory-reembed:{document.id}:{attempt_id}',
+                    trace_id=f'memory-reembed:{document.id}',
+                    text=document.full_text,
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError) as error:
+            logger.warning(
+                'context_reembed_failed',
+                organization_id=str(memory.organization_id),
+                project_id=str(memory.project_id),
+                retrieval_document_id=str(document.id),
+                error=str(error),
+            )
+
+            return False
+
+        document.embedding_vector = list(result.embedding)
+        document.embedding_pgvector = list(result.embedding)
+        document.embedding_reference = f'provider:{result.call_record_id}'
+        document.save(update_fields=['embedding_vector', 'embedding_pgvector', 'embedding_reference', 'updated_at'])
+
+        return True
+
+
 class BuildContextBundle:
     def execute(self, data: ContextBundleInput) -> ContextBundleResult:
         scope = ResolveApiKeyScope().execute(
