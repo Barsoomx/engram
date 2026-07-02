@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
 from django.contrib.auth import authenticate as django_authenticate
 from django.contrib.auth.models import User
 from django.db import transaction
@@ -23,6 +24,8 @@ from engram.access.models import (
 from engram.access.services import EffectiveScope
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import Organization, Project, Team
+
+logger = structlog.get_logger(__name__)
 
 DEFAULT_ORGANIZATION_SLUG = 'default'
 DEFAULT_ORGANIZATION_NAME = 'Default organization'
@@ -116,6 +119,12 @@ class LoginUser:
         identity = self._ensure_identity(user)
         token, _created = Token.objects.get_or_create(user=user)
         scope = resolve_user_scope(user)
+
+        logger.info(
+            'user_login_succeeded',
+            user_id=user.id,
+            identity_id=str(identity.id),
+        )
 
         return LoginResult(token=token.key, user=user, identity=identity, scope=scope)
 

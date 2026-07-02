@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import structlog
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
 
@@ -59,6 +60,27 @@ def test_login_with_valid_credentials_returns_token_and_user() -> None:
     assert payload['organization_id'] == str(organization.id)
 
     assert 'observations:write' in payload['capabilities']
+
+
+@pytest.mark.django_db
+def test_login_with_valid_credentials_logs_success_event() -> None:
+    user = create_user()
+
+    client = APIClient()
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            LOGIN_URL,
+            data={'username': user.get_username(), 'password': 'strong-secret-123'},
+            format='json',
+        )
+
+    assert response.status_code == 200
+
+    identity = Identity.objects.get(external_id=external_id_for_user(user))
+    login_events = [entry for entry in captured_logs if entry['event'] == 'user_login_succeeded']
+    assert len(login_events) == 1
+    assert login_events[0]['user_id'] == user.id
+    assert login_events[0]['identity_id'] == str(identity.id)
 
 
 @pytest.mark.django_db
