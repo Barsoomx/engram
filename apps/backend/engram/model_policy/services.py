@@ -862,6 +862,59 @@ def openai_json_mode_override(response_kind: str) -> dict[str, object]:
     return {}
 
 
+_DEFAULT_MAX_TOKENS = 1024
+_MAX_TOKENS_BY_KIND = {'candidates': 8192}
+_ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
+    'candidates': {
+        'name': 'emit_memories',
+        'description': 'Return the synthesized engineering memories.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'memories': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'title': {'type': 'string'},
+                            'body': {'type': 'string'},
+                            'confidence': {'type': 'number'},
+                            'supporting_observation_ids': {'type': 'array', 'items': {'type': 'string'}},
+                        },
+                        'required': ['title', 'body', 'confidence'],
+                    },
+                },
+            },
+            'required': ['memories'],
+        },
+    },
+    'curation_judgment': {
+        'name': 'emit_judgment',
+        'description': 'Return the curation judgment.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject']},
+                'reason': {'type': 'string'},
+            },
+            'required': ['decision'],
+        },
+    },
+}
+
+
+def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    try:
+        override = int(metadata.get('max_tokens'))
+    except (TypeError, ValueError):
+        override = 0
+    if override > 0:
+        return override
+
+    return _MAX_TOKENS_BY_KIND.get(response_kind, _DEFAULT_MAX_TOKENS)
+
+
 def _resolve_base_url(policy: ModelPolicy) -> str:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     base_url = str(metadata.get('base_url') or '').strip()
@@ -1084,6 +1137,18 @@ def _split_completion(content: str) -> tuple[str, str]:
     return title, body
 
 
+def _anthropic_content_text(response: dict[str, Any]) -> str:
+    blocks = response.get('content') or []
+    for block in blocks:
+        if isinstance(block, dict) and block.get('type') == 'tool_use':
+            return json.dumps(block.get('input') or {})
+    for block in blocks:
+        if isinstance(block, dict) and block.get('type') == 'text':
+            return str(block.get('text') or '')
+
+    return str(blocks[0]['text']) if blocks else ''
+
+
 def _completion_body(content: str, response_kind: str) -> str:
     if response_kind in _STRUCTURED_RESPONSE_KINDS:
         return content
@@ -1122,7 +1187,13 @@ class AnthropicMessagesGateway:
                 generated_body=body,
             )
 
-        content = self._messages(policy.model, prompt_text, system_prompt=data.system_prompt)
+        content = self._messages(
+            policy.model,
+            prompt_text,
+            system_prompt=data.system_prompt,
+            response_kind=data.response_kind,
+            max_tokens=resolve_max_tokens(policy, data.response_kind),
+        )
         title = _completion_title(content, data.response_kind)
         body = _completion_body(content, data.response_kind)
         record = self._record_call(
@@ -1189,18 +1260,30 @@ class AnthropicMessagesGateway:
             metadata={'prompt_retained': False, 'transport': 'http-anthropic'},
         )
 
-    def _messages(self, model: str, prompt: str, system_prompt: str = '') -> str:
+    def _messages(
+        self,
+        model: str,
+        prompt: str,
+        system_prompt: str = '',
+        *,
+        response_kind: str = 'single',
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
+    ) -> str:
         payload_dict: dict[str, object] = {
             'model': model,
-            'max_tokens': 1024,
+            'max_tokens': max_tokens,
             'messages': [{'role': 'user', 'content': prompt}],
         }
         if system_prompt:
             payload_dict['system'] = system_prompt
+        tool = _ANTHROPIC_STRUCTURED_TOOLS.get(response_kind)
+        if tool is not None:
+            payload_dict['tools'] = [tool]
+            payload_dict['tool_choice'] = {'type': 'tool', 'name': tool['name']}
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/v1/messages', payload)
 
-        return str(response['content'][0]['text'])
+        return _anthropic_content_text(response)
 
     def _open(self, url: str, body: bytes) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
