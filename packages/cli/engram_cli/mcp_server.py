@@ -3,17 +3,15 @@ from __future__ import annotations
 import json
 import sys
 from argparse import Namespace
-from collections.abc import Callable
 from typing import Any, TextIO
 
 from engram_cli.http import Transport
-from engram_cli.mcp_tools import build_tools
+from engram_cli.mcp_tools import ToolFn, build_tools
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "engram"
 SERVER_VERSION = "0.2.0"
 
-ToolFn = Callable[[dict[str, Any]], str]
 ToolMap = dict[str, ToolFn]
 
 
@@ -108,7 +106,9 @@ def list_tools() -> list[dict[str, object]]:
 def handle_request(request: dict[str, Any], tools: ToolMap) -> dict[str, Any] | None:
     method = request.get("method")
     req_id = request.get("id")
-    params = request.get("params") or {}
+    params = request.get("params")
+    if not isinstance(params, dict):
+        params = {}
 
     if method == "initialize":
         return {

@@ -1,8 +1,34 @@
 import io
 import json
+import tempfile
 import unittest
+from argparse import Namespace
 
-from engram_cli.mcp_server import PROTOCOL_VERSION, handle_request, run_server
+from engram_cli.mcp_server import (
+    PROTOCOL_VERSION,
+    handle_request,
+    run_mcp_serve,
+    run_server,
+)
+
+
+class StubTransport:
+    def __init__(self, status: int = 200, body: dict | None = None) -> None:
+        self.status = status
+        self.body = body if body is not None else {}
+        self.calls: list[tuple[str, str, dict, dict | None, float]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        self.calls.append((method, url, headers, payload, timeout))
+
+        return self.status, self.body
 
 
 def fake_search(arguments: dict) -> str:
@@ -263,6 +289,43 @@ class McpContractTests(unittest.TestCase):
         run_server(build_tools(), stdin=stdin, stdout=stdout)
 
         self.assertEqual(1, len(stdout.getvalue().splitlines()))
+
+    def test_non_dict_params_returns_error_and_loop_survives(self) -> None:
+        stdin = io.StringIO(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "x"},
+            )
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            + "\n",
+        )
+        stdout = io.StringIO()
+        run_server(build_tools(), stdin=stdin, stdout=stdout)
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+        self.assertEqual(2, len(lines))
+        self.assertEqual(-32601, lines[0]["error"]["code"])
+        self.assertEqual(1, lines[0]["id"])
+        self.assertIn("tools", lines[1]["result"])
+
+
+class RunMcpServeTests(unittest.TestCase):
+    def test_run_mcp_serve_wires_build_tools_and_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="engram-mcp-serve-tests-") as config_dir:
+            args = Namespace(config_dir=config_dir)
+            stdin = io.StringIO(
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+                + "\n"
+                + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+                + "\n",
+            )
+            stdout = io.StringIO()
+            exit_code = run_mcp_serve(args, stdin, stdout, StubTransport())
+            lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, len(lines))
+        self.assertEqual(6, len(lines[1]["result"]["tools"]))
 
 
 if __name__ == "__main__":
