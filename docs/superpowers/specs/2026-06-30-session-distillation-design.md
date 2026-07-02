@@ -46,8 +46,9 @@ org setting → settings default).
 - Add `response_kind: str = 'single'` to `ProviderCallInput`
   (`model_policy/services.py`). DistillSession passes `response_kind='candidates'`.
 - `FakeProviderGateway.call`: when `response_kind=='candidates'`, return a
-  `ProviderCallResult` whose `generated_body` is a **deterministic JSON array** of 2
-  candidates derived from the prompt, with stable confidences (e.g. `0.90` and `0.40`)
+  `ProviderCallResult` whose `generated_body` is a **deterministic JSON object**
+  `{"memories": [...]}` of 2 candidates derived from the prompt, with stable
+  confidences (e.g. `0.90` and `0.40`)
   so tests can assert one auto-promotes and one is held. (Keep the single path
   byte-identical for all existing callers.)
 - Real gateways (OpenAI/Anthropic) need no return-type change: the JSON-array
@@ -83,8 +84,8 @@ class DistillSessionResult:
 2. Build `session_distillation_prompt(observations)` aggregating
    title/body/**facts/narrative/concepts**/files_read/files_modified across the batch
    (current `provider_prompt` ignores facts/narrative/concepts — include them), plus
-   `session_distillation_system_prompt()` instructing a JSON array of
-   `{title, body, confidence (0..1), supporting_observation_ids}`.
+   `session_distillation_system_prompt()` instructing a single JSON object
+   `{"memories": [...]}` of `{title, body, confidence (0..1), supporting_observation_ids}`.
 3. Resolve `ModelPolicy task_type='curation'` (fall back to `'generation'` if no
    curation policy); ONE `get_provider_gateway(policy).call(ProviderCallInput(..., response_kind='candidates'))`.
 4. Parse `result.generated_body` as JSON → `SynthesizedCandidate`s. Parse failure →

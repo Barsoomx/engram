@@ -96,8 +96,9 @@ def curation_judge_system_prompt() -> str:
         'Decide how to reconcile them.\n'
         '\n'
         'Rules:\n'
-        '- Output a single JSON object only, with exactly one key "decision".\n'
+        '- Output a single JSON object only, with exactly two keys "decision" and "reason".\n'
         '- "decision" is one of "merge", "keep_both", "reject".\n'
+        '- "reason" is one short sentence explaining the decision.\n'
         '- "merge": the same durable fact; the new candidate should supersede the existing memory.\n'
         '- "keep_both": the two memories are distinct durable facts and both should be kept.\n'
         '- "reject": the new candidate adds no durable value beyond the existing memory.\n'
@@ -140,6 +141,18 @@ def parse_curation_decision(raw_body: str) -> str:
         return decision
 
     return _DEFAULT_JUDGE_DECISION
+
+
+def parse_curation_reason(raw_body: str) -> str:
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, TypeError):
+        return ''
+
+    if not isinstance(parsed, dict):
+        return ''
+
+    return str(parsed.get('reason') or '').strip()
 
 
 def resolve_near_dup_threshold(organization: Organization) -> Decimal:
@@ -358,7 +371,16 @@ class CurateMemoryCandidate:
         except (ModelPolicyError, ProviderSecretError):
             return _DEFAULT_JUDGE_DECISION
 
-        return parse_curation_decision(result.generated_body)
+        decision = parse_curation_decision(result.generated_body)
+        logger.info(
+            'curation_judge_decision',
+            candidate_id=str(candidate.id),
+            memory_id=str(memory.id),
+            decision=decision,
+            reason=redact_text(parse_curation_reason(result.generated_body)),
+        )
+
+        return decision
 
     def _resolve_judge_policy(self, candidate: MemoryCandidate) -> ResolvedModelPolicy:
         try:

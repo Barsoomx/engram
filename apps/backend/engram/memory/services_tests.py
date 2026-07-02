@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 from django.db import connection
 
-from engram.core.models import RetrievalDocument
+from engram.core.models import AuditEvent, MemoryCandidate, Observation, RetrievalDocument
 from engram.memory.memory_worker_tests import (
     create_embedding_policy,
     create_generation_policy,
@@ -14,11 +14,15 @@ from engram.memory.memory_worker_tests import (
     execute_worker,
 )
 from engram.memory.services import (
+    MemoryCandidateWorkerInput,
+    ProcessObservationRecorded,
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     derive_observation_confidence,
+    distillation_system_prompt,
+    provider_prompt,
 )
-from engram.model_policy.services import FakeProviderGateway
+from engram.model_policy.services import FakeProviderGateway, ProviderCallResult
 
 
 class _ObservationStub:
@@ -272,3 +276,103 @@ def test_promote_memory_candidate_index_embed_has_no_open_transaction(monkeypatc
     PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
     assert observed_in_atomic == [False]
+
+
+def test_provider_prompt_includes_facts_narrative_concepts() -> None:
+    observation = Observation(
+        title='T',
+        body='B',
+        facts=['fact one'],
+        narrative='narrative text',
+        concepts=['gotcha'],
+        files_read=[],
+        files_modified=[],
+        source_metadata={},
+    )
+
+    prompt = provider_prompt(observation)
+
+    assert 'Facts:' in prompt
+    assert 'fact one' in prompt
+    assert 'Narrative: narrative text' in prompt
+    assert 'Concepts:' in prompt
+
+
+def test_distillation_system_prompt_declares_skip_protocol() -> None:
+    assert 'SKIP' in distillation_system_prompt()
+
+
+@pytest.mark.django_db
+def test_process_observation_skip_creates_no_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+
+    class _SkipGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            real = FakeProviderGateway.call(self, data)
+
+            return ProviderCallResult(
+                provider=real.provider,
+                model=real.model,
+                call_record_id=real.call_record_id,
+                redaction_state=real.redaction_state,
+                generated_title='SKIP',
+                generated_body='',
+            )
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _SkipGateway())
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+    assert AuditEvent.objects.filter(
+        event_type='MemoryCandidateSkipped',
+        target_id=str(observation.id),
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    second_run_calls: list[int] = []
+
+    class _SkipGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            real = FakeProviderGateway.call(self, data)
+
+            return ProviderCallResult(
+                provider=real.provider,
+                model=real.model,
+                call_record_id=real.call_record_id,
+                redaction_state=real.redaction_state,
+                generated_title='SKIP',
+                generated_body='',
+            )
+
+    class _CountingGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            second_run_calls.append(1)
+
+            return FakeProviderGateway.call(self, data)
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _SkipGateway())
+    ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _CountingGateway())
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert result.duplicate is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+    assert (
+        AuditEvent.objects.filter(
+            event_type='MemoryCandidateSkipped',
+            target_id=str(observation.id),
+        ).count()
+        == 1
+    )
+    assert second_run_calls == []
