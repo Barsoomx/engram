@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 import pytest
@@ -33,6 +34,7 @@ from engram.core.models import (
     Team,
 )
 from engram.hooks.services import HookEventInput, IngestHookEvent
+from engram.memory.tasks import distill_session
 
 RAW_KEY = 'egk_test_hook_ingest_0123456789abcdefghijklmnopqrstuvwxyz'
 HOOK_PAYLOAD_MAX_BYTES = 65536
@@ -1001,6 +1003,105 @@ def test_session_end_marks_session_ended_and_writes_durable_event(
     distill_task = outbox_tasks['engram.memory.distill_session']
     assert distill_task.args == [str(session.id)]
     assert distill_task.kwargs == {}
+
+
+@pytest.mark.django_db
+def test_get_or_create_session_reactivates_ended_session_on_resume() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    service = IngestHookEvent()
+    agent = service._get_or_create_agent(organization, data)
+    ended_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=data.session_id,
+        runtime=data.agent_runtime,
+        status=SessionStatus.ENDED,
+        started_at=timezone.now() - timedelta(hours=1),
+        ended_at=timezone.now() - timedelta(minutes=40),
+    )
+
+    session = service._get_or_create_session(organization, project, team, agent, data)
+
+    assert session.id == ended_session.id
+    assert session.status == SessionStatus.ACTIVE
+    assert session.ended_at is None
+    ended_session.refresh_from_db()
+    assert ended_session.status == SessionStatus.ACTIVE
+    assert ended_session.ended_at is None
+
+
+@pytest.mark.django_db
+def test_get_or_create_session_does_not_reactivate_ended_session_on_session_end_event() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team, event_type='session_end')
+    service = IngestHookEvent()
+    agent = service._get_or_create_agent(organization, data)
+    ended_at = timezone.now() - timedelta(minutes=40)
+    ended_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=data.session_id,
+        runtime=data.agent_runtime,
+        status=SessionStatus.ENDED,
+        started_at=timezone.now() - timedelta(hours=1),
+        ended_at=ended_at,
+    )
+
+    session = service._get_or_create_session(organization, project, team, agent, data)
+
+    assert session.id == ended_session.id
+    assert session.status == SessionStatus.ENDED
+    assert session.ended_at == ended_at
+
+
+@pytest.mark.django_db
+def test_session_end_dispatches_distill_when_session_was_active(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team, event_type='session_end')
+    dispatched: list[str] = []
+    m_monkeypatch.setattr(distill_session, 'delay', lambda session_id: dispatched.append(session_id))
+
+    with f_capture_on_commit(execute=True):
+        result = IngestHookEvent().execute(data)
+
+    assert dispatched == [str(result.session.id)]
+
+
+@pytest.mark.django_db
+def test_session_end_does_not_dispatch_distill_when_session_already_ended(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team, event_type='session_end')
+    service = IngestHookEvent()
+    agent = service._get_or_create_agent(organization, data)
+    AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=data.session_id,
+        runtime=data.agent_runtime,
+        status=SessionStatus.ENDED,
+        started_at=timezone.now() - timedelta(hours=1),
+        ended_at=timezone.now() - timedelta(minutes=40),
+    )
+    dispatched: list[str] = []
+    m_monkeypatch.setattr(distill_session, 'delay', lambda session_id: dispatched.append(session_id))
+
+    with f_capture_on_commit(execute=True):
+        service.execute(data)
+
+    assert dispatched == []
 
 
 @pytest.mark.django_db

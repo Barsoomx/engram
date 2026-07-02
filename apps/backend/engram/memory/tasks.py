@@ -7,6 +7,7 @@ import structlog
 from django.utils import timezone
 
 from engram.celery_app import app
+from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import Memory, MemoryStatus, Project
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.services import (
@@ -18,6 +19,9 @@ from engram.memory.services import (
     run_daily_digest_with_tracking,
     run_weekly_digest_with_tracking,
 )
+from engram.memory.session_sweep import SweepStaleSessions
+
+logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
@@ -178,6 +182,19 @@ def generate_weekly_digest(
     return str(result.digest_memory.id)
 
 
+@app.task(name='engram.memory.reembed_missing_embeddings')
+def reembed_missing_embeddings() -> dict[str, int]:
+    result = ReembedMissingEmbeddings().execute()
+    logger.info(
+        'reembed_missing_embeddings_completed',
+        scanned=result.scanned,
+        embedded=result.embedded,
+        failed=result.failed,
+    )
+
+    return {'scanned': result.scanned, 'embedded': result.embedded, 'failed': result.failed}
+
+
 @app.task(name='engram.memory.run_scheduled_weekly_digests')
 def run_scheduled_weekly_digests() -> dict[str, int]:
     enqueued_projects = 0
@@ -233,6 +250,19 @@ def run_scheduled_digests() -> dict[str, int]:
     return {
         'enqueued_projects': enqueued_projects,
         'enqueued_tasks': enqueued_tasks,
+    }
+
+
+@app.task(name='engram.memory.sweep_stale_sessions')
+def sweep_stale_sessions() -> dict[str, int]:
+    result = SweepStaleSessions().execute()
+
+    for session_id in result.distillable_session_ids:
+        distill_session.delay(str(session_id))
+
+    return {
+        'swept': len(result.ended_session_ids),
+        'distilled': len(result.distillable_session_ids),
     }
 
 

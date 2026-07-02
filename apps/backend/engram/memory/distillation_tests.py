@@ -40,6 +40,7 @@ from engram.memory.distillation import (
 )
 from engram.memory.services import PromoteMemoryCandidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import EMBEDDING_DIMENSION, FakeProviderGateway, _completion_body
 
 
@@ -302,7 +303,13 @@ def test_distill_session_auto_promotes_high_confidence_and_holds_low_confidence(
     create_observation(organization, project, team, agent, session, index=1)
     create_observation(organization, project, team, agent, session, index=2)
 
-    result = DistillSession().execute(DistillSessionInput(session_id=session.id, request_id='distill-1'))
+    result = DistillSession().execute(
+        DistillSessionInput(
+            session_id=session.id,
+            request_id='distill-1',
+            auto_approve_threshold=Decimal('0.800'),
+        ),
+    )
 
     assert len(result.auto_promoted) == 1
     assert len(result.queued_for_review) == 1
@@ -447,6 +454,56 @@ def test_run_session_distillation_with_tracking_marks_failed_run_and_reraises() 
     run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
     assert run.status == WorkflowRunStatus.FAILED
     assert run.finished_at is not None
+
+
+@pytest.mark.django_db
+def test_distill_session_rerun_with_real_gateway_does_not_replay_stale_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        base_url='https://provider.example/v1',
+        raw_key='real-key',
+    )
+    create_observation(organization, project, team, agent, session, index=1)
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+    candidates_payload = json.dumps(
+        [
+            {
+                'title': 'redis timeout',
+                'body': 'bumped redis timeout to 30s',
+                'confidence': 0.9,
+                'supporting_observation_ids': [],
+            },
+        ],
+    )
+    completion = {'choices': [{'message': {'content': candidates_payload}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    m_monkeypatch.setattr('urllib.request.urlopen', opener)
+
+    first = run_session_distillation_with_tracking(
+        session_id=session.id,
+        request_id='rerun-1',
+        auto_approve_threshold=Decimal('0.500'),
+    )
+    second = run_session_distillation_with_tracking(
+        session_id=session.id,
+        request_id='rerun-2',
+        auto_approve_threshold=Decimal('0.500'),
+    )
+
+    assert len(opener.requests) == 2
+    assert second.provider_call_ids[0] != first.provider_call_ids[0]
+    assert len(first.auto_promoted) == 1
+    assert len(second.auto_promoted) == 1
+    assert second.auto_promoted[0].id == first.auto_promoted[0].id
+    assert Memory.objects.count() == 1
+    memory = Memory.objects.get()
+    assert not memory.title.startswith('Observation:')
+    assert memory.body == 'bumped redis timeout to 30s'
 
 
 @pytest.mark.django_db(transaction=True)

@@ -1026,7 +1026,20 @@ class OpenAICompatibleGateway:
                 f'provider returned {error.code}',
                 retryable=retryable,
             ) from error
+        except TimeoutError as error:
+            raise ModelPolicyError(
+                'provider_timeout',
+                'provider timed out',
+                retryable=True,
+            ) from error
         except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise ModelPolicyError(
+                    'provider_timeout',
+                    'provider timed out',
+                    retryable=True,
+                ) from error
+
             raise ModelPolicyError(
                 'provider_unreachable',
                 f'provider unreachable: {error.reason}',
@@ -1034,12 +1047,12 @@ class OpenAICompatibleGateway:
             ) from error
 
 
-_TITLE_MARKER_RE = re.compile(r'(?i)^\s*title\s*:\s*')
-_BODY_MARKER_RE = re.compile(r'(?i)^\s*body\s*:\s*')
+_TITLE_LABEL_RE = re.compile(r'^\s*title\s*:\s*', re.IGNORECASE)
+_BODY_LABEL_RE = re.compile(r'^\s*body\s*:\s*', re.IGNORECASE)
 
 
-def _strip_marker(line: str, marker: re.Pattern[str]) -> str:
-    return marker.sub('', line, count=1).strip()
+def _strip_label(text: str, pattern: re.Pattern[str]) -> str:
+    return pattern.sub('', text, count=1)
 
 
 def _split_completion(content: str) -> tuple[str, str]:
@@ -1047,14 +1060,15 @@ def _split_completion(content: str) -> tuple[str, str]:
     if not lines:
         return 'Provider-generated memory', content
 
-    title = _strip_marker(lines[0], _TITLE_MARKER_RE)[:255]
+    title = _strip_label(lines[0], _TITLE_LABEL_RE)[:255]
     if len(lines) == 1:
-        return title, _strip_marker(content.strip(), _TITLE_MARKER_RE)
+        body = _strip_label(_strip_label(content, _TITLE_LABEL_RE), _BODY_LABEL_RE)
 
-    body_lines = lines[1:]
-    body_lines[0] = _strip_marker(body_lines[0], _BODY_MARKER_RE)
+        return title, body
 
-    return title, '\n'.join(body_lines)
+    body = _strip_label('\n'.join(lines[1:]), _BODY_LABEL_RE)
+
+    return title, body
 
 
 def _completion_body(content: str, response_kind: str) -> str:
@@ -1196,7 +1210,20 @@ class AnthropicMessagesGateway:
                 f'provider returned {error.code}',
                 retryable=retryable,
             ) from error
+        except TimeoutError as error:
+            raise ModelPolicyError(
+                'provider_timeout',
+                'provider timed out',
+                retryable=True,
+            ) from error
         except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise ModelPolicyError(
+                    'provider_timeout',
+                    'provider timed out',
+                    retryable=True,
+                ) from error
+
             raise ModelPolicyError(
                 'provider_unreachable',
                 f'provider unreachable: {error.reason}',

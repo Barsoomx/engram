@@ -329,6 +329,7 @@ def create_memory_candidate(observation: Observation) -> MemoryCandidate:
 def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() -> None:
     organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
     policy = create_generation_policy(organization, team, project)
+    enable_auto_promote(organization, threshold='0.800')
 
     result = execute_worker(observation)
 
@@ -1129,9 +1130,27 @@ def test_rich_observation_auto_promotes_at_default_threshold() -> None:
 
 
 @pytest.mark.django_db
-def test_thin_observation_held_at_default_threshold() -> None:
+def test_thin_observation_auto_promotes_at_default_threshold() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
+    observation.files_read = []
+    observation.files_modified = []
+    observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])
+
+    result = execute_worker(observation)
+
+    candidate = MemoryCandidate.objects.get()
+    assert candidate.confidence == Decimal('0.500')
+    assert result.held_for_review is False
+    assert result.curated_decision is not None
+    assert result.memory is not None
+
+
+@pytest.mark.django_db
+def test_thin_observation_held_below_configured_threshold() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    enable_auto_promote(organization, threshold='0.800')
     observation.files_read = []
     observation.files_modified = []
     observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])

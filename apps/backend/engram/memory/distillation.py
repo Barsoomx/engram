@@ -55,6 +55,7 @@ class DistillSessionInput:
     request_id: str = ''
     correlation_id: str = ''
     auto_approve_threshold: Decimal | None = None
+    run_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -187,7 +188,7 @@ class DistillSession:
             session_id=str(session.id),
         )
         prompt = session_distillation_prompt(observations)
-        provider_result, resolved = self._synthesize(session, prompt, correlation_id)
+        provider_result, resolved = self._synthesize(session, prompt, correlation_id, data.run_id)
         synthesized = parse_synthesized_candidates(provider_result.generated_body)
         provenance = self._provenance(provider_result, resolved)
 
@@ -253,7 +254,11 @@ class DistillSession:
         session: AgentSession,
         prompt: str,
         correlation_id: str,
+        run_id: str,
     ) -> tuple[ProviderCallResult, ResolvedModelPolicy]:
+        request_id = (
+            f'distill-session:{session.id}:{run_id}:curation' if run_id else f'distill-session:{session.id}:curation'
+        )
         try:
             resolved = self._resolve_policy(session)
             provider_result = get_provider_gateway(resolved.policy).call(
@@ -262,7 +267,7 @@ class DistillSession:
                     project_id=session.project_id,
                     team_id=session.team_id,
                     policy=resolved.policy,
-                    request_id=f'distill-session:{session.id}:curation',
+                    request_id=request_id,
                     trace_id=correlation_id or f'distill-session:{session.id}',
                     prompt=prompt,
                     system_prompt=session_distillation_system_prompt(),
@@ -433,6 +438,7 @@ def run_session_distillation_with_tracking(
                 request_id=request_id,
                 correlation_id=correlation_id,
                 auto_approve_threshold=auto_approve_threshold,
+                run_id=str(run.id),
             ),
         )
     except Exception as error:

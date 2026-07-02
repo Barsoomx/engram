@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -16,9 +17,15 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
-from engram.memory.services import DigestInput, GenerateDigest, MemoryWorkerError
+from engram.memory.services import DigestInput, GenerateDigest, MemoryWorkerError, run_daily_digest_with_tracking
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import ModelPolicyError
+
+
+@pytest.fixture
+def m_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    return monkeypatch
 
 
 def create_digest_policy(organization: Organization, team: Team | None, project: Project) -> ModelPolicy:
@@ -145,3 +152,45 @@ def test_generate_digest_is_idempotent_on_replay() -> None:
     assert result2.memory.id == result1.memory.id
     assert result2.memory_version.id == result1.memory_version.id
     assert result2.retrieval_document.id == result1.retrieval_document.id
+
+
+@pytest.mark.django_db
+def test_run_daily_digest_rerun_with_real_gateway_does_not_replay_stale_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    make_real_policy(
+        organization,
+        project,
+        task_type='digest',
+        base_url='https://provider.example/v1',
+        raw_key='real-key',
+    )
+    first_source = create_source_memory(organization, team, project, title='First day source')
+    second_source = create_source_memory(organization, team, project, title='Second day source')
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+    completion = {'choices': [{'message': {'content': 'Digest title\nSynthesized digest body from provider.'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    m_monkeypatch.setattr('urllib.request.urlopen', opener)
+    request_id = f'daily-digest:{project.id}'
+
+    first = run_daily_digest_with_tracking(
+        organization_id=organization.id,
+        project_id=project.id,
+        memory_ids=(first_source.id,),
+        request_id=request_id,
+        correlation_id=request_id,
+    )
+    second = run_daily_digest_with_tracking(
+        organization_id=organization.id,
+        project_id=project.id,
+        memory_ids=(second_source.id,),
+        request_id=request_id,
+        correlation_id=request_id,
+    )
+
+    assert len(opener.requests) == 2
+    assert second.provider_call_id != first.provider_call_id
+    assert second.memory.id != first.memory.id
+    assert second.memory.body == 'Synthesized digest body from provider.'
+    assert 'Second day source' not in second.memory.body
