@@ -380,6 +380,7 @@ export interface ModelPolicy {
   version: number;
   active: boolean;
   fallback_enabled: boolean;
+  context_window_tokens?: number | null;
 }
 
 export interface ModelPolicyCreateInput {
@@ -394,6 +395,7 @@ export interface ModelPolicyCreateInput {
   secret_id: string;
   request_id: string;
   base_url?: string;
+  context_window_tokens?: number;
 }
 
 export interface ModelPolicyResolveParams {

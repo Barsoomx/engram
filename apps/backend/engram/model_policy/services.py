@@ -38,6 +38,14 @@ logger = structlog.get_logger(__name__)
 SECRET_KEY_VERSION = 'v1'
 NON_PRODUCTION_ENVIRONMENTS = {'dev', 'development', 'local', 'test'}
 
+_MODEL_PREFIX_CONTEXT_WINDOWS = {
+    'claude-': 200000,
+    'gpt-5': 400000,
+    'gpt-4': 128000,
+    'deepseek-': 128000,
+    'glm-': 128000,
+}
+
 
 @dataclass(frozen=True)
 class ProviderSecretInput:
@@ -91,6 +99,7 @@ class ModelPolicyInput:
     actor_id: str
     scope_team_id: uuid.UUID | None = None
     base_url: str = ''
+    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +371,7 @@ class UpdateModelPolicyInput:
     fallback_enabled: bool | None = None
     task_type: str | None = None
     base_url: str | None = None
+    context_window_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -412,6 +422,12 @@ class CreateModelPolicy:
         elif data.scope == PolicyScope.TEAM:
             project = None
 
+        metadata: dict[str, Any] = {}
+        if data.base_url:
+            metadata['base_url'] = data.base_url
+        if data.context_window_tokens:
+            metadata['context_window_tokens'] = data.context_window_tokens
+
         with transaction.atomic():
             policy = ModelPolicy.objects.create(
                 organization_id=data.organization_id,
@@ -424,7 +440,7 @@ class CreateModelPolicy:
                 model=data.model,
                 secret=secret,
                 version=1,
-                metadata={'base_url': data.base_url} if data.base_url else {},
+                metadata=metadata,
             )
             audit_model_policy_event(
                 organization_id=data.organization_id,
@@ -502,6 +518,23 @@ class UpdateModelPolicy:
         policy.metadata = current
         update_fields.append('metadata')
 
+    def _apply_context_window_update(
+        self,
+        policy: ModelPolicy,
+        data: UpdateModelPolicyInput,
+        update_fields: list[str],
+    ) -> None:
+        # The serializer cannot distinguish an omitted field from an explicit null, so a bare
+        # None is treated as "not provided" and leaves any existing override untouched.
+        if data.context_window_tokens is None:
+            return
+
+        current = dict(policy.metadata or {})
+        current['context_window_tokens'] = data.context_window_tokens
+        policy.metadata = current
+        if 'metadata' not in update_fields:
+            update_fields.append('metadata')
+
     def execute(self, data: UpdateModelPolicyInput) -> ModelPolicy:
         with transaction.atomic():
             try:
@@ -518,6 +551,7 @@ class UpdateModelPolicy:
             self._apply_scalar_updates(policy, data, update_fields)
             self._apply_secret_update(policy, data, update_fields)
             self._apply_base_url_update(policy, data, update_fields)
+            self._apply_context_window_update(policy, data, update_fields)
 
             policy.version += 1
             policy.save(update_fields=update_fields)
@@ -805,12 +839,14 @@ def generated_candidates_payload(prompt: str) -> str:
             'body': f'Provider-synthesized candidate body {digest} high',
             'confidence': 0.9,
             'supporting_observation_ids': [],
+            'source_ids': [0],
         },
         {
             'title': f'Provider-synthesized memory {digest} low',
             'body': f'Provider-synthesized candidate body {digest} low',
             'confidence': 0.4,
             'supporting_observation_ids': [],
+            'source_ids': [1],
         },
     ]
 
@@ -880,6 +916,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                             'body': {'type': 'string'},
                             'confidence': {'type': 'number'},
                             'supporting_observation_ids': {'type': 'array', 'items': {'type': 'string'}},
+                            'source_ids': {'type': 'array', 'items': {'type': 'integer'}},
                         },
                         'required': ['title', 'body', 'confidence'],
                     },
@@ -918,6 +955,24 @@ def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
     return _MAX_TOKENS_BY_KIND.get(response_kind, _DEFAULT_MAX_TOKENS)
 
 
+def resolve_context_window_tokens(policy: ModelPolicy) -> int | None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    override = metadata.get('context_window_tokens')
+    if isinstance(override, int) and override > 0:
+        return override
+
+    model = policy.model.lower()
+    best_match: str | None = None
+    for prefix in _MODEL_PREFIX_CONTEXT_WINDOWS:
+        if model.startswith(prefix) and (best_match is None or len(prefix) > len(best_match)):
+            best_match = prefix
+
+    if best_match is not None:
+        return _MODEL_PREFIX_CONTEXT_WINDOWS[best_match]
+
+    return None
+
+
 def _resolve_base_url(policy: ModelPolicy) -> str:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     base_url = str(metadata.get('base_url') or '').strip()
@@ -925,7 +980,7 @@ def _resolve_base_url(policy: ModelPolicy) -> str:
     return base_url if base_url else default_base_url(policy.provider)
 
 
-def _provider_http_timeout() -> int:
+def provider_http_timeout() -> int:
     return int(os.environ.get('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60'))
 
 
@@ -938,7 +993,7 @@ class OpenAICompatibleGateway:
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key
         self._opener = opener or urllib.request.urlopen
-        self._timeout = timeout if timeout is not None else _provider_http_timeout()
+        self._timeout = timeout if timeout is not None else provider_http_timeout()
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -1180,7 +1235,7 @@ class AnthropicMessagesGateway:
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key
         self._opener = opener or urllib.request.urlopen
-        self._timeout = timeout if timeout is not None else _provider_http_timeout()
+        self._timeout = timeout if timeout is not None else provider_http_timeout()
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy

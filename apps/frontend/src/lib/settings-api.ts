@@ -3,6 +3,8 @@ import { apiClient } from '@/lib/auth';
 export type RetrievalSettings = {
   hybrid_retrieval_enabled: boolean;
   require_provenance: boolean;
+  distillation_auto_approve_threshold: number | null;
+  near_dup_threshold: number;
 };
 
 export type EmbeddingSettings = {

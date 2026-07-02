@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from engram.context.context_api_tests import create_project_scope
+from engram.model_policy import services
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
@@ -21,6 +22,7 @@ from engram.model_policy.services import (
     default_base_url,
     encrypt_secret,
     get_provider_gateway,
+    resolve_context_window_tokens,
 )
 
 
@@ -1307,6 +1309,57 @@ def test_anthropic_gateway_messages_honors_env_timeout_override(monkeypatch: pyt
     )
 
     assert opener.timeouts == [240]
+
+
+def test_resolve_context_window_tokens_prefix_match_claude() -> None:
+    policy = ModelPolicy(model='claude-3-5-sonnet-20241022', metadata={})
+
+    assert resolve_context_window_tokens(policy) == 200000
+
+
+def test_resolve_context_window_tokens_prefix_match_gpt5() -> None:
+    policy = ModelPolicy(model='gpt-5-mini', metadata={})
+
+    assert resolve_context_window_tokens(policy) == 400000
+
+
+def test_resolve_context_window_tokens_prefix_match_deepseek() -> None:
+    policy = ModelPolicy(model='deepseek-chat', metadata={})
+
+    assert resolve_context_window_tokens(policy) == 128000
+
+
+def test_resolve_context_window_tokens_longest_prefix_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        services,
+        '_MODEL_PREFIX_CONTEXT_WINDOWS',
+        {'gpt-': 50000, 'gpt-4': 128000},
+    )
+    policy = ModelPolicy(model='gpt-4o-mini', metadata={})
+
+    assert resolve_context_window_tokens(policy) == 128000
+
+
+def test_resolve_context_window_tokens_metadata_override_wins() -> None:
+    policy = ModelPolicy(model='claude-3-5-sonnet-20241022', metadata={'context_window_tokens': 999999})
+
+    assert resolve_context_window_tokens(policy) == 999999
+
+
+@pytest.mark.parametrize('garbage_override', [0, -5, 'not-a-number'])
+def test_resolve_context_window_tokens_garbage_override_ignored(garbage_override: object) -> None:
+    policy = ModelPolicy(
+        model='claude-3-5-sonnet-20241022',
+        metadata={'context_window_tokens': garbage_override},
+    )
+
+    assert resolve_context_window_tokens(policy) == 200000
+
+
+def test_resolve_context_window_tokens_unknown_model_returns_none() -> None:
+    policy = ModelPolicy(model='some-unknown-model', metadata={})
+
+    assert resolve_context_window_tokens(policy) is None
 
 
 @pytest.mark.django_db

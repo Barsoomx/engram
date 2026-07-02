@@ -33,6 +33,7 @@ from engram.memory.services import (
     redact_value,
     resolve_auto_approve_threshold,
 )
+from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (
     AnthropicMessagesGateway,
     FakeProviderGateway,
@@ -45,6 +46,8 @@ from engram.model_policy.services import (
     ResolveModelPolicy,
     ResolveModelPolicyInput,
     get_provider_gateway,
+    provider_http_timeout,
+    resolve_context_window_tokens,
 )
 
 logger = structlog.get_logger(__name__)
@@ -68,6 +71,14 @@ class SynthesizedCandidate:
     body: str
     confidence: Decimal
     supporting_observation_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _ReducedCandidate:
+    title: str
+    body: str
+    confidence: Decimal
+    source_ids: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -113,8 +124,27 @@ def session_distillation_system_prompt() -> str:
     )
 
 
-def _observation_block(observation: Observation) -> str:
-    return '\n'.join(
+def session_reduce_system_prompt() -> str:
+    return (
+        'You are consolidating draft engineering memories synthesized from one agent session.\n'
+        'Given a JSON array of draft memories, each with an integer "id", merge near-duplicate or '
+        'overlapping drafts into a smaller set of high-signal memories.\n'
+        '\n'
+        'Rules:\n'
+        '- Output a single JSON object only, with exactly one key "memories".\n'
+        '- "memories" is an array of objects with the keys '
+        '"title", "body", "confidence", "source_ids".\n'
+        '- "source_ids" lists the integer ids of the input drafts merged into this memory.\n'
+        '- "confidence" is a number between 0 and 1 reflecting how durable and reliable the memory is.\n'
+        '- Preserve exact identifiers verbatim: file paths, function names, class names, '
+        'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
+        '- Do not invent facts not present in the input drafts.\n'
+        '- Do not name any AI assistant, tool, or product by brand.'
+    )
+
+
+def _observation_block(observation: Observation, cap: int) -> str:
+    block = '\n'.join(
         [
             f'Observation: {observation.id}',
             f'Title: {redact_text(observation.title)}',
@@ -126,14 +156,33 @@ def _observation_block(observation: Observation) -> str:
             f'Files modified: {redact_value(observation.files_modified)}',
         ],
     )
+    if len(block) <= cap:
+        return block
+
+    marker = f'\n[truncated {len(block) - cap} chars]'
+    head = block[: max(cap - len(marker), 0)]
+
+    return head + marker
 
 
-def session_distillation_prompt(observations: list[Observation]) -> str:
-    return '\n\n'.join(_observation_block(observation) for observation in observations)
+def session_distillation_prompt(observations: list[Observation], cap: int) -> str:
+    return '\n\n'.join(_observation_block(observation, cap) for observation in observations)
 
 
-def _distill_chunk_char_budget() -> int:
-    return int(os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '40000'))
+def _distill_chunk_char_budget(policy: ModelPolicy) -> int:
+    env_value = os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET')
+    if env_value is not None:
+        return int(env_value)
+
+    ceiling = provider_http_timeout() * 2000
+    tokens = resolve_context_window_tokens(policy)
+    if tokens is None:
+        return min(40000, ceiling)
+
+    context_chars = max(tokens - 8000, 0) * 3
+    floor = min(8000, ceiling)
+
+    return max(min(context_chars, ceiling), floor)
 
 
 def _distill_max_chunks() -> int:
@@ -145,7 +194,7 @@ def chunk_observations(observations: list[Observation], budget: int) -> list[lis
     current: list[Observation] = []
     current_length = 0
     for observation in observations:
-        block_length = len(_observation_block(observation))
+        block_length = len(_observation_block(observation, budget))
         separator_length = 2 if current else 0
         if current and current_length + separator_length + block_length > budget:
             chunks.append(current)
@@ -224,6 +273,68 @@ def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, .
     return tuple(candidates)
 
 
+def _parse_reduced_source_ids(raw: object) -> tuple[int, ...] | None:
+    if not isinstance(raw, list):
+        return None
+
+    source_ids: list[int] = []
+    for source_id in raw:
+        if isinstance(source_id, bool) or not isinstance(source_id, int):
+            return None
+
+        source_ids.append(source_id)
+
+    return tuple(source_ids)
+
+
+def _parse_reduced_candidate_item(item: object) -> _ReducedCandidate | None:
+    if not isinstance(item, dict):
+        return None
+
+    title = item.get('title')
+    body = item.get('body')
+    if not isinstance(title, str) or not isinstance(body, str):
+        return None
+
+    if not title.strip() or not body.strip():
+        return None
+
+    source_ids = _parse_reduced_source_ids(item.get('source_ids'))
+    if source_ids is None:
+        return None
+
+    return _ReducedCandidate(
+        title=title.strip()[:255],
+        body=body.strip(),
+        confidence=_clamp_confidence(item.get('confidence')),
+        source_ids=source_ids,
+    )
+
+
+def _parse_reduced_candidates(raw_body: str) -> tuple[_ReducedCandidate, ...] | None:
+    try:
+        parsed = json.loads(raw_body)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    items = parsed.get('memories')
+    if not isinstance(items, list):
+        return None
+
+    candidates: list[_ReducedCandidate] = []
+    for item in items:
+        candidate = _parse_reduced_candidate_item(item)
+        if candidate is None:
+            return None
+
+        candidates.append(candidate)
+
+    return tuple(candidates)
+
+
 class DistillSession:
     def execute(self, data: DistillSessionInput) -> DistillSessionResult:
         session = self._load_session(data.session_id)
@@ -237,7 +348,9 @@ class DistillSession:
             session_id=str(session.id),
         )
         run_scope = data.run_id or data.correlation_id or data.request_id or uuid.uuid4().hex
-        chunks = chunk_observations(observations, _distill_chunk_char_budget())
+        resolved, gateway = self._resolve_gateway(session)
+        budget = _distill_chunk_char_budget(resolved.policy)
+        chunks = chunk_observations(observations, budget)
         max_chunks = _distill_max_chunks()
         truncated = len(chunks) > max_chunks
         if truncated:
@@ -251,18 +364,30 @@ class DistillSession:
                 observation_count=len(observations),
                 observations_distilled=sum(len(chunk) for chunk in chunks),
             )
-        resolved, gateway = self._resolve_gateway(session)
 
         provider_results: list[ProviderCallResult] = []
         synthesized: list[tuple[SynthesizedCandidate, dict[str, object]]] = []
         for index, chunk in enumerate(chunks):
-            prompt = session_distillation_prompt(chunk)
+            prompt = session_distillation_prompt(chunk, budget)
             provider_result = self._call_chunk(session, gateway, resolved, prompt, correlation_id, run_scope, index)
             provider_results.append(provider_result)
             provenance = self._provenance(provider_result, resolved)
             synthesized.extend(
                 (candidate, provenance) for candidate in parse_synthesized_candidates(provider_result.generated_body)
             )
+
+        synthesized = self._reduce_candidates(
+            session,
+            gateway,
+            resolved,
+            synthesized,
+            provider_results,
+            correlation_id,
+            run_scope,
+            budget,
+            data,
+            chunk_count=len(chunks),
+        )
 
         with transaction.atomic():
             locked_session = self._lock_session(data.session_id)
@@ -391,6 +516,105 @@ class DistillSession:
             'redaction_state': provider_result.redaction_state,
         }
 
+    def _reduce_candidates(
+        self,
+        session: AgentSession,
+        gateway: FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway,
+        resolved: ResolvedModelPolicy,
+        synthesized: list[tuple[SynthesizedCandidate, dict[str, object]]],
+        provider_results: list[ProviderCallResult],
+        correlation_id: str,
+        run_scope: str,
+        budget: int,
+        data: DistillSessionInput,
+        *,
+        chunk_count: int,
+    ) -> list[tuple[SynthesizedCandidate, dict[str, object]]]:
+        reduce_target = int(os.environ.get('ENGRAM_DISTILL_REDUCE_TARGET', '12'))
+        if chunk_count <= 1 or len(synthesized) <= reduce_target:
+            return synthesized
+
+        drafts = [
+            {
+                'id': index,
+                'title': candidate.title,
+                'body': candidate.body,
+                'confidence': float(candidate.confidence),
+            }
+            for index, (candidate, _provenance) in enumerate(synthesized)
+        ]
+        reduce_prompt = json.dumps(drafts)
+        if len(reduce_prompt) > budget:
+            self._audit_reduce_skipped(session, data, reason='over_budget', draft_count=len(synthesized))
+
+            return synthesized
+
+        try:
+            reduce_result = gateway.call(
+                ProviderCallInput(
+                    organization_id=session.organization_id,
+                    project_id=session.project_id,
+                    team_id=session.team_id,
+                    policy=resolved.policy,
+                    request_id=f'distill-session:{session.id}:{run_scope}:curation:reduce',
+                    trace_id=correlation_id or f'distill-session:{session.id}',
+                    prompt=reduce_prompt,
+                    system_prompt=session_reduce_system_prompt(),
+                    response_kind='candidates',
+                ),
+            )
+        except (ModelPolicyError, ProviderSecretError):
+            self._audit_reduce_skipped(session, data, reason='provider_error', draft_count=len(synthesized))
+
+            return synthesized
+
+        parsed_reduced = _parse_reduced_candidates(reduce_result.generated_body)
+        if not parsed_reduced:
+            reason = 'parse_failed' if parsed_reduced is None else 'empty'
+            self._audit_reduce_skipped(session, data, reason=reason, draft_count=len(synthesized))
+
+            return synthesized
+
+        provider_results.append(reduce_result)
+        provenance = self._provenance(reduce_result, resolved)
+        provenance['reduced'] = True
+
+        return self._merge_reduced_candidates(synthesized, parsed_reduced, provenance)
+
+    def _merge_reduced_candidates(
+        self,
+        synthesized: list[tuple[SynthesizedCandidate, dict[str, object]]],
+        reduced: tuple[_ReducedCandidate, ...],
+        provenance: dict[str, object],
+    ) -> list[tuple[SynthesizedCandidate, dict[str, object]]]:
+        merged: list[tuple[SynthesizedCandidate, dict[str, object]]] = []
+        for item in reduced:
+            supporting: list[str] = []
+            seen: set[str] = set()
+            for source_id in item.source_ids:
+                if source_id < 0 or source_id >= len(synthesized):
+                    continue
+
+                draft_candidate, _draft_provenance = synthesized[source_id]
+                for observation_id in draft_candidate.supporting_observation_ids:
+                    if observation_id not in seen:
+                        seen.add(observation_id)
+                        supporting.append(observation_id)
+
+            merged.append(
+                (
+                    SynthesizedCandidate(
+                        title=item.title,
+                        body=item.body,
+                        confidence=item.confidence,
+                        supporting_observation_ids=tuple(supporting),
+                    ),
+                    dict(provenance),
+                ),
+            )
+
+        return merged
+
     def _get_or_create_candidate(
         self,
         session: AgentSession,
@@ -512,6 +736,33 @@ class DistillSession:
                 'chunks_processed': chunks_processed,
                 'observation_count': observation_count,
                 'observations_distilled': observations_distilled,
+            },
+        )
+
+    def _audit_reduce_skipped(
+        self,
+        session: AgentSession,
+        data: DistillSessionInput,
+        *,
+        reason: str,
+        draft_count: int,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=session.organization,
+            project=session.project,
+            team=session.team,
+            event_type='SessionDistillationReduceSkipped',
+            actor_type='system',
+            target_type='agent_session',
+            target_id=str(session.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'reason': reason,
+                'draft_count': draft_count,
+                'session_id': str(session.id),
             },
         )
 
