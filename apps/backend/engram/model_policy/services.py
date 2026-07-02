@@ -818,7 +818,7 @@ def generated_candidates_payload(prompt: str) -> str:
 
 
 def generated_curation_judgment_payload() -> str:
-    return json.dumps({'decision': 'keep_both'})
+    return json.dumps({'decision': 'keep_both', 'reason': 'fake provider default judgment'})
 
 
 def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
