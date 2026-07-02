@@ -125,6 +125,11 @@ beat_schedule: dict[str, dict] = {
         'schedule': crontab(day_of_week=1, hour=3, minute=0),
         'options': {'queue': QUEUE_BATCH},
     },
+    'reembed-missing-embeddings': {
+        'task': 'engram.memory.reembed_missing_embeddings',
+        'schedule': crontab(minute='*/15'),
+        'options': {'queue': QUEUE_BATCH},
+    },
 }
 
 worker_max_tasks_per_child = int(os.getenv('ENGRAM_WORKER_MAX_TASKS_PER_CHILD', 512))
