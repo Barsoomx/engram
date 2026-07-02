@@ -6,7 +6,8 @@ import uuid
 from collections.abc import Iterable
 from typing import Any
 
-from django.db import transaction
+import structlog
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import status
 
@@ -25,7 +26,12 @@ from engram.access.services import (
     api_key_prefix,
     hash_api_key,
 )
-from engram.console.exceptions import LastOwnerError
+from engram.console.exceptions import (
+    LastOwnerError,
+    MemberAlreadyInvitedError,
+    ProjectSlugTakenError,
+    TeamSlugTakenError,
+)
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
@@ -42,6 +48,8 @@ from engram.core.models import (
     Team,
 )
 from engram.core.repository import canonicalize_repository_url
+
+logger = structlog.get_logger(__name__)
 
 OWNER_ROLE_CODE = 'organization_owner'
 
@@ -88,7 +96,21 @@ def create_team(
     name: str,
     slug: str,
 ) -> Team:
-    return Team.objects.create(organization=organization, name=name, slug=slug)
+    try:
+        team = Team.objects.create(organization=organization, name=name, slug=slug)
+    except IntegrityError:
+        raise TeamSlugTakenError(
+            f'team slug {slug!r} already exists in this organization',
+        ) from None
+
+    logger.info(
+        'team_created',
+        organization_id=str(organization.id),
+        team_id=str(team.id),
+        slug=slug,
+    )
+
+    return team
 
 
 @transaction.atomic
@@ -96,6 +118,12 @@ def archive_team(team: Team) -> Team:
     team.archived_at = timezone.now()
 
     team.save(update_fields=['archived_at', 'updated_at'])
+
+    logger.info(
+        'team_archived',
+        organization_id=str(team.organization_id),
+        team_id=str(team.id),
+    )
 
     return team
 
@@ -109,13 +137,27 @@ def create_project(
     repository_url: str = '',
     default_branch: str = '',
 ) -> Project:
-    return Project.objects.create(
-        organization=organization,
-        name=name,
+    try:
+        project = Project.objects.create(
+            organization=organization,
+            name=name,
+            slug=slug,
+            repository_url=canonicalize_repository_url(repository_url) or repository_url,
+            default_branch=default_branch,
+        )
+    except IntegrityError:
+        raise ProjectSlugTakenError(
+            f'project slug {slug!r} already exists in this organization',
+        ) from None
+
+    logger.info(
+        'project_created',
+        organization_id=str(organization.id),
+        project_id=str(project.id),
         slug=slug,
-        repository_url=canonicalize_repository_url(repository_url) or repository_url,
-        default_branch=default_branch,
     )
+
+    return project
 
 
 @transaction.atomic
@@ -123,6 +165,12 @@ def archive_project(project: Project) -> Project:
     project.archived_at = timezone.now()
 
     project.save(update_fields=['archived_at', 'updated_at'])
+
+    logger.info(
+        'project_archived',
+        organization_id=str(project.organization_id),
+        project_id=str(project.id),
+    )
 
     return project
 
@@ -136,20 +184,34 @@ def invite_member(
     email: str,
     role: Role,
 ) -> OrganizationMembership:
-    identity = Identity.objects.create(
-        organization=organization,
-        identity_type=IdentityType.USER,
-        external_id=external_id,
-        display_name=display_name,
-        email=email,
+    try:
+        identity = Identity.objects.create(
+            organization=organization,
+            identity_type=IdentityType.USER,
+            external_id=external_id,
+            display_name=display_name,
+            email=email,
+        )
+
+        membership = OrganizationMembership.objects.create(
+            organization=organization,
+            identity=identity,
+            role=role,
+            status=MembershipStatus.INVITED,
+        )
+    except IntegrityError:
+        raise MemberAlreadyInvitedError(
+            f'identity {external_id!r} is already a member of this organization',
+        ) from None
+
+    logger.info(
+        'member_invited',
+        organization_id=str(organization.id),
+        identity_id=str(identity.id),
+        role=role.code,
     )
 
-    return OrganizationMembership.objects.create(
-        organization=organization,
-        identity=identity,
-        role=role,
-        status=MembershipStatus.INVITED,
-    )
+    return membership
 
 
 @transaction.atomic
@@ -200,6 +262,12 @@ def activate_member(
         event_type='MemberActivated',
         target_type='member',
         target_id=str(membership.id),
+    )
+
+    logger.info(
+        'member_activated',
+        organization_id=str(organization.id),
+        identity_id=str(membership.identity_id),
     )
 
     return membership
@@ -302,6 +370,13 @@ def issue_api_key(
     for capability in capability_objs:
         ApiKeyCapability.objects.get_or_create(api_key=api_key, capability=capability)
 
+    logger.info(
+        'api_key_issued',
+        organization_id=str(organization.id),
+        key_id=str(api_key.id),
+        capabilities=capabilities,
+    )
+
     return api_key, plaintext
 
 
@@ -310,6 +385,12 @@ def revoke_api_key(api_key: ApiKey) -> ApiKey:
     api_key.revoked_at = timezone.now()
 
     api_key.save(update_fields=['revoked_at', 'updated_at'])
+
+    logger.info(
+        'api_key_revoked',
+        organization_id=str(api_key.organization_id),
+        key_id=str(api_key.id),
+    )
 
     return api_key
 

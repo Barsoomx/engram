@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import structlog
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -18,11 +19,15 @@ from engram.console.serializers.api_keys import (
     ApiKeyReadSerializer,
 )
 from engram.console.services import (
+    CapabilityWideningError,
     _issuer_can_grant,
     audit_admin_action,
     issue_api_key,
     revoke_api_key,
 )
+from engram.core.models import AuditResult
+
+logger = structlog.get_logger(__name__)
 
 
 class ApiKeyViewSet(
@@ -93,10 +98,29 @@ class ApiKeyViewSet(
                 status=HTTP_400_BAD_REQUEST,
             )
 
-        _issuer_can_grant(
-            requested_capabilities,
-            request.effective_scope.capabilities,
-        )
+        try:
+            _issuer_can_grant(
+                requested_capabilities,
+                request.effective_scope.capabilities,
+            )
+        except CapabilityWideningError:
+            audit_admin_action(
+                organization=request.active_organization,
+                actor_identity=request.user_identity,
+                event_type='ApiKeyIssueDenied',
+                target_type='api_key',
+                target_id='',
+                metadata={'requested_capabilities': requested_capabilities},
+                result=AuditResult.DENIED,
+            )
+
+            logger.warning(
+                'api_key_issue_denied',
+                organization_id=str(request.active_organization.id),
+                requested_capabilities=requested_capabilities,
+            )
+
+            raise
 
         api_key, plaintext = issue_api_key(
             organization=request.active_organization,

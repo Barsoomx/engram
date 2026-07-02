@@ -19,7 +19,7 @@ from engram.access.services import (
     ResolveApiKeyScope,
     hash_api_key,
 )
-from engram.core.models import AuditEvent, Organization
+from engram.core.models import AuditEvent, AuditResult, Organization
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -274,6 +274,41 @@ def test_issue_rejects_capability_outside_issuer_scope(
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_issue_rejects_capability_outside_issuer_scope_writes_denial_audit(
+    f_scoped_issuer_user_token: str,
+    f_scoped_issuer_org: Organization,
+) -> None:
+    _ensure_capability('secrets:admin')
+
+    client = _auth_client(f_scoped_issuer_user_token, org=f_scoped_issuer_org)
+
+    response = client.post(
+        '/v1/admin/api-keys/',
+        {
+            'name': 'Wide key',
+            'capabilities': ['secrets:admin'],
+        },
+    )
+
+    assert response.status_code == 400
+
+    audit = AuditEvent.objects.filter(
+        organization=f_scoped_issuer_org,
+        event_type='ApiKeyIssueDenied',
+    )
+
+    assert audit.count() == 1
+
+    event = audit.get()
+
+    assert event.result == AuditResult.DENIED
+
+    assert event.metadata['requested_capabilities'] == ['secrets:admin']
+
+    assert not ApiKey.objects.filter(name='Wide key').exists()
 
 
 @pytest.mark.django_db

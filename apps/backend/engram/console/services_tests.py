@@ -3,19 +3,33 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import structlog
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
-from engram.access.models import Identity, IdentityType
+from engram.access.models import Capability, Identity, IdentityType, Role
+from engram.console.exceptions import (
+    MemberAlreadyInvitedError,
+    ProjectSlugTakenError,
+    TeamSlugTakenError,
+)
 from engram.console.services import (
     MemoryReviewError,
     _lock_candidate_or_404,
     _lock_memory_or_404,
+    activate_member,
     approve_memory_candidate,
     archive_memory,
+    archive_project,
+    archive_team,
+    create_project,
+    create_team,
     edit_memory_body,
+    invite_member,
+    issue_api_key,
     narrow_memory,
     reject_review_item,
+    revoke_api_key,
     supersede_memory,
 )
 from engram.core.models import (
@@ -57,6 +71,13 @@ def f_actor_identity(f_organization: Organization) -> Identity:
         external_id='actor-1',
         display_name='Actor',
     )
+
+
+@pytest.fixture
+def f_role() -> Role:
+    role, _ = Role.objects.get_or_create(code='developer', defaults={'name': 'developer'})
+
+    return role
 
 
 def _make_candidate(
@@ -422,3 +443,175 @@ def test_archive_memory_locks_memory_row_for_update(
     sql = _select_sql(queries, 'core_memory"')
 
     assert 'FOR UPDATE' in sql.upper()
+
+
+@pytest.mark.django_db
+def test_create_team_raises_team_slug_taken_on_duplicate_slug(
+    f_organization: Organization,
+) -> None:
+    create_team(organization=f_organization, name='Eng', slug='eng')
+
+    with pytest.raises(TeamSlugTakenError) as error:
+        create_team(organization=f_organization, name='Eng Two', slug='eng')
+
+    assert error.value.error_code == 'team_slug_taken'
+
+
+@pytest.mark.django_db
+def test_create_project_raises_project_slug_taken_on_duplicate_slug(
+    f_organization: Organization,
+) -> None:
+    create_project(organization=f_organization, name='Eng', slug='eng')
+
+    with pytest.raises(ProjectSlugTakenError) as error:
+        create_project(organization=f_organization, name='Eng Two', slug='eng')
+
+    assert error.value.error_code == 'project_slug_taken'
+
+
+@pytest.mark.django_db
+def test_invite_member_raises_member_already_invited_on_duplicate_external_id(
+    f_organization: Organization,
+    f_role: Role,
+) -> None:
+    invite_member(
+        organization=f_organization,
+        external_id='dup-user',
+        display_name='Dup User',
+        email='dup@example.com',
+        role=f_role,
+    )
+
+    with pytest.raises(MemberAlreadyInvitedError) as error:
+        invite_member(
+            organization=f_organization,
+            external_id='dup-user',
+            display_name='Dup User Two',
+            email='dup2@example.com',
+            role=f_role,
+        )
+
+    assert error.value.error_code == 'member_already_invited'
+
+
+@pytest.mark.django_db
+def test_create_team_and_archive_team_log_events(
+    f_organization: Organization,
+) -> None:
+    with structlog.testing.capture_logs() as captured_logs:
+        team = create_team(organization=f_organization, name='Eng', slug='eng')
+        archive_team(team)
+
+    created = [entry for entry in captured_logs if entry['event'] == 'team_created']
+
+    assert len(created) == 1
+
+    assert created[0]['organization_id'] == str(f_organization.id)
+
+    assert created[0]['team_id'] == str(team.id)
+
+    assert created[0]['slug'] == 'eng'
+
+    archived = [entry for entry in captured_logs if entry['event'] == 'team_archived']
+
+    assert len(archived) == 1
+
+    assert archived[0]['team_id'] == str(team.id)
+
+
+@pytest.mark.django_db
+def test_create_project_and_archive_project_log_events(
+    f_organization: Organization,
+) -> None:
+    with structlog.testing.capture_logs() as captured_logs:
+        project = create_project(organization=f_organization, name='Eng', slug='eng')
+        archive_project(project)
+
+    created = [entry for entry in captured_logs if entry['event'] == 'project_created']
+
+    assert len(created) == 1
+
+    assert created[0]['organization_id'] == str(f_organization.id)
+
+    assert created[0]['project_id'] == str(project.id)
+
+    assert created[0]['slug'] == 'eng'
+
+    archived = [entry for entry in captured_logs if entry['event'] == 'project_archived']
+
+    assert len(archived) == 1
+
+    assert archived[0]['project_id'] == str(project.id)
+
+
+@pytest.mark.django_db
+def test_invite_member_and_activate_member_log_events(
+    f_organization: Organization,
+    f_actor_identity: Identity,
+    f_role: Role,
+) -> None:
+    with structlog.testing.capture_logs() as captured_logs:
+        membership = invite_member(
+            organization=f_organization,
+            external_id='invitee-1',
+            display_name='Invitee',
+            email='invitee@example.com',
+            role=f_role,
+        )
+        activate_member(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            membership_id=membership.id,
+        )
+
+    invited = [entry for entry in captured_logs if entry['event'] == 'member_invited']
+
+    assert len(invited) == 1
+
+    assert invited[0]['organization_id'] == str(f_organization.id)
+
+    assert invited[0]['identity_id'] == str(membership.identity_id)
+
+    assert invited[0]['role'] == f_role.code
+
+    activated = [entry for entry in captured_logs if entry['event'] == 'member_activated']
+
+    assert len(activated) == 1
+
+    assert activated[0]['identity_id'] == str(membership.identity_id)
+
+
+@pytest.mark.django_db
+def test_issue_api_key_and_revoke_api_key_log_events(
+    f_organization: Organization,
+    f_actor_identity: Identity,
+) -> None:
+    Capability.objects.get_or_create(
+        code='observations:write',
+        defaults={'description': 'observations:write'},
+    )
+
+    with structlog.testing.capture_logs() as captured_logs:
+        api_key, _plaintext = issue_api_key(
+            organization=f_organization,
+            owner_identity=f_actor_identity,
+            name='Agent key',
+            capabilities=['observations:write'],
+        )
+        revoke_api_key(api_key)
+
+    issued = [entry for entry in captured_logs if entry['event'] == 'api_key_issued']
+
+    assert len(issued) == 1
+
+    assert issued[0]['organization_id'] == str(f_organization.id)
+
+    assert issued[0]['key_id'] == str(api_key.id)
+
+    assert issued[0]['capabilities'] == ['observations:write']
+
+    revoked = [entry for entry in captured_logs if entry['event'] == 'api_key_revoked']
+
+    assert len(revoked) == 1
+
+    assert revoked[0]['key_id'] == str(api_key.id)
