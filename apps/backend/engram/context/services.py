@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.core.domain.usecases.errors import DomainError
+from engram.core.repository import resolve_or_create_project
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -68,7 +69,7 @@ class IndexMemoryVersionResult:
 @dataclass(frozen=True)
 class ContextBundleInput:
     raw_key: str
-    project_id: uuid.UUID
+    project_id: uuid.UUID | None
     team_id: uuid.UUID | None
     agent_runtime: str
     agent_version: str
@@ -818,7 +819,14 @@ class BuildContextBundle:
             target_id=data.request_id,
         )
         organization = Organization.objects.get(id=scope.organization_id)
-        project = Project.objects.get(organization=organization, id=data.project_id)
+        if data.project_id:
+            project = Project.objects.get(organization=organization, id=data.project_id)
+        else:
+            project = resolve_or_create_project(
+                organization=organization,
+                repository_url=data.repository_url,
+                repository_root=data.repository_root,
+            )
         existing_bundle = self._existing_bundle(organization, project, data.request_id)
         if existing_bundle is not None:
             if not self._bundle_authorized_for_scope(existing_bundle, scope):

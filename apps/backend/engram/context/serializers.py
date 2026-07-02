@@ -41,7 +41,7 @@ def _validate_text_list(
 
 
 class ContextRequestSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
+    project_id = serializers.UUIDField(required=False, allow_null=True)
     agent_runtime = serializers.CharField(max_length=40)
     session_id = serializers.CharField(max_length=255)
     request_id = serializers.CharField(max_length=255)

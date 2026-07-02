@@ -5,13 +5,14 @@ from urllib.parse import urlparse
 
 from django.db import transaction
 
+from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import Organization, Project
 
 _SCP_LIKE = re.compile(r'^[A-Za-z0-9._-]+@([^:/]+):(.+)$')
 
 
-class RepositoryUrlRequiredError(Exception):
-    pass
+class RepositoryUrlRequiredError(DomainError):
+    default_error_code = 'project_or_repository_required'
 
 
 def canonicalize_repository_url(url: str) -> str:

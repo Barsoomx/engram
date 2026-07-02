@@ -45,7 +45,7 @@ def _text_list_error(
 
 
 class HookDryRunSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
+    project_id = serializers.UUIDField(required=False, allow_null=True)
     team_id = serializers.UUIDField(required=False, allow_null=True)
     agent_runtime = serializers.ChoiceField(choices=Runtime.values)
     agent_version = serializers.CharField(required=False, allow_blank=True, max_length=80)
@@ -96,7 +96,7 @@ class HookObservationSerializer(serializers.Serializer):
 
 
 class HookEventSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
+    project_id = serializers.UUIDField(required=False, allow_null=True)
     team_id = serializers.UUIDField(required=False, allow_null=True)
     agent_runtime = serializers.ChoiceField(choices=Runtime.values)
     agent_version = serializers.CharField(required=False, allow_blank=True, max_length=80)

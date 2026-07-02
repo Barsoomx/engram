@@ -55,7 +55,7 @@ class HookDryRunView(APIView):
             scope = resolve_request_scope(
                 request,
                 required_capability='observations:write',
-                project_id=data['project_id'],
+                project_id=data.get('project_id'),
                 team_id=data.get('team_id'),
                 request_id=request_id,
             )
@@ -112,7 +112,7 @@ class HookIngestView(APIView):
     def _input(self, request: Request, data: dict[str, Any]) -> HookEventInput:
         return HookEventInput(
             raw_key=bearer_key(request),
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             agent_runtime=data['agent_runtime'],
             agent_version=data.get('agent_version', ''),
