@@ -655,7 +655,7 @@ class RetrievalDocument(TimestampedModel):
     full_text = models.TextField()
     embedding_reference = models.CharField(max_length=255, blank=True)
     embedding_vector = models.JSONField(default=list, blank=True)
-    embedding_pgvector = VectorField(dimensions=64, null=True, blank=True) if VectorField is not None else None
+    embedding_pgvector = VectorField(dimensions=1536, null=True, blank=True) if VectorField is not None else None
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)

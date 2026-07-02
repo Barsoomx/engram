@@ -6,6 +6,7 @@ from typing import Any
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 
 from engram.core.models import RetrievalDocument, VectorField
+from engram.model_policy.services import EMBEDDING_DIMENSION
 
 
 class Command(BaseCommand):
@@ -21,23 +22,36 @@ class Command(BaseCommand):
 
         batch_size = max(1, int(options['batch_size']))
         updated = 0
+        skipped = 0
+        last_id = None
         while True:
-            batch = list(
+            queryset = (
                 RetrievalDocument.objects.filter(embedding_pgvector__isnull=True)
                 .exclude(embedding_vector=[])
-                .order_by('id')[:batch_size],
+                .order_by('id')
             )
+            if last_id is not None:
+                queryset = queryset.filter(id__gt=last_id)
+            batch = list(queryset[:batch_size])
             if not batch:
                 break
 
+            last_id = batch[-1].id
+            fitting = []
             for document in batch:
+                if len(document.embedding_vector) != EMBEDDING_DIMENSION:
+                    skipped += 1
+                    continue
+
                 document.embedding_pgvector = list(document.embedding_vector)
-            RetrievalDocument.objects.bulk_update(batch, ['embedding_pgvector'])
-            updated += len(batch)
+                fitting.append(document)
+            if fitting:
+                RetrievalDocument.objects.bulk_update(fitting, ['embedding_pgvector'])
+                updated += len(fitting)
 
         if options.get('as_json'):
-            self.stdout.write(json.dumps({'updated': updated}))
+            self.stdout.write(json.dumps({'updated': updated, 'skipped': skipped}))
 
             return
 
-        self.stdout.write(f'backfilled embedding_pgvector for {updated} documents')
+        self.stdout.write(f'backfilled embedding_pgvector for {updated} documents, skipped {skipped}')
