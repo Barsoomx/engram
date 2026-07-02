@@ -889,10 +889,20 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
 
 
 _STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment'})
+_JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
 
-def openai_json_mode_override(response_kind: str) -> dict[str, object]:
-    if response_kind in _STRUCTURED_RESPONSE_KINDS:
+def policy_supports_json_object(policy: ModelPolicy) -> bool:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    override = metadata.get('json_mode')
+    if isinstance(override, bool):
+        return override
+
+    return _JSON_OBJECT_DEFAULT_BY_PROVIDER.get(policy.provider, False)
+
+
+def openai_json_mode_override(response_kind: str, policy: ModelPolicy) -> dict[str, object]:
+    if response_kind in _STRUCTURED_RESPONSE_KINDS and policy_supports_json_object(policy):
         return {'response_format': {'type': 'json_object'}}
 
     return {}
@@ -1015,7 +1025,7 @@ class OpenAICompatibleGateway:
 
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
-        extra.update(openai_json_mode_override(data.response_kind))
+        extra.update(openai_json_mode_override(data.response_kind, policy))
         content = self._chat_completion(
             policy.model,
             prompt_text,
