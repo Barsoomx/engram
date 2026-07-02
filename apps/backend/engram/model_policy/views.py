@@ -294,6 +294,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
                 actor_id=scope.actor_id,
                 scope_team_id=data.get('scope_team_id'),
                 base_url=data.get('base_url', ''),
+                context_window_tokens=data.get('context_window_tokens'),
             ),
         )
 
@@ -373,6 +374,7 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
                 fallback_enabled=data.get('fallback_enabled'),
                 task_type=data.get('task_type'),
                 base_url=data.get('base_url'),
+                context_window_tokens=data.get('context_window_tokens'),
             ),
         )
 
@@ -483,4 +485,5 @@ def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
         'version': policy.version,
         'active': policy.active,
         'fallback_enabled': policy.fallback_enabled,
+        'context_window_tokens': policy.metadata.get('context_window_tokens') if policy.metadata else None,
     }

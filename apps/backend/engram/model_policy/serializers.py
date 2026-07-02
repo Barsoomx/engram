@@ -46,6 +46,7 @@ class ModelPolicyCreateSerializer(serializers.Serializer):
     model = serializers.CharField(max_length=120)
     secret_id = serializers.UUIDField()
     base_url = serializers.URLField(required=False, allow_blank=True, max_length=500)
+    context_window_tokens = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     request_id = serializers.CharField(max_length=255)
 
 
@@ -82,6 +83,7 @@ class ModelPolicyUpdateSerializer(serializers.Serializer):
         required=False,
     )
     base_url = serializers.URLField(required=False, allow_blank=True, max_length=500)
+    context_window_tokens = serializers.IntegerField(required=False, allow_null=True, min_value=1)
     request_id = serializers.CharField(max_length=255)
 
 

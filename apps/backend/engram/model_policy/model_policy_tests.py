@@ -1603,6 +1603,174 @@ def test_model_policy_update_base_url_empty_clears_metadata_key() -> None:
 
 
 @pytest.mark.django_db
+def test_model_policy_create_with_context_window_tokens_stores_in_metadata() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Context Window', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Context window policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'context_window_tokens': 64000,
+            'request_id': 'request-policy-context-window-create-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['context_window_tokens'] == 64000
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.metadata.get('context_window_tokens') == 64000
+
+
+@pytest.mark.django_db
+def test_model_policy_create_without_context_window_tokens_returns_null() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI No Context Window', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'No context window policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-no-context-window-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['context_window_tokens'] is None
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert 'context_window_tokens' not in policy.metadata
+
+
+@pytest.mark.django_db
+def test_model_policy_update_context_window_tokens_sets_metadata_key() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Update Context Window', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy to update context window', secret_id)
+
+    response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'context_window_tokens': 32000,
+            'request_id': 'request-policy-update-context-window-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['context_window_tokens'] == 32000
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.metadata.get('context_window_tokens') == 32000
+
+
+@pytest.mark.django_db
+def test_model_policy_update_omitting_context_window_tokens_leaves_existing_override_untouched() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Keep Context Window', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy to keep context window', secret_id)
+
+    client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'context_window_tokens': 32000,
+            'request_id': 'request-policy-set-context-window-2',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    unrelated_response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Renamed without touching context window',
+            'request_id': 'request-policy-omit-context-window-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert unrelated_response.status_code == 200
+    assert unrelated_response.json()['context_window_tokens'] == 32000
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.metadata.get('context_window_tokens') == 32000
+
+
+@pytest.mark.django_db
+def test_model_policy_update_explicit_null_context_window_tokens_leaves_existing_override_untouched() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Null Context Window', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy to null context window', secret_id)
+
+    client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'context_window_tokens': 32000,
+            'request_id': 'request-policy-set-context-window-3',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    null_response = client.patch(
+        f'/v1/model-policy/policies/{policy_id}',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'context_window_tokens': None,
+            'request_id': 'request-policy-null-context-window-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert null_response.status_code == 200
+    assert null_response.json()['context_window_tokens'] == 32000
+    policy = ModelPolicy.objects.get(id=policy_id)
+    assert policy.metadata.get('context_window_tokens') == 32000
+
+
+@pytest.mark.django_db
 def test_reader_role_can_read_secrets_and_policies_but_denied_mutations() -> None:
     scope = create_project_scope()
     _organization, team, project, _owner, _api_key = scope
