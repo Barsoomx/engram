@@ -257,9 +257,7 @@ class DistillSession:
         run_id: str,
     ) -> tuple[ProviderCallResult, ResolvedModelPolicy]:
         request_id = (
-            f'distill-session:{session.id}:{run_id}:curation'
-            if run_id
-            else f'distill-session:{session.id}:curation'
+            f'distill-session:{session.id}:{run_id}:curation' if run_id else f'distill-session:{session.id}:curation'
         )
         try:
             resolved = self._resolve_policy(session)
