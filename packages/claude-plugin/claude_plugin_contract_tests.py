@@ -33,7 +33,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         hooks = hook_manifest["hooks"]
         commands: list[str] = []
 
-        self.assertEqual("./hooks/hooks.json", plugin_manifest["hooks"])
+        self.assertNotIn("hooks", plugin_manifest)
         self.assertNotIn("claude-mem", plugin_manifest_text)
         self.assertNotIn("claude-mem", hook_manifest_text)
 
