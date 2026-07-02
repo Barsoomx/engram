@@ -1,12 +1,14 @@
 import pytest
 
-from engram.console.exceptions import DigestNotFoundError
-from engram.console.exceptions import EmbeddingFieldsRequiredError
-from engram.console.exceptions import EmbeddingSecretNotFoundError
-from engram.console.exceptions import InvalidRerunSnapshotError
-from engram.console.exceptions import MemberAlreadyInvitedError
-from engram.console.exceptions import ProjectSlugTakenError
-from engram.console.exceptions import TeamSlugTakenError
+from engram.console.exceptions import (
+    DigestNotFoundError,
+    EmbeddingFieldsRequiredError,
+    EmbeddingSecretNotFoundError,
+    InvalidRerunSnapshotError,
+    MemberAlreadyInvitedError,
+    ProjectSlugTakenError,
+    TeamSlugTakenError,
+)
 from engram.core.domain.usecases.errors import DomainError
 
 
