@@ -12,6 +12,7 @@ from engram.core.models import (
     RetrievalDocument,
     VectorField,
 )
+from engram.model_policy.services import EMBEDDING_DIMENSION
 
 pytestmark = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
 
@@ -64,7 +65,7 @@ def test_backfill_copies_embedding_vector_into_pgvector(
     f_scope: tuple[Organization, Project],
 ) -> None:
     organization, project = f_scope
-    embedding = [round(0.01 * index, 6) for index in range(64)]
+    embedding = [round(0.0001 * index, 6) for index in range(EMBEDDING_DIMENSION)]
     document = _make_document(organization, project, sequence=1, embedding_vector=embedding)
     assert document.embedding_pgvector is None
 
@@ -73,6 +74,27 @@ def test_backfill_copies_embedding_vector_into_pgvector(
     document.refresh_from_db()
     assert document.embedding_pgvector is not None
     assert list(document.embedding_pgvector) == pytest.approx(embedding, abs=1e-5)
+
+
+@pytest.mark.django_db
+def test_backfill_skips_wrong_dimension_vectors(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    stale = _make_document(organization, project, sequence=3, embedding_vector=[0.1] * 64)
+    valid = _make_document(
+        organization,
+        project,
+        sequence=4,
+        embedding_vector=[0.2] * EMBEDDING_DIMENSION,
+    )
+
+    call_command('engram_backfill_pgvector_embeddings')
+
+    stale.refresh_from_db()
+    valid.refresh_from_db()
+    assert stale.embedding_pgvector is None
+    assert valid.embedding_pgvector is not None
 
 
 @pytest.mark.django_db
@@ -93,7 +115,7 @@ def test_backfill_is_idempotent(
     f_scope: tuple[Organization, Project],
 ) -> None:
     organization, project = f_scope
-    embedding = [round(0.02 * index, 6) for index in range(64)]
+    embedding = [round(0.0002 * index, 6) for index in range(EMBEDDING_DIMENSION)]
     document = _make_document(organization, project, sequence=1, embedding_vector=embedding)
 
     call_command('engram_backfill_pgvector_embeddings')
@@ -112,8 +134,8 @@ def test_backfill_does_not_overwrite_existing_pgvector(
     f_scope: tuple[Organization, Project],
 ) -> None:
     organization, project = f_scope
-    embedding = [round(0.03 * index, 6) for index in range(64)]
-    preset = [round(0.04 * index, 6) for index in range(64)]
+    embedding = [round(0.0003 * index, 6) for index in range(EMBEDDING_DIMENSION)]
+    preset = [round(0.0004 * index, 6) for index in range(EMBEDDING_DIMENSION)]
     document = _make_document(organization, project, sequence=1, embedding_vector=embedding)
     document.embedding_pgvector = preset
     document.save(update_fields=['embedding_pgvector'])

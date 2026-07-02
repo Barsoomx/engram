@@ -52,7 +52,7 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
 )
-from engram.model_policy.services import generated_embedding
+from engram.model_policy.services import EMBEDDING_DIMENSION, generated_embedding
 
 PROVENANCE_RAW_KEY = 'egk_test_services_provenance_0123456789abcdefghijklmnopqrstuvwxyz'
 
@@ -210,14 +210,14 @@ pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector n
 
 
 def _basis_vector(index: int) -> list[float]:
-    vector = [0.0] * 64
+    vector = [0.0] * EMBEDDING_DIMENSION
     vector[index] = 1.0
 
     return vector
 
 
 def _blend_vector(primary: int, secondary: int, weight: float) -> list[float]:
-    vector = [0.0] * 64
+    vector = [0.0] * EMBEDDING_DIMENSION
     vector[primary] = 1.0
     vector[secondary] = weight
     norm = math.sqrt(1.0 + weight * weight)

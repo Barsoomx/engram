@@ -37,7 +37,12 @@ from engram.memory.curation import (
 )
 from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
-from engram.model_policy.services import FakeProviderGateway, ProviderCallInput, ProviderCallResult
+from engram.model_policy.services import (
+    EMBEDDING_DIMENSION,
+    FakeProviderGateway,
+    ProviderCallInput,
+    ProviderCallResult,
+)
 
 _LONG_BODY = 'The retrieval pipeline ranks documents by cosine similarity over embeddings.'
 
@@ -304,7 +309,7 @@ def test_embed_candidate_returns_vector_with_embedding_policy() -> None:
     vector = embed_candidate(candidate)
 
     assert vector is not None
-    assert len(vector) == 64
+    assert len(vector) == EMBEDDING_DIMENSION
 
 
 @pytest.mark.django_db
@@ -593,7 +598,7 @@ def test_curate_reindexes_existing_memory_embedding_for_dedup() -> None:
     document = RetrievalDocument.objects.get(memory=existing)
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=document.memory_version_id))
 
-    assert len(RetrievalDocument.objects.get(memory=existing).embedding_vector) == 64
+    assert len(RetrievalDocument.objects.get(memory=existing).embedding_vector) == EMBEDDING_DIMENSION
 
 
 @pytest.mark.django_db
