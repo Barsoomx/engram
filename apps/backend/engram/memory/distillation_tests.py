@@ -40,7 +40,7 @@ from engram.memory.distillation import (
 )
 from engram.memory.services import PromoteMemoryCandidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
-from engram.model_policy.services import FakeProviderGateway, _completion_body
+from engram.model_policy.services import EMBEDDING_DIMENSION, FakeProviderGateway, _completion_body
 
 
 @pytest.fixture
@@ -340,7 +340,7 @@ def test_distill_session_promotes_clean_candidate_through_curator_with_embedding
     memory = result.auto_promoted[0]
     assert memory.stale is False
     document = RetrievalDocument.objects.get(memory=memory)
-    assert len(document.embedding_vector) == 64
+    assert len(document.embedding_vector) == EMBEDDING_DIMENSION
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
     assert AuditEvent.objects.filter(event_type='MemoryAutoRejected').count() == 0
 

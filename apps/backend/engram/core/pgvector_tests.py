@@ -11,6 +11,7 @@ from engram.core.models import (
     RetrievalDocument,
     VectorField,
 )
+from engram.model_policy.services import EMBEDDING_DIMENSION
 
 
 def _has_pgvector() -> bool:
@@ -56,7 +57,7 @@ def test_retrieval_document_resave_with_populated_pgvector_does_not_raise() -> N
     version = MemoryVersion.objects.create(
         organization=organization, project=project, memory=memory, version=1, body='body', content_hash='hash'
     )
-    embedding = [round(0.01 * index, 6) for index in range(64)]
+    embedding = [round(0.0001 * index, 6) for index in range(EMBEDDING_DIMENSION)]
     document = RetrievalDocument(
         organization=organization,
         project=project,

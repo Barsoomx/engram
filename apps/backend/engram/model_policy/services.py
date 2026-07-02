@@ -1223,7 +1223,7 @@ def get_provider_gateway(
     return gateway
 
 
-EMBEDDING_DIMENSION = 64
+EMBEDDING_DIMENSION = 1536
 
 
 def fit_embedding_dimension(embedding: tuple[float, ...]) -> tuple[float, ...]:

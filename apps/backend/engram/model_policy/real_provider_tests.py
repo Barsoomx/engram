@@ -312,7 +312,7 @@ def test_openai_compatible_gateway_embed_parses_vector() -> None:
 def test_openai_gateway_embed_truncates_oversized_vector_and_renormalizes() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='embedding')
-    opener = _opener_returning(json.dumps({'data': [{'embedding': [1.0] * 1536}]}).encode())
+    opener = _opener_returning(json.dumps({'data': [{'embedding': [1.0] * (EMBEDDING_DIMENSION * 2)}]}).encode())
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
     result = gateway.embed(

@@ -52,6 +52,7 @@ from engram.memory.services import (
 )
 from engram.memory.tasks import process_observation_recorded
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import EMBEDDING_DIMENSION
 
 RAW_KEY = 'egk_test_memory_worker_0123456789abcdefghijklmnopqrstuvwxyz'
 RAW_PROVIDER_SECRET = 'sk-test_memory_worker_secret_1234567890abcdef'
@@ -793,7 +794,7 @@ def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
     execute_worker(observation)
 
     document = RetrievalDocument.objects.get()
-    assert len(document.embedding_vector) == 64
+    assert len(document.embedding_vector) == EMBEDDING_DIMENSION
     assert document.embedding_reference.startswith('provider:')
     assert document.embedding_vector == document.embedding_vector
 
