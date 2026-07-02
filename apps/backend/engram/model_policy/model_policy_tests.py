@@ -1790,7 +1790,7 @@ def test_model_policy_update_omitting_context_window_tokens_leaves_existing_over
 
 
 @pytest.mark.django_db
-def test_model_policy_update_explicit_null_context_window_tokens_leaves_existing_override_untouched() -> None:
+def test_model_policy_update_explicit_null_context_window_tokens_clears_override() -> None:
     scope = create_project_scope()
     _organization, team, project, _owner, _api_key = scope
     create_policy_admin_key(scope)
@@ -1803,6 +1803,7 @@ def test_model_policy_update_explicit_null_context_window_tokens_leaves_existing
         {
             'project_id': str(project.id),
             'team_id': str(team.id),
+            'base_url': 'https://proxy.example.com/openai/v1',
             'context_window_tokens': 32000,
             'request_id': 'request-policy-set-context-window-3',
         },
@@ -1823,9 +1824,10 @@ def test_model_policy_update_explicit_null_context_window_tokens_leaves_existing
     )
 
     assert null_response.status_code == 200
-    assert null_response.json()['context_window_tokens'] == 32000
+    assert null_response.json()['context_window_tokens'] is None
     policy = ModelPolicy.objects.get(id=policy_id)
-    assert policy.metadata.get('context_window_tokens') == 32000
+    assert 'context_window_tokens' not in policy.metadata
+    assert policy.metadata.get('base_url') == 'https://proxy.example.com/openai/v1'
 
 
 @pytest.mark.django_db

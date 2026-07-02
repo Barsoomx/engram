@@ -372,6 +372,7 @@ class UpdateModelPolicyInput:
     task_type: str | None = None
     base_url: str | None = None
     context_window_tokens: int | None = None
+    clear_context_window_tokens: bool = False
 
 
 @dataclass(frozen=True)
@@ -524,8 +525,18 @@ class UpdateModelPolicy:
         data: UpdateModelPolicyInput,
         update_fields: list[str],
     ) -> None:
-        # The serializer cannot distinguish an omitted field from an explicit null, so a bare
-        # None is treated as "not provided" and leaves any existing override untouched.
+        if data.clear_context_window_tokens:
+            current = dict(policy.metadata or {})
+            if 'context_window_tokens' in current:
+                current.pop('context_window_tokens')
+                policy.metadata = current
+                if 'metadata' not in update_fields:
+                    update_fields.append('metadata')
+
+            return
+
+        # clear_context_window_tokens is False here, so the view already determined this
+        # None came from an omitted field, not an explicit null; leave any override untouched.
         if data.context_window_tokens is None:
             return
 

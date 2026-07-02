@@ -12,6 +12,8 @@ from engram.model_policy.services import (
     EmbeddingCallInput,
     OpenAICompatibleGateway,
     ProviderCallInput,
+    UpdateModelPolicy,
+    UpdateModelPolicyInput,
     _split_completion,
 )
 
@@ -128,6 +130,93 @@ def test_anthropic_gateway_call_raises_provider_timeout_on_timeout_error() -> No
 
     assert exc_info.value.code == 'provider_timeout'
     assert exc_info.value.retryable is True
+
+
+@pytest.mark.django_db
+def test_update_model_policy_clear_context_window_tokens_removes_override_keeps_other_keys() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata={'context_window_tokens': 8000})
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            request_id='clear-context-window-1',
+            actor_id='actor-1',
+            clear_context_window_tokens=True,
+        ),
+    )
+
+    assert 'context_window_tokens' not in updated.metadata
+    assert updated.metadata.get('base_url') == 'https://provider.example/v1'
+    assert updated.version == 2
+
+
+@pytest.mark.django_db
+def test_update_model_policy_clear_context_window_tokens_is_noop_when_absent() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+
+    assert 'context_window_tokens' not in policy.metadata
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            request_id='clear-context-window-2',
+            actor_id='actor-1',
+            clear_context_window_tokens=True,
+        ),
+    )
+
+    assert 'context_window_tokens' not in updated.metadata
+    assert updated.metadata == {'base_url': 'https://provider.example/v1'}
+    assert updated.version == 2
+
+
+@pytest.mark.django_db
+def test_update_model_policy_omitted_context_window_tokens_preserves_override() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata={'context_window_tokens': 8000})
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            request_id='omit-context-window-1',
+            actor_id='actor-1',
+        ),
+    )
+
+    assert updated.metadata.get('context_window_tokens') == 8000
+    assert updated.version == 2
+
+
+@pytest.mark.django_db
+def test_update_model_policy_sets_context_window_tokens_when_not_clearing() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata={'context_window_tokens': 8000})
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            request_id='set-context-window-1',
+            actor_id='actor-1',
+            context_window_tokens=32000,
+        ),
+    )
+
+    assert updated.metadata.get('context_window_tokens') == 32000
+    assert updated.version == 2
 
 
 @pytest.mark.django_db
