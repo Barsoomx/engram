@@ -877,6 +877,32 @@ def test_openai_gateway_sends_json_mode_for_curation_judgment() -> None:
 
 
 @pytest.mark.django_db
+def test_openai_gateway_merges_thinking_and_json_mode_for_deepseek_candidates() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek', task_type='curation')
+    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-merge-1',
+            trace_id='json-mode-merge-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['thinking'] == {'type': 'disabled'}
+    assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
 def test_openai_gateway_omits_json_mode_for_single() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)

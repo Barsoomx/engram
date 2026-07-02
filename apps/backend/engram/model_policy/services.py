@@ -855,7 +855,7 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
 _STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment'})
 
 
-def structured_response_format(response_kind: str) -> dict[str, object]:
+def openai_json_mode_override(response_kind: str) -> dict[str, object]:
     if response_kind in _STRUCTURED_RESPONSE_KINDS:
         return {'response_format': {'type': 'json_object'}}
 
@@ -895,7 +895,7 @@ class OpenAICompatibleGateway:
 
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
-        extra.update(structured_response_format(data.response_kind))
+        extra.update(openai_json_mode_override(data.response_kind))
         content = self._chat_completion(
             policy.model,
             prompt_text,
@@ -1085,14 +1085,14 @@ def _split_completion(content: str) -> tuple[str, str]:
 
 
 def _completion_body(content: str, response_kind: str) -> str:
-    if response_kind in ('candidates', 'curation_judgment'):
+    if response_kind in _STRUCTURED_RESPONSE_KINDS:
         return content
 
     return _split_completion(content)[1]
 
 
 def _completion_title(content: str, response_kind: str) -> str:
-    if response_kind in ('candidates', 'curation_judgment'):
+    if response_kind in _STRUCTURED_RESPONSE_KINDS:
         return ''
 
     return _split_completion(content)[0]
