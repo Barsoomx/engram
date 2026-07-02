@@ -13,16 +13,16 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+import structlog
 from cryptography.fernet import Fernet
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.db.models import Q
-from rest_framework import status
 
-from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import AuditEvent, AuditResult, Project, Team
 from engram.core.redaction import redact_value
+from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import (
     ModelPolicy,
     PolicyScope,
@@ -33,30 +33,10 @@ from engram.model_policy.models import (
     SecretScope,
 )
 
+logger = structlog.get_logger(__name__)
+
 SECRET_KEY_VERSION = 'v1'
 NON_PRODUCTION_ENVIRONMENTS = {'dev', 'development', 'local', 'test'}
-
-ERROR_STATUS = {
-    'policy_scope_mismatch': status.HTTP_400_BAD_REQUEST,
-    'team_required': status.HTTP_400_BAD_REQUEST,
-    'model_policy_not_found': status.HTTP_404_NOT_FOUND,
-    'secret_scope_denied': status.HTTP_403_FORBIDDEN,
-}
-
-
-class ModelPolicyError(DomainError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
-        super().__init__(
-            message,
-            error_code=code,
-            status_code=ERROR_STATUS.get(code, status.HTTP_400_BAD_REQUEST),
-        )
-        self.code = code
-        self.retryable = retryable
-
-
-class ProviderSecretError(DomainError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -267,6 +247,12 @@ class CreateProviderSecret:
                 request_id=data.request_id,
                 metadata={'provider': data.provider, 'scope': data.scope, 'raw_secret': data.raw_secret},
             )
+            logger.info(
+                'provider_secret_created',
+                secret_id=str(secret.id),
+                provider=data.provider,
+                scope=data.scope,
+            )
 
             return secret
 
@@ -310,6 +296,11 @@ class RotateProviderSecret:
                 capability='secrets:*',
                 request_id=data.request_id,
                 metadata={'provider': secret.provider, 'raw_secret': data.raw_secret},
+            )
+            logger.info(
+                'provider_secret_rotated',
+                secret_id=str(secret.id),
+                version=next_version,
             )
 
             return secret
@@ -447,6 +438,12 @@ class CreateModelPolicy:
                 request_id=data.request_id,
                 metadata={'provider': data.provider, 'model': data.model, 'task_type': data.task_type},
             )
+            logger.info(
+                'model_policy_created',
+                policy_id=str(policy.id),
+                task_type=data.task_type,
+                provider=data.provider,
+            )
 
         return policy
 
@@ -535,6 +532,11 @@ class UpdateModelPolicy:
                 capability='model_policy:*',
                 request_id=data.request_id,
                 metadata={'provider': policy.provider, 'model': policy.model, 'task_type': policy.task_type},
+            )
+            logger.info(
+                'model_policy_updated',
+                policy_id=str(policy.id),
+                version=policy.version,
             )
 
             return policy

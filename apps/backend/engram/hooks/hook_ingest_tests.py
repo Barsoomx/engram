@@ -17,6 +17,7 @@ from engram.access.models import (
     OrganizationMembership,
     ProjectGrant,
     Role,
+    RoleCapability,
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import (
@@ -69,7 +70,26 @@ def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKe
         external_id='svc-hooks',
         display_name='Hook service account',
     )
-    role = Role.objects.get(code='developer')
+    role, _created = Role.objects.get_or_create(
+        code='developer',
+        defaults={'name': 'Developer', 'built_in': True},
+    )
+    developer_capability_descriptions = {
+        'observations:write': 'Submit observations.',
+        'observations:read': 'Read observations.',
+        'memories:read': 'Read approved memory.',
+        'memories:propose': 'Propose memory updates.',
+        'search:query': 'Query memory search.',
+    }
+    developer_capabilities: dict[str, Capability] = {}
+    for capability_code, description in developer_capability_descriptions.items():
+        capability, _created = Capability.objects.get_or_create(
+            code=capability_code,
+            defaults={'description': description},
+        )
+        developer_capabilities[capability_code] = capability
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+
     OrganizationMembership.objects.create(organization=organization, identity=owner, role=role)
     ProjectGrant.objects.create(organization=organization, project=project, identity=owner, role=role)
     api_key = ApiKey.objects.create(
@@ -85,7 +105,7 @@ def create_project_scope() -> tuple[Organization, Team, Project, Identity, ApiKe
     for capability_code in ('observations:write', 'memories:read'):
         ApiKeyCapability.objects.create(
             api_key=api_key,
-            capability=Capability.objects.get(code=capability_code),
+            capability=developer_capabilities[capability_code],
         )
 
     return organization, team, project, owner, api_key
@@ -249,6 +269,32 @@ def test_hook_dry_run_denies_wrong_project() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_hook_dry_run_denied_response_matches_global_domain_error_shape() -> None:
+    organization, team, _project, _owner, _api_key = create_project_scope()
+    other_project = Project.objects.create(organization=organization, name='CLI', slug='cli')
+    client = APIClient()
+
+    response = client.post(
+        '/v1/hooks/dry-run',
+        {
+            'project_id': str(other_project.id),
+            'team_id': str(team.id),
+            'agent_runtime': 'codex',
+            'agent_version': '0.1.0',
+            'request_id': 'dry-run-shape-check',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body['code'] == 'project_scope_denied'
+    assert body['error_code'] == 'project_scope_denied'
+    assert body['detail']
 
 
 @pytest.mark.django_db

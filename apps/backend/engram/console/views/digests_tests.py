@@ -4,6 +4,7 @@ import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
+import structlog
 from django.contrib.auth.models import User
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
@@ -73,7 +74,12 @@ def _make_client(token: str, organization: Organization) -> APIClient:
     return client
 
 
-def _make_digest_memory(org: Organization, project: Project, ready: bool = False) -> Memory:
+def _make_digest_memory(
+    org: Organization,
+    project: Project,
+    ready: bool = False,
+    digest_kind: str = 'weekly_structured',
+) -> Memory:
     return Memory.objects.create(
         organization=org,
         project=project,
@@ -83,7 +89,7 @@ def _make_digest_memory(org: Organization, project: Project, ready: bool = False
         visibility_scope=VisibilityScope.PROJECT,
         metadata={
             'kind': 'digest',
-            'digest_kind': 'weekly_structured',
+            'digest_kind': digest_kind,
             'window_start': '2026-06-23T00:00:00+00:00',
             'window_end': '2026-06-30T00:00:00+00:00',
             'window_days': 7,
@@ -499,3 +505,104 @@ def test_post_digest_review_returns_404_for_non_digest_memory(
     response = f_review_client.post(f'/v1/admin/digests/{plain_memory.id}/review')
 
     assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_post_digest_review_404_uses_domain_error_shape(
+    f_review_client: APIClient,
+    f_org: Organization,
+) -> None:
+    response = f_review_client.post(f'/v1/admin/digests/{uuid.uuid4()}/review')
+
+    assert response.status_code == 404
+
+    assert response.data['code'] == 'digest_not_found'
+
+    assert response.data['error_code'] == 'digest_not_found'
+
+
+@pytest.mark.django_db
+def test_post_digest_review_accepts_daily_digest_kind(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    digest = _make_digest_memory(f_org, f_project, digest_kind='daily_structured')
+
+    response = f_review_client.post(
+        f'/v1/admin/digests/{digest.id}/review',
+        {'digest_kind': 'daily_structured'},
+        format='json',
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['ready'] is True
+
+    digest.refresh_from_db()
+
+    assert digest.metadata['digest_kind'] == 'daily_structured'
+
+    event = AuditEvent.objects.get(
+        organization=f_org,
+        event_type='DigestReviewed',
+        target_id=str(digest.id),
+    )
+
+    assert event.metadata['digest_kind'] == 'daily_structured'
+
+
+@pytest.mark.django_db
+def test_post_digest_review_digest_kind_mismatch_returns_404(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    digest = _make_digest_memory(f_org, f_project, digest_kind='weekly_structured')
+
+    response = f_review_client.post(
+        f'/v1/admin/digests/{digest.id}/review',
+        {'digest_kind': 'daily_structured'},
+        format='json',
+    )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_post_digest_review_rejects_invalid_digest_kind(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    digest = _make_digest_memory(f_org, f_project)
+
+    response = f_review_client.post(
+        f'/v1/admin/digests/{digest.id}/review',
+        {'digest_kind': 'monthly_structured'},
+        format='json',
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_post_digest_review_logs_digest_reviewed_event(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    digest = _make_digest_memory(f_org, f_project)
+
+    with structlog.testing.capture_logs() as captured_logs:
+        f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
+
+    events = [entry for entry in captured_logs if entry['event'] == 'digest_reviewed']
+
+    assert len(events) == 1
+
+    assert events[0]['organization_id'] == str(f_org.id)
+
+    assert events[0]['memory_id'] == str(digest.id)
+
+    assert events[0]['digest_kind'] == 'weekly_structured'

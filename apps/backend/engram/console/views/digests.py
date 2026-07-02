@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import structlog
 from django.utils import timezone
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -10,6 +11,7 @@ from rest_framework.response import Response
 from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_404_NOT_FOUND
 from rest_framework.views import APIView
 
+from engram.console.exceptions import DigestNotFoundError
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.services import audit_admin_action
@@ -19,6 +21,10 @@ from engram.memory.services import (
     BuildWeeklyStructuredDigest,
     WeeklyDigestInput,
 )
+
+logger = structlog.get_logger(__name__)
+
+_DIGEST_KINDS = ('weekly_structured', 'daily_structured')
 
 
 class WeeklyDigestView(APIView):
@@ -111,15 +117,23 @@ class DigestReviewView(APIView):
 
         memory_id: uuid.UUID = kwargs['memory_id']
 
+        digest_kind = request.data.get('digest_kind', 'weekly_structured')
+
+        if digest_kind not in _DIGEST_KINDS:
+            return Response(
+                {'detail': f'digest_kind must be one of {_DIGEST_KINDS}'},
+                status=HTTP_400_BAD_REQUEST,
+            )
+
         memory = Memory.objects.filter(
             organization=organization,
             id=memory_id,
             metadata__kind='digest',
-            metadata__digest_kind='weekly_structured',
+            metadata__digest_kind=digest_kind,
         ).first()
 
         if memory is None:
-            return Response({'detail': 'digest not found'}, status=HTTP_404_NOT_FOUND)
+            raise DigestNotFoundError('digest not found')
 
         metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
 
@@ -140,9 +154,16 @@ class DigestReviewView(APIView):
             target_type='memory',
             target_id=str(memory.id),
             metadata={
-                'digest_kind': 'weekly_structured',
+                'digest_kind': digest_kind,
                 'memory_id': str(memory.id),
             },
+        )
+
+        logger.info(
+            'digest_reviewed',
+            organization_id=str(organization.id),
+            memory_id=str(memory.id),
+            digest_kind=digest_kind,
         )
 
         return Response(

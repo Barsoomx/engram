@@ -55,7 +55,7 @@ def get_overview_metrics(
         cached = cache.get(cache_key)
     except Exception as e:
         logger.warning(
-            'can not get overview metrics from cache',
+            'overview_metrics_cache_read_failed',
             cache_key=cache_key,
             error=e,
         )
@@ -70,7 +70,7 @@ def get_overview_metrics(
         cache.set(cache_key, metrics, OVERVIEW_METRICS_CACHE_TTL_SECONDS)
     except Exception as e:
         logger.warning(
-            'can not set overview metrics to cache',
+            'overview_metrics_cache_write_failed',
             cache_key=cache_key,
             error=e,
         )

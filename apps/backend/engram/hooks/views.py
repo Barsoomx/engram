@@ -13,18 +13,6 @@ from engram.access.services import AccessDeniedError
 from engram.hooks.serializers import HookDryRunSerializer, HookEventSerializer
 from engram.hooks.services import HookEventInput, IngestHookEvent
 
-ACCESS_STATUS = {
-    'invalid_key': status.HTTP_401_UNAUTHORIZED,
-    'inactive_key': status.HTTP_403_FORBIDDEN,
-    'revoked_key': status.HTTP_403_FORBIDDEN,
-    'expired_key': status.HTTP_403_FORBIDDEN,
-    'inactive_owner': status.HTTP_403_FORBIDDEN,
-    'missing_capability': status.HTTP_403_FORBIDDEN,
-    'project_scope_denied': status.HTTP_403_FORBIDDEN,
-    'team_scope_denied': status.HTTP_403_FORBIDDEN,
-    'organization_suspended': status.HTTP_403_FORBIDDEN,
-}
-
 
 def bearer_key(request: Request) -> str:
     header = request.META.get('HTTP_AUTHORIZATION', '')
@@ -33,12 +21,6 @@ def bearer_key(request: Request) -> str:
         raise AccessDeniedError('missing_api_key', 'Missing bearer API key')
 
     return header[len(prefix) :].strip()
-
-
-def access_error_response(error: AccessDeniedError) -> Response:
-    response_status = ACCESS_STATUS.get(error.code, status.HTTP_401_UNAUTHORIZED)
-
-    return Response({'code': error.code, 'detail': str(error)}, status=response_status)
 
 
 class HookDryRunView(APIView):
@@ -51,16 +33,13 @@ class HookDryRunView(APIView):
         data = serializer.validated_data
         request_id = data.get('request_id', '')
 
-        try:
-            scope = resolve_request_scope(
-                request,
-                required_capability='observations:write',
-                project_id=data.get('project_id'),
-                team_id=data.get('team_id'),
-                request_id=request_id,
-            )
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        scope = resolve_request_scope(
+            request,
+            required_capability='observations:write',
+            project_id=data.get('project_id'),
+            team_id=data.get('team_id'),
+            request_id=request_id,
+        )
 
         return Response(
             {
@@ -92,10 +71,7 @@ class HookIngestView(APIView):
                 {'event_type': [f'Expected {self.expected_event_type}.']},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        try:
-            result = IngestHookEvent().execute(self._input(request, data))
-        except AccessDeniedError as error:
-            return access_error_response(error)
+        result = IngestHookEvent().execute(self._input(request, data))
 
         return Response(
             {

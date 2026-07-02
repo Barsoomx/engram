@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+import structlog
 from rest_framework.test import APIClient
 
 from engram.access.models import ApiKey, ApiKeyCapability, Capability, Role, RoleCapability
@@ -263,3 +264,48 @@ def test_list_memory_links_denies_other_project() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_create_memory_link_returns_not_found_for_other_project_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    other_project = Project.objects.create(organization=organization, name='Other', slug='other-project-link-404')
+    memory, _version, _document = create_approved_memory_document(organization, team, other_project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, request_id='request-link-missing-memory'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'memory_not_found'
+    assert MemoryLink.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_create_memory_link_logs_memory_link_recorded() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            f'/v1/memories/{memory.id}/links',
+            link_payload(project, request_id='request-link-logged'),
+            format='json',
+            **auth_headers(),
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    link_events = [entry for entry in captured_logs if entry['event'] == 'memory_link_recorded']
+    assert len(link_events) == 1
+    assert link_events[0]['memory_id'] == str(memory.id)
+    assert link_events[0]['item_id'] == body['link_id']
+    assert link_events[0]['link_type'] == 'file'
+    assert link_events[0]['created'] is True

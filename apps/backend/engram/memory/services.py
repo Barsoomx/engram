@@ -46,6 +46,8 @@ from engram.model_policy.services import (
     get_provider_gateway,
 )
 
+logger = structlog.get_logger(__name__)
+
 
 @dataclass(frozen=True)
 class MemoryCandidateWorkerInput:
@@ -202,6 +204,16 @@ class RecordMemoryFeedback:
                     'team_ids': [str(team_id) for team_id in scope.team_ids],
                 },
             },
+        )
+
+        logger.info(
+            'memory_feedback_recorded',
+            organization_id=str(memory.organization_id),
+            project_id=str(memory.project_id),
+            memory_id=str(memory.id),
+            action=data.action,
+            already_applied=already_applied,
+            retrieval_documents_updated=updated,
         )
 
 
@@ -891,11 +903,27 @@ class MemoryLinkResult:
         }
 
 
+MEMORY_LINK_STATUS = {
+    'memory_not_found': drf_status.HTTP_404_NOT_FOUND,
+    'link_not_found': drf_status.HTTP_404_NOT_FOUND,
+}
+
+
+class MemoryLinkError(DomainError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(
+            message,
+            error_code=code,
+            status_code=MEMORY_LINK_STATUS.get(code, drf_status.HTTP_400_BAD_REQUEST),
+        )
+        self.code = code
+
+
 class RecordMemoryLink:
     def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
         scope = data.scope
         with transaction.atomic():
-            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
+            memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryLinkError)
             ensure_memory_team_scope(memory, scope)
             link, created = MemoryLink.objects.get_or_create(
                 memory=memory,
@@ -948,21 +976,13 @@ class RecordMemoryLink:
             },
         )
 
-
-MEMORY_LINK_STATUS = {
-    'memory_not_found': drf_status.HTTP_404_NOT_FOUND,
-    'link_not_found': drf_status.HTTP_404_NOT_FOUND,
-}
-
-
-class MemoryLinkError(DomainError):
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(
-            message,
-            error_code=code,
-            status_code=MEMORY_LINK_STATUS.get(code, drf_status.HTTP_400_BAD_REQUEST),
+        logger.info(
+            'memory_link_recorded',
+            memory_id=str(memory.id),
+            item_id=str(link.id),
+            link_type=link.link_type,
+            created=created,
         )
-        self.code = code
 
 
 @dataclass(frozen=True)
@@ -1155,6 +1175,7 @@ class GenerateDigest:
                 visibility_scope=VisibilityScope.PROJECT,
                 metadata={
                     'kind': 'digest',
+                    'digest_kind': 'daily_structured',
                     'source_memory_ids': [str(source.id) for source in sources],
                     'content_hash': content_hash,
                     'provider_call_id': str(provider_result.call_record_id),

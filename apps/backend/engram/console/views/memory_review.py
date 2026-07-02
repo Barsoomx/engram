@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from django.db import transaction
 from django.db.models import Q
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
@@ -27,16 +28,11 @@ from engram.console.serializers.memory_review import (
 )
 from engram.console.services import (
     MemoryReviewError,
-    approve_memory_candidate,
-    archive_memory,
     bulk_archive_memories,
-    edit_memory_body,
     get_review_candidate_or_404,
     get_review_memory_or_404,
-    narrow_memory,
-    reject_review_item,
-    supersede_memory,
 )
+from engram.console.usecases.review_action import ReviewActionInput, ReviewActionUseCase
 from engram.core.models import (
     CandidateStatus,
     Memory,
@@ -102,14 +98,7 @@ class MemoryReviewViewSet(
             item = get_review_candidate_or_404(organization, item_id)
 
         except MemoryReviewError:
-            try:
-                item = get_review_memory_or_404(organization, item_id)
-
-            except MemoryReviewError as error:
-                return Response(
-                    {'code': error.code, 'detail': str(error)},
-                    status=HTTP_404_NOT_FOUND,
-                )
+            item = get_review_memory_or_404(organization, item_id)
 
         return Response(queue_item_payload(item), status=HTTP_200_OK)
 
@@ -162,20 +151,19 @@ class MemoryReviewViewSet(
 
         data = serializer.validated_data
 
-        action_name = data['action']
-
-        reason = data['reason']
-
-        result = self._apply_action(
-            organization=organization,
-            actor_identity=actor_identity,
-            item_id=item_id,
-            action_name=action_name,
-            data=data,
-            reason=reason,
+        output = ReviewActionUseCase(user=request.user, transaction=transaction.atomic()).execute(
+            ReviewActionInput(
+                organization=organization,
+                actor_identity=actor_identity,
+                item_id=item_id,
+                action_name=data['action'],
+                reason=data['reason'],
+                body=data.get('body'),
+                target_memory_id=data.get('target_memory_id'),
+            ),
         )
 
-        return Response(result, status=HTTP_200_OK)
+        return Response(output.result, status=HTTP_200_OK)
 
     @action(detail=False, methods=['post'], url_path='bulk-archive')
     def bulk_archive(self, request: Request, *args: Any, **kwargs: Any) -> Response:
@@ -327,115 +315,6 @@ class MemoryReviewViewSet(
             'previous': previous_url,
             'items': page_items,
         }
-
-    def _apply_action(  # noqa: C901
-        self,
-        organization: Any,
-        actor_identity: Any,
-        item_id: uuid.UUID,
-        action_name: str,
-        data: dict[str, Any],
-        reason: str,
-    ) -> dict[str, Any]:
-        if action_name == 'approve':
-            candidate = get_review_candidate_or_404(organization, item_id)
-
-            memory = approve_memory_candidate(organization, actor_identity, candidate, reason)
-
-            return {
-                'action': 'approve',
-                'candidate_id': str(candidate.id),
-                'memory_id': str(memory.id),
-            }
-
-        if action_name == 'edit':
-            memory = get_review_memory_or_404(organization, item_id)
-
-            body = data.get('body')
-
-            if not body:
-                raise MemoryReviewError('body_required', 'body is required for edit action')
-
-            version = edit_memory_body(organization, actor_identity, memory, body, reason)
-
-            return {
-                'action': 'edit',
-                'memory_id': str(memory.id),
-                'version': version.version,
-            }
-
-        if action_name == 'narrow':
-            memory = get_review_memory_or_404(organization, item_id)
-
-            target_id = data.get('target_memory_id')
-
-            if target_id is None:
-                raise MemoryReviewError(
-                    'target_required',
-                    'target_memory_id is required for narrow action',
-                )
-
-            link = narrow_memory(organization, actor_identity, memory, target_id, reason)
-
-            return {
-                'action': 'narrow',
-                'memory_id': str(memory.id),
-                'link_id': str(link.id),
-            }
-
-        if action_name == 'supersede':
-            memory = get_review_memory_or_404(organization, item_id)
-
-            target_id = data.get('target_memory_id')
-
-            if target_id is None:
-                raise MemoryReviewError(
-                    'target_required',
-                    'target_memory_id is required for supersede action',
-                )
-
-            link = supersede_memory(organization, actor_identity, memory, target_id, reason)
-
-            return {
-                'action': 'supersede',
-                'memory_id': str(memory.id),
-                'link_id': str(link.id),
-            }
-
-        if action_name == 'reject':
-            candidate = MemoryCandidate.objects.filter(
-                organization=organization,
-                id=item_id,
-            ).first()
-
-            if candidate is not None:
-                reject_review_item(organization, actor_identity, candidate, reason)
-
-                return {
-                    'action': 'reject',
-                    'candidate_id': str(candidate.id),
-                }
-
-            memory = get_review_memory_or_404(organization, item_id)
-
-            reject_review_item(organization, actor_identity, memory, reason)
-
-            return {
-                'action': 'reject',
-                'memory_id': str(memory.id),
-            }
-
-        if action_name == 'archive':
-            memory = get_review_memory_or_404(organization, item_id)
-
-            archive_memory(organization, actor_identity, memory, reason)
-
-            return {
-                'action': 'archive',
-                'memory_id': str(memory.id),
-            }
-
-        raise MemoryReviewError('unknown_action', f'unknown action {action_name!r}')
 
     def _version_or_404(self, memory: Memory, version_number: int) -> MemoryVersion:
         version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()

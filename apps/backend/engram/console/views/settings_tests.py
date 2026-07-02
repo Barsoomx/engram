@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import patch
 
 import pytest
+import structlog
 from django.contrib.auth.models import User
 from django.db import DatabaseError
 from django.db.models.query import QuerySet
@@ -24,6 +25,7 @@ from engram.core.models import (
     Agent,
     AgentSession,
     AuditEvent,
+    AuditResult,
     ContextBundle,
     Memory,
     MemoryCandidate,
@@ -548,6 +550,9 @@ def test_embedding_settings_put_missing_fields_returns_400(f_org_admin_client: A
     )
 
     assert response.status_code == 400
+    body = response.json()
+    assert body['code'] == 'embedding_fields_required'
+    assert body['error_code'] == 'embedding_fields_required'
 
 
 @pytest.mark.django_db
@@ -561,6 +566,9 @@ def test_embedding_settings_put_unknown_secret_returns_400(f_org_admin_client: A
     )
 
     assert response.status_code == 400
+    body = response.json()
+    assert body['code'] == 'embedding_secret_not_found'
+    assert body['error_code'] == 'embedding_secret_not_found'
 
 
 @pytest.mark.django_db
@@ -568,6 +576,28 @@ def test_embedding_settings_requires_org_admin(f_reader_client: APIClient) -> No
     response = f_reader_client.get('/v1/admin/settings/embedding')
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_embedding_settings_put_logs_updated_event(f_org_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='settings-org')
+    secret = _make_provider_secret(org)
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = f_org_admin_client.put(
+            '/v1/admin/settings/embedding',
+            {'provider': 'openai', 'model': 'text-embedding-3-small', 'secret_id': str(secret.id)},
+            format='json',
+        )
+
+    assert response.status_code == 200
+    policy = ModelPolicy.objects.get(organization=org, task_type='embedding', active=True)
+    events = [entry for entry in captured_logs if entry['event'] == 'embedding_settings_updated']
+    assert len(events) == 1
+    assert events[0]['organization_id'] == str(org.id)
+    assert events[0]['provider'] == 'openai'
+    assert events[0]['model'] == 'text-embedding-3-small'
+    assert policy.provider == 'openai'
 
 
 # ─── Purge ────────────────────────────────────────────────────────────────────
@@ -620,7 +650,37 @@ def test_purge_writes_audit_event_before_deletion(f_memories_admin_client: APICl
     assert audit.metadata['memory_count'] == 1
     assert audit.metadata['memory_candidate_count'] == 0
     assert audit.metadata['retrieval_document_count'] == 0
+    assert audit.actor_type == 'user'
+    assert audit.capability == ''
+    assert audit.result == AuditResult.RECORDED
     assert Memory.objects.filter(organization=org).count() == 0
+
+
+@pytest.mark.django_db
+def test_purge_logs_purged_event(f_memories_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='purge-org')
+    project = Project.objects.create(organization=org, name='Proj', slug='purge-proj-log')
+    Memory.objects.create(
+        organization=org,
+        project=project,
+        title='To purge',
+        body='body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = f_memories_admin_client.post(
+            '/v1/admin/settings/purge',
+            {'confirmation': 'purge-org'},
+            format='json',
+        )
+
+    assert response.status_code == 200
+    events = [entry for entry in captured_logs if entry['event'] == 'organization_memory_purged']
+    assert len(events) == 1
+    assert events[0]['organization_id'] == str(org.id)
+    assert events[0]['memory_count'] == 1
 
 
 @pytest.mark.django_db

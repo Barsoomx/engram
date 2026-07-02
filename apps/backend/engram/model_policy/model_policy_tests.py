@@ -5,6 +5,7 @@ import json
 from decimal import Decimal
 
 import pytest
+import structlog
 from django.core.exceptions import ImproperlyConfigured
 from django.test import override_settings
 from rest_framework.test import APIClient
@@ -1751,5 +1752,138 @@ def test_create_model_policy_rolls_back_policy_when_audit_write_fails(monkeypatc
                 actor_id='svc-test',
             ),
         )
+
+
+@pytest.mark.django_db
+def test_provider_secret_create_logs_provider_secret_created() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            '/v1/model-policy/secrets',
+            {
+                'project_id': str(project.id),
+                'team_id': str(team.id),
+                'name': 'Log Secret',
+                'provider': 'openai',
+                'scope': 'team',
+                'raw_secret': RAW_PROVIDER_SECRET,
+                'request_id': 'request-secret-log-create',
+            },
+            format='json',
+            **auth_headers(POLICY_RAW_KEY),
+        )
+
+    assert response.status_code == 201
+    secret_id = response.json()['id']
+
+    events = [entry for entry in captured_logs if entry['event'] == 'provider_secret_created']
+    assert len(events) == 1
+    assert events[0]['secret_id'] == secret_id
+    assert events[0]['provider'] == 'openai'
+    assert events[0]['scope'] == 'team'
+    assert RAW_PROVIDER_SECRET not in str(events[0])
+
+
+@pytest.mark.django_db
+def test_provider_secret_rotate_logs_provider_secret_rotated() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    secret_id = _create_secret(client, project, team, 'Rotate Log Secret', 'openai')
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            f'/v1/model-policy/secrets/{secret_id}/rotate',
+            {
+                'project_id': str(project.id),
+                'team_id': str(team.id),
+                'raw_secret': 'sk-rotated-log-secret-0123456789',
+                'request_id': 'request-secret-log-rotate',
+            },
+            format='json',
+            **auth_headers(POLICY_RAW_KEY),
+        )
+
+    assert response.status_code == 200
+
+    events = [entry for entry in captured_logs if entry['event'] == 'provider_secret_rotated']
+    assert len(events) == 1
+    assert events[0]['secret_id'] == secret_id
+    assert events[0]['version'] == 2
+    assert 'sk-rotated-log-secret-0123456789' not in str(events[0])
+
+
+@pytest.mark.django_db
+def test_model_policy_create_logs_model_policy_created() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    secret_id = _create_secret(client, project, team, 'Policy Log Secret', 'openai')
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            '/v1/model-policy/policies',
+            {
+                'project_id': str(project.id),
+                'team_id': str(team.id),
+                'name': 'Log Policy',
+                'scope': 'team',
+                'task_type': 'generation',
+                'provider': 'openai',
+                'model': 'gpt-4o-mini',
+                'secret_id': secret_id,
+                'request_id': 'request-policy-log-create',
+            },
+            format='json',
+            **auth_headers(POLICY_RAW_KEY),
+        )
+
+    assert response.status_code == 201
+    policy_id = response.json()['id']
+
+    events = [entry for entry in captured_logs if entry['event'] == 'model_policy_created']
+    assert len(events) == 1
+    assert events[0]['policy_id'] == policy_id
+    assert events[0]['task_type'] == 'generation'
+    assert events[0]['provider'] == 'openai'
+
+
+@pytest.mark.django_db
+def test_model_policy_update_logs_model_policy_updated() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+
+    secret_id = _create_secret(client, project, team, 'Policy Update Log Secret', 'openai')
+    policy_id = _create_policy(client, project, team, 'Update Log Policy', secret_id)
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.patch(
+            f'/v1/model-policy/policies/{policy_id}',
+            {
+                'project_id': str(project.id),
+                'team_id': str(team.id),
+                'name': 'Renamed Log Policy',
+                'request_id': 'request-policy-log-update',
+            },
+            format='json',
+            **auth_headers(POLICY_RAW_KEY),
+        )
+
+    assert response.status_code == 200
+
+    events = [entry for entry in captured_logs if entry['event'] == 'model_policy_updated']
+    assert len(events) == 1
+    assert events[0]['policy_id'] == policy_id
+    assert events[0]['version'] == 2
 
     assert ModelPolicy.objects.filter(name='Org policy').count() == 0

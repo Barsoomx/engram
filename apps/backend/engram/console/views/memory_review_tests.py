@@ -1143,6 +1143,22 @@ def test_retrieve_unknown_id_returns_404(
 
 
 @pytest.mark.django_db
+def test_retrieve_unknown_id_returns_domain_error_shape(
+    f_admin_token: str,
+    f_admin_org: Organization,
+) -> None:
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/00000000-0000-0000-0000-000000000001/')
+
+    assert response.status_code == 404
+
+    assert response.data['code'] == 'not_found'
+
+    assert response.data['error_code'] == 'not_found'
+
+
+@pytest.mark.django_db
 def test_retrieve_foreign_org_item_returns_404(
     f_admin_token: str,
     f_admin_org: Organization,
