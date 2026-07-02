@@ -595,7 +595,7 @@ def test_fake_provider_gateway_records_redacted_provider_call_without_raw_secret
 
 
 @pytest.mark.django_db
-def test_fake_provider_gateway_reuses_provider_call_for_stable_request_id() -> None:
+def test_fake_provider_gateway_makes_fresh_call_for_repeated_request_id() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
     secret = ProviderSecret.objects.create(
@@ -641,8 +641,65 @@ def test_fake_provider_gateway_reuses_provider_call_for_stable_request_id() -> N
     first = FakeProviderGateway().call(data)
     second = FakeProviderGateway().call(data)
 
-    assert second.call_record_id == first.call_record_id
-    assert ProviderCallRecord.objects.count() == 1
+    assert second.call_record_id != first.call_record_id
+    assert second.generated_body == first.generated_body
+    assert ProviderCallRecord.objects.count() == 2
+
+
+@pytest.mark.django_db
+def test_fake_provider_gateway_logs_repeated_request_id_without_prompt_text() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Generation policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    secret_prompt = 'do not leak this exact prompt text'
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='memory-worker:observation-log-1:generation',
+        trace_id='trace-provider-call-log-1',
+        prompt=secret_prompt,
+    )
+
+    FakeProviderGateway().call(data)
+    with structlog.testing.capture_logs() as captured_logs:
+        FakeProviderGateway().call(data)
+
+    events = [entry for entry in captured_logs if entry['event'] == 'provider_request_repeated']
+    assert len(events) == 1
+    assert events[0]['request_id'] == data.request_id
+    assert events[0]['task_type'] == 'generation'
+    assert secret_prompt not in str(events[0])
 
 
 @pytest.mark.django_db
@@ -763,7 +820,7 @@ def test_fake_provider_gateway_returns_deterministic_memories_object_for_candida
     replay = FakeProviderGateway().call(data)
 
     assert replay.generated_body == result.generated_body
-    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
+    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 2
 
 
 def test_completion_body_passes_through_full_output_for_candidates_kind() -> None:
@@ -808,7 +865,7 @@ def test_generated_embedding_returns_zero_vector_for_short_text() -> None:
 
 
 @pytest.mark.django_db
-def test_fake_provider_gateway_embed_reuses_call_and_redacts_input() -> None:
+def test_fake_provider_gateway_embed_redacts_input_and_records_fresh_call() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
     secret = ProviderSecret.objects.create(
@@ -857,7 +914,8 @@ def test_fake_provider_gateway_embed_reuses_call_and_redacts_input() -> None:
     assert first.provider == 'openai'
     assert first.model == 'text-embedding-3-small'
     assert len(first.embedding) == EMBEDDING_DIMENSION
-    assert second.call_record_id == first.call_record_id
+    assert second.call_record_id != first.call_record_id
+    assert ProviderCallRecord.objects.filter(request_id=data.request_id).count() == 2
     record = ProviderCallRecord.objects.get(id=first.call_record_id)
     assert record.task_type == 'embedding'
     assert record.redaction_state == 'redacted'

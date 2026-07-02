@@ -491,7 +491,7 @@ def test_observation_recorded_worker_is_idempotent_for_duplicate_delivery() -> N
     assert Memory.objects.count() == 1
     assert MemoryVersion.objects.count() == 1
     assert RetrievalDocument.objects.count() == 1
-    assert ProviderCallRecord.objects.count() == 1
+    assert ProviderCallRecord.objects.count() == 2
 
 
 @pytest.mark.django_db
@@ -542,7 +542,7 @@ def test_observation_recorded_worker_reuses_existing_candidate() -> None:
 
     assert second.duplicate is True
     assert second.memory.id == result.memory.id
-    assert ProviderCallRecord.objects.count() == 1
+    assert ProviderCallRecord.objects.count() == 2
 
 
 @pytest.mark.django_db
@@ -801,7 +801,7 @@ def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
 
 
 @pytest.mark.django_db
-def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
+def test_index_memory_version_embedding_reindex_makes_fresh_call_with_stable_vector() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
@@ -816,12 +816,12 @@ def test_index_memory_version_embedding_is_idempotent_across_reindex() -> None:
 
     second_document = RetrievalDocument.objects.get()
     assert second_document.embedding_vector == first_vector
-    assert second_document.embedding_reference == first_reference
+    assert second_document.embedding_reference != first_reference
     indexer_calls = ProviderCallRecord.objects.filter(
         task_type='embedding',
         request_id=f'memory-indexer:{first_document.memory_version_id}:embedding',
     )
-    assert indexer_calls.count() == 1
+    assert indexer_calls.count() == 2
 
 
 @pytest.mark.django_db
