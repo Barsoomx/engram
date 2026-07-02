@@ -28,10 +28,12 @@ from engram.memory.curation import (
     CurateMemoryCandidate,
     CurateMemoryCandidateInput,
     curation_judge_prompt,
+    curation_judge_system_prompt,
     embed_candidate,
     find_near_duplicate,
     is_low_signal,
     parse_curation_decision,
+    parse_curation_reason,
     resolve_curator_llm_judge_enabled,
     supersede_memory_system,
 )
@@ -627,6 +629,20 @@ def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable()
     assert parse_curation_decision('{"decision": "explode"}') == 'keep_both'
     assert parse_curation_decision('[]') == 'keep_both'
     assert parse_curation_decision('{}') == 'keep_both'
+
+
+def test_curation_judge_system_prompt_requires_reason() -> None:
+    prompt = curation_judge_system_prompt()
+
+    assert '"reason"' in prompt
+    assert '"decision"' in prompt
+
+
+def test_parse_curation_reason_reads_reason() -> None:
+    assert parse_curation_reason('{"decision": "merge", "reason": "same fact"}') == 'same fact'
+    assert parse_curation_reason('{"decision": "merge"}') == ''
+    assert parse_curation_reason('not json') == ''
+    assert parse_curation_reason('[]') == ''
 
 
 def test_curation_judge_prompt_redacts_secrets() -> None:
