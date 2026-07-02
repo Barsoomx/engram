@@ -731,6 +731,115 @@ def http_post_json(url: str, payload: dict[str, object], api_key: str) -> tuple[
             return error.code, {'raw': body[:500]}
 
 
+def http_get_json(url: str, api_key: str) -> tuple[int, dict[str, object]]:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(  # noqa: S310 - local e2e server
+        url,
+        headers={'Authorization': f'Bearer {api_key}'},
+        method='GET',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return response.status, json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        body = error.read().decode()
+        try:
+            return error.code, json.loads(body)
+        except json.JSONDecodeError:
+            return error.code, {'raw': body[:500]}
+
+
+def verify_feedback_loop(home: Path, repo: Path, project_id: str, agent_key: str, *, secret: str) -> dict[str, object]:
+    picked = compose_shell_json(
+        f"""
+import json
+from engram.core.models import Memory, Project
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+memory = (
+    Memory.objects.filter(project=project, title__startswith={json.dumps(GENERATION_TITLE_PREFIX)}, stale=False)
+    .order_by('created_at')
+    .first()
+)
+print(json.dumps({{'memory_id': str(memory.id), 'title': memory.title}}))
+""",
+        secret=secret,
+    )
+    memory_id = str(picked.get('memory_id'))
+
+    status, inspection = http_get_json(
+        f'{SERVER_URL}/v1/inspection/memories/{memory_id}?project_id={project_id}', agent_key,
+    )
+    if status != 200 or inspection.get('authorized_for_injection') is not True:
+        raise E2EError(f'inspection before feedback expected authorized_for_injection=true: {status} {inspection}')
+
+    status, feedback = http_post_json(
+        f'{SERVER_URL}/v1/memories/{memory_id}/feedback',
+        {
+            'project_id': project_id,
+            'action': 'stale',
+            'reason': 'e2e feedback loop check',
+            'request_id': 'e2e-feedback-1',
+        },
+        agent_key,
+    )
+    if status != 200:
+        raise E2EError(f'memory feedback failed: {status} {feedback}')
+
+    propagated = compose_shell_json(
+        f"""
+import json
+from engram.core.models import Memory, RetrievalDocument
+
+memory = Memory.objects.get(id={json.dumps(memory_id)})
+documents = list(RetrievalDocument.objects.filter(memory=memory).values_list('stale', flat=True))
+print(json.dumps({{'memory_stale': memory.stale, 'document_stale': documents}}))
+""",
+        secret=secret,
+    )
+    if not propagated.get('memory_stale') or not all(propagated.get('document_stale') or [False]):
+        raise E2EError(f'stale feedback did not propagate: {propagated}')
+
+    status, inspection_after = http_get_json(
+        f'{SERVER_URL}/v1/inspection/memories/{memory_id}?project_id={project_id}', agent_key,
+    )
+    if inspection_after.get('authorized_for_injection') is not False:
+        raise E2EError(f'inspection after feedback should deny injection: {inspection_after}')
+
+    stale_title = str(picked.get('title'))
+    hook_input = {
+        'session_id': 'e2e-feedback-context',
+        'repository_root': str(repo),
+        'cwd': str(repo),
+        'query': stale_title,
+    }
+    context = run_json(
+        [sys.executable, '-m', 'engram_cli', 'hook', 'session-start', '--agent', 'claude-code'],
+        cwd=repo,
+        env=cli_hook_env(home),
+        secret='',
+        input_text=json.dumps(hook_input),
+    )
+    returned_ids = [str(item.get('memory_id')) for item in context.get('items') or [] if isinstance(item, dict)]
+    if memory_id in returned_ids:
+        raise E2EError(f'stale memory still served in context: {memory_id} in {returned_ids}')
+
+    return {'stale_memory': memory_id, 'context_items_after': len(returned_ids)}
+
+
+def verify_observations_api(project_id: str, agent_key: str) -> dict[str, object]:
+    status, body = http_get_json(f'{SERVER_URL}/v1/observations/?project_id={project_id}', agent_key)
+    if status != 200:
+        raise E2EError(f'observations list failed: {status} {body}')
+    items = body.get('items')
+    if not isinstance(items, list) or not items:
+        raise E2EError(f'observations list returned no items: {body}')
+
+    return {'observations': len(items)}
+
+
 def verify_rbac_negatives(project_id: str, golden_key: str) -> dict[str, object]:
     status, body = http_post_json(
         f'{SERVER_URL}/v1/hooks/dry-run',
@@ -990,6 +1099,14 @@ def main() -> int:
             progress('Verifying model policy precedence for auto-created project')
             precedence = verify_policy_precedence(bootstrap, secret=agent_key)
             progress(f'Policy precedence OK: {json.dumps(precedence)}')
+
+            progress('Verifying observations API with agent key')
+            observations = verify_observations_api(str(state.get('project_id')), agent_key)
+            progress(f'Observations OK: {json.dumps(observations)}')
+
+            progress('Verifying memory feedback loop (stale → out of retrieval)')
+            feedback = verify_feedback_loop(home, repo, str(state.get('project_id')), agent_key, secret=agent_key)
+            progress(f'Feedback OK: {json.dumps(feedback)}')
 
             progress('Verifying replay idempotency')
             replay = verify_replay_idempotency(home, repo, secret=agent_key)
