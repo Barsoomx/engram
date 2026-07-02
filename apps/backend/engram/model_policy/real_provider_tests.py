@@ -9,6 +9,7 @@ import pytest
 from engram.context.context_api_tests import create_project_scope
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
+    EMBEDDING_DIMENSION,
     AnthropicMessagesGateway,
     EmbeddingCallInput,
     FakeProviderGateway,
@@ -301,8 +302,57 @@ def test_openai_compatible_gateway_embed_parses_vector() -> None:
         ),
     )
 
-    assert result.embedding == (0.1, 0.2, 0.3)
+    assert len(result.embedding) == EMBEDDING_DIMENSION
+    assert result.embedding[:3] == (0.1, 0.2, 0.3)
+    assert all(component == 0.0 for component in result.embedding[3:])
     assert opener.requests[0].full_url == 'https://provider.example/v1/embeddings'
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embed_truncates_oversized_vector_and_renormalizes() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    opener = _opener_returning(json.dumps({'data': [{'embedding': [1.0] * 1536}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='real-embed-fit-1',
+            trace_id='real-embed-fit-1',
+            text='text to embed',
+        ),
+    )
+
+    assert len(result.embedding) == EMBEDDING_DIMENSION
+    norm = sum(component**2 for component in result.embedding) ** 0.5
+    assert norm == pytest.approx(1.0)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embed_keeps_exact_dimension_vector() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    exact = [float(index) for index in range(EMBEDDING_DIMENSION)]
+    opener = _opener_returning(json.dumps({'data': [{'embedding': exact}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='real-embed-exact-1',
+            trace_id='real-embed-exact-1',
+            text='text to embed',
+        ),
+    )
+
+    assert result.embedding == tuple(exact)
 
 
 @pytest.mark.django_db

@@ -1003,8 +1003,9 @@ class OpenAICompatibleGateway:
     def _embeddings(self, model: str, text: str) -> tuple[float, ...]:
         payload = json.dumps({'model': model, 'input': text}).encode()
         response = self._open(self._base_url + '/embeddings', payload)
+        embedding = tuple(float(component) for component in response['data'][0]['embedding'])
 
-        return tuple(float(component) for component in response['data'][0]['embedding'])
+        return fit_embedding_dimension(embedding)
 
     def _open(self, url: str, body: bytes) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
@@ -1223,6 +1224,21 @@ def get_provider_gateway(
 
 
 EMBEDDING_DIMENSION = 64
+
+
+def fit_embedding_dimension(embedding: tuple[float, ...]) -> tuple[float, ...]:
+    if len(embedding) == EMBEDDING_DIMENSION:
+        return embedding
+
+    if len(embedding) < EMBEDDING_DIMENSION:
+        return embedding + (0.0,) * (EMBEDDING_DIMENSION - len(embedding))
+
+    truncated = embedding[:EMBEDDING_DIMENSION]
+    norm = math.sqrt(sum(component**2 for component in truncated))
+    if norm == 0.0:
+        return truncated
+
+    return tuple(component / norm for component in truncated)
 
 
 @dataclass(frozen=True)
