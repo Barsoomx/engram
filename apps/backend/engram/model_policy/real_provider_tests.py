@@ -189,6 +189,42 @@ def test_openai_compatible_gateway_call_parses_completion() -> None:
 
 
 @pytest.mark.django_db
+def test_openai_compatible_gateway_strips_title_body_markers() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {
+        'choices': [
+            {
+                'message': {
+                    'content': (
+                        'Title: Deposit retries are idempotent\n'
+                        'Body: Retries reuse the accepted replay row.\n'
+                        'Second body line.'
+                    ),
+                },
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='real-call-markers-1',
+            trace_id='real-call-markers-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert result.generated_title == 'Deposit retries are idempotent'
+    assert result.generated_body == 'Retries reuse the accepted replay row.\nSecond body line.'
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize('task_type', ['curation', 'digest'])
 def test_openai_gateway_disables_thinking_for_deepseek_cheap_tiers(task_type: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
