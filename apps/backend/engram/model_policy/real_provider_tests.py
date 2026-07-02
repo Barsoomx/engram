@@ -829,6 +829,349 @@ def test_get_provider_gateway_anthropic_returns_anthropic_host_with_blank_metada
 
 
 @pytest.mark.django_db
+def test_openai_gateway_sends_json_mode_for_candidates() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-1',
+            trace_id='json-mode-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_sends_json_mode_for_curation_judgment() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    completion = {'choices': [{'message': {'content': '{"decision": "keep_both"}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-2',
+            trace_id='json-mode-2',
+            prompt='prompt text',
+            response_kind='curation_judgment',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_merges_thinking_and_json_mode_for_deepseek_candidates() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek', task_type='curation')
+    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-merge-1',
+            trace_id='json-mode-merge-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['thinking'] == {'type': 'disabled'}
+    assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_omits_json_mode_for_single() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {'choices': [{'message': {'content': 'Title\nBody'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-3',
+            trace_id='json-mode-3',
+            prompt='prompt text',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'response_format' not in sent_body
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_forces_tool_for_candidates() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {
+        'content': [
+            {
+                'type': 'tool_use',
+                'name': 'emit_memories',
+                'input': {'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9}]},
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-1',
+            trace_id='anthropic-tool-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_memories'}
+    assert sent_body['tools'][0]['name'] == 'emit_memories'
+    assert sent_body['tools'][0]['input_schema']['required'] == ['memories']
+    assert sent_body['max_tokens'] == 8192
+    assert json.loads(result.generated_body) == {'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9}]}
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_forces_tool_for_curation_judgment() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {
+        'content': [
+            {'type': 'tool_use', 'name': 'emit_judgment', 'input': {'decision': 'merge', 'reason': 'same fact'}},
+        ],
+    }
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-2',
+            trace_id='anthropic-tool-2',
+            prompt='prompt text',
+            response_kind='curation_judgment',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_judgment'}
+    assert sent_body['tools'][0]['input_schema']['properties']['decision']['enum'] == [
+        'merge',
+        'keep_both',
+        'reject',
+    ]
+    assert sent_body['tools'][0]['input_schema']['required'] == ['decision', 'reason']
+    assert sent_body['max_tokens'] == 1024
+    assert json.loads(result.generated_body) == {'decision': 'merge', 'reason': 'same fact'}
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_single_kind_has_no_tools_and_default_budget() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {'content': [{'type': 'text', 'text': 'Title\nBody'}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-3',
+            trace_id='anthropic-tool-3',
+            prompt='prompt text',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'tools' not in sent_body
+    assert 'tool_choice' not in sent_body
+    assert sent_body['max_tokens'] == 1024
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_max_tokens_metadata_override() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    policy.metadata = {**policy.metadata, 'max_tokens': 2048}
+    policy.save(update_fields=['metadata'])
+    message = {'content': [{'type': 'tool_use', 'name': 'emit_memories', 'input': {'memories': []}}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-4',
+            trace_id='anthropic-tool-4',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == 2048
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_thinking_only_content_returns_empty_body() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {'content': [{'type': 'thinking', 'thinking': 'x'}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-6',
+            trace_id='anthropic-tool-6',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    assert result.generated_body == ''
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_bool_max_tokens_metadata_falls_back_to_kind_default() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    policy.metadata = {**policy.metadata, 'max_tokens': True}
+    policy.save(update_fields=['metadata'])
+    message = {'content': [{'type': 'tool_use', 'name': 'emit_memories', 'input': {'memories': []}}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-7',
+            trace_id='anthropic-tool-7',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == 8192
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_structured_kind_falls_back_to_text_block() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {'content': [{'type': 'text', 'text': '{"memories": []}'}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-5',
+            trace_id='anthropic-tool-5',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    assert result.generated_body == '{"memories": []}'
+
+
+@pytest.mark.django_db
 def test_openai_gateway_chat_completion_uses_default_http_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)

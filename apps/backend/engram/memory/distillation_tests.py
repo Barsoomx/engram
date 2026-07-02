@@ -261,7 +261,7 @@ def create_embedding_policy(organization: Organization, team: Team, project: Pro
     )
 
 
-def test_session_distillation_system_prompt_requests_json_array_and_is_runtime_neutral() -> None:
+def test_session_distillation_system_prompt_requests_json_object_and_is_runtime_neutral() -> None:
     prompt = session_distillation_system_prompt()
 
     assert 'JSON' in prompt
@@ -333,6 +333,48 @@ def test_parse_synthesized_candidates_clamps_confidence_to_unit_interval() -> No
 
     assert candidates[0].confidence == Decimal('1.000')
     assert candidates[1].confidence == Decimal('0.000')
+
+
+def test_parse_synthesized_candidates_reads_memories_object() -> None:
+    raw = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Retry queue drops messages on Redis restart',
+                    'body': 'Consumer acks before processing in worker/queue.py.',
+                    'confidence': 0.9,
+                    'supporting_observation_ids': ['obs-1'],
+                },
+            ],
+        },
+    )
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert len(candidates) == 1
+    assert candidates[0].title == 'Retry queue drops messages on Redis restart'
+    assert candidates[0].confidence == Decimal('0.900')
+    assert candidates[0].supporting_observation_ids == ('obs-1',)
+
+
+def test_parse_synthesized_candidates_empty_memories_means_no_candidates() -> None:
+    assert parse_synthesized_candidates('{"memories": []}') == ()
+    assert parse_synthesized_candidates('[]') == ()
+
+
+def test_parse_synthesized_candidates_object_without_memories_falls_back() -> None:
+    candidates = parse_synthesized_candidates('{"other": 1}')
+
+    assert len(candidates) == 1
+    assert candidates[0].confidence == Decimal('0.500')
+
+
+def test_session_distillation_system_prompt_declares_memories_object_contract() -> None:
+    prompt = session_distillation_system_prompt()
+
+    assert '"memories"' in prompt
+    assert '{"memories": []}' in prompt
+    assert '0.9' in prompt
 
 
 @pytest.mark.django_db
@@ -425,6 +467,26 @@ def test_distill_session_makes_provider_call_outside_write_transaction(m_monkeyp
     # (embed/judge) run after that lock is released. No Memory is created since promotion failed.
     assert MemoryCandidate.objects.filter(project=project).count() == 2
     assert Memory.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_distill_session_zero_synthesized_candidates_returns_empty_result(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    m_monkeypatch.setattr(
+        'engram.model_policy.services.generated_candidates_payload',
+        lambda _prompt: json.dumps({'memories': []}),
+    )
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert result.auto_promoted == ()
+    assert result.queued_for_review == ()
+    assert MemoryCandidate.objects.filter(project=project).count() == 0
+    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
 
 
 @pytest.mark.django_db
