@@ -839,12 +839,14 @@ def generated_candidates_payload(prompt: str) -> str:
             'body': f'Provider-synthesized candidate body {digest} high',
             'confidence': 0.9,
             'supporting_observation_ids': [],
+            'source_ids': [0],
         },
         {
             'title': f'Provider-synthesized memory {digest} low',
             'body': f'Provider-synthesized candidate body {digest} low',
             'confidence': 0.4,
             'supporting_observation_ids': [],
+            'source_ids': [1],
         },
     ]
 
@@ -914,6 +916,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                             'body': {'type': 'string'},
                             'confidence': {'type': 'number'},
                             'supporting_observation_ids': {'type': 'array', 'items': {'type': 'string'}},
+                            'source_ids': {'type': 'array', 'items': {'type': 'integer'}},
                         },
                         'required': ['title', 'body', 'confidence'],
                     },

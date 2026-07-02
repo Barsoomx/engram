@@ -569,8 +569,9 @@ class DistillSession:
             return synthesized
 
         parsed_reduced = _parse_reduced_candidates(reduce_result.generated_body)
-        if parsed_reduced is None:
-            self._audit_reduce_skipped(session, data, reason='parse_failed', draft_count=len(synthesized))
+        if not parsed_reduced:
+            reason = 'parse_failed' if parsed_reduced is None else 'empty'
+            self._audit_reduce_skipped(session, data, reason=reason, draft_count=len(synthesized))
 
             return synthesized
 

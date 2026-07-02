@@ -49,6 +49,7 @@ from engram.model_policy.models import ModelPolicy, ProviderCallRecord, Provider
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
+    AnthropicMessagesGateway,
     FakeProviderGateway,
     OpenAICompatibleGateway,
     _completion_body,
@@ -90,6 +91,12 @@ def sequenced_opener(bodies: list[bytes]) -> Any:
 
 def candidates_body(items: list[dict[str, Any]] | dict[str, Any]) -> bytes:
     return json.dumps({'choices': [{'message': {'content': json.dumps(items)}}]}).encode()
+
+
+def anthropic_tool_body(memories: list[dict[str, Any]]) -> bytes:
+    return json.dumps(
+        {'content': [{'type': 'tool_use', 'name': 'emit_memories', 'input': {'memories': memories}}]},
+    ).encode()
 
 
 def create_session_scope(*, suffix: str = '1') -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -1498,3 +1505,96 @@ def test_distill_session_reduce_final_count_matches_llm_provided_target(m_monkey
 
     assert MemoryCandidate.objects.filter(project=project).count() == target
     assert target <= len(chunks) - 1
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_empty_memories_keeps_union_and_audits_empty(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session, policy = _reduce_scope(m_monkeypatch)
+    observations = list(Observation.objects.filter(project=project).order_by('prompt_number'))
+    budget = _distill_chunk_char_budget(policy)
+    chunks = chunk_observations(observations, budget)
+    assert len(chunks) >= 2
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    chunk_bodies = [_draft_chunk_body(index) for index in range(len(chunks))]
+    empty_reduce_body = candidates_body({'memories': []})
+    opener = sequenced_opener([*chunk_bodies, empty_reduce_body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert len(opener.calls) == len(chunks) + 1
+    audit = AuditEvent.objects.get(event_type='SessionDistillationReduceSkipped')
+    assert audit.metadata['reason'] == 'empty'
+    assert MemoryCandidate.objects.filter(project=project).count() == len(chunks)
+    assert len(result.provider_call_ids) == len(chunks)
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_succeeds_via_anthropic_tool_use_and_maps_source_ids(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session, policy = _reduce_scope(m_monkeypatch)
+    observations = list(Observation.objects.filter(project=project).order_by('prompt_number'))
+    budget = _distill_chunk_char_budget(policy)
+    chunks = chunk_observations(observations, budget)
+    assert len(chunks) >= 2
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    chunk_bodies = [
+        anthropic_tool_body(
+            [
+                {
+                    'title': f'draft{index}',
+                    'body': f'draft body {index}',
+                    'confidence': 0.5,
+                    'supporting_observation_ids': [str(chunks[index][0].id)],
+                },
+            ],
+        )
+        for index in range(len(chunks))
+    ]
+    reduce_body = anthropic_tool_body(
+        [
+            {
+                'title': 'merged via anthropic',
+                'body': 'merged body via anthropic',
+                'confidence': 0.8,
+                'source_ids': list(range(len(chunks))),
+            },
+        ],
+    )
+    opener = sequenced_opener([*chunk_bodies, reduce_body])
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id, correlation_id='anthropic-reduce-1'))
+
+    assert len(opener.calls) == len(chunks) + 1
+    assert AuditEvent.objects.filter(event_type='SessionDistillationReduceSkipped').count() == 0
+    candidate = MemoryCandidate.objects.get(project=project)
+    assert candidate.title == 'merged via anthropic'
+    assert candidate.evidence[0]['reduced'] is True
+    assert sorted(candidate.evidence[0]['supporting_observation_ids']) == sorted(
+        str(chunks[index][0].id) for index in range(len(chunks))
+    )
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_parses_successfully_under_fake_provider(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session, policy = _reduce_scope(m_monkeypatch)
+    observations = list(Observation.objects.filter(project=project).order_by('prompt_number'))
+    budget = _distill_chunk_char_budget(policy)
+    chunks = chunk_observations(observations, budget)
+    assert len(chunks) >= 2
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert AuditEvent.objects.filter(event_type='SessionDistillationReduceSkipped').count() == 0
+    candidates = MemoryCandidate.objects.filter(project=project)
+    assert candidates.count() == 2
+    assert all(candidate.evidence[0].get('reduced') is True for candidate in candidates)
