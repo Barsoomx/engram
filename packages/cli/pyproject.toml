@@ -1,6 +1,6 @@
 [project]
 name = "engram-connect"
-version = "0.1.0"
+version = "0.1.1"
 description = "Thin Engram command-line client"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -25,6 +25,7 @@ Repository = "https://github.com/Barsoomx/engram"
 
 [project.scripts]
 engram = "engram_cli.main:console_main"
+engram-connect = "engram_cli.main:console_main"
 
 [build-system]
 requires = ["setuptools>=61"]
