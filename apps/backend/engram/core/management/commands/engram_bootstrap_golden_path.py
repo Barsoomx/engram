@@ -23,6 +23,7 @@ from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecr
 from engram.model_policy.services import SECRET_KEY_VERSION, encrypt_secret, secret_fingerprint, secret_hmac
 
 GOLDEN_PATH_CAPABILITIES = ('memories:read', 'observations:write')
+AGENT_KEY_CAPABILITIES = ('memories:read', 'observations:write', 'search:query', 'projects:agent')
 GOLDEN_PATH_PROVIDER_SECRET = 'sk-engram_golden_path_local_provider_secret_1234567890'
 
 
@@ -31,10 +32,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument('--api-key', required=True)
+        parser.add_argument('--agent-key', default='', dest='agent_key')
         parser.add_argument('--json', action='store_true', dest='as_json')
 
     def handle(self, *args: Any, **options: Any) -> None:
-        result = bootstrap_golden_path(str(options['api_key']))
+        result = bootstrap_golden_path(str(options['api_key']), agent_key=str(options['agent_key']) or None)
         if options['as_json']:
             self.stdout.write(json.dumps(result, sort_keys=True))
 
@@ -46,7 +48,7 @@ class Command(BaseCommand):
         self.stdout.write(f'api_key_fingerprint={result["api_key_fingerprint"]}')
 
 
-def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
+def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict[str, object]:
     with transaction.atomic():
         organization, _created = Organization.objects.update_or_create(
             slug='engram-e2e',
@@ -171,7 +173,38 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
             },
         )
 
-        return {
+        organization_generation_policy, _created = ModelPolicy.objects.update_or_create(
+            organization=organization,
+            team=None,
+            project=None,
+            task_type='generation',
+            scope='organization',
+            defaults={
+                'name': 'Golden path org generation',
+                'provider': 'openai',
+                'model': 'gpt-4.1-mini',
+                'secret': provider_secret,
+                'version': 1,
+                'active': True,
+            },
+        )
+        organization_embedding_policy, _created = ModelPolicy.objects.update_or_create(
+            organization=organization,
+            team=None,
+            project=None,
+            task_type='embedding',
+            scope='organization',
+            defaults={
+                'name': 'Golden path org embeddings',
+                'provider': 'openai',
+                'model': 'text-embedding-3-small',
+                'secret': provider_secret,
+                'version': 1,
+                'active': True,
+            },
+        )
+
+        result: dict[str, object] = {
             'organization_id': str(organization.id),
             'team_id': str(team.id),
             'project_id': str(project.id),
@@ -182,4 +215,45 @@ def bootstrap_golden_path(raw_key: str) -> dict[str, object]:
             'provider_secret_id': str(provider_secret.id),
             'generation_policy_id': str(generation_policy.id),
             'embedding_policy_id': str(embedding_policy.id),
+            'organization_generation_policy_id': str(organization_generation_policy.id),
+            'organization_embedding_policy_id': str(organization_embedding_policy.id),
         }
+        if agent_key:
+            operator_role = Role.objects.get(code='organization_admin')
+            operator_identity, _created = Identity.objects.update_or_create(
+                organization=organization,
+                identity_type=IdentityType.SERVICE_ACCOUNT,
+                external_id='golden-path-operator',
+                defaults={
+                    'display_name': 'Golden path operator',
+                    'active': True,
+                },
+            )
+            OrganizationMembership.objects.update_or_create(
+                organization=organization,
+                identity=operator_identity,
+                defaults={
+                    'role': operator_role,
+                    'active': True,
+                },
+            )
+            agent_api_key, _created = ApiKey.objects.update_or_create(
+                key_hash=hash_api_key(agent_key),
+                defaults={
+                    'organization': organization,
+                    'owner_identity': operator_identity,
+                    'name': 'Golden path agent key',
+                    'key_prefix': api_key_prefix(agent_key),
+                    'key_fingerprint': api_key_fingerprint(agent_key),
+                    'team': None,
+                    'project': None,
+                    'active': True,
+                },
+            )
+            for capability in Capability.objects.filter(code__in=AGENT_KEY_CAPABILITIES):
+                ApiKeyCapability.objects.get_or_create(api_key=agent_api_key, capability=capability)
+            result['agent_api_key_id'] = str(agent_api_key.id)
+            result['agent_api_key_fingerprint'] = agent_api_key.key_fingerprint
+            result['agent_capabilities'] = list(AGENT_KEY_CAPABILITIES)
+
+        return result

@@ -1,6 +1,7 @@
 name: engram
 
 x-backend: &backend
+  image: engram-backend:local
   build:
     context: ../..
     dockerfile: apps/backend/Dockerfile
