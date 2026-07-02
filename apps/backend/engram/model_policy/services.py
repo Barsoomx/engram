@@ -1034,15 +1034,27 @@ class OpenAICompatibleGateway:
             ) from error
 
 
+_TITLE_MARKER_RE = re.compile(r'(?i)^\s*title\s*:\s*')
+_BODY_MARKER_RE = re.compile(r'(?i)^\s*body\s*:\s*')
+
+
+def _strip_marker(line: str, marker: re.Pattern[str]) -> str:
+    return marker.sub('', line, count=1).strip()
+
+
 def _split_completion(content: str) -> tuple[str, str]:
     lines = [line for line in content.splitlines() if line.strip()]
     if not lines:
         return 'Provider-generated memory', content
 
+    title = _strip_marker(lines[0], _TITLE_MARKER_RE)[:255]
     if len(lines) == 1:
-        return lines[0][:255], content
+        return title, _strip_marker(content.strip(), _TITLE_MARKER_RE)
 
-    return lines[0][:255], '\n'.join(lines[1:])
+    body_lines = lines[1:]
+    body_lines[0] = _strip_marker(body_lines[0], _BODY_MARKER_RE)
+
+    return title, '\n'.join(body_lines)
 
 
 def _completion_body(content: str, response_kind: str) -> str:
