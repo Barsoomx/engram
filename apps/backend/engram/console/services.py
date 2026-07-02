@@ -10,6 +10,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
 
+from engram.core.repository import canonicalize_repository_url
 from engram.access.models import (
     ApiKey,
     ApiKeyCapability,
@@ -112,7 +113,7 @@ def create_project(
         organization=organization,
         name=name,
         slug=slug,
-        repository_url=repository_url,
+        repository_url=canonicalize_repository_url(repository_url) or repository_url,
         default_branch=default_branch,
     )
 
