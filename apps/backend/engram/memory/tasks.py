@@ -7,6 +7,7 @@ import structlog
 from django.utils import timezone
 
 from engram.celery_app import app
+from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import Memory, MemoryStatus, Project
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.services import (
@@ -19,6 +20,8 @@ from engram.memory.services import (
     run_weekly_digest_with_tracking,
 )
 from engram.memory.session_sweep import SweepStaleSessions
+
+logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
@@ -177,6 +180,19 @@ def generate_weekly_digest(
         structlog.contextvars.clear_contextvars()
 
     return str(result.digest_memory.id)
+
+
+@app.task(name='engram.memory.reembed_missing_embeddings')
+def reembed_missing_embeddings() -> dict[str, int]:
+    result = ReembedMissingEmbeddings().execute()
+    logger.info(
+        'reembed_missing_embeddings_completed',
+        scanned=result.scanned,
+        embedded=result.embedded,
+        failed=result.failed,
+    )
+
+    return {'scanned': result.scanned, 'embedded': result.embedded, 'failed': result.failed}
 
 
 @app.task(name='engram.memory.run_scheduled_weekly_digests')
