@@ -33,7 +33,9 @@ import { useOrgStore } from '@/lib/org-store';
 
 const CONNECT_CAPABILITIES = [
   'memories:read',
+  'memories:review',
   'observations:write',
+  'observations:read',
   'search:query',
   'projects:agent',
 ];
