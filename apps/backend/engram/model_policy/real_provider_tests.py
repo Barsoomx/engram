@@ -22,6 +22,7 @@ from engram.model_policy.services import (
     default_base_url,
     encrypt_secret,
     get_provider_gateway,
+    policy_supports_json_object,
     resolve_context_window_tokens,
 )
 
@@ -68,6 +69,7 @@ def make_real_policy(
     base_url: str = 'https://provider.example/v1',
     raw_key: str = 'test-provider-key',
     provider: str = 'openai',
+    metadata: dict[str, object] | None = None,
 ) -> ModelPolicy:
     secret = ProviderSecret.objects.create(
         organization=organization,
@@ -99,7 +101,7 @@ def make_real_policy(
         model='gpt-4o-mini' if provider == 'openai' else 'glm-4.7',
         secret=secret,
         version=1,
-        metadata={'base_url': base_url},
+        metadata={'base_url': base_url, **(metadata or {})},
     )
 
 
@@ -881,7 +883,7 @@ def test_openai_gateway_sends_json_mode_for_curation_judgment() -> None:
 
 
 @pytest.mark.django_db
-def test_openai_gateway_merges_thinking_and_json_mode_for_deepseek_candidates() -> None:
+def test_openai_gateway_disables_thinking_but_omits_json_mode_for_deepseek_candidates() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, provider='deepseek', task_type='curation')
     completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
@@ -903,7 +905,64 @@ def test_openai_gateway_merges_thinking_and_json_mode_for_deepseek_candidates() 
 
     sent_body = json.loads(opener.requests[0].data)
     assert sent_body['thinking'] == {'type': 'disabled'}
+    assert 'response_format' not in sent_body
+
+
+@pytest.mark.django_db
+def test_openai_gateway_sends_json_mode_for_deepseek_candidates_with_metadata_opt_in() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        provider='deepseek',
+        task_type='curation',
+        metadata={'json_mode': True},
+    )
+    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-opt-in-1',
+            trace_id='json-mode-opt-in-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['thinking'] == {'type': 'disabled'}
     assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_omits_json_mode_for_openai_candidates_with_metadata_opt_out() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation', metadata={'json_mode': False})
+    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-opt-out-1',
+            trace_id='json-mode-opt-out-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'response_format' not in sent_body
 
 
 @pytest.mark.django_db
@@ -1360,6 +1419,36 @@ def test_resolve_context_window_tokens_unknown_model_returns_none() -> None:
     policy = ModelPolicy(model='some-unknown-model', metadata={})
 
     assert resolve_context_window_tokens(policy) is None
+
+
+def test_policy_supports_json_object_defaults_true_for_openai() -> None:
+    policy = ModelPolicy(provider='openai', metadata={})
+
+    assert policy_supports_json_object(policy) is True
+
+
+def test_policy_supports_json_object_defaults_false_for_deepseek() -> None:
+    policy = ModelPolicy(provider='deepseek', metadata={})
+
+    assert policy_supports_json_object(policy) is False
+
+
+def test_policy_supports_json_object_metadata_override_true_for_deepseek() -> None:
+    policy = ModelPolicy(provider='deepseek', metadata={'json_mode': True})
+
+    assert policy_supports_json_object(policy) is True
+
+
+def test_policy_supports_json_object_metadata_override_false_for_openai() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'json_mode': False})
+
+    assert policy_supports_json_object(policy) is False
+
+
+def test_policy_supports_json_object_defaults_false_for_unknown_provider() -> None:
+    policy = ModelPolicy(provider='mystery', metadata={})
+
+    assert policy_supports_json_object(policy) is False
 
 
 @pytest.mark.django_db
