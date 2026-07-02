@@ -59,6 +59,9 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     if result.memory is not None:
         return str(result.memory.id)
 
+    if result.candidate is None:
+        return 'skipped'
+
     return str(result.candidate.id)
 
 

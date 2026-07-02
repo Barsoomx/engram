@@ -57,13 +57,14 @@ class MemoryCandidateWorkerInput:
 
 @dataclass(frozen=True)
 class MemoryCandidateWorkerResult:
-    candidate: MemoryCandidate
+    candidate: MemoryCandidate | None
     duplicate: bool
     memory: Memory | None = None
     memory_version: MemoryVersion | None = None
     retrieval_document: RetrievalDocument | None = None
     held_for_review: bool = False
     curated_decision: str = ''
+    skipped: bool = False
 
 
 class MemoryWorkerError(Exception):
@@ -217,6 +218,13 @@ class RecordMemoryFeedback:
         )
 
 
+def _is_skip(generated: GeneratedMemoryCandidate) -> bool:
+    title = generated.title.strip()
+    body = generated.body.strip()
+
+    return title.upper() == 'SKIP' and body.upper() in ('', 'SKIP')
+
+
 class ProcessObservationRecorded:
     def execute(self, data: MemoryCandidateWorkerInput) -> MemoryCandidateWorkerResult:
         observation = self._read_observation(data.observation_id)
@@ -226,6 +234,15 @@ class ProcessObservationRecorded:
             observation_id=str(data.observation_id),
         )
         generated = self._generate_candidate(observation, correlation_id=correlation_id)
+
+        if _is_skip(generated):
+            self._audit_skipped(observation)
+            logger.info(
+                'memory_candidate_skipped',
+                observation_id=str(observation.id),
+            )
+
+            return MemoryCandidateWorkerResult(candidate=None, duplicate=False, skipped=True)
 
         with transaction.atomic():
             observation = self._lock_observation(data.observation_id)
@@ -367,6 +384,20 @@ class ProcessObservationRecorded:
 
         return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
 
+    def _audit_skipped(self, observation: Observation) -> None:
+        AuditEvent.objects.create(
+            organization=observation.organization,
+            project=observation.project,
+            team=observation.team,
+            event_type='MemoryCandidateSkipped',
+            actor_type='system',
+            target_type='observation',
+            target_id=str(observation.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            metadata={'reason': 'no_durable_signal'},
+        )
+
     def _audit_held(self, observation: Observation, candidate: MemoryCandidate, threshold: Decimal) -> None:
         AuditEvent.objects.create(
             organization=observation.organization,
@@ -474,6 +505,8 @@ def distillation_system_prompt() -> str:
         'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
         '- Be concise. Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
         '- Do not invent facts not present in the input.\n'
+        '- If the observation contains no durable engineering signal (routine status checks, empty '
+        'search results, plain acknowledgements), output exactly SKIP as the entire response.\n'
         '- Do not name any AI assistant, tool, or product by brand.\n'
         '- The Title must stand alone as a searchable summary.\n'
         '- The Body must be self-contained for future retrieval.'
@@ -485,6 +518,9 @@ def provider_prompt(observation: Observation) -> str:
         [
             f'Title: {redact_text(observation.title)}',
             f'Body: {redact_text(observation.body)}',
+            f'Facts: {redact_value(observation.facts)}',
+            f'Narrative: {redact_text(observation.narrative)}',
+            f'Concepts: {redact_value(observation.concepts)}',
             f'Files read: {redact_value(observation.files_read)}',
             f'Files modified: {redact_value(observation.files_modified)}',
             f'Source metadata: {redact_value(observation.source_metadata)}',
