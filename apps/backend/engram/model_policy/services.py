@@ -700,6 +700,24 @@ class ResolveModelPolicy:
         return ResolvedModelPolicy(policy=policy)
 
 
+def _log_repeat_attempt(data: ProviderCallInput | EmbeddingCallInput) -> None:
+    policy = data.policy
+    repeated = ProviderCallRecord.objects.filter(
+        organization_id=data.organization_id,
+        project_id=data.project_id,
+        task_type=policy.task_type,
+        request_id=data.request_id,
+    ).exists()
+    if not repeated:
+        return
+
+    logger.warning(
+        'provider_request_repeated',
+        request_id=data.request_id,
+        task_type=policy.task_type,
+    )
+
+
 class FakeProviderGateway:
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -709,28 +727,7 @@ class FakeProviderGateway:
         if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
             raise ProviderSecretError('provider secret has no active envelope')
 
-        existing_record = (
-            ProviderCallRecord.objects.filter(
-                organization_id=data.organization_id,
-                project_id=data.project_id,
-                task_type=policy.task_type,
-                request_id=data.request_id,
-            )
-            .order_by('created_at')
-            .first()
-        )
-        if existing_record is not None:
-            redacted_prompt = redact_value(data.prompt)
-            generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
-
-            return ProviderCallResult(
-                provider=existing_record.provider,
-                model=existing_record.model,
-                call_record_id=existing_record.id,
-                redaction_state=existing_record.redaction_state,
-                generated_title=generated_title,
-                generated_body=generated_body,
-            )
+        _log_repeat_attempt(data)
 
         redacted_prompt = redact_value(data.prompt)
         generated_title, generated_body = fake_generated_content(data, str(redacted_prompt.value))
@@ -773,27 +770,10 @@ class FakeProviderGateway:
         if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
             raise ProviderSecretError('provider secret has no active envelope')
 
-        existing_record = (
-            ProviderCallRecord.objects.filter(
-                organization_id=data.organization_id,
-                project_id=data.project_id,
-                task_type=policy.task_type,
-                request_id=data.request_id,
-            )
-            .order_by('created_at')
-            .first()
-        )
+        _log_repeat_attempt(data)
+
         redacted_text = redact_value(data.text)
         embedding = tuple(generated_embedding(str(redacted_text.value)))
-        if existing_record is not None:
-            return EmbeddingCallResult(
-                provider=existing_record.provider,
-                model=existing_record.model,
-                call_record_id=existing_record.id,
-                redaction_state=existing_record.redaction_state,
-                embedding=embedding,
-            )
-
         text_was_redacted = redacted_text.redacted or '[REDACTED]' in data.text
         token_count = len(_embedding_grams(str(redacted_text.value)))
         record = ProviderCallRecord.objects.create(
@@ -1007,21 +987,9 @@ class OpenAICompatibleGateway:
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
-        existing_record = self._existing_record(data)
+        _log_repeat_attempt(data)
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
-        if existing_record is not None:
-            title = _completion_title(prompt_text, data.response_kind)
-            body = _completion_body(prompt_text, data.response_kind)
-
-            return ProviderCallResult(
-                provider=existing_record.provider,
-                model=existing_record.model,
-                call_record_id=existing_record.id,
-                redaction_state=existing_record.redaction_state,
-                generated_title=title,
-                generated_body=body,
-            )
 
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
@@ -1052,17 +1020,9 @@ class OpenAICompatibleGateway:
 
     def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
         policy = data.policy
-        existing_record = self._existing_record(data)
+        _log_repeat_attempt(data)
         redacted_text = redact_value(data.text)
         text_value = str(redacted_text.value)
-        if existing_record is not None:
-            return EmbeddingCallResult(
-                provider=existing_record.provider,
-                model=existing_record.model,
-                call_record_id=existing_record.id,
-                redaction_state=existing_record.redaction_state,
-                embedding=self._embeddings(policy.model, text_value),
-            )
 
         embedding = self._embeddings(policy.model, text_value)
         record = self._record_call(
@@ -1078,20 +1038,6 @@ class OpenAICompatibleGateway:
             call_record_id=record.id,
             redaction_state=record.redaction_state,
             embedding=embedding,
-        )
-
-    def _existing_record(self, data: ProviderCallInput | EmbeddingCallInput) -> ProviderCallRecord | None:
-        policy = data.policy
-
-        return (
-            ProviderCallRecord.objects.filter(
-                organization_id=data.organization_id,
-                project_id=data.project_id,
-                task_type=policy.task_type,
-                request_id=data.request_id,
-            )
-            .order_by('created_at')
-            .first()
         )
 
     def _record_call(
@@ -1249,21 +1195,9 @@ class AnthropicMessagesGateway:
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
-        existing_record = self._existing_record(data)
+        _log_repeat_attempt(data)
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
-        if existing_record is not None:
-            title = _completion_title(prompt_text, data.response_kind)
-            body = _completion_body(prompt_text, data.response_kind)
-
-            return ProviderCallResult(
-                provider=existing_record.provider,
-                model=existing_record.model,
-                call_record_id=existing_record.id,
-                redaction_state=existing_record.redaction_state,
-                generated_title=title,
-                generated_body=body,
-            )
 
         content = self._messages(
             policy.model,
@@ -1294,20 +1228,6 @@ class AnthropicMessagesGateway:
         raise ModelPolicyError(
             'anthropic_embeddings_unsupported',
             'Anthropic-compatible providers do not expose embeddings through this gateway',
-        )
-
-    def _existing_record(self, data: ProviderCallInput | EmbeddingCallInput) -> ProviderCallRecord | None:
-        policy = data.policy
-
-        return (
-            ProviderCallRecord.objects.filter(
-                organization_id=data.organization_id,
-                project_id=data.project_id,
-                task_type=policy.task_type,
-                request_id=data.request_id,
-            )
-            .order_by('created_at')
-            .first()
         )
 
     def _record_call(

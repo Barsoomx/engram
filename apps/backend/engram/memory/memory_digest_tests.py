@@ -17,7 +17,13 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
-from engram.memory.services import DigestInput, GenerateDigest, MemoryWorkerError, run_daily_digest_with_tracking
+from engram.memory.services import (
+    DigestInput,
+    GenerateDigest,
+    MemoryWorkerError,
+    digest_content_hash,
+    run_daily_digest_with_tracking,
+)
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import ModelPolicyError
@@ -152,6 +158,53 @@ def test_generate_digest_is_idempotent_on_replay() -> None:
     assert result2.memory.id == result1.memory.id
     assert result2.memory_version.id == result1.memory_version.id
     assert result2.retrieval_document.id == result1.retrieval_document.id
+
+
+@pytest.mark.django_db
+def test_generate_digest_makes_real_call_when_provider_record_exists_without_memory(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='digest',
+        base_url='https://provider.example/v1',
+        raw_key='real-key',
+    )
+    source = create_source_memory(organization, team, project, title='Orphan record source')
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+    completion = {'choices': [{'message': {'content': 'Digest title\nFresh synthesized digest body.'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    m_monkeypatch.setattr('urllib.request.urlopen', opener)
+    request_id = 'digest-orphan-1'
+    content_hash = digest_content_hash(project.id, (source.id,))
+    ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        policy=policy,
+        secret=policy.secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type='digest',
+        policy_version=policy.version,
+        request_id=f'{request_id}:{content_hash}',
+        trace_id=request_id,
+        redaction_state='clean',
+        token_usage={'input_tokens': 1, 'output_tokens': 0},
+        cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+        metadata={'prompt_retained': False},
+    )
+
+    result = GenerateDigest().execute(
+        DigestInput(project_id=project.id, memory_ids=(source.id,), request_id=request_id),
+    )
+
+    assert len(opener.requests) == 1
+    assert result.memory.body == 'Fresh synthesized digest body.'
+    assert 'Orphan record source' not in result.memory.body
+    assert ProviderCallRecord.objects.filter(request_id=f'{request_id}:{content_hash}').count() == 2
 
 
 @pytest.mark.django_db

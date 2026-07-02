@@ -61,6 +61,99 @@ def _opener_raising(error: Exception) -> Any:
     return opener
 
 
+def _opener_returning_sequence(bodies: list[bytes]) -> Any:
+    def opener(request: Any, timeout: float = 30) -> _FakeResponse:
+        index = len(opener.requests)  # type: ignore[attr-defined]
+        opener.requests.append(request)  # type: ignore[attr-defined]
+
+        return _FakeResponse(bodies[index])
+
+    opener.requests = []  # type: ignore[attr-defined]
+
+    return opener
+
+
+_ANTHROPIC_TOOL_NAME_BY_KIND = {'candidates': 'emit_memories', 'curation_judgment': 'emit_judgment'}
+
+
+def _response_bytes_for(gateway_cls: type, response_kind: str, label: str) -> tuple[bytes, str, str]:
+    if response_kind == 'single':
+        content = f'Response title {label}\nResponse body {label} line'
+        title = f'Response title {label}'
+        body = f'Response body {label} line'
+    elif response_kind == 'candidates':
+        payload: dict[str, Any] = {
+            'memories': [
+                {
+                    'title': f'Memory title {label}',
+                    'body': f'Memory body {label}',
+                    'confidence': 0.5,
+                    'supporting_observation_ids': [],
+                    'source_ids': [0],
+                },
+            ],
+        }
+        content = json.dumps(payload)
+        title = ''
+        body = content
+    else:
+        payload = {'decision': 'reject', 'reason': f'reason {label}'}
+        content = json.dumps(payload)
+        title = ''
+        body = content
+
+    if gateway_cls is OpenAICompatibleGateway:
+        response: dict[str, Any] = {'choices': [{'message': {'content': content}}]}
+    elif response_kind == 'single':
+        response = {'content': [{'type': 'text', 'text': content}]}
+    else:
+        tool_name = _ANTHROPIC_TOOL_NAME_BY_KIND[response_kind]
+        response = {'content': [{'type': 'tool_use', 'name': tool_name, 'input': json.loads(content)}]}
+
+    return json.dumps(response).encode(), title, body
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment'])
+@pytest.mark.parametrize('gateway_cls', [OpenAICompatibleGateway, AnthropicMessagesGateway])
+def test_gateway_call_never_echoes_prompt_on_repeated_request_id(
+    gateway_cls: type,
+    response_kind: str,
+) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    provider = 'openai' if gateway_cls is OpenAICompatibleGateway else 'anthropic'
+    policy = make_real_policy(organization, project, provider=provider, base_url='https://provider.example/v1')
+
+    body_a, _title_a, expected_body_a = _response_bytes_for(gateway_cls, response_kind, 'A')
+    body_b, title_b, expected_body_b = _response_bytes_for(gateway_cls, response_kind, 'B')
+    opener = _opener_returning_sequence([body_a, body_b])
+    gateway = gateway_cls(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    prompt_text = 'PROMPT_MARKER_never_should_appear_in_output for repeated request replay'
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        policy=policy,
+        request_id='anti-echo-1',
+        trace_id='anti-echo-1',
+        prompt=prompt_text,
+        response_kind=response_kind,
+    )
+
+    first = gateway.call(data)
+    second = gateway.call(data)
+
+    assert len(opener.requests) == 2
+    assert second.generated_body == expected_body_b
+    assert second.generated_body != expected_body_a
+    assert second.generated_title == title_b
+    assert prompt_text not in second.generated_body
+    assert prompt_text not in second.generated_title
+    assert second.call_record_id != first.call_record_id
+    assert ProviderCallRecord.objects.filter(request_id='anti-echo-1').count() == 2
+
+
 def make_real_policy(
     organization: Any,
     project: Any,
@@ -303,7 +396,7 @@ def test_openai_gateway_omits_thinking_for_non_deepseek_cheap_tier() -> None:
 
 
 @pytest.mark.django_db
-def test_openai_compatible_gateway_call_reuses_record() -> None:
+def test_openai_compatible_gateway_call_makes_fresh_provider_call_on_repeat() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)
     opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
@@ -321,8 +414,9 @@ def test_openai_compatible_gateway_call_reuses_record() -> None:
     first = gateway.call(data)
     second = gateway.call(data)
 
-    assert second.call_record_id == first.call_record_id
-    assert ProviderCallRecord.objects.filter(request_id='real-call-reuse').count() == 1
+    assert second.call_record_id != first.call_record_id
+    assert len(opener.requests) == 2
+    assert ProviderCallRecord.objects.filter(request_id='real-call-reuse').count() == 2
 
 
 @pytest.mark.django_db
