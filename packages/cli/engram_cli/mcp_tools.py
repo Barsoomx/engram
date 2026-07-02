@@ -7,12 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram_cli.commands import _git_remote_url
+from engram_cli.commands import git_remote_url
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
 ToolFn = Callable[[dict[str, Any]], str]
-HandlerFn = Callable[[dict[str, Any], "str | None", Transport], str]
+HandlerFn = Callable[[dict[str, Any], str | None, Transport], str]
 
 NOT_CONFIGURED_MESSAGE = (
     "Engram MCP bridge is not configured. Run `engram connect` first, or set "
@@ -47,7 +47,7 @@ def resolve_runtime(config_dir: str | None = None) -> McpRuntime | None:
     )
     team_id = os.environ.get("ENGRAM_TEAM_ID") or as_string(config.get("team_id"))
     agent_runtime = os.environ.get("ENGRAM_AGENT_RUNTIME") or "codex"
-    repository_url = "" if project_id else _git_remote_url(os.getcwd())
+    repository_url = "" if project_id else git_remote_url(os.getcwd())
     if not server_url or not api_key:
         return None
 
@@ -62,6 +62,19 @@ def resolve_runtime(config_dir: str | None = None) -> McpRuntime | None:
         repository_url=repository_url,
         agent_runtime=agent_runtime,
     )
+
+
+def _require_runtime(
+    config_dir: str | None, *, require_project: bool = False
+) -> tuple[McpRuntime | None, str]:
+    runtime = resolve_runtime(config_dir)
+    if runtime is None:
+        return None, NOT_CONFIGURED_MESSAGE
+
+    if require_project and not runtime.project_id:
+        return None, PROJECT_REQUIRED_MESSAGE
+
+    return runtime, ""
 
 
 def build_tools(
@@ -88,9 +101,9 @@ def build_tools(
 def search_memory(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
+        return error
 
     payload = _scope_payload(runtime)
     payload.update(
@@ -132,9 +145,9 @@ def fetch_context(
     if not session_id:
         return "engram_context requires session_id."
 
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
+        return error
 
     payload = _scope_payload(runtime)
     payload.update(
@@ -174,12 +187,9 @@ def create_memory_link(
     if not memory_id or not link_type or not target:
         return "engram_memory_link requires memory_id, link_type, and target."
 
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir, require_project=True)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
-
-    if not runtime.project_id:
-        return PROJECT_REQUIRED_MESSAGE
+        return error
 
     payload = _project_payload(runtime)
     payload.update(
@@ -209,12 +219,9 @@ def create_memory_link(
 def list_observations(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir, require_project=True)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
-
-    if not runtime.project_id:
-        return PROJECT_REQUIRED_MESSAGE
+        return error
 
     params: dict[str, str] = {
         "project_id": runtime.project_id,
@@ -256,12 +263,9 @@ def update_memory_version(
     if not memory_id or not body_text:
         return "engram_memory_version requires memory_id and body."
 
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir, require_project=True)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
-
-    if not runtime.project_id:
-        return PROJECT_REQUIRED_MESSAGE
+        return error
 
     payload = _project_payload(runtime)
     payload.update(
@@ -300,12 +304,9 @@ def submit_memory_feedback(
             "(stale or refuted), and reason."
         )
 
-    runtime = resolve_runtime(config_dir)
+    runtime, error = _require_runtime(config_dir, require_project=True)
     if runtime is None:
-        return NOT_CONFIGURED_MESSAGE
-
-    if not runtime.project_id:
-        return PROJECT_REQUIRED_MESSAGE
+        return error
 
     payload = _project_payload(runtime)
     payload.update(

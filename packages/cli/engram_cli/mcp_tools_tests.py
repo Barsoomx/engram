@@ -71,7 +71,7 @@ class McpToolsTests(unittest.TestCase):
         )
 
     def test_resolve_runtime_returns_none_without_any_config(self) -> None:
-        with mock.patch.object(mcp_tools, "_git_remote_url", return_value=""):
+        with mock.patch.object(mcp_tools, "git_remote_url", return_value=""):
             runtime = mcp_tools.resolve_runtime(self.config_dir)
 
         self.assertIsNone(runtime)
@@ -96,7 +96,7 @@ class McpToolsTests(unittest.TestCase):
     def test_repository_url_fallback_without_project_id(self) -> None:
         self.write_local_config(project_id="")
         with mock.patch.object(
-            mcp_tools, "_git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
         ):
             runtime = mcp_tools.resolve_runtime(self.config_dir)
 
@@ -121,11 +121,29 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("Bearer egk_file_key", headers["Authorization"])
         self.assertIn("[c-1] T", text)
 
+    def test_search_renders_valid_entries_and_skips_garbage(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {"citation": "c-1", "title": "T", "body": "B"},
+                    "garbage",
+                    None,
+                ]
+            }
+        )
+        text = mcp_tools.search_memory(
+            {"query": "auth"}, self.config_dir, transport
+        )
+
+        self.assertIn("[c-1] T", text)
+        self.assertNotIn("garbage", text)
+
     def test_search_uses_repository_url_when_no_project(self) -> None:
         self.write_local_config(project_id="")
         transport = StubTransport(body={"items": []})
         with mock.patch.object(
-            mcp_tools, "_git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
         ):
             mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
 
@@ -272,7 +290,7 @@ class McpToolsTests(unittest.TestCase):
     def test_project_required_for_writes_in_repo_mode(self) -> None:
         self.write_local_config(project_id="")
         with mock.patch.object(
-            mcp_tools, "_git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
         ):
             version_text = mcp_tools.update_memory_version(
                 {"memory_id": "m-1", "body": "x"}, self.config_dir, StubTransport()
@@ -298,6 +316,15 @@ class McpToolsTests(unittest.TestCase):
             ],
             list(tools.keys()),
         )
+
+    def test_build_tools_forwards_config_dir_and_transport(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        tools = mcp_tools.build_tools(self.config_dir, transport)
+        tools["engram_search"]({"query": "x"})
+
+        self.assertEqual(1, len(transport.calls))
+        self.assertTrue(transport.calls[0][1].endswith("/v1/search/"))
 
 
 if __name__ == "__main__":

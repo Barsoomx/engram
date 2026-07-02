@@ -577,7 +577,7 @@ def _as_text(value: object) -> str:
     return str(value)
 
 
-def _git_remote_url(path: str) -> str:
+def git_remote_url(path: str) -> str:
     if not path:
         return ""
     try:
@@ -1284,7 +1284,7 @@ def base_hook_payload(
     team_id = as_string(config.get("team_id"))
     if team_id:
         payload["team_id"] = team_id
-    repository_url = payload_string(input_payload, "repository_url") or _git_remote_url(
+    repository_url = payload_string(input_payload, "repository_url") or git_remote_url(
         payload_string(input_payload, "repository_root")
         or payload_string(input_payload, "cwd")
     )
@@ -1723,7 +1723,7 @@ def run_search(
         server_url = normalize_server_url(as_string(config.get("server_url")))
         repository_url = ""
         if not as_string(config.get("project_id")):
-            repository_url = _git_remote_url(os.getcwd())
+            repository_url = git_remote_url(os.getcwd())
         payload = build_search_payload(
             config,
             query=args.query or "",
