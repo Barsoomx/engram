@@ -41,7 +41,7 @@ def test_bootstrap_creates_organization_scope_policies_for_auto_projects() -> No
     result = bootstrap_golden_path(RAW_KEY, agent_key=RAW_AGENT_KEY)
 
     organization_id = result['organization_id']
-    for task_type in ('generation', 'embedding'):
+    for task_type in ('generation', 'embedding', 'digest', 'curation'):
         assert ModelPolicy.objects.filter(
             organization_id=organization_id,
             scope='organization',
@@ -58,6 +58,20 @@ def test_bootstrap_agent_key_is_idempotent() -> None:
     bootstrap_golden_path(RAW_KEY, agent_key=RAW_AGENT_KEY)
 
     assert ApiKey.objects.filter(key_hash=hash_api_key(RAW_AGENT_KEY)).count() == 1
+
+
+@pytest.mark.django_db
+def test_bootstrap_provider_base_url_lands_in_all_policies() -> None:
+    bootstrap_golden_path(
+        RAW_KEY,
+        agent_key=RAW_AGENT_KEY,
+        provider_base_url='http://host.docker.internal:9999/v1',
+    )
+
+    policies = ModelPolicy.objects.all()
+    assert policies.count() == 6
+    for policy in policies:
+        assert policy.metadata.get('base_url') == 'http://host.docker.internal:9999/v1'
 
 
 @pytest.mark.django_db

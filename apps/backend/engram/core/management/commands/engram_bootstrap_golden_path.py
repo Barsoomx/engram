@@ -33,10 +33,15 @@ class Command(BaseCommand):
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument('--api-key', required=True)
         parser.add_argument('--agent-key', default='', dest='agent_key')
+        parser.add_argument('--provider-base-url', default='', dest='provider_base_url')
         parser.add_argument('--json', action='store_true', dest='as_json')
 
     def handle(self, *args: Any, **options: Any) -> None:
-        result = bootstrap_golden_path(str(options['api_key']), agent_key=str(options['agent_key']) or None)
+        result = bootstrap_golden_path(
+            str(options['api_key']),
+            agent_key=str(options['agent_key']) or None,
+            provider_base_url=str(options['provider_base_url']) or None,
+        )
         if options['as_json']:
             self.stdout.write(json.dumps(result, sort_keys=True))
 
@@ -48,7 +53,13 @@ class Command(BaseCommand):
         self.stdout.write(f'api_key_fingerprint={result["api_key_fingerprint"]}')
 
 
-def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict[str, object]:
+def bootstrap_golden_path(
+    raw_key: str,
+    *,
+    agent_key: str | None = None,
+    provider_base_url: str | None = None,
+) -> dict[str, object]:
+    policy_metadata = {'base_url': provider_base_url} if provider_base_url else {}
     with transaction.atomic():
         organization, _created = Organization.objects.update_or_create(
             slug='engram-e2e',
@@ -155,6 +166,7 @@ def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict
                 'secret': provider_secret,
                 'version': 1,
                 'active': True,
+                'metadata': policy_metadata,
             },
         )
         embedding_policy, _created = ModelPolicy.objects.update_or_create(
@@ -170,6 +182,7 @@ def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict
                 'secret': provider_secret,
                 'version': 1,
                 'active': True,
+                'metadata': policy_metadata,
             },
         )
 
@@ -186,6 +199,7 @@ def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict
                 'secret': provider_secret,
                 'version': 1,
                 'active': True,
+                'metadata': policy_metadata,
             },
         )
         organization_embedding_policy, _created = ModelPolicy.objects.update_or_create(
@@ -201,8 +215,26 @@ def bootstrap_golden_path(raw_key: str, *, agent_key: str | None = None) -> dict
                 'secret': provider_secret,
                 'version': 1,
                 'active': True,
+                'metadata': policy_metadata,
             },
         )
+        for organization_task_type in ('digest', 'curation'):
+            ModelPolicy.objects.update_or_create(
+                organization=organization,
+                team=None,
+                project=None,
+                task_type=organization_task_type,
+                scope='organization',
+                defaults={
+                    'name': f'Golden path org {organization_task_type}',
+                    'provider': 'openai',
+                    'model': 'gpt-4.1-mini',
+                    'secret': provider_secret,
+                    'version': 1,
+                    'active': True,
+                    'metadata': policy_metadata,
+                },
+            )
 
         result: dict[str, object] = {
             'organization_id': str(organization.id),

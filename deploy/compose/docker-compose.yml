@@ -12,6 +12,9 @@ x-backend: &backend
     ENGRAM_REDIS_URL: redis://redis:6379/0
     ENGRAM_CELERY_BROKER_URL: amqp://engram:engram@rabbitmq:5672/engram
     ENGRAM_CELERY_RESULT_BACKEND: redis://redis:6379/1
+    ENGRAM_PROVIDER_MODE: ${ENGRAM_PROVIDER_MODE:-fake}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
   depends_on:
     postgres:
       condition: service_healthy
@@ -121,6 +124,7 @@ services:
       sh -ec "python manage.py celery_outbox_relay"
 
   frontend:
+    image: engram-frontend:local
     build:
       context: ../../apps/frontend
       dockerfile: Dockerfile

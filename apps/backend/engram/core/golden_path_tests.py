@@ -133,4 +133,4 @@ def test_bootstrap_golden_path_is_idempotent() -> None:
     assert ApiKeyCapability.objects.count() == 2
     assert ProviderSecret.objects.count() == 1
     assert ProviderSecretEnvelope.objects.count() == 1
-    assert ModelPolicy.objects.count() == 4
+    assert ModelPolicy.objects.count() == 6
