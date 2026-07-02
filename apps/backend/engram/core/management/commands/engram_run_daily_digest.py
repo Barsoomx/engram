@@ -36,7 +36,7 @@ class Command(BaseCommand):
                     status=MemoryStatus.APPROVED,
                     updated_at__gte=window_start,
                 )
-                .exclude(metadata__kind='digest')
+                .exclude(kind='digest')
                 .values_list('id', flat=True),
             )
             if not memory_ids:
