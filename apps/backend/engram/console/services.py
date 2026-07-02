@@ -41,6 +41,7 @@ from engram.core.models import (
     Project,
     Team,
 )
+from engram.core.repository import canonicalize_repository_url
 
 OWNER_ROLE_CODE = 'organization_owner'
 
@@ -112,7 +113,7 @@ def create_project(
         organization=organization,
         name=name,
         slug=slug,
-        repository_url=repository_url,
+        repository_url=canonicalize_repository_url(repository_url) or repository_url,
         default_branch=default_branch,
     )
 

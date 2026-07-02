@@ -32,18 +32,15 @@ Run it without cloning the repo via `uvx`:
 
 ```bash
 uvx engram-connect install \
-  --server <URL> --api-key <KEY> --project <PROJECT_ID>
-```
+  --server <URL> --api-key <KEY>```
 
 Before the package is published to PyPI, install straight from git or `pipx`:
 
 ```bash
 uvx --from "git+https://github.com/Barsoomx/engram.git#subdirectory=packages/cli" \
-  engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
-# or:
+  engram install --server <URL> --api-key <KEY># or:
 pipx install engram-connect
-engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
-```
+engram install --server <URL> --api-key <KEY>```
 
 The plugin steps run `claude plugin marketplace add <--marketplace-source>` then
 `claude plugin install <--plugin-name>@<--marketplace-name>` using the `claude`

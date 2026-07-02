@@ -8,8 +8,6 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
-  Select,
-  SelectItem,
 } from '@heroui/react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
@@ -25,7 +23,6 @@ import NextLink from 'next/link';
 import * as React from 'react';
 
 import { useIssueApiKey } from '@/hooks/use-api-keys';
-import { listProjects, type Paginated, type Project } from '@/lib/admin-api';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   buildConnectCommand,
@@ -33,13 +30,12 @@ import {
   PLUGIN_INSTALL_COMMAND,
 } from '@/lib/build-connect-command';
 import { useOrgStore } from '@/lib/org-store';
-import { useProjectStore } from '@/lib/project-store';
-import { adminQueryKeys } from '@/lib/query-keys';
 
 const CONNECT_CAPABILITIES = [
   'memories:read',
   'observations:write',
   'search:query',
+  'projects:agent',
 ];
 
 function defaultServerUrl(): string {
@@ -63,24 +59,15 @@ interface ConnectAgentModalProps {
 
 export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
-  const activeProjectId = useProjectStore((state) => state.activeProjectId);
 
   const meQuery = useQuery<MeResponse>({
     queryKey: ['auth', 'me'],
     queryFn: fetchMe,
   });
 
-  const projectsParams = React.useMemo(() => ({ page: 1, pageSize: 100 }), []);
-  const projectsQuery = useQuery<Paginated<Project>>({
-    queryKey: adminQueryKeys.projects(activeOrgId, projectsParams),
-    queryFn: () => listProjects(projectsParams),
-    enabled: Boolean(activeOrgId) && isOpen,
-  });
-
   const issueMutation = useIssueApiKey(activeOrgId);
 
   const [serverUrl, setServerUrl] = React.useState<string>(defaultServerUrl);
-  const [selectedProjectId, setSelectedProjectId] = React.useState<string | null>(null);
   const [issued, setIssued] = React.useState<IssuedCommand | null>(null);
   const [issueError, setIssueError] = React.useState<string | null>(null);
   const [fallbackOpen, setFallbackOpen] = React.useState(false);
@@ -89,7 +76,6 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   React.useEffect(() => {
     if (!isOpen) {
       setServerUrl(defaultServerUrl());
-      setSelectedProjectId(null);
       setIssued(null);
       setIssueError(null);
       setFallbackOpen(false);
@@ -104,16 +90,6 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   const canIssue = hasCapability(capabilities, 'api_keys:issue');
   const meLoaded = meQuery.data !== undefined;
 
-  const projects = React.useMemo(
-    () => projectsQuery.data?.results ?? [],
-    [projectsQuery.data?.results],
-  );
-  const effectiveProjectId =
-    selectedProjectId ?? activeProjectId ?? projects[0]?.id ?? null;
-  const selectedProject = projects.find(
-    (project) => project.id === effectiveProjectId,
-  );
-
   async function copyText(id: string, text: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -124,31 +100,19 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   }
 
   async function handleGenerate() {
-    if (!effectiveProjectId) {
-
-      return;
-    }
-
     setIssueError(null);
-
-    const projectSlug = selectedProject?.slug ?? effectiveProjectId;
 
     try {
       const result = await issueMutation.mutateAsync({
-        name: `claude-code · ${projectSlug}`,
+        name: 'claude-code agent',
         capabilities: CONNECT_CAPABILITIES,
       });
 
       setIssued({
-        command: buildConnectCommand({
-          serverUrl,
-          apiKey: result.plaintext,
-          projectId: effectiveProjectId,
-        }),
+        command: buildConnectCommand({ serverUrl, apiKey: result.plaintext }),
         fallbackCommand: buildConnectFallbackCommand({
           serverUrl,
           apiKey: result.plaintext,
-          projectId: effectiveProjectId,
         }),
         keyPrefix: result.key_prefix,
         keyFingerprint: result.key_fingerprint,
@@ -167,8 +131,7 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   }
 
   const isIssuing = issueMutation.isPending;
-  const canGenerate =
-    canIssue && Boolean(effectiveProjectId) && serverUrl.trim().length > 0 && !isIssuing;
+  const canGenerate = canIssue && serverUrl.trim().length > 0 && !isIssuing;
 
   return (
     <Modal
@@ -220,9 +183,9 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
                         Copy it now. You will not see this again.
                       </p>
                       <p className='text-xs text-default-500'>
-                        Engram stores only a hashed fingerprint. The key embedded
-                        in this command is shown once and discarded when you close
-                        this dialog.
+                        One key works across all your repositories — Engram routes
+                        memory to the right project by git remote. The key is shown
+                        once and discarded when you close this dialog.
                       </p>
                     </div>
                   </div>
@@ -298,34 +261,11 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
               ) : (
                 <div className='space-y-4'>
                   <p className='text-sm text-default-500'>
-                    Issue a scoped key and get a one-line command to install the
-                    Engram plugin into a Claude Code harness.
+                    Issue an org-wide agent key and get a one-line command to
+                    install the Engram plugin into a Claude Code harness. One key
+                    covers every repository; memory is routed per project by git
+                    remote.
                   </p>
-                  <Select
-                    label='Project'
-                    labelPlacement='outside'
-                    placeholder={
-                      projectsQuery.isLoading ? 'Loading projects…' : 'Select a project'
-                    }
-                    selectedKeys={
-                      new Set<string>(effectiveProjectId ? [effectiveProjectId] : [])
-                    }
-                    onSelectionChange={(keys) => {
-                      const next = Array.from(keys)[0];
-
-                      setSelectedProjectId(typeof next === 'string' ? next : null);
-                    }}
-                    isDisabled={isIssuing || projects.length === 0}
-                  >
-                    {projects.map((project) => (
-                      <SelectItem key={project.id}>{project.name}</SelectItem>
-                    ))}
-                  </Select>
-                  {!projectsQuery.isLoading && projects.length === 0 && (
-                    <p className='text-xs text-default-500'>
-                      No projects available for this organization yet.
-                    </p>
-                  )}
                   <Input
                     label='Server URL'
                     labelPlacement='outside'
