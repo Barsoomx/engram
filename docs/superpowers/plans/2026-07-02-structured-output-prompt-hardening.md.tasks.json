@@ -31,24 +31,24 @@
     {
       "id": 14,
       "subject": "Task 4: Per-observation distillation — richer prompt fields + SKIP protocol",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [13],
       "description": "See plan Task 4: provider_prompt adds Facts/Narrative/Concepts; distillation_system_prompt adds SKIP rule; MemoryCandidateWorkerResult.candidate optional + skipped flag; ProcessObservationRecorded early-return + MemoryCandidateSkipped audit; tasks.py returns 'skipped'.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/memory/services.py\", \"apps/backend/engram/memory/tasks.py\", \"apps/backend/engram/memory/services_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/memory/services_tests.py engram/memory/tasks_tests.py engram/memory/memory_worker_tests.py -q\", \"acceptanceCriteria\": [\"provider_prompt carries facts/narrative/concepts\", \"SKIP creates no candidate + audit event\", \"non-SKIP flow unchanged\", \"celery task returns skipped\"], \"modelTier\": \"standard\"}\n```"
     },
     {
       "id": 15,
       "subject": "Task 5: Curation judge reason field + decision logging",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [14],
       "description": "See plan Task 5: judge prompt requires decision+reason; parse_curation_reason defensive helper; _judge_decision logs curation_judge_decision with decision+reason; parse_curation_decision unchanged.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/memory/curation.py\", \"apps/backend/engram/memory/curation_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/memory/curation_tests.py -q\", \"acceptanceCriteria\": [\"prompt requires decision+reason\", \"parse_curation_reason defensive\", \"decision+reason logged\", \"decision parsing unchanged\"], \"modelTier\": \"mechanical\"}\n```"
     },
     {
       "id": 16,
       "subject": "Task 6: Full verification + draft PR",
-      "status": "pending",
+      "status": "completed",
       "blockedBy": [15],
       "description": "Full backend pytest + ruff check + ruff format --check in engram-tester-so; push feat/provider-structured-output; draft PR with evidence and merge-risk note (parallel chunking WIP in distillation.py).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"docker exec engram-tester-so bash -c 'pytest -q && ruff check . && ruff format --check .'\", \"acceptanceCriteria\": [\"full suite green\", \"lint green\", \"draft PR opened with evidence\"], \"modelTier\": \"standard\"}\n```"
     }
   ],
-  "lastUpdated": "2026-07-02T19:05:00Z"
+  "lastUpdated": "2026-07-03T00:20:00Z"
 }
