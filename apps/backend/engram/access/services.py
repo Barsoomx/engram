@@ -287,7 +287,10 @@ class ResolveApiKeyScope:
 
             return (key.project_id,)
 
-        if not self._has_project_admin(effective_capabilities):
+        if not (
+            self._has_project_admin(effective_capabilities)
+            or self._has_agent_scope(effective_capabilities)
+        ):
             return None
 
         if requested_project_id is None:
@@ -298,13 +301,18 @@ class ResolveApiKeyScope:
         project_exists = Project.objects.filter(organization=key.organization, id=requested_project_id).exists()
         if not project_exists:
             return None
-        if self._owner_can_access_project(key, owner_capabilities, requested_project_id):
+        if self._has_agent_scope(effective_capabilities) or self._owner_can_access_project(
+            key, owner_capabilities, requested_project_id
+        ):
             return (requested_project_id,)
 
         return None
 
     def _has_project_admin(self, capabilities: set[str]) -> bool:
         return bool({'projects:*', 'policy:admin'} & capabilities)
+
+    def _has_agent_scope(self, capabilities: set[str]) -> bool:
+        return 'projects:agent' in capabilities
 
     def _has_team_admin(self, capabilities: set[str]) -> bool:
         return bool({'teams:*', 'policy:admin'} & capabilities)
