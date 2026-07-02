@@ -74,7 +74,7 @@ enable_utc = True
 
 task_routes = {
     'engram.memory.process_observation_recorded': {'queue': QUEUE_NEAR_REALTIME},
-    'engram.memory.distill_session': {'queue': QUEUE_NEAR_REALTIME},
+    'engram.memory.distill_session': {'queue': QUEUE_BATCH},
     'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
     'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},
     'engram.memory.sweep_stale_sessions': {'queue': QUEUE_BATCH},
