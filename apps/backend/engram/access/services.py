@@ -287,10 +287,7 @@ class ResolveApiKeyScope:
 
             return (key.project_id,)
 
-        if not (
-            self._has_project_admin(effective_capabilities)
-            or self._has_agent_scope(effective_capabilities)
-        ):
+        if not (self._has_project_admin(effective_capabilities) or self._has_agent_scope(effective_capabilities)):
             return None
 
         if requested_project_id is None:

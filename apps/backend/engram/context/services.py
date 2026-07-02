@@ -13,7 +13,6 @@ from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
 from engram.core.domain.usecases.errors import DomainError
-from engram.core.repository import resolve_or_create_project
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -33,6 +32,7 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
+from engram.core.repository import resolve_or_create_project
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,

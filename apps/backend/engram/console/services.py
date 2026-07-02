@@ -10,7 +10,6 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import status
 
-from engram.core.repository import canonicalize_repository_url
 from engram.access.models import (
     ApiKey,
     ApiKeyCapability,
@@ -42,6 +41,7 @@ from engram.core.models import (
     Project,
     Team,
 )
+from engram.core.repository import canonicalize_repository_url
 
 OWNER_ROLE_CODE = 'organization_owner'
 
