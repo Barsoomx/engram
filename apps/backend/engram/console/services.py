@@ -27,7 +27,6 @@ from engram.access.services import (
     hash_api_key,
 )
 from engram.console.exceptions import (
-    LastOwnerError,
     MemberAlreadyInvitedError,
     ProjectSlugTakenError,
     TeamSlugTakenError,
@@ -51,19 +50,9 @@ from engram.core.repository import canonicalize_repository_url
 
 logger = structlog.get_logger(__name__)
 
-OWNER_ROLE_CODE = 'organization_owner'
-
 API_KEY_TOKEN_PREFIX = 'egk_'
 
 WILDCARD_ADMIN_CAPABILITY = 'policy:admin'
-
-
-def _active_owner_count(organization: Organization) -> int:
-    return OrganizationMembership.objects.filter(
-        organization=organization,
-        role__code=OWNER_ROLE_CODE,
-        active=True,
-    ).count()
 
 
 def audit_admin_action(
@@ -214,23 +203,6 @@ def invite_member(
     return membership
 
 
-@transaction.atomic
-def set_member_role(membership: OrganizationMembership, role: Role) -> OrganizationMembership:
-    is_current_owner = membership.role.code == OWNER_ROLE_CODE and membership.active
-
-    if is_current_owner and role.code != OWNER_ROLE_CODE:
-        if _active_owner_count(membership.organization) <= 1:
-            raise LastOwnerError(
-                'cannot demote the last active organization owner',
-            )
-
-    membership.role = role
-
-    membership.save(update_fields=['role', 'updated_at'])
-
-    return membership
-
-
 class MemberNotFoundError(Exception):
     pass
 
@@ -269,22 +241,6 @@ def activate_member(
         organization_id=str(organization.id),
         identity_id=str(membership.identity_id),
     )
-
-    return membership
-
-
-@transaction.atomic
-def remove_member(membership: OrganizationMembership) -> OrganizationMembership:
-    is_current_owner = membership.role.code == OWNER_ROLE_CODE and membership.active
-
-    if is_current_owner and _active_owner_count(membership.organization) <= 1:
-        raise LastOwnerError(
-            'cannot remove the last active organization owner',
-        )
-
-    membership.active = False
-
-    membership.save(update_fields=['active', 'updated_at'])
 
     return membership
 

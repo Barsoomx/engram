@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db import transaction
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.serializers import BaseSerializer
-from rest_framework.status import HTTP_204_NO_CONTENT, HTTP_409_CONFLICT
+from rest_framework.status import HTTP_204_NO_CONTENT
 
 from engram.access.models import OrganizationMembership
-from engram.console.exceptions import LastOwnerError
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.members import (
@@ -22,8 +22,12 @@ from engram.console.services import (
     activate_member,
     audit_admin_action,
     invite_member,
-    remove_member,
-    set_member_role,
+)
+from engram.console.usecases.members import (
+    RemoveMember,
+    RemoveMemberInput,
+    SetMemberRole,
+    SetMemberRoleInput,
 )
 
 
@@ -103,7 +107,9 @@ class MemberViewSet(
 
         previous_role = membership.role.code
 
-        set_member_role(membership, new_role)
+        SetMemberRole(user=self.request.user, transaction=transaction.atomic()).execute(
+            SetMemberRoleInput(membership=membership, role=new_role),
+        )
 
         audit_admin_action(
             organization=self.request.active_organization,
@@ -134,7 +140,9 @@ class MemberViewSet(
     def destroy(self, request: Request, *args: Any, **kwargs: Any) -> Response:
         membership = self.get_object()
 
-        remove_member(membership)
+        RemoveMember(user=self.request.user, transaction=transaction.atomic()).execute(
+            RemoveMemberInput(membership=membership),
+        )
 
         audit_admin_action(
             organization=self.request.active_organization,
@@ -145,12 +153,3 @@ class MemberViewSet(
         )
 
         return Response(status=HTTP_204_NO_CONTENT)
-
-    def handle_exception(self, exc: Exception) -> Response:
-        if isinstance(exc, LastOwnerError):
-            return Response(
-                {'code': 'last_owner', 'detail': str(exc)},
-                status=HTTP_409_CONFLICT,
-            )
-
-        return super().handle_exception(exc)
