@@ -331,3 +331,48 @@ def test_process_observation_skip_creates_no_candidate(monkeypatch: pytest.Monke
         event_type='MemoryCandidateSkipped',
         target_id=str(observation.id),
     ).exists()
+
+
+@pytest.mark.django_db
+def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    second_run_calls: list[int] = []
+
+    class _SkipGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            real = FakeProviderGateway.call(self, data)
+
+            return ProviderCallResult(
+                provider=real.provider,
+                model=real.model,
+                call_record_id=real.call_record_id,
+                redaction_state=real.redaction_state,
+                generated_title='SKIP',
+                generated_body='',
+            )
+
+    class _CountingGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            second_run_calls.append(1)
+
+            return FakeProviderGateway.call(self, data)
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _SkipGateway())
+    ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _CountingGateway())
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert result.duplicate is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+    assert (
+        AuditEvent.objects.filter(
+            event_type='MemoryCandidateSkipped',
+            target_id=str(observation.id),
+        ).count()
+        == 1
+    )
+    assert second_run_calls == []

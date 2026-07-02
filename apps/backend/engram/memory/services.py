@@ -233,6 +233,9 @@ class ProcessObservationRecorded:
             correlation_id=correlation_id,
             observation_id=str(data.observation_id),
         )
+        if self._already_skipped(observation):
+            return MemoryCandidateWorkerResult(candidate=None, duplicate=True, skipped=True)
+
         generated = self._generate_candidate(observation, correlation_id=correlation_id)
 
         if _is_skip(generated):
@@ -384,6 +387,15 @@ class ProcessObservationRecorded:
 
         return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
 
+    def _already_skipped(self, observation: Observation) -> bool:
+        return AuditEvent.objects.filter(
+            organization=observation.organization,
+            project=observation.project,
+            event_type='MemoryCandidateSkipped',
+            target_type='observation',
+            target_id=str(observation.id),
+        ).exists()
+
     def _audit_skipped(self, observation: Observation) -> None:
         AuditEvent.objects.create(
             organization=observation.organization,
@@ -506,7 +518,8 @@ def distillation_system_prompt() -> str:
         '- Be concise. Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
         '- Do not invent facts not present in the input.\n'
         '- If the observation contains no durable engineering signal (routine status checks, empty '
-        'search results, plain acknowledgements), output exactly SKIP as the entire response.\n'
+        'search results, plain acknowledgements), output only the word SKIP as the entire response, '
+        'with no title, body, or explanation.\n'
         '- Do not name any AI assistant, tool, or product by brand.\n'
         '- The Title must stand alone as a searchable summary.\n'
         '- The Body must be self-contained for future retrieval.'
