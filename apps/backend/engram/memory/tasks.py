@@ -19,6 +19,7 @@ from engram.memory.services import (
     run_daily_digest_with_tracking,
     run_weekly_digest_with_tracking,
 )
+from engram.memory.session_sweep import SweepStaleSessions
 
 logger = structlog.get_logger(__name__)
 
@@ -249,6 +250,19 @@ def run_scheduled_digests() -> dict[str, int]:
     return {
         'enqueued_projects': enqueued_projects,
         'enqueued_tasks': enqueued_tasks,
+    }
+
+
+@app.task(name='engram.memory.sweep_stale_sessions')
+def sweep_stale_sessions() -> dict[str, int]:
+    result = SweepStaleSessions().execute()
+
+    for session_id in result.distillable_session_ids:
+        distill_session.delay(str(session_id))
+
+    return {
+        'swept': len(result.ended_session_ids),
+        'distilled': len(result.distillable_session_ids),
     }
 
 

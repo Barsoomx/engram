@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import json
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -12,6 +14,9 @@ Transport = Callable[
     tuple[int, dict[str, object]],
 ]
 
+_RETRY_BACKOFF_SECONDS = 0.25
+_RETRYABLE_HTTP_CODES = (502, 503, 504)
+
 
 def urllib_transport(
     method: str,
@@ -19,23 +24,47 @@ def urllib_transport(
     headers: dict[str, str],
     payload: dict[str, object] | None,
     timeout: float,
+    max_attempts: int = 1,
 ) -> tuple[int, dict[str, object]]:
-    try:
-        request_headers = dict(headers)
-        body = None
-        if payload is not None:
-            body = json.dumps(payload).encode()
-            request_headers.setdefault("Content-Type", "application/json")
-        request_headers.setdefault("Accept", "application/json")
-        request = urllib.request.Request(
-            url, data=body, headers=request_headers, method=method
-        )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return response.status, parse_json_body(response.read())
-    except urllib.error.HTTPError as error:
-        return error.code, parse_json_body(error.read())
-    except (OSError, TimeoutError, urllib.error.URLError, ValueError):
-        return 503, {"code": "server_unavailable", "detail": "Server is unavailable"}
+    request_headers = dict(headers)
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode()
+        request_headers.setdefault("Content-Type", "application/json")
+    request_headers.setdefault("Accept", "application/json")
+
+    for attempt in range(max_attempts):
+        try:
+            request = urllib.request.Request(
+                url, data=body, headers=request_headers, method=method
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, parse_json_body(response.read())
+        except urllib.error.HTTPError as error:
+            if error.code not in _RETRYABLE_HTTP_CODES or attempt == max_attempts - 1:
+                return error.code, parse_json_body(error.read())
+
+        except (OSError, TimeoutError, urllib.error.URLError):
+            if attempt == max_attempts - 1:
+                return 503, {
+                    "code": "server_unavailable",
+                    "detail": "Server is unavailable",
+                }
+
+        except ValueError:
+            return 503, {
+                "code": "server_unavailable",
+                "detail": "Server is unavailable",
+            }
+
+        time.sleep(_RETRY_BACKOFF_SECONDS)
+
+
+def _with_max_attempts(transport: Transport, max_attempts: int) -> Transport:
+    if transport is urllib_transport:
+        return functools.partial(urllib_transport, max_attempts=max_attempts)
+
+    return transport
 
 
 def parse_json_body(data: bytes) -> dict[str, object]:
@@ -62,7 +91,8 @@ def post_dry_run(
     agent_runtime: str,
     agent_version: str,
     request_id: str,
-    timeout: float = 2.0,
+    timeout: float = 5.0,
+    max_attempts: int = 2,
 ) -> tuple[int, dict[str, object]]:
     payload: dict[str, object] = {
         "agent_runtime": agent_runtime,
@@ -74,7 +104,7 @@ def post_dry_run(
     if team_id:
         payload["team_id"] = team_id
 
-    return transport(
+    return _with_max_attempts(transport, max_attempts)(
         "POST",
         f"{server_url}/v1/hooks/dry-run",
         {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -90,9 +120,10 @@ def post_json(
     path: str,
     api_key: str,
     payload: dict[str, object],
-    timeout: float = 2.0,
+    timeout: float = 8.0,
+    max_attempts: int = 2,
 ) -> tuple[int, dict[str, object]]:
-    return transport(
+    return _with_max_attempts(transport, max_attempts)(
         "POST",
         f"{server_url}{path}",
         {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -186,13 +217,14 @@ def get_json(
     path: str,
     api_key: str,
     params: dict[str, str] | None = None,
-    timeout: float = 2.0,
+    timeout: float = 8.0,
+    max_attempts: int = 2,
 ) -> tuple[int, dict[str, object]]:
     query = ""
     if params:
         query = "?" + urlencode(params)
 
-    return transport(
+    return _with_max_attempts(transport, max_attempts)(
         "GET",
         f"{server_url}{path}{query}",
         {"Authorization": f"Bearer {api_key}"},

@@ -1154,7 +1154,7 @@ class GenerateDigest:
                     project_id=project.id,
                     team_id=None,
                     policy=resolved.policy,
-                    request_id=data.request_id,
+                    request_id=f'{data.request_id}:{content_hash}',
                     trace_id=data.request_id,
                     prompt=prompt,
                     system_prompt=digest_system_prompt(),

@@ -44,7 +44,7 @@ def test_resolve_auto_approve_threshold_uses_org_setting_without_override() -> N
 def test_resolve_auto_approve_threshold_falls_back_to_settings_default() -> None:
     organization = Organization.objects.create(name='Engram', slug='engram')
 
-    assert resolve_auto_approve_threshold(organization) == Decimal('0.800')
+    assert resolve_auto_approve_threshold(organization) == Decimal('0.500')
 
 
 @pytest.mark.django_db
@@ -52,4 +52,4 @@ def test_resolve_auto_approve_threshold_falls_back_when_org_setting_is_null() ->
     organization = Organization.objects.create(name='Engram', slug='engram')
     OrganizationSettings.objects.create(organization=organization)
 
-    assert resolve_auto_approve_threshold(organization) == Decimal('0.800')
+    assert resolve_auto_approve_threshold(organization) == Decimal('0.500')

@@ -1026,7 +1026,20 @@ class OpenAICompatibleGateway:
                 f'provider returned {error.code}',
                 retryable=retryable,
             ) from error
+        except TimeoutError as error:
+            raise ModelPolicyError(
+                'provider_timeout',
+                'provider timed out',
+                retryable=True,
+            ) from error
         except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise ModelPolicyError(
+                    'provider_timeout',
+                    'provider timed out',
+                    retryable=True,
+                ) from error
+
             raise ModelPolicyError(
                 'provider_unreachable',
                 f'provider unreachable: {error.reason}',
@@ -1034,15 +1047,28 @@ class OpenAICompatibleGateway:
             ) from error
 
 
+_TITLE_LABEL_RE = re.compile(r'^\s*title\s*:\s*', re.IGNORECASE)
+_BODY_LABEL_RE = re.compile(r'^\s*body\s*:\s*', re.IGNORECASE)
+
+
+def _strip_label(text: str, pattern: re.Pattern[str]) -> str:
+    return pattern.sub('', text, count=1)
+
+
 def _split_completion(content: str) -> tuple[str, str]:
     lines = [line for line in content.splitlines() if line.strip()]
     if not lines:
         return 'Provider-generated memory', content
 
+    title = _strip_label(lines[0], _TITLE_LABEL_RE)[:255]
     if len(lines) == 1:
-        return lines[0][:255], content
+        body = _strip_label(_strip_label(content, _TITLE_LABEL_RE), _BODY_LABEL_RE)
 
-    return lines[0][:255], '\n'.join(lines[1:])
+        return title, body
+
+    body = _strip_label('\n'.join(lines[1:]), _BODY_LABEL_RE)
+
+    return title, body
 
 
 def _completion_body(content: str, response_kind: str) -> str:
@@ -1184,7 +1210,20 @@ class AnthropicMessagesGateway:
                 f'provider returned {error.code}',
                 retryable=retryable,
             ) from error
+        except TimeoutError as error:
+            raise ModelPolicyError(
+                'provider_timeout',
+                'provider timed out',
+                retryable=True,
+            ) from error
         except urllib.error.URLError as error:
+            if isinstance(error.reason, TimeoutError):
+                raise ModelPolicyError(
+                    'provider_timeout',
+                    'provider timed out',
+                    retryable=True,
+                ) from error
+
             raise ModelPolicyError(
                 'provider_unreachable',
                 f'provider unreachable: {error.reason}',
