@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from typing import Any
 
 from django.db.models import Q, QuerySet
@@ -13,7 +14,7 @@ from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
 from engram.access.services import EffectiveScope
-from engram.model_policy.filters import ModelPolicyFilterSet
+from engram.model_policy.filters import ModelPolicyFilterSet, ProviderSecretFilterSet
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
@@ -48,6 +49,20 @@ from engram.model_policy.services import (
     UpdateProviderSecret,
     UpdateProviderSecretInput,
 )
+
+
+def _paginated_list_response(
+    queryset: QuerySet[Any],
+    data: dict[str, Any],
+    response_builder: Callable[[Any], dict[str, Any]],
+) -> Response:
+    limit = data.get('limit', 50)
+    offset = data.get('offset', 0)
+    ordered = queryset.order_by('-created_at')
+    total_count = ordered.count()
+    items = [response_builder(obj) for obj in ordered[offset : offset + limit]]
+
+    return Response({'count': total_count, 'items': items})
 
 
 class ModelPolicyBaseView(APIView):
@@ -90,13 +105,10 @@ class ProviderSecretListView(ModelPolicyBaseView):
             target_id='list',
         )
 
-        limit = data.get('limit', 50)
-        offset = data.get('offset', 0)
-        queryset = scoped_secrets(scope).order_by('-created_at')
-        total_count = queryset.count()
-        items = [provider_secret_response(s) for s in queryset[offset : offset + limit]]
+        secrets = scoped_secrets(scope)
+        secrets = ProviderSecretFilterSet(data=request.query_params, queryset=secrets).qs
 
-        return Response({'count': total_count, 'items': items})
+        return _paginated_list_response(secrets, data, provider_secret_response)
 
     def post(self, request: Request) -> Response:
         serializer = ProviderSecretCreateSerializer(data=request.data)
@@ -252,13 +264,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
         policies = scoped_policies(scope)
         policies = ModelPolicyFilterSet(data=request.query_params, queryset=policies).qs
 
-        limit = data.get('limit', 50)
-        offset = data.get('offset', 0)
-        queryset = policies.order_by('-created_at')
-        total_count = queryset.count()
-        items = [model_policy_response(p) for p in queryset[offset : offset + limit]]
-
-        return Response({'count': total_count, 'items': items})
+        return _paginated_list_response(policies, data, model_policy_response)
 
     def post(self, request: Request) -> Response:
         serializer = ModelPolicyCreateSerializer(data=request.data)
