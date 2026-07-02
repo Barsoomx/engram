@@ -915,6 +915,77 @@ def build_post_tool_use_payload(
     return build_generic_hook_payload(config, runtime, input_payload, "post_tool_use")
 
 
+OBSERVATION_BODY_MAX_LENGTH = 16000
+OBSERVATION_PATH_MAX_LENGTH = 1024
+OBSERVATION_TOOL_INPUT_PREVIEW_CHARS = 2000
+OBSERVATION_TOOL_RESPONSE_PREVIEW_CHARS = 6000
+PAYLOAD_TOOL_INPUT_MAX_BYTES = 32768
+PAYLOAD_TOOL_INPUT_PREVIEW_CHARS = 2000
+FILES_READ_TOOLS = ("Read",)
+FILES_MODIFIED_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+
+
+def compact_json(value: object, limit: int) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        text = str(value)
+    if len(text) > limit:
+        return text[:limit] + "…[truncated]"
+
+    return text
+
+
+def tool_file_paths(tool_name: str, tool_input: object) -> list[str]:
+    if tool_name not in FILES_READ_TOOLS + FILES_MODIFIED_TOOLS:
+        return []
+    if not isinstance(tool_input, dict):
+        return []
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if isinstance(path, str) and path.strip():
+        return [path.strip()[:OBSERVATION_PATH_MAX_LENGTH]]
+
+    return []
+
+
+def synthesize_observation(
+    input_payload: dict[str, object], event_type: str
+) -> dict[str, object]:
+    parts: list[str] = []
+    prompt = payload_string(input_payload, "prompt")
+    if prompt:
+        parts.append(prompt)
+    for field in ("query", "message", "reason", "source"):
+        value = payload_string(input_payload, field)
+        if value:
+            parts.append(f"{field}: {value}")
+    tool_name = payload_string(input_payload, "tool_name")
+    if tool_name:
+        parts.append(f"tool: {tool_name}")
+        tool_input = input_payload.get("tool_input")
+        if isinstance(tool_input, dict) and tool_input:
+            parts.append(
+                "input: "
+                + compact_json(tool_input, OBSERVATION_TOOL_INPUT_PREVIEW_CHARS)
+            )
+        tool_response = input_payload.get("tool_response")
+        if tool_response:
+            parts.append(
+                "result: "
+                + compact_json(tool_response, OBSERVATION_TOOL_RESPONSE_PREVIEW_CHARS)
+            )
+    body = "\n".join(parts)[:OBSERVATION_BODY_MAX_LENGTH]
+    if not body:
+        return {}
+    observation: dict[str, object] = {"type": event_type, "body": body}
+    file_paths = tool_file_paths(tool_name, input_payload.get("tool_input"))
+    if file_paths:
+        field = "files_modified" if tool_name in FILES_MODIFIED_TOOLS else "files_read"
+        observation[field] = file_paths
+
+    return observation
+
+
 def build_generic_hook_payload(
     config: dict[str, object],
     runtime: str,
@@ -930,8 +1001,16 @@ def build_generic_hook_payload(
                 payload[field] = value
         tool_input = input_payload.get("tool_input")
         if isinstance(tool_input, dict) and tool_input:
-            payload["tool_input"] = tool_input
+            serialized = json.dumps(tool_input, sort_keys=True)
+            if len(serialized) > PAYLOAD_TOOL_INPUT_MAX_BYTES:
+                payload["tool_input_preview"] = (
+                    serialized[:PAYLOAD_TOOL_INPUT_PREVIEW_CHARS] + "…[truncated]"
+                )
+            else:
+                payload["tool_input"] = tool_input
     observation = dict_value(input_payload.get("observation"))
+    if not observation:
+        observation = synthesize_observation(input_payload, event_type)
     session_id = required_payload_string(input_payload, "session_id")
     payload_schema_version = (
         payload_string(input_payload, "payload_schema_version") or "v1"
@@ -971,6 +1050,8 @@ def build_generic_hook_payload(
             or stable_hash,
             "request_id": payload_string(input_payload, "request_id") or event_id,
             "payload": payload,
+            "occurred_at": payload_string(input_payload, "occurred_at")
+            or datetime.now(UTC).isoformat(),
         },
     )
     if observation:
