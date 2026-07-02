@@ -863,7 +863,7 @@ def openai_json_mode_override(response_kind: str) -> dict[str, object]:
 
 
 _DEFAULT_MAX_TOKENS = 1024
-_MAX_TOKENS_BY_KIND = {'candidates': 8192}
+_MAX_TOKENS_BY_KIND = {'candidates': 8192, 'curation_judgment': 1024}
 _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
     'candidates': {
         'name': 'emit_memories',
@@ -905,8 +905,11 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
 
 def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    raw = metadata.get('max_tokens')
+    if isinstance(raw, bool):
+        raw = None
     try:
-        override = int(metadata.get('max_tokens'))
+        override = int(raw)
     except (TypeError, ValueError):
         override = 0
     if override > 0:
@@ -1146,7 +1149,7 @@ def _anthropic_content_text(response: dict[str, Any]) -> str:
         if isinstance(block, dict) and block.get('type') == 'text':
             return str(block.get('text') or '')
 
-    return str(blocks[0]['text']) if blocks else ''
+    return str(blocks[0].get('text') or '') if blocks else ''
 
 
 def _completion_body(content: str, response_kind: str) -> str:

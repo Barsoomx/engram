@@ -1076,6 +1076,69 @@ def test_anthropic_gateway_max_tokens_metadata_override() -> None:
 
 
 @pytest.mark.django_db
+def test_anthropic_gateway_thinking_only_content_returns_empty_body() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    message = {'content': [{'type': 'thinking', 'thinking': 'x'}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-6',
+            trace_id='anthropic-tool-6',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    assert result.generated_body == ''
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_bool_max_tokens_metadata_falls_back_to_kind_default() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    policy.metadata = {**policy.metadata, 'max_tokens': True}
+    policy.save(update_fields=['metadata'])
+    message = {'content': [{'type': 'tool_use', 'name': 'emit_memories', 'input': {'memories': []}}]}
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-tool-7',
+            trace_id='anthropic-tool-7',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == 8192
+
+
+@pytest.mark.django_db
 def test_anthropic_gateway_structured_kind_falls_back_to_text_block() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(
