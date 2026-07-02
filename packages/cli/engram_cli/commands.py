@@ -136,9 +136,7 @@ def run_connect_flags(
         server_url = normalize_server_url(args.server)
         api_key = required_value(args.api_key, "missing_api_key", "API key is required")
         api_key_for_redaction = api_key
-        project_id = required_value(
-            args.project, "missing_project", "Project id is required"
-        )
+        project_id = (args.project or "").strip()
         team_id = args.team or ""
         agent_version = args.agent_version or ""
         runtimes = normalize_runtimes(args.agent)
@@ -576,6 +574,24 @@ def _as_text(value: object) -> str:
         return value.decode(errors="replace")
 
     return str(value)
+
+
+def _git_remote_url(path: str) -> str:
+    if not path:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if result.returncode != 0:
+        return ""
+
+    return result.stdout.strip()
 
 
 def run_install(
@@ -1143,18 +1159,26 @@ def base_hook_payload(
     runtime: str,
     input_payload: dict[str, object],
 ) -> dict[str, object]:
-    payload = {
-        "project_id": as_string(config.get("project_id")),
+    payload: dict[str, object] = {
         "agent_runtime": runtime,
         "agent_version": as_string(config.get("agent_version")),
     }
+    project_id = as_string(config.get("project_id"))
+    if project_id:
+        payload["project_id"] = project_id
     team_id = as_string(config.get("team_id"))
     if team_id:
         payload["team_id"] = team_id
-    if not payload["project_id"]:
+    repository_url = payload_string(input_payload, "repository_url") or _git_remote_url(
+        payload_string(input_payload, "repository_root")
+        or payload_string(input_payload, "cwd")
+    )
+    if repository_url:
+        payload["repository_url"] = repository_url
+    if not project_id and not repository_url:
         raise CliError(
             "missing_project",
-            "Project id is missing from local config",
+            "Set --project or run the agent inside a git repository",
             remediation_for("missing_project"),
         )
     input_team_id = payload_string(input_payload, "team_id")
@@ -1295,7 +1319,7 @@ def write_local_state(
     config_payload: dict[str, object] = {
         "version": 1,
         "server_url": server_url,
-        "project_id": project_id,
+        "project_id": project_id or None,
         "team_id": team_id or None,
         "agent_runtimes": list(runtimes),
         "agent_version": agent_version,

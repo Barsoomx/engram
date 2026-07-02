@@ -1600,7 +1600,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn("missing_api_key", stderr)
 
-    def test_connect_requires_project(self) -> None:
+    def test_connect_without_project_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             exit_code, _stdout, stderr = self.run_cli(
                 [
@@ -1612,11 +1612,11 @@ class CliLifecycleTests(unittest.TestCase):
                     "--config-dir",
                     tmp,
                 ],
-                FakeTransport([]),
+                FakeTransport([(200, dry_run_ok()), (200, dry_run_ok())]),
             )
 
-            self.assertEqual(1, exit_code)
-            self.assertIn("missing_project", stderr)
+            self.assertEqual(0, exit_code, stderr)
+            self.assertTrue((Path(tmp) / "config.json").exists())
 
     def test_search_posts_query_and_prints_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

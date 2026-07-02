@@ -65,11 +65,12 @@ def post_dry_run(
     timeout: float = 2.0,
 ) -> tuple[int, dict[str, object]]:
     payload: dict[str, object] = {
-        "project_id": project_id,
         "agent_runtime": agent_runtime,
         "agent_version": agent_version,
         "request_id": request_id,
     }
+    if project_id:
+        payload["project_id"] = project_id
     if team_id:
         payload["team_id"] = team_id
 
