@@ -1,0 +1,54 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-02-structured-output-prompt-hardening.md",
+  "tasks": [
+    {
+      "id": 10,
+      "subject": "Task 0: Test environment for the worktree",
+      "status": "completed",
+      "description": "Infra: engram-tester-so container (python:3.12-slim, engram-net, worktree apps/backend at /app, ENGRAM_DATABASE_URL=postgresql://engram:engram@engram-testpg:5432/engram_so) + engram_so DB + poetry install + green baseline of real_provider_tests/distillation_tests/curation_tests. No commit.\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/model_policy/real_provider_tests.py engram/memory/distillation_tests.py engram/memory/curation_tests.py -q\", \"acceptanceCriteria\": [\"tester container on engram-net with worktree mounted\", \"baseline modules green\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 11,
+      "subject": "Task 1: Session distillation {\"memories\"} contract + rubric + tolerant parser + fake gateway",
+      "status": "completed",
+      "blockedBy": [10],
+      "description": "See plan Task 1: session_distillation_system_prompt -> single JSON object {\"memories\": [...]} with confidence rubric + good/bad example; parse_synthesized_candidates accepts object/bare-array, valid-empty -> (); generated_candidates_payload -> {\"memories\": [...]}.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/memory/distillation.py\", \"apps/backend/engram/model_policy/services.py\", \"apps/backend/engram/memory/distillation_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/memory/distillation_tests.py engram/model_policy/services_tests.py engram/memory/tasks_tests.py -q\", \"acceptanceCriteria\": [\"memories-object parses\", \"empty memories -> ()\", \"bare array still parses\", \"garbage -> fallback\", \"fake gateway emits memories object\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 12,
+      "subject": "Task 2: OpenAI-compatible gateway response_format json_object",
+      "status": "completed",
+      "blockedBy": [11],
+      "description": "See plan Task 2: structured_response_format(response_kind) helper; OpenAICompatibleGateway.call merges it into extra for candidates/curation_judgment; single unchanged; deepseek override preserved.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/model_policy/services.py\", \"apps/backend/engram/model_policy/real_provider_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/model_policy/real_provider_tests.py -q\", \"acceptanceCriteria\": [\"candidates/judgment requests carry response_format json_object\", \"single requests do not\", \"deepseek thinking override preserved\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 13,
+      "subject": "Task 3: Anthropic gateway forced tool_use + per-kind max_tokens",
+      "status": "completed",
+      "blockedBy": [12],
+      "description": "See plan Task 3: _ANTHROPIC_STRUCTURED_TOOLS (emit_memories/emit_judgment), forced tool_choice, _anthropic_content_text serializes tool_use input to JSON string, resolve_max_tokens (8192 candidates / 1024 default / policy.metadata override).\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/model_policy/services.py\", \"apps/backend/engram/model_policy/real_provider_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/model_policy/real_provider_tests.py -q\", \"acceptanceCriteria\": [\"forced tool_use for structured kinds\", \"tool_use input serialized back to JSON string\", \"max_tokens 8192 candidates / 1024 default / metadata override\", \"text fallback preserved\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 14,
+      "subject": "Task 4: Per-observation distillation — richer prompt fields + SKIP protocol",
+      "status": "pending",
+      "blockedBy": [13],
+      "description": "See plan Task 4: provider_prompt adds Facts/Narrative/Concepts; distillation_system_prompt adds SKIP rule; MemoryCandidateWorkerResult.candidate optional + skipped flag; ProcessObservationRecorded early-return + MemoryCandidateSkipped audit; tasks.py returns 'skipped'.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/memory/services.py\", \"apps/backend/engram/memory/tasks.py\", \"apps/backend/engram/memory/services_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/memory/services_tests.py engram/memory/tasks_tests.py engram/memory/memory_worker_tests.py -q\", \"acceptanceCriteria\": [\"provider_prompt carries facts/narrative/concepts\", \"SKIP creates no candidate + audit event\", \"non-SKIP flow unchanged\", \"celery task returns skipped\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 15,
+      "subject": "Task 5: Curation judge reason field + decision logging",
+      "status": "pending",
+      "blockedBy": [14],
+      "description": "See plan Task 5: judge prompt requires decision+reason; parse_curation_reason defensive helper; _judge_decision logs curation_judge_decision with decision+reason; parse_curation_decision unchanged.\n\n```json:metadata\n{\"files\": [\"apps/backend/engram/memory/curation.py\", \"apps/backend/engram/memory/curation_tests.py\"], \"verifyCommand\": \"docker exec engram-tester-so pytest engram/memory/curation_tests.py -q\", \"acceptanceCriteria\": [\"prompt requires decision+reason\", \"parse_curation_reason defensive\", \"decision+reason logged\", \"decision parsing unchanged\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 16,
+      "subject": "Task 6: Full verification + draft PR",
+      "status": "pending",
+      "blockedBy": [15],
+      "description": "Full backend pytest + ruff check + ruff format --check in engram-tester-so; push feat/provider-structured-output; draft PR with evidence and merge-risk note (parallel chunking WIP in distillation.py).\n\n```json:metadata\n{\"files\": [], \"verifyCommand\": \"docker exec engram-tester-so bash -c 'pytest -q && ruff check . && ruff format --check .'\", \"acceptanceCriteria\": [\"full suite green\", \"lint green\", \"draft PR opened with evidence\"], \"modelTier\": \"standard\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-07-02T19:05:00Z"
+}

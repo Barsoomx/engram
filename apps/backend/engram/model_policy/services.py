@@ -925,11 +925,20 @@ def _resolve_base_url(policy: ModelPolicy) -> str:
     return base_url if base_url else default_base_url(policy.provider)
 
 
+def _provider_http_timeout() -> int:
+    return int(os.environ.get('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60'))
+
+
+def _embedding_http_timeout() -> int:
+    return int(os.environ.get('ENGRAM_EMBEDDING_HTTP_TIMEOUT', '30'))
+
+
 class OpenAICompatibleGateway:
-    def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
+    def __init__(self, base_url: str, api_key: str, *, opener: Any = None, timeout: int | None = None) -> None:
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key
         self._opener = opener or urllib.request.urlopen
+        self._timeout = timeout if timeout is not None else _provider_http_timeout()
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -1067,18 +1076,18 @@ class OpenAICompatibleGateway:
         if extra:
             payload_dict.update(extra)
         payload = json.dumps(payload_dict).encode()
-        response = self._open(self._base_url + '/chat/completions', payload)
+        response = self._open(self._base_url + '/chat/completions', payload, timeout=self._timeout)
 
         return str(response['choices'][0]['message']['content'])
 
     def _embeddings(self, model: str, text: str) -> tuple[float, ...]:
         payload = json.dumps({'model': model, 'input': text}).encode()
-        response = self._open(self._base_url + '/embeddings', payload)
+        response = self._open(self._base_url + '/embeddings', payload, timeout=_embedding_http_timeout())
         embedding = tuple(float(component) for component in response['data'][0]['embedding'])
 
         return fit_embedding_dimension(embedding)
 
-    def _open(self, url: str, body: bytes) -> dict[str, Any]:
+    def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
             url,
             data=body,
@@ -1086,7 +1095,7 @@ class OpenAICompatibleGateway:
             method='POST',
         )
         try:
-            with self._opener(request, timeout=30) as response:
+            with self._opener(request, timeout=timeout) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
             retryable = error.code == 429 or error.code >= 500
@@ -1167,10 +1176,11 @@ def _completion_title(content: str, response_kind: str) -> str:
 
 
 class AnthropicMessagesGateway:
-    def __init__(self, base_url: str, api_key: str, *, opener: Any = None) -> None:
+    def __init__(self, base_url: str, api_key: str, *, opener: Any = None, timeout: int | None = None) -> None:
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key
         self._opener = opener or urllib.request.urlopen
+        self._timeout = timeout if timeout is not None else _provider_http_timeout()
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -1284,11 +1294,11 @@ class AnthropicMessagesGateway:
             payload_dict['tools'] = [tool]
             payload_dict['tool_choice'] = {'type': 'tool', 'name': tool['name']}
         payload = json.dumps(payload_dict).encode()
-        response = self._open(self._base_url + '/v1/messages', payload)
+        response = self._open(self._base_url + '/v1/messages', payload, timeout=self._timeout)
 
         return _anthropic_content_text(response)
 
-    def _open(self, url: str, body: bytes) -> dict[str, Any]:
+    def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
             url,
             data=body,
@@ -1300,7 +1310,7 @@ class AnthropicMessagesGateway:
             method='POST',
         )
         try:
-            with self._opener(request, timeout=30) as response:
+            with self._opener(request, timeout=timeout) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
             retryable = error.code == 429 or error.code >= 500

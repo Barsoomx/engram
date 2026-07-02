@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import uuid
 from datetime import timedelta
 
@@ -25,6 +26,8 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
+_DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', '600'))
+_DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
 
 
 @app.task(
@@ -65,6 +68,8 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
+    soft_time_limit=_DISTILL_SOFT_TIME_LIMIT,
+    time_limit=_DISTILL_TIME_LIMIT,
 )
 def distill_session(self: object, session_id: object) -> str:
     try:

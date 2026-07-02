@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.error
 from decimal import Decimal
 from typing import Any
 
@@ -33,20 +34,58 @@ from engram.core.models import (
 from engram.memory.distillation import (
     DistillSession,
     DistillSessionInput,
+    chunk_observations,
     parse_synthesized_candidates,
     run_session_distillation_with_tracking,
     session_distillation_prompt,
     session_distillation_system_prompt,
 )
-from engram.memory.services import PromoteMemoryCandidate
+from engram.memory.services import MemoryWorkerError, PromoteMemoryCandidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
-from engram.model_policy.services import EMBEDDING_DIMENSION, FakeProviderGateway, _completion_body
+from engram.model_policy.services import (
+    EMBEDDING_DIMENSION,
+    FakeProviderGateway,
+    OpenAICompatibleGateway,
+    _completion_body,
+)
 
 
 @pytest.fixture
 def m_monkeypatch(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     return monkeypatch
+
+
+class _RecordingResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _RecordingResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+
+def sequenced_opener(bodies: list[bytes]) -> Any:
+    calls: list[Any] = []
+
+    def opener(request: Any, timeout: float = 30) -> _RecordingResponse:
+        calls.append(request)
+        body = bodies[len(calls) - 1] if len(calls) <= len(bodies) else bodies[-1]
+
+        return _RecordingResponse(body)
+
+    opener.calls = calls  # type: ignore[attr-defined]
+
+    return opener
+
+
+def candidates_body(items: list[dict[str, Any]]) -> bytes:
+    return json.dumps({'choices': [{'message': {'content': json.dumps(items)}}]}).encode()
 
 
 def create_session_scope(*, suffix: str = '1') -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -479,7 +518,10 @@ def test_distill_session_is_idempotent_on_rerun() -> None:
     assert Memory.objects.count() == 1
     assert RetrievalDocument.objects.count() == 1
     assert AuditEvent.objects.filter(event_type='MemoryCandidateHeldForReview').count() == 1
-    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 1
+    # Reruns without an explicit run_id/correlation_id/request_id each get a fresh per-chunk request_id
+    # (uuid4 fallback), so they are no longer deduped at the provider-call level; idempotency is enforced
+    # by content_hash on MemoryCandidate instead.
+    assert ProviderCallRecord.objects.filter(task_type='curation').count() == 2
     assert len(second.auto_promoted) == 1
     assert len(second.queued_for_review) == 1
     assert second.auto_promoted[0].id == first.auto_promoted[0].id
@@ -623,3 +665,297 @@ def test_distill_session_concurrent_execution_creates_exactly_one_memory() -> No
     assert MemoryCandidate.objects.filter(project=project).count() == 2
     assert Memory.objects.count() == 1
     assert RetrievalDocument.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_chunk_observations_splits_oversized_blocks_into_separate_chunks() -> None:
+    organization, team, project, agent, session = create_session_scope()
+    observations = [create_observation(organization, project, team, agent, session, index=i) for i in range(1, 4)]
+
+    chunks = chunk_observations(observations, budget=10)
+
+    assert len(chunks) == 3
+    assert [chunk[0].id for chunk in chunks] == [observation.id for observation in observations]
+
+
+@pytest.mark.django_db
+def test_chunk_observations_packs_small_blocks_into_one_chunk_under_budget() -> None:
+    organization, team, project, agent, session = create_session_scope()
+    observations = [create_observation(organization, project, team, agent, session, index=i) for i in range(1, 4)]
+
+    chunks = chunk_observations(observations, budget=1_000_000)
+
+    assert len(chunks) == 1
+    assert [observation.id for observation in chunks[0]] == [observation.id for observation in observations]
+
+
+@pytest.mark.django_db
+def test_distill_session_batches_observations_into_multiple_provider_calls_with_distinct_request_ids(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    for index in range(1, 4):
+        create_observation(organization, project, team, agent, session, index=index)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+    body = candidates_body(
+        [{'title': 'candidate title', 'body': 'candidate body', 'confidence': 0.9, 'supporting_observation_ids': []}],
+    )
+    opener = sequenced_opener([body, body, body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id, correlation_id='batch-test-1'))
+
+    assert len(opener.calls) == 3
+    records = list(ProviderCallRecord.objects.filter(task_type='curation').order_by('created_at'))
+    assert len(records) == 3
+    request_ids = [record.request_id for record in records]
+    assert len(set(request_ids)) == 3
+    assert request_ids == [f'distill-session:{session.id}:batch-test-1:curation:chunk:{index}' for index in range(3)]
+    assert result.provider_call_ids == tuple(str(record.id) for record in records)
+    assert not any(
+        candidate.title.startswith('Observation:') for candidate in MemoryCandidate.objects.filter(project=project)
+    )
+
+
+@pytest.mark.django_db
+def test_distill_session_chunk_prompts_cover_every_observation_exactly_once_in_order(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    observations = [create_observation(organization, project, team, agent, session, index=i) for i in range(1, 5)]
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
+    opener = sequenced_opener([body] * len(observations))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    prompts = [json.loads(request.data)['messages'][-1]['content'] for request in opener.calls]
+    covered_ids = []
+    for prompt in prompts:
+        matches = [str(observation.id) for observation in observations if str(observation.id) in prompt]
+        assert len(matches) == 1
+        covered_ids.append(matches[0])
+
+    assert covered_ids == [str(observation.id) for observation in observations]
+
+
+@pytest.mark.django_db
+def test_distill_session_small_session_makes_exactly_one_provider_call(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    body = candidates_body(
+        [
+            {'title': 'promoted', 'body': 'body a', 'confidence': 0.9, 'supporting_observation_ids': []},
+            {'title': 'held', 'body': 'body b', 'confidence': 0.4, 'supporting_observation_ids': []},
+        ],
+    )
+    opener = sequenced_opener([body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id, correlation_id='small-test-1'))
+
+    assert len(opener.calls) == 1
+    record = ProviderCallRecord.objects.get(task_type='curation')
+    assert record.request_id == f'distill-session:{session.id}:small-test-1:curation:chunk:0'
+    assert len(result.auto_promoted) == 1
+    assert len(result.queued_for_review) == 1
+
+
+@pytest.mark.django_db
+def test_distill_session_dedups_identical_candidate_across_chunks(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body(
+        [{'title': 'dup title', 'body': 'dup body', 'confidence': 0.9, 'supporting_observation_ids': []}],
+    )
+    opener = sequenced_opener([body, body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert len(opener.calls) == 2
+    assert MemoryCandidate.objects.filter(project=project).count() == 1
+
+
+@pytest.mark.django_db
+def test_distill_session_candidate_evidence_matches_its_own_chunk_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body_zero = candidates_body(
+        [{'title': 'chunk0 candidate', 'body': 'body0', 'confidence': 0.9, 'supporting_observation_ids': []}],
+    )
+    body_one = candidates_body(
+        [{'title': 'chunk1 candidate', 'body': 'body1', 'confidence': 0.9, 'supporting_observation_ids': []}],
+    )
+    opener = sequenced_opener([body_zero, body_one])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id, correlation_id='prov-test-1'))
+
+    record0 = ProviderCallRecord.objects.get(request_id=f'distill-session:{session.id}:prov-test-1:curation:chunk:0')
+    record1 = ProviderCallRecord.objects.get(request_id=f'distill-session:{session.id}:prov-test-1:curation:chunk:1')
+    candidate0 = MemoryCandidate.objects.get(title='chunk0 candidate')
+    candidate1 = MemoryCandidate.objects.get(title='chunk1 candidate')
+
+    assert candidate0.evidence[0]['provider_call_id'] == str(record0.id)
+    assert candidate1.evidence[0]['provider_call_id'] == str(record1.id)
+
+
+@pytest.mark.django_db
+def test_distill_session_aborts_on_chunk_failure_without_entering_transaction(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
+    calls: list[Any] = []
+
+    def opener(request: Any, timeout: float = 30) -> _RecordingResponse:
+        calls.append(request)
+        if len(calls) == 2:
+            raise urllib.error.URLError('boom')
+
+        return _RecordingResponse(body)
+
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    with pytest.raises(MemoryWorkerError):
+        DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    assert len(calls) == 2
+    assert MemoryCandidate.objects.filter(project=project).count() == 0
+
+
+@pytest.mark.django_db
+def test_run_session_distillation_with_tracking_marks_failed_run_on_chunk_provider_error(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+
+    def opener(request: Any, timeout: float = 30) -> _RecordingResponse:
+        raise urllib.error.URLError('boom')
+
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    with pytest.raises(MemoryWorkerError):
+        run_session_distillation_with_tracking(session_id=session.id, request_id='fail-track-1')
+
+    run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
+    assert run.status == WorkflowRunStatus.FAILED
+
+
+@pytest.mark.django_db
+def test_run_session_distillation_with_tracking_records_all_chunk_provider_call_ids(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body([{'title': 'x', 'body': 'y', 'confidence': 0.4, 'supporting_observation_ids': []}])
+    opener = sequenced_opener([body, body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    run_session_distillation_with_tracking(session_id=session.id, request_id='track-multi-1')
+
+    run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
+    records = ProviderCallRecord.objects.filter(task_type='curation').order_by('created_at')
+
+    assert run.provider_call_ids == [str(record.id) for record in records]
+    assert len(run.provider_call_ids) == 2
+
+
+@pytest.mark.django_db
+def test_distill_session_truncates_to_max_chunks_and_audits_when_chunk_count_exceeds_cap(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    for index in range(1, 11):
+        create_observation(organization, project, team, agent, session, index=index)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
+    opener = sequenced_opener([body] * 8)
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    run_session_distillation_with_tracking(session_id=session.id, request_id='cap-test-1')
+
+    assert len(opener.calls) == 8
+    audit = AuditEvent.objects.get(event_type='SessionDistillationTruncated')
+    assert audit.actor_type == 'system'
+    assert audit.target_type == 'agent_session'
+    assert audit.target_id == str(session.id)
+    assert audit.capability == 'memories:review'
+    assert audit.metadata == {
+        'chunks_total': 10,
+        'chunks_processed': 8,
+        'observation_count': 10,
+        'observations_distilled': 8,
+    }
+    run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
+    assert run.escalation is True
+
+
+@pytest.mark.django_db
+def test_distill_session_at_or_under_max_chunks_does_not_truncate_or_escalate() -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+
+    run_session_distillation_with_tracking(session_id=session.id, request_id='no-truncation-1')
+
+    assert AuditEvent.objects.filter(event_type='SessionDistillationTruncated').count() == 0
+    run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
+    assert run.escalation is False
+
+
+@pytest.mark.django_db
+def test_distill_session_two_direct_invocations_without_run_id_yield_distinct_chunk_request_ids(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
+    opener = sequenced_opener([body, body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    records = list(ProviderCallRecord.objects.filter(task_type='curation').order_by('created_at'))
+    assert len(records) == 2
+    assert records[0].request_id != records[1].request_id

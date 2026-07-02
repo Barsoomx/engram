@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -33,7 +34,10 @@ from engram.memory.services import (
     resolve_auto_approve_threshold,
 )
 from engram.model_policy.services import (
+    AnthropicMessagesGateway,
+    FakeProviderGateway,
     ModelPolicyError,
+    OpenAICompatibleGateway,
     ProviderCallInput,
     ProviderCallResult,
     ProviderSecretError,
@@ -72,6 +76,7 @@ class DistillSessionResult:
     auto_promoted: tuple[Memory, ...]
     queued_for_review: tuple[MemoryCandidate, ...]
     provider_call_ids: tuple[str, ...] = ()
+    truncated: bool = False
 
 
 def session_distillation_system_prompt() -> str:
@@ -108,25 +113,52 @@ def session_distillation_system_prompt() -> str:
     )
 
 
-def session_distillation_prompt(observations: list[Observation]) -> str:
-    blocks = []
-    for observation in observations:
-        blocks.append(
-            '\n'.join(
-                [
-                    f'Observation: {observation.id}',
-                    f'Title: {redact_text(observation.title)}',
-                    f'Body: {redact_text(observation.body)}',
-                    f'Facts: {redact_value(observation.facts)}',
-                    f'Narrative: {redact_text(observation.narrative)}',
-                    f'Concepts: {redact_value(observation.concepts)}',
-                    f'Files read: {redact_value(observation.files_read)}',
-                    f'Files modified: {redact_value(observation.files_modified)}',
-                ],
-            ),
-        )
+def _observation_block(observation: Observation) -> str:
+    return '\n'.join(
+        [
+            f'Observation: {observation.id}',
+            f'Title: {redact_text(observation.title)}',
+            f'Body: {redact_text(observation.body)}',
+            f'Facts: {redact_value(observation.facts)}',
+            f'Narrative: {redact_text(observation.narrative)}',
+            f'Concepts: {redact_value(observation.concepts)}',
+            f'Files read: {redact_value(observation.files_read)}',
+            f'Files modified: {redact_value(observation.files_modified)}',
+        ],
+    )
 
-    return '\n\n'.join(blocks)
+
+def session_distillation_prompt(observations: list[Observation]) -> str:
+    return '\n\n'.join(_observation_block(observation) for observation in observations)
+
+
+def _distill_chunk_char_budget() -> int:
+    return int(os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '40000'))
+
+
+def _distill_max_chunks() -> int:
+    return int(os.environ.get('ENGRAM_DISTILL_MAX_CHUNKS', '8'))
+
+
+def chunk_observations(observations: list[Observation], budget: int) -> list[list[Observation]]:
+    chunks: list[list[Observation]] = []
+    current: list[Observation] = []
+    current_length = 0
+    for observation in observations:
+        block_length = len(_observation_block(observation))
+        separator_length = 2 if current else 0
+        if current and current_length + separator_length + block_length > budget:
+            chunks.append(current)
+            current = []
+            current_length = 0
+            separator_length = 0
+        current.append(observation)
+        current_length += separator_length + block_length
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
 def session_candidate_content_hash(session_id: uuid.UUID, title: str, body: str) -> str:
@@ -204,10 +236,33 @@ class DistillSession:
             correlation_id=correlation_id,
             session_id=str(session.id),
         )
-        prompt = session_distillation_prompt(observations)
-        provider_result, resolved = self._synthesize(session, prompt, correlation_id, data.run_id)
-        synthesized = parse_synthesized_candidates(provider_result.generated_body)
-        provenance = self._provenance(provider_result, resolved)
+        run_scope = data.run_id or data.correlation_id or data.request_id or uuid.uuid4().hex
+        chunks = chunk_observations(observations, _distill_chunk_char_budget())
+        max_chunks = _distill_max_chunks()
+        truncated = len(chunks) > max_chunks
+        if truncated:
+            chunks_total = len(chunks)
+            chunks = chunks[:max_chunks]
+            self._audit_truncated(
+                session,
+                data,
+                chunks_total=chunks_total,
+                chunks_processed=len(chunks),
+                observation_count=len(observations),
+                observations_distilled=sum(len(chunk) for chunk in chunks),
+            )
+        resolved, gateway = self._resolve_gateway(session)
+
+        provider_results: list[ProviderCallResult] = []
+        synthesized: list[tuple[SynthesizedCandidate, dict[str, object]]] = []
+        for index, chunk in enumerate(chunks):
+            prompt = session_distillation_prompt(chunk)
+            provider_result = self._call_chunk(session, gateway, resolved, prompt, correlation_id, run_scope, index)
+            provider_results.append(provider_result)
+            provenance = self._provenance(provider_result, resolved)
+            synthesized.extend(
+                (candidate, provenance) for candidate in parse_synthesized_candidates(provider_result.generated_body)
+            )
 
         with transaction.atomic():
             locked_session = self._lock_session(data.session_id)
@@ -216,7 +271,7 @@ class DistillSession:
             to_curate: list[MemoryCandidate] = []
             auto_promoted: list[Memory] = []
             queued: list[MemoryCandidate] = []
-            for candidate_input in synthesized:
+            for candidate_input, provenance in synthesized:
                 candidate, created = self._get_or_create_candidate(locked_session, candidate_input, provenance)
                 if not created:
                     self._classify_existing(candidate, auto_promoted, queued)
@@ -238,7 +293,8 @@ class DistillSession:
             session=locked_session,
             auto_promoted=tuple(auto_promoted),
             queued_for_review=tuple(queued),
-            provider_call_ids=(str(provider_result.call_record_id),),
+            provider_call_ids=tuple(str(result.call_record_id) for result in provider_results),
+            truncated=truncated,
         )
 
     def _load_session(self, session_id: uuid.UUID) -> AgentSession:
@@ -266,25 +322,35 @@ class DistillSession:
             ).order_by('prompt_number', 'created_at'),
         )
 
-    def _synthesize(
+    def _resolve_gateway(
         self,
         session: AgentSession,
-        prompt: str,
-        correlation_id: str,
-        run_id: str,
-    ) -> tuple[ProviderCallResult, ResolvedModelPolicy]:
-        request_id = (
-            f'distill-session:{session.id}:{run_id}:curation' if run_id else f'distill-session:{session.id}:curation'
-        )
+    ) -> tuple[ResolvedModelPolicy, FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway]:
         try:
             resolved = self._resolve_policy(session)
-            provider_result = get_provider_gateway(resolved.policy).call(
+
+            return resolved, get_provider_gateway(resolved.policy)
+        except (ModelPolicyError, ProviderSecretError) as error:
+            raise MemoryWorkerError(redact_error(str(error)), retryable=getattr(error, 'retryable', False)) from error
+
+    def _call_chunk(
+        self,
+        session: AgentSession,
+        gateway: FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway,
+        resolved: ResolvedModelPolicy,
+        prompt: str,
+        correlation_id: str,
+        run_scope: str,
+        index: int,
+    ) -> ProviderCallResult:
+        try:
+            return gateway.call(
                 ProviderCallInput(
                     organization_id=session.organization_id,
                     project_id=session.project_id,
                     team_id=session.team_id,
                     policy=resolved.policy,
-                    request_id=request_id,
+                    request_id=f'distill-session:{session.id}:{run_scope}:curation:chunk:{index}',
                     trace_id=correlation_id or f'distill-session:{session.id}',
                     prompt=prompt,
                     system_prompt=session_distillation_system_prompt(),
@@ -293,8 +359,6 @@ class DistillSession:
             )
         except (ModelPolicyError, ProviderSecretError) as error:
             raise MemoryWorkerError(redact_error(str(error)), retryable=getattr(error, 'retryable', False)) from error
-
-        return provider_result, resolved
 
     def _resolve_policy(self, session: AgentSession) -> ResolvedModelPolicy:
         try:
@@ -421,6 +485,36 @@ class DistillSession:
             },
         )
 
+    def _audit_truncated(
+        self,
+        session: AgentSession,
+        data: DistillSessionInput,
+        *,
+        chunks_total: int,
+        chunks_processed: int,
+        observation_count: int,
+        observations_distilled: int,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=session.organization,
+            project=session.project,
+            team=session.team,
+            event_type='SessionDistillationTruncated',
+            actor_type='system',
+            target_type='agent_session',
+            target_id=str(session.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'chunks_total': chunks_total,
+                'chunks_processed': chunks_processed,
+                'observation_count': observation_count,
+                'observations_distilled': observations_distilled,
+            },
+        )
+
 
 def run_session_distillation_with_tracking(
     session_id: uuid.UUID,
@@ -478,14 +572,12 @@ def run_session_distillation_with_tracking(
 
     run.provider_call_ids = list(result.provider_call_ids)
 
-    run.save(
-        update_fields=[
-            'status',
-            'finished_at',
-            'result_memory',
-            'provider_call_ids',
-            'updated_at',
-        ],
-    )
+    update_fields = ['status', 'finished_at', 'result_memory', 'provider_call_ids', 'updated_at']
+    if result.truncated:
+        run.escalation = True
+
+        update_fields.append('escalation')
+
+    run.save(update_fields=update_fields)
 
     return result
