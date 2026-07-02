@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import structlog
 from django.contrib.auth.models import User
 from rest_framework.test import APIClient
 
@@ -440,6 +441,32 @@ def test_apply_unknown_preset_key_returns_404(
 
     assert response.status_code == 404
     assert response.json()['code'] == 'preset_not_found'
+
+
+@pytest.mark.django_db
+def test_apply_logs_preset_applied_event(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+) -> None:
+    with structlog.testing.capture_logs() as captured_logs:
+        response = f_admin_client.post(
+            '/v1/admin/model-setup/apply',
+            {
+                'project_id': str(f_setup_project.id),
+                'scope': 'project',
+                'preset_key': 'deepseek_openai',
+                'provider_keys': {'deepseek': 'sk-deepseek-key', 'openai': 'sk-openai-key'},
+                'request_id': 'req-apply-log-1',
+            },
+            format='json',
+        )
+
+    assert response.status_code == 200
+    events = [entry for entry in captured_logs if entry['event'] == 'model_preset_applied']
+    assert len(events) == 1
+    assert events[0]['preset_key'] == 'deepseek_openai'
+    assert events[0]['scope'] == 'project'
+    assert events[0]['project_id'] == str(f_setup_project.id)
 
 
 @pytest.mark.django_db

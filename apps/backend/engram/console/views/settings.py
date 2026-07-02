@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
 
+import structlog
 from django.db import transaction
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -9,11 +10,11 @@ from rest_framework.response import Response
 from rest_framework.status import HTTP_400_BAD_REQUEST
 from rest_framework.views import APIView
 
+from engram.console.exceptions import EmbeddingFieldsRequiredError, EmbeddingSecretNotFoundError
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.services import audit_admin_action
 from engram.core.models import (
-    AuditEvent,
     ContextBundle,
     ContextBundleItem,
     Memory,
@@ -22,6 +23,8 @@ from engram.core.models import (
     RetrievalDocument,
 )
 from engram.model_policy.models import ModelPolicy, PolicyScope, ProviderSecret
+
+logger = structlog.get_logger(__name__)
 
 _BOOLEAN_SETTINGS_FIELDS = (
     'hybrid_retrieval_enabled',
@@ -146,10 +149,7 @@ class EmbeddingSettingsView(APIView):
         secret_id = request.data.get('secret_id')
 
         if not provider or not model or not secret_id:
-            return Response(
-                {'error': 'provider, model, and secret_id are required'},
-                status=HTTP_400_BAD_REQUEST,
-            )
+            raise EmbeddingFieldsRequiredError('provider, model, and secret_id are required')
 
         try:
             secret = ProviderSecret.objects.get(
@@ -158,7 +158,7 @@ class EmbeddingSettingsView(APIView):
                 active=True,
             )
         except ProviderSecret.DoesNotExist:
-            return Response({'error': 'provider secret not found'}, status=HTTP_400_BAD_REQUEST)
+            raise EmbeddingSecretNotFoundError('provider secret not found') from None
 
         with transaction.atomic():
             ModelPolicy.objects.filter(
@@ -185,6 +185,13 @@ class EmbeddingSettingsView(APIView):
             target_type='model_policy',
             target_id=str(policy.id),
             metadata={'provider': provider, 'model': model},
+        )
+
+        logger.info(
+            'embedding_settings_updated',
+            organization_id=str(request.active_organization.id),
+            provider=provider,
+            model=model,
         )
 
         return Response({'provider': policy.provider, 'model': policy.model})
@@ -220,11 +227,10 @@ class PurgeOrganizationMemoryView(APIView):
             MemoryCandidate.objects.filter(organization=organization).delete()
             Memory.objects.filter(organization=organization).delete()
 
-            AuditEvent.objects.create(
+            audit_admin_action(
                 organization=organization,
+                actor_identity=request.user_identity,
                 event_type='OrganizationMemoryPurged',
-                actor_type='user',
-                actor_id=str(request.user_identity.id),
                 target_type='organization',
                 target_id=str(organization.id),
                 metadata={
@@ -235,6 +241,16 @@ class PurgeOrganizationMemoryView(APIView):
                     'context_bundle_item_count': bundle_item_count,
                 },
             )
+
+        logger.info(
+            'organization_memory_purged',
+            organization_id=str(organization.id),
+            memory_count=memory_count,
+            memory_candidate_count=candidate_count,
+            retrieval_document_count=doc_count,
+            context_bundle_count=bundle_count,
+            context_bundle_item_count=bundle_item_count,
+        )
 
         return Response(
             {

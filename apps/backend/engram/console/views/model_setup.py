@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import structlog
 from django.db import transaction
 from django.db.models import Q
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -25,6 +26,8 @@ from engram.model_policy.services import (
     ModelPolicyInput,
     ProviderSecretInput,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 class ModelSetupStatusView(APIView):
@@ -178,6 +181,14 @@ class ApplyPresetView(APIView):
                     ),
                 )
                 created_policy_ids.append(str(policy.id))
+
+        logger.info(
+            'model_preset_applied',
+            organization_id=str(org.id),
+            preset_key=preset_key,
+            scope=scope,
+            project_id=str(project_id),
+        )
 
         return Response(
             {
