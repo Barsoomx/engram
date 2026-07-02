@@ -628,6 +628,12 @@ def reject_review_item(
         if item.status == CandidateStatus.REJECTED:
             return
 
+        if item.status != CandidateStatus.PROPOSED:
+            raise MemoryReviewError(
+                'invalid_state',
+                'only proposed candidates can be rejected',
+            )
+
         item.status = CandidateStatus.REJECTED
 
         item.save(update_fields=['status', 'updated_at'])

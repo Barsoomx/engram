@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+import time
 import uuid
+from unittest import mock
 
 import pytest
 import structlog
@@ -22,6 +25,7 @@ from engram.console.services import (
     archive_memory,
     archive_project,
     archive_team,
+    audit_admin_action,
     create_project,
     create_team,
     edit_memory_body,
@@ -615,3 +619,94 @@ def test_issue_api_key_and_revoke_api_key_log_events(
     assert len(revoked) == 1
 
     assert revoked[0]['key_id'] == str(api_key.id)
+
+
+@pytest.mark.django_db(transaction=True)
+@postgres_only
+def test_concurrent_approve_and_reject_on_same_candidate_serializes_transition(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    candidate_id = candidate.id
+
+    approve_holds_lock = threading.Event()
+
+    reject_attempted = threading.Event()
+
+    outcomes: dict[str, object] = {}
+
+    real_audit_admin_action = audit_admin_action
+
+    def blocking_audit_admin_action(*args: object, **kwargs: object) -> object:
+        approve_holds_lock.set()
+
+        reject_attempted.wait(timeout=10)
+
+        time.sleep(0.2)
+
+        return real_audit_admin_action(*args, **kwargs)
+
+    def approve_worker() -> None:
+        try:
+            with mock.patch(
+                'engram.console.services.audit_admin_action',
+                side_effect=blocking_audit_admin_action,
+            ):
+                candidate_ref = MemoryCandidate.objects.get(id=candidate_id)
+
+                memory = approve_memory_candidate(f_organization, f_actor_identity, candidate_ref, 'approve wins race')
+
+                outcomes['memory_id'] = memory.id
+
+        except BaseException as error:  # noqa: BLE001
+            outcomes['approve_error'] = error
+
+        finally:
+            connection.close()
+
+    def reject_worker() -> None:
+        try:
+            approve_holds_lock.wait(timeout=10)
+
+            reject_attempted.set()
+
+            candidate_ref = MemoryCandidate.objects.get(id=candidate_id)
+
+            reject_review_item(f_organization, f_actor_identity, candidate_ref, 'reject too late')
+
+            outcomes['reject_completed_without_error'] = True
+
+        except MemoryReviewError as error:
+            outcomes['reject_error'] = error
+
+        finally:
+            connection.close()
+
+    threads = [threading.Thread(target=approve_worker), threading.Thread(target=reject_worker)]
+
+    for started in threads:
+        started.start()
+
+    for finished in threads:
+        finished.join(timeout=30)
+
+    assert 'approve_error' not in outcomes, outcomes.get('approve_error')
+
+    assert 'memory_id' in outcomes
+
+    candidate.refresh_from_db()
+
+    assert candidate.promoted_memory_id == outcomes['memory_id']
+
+    assert 'reject_error' in outcomes, (
+        'reject_review_item must reject an already-promoted candidate with an '
+        'invalid_state MemoryReviewError instead of silently overwriting the '
+        f'approved transition; observed final status={candidate.status!r}'
+    )
+
+    assert outcomes['reject_error'].code == 'invalid_state'
+
+    assert candidate.status == CandidateStatus.PROMOTED
