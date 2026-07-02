@@ -852,6 +852,16 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
     return {}
 
 
+_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment'})
+
+
+def structured_response_format(response_kind: str) -> dict[str, object]:
+    if response_kind in _STRUCTURED_RESPONSE_KINDS:
+        return {'response_format': {'type': 'json_object'}}
+
+    return {}
+
+
 def _resolve_base_url(policy: ModelPolicy) -> str:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     base_url = str(metadata.get('base_url') or '').strip()
@@ -883,11 +893,14 @@ class OpenAICompatibleGateway:
                 generated_body=body,
             )
 
+        extra: dict[str, object] = {}
+        extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
+        extra.update(structured_response_format(data.response_kind))
         content = self._chat_completion(
             policy.model,
             prompt_text,
             system_prompt=data.system_prompt,
-            extra=deepseek_thinking_override(policy.provider, policy.task_type),
+            extra=extra,
         )
         title = _completion_title(content, data.response_kind)
         body = _completion_body(content, data.response_kind)
