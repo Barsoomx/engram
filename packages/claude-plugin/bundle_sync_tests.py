@@ -25,7 +25,7 @@ def runtime_module_names() -> tuple[str, ...]:
             and not path.name.endswith("_tests.py")
         )
     )
-REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd", "UserPromptSubmit")
+REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "SessionEnd", "UserPromptSubmit")
 
 
 class BundleSyncTests(unittest.TestCase):

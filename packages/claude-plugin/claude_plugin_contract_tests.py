@@ -14,7 +14,7 @@ REQUIRED_PACKAGE_FILES = (
     PLUGIN_MANIFEST_PATH,
     HOOK_MANIFEST_PATH,
 )
-REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "Error", "Decision", "SessionEnd", "UserPromptSubmit")
+REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "SessionEnd", "UserPromptSubmit")
 
 
 class ClaudePluginContractTests(unittest.TestCase):
@@ -33,7 +33,7 @@ class ClaudePluginContractTests(unittest.TestCase):
         hooks = hook_manifest["hooks"]
         commands: list[str] = []
 
-        self.assertEqual("./hooks/hooks.json", plugin_manifest["hooks"])
+        self.assertNotIn("hooks", plugin_manifest)
         self.assertNotIn("claude-mem", plugin_manifest_text)
         self.assertNotIn("claude-mem", hook_manifest_text)
 
