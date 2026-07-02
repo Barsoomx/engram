@@ -102,7 +102,8 @@ def session_distillation_system_prompt() -> str:
         'a Redis restart during processing loses them. Fixed by acknowledging after processing.", '
         '"confidence": 0.9, "supporting_observation_ids": ["<id>"]}\n'
         'Bad memory (never produce): {"title": "Worked on the queue", '
-        '"body": "Investigated some queue issues and made progress."} '
+        '"body": "Investigated some queue issues and made progress.", '
+        '"confidence": 0.4, "supporting_observation_ids": []} '
         '- vague, no identifiers, not durable.'
     )
 

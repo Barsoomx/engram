@@ -222,7 +222,7 @@ def create_embedding_policy(organization: Organization, team: Team, project: Pro
     )
 
 
-def test_session_distillation_system_prompt_requests_json_array_and_is_runtime_neutral() -> None:
+def test_session_distillation_system_prompt_requests_json_object_and_is_runtime_neutral() -> None:
     prompt = session_distillation_system_prompt()
 
     assert 'JSON' in prompt

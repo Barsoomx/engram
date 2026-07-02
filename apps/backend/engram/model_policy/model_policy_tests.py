@@ -747,9 +747,11 @@ def test_fake_provider_gateway_returns_deterministic_memories_object_for_candida
     result = FakeProviderGateway().call(data)
 
     payload = json.loads(result.generated_body)
-    candidates = payload['memories']
 
     assert isinstance(payload, dict)
+
+    candidates = payload['memories']
+
     assert isinstance(candidates, list)
     assert len(candidates) == 2
     assert sorted(Decimal(str(item['confidence'])) for item in candidates) == [Decimal('0.4'), Decimal('0.9')]
