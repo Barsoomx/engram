@@ -94,6 +94,7 @@ class IngestHookEvent:
             with transaction.atomic():
                 agent = self._get_or_create_agent(organization, data)
                 session = self._get_or_create_session(organization, project, team, agent, data)
+                session_was_active = session.status == SessionStatus.ACTIVE
                 if data.event_type == 'session_end':
                     session.status = SessionStatus.ENDED
                     session.ended_at = data.occurred_at or timezone.now()
@@ -144,7 +145,7 @@ class IngestHookEvent:
                 )
                 observation_id = str(observation.id)
                 transaction.on_commit(lambda: process_observation_recorded.delay(observation_id))
-                if data.event_type == 'session_end':
+                if data.event_type == 'session_end' and session_was_active:
                     session_id = str(session.id)
                     transaction.on_commit(lambda: distill_session.delay(session_id))
 
@@ -268,7 +269,7 @@ class IngestHookEvent:
         data: HookEventInput,
     ) -> AgentSession:
         model_id = data.payload.get('model_id') if data.event_type == 'session_start' else None
-        session, _created = AgentSession.objects.get_or_create(
+        session, created = AgentSession.objects.get_or_create(
             organization=organization,
             project=project,
             external_session_id=data.session_id,
@@ -300,6 +301,11 @@ class IngestHookEvent:
             if getattr(session, field) != value:
                 setattr(session, field, value)
                 update_fields.append(field)
+        if not created and session.status == SessionStatus.ENDED and data.event_type != 'session_end':
+            session.status = SessionStatus.ACTIVE
+            session.ended_at = None
+            update_fields.append('status')
+            update_fields.append('ended_at')
         if update_fields:
             update_fields.append('updated_at')
             session.save(update_fields=update_fields)

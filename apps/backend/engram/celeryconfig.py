@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 from celery.schedules import crontab
@@ -76,6 +77,7 @@ task_routes = {
     'engram.memory.distill_session': {'queue': QUEUE_NEAR_REALTIME},
     'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
     'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},
+    'engram.memory.sweep_stale_sessions': {'queue': QUEUE_BATCH},
 }
 
 task_soft_time_limit = 120
@@ -123,6 +125,11 @@ beat_schedule: dict[str, dict] = {
     'weekly-digest': {
         'task': 'engram.memory.run_scheduled_weekly_digests',
         'schedule': crontab(day_of_week=1, hour=3, minute=0),
+        'options': {'queue': QUEUE_BATCH},
+    },
+    'stale-session-sweep': {
+        'task': 'engram.memory.sweep_stale_sessions',
+        'schedule': timedelta(minutes=5),
         'options': {'queue': QUEUE_BATCH},
     },
 }

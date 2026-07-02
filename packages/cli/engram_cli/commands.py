@@ -1073,6 +1073,20 @@ def build_generic_hook_payload(
     return request_payload
 
 
+def extract_model_id(input_payload: dict[str, object]) -> str:
+    model_id = payload_string(input_payload, "model_id")
+    if model_id:
+        return model_id
+
+    model = input_payload.get("model")
+    if isinstance(model, str):
+        return model.strip()
+    if isinstance(model, dict):
+        return payload_string(model, "id")
+
+    return ""
+
+
 def build_session_start_hook_payload(
     config: dict[str, object],
     runtime: str,
@@ -1080,8 +1094,15 @@ def build_session_start_hook_payload(
 ) -> dict[str, object]:
     payload = dict_value(input_payload.get("payload"))
     if payload:
+        if not payload_string(payload, "model_id"):
+            model_id = extract_model_id(input_payload)
+            if model_id:
+                payload["model_id"] = model_id
+        lifecycle_input_payload = dict(input_payload)
+        lifecycle_input_payload["payload"] = payload
+
         return build_generic_hook_payload(
-            config, runtime, input_payload, "session_start"
+            config, runtime, lifecycle_input_payload, "session_start"
         )
 
     lifecycle_input_payload = dict(input_payload)
@@ -1089,6 +1110,9 @@ def build_session_start_hook_payload(
     copy_optional_strings(
         lifecycle_payload, input_payload, ("repository_root", "branch", "cwd")
     )
+    model_id = extract_model_id(input_payload)
+    if model_id:
+        lifecycle_payload["model_id"] = model_id
     lifecycle_input_payload["payload"] = lifecycle_payload
 
     return build_generic_hook_payload(
