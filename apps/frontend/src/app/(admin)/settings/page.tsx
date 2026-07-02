@@ -133,6 +133,81 @@ function ReadOnlyField({ label, value }: { label: string; value: string }) {
   );
 }
 
+function NumberField({
+  label,
+  description,
+  value,
+  onCommit,
+  disabled = false,
+  allowNull = false,
+}: {
+  label: string;
+  description: string;
+  value: number | null;
+  onCommit: (next: number | null) => void;
+  disabled?: boolean;
+  allowNull?: boolean;
+}) {
+  const [draft, setDraft] = React.useState(value === null ? '' : String(value));
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    setDraft(value === null ? '' : String(value));
+    setError(null);
+  }, [value]);
+
+  const commit = React.useCallback(() => {
+    const trimmed = draft.trim();
+
+    if (trimmed === '') {
+      if (allowNull) {
+        setError(null);
+        onCommit(null);
+
+        return;
+      }
+
+      setError('Value is required.');
+
+      return;
+    }
+
+    const parsed = Number(trimmed);
+
+    if (Number.isNaN(parsed) || parsed < 0 || parsed > 1) {
+      setError('Enter a number between 0 and 1.');
+
+      return;
+    }
+
+    setError(null);
+    onCommit(parsed);
+  }, [draft, allowNull, onCommit]);
+
+  return (
+    <div className='py-3'>
+      <div className='flex items-center justify-between gap-4'>
+        <div className='min-w-0'>
+          <p className='text-[13px] font-medium text-foreground'>{label}</p>
+          <p className='text-[12px] leading-relaxed text-default-500'>{description}</p>
+        </div>
+        <input
+          type='number'
+          step={0.05}
+          min={0}
+          max={1}
+          disabled={disabled}
+          value={draft}
+          onChange={(event) => setDraft(event.target.value)}
+          onBlur={commit}
+          className='h-9 w-24 shrink-0 rounded-[9px] border border-divider-strong bg-content2 px-2.5 text-right font-mono text-[13px] text-foreground outline-hidden transition-colors focus:border-primary/60 disabled:cursor-not-allowed disabled:opacity-60'
+        />
+      </div>
+      {error && <p className='mt-1.5 text-[11.5px] text-danger'>{error}</p>}
+    </div>
+  );
+}
+
 function Toggle({
   label,
   description,
@@ -218,6 +293,28 @@ export default function SettingsPage() {
       }
 
       retrievalMutation.mutate({ ...retrieval, [key]: next });
+    },
+    [retrieval, retrievalMutation],
+  );
+
+  const handleAutoApproveChange = React.useCallback(
+    (next: number | null) => {
+      if (!retrieval) {
+        return;
+      }
+
+      retrievalMutation.mutate({ ...retrieval, distillation_auto_approve_threshold: next });
+    },
+    [retrieval, retrievalMutation],
+  );
+
+  const handleNearDupChange = React.useCallback(
+    (next: number | null) => {
+      if (!retrieval || next === null) {
+        return;
+      }
+
+      retrievalMutation.mutate({ ...retrieval, near_dup_threshold: next });
     },
     [retrieval, retrievalMutation],
   );
@@ -386,6 +483,21 @@ export default function SettingsPage() {
               description='Only inject memories with a verified source.'
               checked={retrieval?.require_provenance ?? false}
               onChange={(next) => handleRetrievalToggle('require_provenance', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
+            <NumberField
+              label='Auto-approve confidence threshold'
+              description='Memory candidates at or above this confidence auto-promote; below it they wait for review.'
+              value={retrieval?.distillation_auto_approve_threshold ?? null}
+              onCommit={handleAutoApproveChange}
+              disabled={!retrieval || retrievalMutation.isPending}
+              allowNull
+            />
+            <NumberField
+              label='Near-duplicate threshold'
+              description='Similarity above this value treats a candidate as a duplicate of an existing memory.'
+              value={retrieval?.near_dup_threshold ?? null}
+              onCommit={handleNearDupChange}
               disabled={!retrieval || retrievalMutation.isPending}
             />
           </div>

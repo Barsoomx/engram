@@ -252,6 +252,7 @@ interface CreatePolicyModalProps {
     model: string;
     secret_id: string;
     base_url?: string;
+    context_window_tokens?: number;
   }) => Promise<boolean>;
 }
 
@@ -271,6 +272,7 @@ function CreatePolicyModal({
   const [model, setModel] = React.useState('');
   const [secretId, setSecretId] = React.useState('');
   const [baseUrl, setBaseUrl] = React.useState('');
+  const [contextWindowTokens, setContextWindowTokens] = React.useState('');
 
   React.useEffect(() => {
     if (!isOpen) {
@@ -281,6 +283,7 @@ function CreatePolicyModal({
       setModel('');
       setSecretId('');
       setBaseUrl('');
+      setContextWindowTokens('');
     }
   }, [isOpen]);
 
@@ -315,6 +318,10 @@ function CreatePolicyModal({
       return;
     }
 
+    const parsedContextWindowTokens = contextWindowTokens.trim()
+      ? Number(contextWindowTokens.trim())
+      : undefined;
+
     const ok = await onSubmit({
       name: name.trim(),
       scope,
@@ -323,6 +330,11 @@ function CreatePolicyModal({
       model: model.trim(),
       secret_id: secretId.trim(),
       base_url: baseUrl.trim() || undefined,
+      context_window_tokens:
+        parsedContextWindowTokens !== undefined &&
+        Number.isFinite(parsedContextWindowTokens)
+          ? parsedContextWindowTokens
+          : undefined,
     });
 
     if (ok) {
@@ -456,6 +468,19 @@ function CreatePolicyModal({
                   description='For GLM / self-hosted / OpenAI-compatible endpoints. Leave blank to use the provider default.'
                   classNames={{ input: 'font-mono text-xs' }}
                 />
+                <Input
+                  type='number'
+                  label='Context window (tokens)'
+                  labelPlacement='outside'
+                  placeholder='200000'
+                  value={contextWindowTokens}
+                  onValueChange={setContextWindowTokens}
+                  isDisabled={isPending}
+                  min={1}
+                  step={1000}
+                  description='Optional override of the model context window used to size distillation chunks; leave blank to auto-detect.'
+                  classNames={{ input: 'font-mono text-xs' }}
+                />
                 {scope === 'team' && !teamId && (
                   <p className='text-[12px] text-warning'>
                     Select a team in the top switcher to create a team-scoped
@@ -574,6 +599,11 @@ function ResolveTester({
             <ResolveField label='Scope'>
               {humanizeTask(outcome.policy.scope)}
             </ResolveField>
+            <ResolveField label='Context window' mono>
+              {outcome.policy.context_window_tokens
+                ? `${outcome.policy.context_window_tokens} tokens`
+                : 'Auto-detected'}
+            </ResolveField>
           </div>
         </div>
       )}
@@ -663,6 +693,11 @@ function PolicyDetailModal({
                     </ResolveField>
                     <ResolveField label='Secret ID' mono>
                       {policy.secret_id}
+                    </ResolveField>
+                    <ResolveField label='Context window' mono>
+                      {policy.context_window_tokens
+                        ? `${policy.context_window_tokens} tokens`
+                        : 'Auto-detected'}
                     </ResolveField>
                     {policy.project_id && (
                       <ResolveField label='Project ID' mono>
@@ -827,6 +862,7 @@ export default function ModelPoliciesPage() {
     model: string;
     secret_id: string;
     base_url?: string;
+    context_window_tokens?: number;
   }): Promise<boolean> {
     setCreateError(null);
 
@@ -842,6 +878,7 @@ export default function ModelPoliciesPage() {
         secret_id: input.secret_id,
         request_id: genRequestId(),
         base_url: input.base_url,
+        context_window_tokens: input.context_window_tokens,
       });
 
       return true;
