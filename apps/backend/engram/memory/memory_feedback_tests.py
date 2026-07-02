@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import structlog
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -127,6 +128,28 @@ def test_memory_feedback_stale_updates_memory_documents_and_audit() -> None:
     assert audit.metadata['action'] == 'stale'
     assert RAW_KEY not in str(response.json())
     assert RAW_KEY not in str(audit.metadata)
+
+
+@pytest.mark.django_db
+def test_memory_feedback_logs_memory_feedback_recorded() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    with structlog.testing.capture_logs() as captured_logs:
+        response = client.post(
+            f'/v1/memories/{memory.id}/feedback',
+            valid_feedback_payload(project, team, request_id='request-memory-feedback-logged'),
+            format='json',
+            **auth_headers(),
+        )
+
+    assert response.status_code == 200
+    feedback_events = [entry for entry in captured_logs if entry['event'] == 'memory_feedback_recorded']
+    assert len(feedback_events) == 1
+    assert feedback_events[0]['memory_id'] == str(memory.id)
+    assert feedback_events[0]['project_id'] == str(project.id)
+    assert feedback_events[0]['action'] == 'stale'
 
 
 @pytest.mark.django_db

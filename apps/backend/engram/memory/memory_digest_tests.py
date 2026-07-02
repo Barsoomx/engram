@@ -79,6 +79,7 @@ def test_generate_digest_creates_memory_from_sources() -> None:
     )
 
     assert result.memory.metadata['kind'] == 'digest'
+    assert result.memory.metadata['digest_kind'] == 'daily_structured'
     assert result.memory.metadata['source_memory_ids'] == [str(first.id), str(second.id)]
     assert result.memory.title.startswith('Digest ')
     assert result.memory.body
