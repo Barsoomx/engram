@@ -36,13 +36,9 @@ permissions:
   packages: write
   id-token: write        # sign the provenance attestation (Sigstore / OIDC)
   attestations: write    # store the attestation
-  security-events: write # upload the Snyk image-scan SARIF to code scanning
 
 env:
   REGISTRY: ghcr.io
-  # Image vulnerability scan (Snyk). The scan + SARIF-upload steps skip entirely when this
-  # secret is unset (e.g. fork PRs), so the workflow stays green without a Snyk account.
-  SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
 jobs:
   publish:
@@ -95,10 +91,6 @@ jobs:
           context: ${{ matrix.context }}
           file: ${{ matrix.file }}
           push: ${{ github.event_name != 'pull_request' }}
-          # Also load the built (single-arch) image into the local docker daemon so the Snyk
-          # step below can scan the exact image — including on pull_request, where nothing is
-          # pushed to the registry.
-          load: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.image }}
@@ -115,34 +107,3 @@ jobs:
           subject-name: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
-
-      # ---- Image vulnerability scan (Snyk) — REPORT ONLY, never blocks the publish ----
-      # Findings land in the GitHub Security / code-scanning tab (category snyk-<image>),
-      # deduplicated and dismissible like CodeQL. The scan step is continue-on-error and the
-      # whole block skips when SNYK_TOKEN is unset, so a publish is never gated on it.
-      - name: Pick a loaded image ref to scan
-        id: scan_ref
-        if: ${{ env.SNYK_TOKEN != '' }}
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: echo "ref=$(printf '%s\n' "$TAGS" | head -n1)" >> "$GITHUB_OUTPUT"
-
-      - name: Snyk container scan (SARIF, report-only)
-        if: ${{ env.SNYK_TOKEN != '' }}
-        continue-on-error: true
-        uses: snyk/actions/docker@8e119fbb6c251787721d34ba683ed48eba792766 # snyk/actions master @ 2026-05-27
-        with:
-          image: ${{ steps.scan_ref.outputs.ref }}
-          # The action's `sarif` input defaults true, so it always writes results to snyk.sarif
-          # in the workspace. Do NOT pass --sarif-file-output: it makes snyk write to a path
-          # inside the action's container that is not persisted to the host, so the upload can't
-          # find it. --file lets Snyk suggest base-image upgrades.
-          args: --file=${{ matrix.file }} --severity-threshold=high
-
-      - name: Upload Snyk SARIF to code scanning
-        if: ${{ always() && env.SNYK_TOKEN != '' }}
-        continue-on-error: true
-        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.30.9
-        with:
-          sarif_file: snyk.sarif
-          category: snyk-${{ matrix.image }}

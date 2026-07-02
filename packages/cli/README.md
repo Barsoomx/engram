@@ -16,7 +16,9 @@ python -m engram_cli hook session-start --response-format codex < hook.json
 python -m engram_cli disconnect
 ```
 
-The package also declares an `engram` console script in `pyproject.toml`.
+The package declares two console scripts in `pyproject.toml` that share the same
+entrypoint: `engram` (short, for typed commands) and `engram-connect` (matches the
+distribution name, so `uvx engram-connect ...` works without `--from`).
 
 ## Plug-and-play install (`engram install`)
 
@@ -29,19 +31,16 @@ plugin through the native `claude plugin` marketplace, and finishes with a
 Run it without cloning the repo via `uvx`:
 
 ```bash
-uvx --from engram-connect engram install \
-  --server <URL> --api-key <KEY> --project <PROJECT_ID>
-```
+uvx engram-connect install \
+  --server <URL> --api-key <KEY>```
 
 Before the package is published to PyPI, install straight from git or `pipx`:
 
 ```bash
 uvx --from "git+https://github.com/Barsoomx/engram.git#subdirectory=packages/cli" \
-  engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
-# or:
+  engram install --server <URL> --api-key <KEY># or:
 pipx install engram-connect
-engram install --server <URL> --api-key <KEY> --project <PROJECT_ID>
-```
+engram install --server <URL> --api-key <KEY>```
 
 The plugin steps run `claude plugin marketplace add <--marketplace-source>` then
 `claude plugin install <--plugin-name>@<--marketplace-name>` using the `claude`

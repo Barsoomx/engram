@@ -9,7 +9,7 @@ export function buildConnectCommand({
   serverUrl: string;
   apiKey: string;
 }): string {
-  return `uvx --from engram-connect engram install --server ${normalizeServerUrl(serverUrl)} --api-key ${apiKey}`;
+  return `uvx engram-connect install --server ${normalizeServerUrl(serverUrl)} --api-key ${apiKey}`;
 }
 
 export function buildConnectFallbackCommand({
