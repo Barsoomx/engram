@@ -7,7 +7,7 @@
       "name": "engram",
       "source": "./packages/claude-plugin",
       "description": "Thin Engram hook adapter for Claude Code.",
-      "version": "0.1.6",
+      "version": "0.1.7",
       "category": "Productivity",
       "metadata": { "author": "Engram", "license": "MIT" }
     }

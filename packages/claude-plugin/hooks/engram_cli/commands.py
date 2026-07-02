@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import hashlib
 import json
 import shutil
@@ -1646,6 +1647,33 @@ def normalize_mcp_agent(value: str | None) -> tuple[str, ...]:
     )
 
 
+def build_search_payload(
+    config: dict[str, object],
+    *,
+    query: str,
+    file_paths: list[str],
+    symbols: list[str],
+    limit: int,
+    repository_url: str,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "query": query,
+        "file_paths": file_paths,
+        "symbols": symbols,
+        "limit": limit,
+    }
+    project_id = as_string(config.get("project_id"))
+    if project_id:
+        payload["project_id"] = project_id
+    elif repository_url:
+        payload["repository_url"] = repository_url
+    team_id = as_string(config.get("team_id"))
+    if team_id:
+        payload["team_id"] = team_id
+
+    return payload
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,
@@ -1669,16 +1697,17 @@ def run_search(
                 remediation_for("missing_credential"),
             )
         server_url = normalize_server_url(as_string(config.get("server_url")))
-        payload = {
-            "project_id": as_string(config.get("project_id")),
-            "query": args.query or "",
-            "file_paths": list(args.file_path or []),
-            "symbols": list(args.symbol or []),
-            "limit": args.limit,
-        }
-        team_id = as_string(config.get("team_id"))
-        if team_id:
-            payload["team_id"] = team_id
+        repository_url = ""
+        if not as_string(config.get("project_id")):
+            repository_url = _git_remote_url(os.getcwd())
+        payload = build_search_payload(
+            config,
+            query=args.query or "",
+            file_paths=list(args.file_path or []),
+            symbols=list(args.symbol or []),
+            limit=args.limit,
+            repository_url=repository_url,
+        )
         active_transport = transport or urllib_transport
         status, body = post_json(
             transport=active_transport,
