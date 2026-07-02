@@ -693,7 +693,7 @@ def resolve_query_embedding(
         return None
     except ProviderSecretError as error:
         logger.warning(
-            'query embedding skipped: provider secret unavailable',
+            'query_embedding_skipped',
             organization_id=str(organization.id),
             project_id=str(project.id),
             request_id=request_id,
@@ -788,7 +788,7 @@ class IndexMemoryVersion:
             return
         except ProviderSecretError as error:
             logger.warning(
-                'embedding skipped: provider secret unavailable',
+                'context_embedding_skipped',
                 organization_id=str(memory.organization_id),
                 project_id=str(memory.project_id),
                 memory_version_id=str(version.id),

@@ -189,7 +189,7 @@ def embed_candidate(candidate: MemoryCandidate) -> list[float] | None:
         return None
     except ProviderSecretError as error:
         logger.warning(
-            'curator embedding skipped: provider secret unavailable',
+            'curator_embedding_skipped',
             organization_id=str(candidate.organization_id),
             project_id=str(candidate.project_id),
             candidate_id=str(candidate.id),
