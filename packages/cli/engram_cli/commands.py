@@ -922,6 +922,15 @@ def build_generic_hook_payload(
     event_type: str,
 ) -> dict[str, object]:
     payload = dict_value(input_payload.get("payload"))
+    if not payload:
+        payload = {"trigger": event_type}
+        for field in ("prompt", "query", "tool_name", "message", "reason"):
+            value = payload_string(input_payload, field)
+            if value:
+                payload[field] = value
+        tool_input = input_payload.get("tool_input")
+        if isinstance(tool_input, dict) and tool_input:
+            payload["tool_input"] = tool_input
     observation = dict_value(input_payload.get("observation"))
     session_id = required_payload_string(input_payload, "session_id")
     payload_schema_version = (
