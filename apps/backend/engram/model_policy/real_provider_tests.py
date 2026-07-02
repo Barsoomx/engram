@@ -41,10 +41,12 @@ class _FakeResponse:
 def _opener_returning(body: bytes) -> Any:
     def opener(request: Any, timeout: float = 30) -> _FakeResponse:
         opener.requests.append(request)
+        opener.timeouts.append(timeout)
 
         return _FakeResponse(body)
 
     opener.requests = []  # type: ignore[attr-defined]
+    opener.timeouts = []  # type: ignore[attr-defined]
 
     return opener
 
@@ -824,3 +826,164 @@ def test_get_provider_gateway_anthropic_returns_anthropic_host_with_blank_metada
     assert isinstance(gateway, AnthropicMessagesGateway)
     assert gateway._base_url == 'https://api.anthropic.com'
     assert gateway._api_key == 'anthropic-key'
+
+
+@pytest.mark.django_db
+def test_openai_gateway_chat_completion_uses_default_http_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='timeout-default-1',
+            trace_id='timeout-default-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert opener.timeouts == [60]
+
+
+@pytest.mark.django_db
+def test_openai_gateway_chat_completion_honors_env_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '180')
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='timeout-override-1',
+            trace_id='timeout-override-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert opener.timeouts == [180]
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embeddings_use_shorter_default_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    monkeypatch.delenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', raising=False)
+    opener = _opener_returning(json.dumps({'data': [{'embedding': [0.1, 0.2, 0.3]}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='embed-timeout-default-1',
+            trace_id='embed-timeout-default-1',
+            text='text to embed',
+        ),
+    )
+
+    assert opener.timeouts == [30]
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embeddings_honor_env_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    monkeypatch.setenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', '5')
+    opener = _opener_returning(json.dumps({'data': [{'embedding': [0.1, 0.2, 0.3]}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='embed-timeout-override-1',
+            trace_id='embed-timeout-override-1',
+            text='text to embed',
+        ),
+    )
+
+    assert opener.timeouts == [5]
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_messages_uses_default_http_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    opener = _opener_returning(json.dumps({'content': [{'text': 'Title\nBody'}]}).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-timeout-default-1',
+            trace_id='anthropic-timeout-default-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert opener.timeouts == [60]
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_messages_honors_env_timeout_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '240')
+    opener = _opener_returning(json.dumps({'content': [{'text': 'Title\nBody'}]}).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-timeout-override-1',
+            trace_id='anthropic-timeout-override-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert opener.timeouts == [240]
+
+
+@pytest.mark.django_db
+def test_openai_gateway_constructor_timeout_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '180')
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener, timeout=9)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='ctor-timeout-1',
+            trace_id='ctor-timeout-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert opener.timeouts == [9]
