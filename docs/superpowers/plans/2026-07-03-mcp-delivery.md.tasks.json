@@ -1,0 +1,61 @@
+{
+  "planPath": "docs/superpowers/plans/2026-07-03-mcp-delivery.md",
+  "tasks": [
+    {
+      "id": 24,
+      "subject": "Task 1: MCP tool handlers (mcp_tools.py)",
+      "status": "pending",
+      "description": "**Goal:** Six MCP tool handlers over engram_cli.http/config: env→file resolution, repo-url fallback, unique request ids, correct response fields.\n\n**Files:** create packages/cli/engram_cli/mcp_tools.py + mcp_tools_tests.py\n\n**Verify:** PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\n\n```json:metadata\n{\"files\": [\"packages/cli/engram_cli/mcp_tools.py\", \"packages/cli/engram_cli/mcp_tools_tests.py\"], \"verifyCommand\": \"PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\", \"acceptanceCriteria\": [\"six handlers with correct endpoints and payloads\", \"current_version/memory_version_id rendered\", \"unique mcp-<uuid4> request ids per call\", \"env-over-file config resolution with repo-url fallback\", \"project-required message for writes in repo mode\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 25,
+      "subject": "Task 2: MCP protocol server module (mcp_server.py)",
+      "status": "pending",
+      "blockedBy": [24],
+      "description": "**Goal:** Port JSON-RPC stdio server into engram_cli with feedback tool schema, exception guard, run_mcp_serve entry.\n\n**Files:** create packages/cli/engram_cli/mcp_server.py + mcp_server_tests.py\n\n**Verify:** PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\n\n```json:metadata\n{\"files\": [\"packages/cli/engram_cli/mcp_server.py\", \"packages/cli/engram_cli/mcp_server_tests.py\"], \"verifyCommand\": \"PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\", \"acceptanceCriteria\": [\"six tools listed with feedback schema\", \"tool exception -> -32603 error, loop survives\", \"run_mcp_serve wires build_tools and returns 0\", \"ported contract tests pass\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 26,
+      "subject": "Task 3: CLI mcp command group + resolvable registration",
+      "status": "pending",
+      "blockedBy": [25],
+      "description": "**Goal:** engram mcp install|serve group (mcp-install deprecated alias); registration entry resolvable (which(engram) / sys.executable -m engram_cli), no API key in entry.\n\n**Files:** modify packages/cli/engram_cli/main.py, commands.py, cli_lifecycle_tests.py\n\n**Verify:** PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\n\n```json:metadata\n{\"files\": [\"packages/cli/engram_cli/main.py\", \"packages/cli/engram_cli/commands.py\", \"packages/cli/engram_cli/cli_lifecycle_tests.py\"], \"verifyCommand\": \"PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v\", \"acceptanceCriteria\": [\"mcp install|serve work, mcp-install alias kept\", \"entry resolvable via which(engram) or sys.executable -m engram_cli\", \"no env/api key in written entry\", \"install output mentions plugin MCP delivery\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 27,
+      "subject": "Task 4: Claude plugin ships MCP server",
+      "status": "pending",
+      "blockedBy": [26],
+      "description": "**Goal:** Plugin-root .mcp.json + hooks/mcp.py shim + bundle sync + contract tests + version bump 0.1.8 (plugin + marketplace).\n\n**Files:** create packages/claude-plugin/.mcp.json, hooks/mcp.py; modify plugin.json, .claude-plugin/marketplace.json, claude_plugin_contract_tests.py; regen bundle\n\n**Verify:** python3 scripts/sync_plugin_bundle.py --check && PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v\n\n```json:metadata\n{\"files\": [\"packages/claude-plugin/.mcp.json\", \"packages/claude-plugin/hooks/mcp.py\", \"packages/claude-plugin/.claude-plugin/plugin.json\", \".claude-plugin/marketplace.json\", \"packages/claude-plugin/claude_plugin_contract_tests.py\"], \"verifyCommand\": \"python3 scripts/sync_plugin_bundle.py --check && PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v\", \"acceptanceCriteria\": [\".mcp.json registers python3 hooks/mcp.py with no env\", \"shim runs main(['mcp','serve'])\", \"bundle sync includes mcp modules\", \"plugin+marketplace versions 0.1.8\"], \"modelTier\": \"standard\"}\n```"
+    },
+    {
+      "id": 28,
+      "subject": "Task 5: Compose golden-path e2e drives MCP over stdio",
+      "status": "pending",
+      "blockedBy": [26],
+      "description": "**Goal:** e2e_golden_path.py launches engram mcp serve subprocess with agent-capability key and drives all six tools over stdio.\n\n**USER-ORDERED GATE — NON-SKIPPABLE.**\n\n**Files:** modify scripts/e2e_golden_path.py\n\n**Verify:** python3 scripts/e2e_golden_path.py → exit 0, 'MCP stdio bridge passed'\n\n```json:metadata\n{\"files\": [\"scripts/e2e_golden_path.py\"], \"verifyCommand\": \"python3 scripts/e2e_golden_path.py\", \"acceptanceCriteria\": [\"bootstrap --agent-key wired and second config dir connected\", \"all six tools called over real stdio against live backend\", \"two version calls yield different current_version (no replay)\", \"no secret in any mcp response\", \"script exits 0 with MCP stdio bridge passed\"], \"modelTier\": \"standard\", \"userGate\": true, \"tags\": [\"user-gate\"], \"requireEvidenceTokens\": [[\"current_version=2\", \"first update\", \"version one\"], [\"current_version=3\", \"second update\", \"version two\"]]}\n```"
+    },
+    {
+      "id": 29,
+      "subject": "Task 6: Claude plugin e2e verifies MCP registration",
+      "status": "pending",
+      "blockedBy": [27],
+      "description": "**Goal:** e2e_claude_plugin.py asserts installed plugin ships .mcp.json + working hooks/mcp.py (initialize/tools-list/search over stdio, ENGRAM_HOME config).\n\n**USER-ORDERED GATE — NON-SKIPPABLE.**\n\n**Files:** modify scripts/e2e_claude_plugin.py\n\n**Verify:** python3 scripts/e2e_claude_plugin.py (env per .github/workflows/claude-plugin-e2e.yml) → exit 0, 'plugin MCP bridge passed'\n\n```json:metadata\n{\"files\": [\"scripts/e2e_claude_plugin.py\"], \"verifyCommand\": \"python3 scripts/e2e_claude_plugin.py (env per .github/workflows/claude-plugin-e2e.yml)\", \"acceptanceCriteria\": [\"installed plugin root contains .mcp.json and hooks/mcp.py\", \"shim answers initialize/tools-list/search over stdio against live test backend\", \"e2e exits 0 with plugin MCP bridge passed\"], \"modelTier\": \"standard\", \"userGate\": true, \"tags\": [\"user-gate\"]}\n```"
+    },
+    {
+      "id": 30,
+      "subject": "Task 7: Documentation alignment",
+      "status": "pending",
+      "blockedBy": [26],
+      "description": "**Goal:** guides/mcp.md rewrite (implemented, delivery matrix, egk_, codex snippet), mcp-tools.md real six tools + Deferred section, client-installation/quickstart/plugin README touch-ups.\n\n**Verify:** grep -rn 'engram_mcp\\|sk-engram_\\|not yet implemented' docs/ README.md packages/claude-plugin/README.md → no MCP-related hits\n\n```json:metadata\n{\"files\": [\"docs/guides/mcp.md\", \"docs/mcp-tools.md\", \"docs/client-installation.md\", \"docs/quickstart.md\", \"packages/claude-plugin/README.md\"], \"verifyCommand\": \"grep -rn 'engram_mcp\\\\|sk-engram_\\\\|not yet implemented' docs/ README.md packages/claude-plugin/README.md\", \"acceptanceCriteria\": [\"guides/mcp.md matches shipped commands and delivery\", \"mcp-tools.md lists real six tools + explicit deferred set\", \"no stale engram_mcp / sk-engram_ / not-yet-implemented references\"], \"modelTier\": \"mechanical\"}\n```"
+    },
+    {
+      "id": 31,
+      "subject": "Task 8: Retire packages/mcp, update CI, bump engram-connect 0.2.0",
+      "status": "pending",
+      "blockedBy": [28, 29, 30],
+      "description": "**Goal:** Delete packages/mcp, remove backend.yml MCP step, bump engram-connect 0.2.0, fix release-runbook/verification-matrix references.\n\n**Verify:** CLI + plugin unittest sweeps + bundle --check green; git grep 'engram_mcp' only in historical docs\n\n```json:metadata\n{\"files\": [\".github/workflows/backend.yml\", \"packages/cli/pyproject.toml\", \"docs/release-runbook.md\", \"docs/verification-matrix.md\"], \"verifyCommand\": \"PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v && PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v && python3 scripts/sync_plugin_bundle.py --check\", \"acceptanceCriteria\": [\"packages/mcp deleted, no runtime references remain\", \"backend.yml MCP step removed\", \"engram-connect 0.2.0\", \"full local sweep green\"], \"modelTier\": \"mechanical\"}\n```"
+    }
+  ],
+  "lastUpdated": "2026-07-03T00:00:00Z"
+}
