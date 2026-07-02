@@ -700,7 +700,7 @@ def test_fake_provider_gateway_returns_deterministic_generated_candidate_content
 
 
 @pytest.mark.django_db
-def test_fake_provider_gateway_returns_deterministic_candidate_array_for_candidates_kind() -> None:
+def test_fake_provider_gateway_returns_deterministic_memories_object_for_candidates_kind() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
     secret = ProviderSecret.objects.create(
@@ -746,8 +746,10 @@ def test_fake_provider_gateway_returns_deterministic_candidate_array_for_candida
 
     result = FakeProviderGateway().call(data)
 
-    candidates = json.loads(result.generated_body)
+    payload = json.loads(result.generated_body)
+    candidates = payload['memories']
 
+    assert isinstance(payload, dict)
     assert isinstance(candidates, list)
     assert len(candidates) == 2
     assert sorted(Decimal(str(item['confidence'])) for item in candidates) == [Decimal('0.4'), Decimal('0.9')]

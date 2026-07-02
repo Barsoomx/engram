@@ -81,16 +81,29 @@ def session_distillation_system_prompt() -> str:
         'runtime-neutral engineering memories.\n'
         '\n'
         'Rules:\n'
-        '- Output a JSON array only. Each element is an object with the keys '
+        '- Output a single JSON object only, with exactly one key "memories".\n'
+        '- "memories" is an array of objects with the keys '
         '"title", "body", "confidence", "supporting_observation_ids".\n'
-        '- "confidence" is a number between 0 and 1 reflecting how durable and reliable the memory is.\n'
+        '- If the session contains no durable engineering signal, output {"memories": []}.\n'
+        '- "confidence" is a number between 0 and 1: 0.9 or higher for verified facts with direct '
+        'evidence (a fix confirmed by tests, an observed error with its cause), 0.6-0.8 for plausible '
+        'conclusions consistent with the observations, 0.3-0.5 for unverified hypotheses, below 0.3 '
+        'for speculation.\n'
         '- "supporting_observation_ids" lists the observation ids the memory is derived from.\n'
         '- Consolidate related observations into a small number of high-signal memories.\n'
         '- Preserve exact identifiers verbatim: file paths, function names, class names, '
         'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
         '- Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
         '- Do not invent facts not present in the input.\n'
-        '- Do not name any AI assistant, tool, or product by brand.'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '\n'
+        'Good memory: {"title": "Retry queue drops messages on Redis restart", '
+        '"body": "The consumer in worker/queue.py acknowledges messages before processing; '
+        'a Redis restart during processing loses them. Fixed by acknowledging after processing.", '
+        '"confidence": 0.9, "supporting_observation_ids": ["<id>"]}\n'
+        'Bad memory (never produce): {"title": "Worked on the queue", '
+        '"body": "Investigated some queue issues and made progress."} '
+        '- vague, no identifiers, not durable.'
     )
 
 
@@ -148,11 +161,17 @@ def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, .
     except (json.JSONDecodeError, TypeError):
         return (_fallback_candidate(raw_body),)
 
-    if not isinstance(parsed, list):
+    if isinstance(parsed, dict):
+        items = parsed.get('memories')
+        if not isinstance(items, list):
+            return (_fallback_candidate(raw_body),)
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
         return (_fallback_candidate(raw_body),)
 
     candidates: list[SynthesizedCandidate] = []
-    for item in parsed:
+    for item in items:
         if not isinstance(item, dict):
             continue
         title = str(item.get('title') or '').strip()
@@ -168,9 +187,6 @@ def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, .
                 supporting_observation_ids=supporting,
             ),
         )
-
-    if not candidates:
-        return (_fallback_candidate(raw_body),)
 
     return tuple(candidates)
 

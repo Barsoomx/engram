@@ -814,7 +814,7 @@ def generated_candidates_payload(prompt: str) -> str:
         },
     ]
 
-    return json.dumps(candidates)
+    return json.dumps({'memories': candidates})
 
 
 def generated_curation_judgment_payload() -> str:
