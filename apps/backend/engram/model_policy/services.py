@@ -897,7 +897,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                 'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject']},
                 'reason': {'type': 'string'},
             },
-            'required': ['decision'],
+            'required': ['decision', 'reason'],
         },
     },
 }

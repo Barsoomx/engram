@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 import pytest
+import structlog
 from django.db import connection
 
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
@@ -643,6 +644,28 @@ def test_parse_curation_reason_reads_reason() -> None:
     assert parse_curation_reason('{"decision": "merge"}') == ''
     assert parse_curation_reason('not json') == ''
     assert parse_curation_reason('[]') == ''
+
+
+@pytest.mark.django_db
+def test_judge_decision_logs_redacted_reason(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(
+        monkeypatch,
+        _JudgeGatewayStub('{"decision": "keep_both", "reason": "token sk-abcdef0123456789 already stored"}'),
+    )
+
+    with structlog.testing.capture_logs() as captured_logs:
+        CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    events = [entry for entry in captured_logs if entry['event'] == 'curation_judge_decision']
+    assert len(events) == 1
+    assert events[0]['decision'] == 'keep_both'
+    assert 'sk-abcdef0123456789' not in events[0]['reason']
+    assert 'already stored' in events[0]['reason']
 
 
 def test_curation_judge_prompt_redacts_secrets() -> None:

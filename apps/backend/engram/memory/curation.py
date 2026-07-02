@@ -377,7 +377,7 @@ class CurateMemoryCandidate:
             candidate_id=str(candidate.id),
             memory_id=str(memory.id),
             decision=decision,
-            reason=parse_curation_reason(result.generated_body),
+            reason=redact_text(parse_curation_reason(result.generated_body)),
         )
 
         return decision
