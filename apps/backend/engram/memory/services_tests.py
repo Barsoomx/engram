@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from decimal import Decimal
 
 import pytest
 from django.db import connection
 
-from engram.core.models import AuditEvent, MemoryCandidate, Observation, RetrievalDocument
+from engram.core.models import AuditEvent, MemoryCandidate, Observation, Organization, Project, RetrievalDocument, Team
 from engram.memory.memory_worker_tests import (
     create_embedding_policy,
     create_generation_policy,
@@ -18,13 +19,20 @@ from engram.memory.services import (
     ProcessObservationRecorded,
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
+    call_with_fallback,
     derive_observation_confidence,
     distillation_system_prompt,
     provider_prompt,
     strip_json_fence,
 )
-from engram.model_policy.models import ProviderCallRecord
-from engram.model_policy.services import FakeProviderGateway, ProviderCallResult
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import (
+    FakeProviderGateway,
+    ModelPolicyError,
+    ProviderCallInput,
+    ProviderCallResult,
+    ResolvedModelPolicy,
+)
 
 
 class _ObservationStub:
@@ -466,3 +474,209 @@ def test_strip_json_fence_returns_non_fence_text_unchanged() -> None:
 
 def test_strip_json_fence_returns_non_str_input_unchanged() -> None:
     assert strip_json_fence(None) is None  # type: ignore[arg-type]
+
+
+def create_fallback_scope() -> tuple[Organization, Team, Project]:
+    organization = Organization.objects.create(name='Fallback Org', slug='fallback-org')
+    team = Team.objects.create(organization=organization, name='Platform', slug='platform')
+    project = Project.objects.create(
+        organization=organization,
+        name='Backend',
+        slug='backend',
+        repository_url='https://example.test/engram.git',
+        repository_root='/workspace/engram',
+    )
+
+    return organization, team, project
+
+
+def create_fallback_policy(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    task_type: str,
+    fallback_enabled: bool = False,
+) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name=f'{task_type} secret',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name=f'{task_type} policy',
+        scope='project',
+        task_type=task_type,
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+        fallback_enabled=fallback_enabled,
+    )
+
+
+def fallback_provider_call_input(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    policy: ModelPolicy,
+) -> ProviderCallInput:
+    return ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='fallback-request',
+        trace_id='fallback-trace',
+        prompt='prompt text',
+        system_prompt='system prompt',
+        response_kind='candidates',
+    )
+
+
+def fallback_provider_call_result(policy: ModelPolicy) -> ProviderCallResult:
+    return ProviderCallResult(
+        provider=policy.provider,
+        model=policy.model,
+        call_record_id=uuid.uuid4(),
+        redaction_state='clean',
+        generated_title='title',
+        generated_body='body',
+    )
+
+
+class _RaisingGateway:
+    def __init__(self, error: ModelPolicyError) -> None:
+        self._error = error
+        self.calls: list[ProviderCallInput] = []
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self.calls.append(data)
+        raise self._error
+
+
+class _StubGateway:
+    def __init__(self, *, result: ProviderCallResult) -> None:
+        self._result = result
+        self.calls: list[ProviderCallInput] = []
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self.calls.append(data)
+
+        return self._result
+
+
+@pytest.mark.django_db
+def test_call_with_fallback_uses_fallback_gateway_on_model_policy_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_fallback_scope()
+    primary_policy = create_fallback_policy(organization, team, project, task_type='curation', fallback_enabled=True)
+    generation_policy = create_fallback_policy(organization, team, project, task_type='generation')
+    resolved = ResolvedModelPolicy(policy=primary_policy)
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    primary_gateway = _RaisingGateway(error)
+    fallback_result = fallback_provider_call_result(generation_policy)
+    fallback_gateway = _StubGateway(result=fallback_result)
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_args, **_kwargs: fallback_gateway)
+    data = fallback_provider_call_input(organization, team, project, primary_policy)
+
+    result, used_resolved = call_with_fallback(resolved, primary_gateway, data)
+
+    assert result is fallback_result
+    assert used_resolved.policy == generation_policy
+    assert primary_gateway.calls == [data]
+    assert fallback_gateway.calls[0].policy == generation_policy
+    audit = AuditEvent.objects.get(event_type='ProviderFallbackUsed')
+    assert audit.metadata['primary_policy_id'] == str(primary_policy.id)
+    assert audit.metadata['fallback_policy_id'] == str(generation_policy.id)
+    assert audit.metadata['task_type'] == 'curation'
+    assert audit.metadata['error_code'] == 'provider_http_error'
+
+
+@pytest.mark.django_db
+def test_call_with_fallback_reraises_when_fallback_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_fallback_scope()
+    primary_policy = create_fallback_policy(organization, team, project, task_type='curation', fallback_enabled=False)
+    create_fallback_policy(organization, team, project, task_type='generation')
+    resolved = ResolvedModelPolicy(policy=primary_policy)
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    primary_gateway = _RaisingGateway(error)
+    fallback_calls: list[ModelPolicy] = []
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda policy, **_kwargs: fallback_calls.append(policy) or FakeProviderGateway(),
+    )
+    data = fallback_provider_call_input(organization, team, project, primary_policy)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        call_with_fallback(resolved, primary_gateway, data)
+
+    assert exc_info.value is error
+    assert fallback_calls == []
+    assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
+
+
+@pytest.mark.django_db
+def test_call_with_fallback_reraises_when_fallback_resolves_to_same_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_fallback_scope()
+    primary_policy = create_fallback_policy(
+        organization,
+        team,
+        project,
+        task_type='generation',
+        fallback_enabled=True,
+    )
+    resolved = ResolvedModelPolicy(policy=primary_policy)
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    primary_gateway = _RaisingGateway(error)
+    fallback_calls: list[ModelPolicy] = []
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda policy, **_kwargs: fallback_calls.append(policy) or FakeProviderGateway(),
+    )
+    data = fallback_provider_call_input(organization, team, project, primary_policy)
+
+    with pytest.raises(ModelPolicyError) as exc_info:
+        call_with_fallback(resolved, primary_gateway, data)
+
+    assert exc_info.value is error
+    assert fallback_calls == []
+    assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
+
+
+@pytest.mark.django_db
+def test_call_with_fallback_returns_primary_result_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_fallback_scope()
+    primary_policy = create_fallback_policy(organization, team, project, task_type='curation', fallback_enabled=True)
+    resolved = ResolvedModelPolicy(policy=primary_policy)
+    primary_result = fallback_provider_call_result(primary_policy)
+    primary_gateway = _StubGateway(result=primary_result)
+    fallback_calls: list[ModelPolicy] = []
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda policy, **_kwargs: fallback_calls.append(policy) or FakeProviderGateway(),
+    )
+    data = fallback_provider_call_input(organization, team, project, primary_policy)
+
+    result, used_resolved = call_with_fallback(resolved, primary_gateway, data)
+
+    assert result is primary_result
+    assert used_resolved is resolved
+    assert fallback_calls == []
+    assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
