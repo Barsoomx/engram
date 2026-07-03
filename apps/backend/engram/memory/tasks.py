@@ -11,6 +11,7 @@ from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import Memory, MemoryStatus, Project
 from engram.memory.distillation import run_session_distillation_with_tracking
+from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
     DAILY_DIGEST_WINDOW_DAYS,
     WEEKLY_DIGEST_WINDOW_DAYS,
@@ -271,6 +272,18 @@ def sweep_stale_sessions() -> dict[str, int]:
     return {
         'swept': len(result.ended_session_ids),
         'distilled': len(result.distillable_session_ids),
+    }
+
+
+@app.task(name='engram.memory.retry_failed_distillations')
+def retry_failed_distillations() -> dict[str, int]:
+    result = RetryFailedDistillations().execute()
+
+    for session_id in result.retriable_session_ids:
+        distill_session.delay(str(session_id))
+
+    return {
+        'retried': len(result.retriable_session_ids),
     }
 
 
