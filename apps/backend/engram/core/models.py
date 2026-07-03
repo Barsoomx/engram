@@ -849,6 +849,7 @@ class LinkType(models.TextChoices):
     ISSUE = 'issue', 'Issue'
     NARROWED_BY = 'narrowed_by', 'Narrowed by'
     SUPERSEDED_BY = 'superseded_by', 'Superseded by'
+    CONFLICTS_WITH = 'conflicts_with', 'Conflicts With'
 
 
 class MemoryLink(TimestampedModel):

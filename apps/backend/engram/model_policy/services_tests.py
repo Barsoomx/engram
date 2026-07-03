@@ -8,6 +8,7 @@ from engram.context.context_api_tests import create_project_scope
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.real_provider_tests import _opener_raising, make_real_policy
 from engram.model_policy.services import (
+    _ANTHROPIC_STRUCTURED_TOOLS,
     AnthropicMessagesGateway,
     EmbeddingCallInput,
     OpenAICompatibleGateway,
@@ -241,3 +242,9 @@ def test_openai_gateway_call_raises_provider_timeout_when_url_error_wraps_timeou
 
     assert exc_info.value.code == 'provider_timeout'
     assert exc_info.value.retryable is True
+
+
+def test_curation_judgment_tool_schema_decision_enum_includes_contradicts() -> None:
+    decision_schema = _ANTHROPIC_STRUCTURED_TOOLS['curation_judgment']['input_schema']['properties']['decision']
+
+    assert 'contradicts' in decision_schema['enum']

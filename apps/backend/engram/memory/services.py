@@ -37,6 +37,7 @@ from engram.core.models import (
     WorkflowRunType,
 )
 from engram.core.redaction import redact_value as core_redact_value
+from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.model_policy.services import (
     AnthropicMessagesGateway,
     FakeProviderGateway,
@@ -688,6 +689,7 @@ class PromoteMemoryCandidate:
         candidate.status = CandidateStatus.PROMOTED
         candidate.promoted_memory = memory
         candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+        clear_candidate_conflict_links(candidate)
 
         return memory, version
 

@@ -50,6 +50,7 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value as core_redact_value
 from engram.core.repository import canonicalize_repository_url
+from engram.memory.conflict_links import clear_candidate_conflict_links
 
 logger = structlog.get_logger(__name__)
 
@@ -502,6 +503,8 @@ def approve_memory_candidate(
 
     candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
 
+    clear_candidate_conflict_links(candidate)
+
     audit_admin_action(
         organization=organization,
         actor_identity=actor_identity,
@@ -671,6 +674,8 @@ def reject_review_item(
         item.status = CandidateStatus.REJECTED
 
         item.save(update_fields=['status', 'updated_at'])
+
+        clear_candidate_conflict_links(item)
 
         target_type = 'memory_candidate'
 

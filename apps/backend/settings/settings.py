@@ -179,6 +179,29 @@ ENGRAM_NEAR_DUP_THRESHOLD = Decimal(
     os.environ.get('ENGRAM_NEAR_DUP_THRESHOLD', '0.850'),
 )
 
+ENGRAM_CURATOR_ESCALATION_ENABLED = to_bool(os.environ.get('ENGRAM_CURATOR_ESCALATION_ENABLED', 'true'))
+
+_DEFAULT_CURATOR_SENSITIVE_TERMS = (
+    'password',
+    'private key',
+    'api key',
+    'api_key',
+    'access key',
+    'client secret',
+    'secret key',
+    'vault',
+    'cve-',
+    'vulnerability',
+    'security incident',
+)
+ENGRAM_CURATOR_SENSITIVE_TERMS = tuple(
+    term.casefold()
+    for term in csv(
+        os.environ.get('ENGRAM_CURATOR_SENSITIVE_TERMS', ','.join(_DEFAULT_CURATOR_SENSITIVE_TERMS)),
+        default=_DEFAULT_CURATOR_SENSITIVE_TERMS,
+    )
+)
+
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',

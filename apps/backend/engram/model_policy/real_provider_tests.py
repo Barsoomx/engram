@@ -1165,6 +1165,7 @@ def test_anthropic_gateway_forces_tool_for_curation_judgment() -> None:
         'merge',
         'keep_both',
         'reject',
+        'contradicts',
     ]
     assert sent_body['tools'][0]['input_schema']['required'] == ['decision', 'reason']
     assert sent_body['max_tokens'] == 1024
