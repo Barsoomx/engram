@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
 import structlog
 from django.core.exceptions import ImproperlyConfigured
+from django.db import connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.models import ApiKeyCapability, Capability, Identity, OrganizationMembership, ProjectGrant, Role
 from engram.context.context_api_tests import auth_headers, create_project_scope, create_scoped_api_key
-from engram.core.models import AuditEvent, Team
+from engram.core.models import AuditEvent, AuditResult, Team
 from engram.model_policy import services
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
@@ -2119,3 +2124,173 @@ def test_model_policy_update_logs_model_policy_updated() -> None:
     assert events[0]['version'] == 2
 
     assert ModelPolicy.objects.filter(name='Org policy').count() == 0
+
+
+def _create_call_record(
+    policy: ModelPolicy,
+    secret: ProviderSecret,
+    organization: object,
+    project: object,
+    team: Team,
+    *,
+    result: str,
+    created_at: object,
+) -> ProviderCallRecord:
+    record = ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        policy=policy,
+        secret=secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type=policy.task_type,
+        policy_version=policy.version,
+        request_id=f'health-check-{uuid.uuid4()}',
+        trace_id='trace-health',
+        redaction_state='clean',
+        result=result,
+    )
+    ProviderCallRecord.objects.filter(id=record.id).update(created_at=created_at)
+    record.refresh_from_db()
+
+    return record
+
+
+# ─── Policy health fields (§2.6) ───────────────────────────────────────────────
+
+
+@pytest.mark.django_db
+def test_model_policy_detail_includes_health_fields_from_provider_call_records() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Health Detail', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy Health Detail', secret_id, 'curation')
+    policy = ModelPolicy.objects.get(id=policy_id)
+    secret = ProviderSecret.objects.get(id=secret_id)
+
+    success_record = _create_call_record(
+        policy,
+        secret,
+        organization,
+        project,
+        team,
+        result=AuditResult.RECORDED,
+        created_at=timezone.now() - timedelta(hours=1),
+    )
+    _create_call_record(
+        policy,
+        secret,
+        organization,
+        project,
+        team,
+        result=AuditResult.ERROR,
+        created_at=timezone.now() - timedelta(hours=2),
+    )
+    _create_call_record(
+        policy,
+        secret,
+        organization,
+        project,
+        team,
+        result=AuditResult.ERROR,
+        created_at=timezone.now() - timedelta(hours=48),
+    )
+
+    response = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['last_success_at'] == success_record.created_at.isoformat()
+    assert body['recent_error_count'] == 1
+
+
+@pytest.mark.django_db
+def test_model_policy_detail_health_fields_default_to_none_and_zero_without_records() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Health Empty', 'openai')
+    policy_id = _create_policy(client, project, team, 'Policy Health Empty', secret_id)
+
+    response = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['last_success_at'] is None
+    assert body['recent_error_count'] == 0
+
+
+@pytest.mark.django_db
+def test_model_policy_list_includes_health_fields_and_avoids_per_policy_queries() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Health List', 'openai')
+
+    policy_ids = [
+        _create_policy(client, project, team, f'Policy Health List {task_type}', secret_id, task_type)
+        for task_type in ('generation', 'curation', 'digest')
+    ]
+    secret = ProviderSecret.objects.get(id=secret_id)
+    for policy_id in policy_ids:
+        policy = ModelPolicy.objects.get(id=policy_id)
+        _create_call_record(
+            policy,
+            secret,
+            organization,
+            project,
+            team,
+            result=AuditResult.RECORDED,
+            created_at=timezone.now() - timedelta(hours=1),
+        )
+        _create_call_record(
+            policy,
+            secret,
+            organization,
+            project,
+            team,
+            result=AuditResult.ERROR,
+            created_at=timezone.now() - timedelta(hours=2),
+        )
+        _create_call_record(
+            policy,
+            secret,
+            organization,
+            project,
+            team,
+            result=AuditResult.ERROR,
+            created_at=timezone.now() - timedelta(hours=48),
+        )
+
+    with CaptureQueriesContext(connection) as ctx:
+        response = client.get(
+            '/v1/model-policy/policies',
+            {'project_id': str(project.id), 'team_id': str(team.id)},
+            **auth_headers(POLICY_RAW_KEY),
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 3
+    items_by_id = {item['id']: item for item in body['items']}
+    for policy_id in policy_ids:
+        assert items_by_id[policy_id]['recent_error_count'] == 1
+        assert items_by_id[policy_id]['last_success_at'] is not None
+
+    provider_call_record_queries = [
+        entry for entry in ctx.captured_queries if 'model_policy_providercallrecord' in entry['sql'].lower()
+    ]
+    assert len(provider_call_record_queries) < len(policy_ids)

@@ -281,6 +281,82 @@ def test_retrieval_settings_put_rejects_out_of_range_auto_approve_threshold(f_or
     assert response.status_code == 400
 
 
+@pytest.mark.django_db
+def test_retrieval_settings_put_above_ceiling_includes_advisory(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': 0.8},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['distillation_auto_approve_threshold'] == pytest.approx(0.8)
+    assert body['advisory'] == (
+        'per-observation candidates will always be held; session distillation must be healthy for memory to be promoted'
+    )
+
+    organization = Organization.objects.get(slug='settings-org')
+    settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+    assert float(settings.distillation_auto_approve_threshold) == pytest.approx(0.8)
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_at_or_below_ceiling_has_no_advisory(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': 0.5},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['distillation_auto_approve_threshold'] == pytest.approx(0.5)
+    assert 'advisory' not in body
+
+    organization = Organization.objects.get(slug='settings-org')
+    settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+    assert float(settings.distillation_auto_approve_threshold) == pytest.approx(0.5)
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_null_threshold_has_no_advisory(f_org_admin_client: APIClient) -> None:
+    f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': 0.8},
+        format='json',
+    )
+
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': None},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['distillation_auto_approve_threshold'] is None
+    assert 'advisory' not in body
+
+    organization = Organization.objects.get(slug='settings-org')
+    settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+    assert settings.distillation_auto_approve_threshold is None
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_get_never_includes_advisory(f_org_admin_client: APIClient) -> None:
+    f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'distillation_auto_approve_threshold': 0.8},
+        format='json',
+    )
+
+    response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert response.status_code == 200
+    assert 'advisory' not in response.json()
+
+
 # ─── Hybrid retrieval gating in BuildContextBundle ───────────────────────────
 
 
