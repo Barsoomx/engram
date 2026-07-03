@@ -38,8 +38,10 @@ from engram.console.services import (
 )
 from engram.core.models import (
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     Organization,
     Project,
@@ -231,6 +233,43 @@ def test_approve_memory_candidate_promotes_candidate(
 
 
 @pytest.mark.django_db
+def test_approve_memory_candidate_clears_conflict_links(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    other_candidate = _make_candidate(f_organization, f_project)
+
+    existing_memory = _make_memory(f_organization, f_project)
+
+    conflict_link = MemoryLink.objects.create(
+        organization=f_organization,
+        project=f_project,
+        memory=existing_memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+
+    survivor_link = MemoryLink.objects.create(
+        organization=f_organization,
+        project=f_project,
+        memory=existing_memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{other_candidate.id}',
+        label='contradiction claim',
+    )
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert not MemoryLink.objects.filter(id=conflict_link.id).exists()
+
+    assert MemoryLink.objects.filter(id=survivor_link.id).exists()
+
+
+@pytest.mark.django_db
 def test_edit_memory_body_creates_new_version(
     f_organization: Organization,
     f_project: Project,
@@ -294,6 +333,43 @@ def test_reject_review_item_rejects_candidate(
     candidate.refresh_from_db()
 
     assert candidate.status == CandidateStatus.REJECTED
+
+
+@pytest.mark.django_db
+def test_reject_review_item_clears_conflict_links_for_candidate(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    other_candidate = _make_candidate(f_organization, f_project)
+
+    existing_memory = _make_memory(f_organization, f_project)
+
+    conflict_link = MemoryLink.objects.create(
+        organization=f_organization,
+        project=f_project,
+        memory=existing_memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+
+    survivor_link = MemoryLink.objects.create(
+        organization=f_organization,
+        project=f_project,
+        memory=existing_memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{other_candidate.id}',
+        label='contradiction claim',
+    )
+
+    reject_review_item(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert not MemoryLink.objects.filter(id=conflict_link.id).exists()
+
+    assert MemoryLink.objects.filter(id=survivor_link.id).exists()
 
 
 @pytest.mark.django_db

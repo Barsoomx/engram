@@ -544,6 +544,61 @@ def test_curate_rejects_low_signal_candidate_without_creating_memory() -> None:
 
 
 @pytest.mark.django_db
+def test_curate_reject_low_signal_clears_conflict_links() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='noise',
+        body='noise',
+        content_hash='hash-noise-conflict',
+    )
+    other_candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='other candidate',
+        body=_LONG_BODY,
+        content_hash='hash-other-candidate',
+    )
+    existing = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Existing fact',
+            body=_LONG_BODY,
+            content_hash='hash-existing-conflict',
+        ),
+    )
+    conflict_link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=existing,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+    survivor_link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=existing,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{other_candidate.id}',
+        label='contradiction claim',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert result.decision == 'rejected'
+    assert not MemoryLink.objects.filter(id=conflict_link.id).exists()
+    assert MemoryLink.objects.filter(id=survivor_link.id).exists()
+
+
+@pytest.mark.django_db
 def test_curate_disabled_passes_through_to_plain_promotion() -> None:
     organization, team, project = create_scope()
     create_embedding_policy(organization, team, project)

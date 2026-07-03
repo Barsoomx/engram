@@ -465,6 +465,11 @@ class CurateMemoryCandidate:
             else:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
+                MemoryLink.objects.filter(
+                    organization=locked.organization,
+                    link_type=LinkType.CONFLICTS_WITH,
+                    target=f'candidate:{locked.id}',
+                ).delete()
                 metadata: dict[str, object] = {
                     'reason': reason,
                     'body_length': len(redact_text(locked.body).strip()),

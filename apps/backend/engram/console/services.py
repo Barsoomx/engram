@@ -476,6 +476,12 @@ def approve_memory_candidate(
 
     candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
 
+    MemoryLink.objects.filter(
+        organization=candidate.organization,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+    ).delete()
+
     audit_admin_action(
         organization=organization,
         actor_identity=actor_identity,
@@ -637,6 +643,12 @@ def reject_review_item(
         item.status = CandidateStatus.REJECTED
 
         item.save(update_fields=['status', 'updated_at'])
+
+        MemoryLink.objects.filter(
+            organization=item.organization,
+            link_type=LinkType.CONFLICTS_WITH,
+            target=f'candidate:{item.id}',
+        ).delete()
 
         target_type = 'memory_candidate'
 
