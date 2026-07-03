@@ -99,6 +99,16 @@ integration, client surfaces, and operations.
   `apps/backend`, `apps/frontend`, `packages/cli`,
   `packages/claude-plugin`, `packages/codex-plugin`, `plugin-repository`, and
   `deploy/compose` (the former `packages/mcp` merged into `packages/cli`).
+- Repository-URL project routing parity: `repository_url` is now accepted as
+  an alternative to `project_id` on observations (list/detail) and memory
+  (feedback, version, links, diff) endpoints, matching hooks/context/search.
+  One precedence ladder (per-call argument/`--project` > `ENGRAM_PROJECT_ID` >
+  `~/.engram/config.json` `project_id` > repository derived from the current
+  workspace) now governs project selection identically across all six MCP
+  tools, `engram search`/`observations`/`memory version|link|links`, and hook
+  ingest. The MCP bridge derives the workspace from `CLAUDE_PROJECT_DIR` when
+  set (falling back to `cwd`), so a Claude Code plugin-cache working directory
+  can no longer mis-route memory to the wrong project.
 
 ### Changed
 
@@ -133,3 +143,15 @@ integration, client surfaces, and operations.
   retrieval document paths, context `rendered_text`, and audit metadata.
 - Cross-team and cross-project denial enforced across ingest, memory lookup,
   context bundle generation, inspection API, worker processing, and replay.
+- Cross-project isolation on repository-URL routing: hooks, search, and
+  context previously resolved a `repository_url` to a project without
+  verifying the requesting scope's project membership, so a project-scoped
+  API key could read or write another in-org project's memory by sending its
+  `repository_url`. All repository-URL paths (including the new observations
+  and memory endpoints) now run through a shared resolver that enforces
+  membership before any query executes, denying `project_scope_denied` on a
+  mismatch; a project-bound key's binding wins even if it also carries the
+  `projects:agent` capability. `git_remote_url` strips URL userinfo,
+  including the password-only form (`https://:token@host/...`, previously
+  missed because an empty username was treated as absent), so embedded
+  credentials never reach a request payload or query string.

@@ -1328,3 +1328,52 @@ distills observations into `Provider-generated memory <hash>` text, so the e2e
 search anchors on `file_paths` + memory_id instead of the run marker; an
 org-wide agent key cannot bind `--team` (`team_scope_denied`), so the agent
 connect omits it.
+
+## 2026-07-03: Project Routing Parity
+
+Branch: `feat/project-routing-parity`. Spec:
+`docs/superpowers/specs/2026-07-03-project-routing-parity-design.md`.
+
+Closes the asymmetry where `engram_memory_link`, `engram_observations`,
+`engram_memory_version`, and `engram_memory_feedback` (MCP) and their CLI
+equivalents hard-required a connected project while `engram_search` and
+`engram_context` already fell back to a repository-derived project. Nine
+serializers (observations list/detail; memory feedback, version POST/GET,
+links POST/GET/DELETE, diff GET) now accept `repository_url` alongside
+`project_id`, resolved through a new shared, scope-enforcing
+`resolve_project_for_scope` (`core/repository.py`) that hooks/search/context
+are retrofitted onto as well. The retrofit is also a security fix: it closes
+a latent hole where a project-scoped key sending an in-org
+`repository_url` belonging to a different project could read/write that
+project via hooks/search/context, because those paths never checked resolved
+project membership. `EffectiveScope.project_bound` is new; the membership
+guard makes a project-bound key's binding win over a `projects:agent`
+capability grant unconditionally. One precedence ladder (per-call
+`project_id`/`--project` > `ENGRAM_PROJECT_ID` > config `project_id` >
+repo-derived) now applies identically to all six MCP tools, `engram search`,
+`engram observations`, `engram memory version|link|links`, and hook payload
+building; the MCP bridge derives the repo from `CLAUDE_PROJECT_DIR` before
+falling back to cwd, closing a plugin-cache mis-routing risk; `git_remote_url`
+strips URL userinfo (including the password-only form) before it ever leaves
+the machine.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| full backend gate (isolated pgvector harness) | `docker exec -w /app -e ENGRAM_DATABASE_URL=postgresql://engram:engram@engram-projrouting-pg:5432/engram engram-projrouting-tester poetry run pytest -q` | Backend | yes | pass | 1268+ passed: `resolve_project_for_scope` matrix (project_id path, canonical match, not-found, membership deny, unbound `projects:agent` allow incl. just-created, bound key WITH `projects:agent` denied for a foreign project / allowed for its own, session scope never takes the capability branch, cross-org isolation), nine-serializer one-of validation, per-endpoint repo-url API tests, and hooks/search/context retrofit regressions (project-scoped key + foreign in-org repo-url now denied, org-wide behavior unchanged). |
+| CLI suite | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend / Run CLI tests | yes | pass | 166 passed: precedence-ladder order proven for search/observations/memory (`--project` > `ENGRAM_PROJECT_ID` > config > repo-derived), `missing_project` client error with zero transport calls, userinfo stripped from `git_remote_url` incl. the password-only form, hooks honor `ENGRAM_PROJECT_ID`, MCP tools send `repository_url` in repo-url mode and no longer return a project-required message, `project_not_found` rendered as guidance text, `CLAUDE_PROJECT_DIR` wins over cwd. |
+| Claude plugin contract tests | `PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v` | Backend / Run Claude plugin contract tests | yes | pass | 8 passed, no regressions from the vendored bundle re-sync. |
+| plugin bundle sync | `python3 scripts/sync_plugin_bundle.py --check` | Repository Quality | yes | pass | Bundle in sync (`commands.py`, `mcp_tools.py`, `mcp_server.py`, `main.py` re-synced into `packages/claude-plugin/hooks/engram_cli/`). |
+| compose golden path + repo-url-mode MCP drive | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pending | Task 5 (second `drive_mcp_stdio` pass with a config dir carrying no `project_id` and cwd inside a repo whose `origin` matches the bootstrap project, asserting all six tools succeed) not yet run at the time of this entry; coordinator to update this row after the e2e gate completes. |
+
+First decisive failures (from commit history): `_strip_url_userinfo` missed
+the password-only userinfo form (`https://:TOKEN@host/repo.git` has an empty
+username, which the original guard treated as falsy and skipped stripping) -
+the token would have leaked into request payloads/query strings (fixed in
+`b670ab156ad2`). `resolve_project_for_scope` called `resolve_or_create_project`
+before running the membership guard, so `allow_create=True` committed a new
+`Project` row even when the requesting scope could never pass the guard for a
+freshly created project (any project-bound key, any session scope, or an
+unbound key without `projects:agent`) - the row stayed committed after the
+immediate `project_scope_denied` (fixed in `5f8f5e0ec28f`; creation is now
+attempted only when the scope actually holds the unbound `projects:agent`
+capability that would admit a just-created project).

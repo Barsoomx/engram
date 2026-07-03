@@ -13,9 +13,11 @@ and configuration.
 The MCP server:
 
 - runs locally as a stdio JSON-RPC bridge;
-- stores only server URL, project id, and scoped agent credential metadata
-  (resolved from environment variables or `~/.engram`, never persisted by the
-  bridge itself);
+- stores only server URL, an optional project id override, and scoped agent
+  credential metadata (resolved from environment variables, `~/.engram`, or a
+  git-derived `repository_url` per the precedence ladder in
+  [guides/mcp.md](guides/mcp.md#project-precedence-ladder), never persisted by
+  the bridge itself);
 - calls server APIs for every read and write;
 - enforces server-side RBAC on every tool call;
 - never stores local memory, embeddings, provider secrets, or curation state.
@@ -30,15 +32,18 @@ Desktop, or directly over stdio for any other client.
 | Tool                      | Maps to conceptual tool                        | Description                                                    |
 |----------------------------|--------------------------------------------------|--------------------------------------------------------------------|
 | `engram_search`           | `memory.search`                                 | hybrid exact + semantic search over authorized memory             |
-| `engram_context`          | `memory.context`                                | session-start context bundle for the connected project            |
+| `engram_context`          | `memory.context`                                | session-start context bundle for the resolved project              |
 | `engram_memory_link`      | shipped extra, beyond the original catalog      | attach a file/symbol/commit/issue link to an approved memory      |
-| `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the connected project                |
+| `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the resolved project                |
 | `engram_memory_version`   | shipped extra, beyond the original catalog      | update an approved memory body, creating a new reviewed version   |
 | `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | mark an injected memory stale or refuted, with a reason         |
 
 All six are developer-scoped. Any actor whose API key resolves read/write
 capability for the target memory can call them; there is no separate
-lead/curator tool set yet.
+lead/curator tool set yet. All six also accept an optional per-call
+`project_id` argument and fall back to a repository-derived project when
+neither it nor `ENGRAM_PROJECT_ID`/config resolve one - see
+[guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
 
 These tools should feel seamless. Developers should not need to understand the
 curation pipeline to benefit from memory.
@@ -93,3 +98,12 @@ MCP tools use the same effective access algorithm as the API and admin UI:
 
 If a lead asks for cross-team data, the server returns only teams and projects
 the actor can access. Denials include the missing capability and request id.
+
+Repository-URL-derived calls carry the same guarantee: the shared resolver
+resolves the project inside the key's own organization only, then checks it
+against the key's binding before any query runs. A `repository_url` outside
+the key's binding is denied `403 project_scope_denied` (a DENIED audit event
+records the resolved project id); a `repository_url` matching no project in
+the organization returns `404 project_not_found`. See
+[guides/mcp.md](guides/mcp.md#errors-from-repository-url-resolution) for the
+guidance text each tool renders for these.

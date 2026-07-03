@@ -30,6 +30,35 @@ All local state lives under `~/.engram/` (override with `--config-dir`):
 Forbidden on the client (by design): provider secrets, embeddings, memory
 bundles, prompt/tool-output bodies, persistent queues.
 
+## Project resolution
+
+`engram search`, `engram observations`, `engram memory version|link|links`,
+and hook ingest all resolve which project a call targets with the same
+precedence ladder, in order:
+
+1. an explicit override for that call - `--project` on the CLI commands
+   below, or the harness-supplied `project_id` field on hook payloads;
+2. `ENGRAM_PROJECT_ID`;
+3. `project_id` in `~/.engram/config.json` (written by `engram connect
+   --project ...` - optional, `connect` works without it);
+4. the repository derived from `git remote get-url origin` in the current
+   directory, sent as `repository_url` instead of `project_id`. Credentials
+   embedded in the remote URL (`https://user:token@host/...`, including the
+   password-only form `https://:token@host/...`) are stripped before the
+   value ever leaves the machine.
+
+`engram search` never fails client-side on an unresolved project: if nothing
+in the ladder resolves, it sends the request with neither `project_id` nor
+`repository_url`, and the server answers `400 project_or_repository_required`.
+`engram observations` and `engram memory version|link|links` fail fast
+client-side instead - `missing_project: Set --project, ENGRAM_PROJECT_ID, or
+run inside a git repository` - with no network call.
+
+The server always re-authorizes whichever project a `repository_url`-derived
+request resolves to, inside the caller's own organization; see
+[backend-contracts.md](../backend-contracts.md#project-routing-contract) for
+the resolver contract and error codes.
+
 ## `engram connect`
 
 Writes config + credentials + hook manifests, then calls `POST /v1/hooks/dry-run`
@@ -126,6 +155,12 @@ echo '{"session_id":"s1","payload":{"tool":"Edit"}}' | \
 | `--config-dir`     | path                                  | `~/.engram` |
 | `--response-format`| `server`, `codex`, `claude-code`      | `server`  |
 
+Project resolution follows the ladder in [Project resolution](#project-resolution):
+the stdin payload's own `project_id` field wins, then `ENGRAM_PROJECT_ID`, then
+config `project_id`; hooks have no repo-derived fallback beyond the
+`repository_url`/`repository_root`/`cwd` the harness already supplies in the
+payload.
+
 `--response-format` controls the shape of stdout:
 
 - `server` - the raw server response body.
@@ -141,11 +176,13 @@ supplied, so replaying the same stdin is safe.
 
 ## `engram search`
 
-Semantic + full-text memory search within the connected project's scope.
+Semantic + full-text memory search within the resolved project's scope (see
+[Project resolution](#project-resolution)).
 
 ```bash
 engram search --query "auth token rotation" --limit 5
 engram search --query "auth" --file-path src/auth.py --symbol rotate_token --json
+engram search --query "auth" --project <project_id>
 ```
 
 | Flag          | Default | Description                                   |
@@ -154,26 +191,36 @@ engram search --query "auth" --file-path src/auth.py --symbol rotate_token --jso
 | `--file-path` | -       | Repeatable path filter                        |
 | `--symbol`    | -       | Repeatable symbol filter                      |
 | `--limit`     | 5       | Max items                                     |
+| `--project`   | empty   | Project id override (ladder rung 1)           |
 | `--json`      | false   | Emit the raw server response as JSON          |
 
 Plain output lists each item as `<citation>: <title>` followed by its body.
 
 ## `engram observations`
 
-Lists observations visible to the connected scope.
+Lists observations visible to the resolved scope (see
+[Project resolution](#project-resolution)).
 
 ```bash
 engram observations --limit 20
+engram observations --project <project_id>
 ```
+
+| Flag        | Default | Description                                     |
+|-------------|---------|--------------------------------------------------|
+| `--limit`   | 20      | Max items                                         |
+| `--project` | empty   | Project id override (ladder rung 1)               |
 
 ## `engram memory`
 
-Memory mutations and links (all within the connected project scope):
+Memory mutations and links (all within the resolved project scope; every
+subcommand accepts `--project` as ladder rung 1):
 
 ```bash
 engram memory version <memory_id> --body "Updated body" --reason "fix"
 engram memory link <memory_id> --link-type file --target src/auth.py --label "rotate"
 engram memory links <memory_id>
+engram memory version <memory_id> --body "Updated body" --project <project_id>
 ```
 
 | Subcommand | Path                                   | Notes                              |
@@ -196,6 +243,16 @@ Common codes: `missing_server_url`, `missing_api_key`, `missing_project`,
 `server_unavailable`, `http_error`, `invalid_response`, `invalid_key`,
 `expired_key`, `missing_capability`, `project_scope_denied`,
 `team_scope_denied`. The raw API key is always redacted from error output.
+
+`missing_project` is raised client-side, with no network call, by
+`engram observations` and `engram memory version|link|links` when the
+[precedence ladder](#project-resolution) resolves neither a project id nor a
+repository URL. Two server-side codes can also reach the terminal, printed
+with their own code (not wrapped as `http_error`) once a `repository_url` is
+in play: `project_or_repository_required` (400 - neither `project_id` nor
+`repository_url` reached the server; `engram search` can hit this, since it
+does not gate client-side) and `project_not_found` (404 - the resolved
+`repository_url` matches no project in the organization).
 
 ## See also
 

@@ -71,6 +71,48 @@ Rules:
 - audit records include request id, actor, target resource, scope filters,
   capability checked, missing capability on deny, and result.
 
+## Project Routing Contract
+
+Every agent-facing endpoint that reads or writes tenant-scoped memory data
+(hooks ingest, context bundles, search, observations list/detail, memory
+feedback/version/links/diff) resolves its target project through one shared,
+scope-enforcing resolver (`resolve_project_for_scope` in
+`engram/core/repository.py`), not per-view logic.
+
+Rules:
+
+- request contract: `project_id` (UUID) and `repository_url` (string,
+  optional, at most 1024 characters) are both accepted; `project_id` wins
+  when both are present; at least one is required or the request is denied
+  with `400 project_or_repository_required`;
+- resolution always happens inside the caller's own organization - a
+  `repository_url` can never resolve a project belonging to another
+  organization, regardless of whether that project's repository URL
+  collides;
+- membership guard, binding wins over capability: a request is authorized
+  only if the resolved project is already in the caller's scoped
+  `project_ids`, or the caller is an **unbound** API-key scope
+  (`project_bound=False`) carrying the `projects:agent` capability (the
+  branch that admits a project newly auto-created by this same call). A
+  **project-bound** key never takes the capability branch, even if it was
+  (mis)granted `projects:agent` - its binding is the sole rule. Console and
+  session scopes never take the capability branch either. Failing the guard
+  raises `403 project_scope_denied` and writes a DENIED audit event carrying
+  the resolved project id;
+- resolve-only vs. resolve-or-create: hooks ingest, context bundles, and
+  search may auto-create a project for an unmatched `repository_url`
+  (`allow_create=True`), but only take the create path when the caller
+  already holds the unbound `projects:agent` branch above - a project-bound
+  key, or an unbound key without the capability, gets `404 project_not_found`
+  instead of a side-effecting create. Observations (list/detail) and memory
+  mutations/reads (feedback, version, links, diff) are resolve-only: an
+  unmatched `repository_url` always returns `404 project_not_found`, with no
+  project created as a read/write side effect;
+- client-provided `project_id`/`repository_url` values are selection, never
+  authorization - the resolver only narrows within the scope
+  `resolve_request_scope` already computed from the API key or session; no
+  value on either field can expand organization/team/project scope.
+
 ## Observability Fields
 
 Every API request, hook event, service call, queued task, worker job, and
