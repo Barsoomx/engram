@@ -265,6 +265,7 @@ class SearchPayloadTests(unittest.TestCase):
             file_paths=[],
             symbols=[],
             limit=5,
+            project_id="proj-1",
             repository_url="git@github.com:acme/x.git",
         )
 
@@ -280,6 +281,7 @@ class SearchPayloadTests(unittest.TestCase):
             file_paths=["a.py"],
             symbols=[],
             limit=3,
+            project_id="",
             repository_url="git@github.com:acme/x.git",
         )
 

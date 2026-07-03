@@ -597,7 +597,7 @@ def git_remote_url(path: str) -> str:
 
 def _strip_url_userinfo(url: str) -> str:
     parsed = urlparse(url)
-    if not parsed.scheme or not parsed.username:
+    if not parsed.scheme or not (parsed.username or parsed.password):
         return url
     netloc = parsed.hostname or ""
     if parsed.port:
@@ -1706,9 +1706,8 @@ def build_search_payload(
         "symbols": symbols,
         "limit": limit,
     }
-    effective_project_id = project_id or as_string(config.get("project_id"))
-    if effective_project_id:
-        payload["project_id"] = effective_project_id
+    if project_id:
+        payload["project_id"] = project_id
     elif repository_url:
         payload["repository_url"] = repository_url
     team_id = as_string(config.get("team_id"))
