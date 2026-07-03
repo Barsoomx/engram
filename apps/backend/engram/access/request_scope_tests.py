@@ -316,11 +316,11 @@ def test_session_scope_narrows_to_requested_project() -> None:
 
 
 @pytest.mark.django_db
-def test_session_scope_writes_audit_on_allow() -> None:
+def test_session_scope_writes_no_audit_on_allow() -> None:
     from rest_framework.test import APIRequestFactory
 
     from engram.access.request_scope import resolve_request_scope
-    from engram.core.models import AuditEvent, AuditResult
+    from engram.core.models import AuditEvent
 
     organization, _team, project, _owner, _api_key = create_project_scope()
     user, token = _make_admin_session(organization)
@@ -334,15 +334,11 @@ def test_session_scope_writes_audit_on_allow() -> None:
         request, required_capability='memories:admin', project_id=project.id, target_type='memory', target_id='list'
     )
 
-    event = AuditEvent.objects.filter(
+    assert not AuditEvent.objects.filter(
         organization=organization,
         event_type='AccessScopeResolved',
         actor_type='user',
-        result=AuditResult.ALLOWED,
-    ).first()
-    assert event is not None
-    assert event.capability == 'memories:admin'
-    assert event.actor_id == str(user.id)
+    ).exists()
 
 
 @pytest.mark.django_db
