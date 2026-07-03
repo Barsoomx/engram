@@ -3,7 +3,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 
 import structlog
@@ -38,9 +38,14 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value as core_redact_value
 from engram.model_policy.services import (
+    AnthropicMessagesGateway,
+    FakeProviderGateway,
     ModelPolicyError,
+    OpenAICompatibleGateway,
     ProviderCallInput,
+    ProviderCallResult,
     ProviderSecretError,
+    ResolvedModelPolicy,
     ResolveModelPolicy,
     ResolveModelPolicyInput,
     get_provider_gateway,
@@ -66,6 +71,65 @@ def strip_json_fence(raw_body: str) -> str:
         return raw_body
 
     return '\n'.join(body_lines[:closing_index]).strip()
+
+
+_ProviderGateway = FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway
+
+
+def _audit_provider_fallback_used(
+    resolved: ResolvedModelPolicy,
+    fallback_resolved: ResolvedModelPolicy,
+    data: ProviderCallInput,
+    error: ModelPolicyError,
+) -> None:
+    AuditEvent.objects.create(
+        organization_id=data.organization_id,
+        project_id=data.project_id,
+        team_id=data.team_id,
+        event_type='ProviderFallbackUsed',
+        actor_type='system',
+        target_type='model_policy',
+        target_id=str(resolved.policy.id),
+        capability='memories:review',
+        result=AuditResult.RECORDED,
+        request_id=data.request_id,
+        correlation_id=data.trace_id,
+        metadata={
+            'primary_policy_id': str(resolved.policy.id),
+            'fallback_policy_id': str(fallback_resolved.policy.id),
+            'task_type': resolved.policy.task_type,
+            'error_code': error.code,
+        },
+    )
+
+
+def call_with_fallback(
+    resolved: ResolvedModelPolicy,
+    gateway: _ProviderGateway,
+    data: ProviderCallInput,
+) -> tuple[ProviderCallResult, ResolvedModelPolicy]:
+    try:
+        return gateway.call(data), resolved
+    except ModelPolicyError as error:
+        if not resolved.policy.fallback_enabled:
+            raise
+
+        fallback_resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+                team_id=data.team_id,
+                task_type='generation',
+            ),
+        )
+        if fallback_resolved.policy.id == resolved.policy.id:
+            raise
+
+        fallback_gateway = get_provider_gateway(fallback_resolved.policy)
+        fallback_result = fallback_gateway.call(replace(data, policy=fallback_resolved.policy))
+        _audit_provider_fallback_used(resolved, fallback_resolved, data, error)
+
+        return fallback_result, fallback_resolved
 
 
 @dataclass(frozen=True)
@@ -1216,7 +1280,9 @@ class GenerateDigest:
         )
         prompt = digest_prompt(sources)
         try:
-            provider_result = get_provider_gateway(resolved.policy).call(
+            provider_result, _used_resolved = call_with_fallback(
+                resolved,
+                get_provider_gateway(resolved.policy),
                 ProviderCallInput(
                     organization_id=project.organization_id,
                     project_id=project.id,

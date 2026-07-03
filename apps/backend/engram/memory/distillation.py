@@ -27,6 +27,7 @@ from engram.core.models import (
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.services import (
     MemoryWorkerError,
+    call_with_fallback,
     is_auto_promotable,
     redact_error,
     redact_text,
@@ -365,21 +366,33 @@ class DistillSession:
                 observations_distilled=sum(len(chunk) for chunk in chunks),
             )
 
+        active_resolved, active_gateway = resolved, gateway
         provider_results: list[ProviderCallResult] = []
         synthesized: list[tuple[SynthesizedCandidate, dict[str, object]]] = []
         for index, chunk in enumerate(chunks):
             prompt = session_distillation_prompt(chunk, budget)
-            provider_result = self._call_chunk(session, gateway, resolved, prompt, correlation_id, run_scope, index)
+            provider_result, used_resolved = self._call_chunk(
+                session,
+                active_gateway,
+                active_resolved,
+                prompt,
+                correlation_id,
+                run_scope,
+                index,
+            )
+            if used_resolved.policy.id != active_resolved.policy.id:
+                active_resolved = used_resolved
+                active_gateway = get_provider_gateway(active_resolved.policy)
             provider_results.append(provider_result)
-            provenance = self._provenance(provider_result, resolved)
+            provenance = self._provenance(provider_result, used_resolved)
             synthesized.extend(
                 (candidate, provenance) for candidate in parse_synthesized_candidates(provider_result.generated_body)
             )
 
         synthesized = self._reduce_candidates(
             session,
-            gateway,
-            resolved,
+            active_gateway,
+            active_resolved,
             synthesized,
             provider_results,
             correlation_id,
@@ -467,9 +480,11 @@ class DistillSession:
         correlation_id: str,
         run_scope: str,
         index: int,
-    ) -> ProviderCallResult:
+    ) -> tuple[ProviderCallResult, ResolvedModelPolicy]:
         try:
-            return gateway.call(
+            return call_with_fallback(
+                resolved,
+                gateway,
                 ProviderCallInput(
                     organization_id=session.organization_id,
                     project_id=session.project_id,
@@ -550,7 +565,9 @@ class DistillSession:
             return synthesized
 
         try:
-            reduce_result = gateway.call(
+            reduce_result, used_resolved = call_with_fallback(
+                resolved,
+                gateway,
                 ProviderCallInput(
                     organization_id=session.organization_id,
                     project_id=session.project_id,
@@ -576,7 +593,7 @@ class DistillSession:
             return synthesized
 
         provider_results.append(reduce_result)
-        provenance = self._provenance(reduce_result, resolved)
+        provenance = self._provenance(reduce_result, used_resolved)
         provenance['reduced'] = True
 
         return self._merge_reduced_candidates(synthesized, parsed_reduced, provenance)

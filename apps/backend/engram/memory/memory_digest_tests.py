@@ -26,7 +26,7 @@ from engram.memory.services import (
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
-from engram.model_policy.services import ModelPolicyError
+from engram.model_policy.services import FakeProviderGateway, ModelPolicyError, ProviderCallInput, ProviderCallResult
 
 
 @pytest.fixture
@@ -61,6 +61,40 @@ def create_digest_policy(organization: Organization, team: Team | None, project:
         name='Digest policy',
         scope='project',
         task_type='digest',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+
+
+def create_digest_generation_policy(organization: Organization, project: Project) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=None,
+        name='Org Generation OpenAI',
+        provider='openai',
+        scope='organization',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=None,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-generation-secret',
+        hmac_digest='generation-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=None,
+        project=project,
+        name='Generation policy',
+        scope='project',
+        task_type='generation',
         provider='openai',
         model='gpt-4.1-mini',
         secret=secret,
@@ -247,3 +281,61 @@ def test_run_daily_digest_rerun_with_real_gateway_does_not_replay_stale_provider
     assert second.memory.id != first.memory.id
     assert second.memory.body == 'Synthesized digest body from provider.'
     assert 'Second day source' not in second.memory.body
+
+
+class _DigestRaisingGateway:
+    def __init__(self, error: ModelPolicyError) -> None:
+        self._error = error
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        raise self._error
+
+
+def digest_policy_routed_gateway(error: ModelPolicyError) -> object:
+    def stub_get_provider_gateway(policy: ModelPolicy, **_kwargs: object) -> object:
+        if policy.task_type == 'digest':
+            return _DigestRaisingGateway(error)
+
+        return FakeProviderGateway()
+
+    return stub_get_provider_gateway
+
+
+@pytest.mark.django_db
+def test_generate_digest_falls_back_when_policy_call_fails(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    digest_policy = create_digest_policy(organization, team, project)
+    digest_policy.fallback_enabled = True
+    digest_policy.save(update_fields=['fallback_enabled'])
+    create_digest_generation_policy(organization, project)
+    source = create_source_memory(organization, team, project, title='Fallback source')
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    m_monkeypatch.setattr('engram.memory.services.get_provider_gateway', digest_policy_routed_gateway(error))
+
+    result = GenerateDigest().execute(
+        DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-fallback'),
+    )
+
+    assert result.memory.metadata['kind'] == 'digest'
+    audit = AuditEvent.objects.get(event_type='ProviderFallbackUsed')
+    assert audit.metadata['task_type'] == 'digest'
+    assert audit.metadata['error_code'] == 'provider_http_error'
+    assert audit.metadata['primary_policy_id'] == str(digest_policy.id)
+
+
+@pytest.mark.django_db
+def test_generate_digest_does_not_fall_back_when_disabled(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    create_digest_generation_policy(organization, project)
+    source = create_source_memory(organization, team, project, title='No fallback source')
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    m_monkeypatch.setattr('engram.memory.services.get_provider_gateway', digest_policy_routed_gateway(error))
+
+    with pytest.raises(MemoryWorkerError, match='digest provider unavailable'):
+        GenerateDigest().execute(
+            DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-no-fallback'),
+        )
+
+    assert Memory.objects.filter(metadata__kind='digest').count() == 0
+    assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
