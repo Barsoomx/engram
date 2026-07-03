@@ -47,7 +47,6 @@ from engram.model_policy.services import (
     ResolveModelPolicy,
     ResolveModelPolicyInput,
     get_provider_gateway,
-    provider_http_timeout,
     resolve_context_window_tokens,
 )
 
@@ -175,7 +174,7 @@ def _distill_chunk_char_budget(policy: ModelPolicy) -> int:
     if env_value is not None:
         return int(env_value)
 
-    ceiling = provider_http_timeout() * 2000
+    ceiling = int(os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', '120000'))
     tokens = resolve_context_window_tokens(policy)
     if tokens is None:
         return min(40000, ceiling)

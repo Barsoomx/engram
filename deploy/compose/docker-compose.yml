@@ -73,7 +73,7 @@ services:
       rabbitmq:
         condition: service_healthy
     command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-batch"
+      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-batch --prefetch-multiplier=1"
 
   worker-highmemory:
     <<: *backend

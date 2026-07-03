@@ -1062,21 +1062,21 @@ def test_distill_chunk_char_budget_env_override_returns_verbatim(m_monkeypatch: 
     assert _distill_chunk_char_budget(policy) == 777
 
 
-def test_distill_chunk_char_budget_unknown_model_defaults_to_40000_capped_by_ceiling(
+def test_distill_chunk_char_budget_unknown_model_defaults_to_40000_capped_by_default_ceiling(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60')
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
     policy = ModelPolicy(model='mystery-model-9000', metadata={})
 
     assert _distill_chunk_char_budget(policy) == 40000
 
 
-def test_distill_chunk_char_budget_known_model_is_min_of_context_chars_and_ceiling(
+def test_distill_chunk_char_budget_known_model_is_clamped_to_default_ceiling(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60')
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
     policy = ModelPolicy(model='claude-3-opus', metadata={})
 
     assert _distill_chunk_char_budget(policy) == 120000
@@ -1086,7 +1086,7 @@ def test_distill_chunk_char_budget_uses_uncapped_context_chars_between_floor_and
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60')
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
     policy = ModelPolicy(model='mystery-model', metadata={'context_window_tokens': 12000})
 
     assert _distill_chunk_char_budget(policy) == 12000
@@ -1094,20 +1094,45 @@ def test_distill_chunk_char_budget_uses_uncapped_context_chars_between_floor_and
 
 def test_distill_chunk_char_budget_floor_clamps_small_context_window(m_monkeypatch: pytest.MonkeyPatch) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60')
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
     policy = ModelPolicy(model='mystery-model', metadata={'context_window_tokens': 8000})
 
     assert _distill_chunk_char_budget(policy) == 8000
 
 
-def test_distill_chunk_char_budget_never_exceeds_ceiling_when_ceiling_below_floor(
-    m_monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_distill_chunk_char_budget_ceiling_env_override_changes_ceiling(m_monkeypatch: pytest.MonkeyPatch) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '1')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', '2000')
     policy = ModelPolicy(model='mystery-model', metadata={'context_window_tokens': 8000})
 
     assert _distill_chunk_char_budget(policy) == 2000
+
+
+def test_distill_chunk_char_budget_absolute_override_wins_over_ceiling_override(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', '2000')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '999')
+    policy = ModelPolicy(model='claude-3-opus', metadata={})
+
+    assert _distill_chunk_char_budget(policy) == 999
+
+
+def test_distill_chunk_char_budget_decoupled_from_provider_http_timeout(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
+    m_monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    policy = ModelPolicy(model='claude-3-opus', metadata={})
+    baseline = _distill_chunk_char_budget(policy)
+
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '600')
+    grown = _distill_chunk_char_budget(policy)
+
+    assert baseline == 120000
+    assert grown == baseline
+    assert grown != 600 * 2000
 
 
 @pytest.mark.django_db
@@ -1115,7 +1140,7 @@ def test_distill_session_known_model_yields_fewer_chunks_than_unknown_and_drops_
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60')
+    m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', raising=False)
     organization, team, project, agent, session = create_session_scope()
     observations = [
         create_observation(organization, project, team, agent, session, index=i, body='x' * 1500) for i in range(1, 51)
@@ -1324,7 +1349,7 @@ def test_parse_reduced_candidates_truly_invalid_still_returns_none() -> None:
 def _reduce_scope(
     m_monkeypatch: pytest.MonkeyPatch,
     *,
-    timeout: str = '1',
+    ceiling: str = '2000',
     observation_count: int = 40,
 ) -> tuple[Organization, Team, Project, Agent, AgentSession, ModelPolicy]:
     organization, team, project, agent, session = create_session_scope()
@@ -1332,7 +1357,7 @@ def _reduce_scope(
     for index in range(1, observation_count + 1):
         create_observation(organization, project, team, agent, session, index=index)
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
-    m_monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', timeout)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_CEILING', ceiling)
 
     return organization, team, project, agent, session, policy
 
