@@ -422,6 +422,7 @@ class ProcessObservationRecorded:
             evidence=generated.evidence,
             content_hash=candidate_hash,
             confidence=derive_observation_confidence(observation),
+            kind=observation.observation_type if observation.observation_type in _DURABLE_OBSERVATION_TYPES else '',
         )
 
         return candidate, True
@@ -736,6 +737,8 @@ class PromoteMemoryCandidate:
         captured_by = self._captured_by(candidate)
         if captured_by is not None:
             metadata['captured_by'] = captured_by
+        if candidate.kind:
+            metadata['kind'] = candidate.kind
 
         return metadata
 

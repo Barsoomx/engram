@@ -59,6 +59,16 @@ class MemoryStatus(models.TextChoices):
     CONFLICT = 'conflict', 'Conflict'
 
 
+MEMORY_KINDS = ('decision', 'convention', 'gotcha', 'architecture', 'incident', 'digest')
+
+
+def clamp_memory_kind(value: object) -> str:
+    if value in MEMORY_KINDS and value != 'digest':
+        return value
+
+    return ''
+
+
 class ContextBundleStatus(models.TextChoices):
     CREATED = 'created', 'Created'
     INJECTED = 'injected', 'Injected'
@@ -489,6 +499,7 @@ class MemoryCandidate(TimestampedModel):
     evidence = models.JSONField(default=list, blank=True)
     content_hash = models.CharField(max_length=128)
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    kind = models.CharField(max_length=40, blank=True, default='')
 
     class Meta:
         constraints = [

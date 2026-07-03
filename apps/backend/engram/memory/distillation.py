@@ -23,6 +23,7 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    clamp_memory_kind,
 )
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.services import (
@@ -72,6 +73,7 @@ class SynthesizedCandidate:
     body: str
     confidence: Decimal
     supporting_observation_ids: tuple[str, ...]
+    kind: str = ''
 
 
 @dataclass(frozen=True)
@@ -100,13 +102,15 @@ def session_distillation_system_prompt() -> str:
         'Rules:\n'
         '- Output a single JSON object only, with exactly one key "memories".\n'
         '- "memories" is an array of objects with the keys '
-        '"title", "body", "confidence", "supporting_observation_ids".\n'
+        '"title", "body", "confidence", "supporting_observation_ids", and optionally "kind".\n'
         '- If the session contains no durable engineering signal, output {"memories": []}.\n'
         '- "confidence" is a number between 0 and 1: 0.9 or higher for verified facts with direct '
         'evidence (a fix confirmed by tests, an observed error with its cause), 0.6-0.8 for plausible '
         'conclusions consistent with the observations, 0.3-0.5 for unverified hypotheses, below 0.3 '
         'for speculation.\n'
         '- "supporting_observation_ids" lists the observation ids the memory is derived from.\n'
+        '- "kind" is optional: one of "decision", "convention", "gotcha", "architecture", "incident" '
+        'when the memory clearly fits one of those categories, omitted otherwise.\n'
         '- Consolidate related observations into a small number of high-signal memories.\n'
         '- Preserve exact identifiers verbatim: file paths, function names, class names, '
         'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
@@ -268,6 +272,7 @@ def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, .
                 body=body or title,
                 confidence=_clamp_confidence(item.get('confidence')),
                 supporting_observation_ids=supporting,
+                kind=clamp_memory_kind(item.get('kind')),
             ),
         )
 
@@ -663,6 +668,7 @@ class DistillSession:
             evidence=self._candidate_evidence(session, candidate_input, provenance),
             content_hash=content_hash,
             confidence=candidate_input.confidence,
+            kind=candidate_input.kind,
         )
 
         return candidate, True

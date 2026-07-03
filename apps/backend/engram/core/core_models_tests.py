@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
 from engram.core.models import (
+    MEMORY_KINDS,
     Agent,
     AgentSession,
     AuditEvent,
@@ -19,6 +20,7 @@ from engram.core.models import (
     RawEventEnvelope,
     RetrievalDocument,
     Team,
+    clamp_memory_kind,
 )
 
 
@@ -731,6 +733,59 @@ def test_memory_kind_full_save_mirrors_changed_metadata_kind() -> None:
 
     refreshed = Memory.objects.get(pk=memory.pk)
     assert refreshed.kind == 'summary'
+
+
+def test_clamp_memory_kind_accepts_non_digest_vocabulary_values() -> None:
+    for kind in MEMORY_KINDS:
+        if kind == 'digest':
+            continue
+        assert clamp_memory_kind(kind) == kind
+
+
+def test_clamp_memory_kind_rejects_digest() -> None:
+    assert clamp_memory_kind('digest') == ''
+
+
+def test_clamp_memory_kind_rejects_unknown_value() -> None:
+    assert clamp_memory_kind('random') == ''
+
+
+def test_clamp_memory_kind_rejects_none_and_empty_string() -> None:
+    assert clamp_memory_kind(None) == ''
+    assert clamp_memory_kind('') == ''
+
+
+@pytest.mark.django_db
+def test_memory_candidate_kind_defaults_to_empty_string() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Candidate without kind',
+        body='Body text.',
+        content_hash='candidate-kind-default-hash',
+    )
+
+    assert candidate.kind == ''
+
+
+@pytest.mark.django_db
+def test_memory_candidate_kind_persists_explicit_value() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Candidate with kind',
+        body='Body text.',
+        content_hash='candidate-kind-explicit-hash',
+        kind='gotcha',
+    )
+
+    assert candidate.kind == 'gotcha'
 
 
 def index_field_sets(model: type) -> set[tuple[str, ...]]:
