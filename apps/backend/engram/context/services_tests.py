@@ -25,6 +25,7 @@ from engram.context.services import (
     RetrievalMatch,
     _pack_to_budget,
     _semantic_retrieval_matches_python,
+    derive_retrieval_terms,
     estimate_tokens,
     fuse_retrieval_legs,
     fuse_semantic_lexical,
@@ -501,6 +502,26 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
 
 
 # IndexMemoryVersion — extracted symbols/exact_terms
+
+
+def test_derive_retrieval_terms_merges_metadata_and_extracted_values() -> None:
+    symbols, exact_terms = derive_retrieval_terms(
+        {'symbols': ['legacy_symbol'], 'exact_terms': ['LEGACY-1']},
+        'Scope resolver gotcha',
+        '`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.',
+    )
+
+    assert 'legacy_symbol' in symbols
+    assert 'resolve_scope' in symbols
+    assert 'legacy-1' in exact_terms
+    assert 'accessdeniederror' in exact_terms
+
+
+def test_derive_retrieval_terms_defaults_missing_metadata_to_empty_tuples() -> None:
+    symbols, exact_terms = derive_retrieval_terms({}, 'Plain title', 'plain body without markers')
+
+    assert symbols == ()
+    assert exact_terms == ('plain title',)
 
 
 @pytest.mark.django_db

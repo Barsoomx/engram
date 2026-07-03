@@ -706,6 +706,24 @@ def resolve_query_embedding(
     return result
 
 
+def derive_retrieval_terms(metadata: dict, title: str, body: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    symbols = tuple(
+        unique_text_values(
+            metadata.get('symbols', []),
+            extract_symbols(title, body),
+        ),
+    )
+    exact_terms = normalize_lookup_values(
+        [
+            *metadata.get('exact_terms', []),
+            title,
+            *extract_exact_terms(title, body),
+        ],
+    )
+
+    return symbols, exact_terms
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -725,19 +743,9 @@ class IndexMemoryVersion:
             observation.files_read if observation is not None else [],
             observation.files_modified if observation is not None else [],
         )
-        symbols = unique_text_values(
-            metadata.get('symbols', []),
-            extract_symbols(memory.title, version.body),
-        )
-        exact_terms = list(
-            normalize_lookup_values(
-                [
-                    *metadata.get('exact_terms', []),
-                    memory.title,
-                    *extract_exact_terms(memory.title, version.body),
-                ],
-            ),
-        )
+        symbols, exact_terms = derive_retrieval_terms(metadata, memory.title, version.body)
+        symbols = list(symbols)
+        exact_terms = list(exact_terms)
         full_text = f'{memory.title}\n\n{version.body}'.strip()
 
         retrieval_document, created = RetrievalDocument.objects.update_or_create(
