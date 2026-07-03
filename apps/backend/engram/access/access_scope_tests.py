@@ -201,7 +201,7 @@ def test_api_key_prefix_collision_does_not_block_distinct_keys_or_resolution() -
 
 
 @pytest.mark.django_db
-def test_project_scoped_api_key_resolves_effective_scope_and_audits_allow() -> None:
+def test_project_scoped_api_key_resolves_effective_scope_without_audit_row() -> None:
     organization, team, project = create_project_scope()
     owner = create_owner(organization)
     grant_project_access(organization, project, owner)
@@ -217,7 +217,6 @@ def test_project_scoped_api_key_resolves_effective_scope_and_audits_allow() -> N
     )
 
     api_key.refresh_from_db()
-    audit = AuditEvent.objects.get(request_id='request-allow-1')
 
     assert scope.organization_id == organization.id
     assert scope.identity_id == owner.id
@@ -226,11 +225,7 @@ def test_project_scoped_api_key_resolves_effective_scope_and_audits_allow() -> N
     assert scope.team_ids == (team.id,)
     assert 'observations:write' in scope.capabilities
     assert api_key.last_used_at is not None
-    assert audit.result == AuditResult.ALLOWED
-    assert audit.organization_id == organization.id
-    assert audit.project_id == project.id
-    assert audit.capability == 'observations:write'
-    assert RAW_KEY not in str(audit.metadata)
+    assert not AuditEvent.objects.filter(request_id='request-allow-1').exists()
 
 
 @pytest.mark.django_db
@@ -394,7 +389,7 @@ def test_unbound_api_key_needs_explicit_project_capability_to_resolve_project_sc
 
 
 @pytest.mark.django_db
-def test_unbound_api_key_with_project_capability_records_resolved_scope_filters() -> None:
+def test_unbound_api_key_with_project_capability_resolves_scope_without_audit_row() -> None:
     organization, _team, project = create_project_scope()
     owner = create_owner(organization, role_code='organization_admin')
     api_key = create_scoped_api_key(
@@ -412,18 +407,10 @@ def test_unbound_api_key_with_project_capability_records_resolved_scope_filters(
         request_id='request-unbound-project-allow-1',
     )
 
-    audit = AuditEvent.objects.get(request_id='request-unbound-project-allow-1')
-
     assert scope.api_key_id == api_key.id
     assert scope.project_ids == (project.id,)
     assert scope.team_ids == ()
-    assert audit.result == AuditResult.ALLOWED
-    assert audit.project_id == project.id
-    assert audit.metadata['scope_filters'] == {
-        'organization_id': str(organization.id),
-        'project_ids': [str(project.id)],
-        'team_ids': [],
-    }
+    assert not AuditEvent.objects.filter(request_id='request-unbound-project-allow-1').exists()
 
 
 @pytest.mark.django_db
