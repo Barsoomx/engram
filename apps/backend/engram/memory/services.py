@@ -1352,19 +1352,22 @@ class GenerateDigest:
         )
 
     def _find_existing(self, project: Project, content_hash: str) -> DigestResult | None:
-        existing_memory = Memory.objects.filter(
-            organization=project.organization,
-            project=project,
-            kind='digest',
-            metadata__content_hash=content_hash,
-        ).first()
+        existing_memory = (
+            Memory.objects.filter(
+                organization=project.organization,
+                project=project,
+                kind='digest',
+                metadata__content_hash=content_hash,
+                versions__retrieval_document__isnull=False,
+            )
+            .order_by('-created_at')
+            .first()
+        )
         if existing_memory is None:
             return None
 
         existing_version = MemoryVersion.objects.filter(memory=existing_memory).order_by('version').first()
         existing_doc = RetrievalDocument.objects.filter(memory=existing_memory).first()
-        if existing_version is None or existing_doc is None:
-            return None
 
         metadata = existing_memory.metadata if isinstance(existing_memory.metadata, dict) else {}
         call_id_str = metadata.get('provider_call_id')
@@ -1555,21 +1558,20 @@ class BuildWeeklyStructuredDigest:
         )
 
     def _find_existing(self, project: Project, content_hash: str) -> WeeklyDigestResult | None:
-        existing = Memory.objects.filter(
-            organization=project.organization,
-            project=project,
-            kind='digest',
-            metadata__digest_kind='weekly_structured',
-            metadata__content_hash=content_hash,
-        ).first()
+        existing = (
+            Memory.objects.filter(
+                organization=project.organization,
+                project=project,
+                kind='digest',
+                metadata__digest_kind='weekly_structured',
+                metadata__content_hash=content_hash,
+                versions__retrieval_document__isnull=False,
+            )
+            .order_by('-created_at')
+            .first()
+        )
 
         if existing is None:
-            return None
-
-        existing_version = MemoryVersion.objects.filter(memory=existing).order_by('version').first()
-        existing_doc = RetrievalDocument.objects.filter(memory=existing).first()
-
-        if existing_version is None or existing_doc is None:
             return None
 
         metadata = existing.metadata if isinstance(existing.metadata, dict) else {}

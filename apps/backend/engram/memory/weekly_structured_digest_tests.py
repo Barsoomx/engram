@@ -19,6 +19,7 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
     Team,
+    VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
@@ -28,6 +29,7 @@ from engram.memory.services import (
     WeeklyDigestInput,
     WeeklyDigestResult,
     run_weekly_digest_with_tracking,
+    weekly_digest_content_hash,
 )
 
 
@@ -651,6 +653,61 @@ def test_idempotent_rerun_does_not_duplicate_version_or_document(
     assert result1.digest_memory.id == result2.digest_memory.id
 
     assert Memory.objects.filter(id=result1.digest_memory.id).count() == 1
+
+    assert MemoryVersion.objects.filter(memory=result1.digest_memory).count() == 1
+
+    assert RetrievalDocument.objects.filter(memory=result1.digest_memory).count() == 1
+
+
+@pytest.mark.django_db
+def test_legacy_orphan_without_version_or_document_is_not_reused_or_reduplicated(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start = _window_start()
+
+    window_end = _window_end()
+
+    content_hash = weekly_digest_content_hash(f_project.id, window_start, window_end, None)
+
+    orphan = Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        title=f'Weekly Structured Digest {window_start.date()} to {window_end.date()}',
+        body='legacy orphan digest with no version or retrieval document',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={
+            'kind': 'digest',
+            'digest_kind': 'weekly_structured',
+            'window_start': window_start.isoformat(),
+            'window_end': window_end.isoformat(),
+            'window_days': 7,
+            'memory_changes': {},
+            'counts': {},
+            'content_hash': content_hash,
+            'ready': False,
+            'reviewed_at': None,
+        },
+    )
+
+    result1 = _run(f_org, f_project)
+
+    result2 = _run(f_org, f_project)
+
+    assert result1.digest_memory.id == result2.digest_memory.id
+
+    assert result1.digest_memory.id != orphan.id
+
+    assert (
+        Memory.objects.filter(
+            organization=f_org,
+            project=f_project,
+            metadata__kind='digest',
+            metadata__digest_kind='weekly_structured',
+        ).count()
+        == 2
+    )
 
     assert MemoryVersion.objects.filter(memory=result1.digest_memory).count() == 1
 

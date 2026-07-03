@@ -195,6 +195,31 @@ def test_generate_digest_is_idempotent_on_replay() -> None:
 
 
 @pytest.mark.django_db
+def test_legacy_orphan_without_version_or_document_is_not_reused_or_reduplicated() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    source = create_source_memory(organization, team, project, title='Orphan-regression source')
+    digest_input = DigestInput(
+        project_id=project.id,
+        memory_ids=(source.id,),
+        request_id='digest-orphan-regress',
+    )
+
+    seed_result = GenerateDigest().execute(digest_input)
+    orphan_id = seed_result.memory.id
+    MemoryVersion.objects.filter(memory_id=orphan_id).delete()
+
+    result1 = GenerateDigest().execute(digest_input)
+    result2 = GenerateDigest().execute(digest_input)
+
+    assert result1.memory.id == result2.memory.id
+    assert result1.memory.id != orphan_id
+    assert Memory.objects.filter(metadata__kind='digest', project=project).count() == 2
+    assert MemoryVersion.objects.filter(memory=result1.memory).count() == 1
+    assert RetrievalDocument.objects.filter(memory=result1.memory).count() == 1
+
+
+@pytest.mark.django_db
 def test_generate_digest_makes_real_call_when_provider_record_exists_without_memory(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
