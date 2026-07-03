@@ -24,6 +24,7 @@ from engram.core.models import (
     OrganizationSettings,
     RetrievalDocument,
 )
+from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.memory.services import (
     MemoryWorkerError,
     PromoteMemoryCandidate,
@@ -465,11 +466,7 @@ class CurateMemoryCandidate:
             else:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
-                MemoryLink.objects.filter(
-                    organization=locked.organization,
-                    link_type=LinkType.CONFLICTS_WITH,
-                    target=f'candidate:{locked.id}',
-                ).delete()
+                clear_candidate_conflict_links(locked)
                 metadata: dict[str, object] = {
                     'reason': reason,
                     'body_length': len(redact_text(locked.body).strip()),

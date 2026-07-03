@@ -1176,3 +1176,19 @@ def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory
     assert len(results) == 2
     assert Memory.objects.count() == 1
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_clears_conflict_links_at_promotion(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+    assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == 1
+
+    PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=duplicate.id))
+
+    assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == 0

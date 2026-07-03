@@ -47,6 +47,7 @@ from engram.core.models import (
     Team,
 )
 from engram.core.repository import canonicalize_repository_url
+from engram.memory.conflict_links import clear_candidate_conflict_links
 
 logger = structlog.get_logger(__name__)
 
@@ -476,11 +477,7 @@ def approve_memory_candidate(
 
     candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
 
-    MemoryLink.objects.filter(
-        organization=candidate.organization,
-        link_type=LinkType.CONFLICTS_WITH,
-        target=f'candidate:{candidate.id}',
-    ).delete()
+    clear_candidate_conflict_links(candidate)
 
     audit_admin_action(
         organization=organization,
@@ -644,11 +641,7 @@ def reject_review_item(
 
         item.save(update_fields=['status', 'updated_at'])
 
-        MemoryLink.objects.filter(
-            organization=item.organization,
-            link_type=LinkType.CONFLICTS_WITH,
-            target=f'candidate:{item.id}',
-        ).delete()
+        clear_candidate_conflict_links(item)
 
         target_type = 'memory_candidate'
 
