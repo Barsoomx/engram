@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -989,6 +990,13 @@ def _embedding_http_timeout() -> int:
     return int(os.environ.get('ENGRAM_EMBEDDING_HTTP_TIMEOUT', '30'))
 
 
+_NO_PROMPT_REDACTION_STATE = 'not_applicable'
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
 class OpenAICompatibleGateway:
     def __init__(self, base_url: str, api_key: str, *, opener: Any = None, timeout: int | None = None) -> None:
         self._base_url = base_url.rstrip('/')
@@ -1005,12 +1013,20 @@ class OpenAICompatibleGateway:
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
         extra.update(openai_json_mode_override(data.response_kind, policy))
-        content = self._chat_completion(
-            policy.model,
-            prompt_text,
-            system_prompt=data.system_prompt,
-            extra=extra,
-        )
+        extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
+        started_at = time.monotonic()
+        try:
+            content = self._chat_completion(
+                policy.model,
+                prompt_text,
+                system_prompt=data.system_prompt,
+                extra=extra,
+            )
+        except ModelPolicyError as error:
+            self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
+            raise
+
+        latency_ms = _elapsed_ms(started_at)
         title = _completion_title(content, data.response_kind)
         body = _completion_body(content, data.response_kind)
         record = self._record_call(
@@ -1018,6 +1034,7 @@ class OpenAICompatibleGateway:
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
             token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+            latency_ms=latency_ms,
         )
 
         return ProviderCallResult(
@@ -1035,12 +1052,20 @@ class OpenAICompatibleGateway:
         redacted_text = redact_value(data.text)
         text_value = str(redacted_text.value)
 
-        embedding = self._embeddings(policy.model, text_value)
+        started_at = time.monotonic()
+        try:
+            embedding = self._embeddings(policy.model, text_value)
+        except ModelPolicyError as error:
+            self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
+            raise
+
+        latency_ms = _elapsed_ms(started_at)
         record = self._record_call(
             data,
             policy,
             redaction_state='redacted' if redacted_text.redacted or '[REDACTED]' in data.text else 'clean',
             token_usage={'input_tokens': len(text_value.split()), 'output_tokens': 0},
+            latency_ms=latency_ms,
         )
 
         return EmbeddingCallResult(
@@ -1058,6 +1083,7 @@ class OpenAICompatibleGateway:
         *,
         redaction_state: str,
         token_usage: dict[str, int],
+        latency_ms: int,
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
             organization_id=data.organization_id,
@@ -1073,10 +1099,43 @@ class OpenAICompatibleGateway:
             trace_id=data.trace_id,
             redaction_state=redaction_state,
             token_usage=token_usage,
-            latency_ms=0,
+            latency_ms=latency_ms,
             cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False, 'transport': 'http'},
+        )
+
+    def _record_error(
+        self,
+        data: ProviderCallInput | EmbeddingCallInput,
+        policy: ModelPolicy,
+        error: ModelPolicyError,
+        *,
+        latency_ms: int,
+    ) -> ProviderCallRecord:
+        return ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=data.trace_id,
+            redaction_state=_NO_PROMPT_REDACTION_STATE,
+            token_usage={},
+            latency_ms=latency_ms,
+            cost_metadata={},
+            result=AuditResult.ERROR,
+            metadata={
+                'error_code': error.code,
+                'http_status': error.http_status,
+                'prompt_retained': False,
+                'transport': 'http',
+            },
         )
 
     def _chat_completion(
@@ -1125,6 +1184,7 @@ class OpenAICompatibleGateway:
                 'provider_http_error',
                 f'provider returned {error.code}',
                 retryable=retryable,
+                http_status=error.code,
             ) from error
         except TimeoutError as error:
             raise ModelPolicyError(
@@ -1210,13 +1270,20 @@ class AnthropicMessagesGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
 
-        content = self._messages(
-            policy.model,
-            prompt_text,
-            system_prompt=data.system_prompt,
-            response_kind=data.response_kind,
-            max_tokens=resolve_max_tokens(policy, data.response_kind),
-        )
+        started_at = time.monotonic()
+        try:
+            content = self._messages(
+                policy.model,
+                prompt_text,
+                system_prompt=data.system_prompt,
+                response_kind=data.response_kind,
+                max_tokens=resolve_max_tokens(policy, data.response_kind),
+            )
+        except ModelPolicyError as error:
+            self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
+            raise
+
+        latency_ms = _elapsed_ms(started_at)
         title = _completion_title(content, data.response_kind)
         body = _completion_body(content, data.response_kind)
         record = self._record_call(
@@ -1224,6 +1291,7 @@ class AnthropicMessagesGateway:
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
             token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+            latency_ms=latency_ms,
         )
 
         return ProviderCallResult(
@@ -1248,6 +1316,7 @@ class AnthropicMessagesGateway:
         *,
         redaction_state: str,
         token_usage: dict[str, int],
+        latency_ms: int,
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
             organization_id=data.organization_id,
@@ -1263,10 +1332,43 @@ class AnthropicMessagesGateway:
             trace_id=data.trace_id,
             redaction_state=redaction_state,
             token_usage=token_usage,
-            latency_ms=0,
+            latency_ms=latency_ms,
             cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False, 'transport': 'http-anthropic'},
+        )
+
+    def _record_error(
+        self,
+        data: ProviderCallInput | EmbeddingCallInput,
+        policy: ModelPolicy,
+        error: ModelPolicyError,
+        *,
+        latency_ms: int,
+    ) -> ProviderCallRecord:
+        return ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=data.trace_id,
+            redaction_state=_NO_PROMPT_REDACTION_STATE,
+            token_usage={},
+            latency_ms=latency_ms,
+            cost_metadata={},
+            result=AuditResult.ERROR,
+            metadata={
+                'error_code': error.code,
+                'http_status': error.http_status,
+                'prompt_retained': False,
+                'transport': 'http-anthropic',
+            },
         )
 
     def _messages(
@@ -1314,6 +1416,7 @@ class AnthropicMessagesGateway:
                 'provider_http_error',
                 f'provider returned {error.code}',
                 retryable=retryable,
+                http_status=error.code,
             ) from error
         except TimeoutError as error:
             raise ModelPolicyError(

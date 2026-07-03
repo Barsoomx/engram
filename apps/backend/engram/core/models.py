@@ -69,6 +69,7 @@ class AuditResult(models.TextChoices):
     ALLOWED = 'allowed', 'Allowed'
     DENIED = 'denied', 'Denied'
     RECORDED = 'recorded', 'Recorded'
+    ERROR = 'error', 'Error'
 
 
 def add_scope_error(errors: dict[str, list[str]], field: str, message: str) -> None:
