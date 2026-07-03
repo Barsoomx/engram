@@ -3,11 +3,14 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+import structlog
+from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandParser
-from django.utils import timezone
 
 from engram.context.services import derive_retrieval_terms
 from engram.core.models import RetrievalDocument
+
+logger = structlog.get_logger(__name__)
 
 
 class Command(BaseCommand):
@@ -30,6 +33,7 @@ class Command(BaseCommand):
         dry_run = options['dry_run']
         scanned = 0
         changed = 0
+        failed = 0
 
         for document in queryset.iterator(chunk_size=200):
             scanned += 1
@@ -37,25 +41,34 @@ class Command(BaseCommand):
             memory = document.memory
             metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
             symbols, exact_terms = derive_retrieval_terms(metadata, memory.title, document.memory_version.body)
-            symbols = list(symbols)
-            exact_terms = list(exact_terms)
 
             if document.symbols == symbols and document.exact_terms == exact_terms:
                 continue
 
-            changed += 1
-
             if dry_run:
+                changed += 1
+
                 continue
 
             document.symbols = symbols
             document.exact_terms = exact_terms
-            document.updated_at = timezone.now()
-            document.save(update_fields=['symbols', 'exact_terms', 'updated_at'])
+            try:
+                document.save(update_fields=['symbols', 'exact_terms', 'updated_at'])
+            except ValidationError as error:
+                failed += 1
+                logger.warning(
+                    'retrieval_terms_backfill_row_failed',
+                    document_id=str(document.id),
+                    error=str(error),
+                )
+
+                continue
+
+            changed += 1
 
         if dry_run:
             self.stdout.write(f'would_change={changed} scanned={scanned}')
 
             return
 
-        self.stdout.write(f'changed={changed} scanned={scanned}')
+        self.stdout.write(f'changed={changed} failed={failed} scanned={scanned}')

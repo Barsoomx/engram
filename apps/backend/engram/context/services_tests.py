@@ -517,11 +517,11 @@ def test_derive_retrieval_terms_merges_metadata_and_extracted_values() -> None:
     assert 'accessdeniederror' in exact_terms
 
 
-def test_derive_retrieval_terms_defaults_missing_metadata_to_empty_tuples() -> None:
+def test_derive_retrieval_terms_defaults_missing_metadata_to_empty_lists() -> None:
     symbols, exact_terms = derive_retrieval_terms({}, 'Plain title', 'plain body without markers')
 
-    assert symbols == ()
-    assert exact_terms == ('plain title',)
+    assert symbols == []
+    assert exact_terms == ['plain title']
 
 
 @pytest.mark.django_db

@@ -90,6 +90,7 @@ def test_backfill_second_run_reports_no_changes(
     call_command('engram_backfill_retrieval_terms', stdout=out)
 
     assert 'changed=0' in out.getvalue()
+    assert 'failed=0' in out.getvalue()
     assert 'scanned=1' in out.getvalue()
 
 
@@ -127,6 +128,49 @@ def test_backfill_organization_filter_skips_other_organizations(
     other.refresh_from_db()
     assert 'resolve_scope' in target.symbols
     assert other.symbols == []
+
+
+@pytest.mark.django_db
+def test_backfill_isolates_row_level_failures(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    healthy = _make_document(organization, project, sequence=1)
+
+    broken_memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title=_TITLE,
+        body=_BODY,
+        status=MemoryStatus.APPROVED,
+    )
+    broken_version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=broken_memory,
+        version=1,
+        body=_BODY,
+        content_hash='hash-broken',
+    )
+    broken = RetrievalDocument(
+        organization=organization,
+        project=project,
+        memory=broken_memory,
+        memory_version=broken_version,
+        full_text='',
+    )
+    RetrievalDocument.objects.bulk_create([broken])
+
+    out = StringIO()
+    call_command('engram_backfill_retrieval_terms', stdout=out)
+
+    healthy.refresh_from_db()
+    broken.refresh_from_db()
+    assert 'resolve_scope' in healthy.symbols
+    assert broken.symbols == []
+    assert 'changed=1' in out.getvalue()
+    assert 'failed=1' in out.getvalue()
+    assert 'scanned=2' in out.getvalue()
 
 
 @pytest.mark.django_db
