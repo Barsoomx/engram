@@ -1,8 +1,34 @@
 import io
 import json
+import tempfile
 import unittest
+from argparse import Namespace
 
-from engram_mcp.server import PROTOCOL_VERSION, handle_request, run_server
+from engram_cli.mcp_server import (
+    PROTOCOL_VERSION,
+    handle_request,
+    run_mcp_serve,
+    run_server,
+)
+
+
+class StubTransport:
+    def __init__(self, status: int = 200, body: dict | None = None) -> None:
+        self.status = status
+        self.body = body if body is not None else {}
+        self.calls: list[tuple[str, str, dict, dict | None, float]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        self.calls.append((method, url, headers, payload, timeout))
+
+        return self.status, self.body
 
 
 def fake_search(arguments: dict) -> str:
@@ -25,6 +51,10 @@ def fake_memory_version(arguments: dict) -> str:
     return f"versioned {arguments.get('memory_id')} body={arguments.get('body')}"
 
 
+def fake_feedback(arguments: dict) -> str:
+    return f"feedback {arguments.get('action')} on {arguments.get('memory_id')}"
+
+
 def build_tools() -> dict:
     return {
         "engram_search": fake_search,
@@ -32,6 +62,7 @@ def build_tools() -> dict:
         "engram_memory_link": fake_link,
         "engram_observations": fake_observations,
         "engram_memory_version": fake_memory_version,
+        "engram_memory_feedback": fake_feedback,
     }
 
 
@@ -67,6 +98,7 @@ class McpContractTests(unittest.TestCase):
                 "engram_memory_link",
                 "engram_observations",
                 "engram_memory_version",
+                "engram_memory_feedback",
             ],
         )
         link_schema = response["result"]["tools"][2]["inputSchema"]
@@ -75,6 +107,21 @@ class McpContractTests(unittest.TestCase):
         self.assertEqual([], observations_schema["required"])
         version_schema = response["result"]["tools"][4]["inputSchema"]
         self.assertEqual(["memory_id", "body"], version_schema["required"])
+
+    def test_tools_list_feedback_schema(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 10, "method": "tools/list"}, build_tools()
+        )
+        feedback = response["result"]["tools"][5]
+
+        self.assertEqual("engram_memory_feedback", feedback["name"])
+        self.assertEqual(
+            ["memory_id", "action", "reason"], feedback["inputSchema"]["required"]
+        )
+        self.assertEqual(
+            ["stale", "refuted"],
+            feedback["inputSchema"]["properties"]["action"]["enum"],
+        )
 
     def test_tools_call_search_returns_text_content(self) -> None:
         response = handle_request(
@@ -177,6 +224,34 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual(-32601, response["error"]["code"])
 
+    def test_tool_exception_returns_error_and_loop_survives(self) -> None:
+        def broken(arguments: dict) -> str:
+            raise RuntimeError("boom")
+
+        tools = build_tools()
+        tools["engram_search"] = broken
+        stdin = io.StringIO(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/call",
+                    "params": {"name": "engram_search", "arguments": {"query": "x"}},
+                },
+            )
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            + "\n",
+        )
+        stdout = io.StringIO()
+        run_server(tools, stdin=stdin, stdout=stdout)
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+        self.assertEqual(2, len(lines))
+        self.assertEqual(-32603, lines[0]["error"]["code"])
+        self.assertEqual(1, lines[0]["id"])
+        self.assertIn("tools", lines[1]["result"])
+
     def test_run_server_handles_ndjson_round_trip(self) -> None:
         stdin = io.StringIO(
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
@@ -201,7 +276,7 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual(3, len(lines))
         self.assertEqual(PROTOCOL_VERSION, lines[0]["result"]["protocolVersion"])
-        self.assertEqual(5, len(lines[1]["result"]["tools"]))
+        self.assertEqual(6, len(lines[1]["result"]["tools"]))
         self.assertIn("searched: auth", lines[2]["result"]["content"][0]["text"])
 
     def test_run_server_skips_malformed_lines(self) -> None:
@@ -214,6 +289,43 @@ class McpContractTests(unittest.TestCase):
         run_server(build_tools(), stdin=stdin, stdout=stdout)
 
         self.assertEqual(1, len(stdout.getvalue().splitlines()))
+
+    def test_non_dict_params_returns_error_and_loop_survives(self) -> None:
+        stdin = io.StringIO(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": "x"},
+            )
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            + "\n",
+        )
+        stdout = io.StringIO()
+        run_server(build_tools(), stdin=stdin, stdout=stdout)
+        lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+        self.assertEqual(2, len(lines))
+        self.assertEqual(-32601, lines[0]["error"]["code"])
+        self.assertEqual(1, lines[0]["id"])
+        self.assertIn("tools", lines[1]["result"])
+
+
+class RunMcpServeTests(unittest.TestCase):
+    def test_run_mcp_serve_wires_build_tools_and_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="engram-mcp-serve-tests-") as config_dir:
+            args = Namespace(config_dir=config_dir)
+            stdin = io.StringIO(
+                json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+                + "\n"
+                + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+                + "\n",
+            )
+            stdout = io.StringIO()
+            exit_code = run_mcp_serve(args, stdin, stdout, StubTransport())
+            lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+
+        self.assertEqual(0, exit_code)
+        self.assertEqual(2, len(lines))
+        self.assertEqual(6, len(lines[1]["result"]["tools"]))
 
 
 if __name__ == "__main__":

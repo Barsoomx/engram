@@ -83,12 +83,12 @@ provider secret envelope, and generation + embedding model policies. It is
 idempotent: re-running it updates the existing rows.
 
 Choose a raw API key value (this is the secret your agents will use). The server
-does not enforce a specific prefix, but a descriptive prefix such as
-`sk-engram_` is strongly recommended for readability and audit. Use a long,
-random string. For example:
+does not enforce a specific prefix, but the `egk_` prefix used by
+server-issued keys is strongly recommended for readability and audit. Use a
+long, random string. For example:
 
 ```bash
-export ENGRAM_GOLDEN_KEY='sk-engram_local_quickstart_00112233445566778899'
+export ENGRAM_GOLDEN_KEY='egk_local_quickstart_00112233445566778899'
 ```
 
 Run the bootstrap inside the `api` container:
@@ -166,7 +166,7 @@ Flags:
 | Flag              | Required | Description                                                     |
 |-------------------|----------|-----------------------------------------------------------------|
 | `--server`        | yes      | Engram API base URL (`http://` or `https://`).                  |
-| `--api-key`       | yes      | Scoped Engram API key (must start with `sk-engram_`).           |
+| `--api-key`       | yes      | Scoped Engram API key (server-issued keys use the `egk_` prefix). |
 | `--project`       | yes      | Project id from bootstrap (or from the admin UI).               |
 | `--team`          | no       | Team id. Defaults to the key's bound team.                      |
 | `--agent`         | no       | `codex`, `claude-code`, or `both` (default `both`).             |
@@ -223,7 +223,9 @@ For the native plugin packages, see:
 - `packages/claude-plugin/README.md`
 - `packages/codex-plugin/README.md`
 
-For the MCP bridge (memory tools surfaced to Claude Code), see
+For the MCP bridge (memory tools surfaced as callable tools - registered
+automatically for Claude Code via the plugin, via `engram mcp install` for
+Claude Desktop, or `engram mcp serve` for any other MCP client), see
 [guides/mcp.md](guides/mcp.md).
 
 ## 8. Exercise ingest and context

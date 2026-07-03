@@ -39,6 +39,7 @@ class E2EError(Exception):
 
 def main() -> int:
     api_key = f'egk_e2e_{secrets.token_urlsafe(32)}'
+    agent_key = f'egk_e2e_agent_{secrets.token_urlsafe(32)}'
     run_id = secrets.token_hex(8)
     failed = True
     try:
@@ -64,11 +65,14 @@ def main() -> int:
                     'engram_bootstrap_golden_path',
                     '--api-key',
                     api_key,
+                    '--agent-key',
+                    agent_key,
                     '--json',
                 ],
                 cwd=COMPOSE_DIR,
                 secret=api_key,
             )
+            assert_secret_absent('bootstrap response', json.dumps(bootstrap), agent_key)
             project_id = required_string(bootstrap, 'project_id')
             team_id = required_string(bootstrap, 'team_id')
             cli_env = pythonpath_env()
@@ -101,6 +105,35 @@ def main() -> int:
             )
             assert_secret_absent('connect stdout', connect.stdout, api_key)
             assert_secret_absent('connect stderr', connect.stderr, api_key)
+
+            progress('Connecting host CLI with agent key')
+            mcp_config_dir = os.path.join(config_dir, 'mcp')
+            os.makedirs(mcp_config_dir, exist_ok=True)
+            agent_connect = run(
+                [
+                    sys.executable,
+                    '-m',
+                    'engram_cli',
+                    'connect',
+                    '--server',
+                    SERVER_URL,
+                    '--api-key',
+                    agent_key,
+                    '--project',
+                    project_id,
+                    '--agent',
+                    'codex',
+                    '--agent-version',
+                    'e2e',
+                    '--config-dir',
+                    mcp_config_dir,
+                ],
+                cwd=ROOT,
+                env=cli_env,
+                secret=agent_key,
+            )
+            assert_secret_absent('agent connect stdout', agent_connect.stdout, agent_key)
+            assert_secret_absent('agent connect stderr', agent_connect.stderr, agent_key)
 
             progress('Submitting hook observation')
             post_tool_use = run_json(
@@ -156,6 +189,16 @@ def main() -> int:
             required_string(audit_evidence, 'audit_event_id')
             assert_secret_absent('context response', json.dumps(context), api_key)
 
+            progress('Driving MCP stdio bridge')
+            drive_mcp_stdio(
+                config_dir=mcp_config_dir,
+                env=cli_env,
+                memory_id=worker_memory['memory_id'],
+                run_id=run_id,
+                secrets_list=[api_key, agent_key],
+            )
+            progress('MCP stdio bridge passed')
+
         progress('Compose golden path passed')
 
         failed = False
@@ -177,6 +220,113 @@ def main() -> int:
             secret=api_key,
             check=False,
         )
+
+
+def drive_mcp_stdio(
+    *,
+    config_dir: str,
+    env: dict[str, str],
+    memory_id: str,
+    run_id: str,
+    secrets_list: list[str],
+) -> None:
+    requests = [
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
+        {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+        _tool_call(
+            3, 'engram_search', {'query': 'Provider-generated memory', 'file_paths': [MEMORY_FILE]}
+        ),
+        _tool_call(4, 'engram_context', {'session_id': f'mcp-{run_id}'}),
+        _tool_call(5, 'engram_observations', {'limit': 5}),
+        _tool_call(
+            6,
+            'engram_memory_link',
+            {'memory_id': memory_id, 'link_type': 'file', 'target': f'e2e/{run_id}.py'},
+        ),
+        _tool_call(
+            7,
+            'engram_memory_version',
+            {'memory_id': memory_id, 'body': f'mcp e2e first update {run_id}'},
+        ),
+        _tool_call(
+            8,
+            'engram_memory_version',
+            {'memory_id': memory_id, 'body': f'mcp e2e second update {run_id}'},
+        ),
+        _tool_call(
+            9,
+            'engram_memory_feedback',
+            {'memory_id': memory_id, 'action': 'stale', 'reason': f'mcp e2e {run_id}'},
+        ),
+    ]
+    process = subprocess.Popen(
+        [sys.executable, '-m', 'engram_cli', 'mcp', 'serve', '--config-dir', config_dir],
+        cwd=ROOT,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate(
+        '\n'.join(json.dumps(request) for request in requests) + '\n', timeout=180
+    )
+    if process.returncode != 0:
+        raise SystemExit(f'mcp serve exited {process.returncode}: {stderr[-2000:]}')
+
+    responses: dict[int, dict[str, object]] = {}
+    for line in stdout.splitlines():
+        message = json.loads(line)
+        if 'id' in message:
+            responses[message['id']] = message
+    tool_names = [tool['name'] for tool in responses[2]['result']['tools']]
+    assert_equal(len(tool_names), 6, 'mcp tools count')
+    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9)}
+    for rid, text in texts.items():
+        for secret in secrets_list:
+            assert_secret_absent(f'mcp response {rid}', text, secret)
+        if text.startswith('Engram call failed'):
+            raise SystemExit(f'mcp tool {rid} failed: {text}')
+    if memory_id not in texts[3]:
+        raise SystemExit(f'mcp search missed memory_id: {texts[3][:400]}')
+    if 'link_id=' not in texts[6] or 'created=True' not in texts[6]:
+        raise SystemExit(f'mcp link failed: {texts[6]}')
+    first_version = _extract_field(texts[7], 'current_version')
+    second_version = _extract_field(texts[8], 'current_version')
+    if not first_version or first_version in ('None', second_version):
+        raise SystemExit(
+            f'mcp version replayed or empty: {texts[7]} / {texts[8]}'
+        )
+    if 'stale=True' not in texts[9]:
+        raise SystemExit(f'mcp feedback failed: {texts[9]}')
+
+
+def _tool_call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, object]:
+    return {
+        'jsonrpc': '2.0',
+        'id': request_id,
+        'method': 'tools/call',
+        'params': {'name': name, 'arguments': arguments},
+    }
+
+
+def _content_text(response: dict[str, object]) -> str:
+    result = response.get('result')
+    if not isinstance(result, dict):
+        return f"Engram call failed: {json.dumps(response.get('error'))}"
+
+    content = result.get('content')
+
+    return content[0]['text'] if isinstance(content, list) and content else ''
+
+
+def _extract_field(text: str, field: str) -> str:
+    for token in text.split():
+        if token.startswith(f'{field}='):
+            return token.split('=', 1)[1]
+
+    return ''
 
 
 def ensure_compose_env() -> None:
