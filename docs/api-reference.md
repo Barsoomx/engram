@@ -141,17 +141,19 @@ full resolver and authorization contract.
 
 | Method | Path                              | Description                                       |
 |--------|-----------------------------------|---------------------------------------------------|
+| POST   | `/v1/hooks/pre-tool-use`          | Ingest a PreToolUse hook event                    |
 | POST   | `/v1/hooks/post-tool-use`         | Ingest a PostToolUse hook event                   |
 | POST   | `/v1/hooks/session-start`         | Ingest a SessionStart hook event                  |
 | POST   | `/v1/hooks/error`                 | Ingest an Error hook event                        |
 | POST   | `/v1/hooks/decision`              | Ingest a Decision hook event                      |
 | POST   | `/v1/hooks/session-end`           | Ingest a SessionEnd hook event                    |
+| POST   | `/v1/hooks/user-prompt-submit`    | Ingest a UserPromptSubmit hook event              |
 | POST   | `/v1/hooks/dry-run`               | Verify a key + resolve scope without persisting   |
 
-`dry-run` does not require ingestion capability; it resolves the bearer's
-actor and scope and returns server health. The five ingest hooks require a
-capability appropriate to the event (typically an `observations:*` /
-`hooks:*` grant on the key).
+`dry-run` requires the same `observations:write` capability as the ingest
+hooks; it resolves the bearer's actor and scope and returns server health
+without persisting anything. The seven ingest hooks all require
+`observations:write` on the key, regardless of event type.
 
 ### Context
 
@@ -184,7 +186,8 @@ capability appropriate to the event (typically an `observations:*` /
 ### Model policy
 
 Provider secrets and model policies are managed per organization; the bearer
-key must carry `policy:admin` (or a matching admin grant) for write actions.
+key must carry `secrets:*` for secret write actions and `model_policy:*` for
+policy write actions.
 
 | Method | Path                                          | Description                                       |
 |--------|-----------------------------------------------|---------------------------------------------------|
@@ -216,7 +219,7 @@ audit trails. The key must carry a read capability for the relevant resource.
 | Method | Path            | Auth                          | Description                          |
 |--------|-----------------|-------------------------------|--------------------------------------|
 | GET    | `/-/healthz/`   | none                          | Liveness probe                       |
-| GET    | `/-/readyz/`    | none                          | Readiness probe (DB/cache/queue)     |
+| GET    | `/-/readyz/`    | none                          | Readiness probe (DB only)            |
 | GET    | `/-/startup/`   | none                          | Startup probe                        |
 | GET    | `/-/metrics`    | `Bearer <ENGRAM_METRICS_TOKEN>` (optional) | Prometheus metrics exposition |
 

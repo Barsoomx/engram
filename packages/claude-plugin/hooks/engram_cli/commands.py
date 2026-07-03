@@ -930,14 +930,6 @@ def read_stdin_json(stdin: TextIO) -> dict[str, object]:
     return payload
 
 
-def build_post_tool_use_payload(
-    config: dict[str, object],
-    runtime: str,
-    input_payload: dict[str, object],
-) -> dict[str, object]:
-    return build_generic_hook_payload(config, runtime, input_payload, "post_tool_use")
-
-
 OBSERVATION_BODY_MAX_LENGTH = 16000
 OBSERVATION_PATH_MAX_LENGTH = 1024
 OBSERVATION_TOOL_INPUT_PREVIEW_CHARS = 2000

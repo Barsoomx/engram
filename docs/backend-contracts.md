@@ -14,7 +14,7 @@ V1 uses:
 - Ruff;
 - pytest and pytest-django;
 - structlog;
-- Sentry and OpenTelemetry.
+- Sentry.
 
 Any deviation from this stack needs a decision record before implementation.
 
@@ -126,7 +126,6 @@ provider call propagates:
 - hook event id;
 - idempotency key;
 - Celery task id when queued;
-- worker job id;
 - provider call id when present.
 
 Forbidden in logs and traces:
@@ -146,6 +145,7 @@ V1 adapters:
 
 - Anthropic generation.
 - OpenAI generation.
+- DeepSeek generation.
 - OpenAI embeddings.
 
 Provider calls record provider, model, policy version, tenant/team/project,
@@ -153,19 +153,13 @@ request id, trace id, token usage, latency, cost metadata when available, and
 redaction state. Provider selection must be testable without changing hook
 adapters.
 
-## Vault Adapter Contract
+## Secret Storage Contract
 
-Vault-compatible storage must support:
+Provider secrets are stored using a single database envelope (Fernet
+symmetric encryption); `SecretStorageMode.EXTERNAL_VAULT` exists as a schema
+choice with no adapter implementation behind it. No raw secret appears in
+audit, logs, traces, or frontend responses.
 
-- tenant-scoped path prefixes;
-- configurable auth mode;
-- read and write roles separated;
-- KV v2 style versioning or equivalent;
-- CAS/create-if-absent semantics for seed/create;
-- retries with bounded timeout;
-- rotation state;
-- dependent health invalidation after rotation;
-- no raw secret in audit, logs, traces, or frontend responses.
-
-Database envelope mode must define KEK/DEK hierarchy, key version, ciphertext,
-HMAC, rotation state, and audit events.
+Database envelope mode defines key version, ciphertext, HMAC, and audit
+events, using one symmetric key derived from `ENGRAM_SECRET_ENCRYPTION_KEY`
+for all secrets, not a separate KEK/DEK wrapping hierarchy.

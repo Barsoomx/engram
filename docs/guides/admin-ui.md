@@ -45,17 +45,40 @@ role.
 
 ## Sidebar
 
-The left sidebar exposes seven destinations:
+The left sidebar is capability-gated and grouped into two sections, **Workspace**
+and **Administration**. An item is shown only if the signed-in role grants the
+item's capability.
 
-| Nav item      | Route        | Purpose                                              |
-|---------------|--------------|------------------------------------------------------|
-| Dashboard     | `/`          | Overview landing                                     |
-| Memories      | `/memories`  | Browse and inspect memory items                      |
-| Observations  | `/observations` | Browse raw observations                           |
-| API Keys      | `/api-keys`  | Issue, list, revoke API keys (see [api-keys.md](api-keys.md)) |
-| Projects      | `/projects`  | Browse projects in the active org                    |
-| Audit         | `/audit`     | Audit log reader                                     |
-| Health        | `/health`    | Service health dashboard                             |
+**Workspace**
+
+| Nav item        | Route              | Purpose                                              |
+|-----------------|--------------------|-------------------------------------------------------|
+| Dashboard       | `/`                | Overview landing                                     |
+| Memories        | `/memories`        | Browse and inspect memory items                      |
+| Observations    | `/observations`    | Browse raw observations                              |
+| Memory Review   | `/memory-review`   | Review memory candidates                             |
+| Projects        | `/projects`        | Browse and manage projects in the active org         |
+| Search Debugger | `/search-debug`    | Debug retrieval/search queries                       |
+| Hook Debugger   | `/hook-debug`      | Debug hook/observation ingestion                     |
+| Context Bundles | `/context-bundles` | Browse packed context bundles                        |
+| Weekly Digest   | `/digests`         | Browse weekly digest runs                            |
+| Workflow Runs   | `/workflow-runs`   | Browse workflow run history                          |
+
+**Administration**
+
+| Nav item       | Route             | Purpose                                              |
+|----------------|-------------------|-------------------------------------------------------|
+| Secrets        | `/secrets`        | Manage provider secrets                              |
+| Model Policies | `/model-policies` | Configure model routing policies                     |
+| Model Setup    | `/model-setup`    | Model setup wizard                                   |
+| Organizations  | `/organizations`  | Manage the active organization                       |
+| Teams          | `/teams`          | Team CRUD                                            |
+| Members        | `/members`        | Member CRUD and role assignment                      |
+| Roles          | `/roles`          | Read-only role list                                  |
+| API Keys       | `/api-keys`       | Issue, list, revoke API keys (see [api-keys.md](api-keys.md)) |
+| Audit log      | `/audit`          | Audit log reader                                     |
+| Settings       | `/settings`       | Application settings                                 |
+| Health         | `/health`         | Service health dashboard                             |
 
 A **Sign out** button at the bottom of the sidebar calls
 `POST /v1/auth/logout` and clears the local token.
@@ -91,8 +114,9 @@ issue time. See [api-keys.md](api-keys.md).
 
 ### Projects
 
-Browse projects in the active organization. Project CRUD (create/update/archive)
-is performed via the admin API (`/v1/admin/projects/`).
+Browse projects in the active organization. Project create, update, and archive
+are performed directly in the UI (see [../api-reference.md](../api-reference.md)
+for the underlying admin API).
 
 ### Audit
 
@@ -103,21 +127,23 @@ Read-only view of audit events (writes, admin actions, denials). Requires
 
 Service health dashboard backed by `/-/healthz/` and related checks.
 
-## What is API-only
+### Organizations
 
-The following admin resources are exposed via the API in Phase A/B but do not
-have dedicated UI pages in Phase B. Manage them through the API or the
-respective settings surface:
+Manage the active organization: view and update organization settings.
 
-| Resource      | API path                    | Notes                              |
-|---------------|-----------------------------|------------------------------------|
-| Organizations | `/v1/admin/organizations/`  | Read + update settings             |
-| Teams         | `/v1/admin/teams/`          | Full CRUD                          |
-| Members       | `/v1/admin/members/`        | CRUD + last-owner guard            |
-| Roles         | `/v1/admin/roles/`          | Read-only (seeded via migrations)  |
+### Teams
 
-Refer to [../api-reference.md](../api-reference.md) for methods, capabilities,
-and payloads.
+Full team CRUD: create, update, and archive teams in the active organization.
+
+### Members
+
+Manage organization members: invite, deactivate, and change member roles. A
+last-owner guard prevents removing the final owner.
+
+### Roles
+
+Read-only view of the roles available in the active organization (roles are
+seeded via migrations).
 
 ## See also
 

@@ -60,7 +60,7 @@ Secrets and model policies:
 - rotation test;
 - dependency impact;
 - inherited organization/team/project policy display;
-- provider selector for Anthropic and OpenAI;
+- provider selector for Anthropic, OpenAI, and DeepSeek;
 - task-level routing for generation, curation, embeddings, and summaries;
 - cost/latency hints per provider and model;
 - provider health;

@@ -78,8 +78,8 @@ policy decisions remain authoritative.
 - Team-owned AI provider secrets and model routing.
 - AI memory workflow: proposed, rejected, merged, approved, refuted,
   conflicted, archived, escalated.
-- Memory visibility: private user memory, team memory, project memory,
-  organization memory, shared packs, and policy packs.
+- Memory visibility: session memory, project memory, team memory, and
+  organization memory.
 - Exact and semantic retrieval with permission filtering before context packing.
 - Context bundle generation as the primary agent-facing output.
 - Admin audit trail for reads, writes, retrieval decisions, hook calls, and
@@ -108,7 +108,7 @@ policy decisions remain authoritative.
 - A team can configure provider keys and model policy without exposing raw
   secrets to agents.
 - A single-team developer cannot read another team's memory unless a shared
-  project, memory pack, or explicit grant allows it.
+  project or explicit grant allows it.
 - Every injected memory has provenance, scope, and audit evidence.
 - Every context bundle is explainable: why each memory was included, which scope
   allowed it, and which source supports it.

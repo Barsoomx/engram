@@ -76,7 +76,7 @@ engram connect \
 |-------------------|----------|---------|------------------------------------------------------|
 | `--server`        | yes      | -       | `http(s)://host[:port]`                              |
 | `--api-key`       | yes      | -       | Scoped Engram key (server-issued keys use the `egk_` prefix) |
-| `--project`       | yes      | -       | Project id                                           |
+| `--project`       | no       | empty   | Project id                                           |
 | `--team`          | no       | key's bound team | Team id                                      |
 | `--agent`         | no       | `both`  | `codex`, `claude-code` (alias `claude_code`), `both` |
 | `--agent-version` | no       | empty   | Free-form version tag                                |
@@ -143,6 +143,10 @@ Subcommands (one per supported event):
 - `post-tool-use` - posts to `/v1/hooks/post-tool-use`.
 - `error` - posts to `/v1/hooks/error`.
 - `decision` - posts to `/v1/hooks/decision`.
+- `session-end` - posts to `/v1/hooks/session-end`.
+- `user-prompt-submit` - posts to `/v1/hooks/user-prompt-submit` (ingest) and
+  then `POST /v1/context/user-prompt-submit` to fetch the rendered context
+  bundle.
 
 ```bash
 echo '{"session_id":"s1","payload":{"tool":"Edit"}}' | \
@@ -164,15 +168,20 @@ payload.
 `--response-format` controls the shape of stdout:
 
 - `server` - the raw server response body.
-- `claude-code` - for `session-start`, a `systemMessage` plus a
-  `hookSpecificOutput.additionalContext` block; for other events, an empty
-  object (Claude Code ignores the body).
-- `codex` - `{"continue": true, ...}` plus, for `session-start`, the
-  `systemMessage` and `additionalContext`.
+- `claude-code` - for `session-start` and `user-prompt-submit`, a
+  `systemMessage` plus a `hookSpecificOutput.additionalContext` block; for
+  other events, an empty object (Claude Code ignores the body).
+- `codex` - `{"continue": true, ...}` plus, for `session-start` and
+  `user-prompt-submit`, the `systemMessage` and `additionalContext`.
 
-Idempotency: the adapter derives `event_id`, `idempotency_key`, `content_hash`,
-and `request_id` from a stable hash of the event material when they are not
-supplied, so replaying the same stdin is safe.
+Idempotency: the ingest POST (`/v1/hooks/*`) derives `event_id`,
+`idempotency_key`, `content_hash`, and `request_id` from a stable hash of the
+event material when they are not supplied, so replaying the same stdin is
+safe. For `session-start` and `user-prompt-submit`, the second POST (to
+`/v1/context/session-start` or `/v1/context/user-prompt-submit`) falls back to
+a fresh random UUID for `request_id` when stdin doesn't supply one, so
+replaying identical stdin for those two commands is not deduplicated
+server-side.
 
 ## `engram search`
 

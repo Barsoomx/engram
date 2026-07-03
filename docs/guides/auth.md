@@ -56,9 +56,14 @@ Authorization: Token <drf-token>
 X-Engram-Organization: <org-id>
 ```
 
-The `organization_id` returned by login is the default active organization. If
-you belong to multiple organizations, re-login scoped to the one you want to
-operate on; the server resolves capabilities per active organization.
+If the header is omitted and the user has exactly one active organization
+membership, the server falls back to that organization silently; otherwise the
+header is required and requests without it are rejected.
+
+The `organization_id` returned by login is the oldest active organization
+membership for that user. If you belong to multiple organizations, switch by
+sending a different `X-Engram-Organization` header on subsequent requests; the
+server resolves capabilities per active organization for each request.
 
 ## Logout
 
@@ -83,8 +88,9 @@ checked server-side on every admin action. Examples:
 - `api_keys:read` / `api_keys:issue` / `api_keys:revoke`
 - `audit:read`
 
-Denied requests return the missing capability and a request id. See
-[../api-reference.md](../api-reference.md) for the per-endpoint capability
+Denied requests return a domain error body (`detail`, `error_code`, `code`);
+the response does not include the missing capability name or a request id.
+See [../api-reference.md](../api-reference.md) for the per-endpoint capability
 matrix and [../rbac-and-scopes.md](../rbac-and-scopes.md) for the full model.
 
 ## Two surfaces, two headers

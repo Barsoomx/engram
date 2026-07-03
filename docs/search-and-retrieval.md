@@ -7,9 +7,12 @@ capability used to build the smallest useful context bundle for a concrete agent
 task.
 
 Retrieval must combine exact/grep-style matching with semantic retrieval in V1.
-Exact matching is the authority for names, paths, symbols, ticket ids, commands,
-and error strings. Semantic retrieval is required for recall across paraphrases
-and related decisions. Neither path is sufficient alone.
+Exact matching is authoritative for file paths and memory titles today; other
+categories (symbols, ticket ids, commands, error strings) fall back to
+full-text substring matching because no memory-write path currently populates
+the `symbols`/`exact_terms` metadata needed to index them. Semantic retrieval
+is required for recall across paraphrases and related decisions. Neither path
+is sufficient alone.
 
 Agent memory needs reliable answers to questions like "what did we decide about
 this file?", "where did this error happen?", and "which review found this bug?"
@@ -25,7 +28,6 @@ PostgreSQL should store normalized retrieval documents with:
 - source observation ids;
 - file paths;
 - symbols;
-- branch/environment filters;
 - normalized exact terms;
 - full-text document;
 - trigram-friendly fields;
@@ -55,19 +57,9 @@ Later:
 4. Run exact, full-text, trigram, and vector retrieval.
 5. Fuse candidates deterministically, with exact matches allowed to dominate
    when filenames, symbols, ticket ids, commands, or error strings match.
-6. Pack the context bundle with citations, confidence, source references, and
-   stale/conflict warnings.
+6. Pack the context bundle with citations, source references, and inclusion
+   reasons.
 7. Audit the final injected memory set.
-
-## Result Types
-
-- memory: approved durable knowledge;
-- observation: raw or lightly normalized session evidence;
-- decision: approved project or team decision;
-- incident: failure pattern and resolution;
-- convention: local project rule or coding pattern;
-- policy: admin guidance or guardrail;
-- conflict: competing memories requiring review.
 
 ## Explainability
 
@@ -77,7 +69,6 @@ Every context bundle sent to an agent should be explainable:
 - semantic neighbors used and embedding model/version;
 - scope filters applied;
 - memory versions returned;
-- stale or conflict markers;
 - source observation links;
 - model policy used for reranking or summarization.
 

@@ -560,18 +560,6 @@ def memory_candidate_content_hash(observation: Observation) -> str:
     return hashlib.sha256(observation.content_hash.encode()).hexdigest()
 
 
-def candidate_title(observation: Observation) -> str:
-    return redact_text(observation.title)[:255]
-
-
-def candidate_body(observation: Observation) -> str:
-    body = observation.body.strip()
-    if body:
-        return redact_text(body)
-
-    return redact_text(observation.title)
-
-
 def candidate_evidence(
     observation: Observation,
     title: str | None = None,
