@@ -78,6 +78,7 @@ task_routes = {
     'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
     'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},
     'engram.memory.sweep_stale_sessions': {'queue': QUEUE_BATCH},
+    'engram.memory.retry_failed_distillations': {'queue': QUEUE_BATCH},
 }
 
 task_soft_time_limit = 120
@@ -130,6 +131,11 @@ beat_schedule: dict[str, dict] = {
     'stale-session-sweep': {
         'task': 'engram.memory.sweep_stale_sessions',
         'schedule': timedelta(minutes=5),
+        'options': {'queue': QUEUE_BATCH},
+    },
+    'retry-failed-distillations': {
+        'task': 'engram.memory.retry_failed_distillations',
+        'schedule': timedelta(minutes=30),
         'options': {'queue': QUEUE_BATCH},
     },
     'reembed-missing-embeddings': {
