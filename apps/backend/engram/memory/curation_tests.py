@@ -359,6 +359,36 @@ def test_supersede_memory_system_marks_loser_and_links_winner() -> None:
 
 
 @pytest.mark.django_db
+def test_supersede_memory_system_marks_loser_retrieval_document_stale() -> None:
+    organization, team, project = create_scope()
+    loser = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Old fact',
+            body=_LONG_BODY,
+            content_hash='hash-loser-doc',
+        ),
+    )
+    winner = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='New fact',
+            body=_LONG_BODY,
+            content_hash='hash-winner-doc',
+        ),
+    )
+
+    supersede_memory_system(loser, winner, score=0.97)
+
+    document = RetrievalDocument.objects.get(memory=loser)
+    assert document.stale is True
+
+
+@pytest.mark.django_db
 def test_supersede_memory_system_is_idempotent_when_already_stale() -> None:
     organization, team, project = create_scope()
     loser = promote_candidate(

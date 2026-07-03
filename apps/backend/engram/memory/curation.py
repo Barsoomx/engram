@@ -256,6 +256,7 @@ def supersede_memory_system(
 
     loser.stale = True
     loser.save(update_fields=['stale', 'updated_at'])
+    RetrievalDocument.objects.filter(memory=loser).update(stale=True)
     link, _created = MemoryLink.objects.get_or_create(
         memory=loser,
         link_type=LinkType.SUPERSEDED_BY,
