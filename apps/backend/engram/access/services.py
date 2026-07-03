@@ -388,6 +388,9 @@ class ResolveApiKeyScope:
         resolved_project_ids: tuple[uuid.UUID, ...] = (),
         resolved_team_ids: tuple[uuid.UUID, ...] = (),
     ) -> None:
+        if result == AuditResult.ALLOWED:
+            return
+
         metadata = {
             'api_key_fingerprint': key.key_fingerprint,
             'owner_identity_id': str(key.owner_identity_id),

@@ -141,6 +141,9 @@ def _audit_session_scope(
     capabilities: tuple[str, ...],
 ) -> None:
     allowed = reason == ''
+    if allowed:
+        return
+
     AuditEvent.objects.create(
         organization=organization,
         project_id=project_id if allowed and project_id is not None else None,
