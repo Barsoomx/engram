@@ -70,6 +70,7 @@ def test_bootstrap_golden_path_creates_scoped_project_key_without_raw_secret() -
         'organization_id': str(organization.id),
         'team_id': str(team.id),
         'project_id': str(project.id),
+        'repository_url': project.repository_url,
         'identity_id': str(identity.id),
         'api_key_id': str(api_key.id),
         'api_key_fingerprint': api_key_fingerprint(RAW_KEY),
