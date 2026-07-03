@@ -38,12 +38,15 @@ every access check.
 
 ## Capability Groups
 
+- `organizations:*`
 - `members:*`
 - `teams:*`
 - `projects:*`
+- `projects:agent`
 - `api_keys:*`
 - `secrets:*`
 - `model_policy:*`
+- `context:read`
 - `observations:write`
 - `observations:read`
 - `memories:read`
@@ -52,6 +55,7 @@ every access check.
 - `memories:admin`
 - `search:query`
 - `audit:read`
+- `roles:read`
 - `policy:admin`
 
 Avoid a large conditional-access language in v1. Capability checks plus scope
@@ -80,7 +84,8 @@ them.
 3. Load project grants and repository bindings relevant to the request.
 4. Intersect owner capabilities with API key restrictions.
 5. Apply resource filters before retrieval, ranking, or response construction.
-6. Log the decision input and result to audit.
+6. Log denied decisions to audit with the decision input and result; allowed
+   decisions are not audited.
 
 Authorization must run before context bundles are assembled and before memory
 content is passed into a model prompt.
@@ -97,5 +102,5 @@ Hook writes derive target scope from server-side bindings:
 5. Allow `memories:propose` only for candidate memory in the resolved binding.
 6. Require Admin or Owner approval for organization scope, shared packs, policy
    packs, and high-impact contradictions.
-7. Audit both accepted and denied writes with the resolved scope and checked
-   capability.
+7. Audit denied writes with the resolved scope and checked capability;
+   accepted writes are not audited.

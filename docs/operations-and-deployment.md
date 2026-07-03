@@ -51,8 +51,8 @@ Required telemetry:
 - span id, actor id, team/project ids, hook event id, idempotency key, Celery
   task id, worker job id, and provider call id where present;
 - structured logs with tenant-safe redaction;
-- metrics for hook latency, retrieval latency, queue depth, distillation cost,
-  provider errors, secret failures, and audit write failures;
+- metrics: an `http_requests_total` counter labeled by view and status class,
+  exposed via the `/metrics` endpoint;
 - traces for retrieval pipelines and model calls;
 - health checks for database, queue, secret store, provider policy, and index lag.
 
@@ -60,8 +60,8 @@ Required telemetry:
 
 Server unavailable:
 
-- hooks return no memory or use bounded metadata-only retry mode according to
-  admin policy;
+- hooks retry a bounded number of times on transient errors with a flat
+  backoff, then return no memory and a `server_unavailable` error;
 - agents should keep working without local worker startup.
 
 Secret store unavailable:
@@ -86,7 +86,5 @@ Bad memory:
 ## Data Governance
 
 - Tenant-scoped export.
-- Retention policies per organization and memory type.
-- Legal hold for audit and selected memory.
 - Redaction workflow for sensitive observations.
 - Immutable audit events with tamper-evident hashes as a later hardening step.

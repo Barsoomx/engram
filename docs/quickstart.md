@@ -10,11 +10,12 @@ Expect 10-15 minutes, most of it Docker image builds.
 
 - Docker with the Compose v2 plugin.
 - `git`.
-- A Python 3.11+ environment if you want to run the `engram` CLI on your host
+- A Python 3.12+ environment if you want to run the `engram` CLI on your host
   (the CLI is a thin client; it does not run a local worker).
-- Network egress for OpenAI if you want live embeddings/generation. Without it,
-  ingest still lands observations, but retrieval and context generation are
-  degraded.
+- The Compose stack defaults to a fake provider gateway (`ENGRAM_PROVIDER_MODE=fake`
+  in `docker-compose.yml`), so ingest, retrieval, and context generation all work
+  without network egress or a real provider key. Set `ENGRAM_PROVIDER_MODE=real`
+  and configure a real provider secret to use live embeddings/generation.
 
 ## 1. Clone and configure
 
@@ -37,8 +38,11 @@ ENGRAM_CELERY_RESULT_BACKEND=redis://redis:6379/1
 ```
 
 `ENGRAM_SECRET_KEY` must be changed from the example value before any real use.
-The Compose file wires the database, Redis, and RabbitMQ URLs for you; only
-override them if you are pointing at external services.
+`ENGRAM_DATABASE_URL` and `ENGRAM_REDIS_URL` are hardcoded in
+`docker-compose.yml` to the bundled `postgres`/`redis` services and are not
+read from `.env`. `ENGRAM_CELERY_BROKER_URL` and `ENGRAM_CELERY_RESULT_BACKEND`
+are also hardcoded in `docker-compose.yml`, so the values set in `.env` in this
+step have no effect on the containers started by this Compose file.
 
 ## 2. Start the stack
 
@@ -62,7 +66,7 @@ Services that come up:
 | `worker-domain-events` | -   | Celery worker, `engram-domain-events` queue       |
 | `beat`               | -     | Celery beat scheduler                             |
 | `relay`              | -     | Durable outbox relay                              |
-| `postgres`           | -     | PostgreSQL 16 with pgvector                       |
+| `postgres`           | -     | PostgreSQL 18 with pgvector                       |
 | `redis`              | -     | Cache + result backend                            |
 | `rabbitmq`           | -     | Celery broker                                     |
 
@@ -79,8 +83,9 @@ A `200` from `http://localhost:8000/-/healthz/` means the API is up.
 
 Engram ships a deterministic bootstrap command that creates a ready-to-use
 organization, team, project, service-account identity, a scoped API key, a
-provider secret envelope, and generation + embedding model policies. It is
-idempotent: re-running it updates the existing rows.
+provider secret envelope, and project + organization model policies for
+generation, embedding, digest, and curation. It is idempotent: re-running it
+updates the existing rows.
 
 Choose a raw API key value (this is the secret your agents will use). The server
 does not enforce a specific prefix, but the `egk_` prefix used by
@@ -104,12 +109,14 @@ Plain-text output:
 organization_id=<uuid>
 project_id=<uuid>
 team_id=<uuid>
+repository_url=<url>
 api_key_fingerprint=<short-fingerprint>
 ```
 
 For scripting, add `--json` to get the same fields as a single JSON object,
 plus `identity_id`, `api_key_id`, `capabilities`, `provider_secret_id`,
-`generation_policy_id`, `embedding_policy_id`.
+`generation_policy_id`, `embedding_policy_id`,
+`organization_generation_policy_id`, `organization_embedding_policy_id`.
 
 What this command creates (all under organization slug `engram-e2e`):
 
@@ -119,8 +126,10 @@ What this command creates (all under organization slug `engram-e2e`):
 - Service-account identity `golden-path-agent` with the `developer` role.
 - API key with capabilities `memories:read` and `observations:write`, scoped to
   the team and project.
-- An OpenAI provider secret envelope and two model policies (`generation` with
-  `gpt-4.1-mini`, `embedding` with `text-embedding-3-small`).
+- An OpenAI provider secret envelope and six model policies: project-scoped
+  `generation` and `embedding` on project `backend`, plus organization-scoped
+  `generation`, `embedding`, `digest`, and `curation`. Generation/digest/curation
+  use `gpt-4.1-mini`; embedding uses `text-embedding-3-small`.
 
 Record `$ENGRAM_GOLDEN_KEY` somewhere safe now. It is the only time the raw key
 is materialized on your side; the server stores only its hash and fingerprint.
@@ -141,8 +150,8 @@ Verify:
 engram --help
 ```
 
-You should see subcommands: `connect`, `doctor`, `disconnect`, `hook`, `search`,
-`observations`, `memory`.
+You should see subcommands: `connect`, `install`, `doctor`, `disconnect`,
+`mcp-install`, `mcp`, `hook`, `search`, `memory`, `observations`.
 
 ## 5. Connect an agent
 
@@ -216,7 +225,8 @@ All required checks passed.
 
 `engram connect` writes hook manifests that the plugin packages or your agent
 config reference. The hooks exposed are `SessionStart`, `PostToolUse`, `Error`,
-and `Decision`, each invoking the thin `engram hook <event>` adapter.
+`Decision`, `SessionEnd`, and `UserPromptSubmit`, each invoking the thin
+`engram hook <event>` adapter.
 
 For the native plugin packages, see:
 
@@ -263,11 +273,16 @@ matching memory items with citations.
 
 ## 9. Explore the admin UI
 
-Open `http://localhost:3000/` and sign in with a username and password for an
-identity that belongs to the bootstrapped organization. The sidebar exposes
-Dashboard, Memories, Observations, API Keys, Projects, Audit, and Health. For
-the full admin surface (organizations, teams, members, roles) use the admin
-API documented in [api-reference.md](api-reference.md). See
+Open `http://localhost:3000/` and sign in as `admin`. This account is created
+automatically by `engram_bootstrap_admin`, which the `api` container runs on
+every start (separate from the `engram-e2e` golden-path project from step 3;
+it creates its own `default` organization, team, and project). The password
+is `ENGRAM_BOOTSTRAP_ADMIN_PASSWORD` if you set it before the first start,
+otherwise a random password is generated once and printed to the `api`
+container's logs (`docker compose logs api`). The capability-gated sidebar
+groups Workspace pages (memories, observations, review, search/hook debuggers,
+projects, digests, workflow runs) and Administration pages (secrets, model
+policies, organizations, teams, members, roles, API keys, audit, health). See
 [guides/admin-ui.md](guides/admin-ui.md) and
 [guides/api-keys.md](guides/api-keys.md).
 

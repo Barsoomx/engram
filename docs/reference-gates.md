@@ -110,7 +110,7 @@ Evidence:
 - `django_celery_outbox/relay/_message_selector.py`
 - `django_celery_outbox/relay/_mutations.py`
 - `django_celery_outbox/relay/_relay.py`
-- `django_celery_outbox/_config.py`
+- `django_celery_outbox/relay/_config.py`
 - `django_celery_outbox/management/commands/celery_outbox_relay.py`
 - `docs/operations/runbook.md`
 - `docs/operations/dead-letter.md`
@@ -369,6 +369,9 @@ Engram adaptation:
 - Prioritize tables, filters, detail panes, audits, and diagnostics.
 
 ## Engram Gate Checklist
+
+Gate 1 (parity-01) satisfied this checklist on 2026-06-25; see
+`docs/parity/2026-06-25-first-parity-gate-report.md`.
 
 Before backend implementation begins:
 

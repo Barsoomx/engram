@@ -1,9 +1,9 @@
 # API Keys Guide
 
 API keys authenticate the agent/runtime surface of Engram: hooks, context
-retrieval, search, memory mutations, and the MCP bridge. They are scoped to a
-team and project, carry a subset of the issuing identity's capabilities, and are
-managed from the admin UI or the admin API.
+retrieval, search, memory mutations, and the MCP bridge. They carry a subset
+of the issuing identity's capabilities, and are managed from the admin UI or
+the admin API.
 
 This guide reflects Phase A behavior. For the endpoint contract, see
 [../api-reference.md](../api-reference.md); for the scope model, see
@@ -31,8 +31,6 @@ curl -X POST http://localhost:8000/v1/admin/api-keys/ \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude Code agent",
-    "team": "<team-id>",
-    "project": "<project-id>",
     "capabilities": ["memories:read", "observations:write"]
   }'
 ```
@@ -40,15 +38,16 @@ curl -X POST http://localhost:8000/v1/admin/api-keys/ \
 | Field          | Required | Description                                                 |
 |----------------|----------|-------------------------------------------------------------|
 | `name`         | yes      | Human label                                                 |
-| `team`         | yes*     | Team id the key is scoped to                                |
-| `project`      | yes*     | Project id the key is scoped to                             |
 | `capabilities` | yes      | Subset of the issuer's capabilities (see below)             |
 
-`team`/`project` scope the key. The requested `capabilities` **cannot widen**
-beyond what the issuing user's own role grants; the server intersects them.
+The requested `capabilities` **cannot widen** beyond what the issuing user's
+own role grants; the server rejects the whole request (no key is created) if
+any requested capability isn't covered by the issuer's own capabilities or a
+`{group}:*`/`policy:admin` wildcard.
 
-The response contains the plaintext `key` plus its `id`, `key_fingerprint`,
-prefix, and resolved scope. Store the plaintext immediately.
+The response contains the plaintext `key` plus its `id`, `name`, `key_prefix`,
+`key_fingerprint`, `capabilities`, and `created_at`. Store the plaintext
+immediately.
 
 The golden-path bootstrap (`engram_bootstrap_golden_path`) creates exactly such
 a key deterministically, with capabilities `memories:read` and
@@ -63,8 +62,9 @@ curl http://localhost:8000/v1/admin/api-keys/ \
   -H "X-Engram-Organization: <org-id>"
 ```
 
-Requires `api_keys:read`. Returns id, name, prefix, fingerprint, team, project,
-capabilities, and active status. No plaintext.
+Requires `api_keys:read`. Returns id, name, prefix, fingerprint, owner
+identity, capabilities, created/expires/last-used timestamps, active status,
+and revoked_at. No plaintext.
 
 ## Revoke a key
 
@@ -74,8 +74,8 @@ curl -X POST http://localhost:8000/v1/admin/api-keys/<id>/revoke/ \
   -H "X-Engram-Organization: <org-id>"
 ```
 
-Requires `api_keys:revoke`. Marks the key inactive; subsequent bearer calls
-fail with `invalid_key` / `expired_key`.
+Requires `api_keys:revoke`. Sets `revoked_at`; subsequent bearer calls fail
+with `revoked_key` (HTTP 403).
 
 ## Capabilities
 

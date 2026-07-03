@@ -109,11 +109,7 @@ The main goal is to reduce repeated project re-learning by AI agents.
 
 Do not widen the platform first. Improve memory quality first:
 
-- automatic proposals for new memories;
-- links between memory, code, pull requests, and tasks;
 - task-relevant context;
-- deduplication;
-- memory versions;
 - collaboration across multiple developers.
 
 At this point, memory becomes collective rather than personal.

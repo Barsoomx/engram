@@ -20,8 +20,8 @@ The client command should be renamed and narrowed around the `engram` binary.
 Target command shape:
 
 - `engram connect`
-- `engram hooks install`
-- `engram agent connect`
+- `engram install`
+- `engram mcp install`
 
 The V1 golden path is non-interactive and scriptable:
 
@@ -29,17 +29,16 @@ The V1 golden path is non-interactive and scriptable:
 engram connect --server URL --api-key KEY --project PROJECT
 ```
 
-The interactive wizard can wrap the same fields later:
+The interactive wizard wraps a subset of the same fields:
 
-1. Choose agent: Claude Code, Codex, or both.
-2. Enter server URL.
-3. Authenticate by device/browser flow or paste a scoped API key.
-4. Choose organization, team, project, and repository binding.
-5. Install thin hook config for the selected agent.
-6. Register the MCP bridge: automatic for Claude Code (bundled with the
-   plugin); explicit via `engram mcp install` for Claude Desktop or other
-   clients.
-7. Run a dry-run hook call and print the resolved identity/scope.
+1. Enter server URL.
+2. Log in with a username and password against the server's token endpoint.
+3. Choose organization and project from the fetched lists.
+4. Provide an API key name; the wizard issues a scoped API key.
+5. Install thin hook config for the agent runtime(s) passed via `--agent`
+   (default: both).
+6. Print a connection summary; it does not run a live dry-run identity/scope
+   check the way the non-interactive flags path does.
 
 The command must not install Bun, local vector databases, local SQLite stores,
 provider SDK workers, or background services.
@@ -48,15 +47,15 @@ provider SDK workers, or background services.
 
 V1 stores one hook credential artifact:
 
-- preferred: OS keychain entry containing a project-scoped agent token minted
-  from the supplied API key;
-- fallback for headless hosts: file containing the agent token with strict file
-  permissions;
-- local config stores only server URL, project id, and redacted fingerprint.
+- a `credentials.json` file containing the API key, written with owner-only
+  file permissions (`chmod 0o600`); there is no OS keychain integration;
+- local config stores server URL, project id, team id, agent runtimes, agent
+  version, credential fingerprint, connect timestamp, and resolved
+  actor/scope.
 
 The raw organization/team provider keys never reach the client. `doctor` verifies
-token validity, expiry, project scope, last rotation time, hook file state, and
-server reachability.
+token validity, expiry, project scope, hook file state, and server
+reachability.
 
 ## Managed Installation
 

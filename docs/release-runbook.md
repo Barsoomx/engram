@@ -15,8 +15,8 @@ References:
 - A fresh clone in a new directory with no reused virtualenv, `node_modules`,
   database volume, build cache, or generated config.
 - Docker with Compose v2 enabled.
-- `python3`, `pnpm` (9.x via `corepack enable`), and `poetry` available on the
-  host for repository-quality and frontend gates.
+- `python3`, `pnpm` (11.9.0 via `corepack prepare pnpm@11.9.0 --activate`), and
+  `poetry` available on the host for backend and frontend gates.
 - No real secrets in the tree. Confirm:
 
 ```bash
@@ -36,8 +36,10 @@ Run every command from the repository root unless noted. All commands must exit
 docker compose -f deploy/compose/docker-compose.yml up -d --build --wait
 ```
 
-Expected: backend API, worker, relay, PostgreSQL, RabbitMQ broker, Redis result
-backend, and the frontend service reach healthy state.
+Expected: api, frontend, PostgreSQL, RabbitMQ broker, and Redis reach healthy
+state (each defines a healthcheck); worker-realtime, worker-near-realtime,
+worker-batch, worker-highmemory, worker-domain-events, beat, and relay have no
+healthcheck and are expected to be running.
 
 ### 1.2 Apply migrations and verify freshness
 
@@ -94,19 +96,7 @@ python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v
 
 Expected: both plugin contract suites pass.
 
-### 1.8 Repository quality gates
-
-```bash
-python3 -m unittest discover -s tests -v
-python3 scripts/repository_layout.py
-python3 scripts/repository_quality.py
-git diff --check HEAD
-```
-
-Expected: repository tests pass, layout and quality scripts exit with no output,
-whitespace clean.
-
-### 1.9 E2E golden path
+### 1.8 E2E golden path
 
 ```bash
 python3 scripts/e2e_golden_path.py
@@ -116,16 +106,16 @@ Expected: Compose starts, host CLI connects, hook observation is submitted,
 worker-created retrieval document is observed, future session context bundle is
 returned with citations, and Compose stops cleanly.
 
-### 1.10 Frontend build
+### 1.9 Frontend build
 
 ```bash
 cd apps/frontend && pnpm install --frozen-lockfile && pnpm build
 ```
 
 Expected: clean `pnpm build` with no type or lint errors. `pnpm lint`
-(`next lint`) is also available.
+(`eslint .`) is also available.
 
-### 1.11 Stop Compose runtime
+### 1.10 Stop Compose runtime
 
 ```bash
 docker compose -f deploy/compose/docker-compose.yml down
@@ -153,15 +143,17 @@ git push origin v<VERSION>
 
 ## 4. Build Images
 
-Build backend and frontend images from the tagged SHA with explicit tags:
+Pushing the `v<VERSION>` tag in step 3 triggers
+`.github/workflows/publish-images.yml`, which builds the backend and frontend
+images and pushes them to `ghcr.io` with signed SLSA build-provenance
+attestations. To build the images locally instead:
 
 ```bash
-docker compose -f deploy/compose/docker-compose.yml build api worker relay frontend
+docker compose -f deploy/compose/docker-compose.yml build api worker-realtime worker-near-realtime worker-batch worker-highmemory worker-domain-events beat relay frontend
 ```
 
-Tag and push the images to the operator registry per
-`docs/operations-and-deployment.md`. Record the image digests in the release
-status report.
+Confirm the `publish-images.yml` run for the tag succeeded and record the
+published image digests in the release status report.
 
 ## 5. Publish Plugin Repository
 
@@ -191,7 +183,7 @@ plugin packages. Specifically verify:
 - search, memory version, memory links, observations, and inspection endpoints
   respond under scoped API keys;
 - frontend admin UI loads health and memories pages;
-- Prometheus `/metrics` endpoint responds.
+- Prometheus `/-/metrics` endpoint responds.
 
 Record the release-candidate SHA, OS, Docker version, exact commands, exit
 codes, and first decisive failure (if any) in the release status report. Do not

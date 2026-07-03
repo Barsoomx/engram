@@ -35,8 +35,10 @@ The rewrite should remove or replace:
 3. Port hook payload knowledge into thin adapter packages.
 4. Port useful event and memory semantics into Python domain services.
 5. Replace local worker calls with authenticated server APIs.
-6. Replace the inherited installer with a small `connect`/`doctor`/`disconnect`
-   client package that only manages hooks and server credentials.
+6. Replace the inherited installer with a small `connect`/`doctor`/`disconnect`/
+   `install` client package that manages hooks and server credentials, plus
+   operator commands for search, observations, memory version/link/links, and
+   MCP install/serve.
 7. Add import tooling only after the target schema and authorization model are
    stable.
 

@@ -44,12 +44,11 @@ or background services.
 
 | Event | Endpoint | Sync behavior | Timeout budget | Response |
 | --- | --- | --- | --- | --- |
-| session start | `/v1/context/session-start` | synchronous retrieval | 2s | memory bundle, citations, warnings |
-| prompt submit | `/v1/context` | optional synchronous retrieval | 1s | focused guidance |
-| pre tool use | `/v1/hooks/pre-tool-use` | warning/audit in V1 | 1s | allowed warning fields only |
-| post tool use | `/v1/hooks/post-tool-use` | synchronous durable ingest, async distillation | 2s | ack, request id |
-| stop/session end | `/v1/hooks/session-end` | synchronous durable ingest, async digest/curation | 2s | ack, scheduled job ids |
-| dry run | `/v1/hooks/dry-run` | synchronous verification | 2s | resolved actor, scopes, server health |
+| session start | `/v1/context/session-start` | synchronous retrieval | 60s | memory bundle, citations, warnings |
+| prompt submit | `/v1/hooks/user-prompt-submit` then `/v1/context/user-prompt-submit` | optional synchronous retrieval | 60s | focused guidance |
+| post tool use | `/v1/hooks/post-tool-use` | synchronous durable ingest, async distillation | 120s | ack, request id |
+| stop/session end | `/v1/hooks/session-end` | synchronous durable ingest, async digest/curation | 60s | ack, request id |
+| dry run | `/v1/hooks/dry-run` | synchronous verification | 5s | resolved actor, scopes, server health |
 
 Every request includes agent family, agent version, event id, session id,
 repository metadata, cwd, idempotency key, timestamp, and auth credential.
@@ -72,13 +71,6 @@ Prompt submit:
 - call focused retrieval when useful;
 - attach compact memory guidance before the agent plans.
 
-Pre-tool use:
-
-- retrieve narrow context for risky or context-sensitive actions;
-- optionally run server-side policy checks;
-- return warnings or blocking decisions only when the configured policy layer
-  requires it.
-
 Post-tool use:
 
 - send tool result metadata, changed files, commands, failures, and references;
@@ -93,24 +85,20 @@ Stop/session end:
 
 Explicit tools:
 
-- `memory.search`
-- `memory.observe`
-- `memory.update`
-- `memory.feedback`
-- `memory.explain`
+- `engram_search`
+- `engram_context`
+- `engram_memory_link`
+- `engram_observations`
+- `engram_memory_version`
+- `engram_memory_feedback`
 
 ## Server-Only Contract
 
 Adapters may cache request ids, hook trust state, credential metadata, and
 short-lived retry buffers.
 They must not run persistent local summarizers, vector indexes, SQLite stores, or
-background workers. If the server is unavailable, hooks should degrade by
-recording a bounded local retry envelope or returning no memory, depending on
-admin policy.
-
-Retry envelopes are metadata-only by default. They have a strict size limit, TTL,
-redaction pass, optional encryption, and never contain provider secrets, memory
-bundles, embeddings, or unredacted prompt/tool-output bodies.
+background workers. If the server is unavailable, hooks return an error and no
+memory bundle is returned; nothing is written to local storage.
 
 ## Trust And Managed Hooks
 
@@ -118,16 +106,3 @@ Enterprise deployments should support managed hooks so platform admins can
 install and trust the same integration across developer machines. Trust is still
 not authorization. The server must verify API keys, scopes, request signatures,
 tenant/project binding, and replay protection for every call.
-
-## Policy Layer
-
-Policy enforcement uses the same hook surfaces as memory retrieval, but it is a
-separate domain:
-
-- memory guidance tells the agent what prior context matters;
-- policy decisions tell the hook whether an operation is allowed, warned, or
-  blocked;
-- both decisions are audited with shared correlation ids.
-
-This keeps the memory product honest: memory improves agent behavior, while the
-server remains the source of truth for authorization and policy.

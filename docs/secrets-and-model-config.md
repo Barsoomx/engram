@@ -9,21 +9,18 @@ prompts, logs, observations, memory content, or frontend responses.
 
 ## Secret Store
 
-Support two storage modes:
+Storage mode:
 
-- External vault adapter: HashiCorp Vault-compatible interface for customers
-  that already run a secret store.
 - Database envelope encryption: encrypted secret payloads in PostgreSQL with
   HMAC verification, key versioning, and rotation metadata.
 
-Both modes expose the same domain API:
+This mode exposes the following domain API:
 
 - create secret reference;
 - rotate secret;
 - disable secret;
-- test secret with redacted result;
-- audit every secret read/use;
-- report which model policies depend on a secret.
+- audit secret reads authenticated via API key (allowed and denied); a
+  session-authenticated read is audited only when denied.
 
 ## Secret Scope
 
@@ -57,10 +54,6 @@ Sentry project settings:
 - default model;
 - task-specific models for distillation, embedding, retrieval rerank, memory
   conflict detection, and admin assistant features;
-- budget limits;
-- allowed providers;
-- blocked providers;
-- retention and logging preferences;
 - region or deployment endpoint constraints;
 - fallback behavior.
 
@@ -72,26 +65,28 @@ V1 provider support:
 - Anthropic models for teams that want Claude-quality generation.
 - OpenAI models for cost-aware memory generation, digesting, curation, and
   embeddings.
-- Task-level routing so an organization can use a cheaper OpenAI model for
-  routine observation distillation and reserve a stronger model for
+- DeepSeek models as an additional cost-aware provider option.
+- Task-level routing so an organization can use a cheaper OpenAI or DeepSeek
+  model for routine observation distillation and reserve a stronger model for
   contradiction resolution or high-impact summaries.
 - Provider health and cost metadata visible to admins before they choose a
   default.
 
 The product must support multiple generation backends. Provider selection is an
 organization/team setting, and every generated memory records the provider,
-model, policy version, and cost metadata when available.
+model, and policy version. Cost metadata is recorded as an estimated
+placeholder, not derived from actual token usage.
 
 ## Safety Requirements
 
 - Secrets are redacted before logs, traces, observations, and audit details.
-- Provider request bodies are classified before optional retention.
+- Provider request bodies are never retained (`prompt_retained` is always
+  false).
 - Memory generation must reject or mask detected secrets.
 - Secret reads require `secrets:read` or a server-side job capability, never
   plain `memories:read`.
 - API keys cannot be used to export provider secrets.
-- Rotating a secret creates an audit event and invalidates dependent health
-  checks until they pass again.
+- Rotating a secret creates an audit event.
 
 ## Simple First Version
 
@@ -100,5 +95,5 @@ overrides that select existing secrets. Project and service-account owned raw
 secrets are later. Avoid per-file, per-branch, or arbitrary condition
 expressions until customer use proves they are needed.
 
-See [Backend contracts](backend-contracts.md) for vault adapter and envelope
+See [Backend contracts](backend-contracts.md) for secret storage and envelope
 encryption invariants.

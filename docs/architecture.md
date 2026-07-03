@@ -17,7 +17,7 @@ V1 stack:
 - Celery worker pools for ingestion follow-up, digest generation, memory
   curation, indexing, and retention tasks.
 - Transaction-safe Celery enqueueing through `django-celery-outbox`.
-- OpenTelemetry traces, structured logs, metrics, and error reporting.
+- Structured logs, metrics, and error reporting via Sentry.
 - Admin frontend as a dense operational console.
 
 The inherited worker implementation is source material, not the target runtime.
@@ -64,10 +64,18 @@ live transport as id-only Celery tasks persisted by `django-celery-outbox`.
 Current task signals:
 
 - `engram.memory.process_observation_recorded`
+- `engram.memory.distill_session`
+- `engram.memory.generate_daily_digest`
+- `engram.memory.generate_weekly_digest`
+- `engram.memory.sweep_stale_sessions`
+- `engram.memory.retry_failed_distillations`
+- `engram.memory.run_scheduled_digests`
+- `engram.memory.run_scheduled_weekly_digests`
+- `engram.memory.reembed_missing_embeddings`
 
 The queued payload carries the observation id. Workers reload tenant, project,
 team, actor, source hook, correlation, and trace context from authoritative
-domain rows. Future domain-event expansion requires a separate decision record.
+domain rows.
 
 ## Persistence
 
@@ -93,18 +101,23 @@ schema.
 
 Public server APIs:
 
-- `/v1/hooks/claude-code/*`
-- `/v1/hooks/codex/*`
+- `/v1/hooks/dry-run`
+- `/v1/hooks/pre-tool-use`
+- `/v1/hooks/post-tool-use`
+- `/v1/hooks/session-start`
+- `/v1/hooks/error`
+- `/v1/hooks/decision`
+- `/v1/hooks/session-end`
+- `/v1/hooks/user-prompt-submit`
 - `/v1/observations`
-- `/v1/memories`
+- `/v1/memories/<memory_id>/*` (diff, feedback, version, links)
 - `/v1/search`
 - `/v1/context`
 - `/v1/context/session-start`
-- `/v1/hooks/dry-run`
-- `/v1/projects`
-- `/v1/api-keys`
-- `/v1/model-policies`
-- `/v1/audit`
+- `/v1/admin/projects`
+- `/v1/admin/api-keys`
+- `/v1/model-policy/policies`
+- `/v1/admin/audit-events`
 
 Admin APIs use the same domain services and authorization checks as hook APIs.
 There should be no hidden local-only API path.

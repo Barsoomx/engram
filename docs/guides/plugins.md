@@ -18,14 +18,16 @@ adapter, which authenticates using the credential written by `engram connect`.
 
 ## Hook events
 
-Both plugins expose the same four events:
+Event coverage differs between the two plugins:
 
-| Event         | CLI adapter                       | Server endpoint            |
-|---------------|-----------------------------------|----------------------------|
-| `SessionStart`| `engram hook session-start`       | `POST /v1/hooks/session-start` + `POST /v1/context/session-start` |
-| `PostToolUse` | `engram hook post-tool-use`       | `POST /v1/hooks/post-tool-use` |
-| `Error`       | `engram hook error`               | `POST /v1/hooks/error`     |
-| `Decision`    | `engram hook decision`            | `POST /v1/hooks/decision`  |
+| Event             | CLI adapter                       | Server endpoint            | Claude Code | Codex |
+|-------------------|------------------------------------|----------------------------|-------------|-------|
+| `SessionStart`    | `engram hook session-start`       | `POST /v1/hooks/session-start` + `POST /v1/context/session-start` | yes | yes |
+| `PostToolUse`     | `engram hook post-tool-use`       | `POST /v1/hooks/post-tool-use` | yes | yes |
+| `SessionEnd`      | `engram hook session-end`         | `POST /v1/hooks/session-end` | yes | yes |
+| `UserPromptSubmit`| `engram hook user-prompt-submit`  | `POST /v1/hooks/user-prompt-submit` | yes | yes |
+| `Error`           | `engram hook error`               | `POST /v1/hooks/error`     | no | yes |
+| `Decision`        | `engram hook decision`            | `POST /v1/hooks/decision`  | no | yes |
 
 Each adapter call:
 
@@ -42,16 +44,18 @@ Package: `packages/claude-plugin/`. The manifest lives at
 `packages/claude-plugin/.claude-plugin/plugin.json`.
 
 The plugin uses `engram hook ... --agent claude_code --response-format claude-code`.
-For `SessionStart` the adapter returns a `systemMessage` plus a
-`hookSpecificOutput.additionalContext` block; for the other events it returns an
-empty object, which Claude Code ignores.
+For `SessionStart` and `UserPromptSubmit` the adapter returns a `systemMessage`
+plus a `hookSpecificOutput.additionalContext` block; for `PostToolUse` and
+`SessionEnd` it returns an empty object, which Claude Code ignores.
 
 ### Install
 
-Reference the package directory from your Claude Code profile/plugin list, or
-copy the hook manifest entries into your Claude Code settings. The manifest
-points at `engram hook` for each event, so once `engram connect` has run, no
-further configuration is needed.
+Run `engram install` (after `engram connect`). It adds the Engram marketplace
+(`claude plugin marketplace add <source>`) and installs the plugin
+(`claude plugin install engram@engram-marketplace`). The plugin bundles its own
+copy of the CLI under `hooks/`, so each hook command runs
+`python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook ...` directly — a separate
+`engram` install on `PATH` is not required for hooks or MCP tools to work.
 
 See `packages/claude-plugin/README.md` for the package contract.
 
@@ -64,9 +68,11 @@ The hooks call the same thin Python CLI with `--agent codex` (or
 `--response-format codex`). Codex hook responses use the `{"continue": true, ...}`
 shape and must not emit fields Codex does not support.
 
-> **Status:** as of Phase C this package is a contract fixture. It is not
-> published and does not install itself into a user profile. It documents the
-> intended Codex hook wiring so a later checkpoint can publish it.
+> **Status:** the manifest wires all six hook events (`SessionStart`,
+> `PostToolUse`, `Error`, `Decision`, `SessionEnd`, `UserPromptSubmit`), but the
+> Codex harness is not yet exercised end to end — Claude Code is the validated
+> path today. The package is not published to a marketplace and does not install
+> itself into a user profile; see the README for manual install commands.
 
 See `packages/codex-plugin/README.md` for the package contract.
 

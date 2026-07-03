@@ -14,14 +14,12 @@ The repository default branch should be `master`.
 - Block non-fast-forward pushes.
 - Require linear history.
 - Require pull request review once implementation work starts.
-- Require repository quality workflow before merging.
 - Enable secret scanning and Dependabot alerts where GitHub plan supports them.
 
 ## Initial Workflows
 
 The docs-first phase should keep CI small and honest:
 
-- repository quality: whitespace checks and forbidden sensitive-term scan;
 - CodeQL once the Python/TypeScript source tree stabilizes;
 - Dependabot for GitHub Actions and later Python package manifests.
 
@@ -57,10 +55,4 @@ the old package runtime.
 - RBAC, outbox, and seed-data migrations have migration tests.
 - Transactional/race tests are marked and run separately when they require
   sequential execution.
-- CI must run Ruff, type checks, and pytest once the Python scaffold exists.
-
-## Sensitive-Term Scan
-
-Repository quality CI owns the forbidden sensitive-term regex. The scan covers
-README, docs, governance files, and workflow definitions. Failures should point
-to the exact file and line and must be reviewed by the repository owner.
+- CI runs Ruff and pytest for the backend.
