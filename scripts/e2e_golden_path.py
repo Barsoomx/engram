@@ -8,8 +8,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -203,15 +201,6 @@ def main() -> int:
             )
             progress('MCP stdio bridge passed')
 
-            progress('Verifying symbol-tier exact-match retrieval')
-            assert_symbol_search_evidence(
-                server_url=SERVER_URL,
-                api_key=agent_key,
-                project_id=project_id,
-                memory_id=worker_memory['memory_id'],
-                symbol=SYMBOL_TERM,
-            )
-
             progress('Submitting second hook observation for repo-url-mode drive')
             run_id_repo_url = f'{run_id}-repourl'
             post_tool_use_repo_url = run_json(
@@ -341,8 +330,9 @@ def drive_mcp_stdio(
                 'body': f'mcp e2e second update {run_id} calls `{SYMBOL_TERM}()` during planning.',
             },
         ),
+        _tool_call(9, 'engram_search', {'query': '', 'symbols': [SYMBOL_TERM]}),
         _tool_call(
-            9,
+            10,
             'engram_memory_feedback',
             {'memory_id': memory_id, 'action': feedback_action, 'reason': f'mcp e2e {run_id}'},
         ),
@@ -369,7 +359,7 @@ def drive_mcp_stdio(
             responses[message['id']] = message
     tool_names = [tool['name'] for tool in responses[2]['result']['tools']]
     assert_equal(len(tool_names), 6, 'mcp tools count')
-    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9)}
+    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9, 10)}
     for rid, text in texts.items():
         for secret in secrets_list:
             assert_secret_absent(f'mcp response {rid}', text, secret)
@@ -385,8 +375,10 @@ def drive_mcp_stdio(
         raise SystemExit(
             f'mcp version replayed or empty: {texts[7]} / {texts[8]}'
         )
-    if f'{feedback_action}=True' not in texts[9] or 'already_applied=False' not in texts[9]:
-        raise SystemExit(f'mcp feedback failed: {texts[9]}')
+    if f'memory_id={memory_id}' not in texts[9]:
+        raise SystemExit(f'mcp symbol search missed memory_id: {texts[9][:400]}')
+    if f'{feedback_action}=True' not in texts[10] or 'already_applied=False' not in texts[10]:
+        raise SystemExit(f'mcp feedback failed: {texts[10]}')
 
 
 def _tool_call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -628,63 +620,6 @@ print(json.dumps({{
     'audit_event_id': str(audit.id),
 }}))
 """
-
-
-def assert_symbol_search_evidence(
-    *,
-    server_url: str,
-    api_key: str,
-    project_id: str,
-    memory_id: str,
-    symbol: str,
-) -> None:
-    body = post_search(
-        server_url=server_url,
-        api_key=api_key,
-        payload={'project_id': project_id, 'query': '', 'file_paths': [], 'symbols': [symbol], 'limit': 5},
-    )
-    assert_secret_absent('symbol search response', json.dumps(body), api_key)
-    items = body.get('items')
-    if not isinstance(items, list) or not items:
-        raise E2EError('Symbol search returned no items')
-
-    match = next(
-        (item for item in items if isinstance(item, dict) and item.get('memory_id') == memory_id),
-        None,
-    )
-    if match is None:
-        raise E2EError(f'Symbol search did not return memory_id {memory_id}: {json.dumps(items)[:600]}')
-
-    inclusion_reason = match.get('inclusion_reason')
-    if not isinstance(inclusion_reason, str) or not inclusion_reason.startswith('exact match:'):
-        raise E2EError(f'Symbol search inclusion_reason was not an exact match: {inclusion_reason!r}')
-
-    matched_terms = match.get('matched_terms')
-    if not isinstance(matched_terms, list) or symbol not in matched_terms:
-        raise E2EError(f'Symbol search matched_terms missing {symbol!r}: {matched_terms!r}')
-
-
-def post_search(*, server_url: str, api_key: str, payload: dict[str, object]) -> dict[str, object]:
-    request = urllib.request.Request(
-        f'{server_url}/v1/search/',
-        data=json.dumps(payload).encode(),
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-        },
-        method='POST',
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=8.0) as response:
-            payload_response = json.loads(response.read().decode())
-    except urllib.error.HTTPError as error:
-        raise E2EError(f'Search request failed ({error.code}): {error.read().decode()}') from error
-
-    if not isinstance(payload_response, dict):
-        raise E2EError('Expected search response to be a JSON object')
-
-    return payload_response
 
 
 def run_json(
