@@ -6,8 +6,8 @@
     {
       "name": "engram",
       "source": "./packages/claude-plugin",
-      "description": "Thin Engram hook adapter for Claude Code.",
-      "version": "0.1.7",
+      "description": "Thin Engram hook adapter and MCP bridge for Claude Code.",
+      "version": "0.1.8",
       "category": "Productivity",
       "metadata": { "author": "Engram", "license": "MIT" }
     }
