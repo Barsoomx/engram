@@ -436,6 +436,113 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
     assert second_run_calls == []
 
 
+class _TitleBodyGateway(FakeProviderGateway):
+    def __init__(self, *, title: str, body: str) -> None:
+        self._title = title
+        self._body = body
+
+    def call(self, data: object) -> ProviderCallResult:
+        real = FakeProviderGateway.call(self, data)
+
+        return ProviderCallResult(
+            provider=real.provider,
+            model=real.model,
+            call_record_id=real.call_record_id,
+            redaction_state=real.redaction_state,
+            generated_title=self._title,
+            generated_body=self._body,
+        )
+
+
+@pytest.mark.django_db
+def test_process_observation_empty_body_falls_back_to_title(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body=''),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is False
+    candidates = MemoryCandidate.objects.filter(source_observation=observation)
+    assert candidates.count() == 1
+    candidate = candidates.get()
+    assert candidate.title == 'Config lives in settings.py'
+    assert candidate.body == 'Config lives in settings.py'
+
+
+@pytest.mark.django_db
+def test_process_observation_empty_title_falls_back_to_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='', body='Uses pgvector cosine.'),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is False
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.title == 'Uses pgvector cosine.'
+    assert candidate.body == 'Uses pgvector cosine.'
+
+
+@pytest.mark.django_db
+def test_process_observation_both_title_and_body_empty_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='', body=''),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+    assert AuditEvent.objects.filter(
+        event_type='MemoryCandidateSkipped',
+        target_id=str(observation.id),
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_process_observation_skip_title_with_empty_body_still_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='SKIP', body=''),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+
+
+@pytest.mark.django_db
+def test_process_observation_normal_title_and_body_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is False
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.title == 'Config lives in settings.py'
+    assert candidate.body == 'Uses pgvector cosine.'
+
+
 def test_strip_json_fence_strips_json_tagged_fence() -> None:
     fenced = '```json\n{"memories": []}\n```'
 

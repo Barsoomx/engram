@@ -305,6 +305,9 @@ def _is_skip(generated: GeneratedMemoryCandidate) -> bool:
     title = generated.title.strip()
     body = generated.body.strip()
 
+    if not title or not body:
+        return True
+
     return title.upper() == 'SKIP' and body.upper() in ('', 'SKIP')
 
 
@@ -456,11 +459,13 @@ class ProcessObservationRecorded:
             'task_type': resolved.policy.task_type,
             'redaction_state': provider_result.redaction_state,
         }
+        title = (provider_result.generated_title or provider_result.generated_body)[:255]
+        body = provider_result.generated_body or provider_result.generated_title
 
         return GeneratedMemoryCandidate(
-            title=provider_result.generated_title,
-            body=provider_result.generated_body,
-            evidence=candidate_evidence(observation, provider_result.generated_title, provenance),
+            title=title,
+            body=body,
+            evidence=candidate_evidence(observation, title, provenance),
         )
 
     def _has_provider_provenance(self, candidate: MemoryCandidate) -> bool:
