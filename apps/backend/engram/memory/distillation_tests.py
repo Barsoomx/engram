@@ -421,6 +421,35 @@ def test_parse_synthesized_candidates_object_without_memories_falls_back() -> No
     assert candidates[0].confidence == Decimal('0.500')
 
 
+def test_parse_synthesized_candidates_strips_json_fence_instead_of_falling_back() -> None:
+    fenced = '```json\n{"memories": [{"title": "T", "body": "B", "confidence": 0.9}]}\n```'
+
+    candidates = parse_synthesized_candidates(fenced)
+
+    assert len(candidates) == 1
+    assert candidates[0].title == 'T'
+    assert candidates[0].body == 'B'
+    assert candidates[0].confidence == Decimal('0.900')
+    assert not candidates[0].title.startswith('```')
+
+
+def test_parse_synthesized_candidates_unfenced_json_still_parses() -> None:
+    raw = json.dumps({'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9}]})
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert len(candidates) == 1
+    assert candidates[0].title == 'T'
+
+
+def test_parse_synthesized_candidates_genuinely_invalid_still_falls_back() -> None:
+    candidates = parse_synthesized_candidates('this is not json and not fenced either')
+
+    assert len(candidates) == 1
+    assert candidates[0].confidence == Decimal('0.500')
+    assert candidates[0].body == 'this is not json and not fenced either'
+
+
 def test_session_distillation_system_prompt_declares_memories_object_contract() -> None:
     prompt = session_distillation_system_prompt()
 
@@ -1262,6 +1291,34 @@ def test_parse_reduced_candidates_parses_valid_memories_object() -> None:
     assert parsed[0].title == 'merged'
     assert parsed[0].confidence == Decimal('0.750')
     assert parsed[0].source_ids == (0, 2)
+
+
+def test_parse_reduced_candidates_strips_json_fence() -> None:
+    raw = json.dumps(
+        {'memories': [{'title': 'merged', 'body': 'merged body', 'confidence': 0.75, 'source_ids': [0, 2]}]},
+    )
+    fenced = f'```json\n{raw}\n```'
+
+    parsed = _parse_reduced_candidates(fenced)
+
+    assert parsed is not None
+    assert len(parsed) == 1
+    assert parsed[0].title == 'merged'
+
+
+def test_parse_reduced_candidates_unfenced_json_still_parses() -> None:
+    raw = json.dumps(
+        {'memories': [{'title': 'merged', 'body': 'merged body', 'confidence': 0.75, 'source_ids': [0, 2]}]},
+    )
+
+    parsed = _parse_reduced_candidates(raw)
+
+    assert parsed is not None
+    assert len(parsed) == 1
+
+
+def test_parse_reduced_candidates_truly_invalid_still_returns_none() -> None:
+    assert _parse_reduced_candidates('this is not json and not fenced either') is None
 
 
 def _reduce_scope(
