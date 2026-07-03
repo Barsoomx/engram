@@ -49,6 +49,7 @@ class EffectiveScope:
     capabilities: tuple[str, ...]
     actor_type: str
     actor_id: str
+    project_bound: bool
 
 
 ACCESS_STATUS = {
@@ -210,6 +211,7 @@ class ResolveApiKeyScope:
                 capabilities=effective_capabilities,
                 actor_type='api_key',
                 actor_id=str(key.id),
+                project_bound=bool(key.project_id),
             )
 
     def _find_key(self, raw_key: str) -> ApiKey | None:

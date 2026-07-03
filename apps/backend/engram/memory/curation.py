@@ -539,6 +539,7 @@ class CurateMemoryCandidate:
             capabilities=(),
             actor_type='system',
             actor_id='curator',
+            project_bound=False,
         )
 
         return authorized_retrieval_documents(candidate.organization, candidate.project, scope)

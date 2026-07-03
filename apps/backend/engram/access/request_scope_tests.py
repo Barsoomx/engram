@@ -313,6 +313,7 @@ def test_session_scope_narrows_to_requested_project() -> None:
     )
 
     assert scope.project_ids == (project.id,)
+    assert scope.project_bound is False
 
 
 @pytest.mark.django_db

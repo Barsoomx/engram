@@ -58,6 +58,7 @@ def scope_for(organization: Organization, project: Project) -> EffectiveScope:
         capabilities=(),
         actor_type='api_key',
         actor_id='actor-1',
+        project_bound=False,
     )
 
 
