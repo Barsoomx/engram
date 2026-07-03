@@ -259,6 +259,9 @@ def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path) -> None:
     if not search_text or search_text.startswith('Engram call failed'):
         raise E2EError(f'plugin mcp search failed: {lines[2]}')
 
+    if 'not configured' in search_text or 'requires a connected project' in search_text:
+        raise E2EError(f'plugin mcp search did not reach the backend: {search_text}')
+
 
 def connect_cli(home: Path, agent_key: str) -> None:
     env = dict(os.environ)
