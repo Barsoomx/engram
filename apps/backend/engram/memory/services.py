@@ -1533,6 +1533,20 @@ class BuildWeeklyStructuredDigest:
                 },
             )
 
+            version = MemoryVersion.objects.create(
+                organization=digest_memory.organization,
+                project=digest_memory.project,
+                memory=digest_memory,
+                version=1,
+                body=digest_memory.body,
+                content_hash=content_hash,
+                source_metadata={'kind': 'digest'},
+            )
+
+            IndexMemoryVersion().execute(
+                IndexMemoryVersionInput(memory_version_id=version.id),
+            )
+
         return WeeklyDigestResult(
             digest_memory=digest_memory,
             counts=counts,
@@ -1550,6 +1564,12 @@ class BuildWeeklyStructuredDigest:
         ).first()
 
         if existing is None:
+            return None
+
+        existing_version = MemoryVersion.objects.filter(memory=existing).order_by('version').first()
+        existing_doc = RetrievalDocument.objects.filter(memory=existing).first()
+
+        if existing_version is None or existing_doc is None:
             return None
 
         metadata = existing.metadata if isinstance(existing.metadata, dict) else {}

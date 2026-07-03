@@ -591,7 +591,7 @@ def supersede_memory(
 
     memory.save(update_fields=['stale', 'updated_at'])
 
-    RetrievalDocument.objects.filter(memory=memory).update(stale=True)
+    RetrievalDocument.objects.filter(memory=memory).update(stale=True, updated_at=timezone.now())
 
     return _record_memory_link(
         organization=organization,
@@ -683,7 +683,7 @@ def reject_review_item(
 
         item.save(update_fields=['status', 'refuted', 'updated_at'])
 
-        RetrievalDocument.objects.filter(memory=item).update(refuted=True)
+        RetrievalDocument.objects.filter(memory=item).update(refuted=True, updated_at=timezone.now())
 
         target_type = 'memory'
 

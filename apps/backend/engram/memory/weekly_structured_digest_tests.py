@@ -7,13 +7,17 @@ from unittest import mock
 import pytest
 from django.utils import timezone
 
+from engram.access.services import EffectiveScope
+from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
     LinkType,
     Memory,
     MemoryLink,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
+    RetrievalDocument,
     Team,
     WorkflowRun,
     WorkflowRunStatus,
@@ -113,6 +117,20 @@ def _run(
             window_days=window_days,
             team_id=team_id,
         ),
+    )
+
+
+def _read_scope(org: Organization, project: Project) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=org.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(project.id,),
+        team_ids=(),
+        capabilities=(),
+        actor_type='user',
+        actor_id='reader',
+        project_bound=True,
     )
 
 
@@ -601,3 +619,39 @@ def test_team_scoped_digest_has_independent_content_hash_from_unscoped(
     team_scoped_ids = [item['id'] for items in team_scoped_result.memory_changes.values() for item in items]
 
     assert str(mem_no_team.id) not in team_scoped_ids
+
+
+@pytest.mark.django_db
+def test_weekly_digest_creates_retrievable_version_and_document(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    result = _run(f_org, f_project)
+
+    version = MemoryVersion.objects.get(memory=result.digest_memory)
+
+    assert version.version == 1
+
+    document = RetrievalDocument.objects.get(memory=result.digest_memory)
+
+    authorized = authorized_retrieval_documents(f_org, f_project, _read_scope(f_org, f_project))
+
+    assert document.id in [doc.id for doc in authorized]
+
+
+@pytest.mark.django_db
+def test_idempotent_rerun_does_not_duplicate_version_or_document(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    result1 = _run(f_org, f_project)
+
+    result2 = _run(f_org, f_project)
+
+    assert result1.digest_memory.id == result2.digest_memory.id
+
+    assert Memory.objects.filter(id=result1.digest_memory.id).count() == 1
+
+    assert MemoryVersion.objects.filter(memory=result1.digest_memory).count() == 1
+
+    assert RetrievalDocument.objects.filter(memory=result1.digest_memory).count() == 1
