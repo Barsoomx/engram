@@ -524,6 +524,9 @@ def edit_memory_body(
 ) -> MemoryVersion:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    if memory.kind == 'digest':
+        raise MemoryReviewError('invalid_state', 'digest memories cannot be edited')
+
     next_version = memory.current_version + 1
 
     version = MemoryVersion.objects.create(

@@ -112,6 +112,7 @@ def _make_memory(
     project: Project,
     *,
     status: str = MemoryStatus.CONFLICT,
+    kind: str = '',
 ) -> Memory:
     counter = Memory.objects.count()
 
@@ -123,6 +124,7 @@ def _make_memory(
         status=status,
         visibility_scope=VisibilityScope.PROJECT,
         confidence='0.500',
+        metadata={'kind': kind} if kind else {},
     )
 
 
@@ -296,6 +298,24 @@ def test_edit_memory_body_reindexes_retrieval_document(
     document = RetrievalDocument.objects.get(memory_version=version)
 
     assert 'updated body text' in document.full_text
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_rejects_digest_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, kind='digest')
+
+    with pytest.raises(MemoryReviewError) as error:
+        edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    assert error.value.code == 'invalid_state'
+
+    memory.refresh_from_db()
+
+    assert memory.current_version == 1
 
 
 @pytest.mark.django_db
