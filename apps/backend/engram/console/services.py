@@ -460,6 +460,14 @@ def approve_memory_candidate(
             'only proposed candidates can be approved',
         )
 
+    metadata: dict[str, object] = {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+    }
+    if candidate.kind:
+        metadata['kind'] = candidate.kind
+
     memory = Memory.objects.create(
         organization=candidate.organization,
         project=candidate.project,
@@ -469,11 +477,7 @@ def approve_memory_candidate(
         status=MemoryStatus.APPROVED,
         visibility_scope=candidate.visibility_scope,
         confidence=candidate.confidence,
-        metadata={
-            'source': 'memory_candidate',
-            'memory_candidate_id': str(candidate.id),
-            'evidence': candidate.evidence,
-        },
+        metadata=metadata,
     )
 
     version = MemoryVersion.objects.create(

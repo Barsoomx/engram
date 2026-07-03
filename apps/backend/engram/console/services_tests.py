@@ -94,6 +94,7 @@ def _make_candidate(
     project: Project,
     *,
     status: str = CandidateStatus.PROPOSED,
+    kind: str = '',
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
 
@@ -106,6 +107,7 @@ def _make_candidate(
         visibility_scope=VisibilityScope.PROJECT,
         content_hash=f'hash-c-{counter}',
         confidence='0.500',
+        kind=kind,
     )
 
 
@@ -249,6 +251,36 @@ def test_approve_memory_candidate_promotes_candidate(
     assert candidate.status == CandidateStatus.PROMOTED
 
     assert candidate.promoted_memory_id == memory.id
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_carries_kind_into_memory_metadata_and_column(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project, kind='gotcha')
+
+    memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert memory.metadata['kind'] == 'gotcha'
+
+    assert memory.kind == 'gotcha'
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_omits_kind_from_memory_metadata_when_unset(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert 'kind' not in memory.metadata
+
+    assert memory.kind == ''
 
 
 @pytest.mark.django_db
