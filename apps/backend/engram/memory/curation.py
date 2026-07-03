@@ -130,6 +130,10 @@ def audit_curator_action(
     threshold: Decimal | None = None,
     judge_context: dict[str, object] | None = None,
     extra: dict[str, object] | None = None,
+    target_type: str = 'memory_candidate',
+    target_id: str | None = None,
+    request_id: str = '',
+    correlation_id: str = '',
 ) -> None:
     metadata: dict[str, object] = {
         'candidate_id': str(candidate.id),
@@ -152,10 +156,12 @@ def audit_curator_action(
         event_type=event_type,
         actor_type='system',
         actor_id='curator',
-        target_type='memory_candidate',
-        target_id=str(candidate.id),
+        target_type=target_type,
+        target_id=target_id if target_id is not None else str(candidate.id),
         capability='memories:review',
         result=AuditResult.RECORDED,
+        request_id=request_id,
+        correlation_id=correlation_id,
         metadata=redact_value(metadata).value,
     )
 
@@ -370,7 +376,10 @@ def supersede_memory_system(
     candidate: MemoryCandidate,
     *,
     score: float | None = None,
+    threshold: Decimal | None = None,
     judge_context: dict[str, object] | None = None,
+    request_id: str = '',
+    correlation_id: str = '',
 ) -> MemoryLink | None:
     loser = Memory.objects.select_for_update().get(id=loser.id)
     if loser.stale:
@@ -394,7 +403,12 @@ def supersede_memory_system(
         event_type='MemorySuperseded',
         decision='superseded',
         near_dup_score=score,
+        threshold=threshold,
         judge_context=judge_context,
+        target_type='memory',
+        target_id=str(loser.id),
+        request_id=request_id,
+        correlation_id=correlation_id,
         extra={'winner_memory_id': str(winner.id), 'loser_memory_id': str(loser.id)},
     )
 
@@ -417,13 +431,13 @@ class CurateMemoryCandidate:
             return self._hold_for_escalation(candidate, reason, data)
 
         if not resolve_curator_enabled(candidate.organization):
-            return self._promote(candidate, 'passthrough', route='passthrough')
+            return self._promote(candidate, 'passthrough', data, route='passthrough')
 
         embedding = embed_candidate(candidate)
         if embedding is not None:
             return self._curate_with_embedding(candidate, embedding, data)
 
-        return self._promote(candidate, 'promoted', route='embedding_unavailable')
+        return self._promote(candidate, 'promoted', data, route='embedding_unavailable')
 
     def _curate_with_embedding(
         self,
@@ -437,24 +451,26 @@ class CurateMemoryCandidate:
         documents = self._authorized_documents(candidate)
         near_dup = find_near_duplicate(embedding, documents, floor)
         if near_dup is None:
-            return self._promote(candidate, 'promoted', route='no_duplicate')
+            return self._promote(candidate, 'promoted', data, route='no_duplicate', threshold=threshold)
 
         _document, score = near_dup
         if score >= float(threshold):
-            return self._supersede(candidate, near_dup, data)
+            return self._supersede(candidate, near_dup, data, threshold=threshold)
 
-        return self._judge(candidate, near_dup, data)
+        return self._judge(candidate, near_dup, data, threshold=threshold)
 
     def _judge(
         self,
         candidate: MemoryCandidate,
         near_dup: tuple[RetrievalDocument, float],
         data: CurateMemoryCandidateInput,
+        *,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
         outcome = self._judge_decision(candidate, document.memory, data)
         if outcome.decision == 'merge':
-            return self._supersede(candidate, near_dup, data, judge_context=outcome.judge_context)
+            return self._supersede(candidate, near_dup, data, judge_context=outcome.judge_context, threshold=threshold)
 
         if outcome.decision == 'reject':
             return self._reject(
@@ -463,6 +479,7 @@ class CurateMemoryCandidate:
                 reason='near_dup_judge_reject',
                 near_dup_score=score,
                 judge_context=outcome.judge_context,
+                threshold=threshold,
             )
 
         if outcome.decision == 'contradicts':
@@ -473,9 +490,17 @@ class CurateMemoryCandidate:
                 outcome.reason,
                 data,
                 judge_context=outcome.judge_context,
+                threshold=threshold,
             )
 
-        return self._promote(candidate, 'promoted', route='judge_keep_both', judge_context=outcome.judge_context)
+        return self._promote(
+            candidate,
+            'promoted',
+            data,
+            route='judge_keep_both',
+            judge_context=outcome.judge_context,
+            threshold=threshold,
+        )
 
     def _judge_decision(
         self,
@@ -565,9 +590,11 @@ class CurateMemoryCandidate:
         self,
         candidate: MemoryCandidate,
         decision: str,
+        data: CurateMemoryCandidateInput,
         *,
         route: str,
         judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
         if not promotion.duplicate:
@@ -576,6 +603,8 @@ class CurateMemoryCandidate:
                 event_type='MemoryCuratorPromoted',
                 decision=route,
                 judge_context=judge_context,
+                threshold=threshold,
+                correlation_id=data.correlation_id,
                 extra={'memory_id': str(promotion.memory.id)},
             )
 
@@ -596,6 +625,7 @@ class CurateMemoryCandidate:
         reason: str = 'low_signal',
         near_dup_score: float | None = None,
         judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         already_settled = False
         with transaction.atomic():
@@ -613,6 +643,8 @@ class CurateMemoryCandidate:
                     reason=reason,
                     near_dup_score=near_dup_score,
                     judge_context=judge_context,
+                    threshold=threshold,
+                    correlation_id=data.correlation_id,
                     extra={'body_length': len(redact_text(locked.body).strip())},
                 )
 
@@ -645,6 +677,7 @@ class CurateMemoryCandidate:
                     event_type='MemoryCandidateHeldForReview',
                     decision='held_escalation',
                     reason=metadata_reason,
+                    correlation_id=data.correlation_id,
                 )
 
         if already_settled:
@@ -671,6 +704,7 @@ class CurateMemoryCandidate:
         data: CurateMemoryCandidateInput,
         *,
         judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         stored_reason = redact_text(reason)[:200]
         already_settled = False
@@ -708,6 +742,8 @@ class CurateMemoryCandidate:
                         reason=stored_reason,
                         near_dup_score=score,
                         judge_context=judge_context,
+                        threshold=threshold,
+                        correlation_id=data.correlation_id,
                         extra={'memory_id': str(existing_memory.id)},
                     )
 
@@ -725,6 +761,7 @@ class CurateMemoryCandidate:
         data: CurateMemoryCandidateInput,
         *,
         judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
         loser = document.memory
@@ -745,7 +782,10 @@ class CurateMemoryCandidate:
                 promotion.memory,
                 promotion.candidate,
                 score=score,
+                threshold=threshold,
                 judge_context=judge_context,
+                request_id=f'curator:{candidate.id}',
+                correlation_id=data.correlation_id,
             )
 
         return CurateMemoryCandidateResult(

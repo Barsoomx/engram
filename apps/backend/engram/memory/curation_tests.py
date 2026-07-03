@@ -376,7 +376,14 @@ def test_supersede_memory_system_marks_loser_and_links_winner() -> None:
     )
     winner = promote_candidate(winner_candidate)
 
-    link = supersede_memory_system(loser, winner, winner_candidate, score=0.97)
+    link = supersede_memory_system(
+        loser,
+        winner,
+        winner_candidate,
+        score=0.97,
+        threshold=Decimal('0.850'),
+        correlation_id='corr-1',
+    )
 
     loser.refresh_from_db()
     assert loser.stale is True
@@ -386,11 +393,13 @@ def test_supersede_memory_system_marks_loser_and_links_winner() -> None:
     audit = AuditEvent.objects.get(event_type='MemorySuperseded')
     assert audit.actor_type == 'system'
     assert audit.result == AuditResult.RECORDED
-    assert audit.target_type == 'memory_candidate'
-    assert audit.target_id == str(winner_candidate.id)
+    assert audit.target_type == 'memory'
+    assert audit.target_id == str(loser.id)
+    assert audit.correlation_id == 'corr-1'
     assert audit.metadata['winner_memory_id'] == str(winner.id)
     assert audit.metadata['loser_memory_id'] == str(loser.id)
     assert audit.metadata['near_dup_score'] == '0.97'
+    assert audit.metadata['threshold'] == '0.850'
 
 
 @pytest.mark.django_db
@@ -1122,13 +1131,18 @@ def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch:
     existing, duplicate = seed_existing_and_duplicate(organization, team, project)
     patch_judge_gateway(monkeypatch, _ExplodingJudgeGateway())
 
-    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+    result = CurateMemoryCandidate().execute(
+        CurateMemoryCandidateInput(candidate_id=duplicate.id, correlation_id='corr-full-flow'),
+    )
 
     existing.refresh_from_db()
     assert result.decision == 'superseded'
     assert result.superseded_memory is not None
     assert result.superseded_memory.id == existing.id
     assert existing.stale is True
+    audit = AuditEvent.objects.get(event_type='MemorySuperseded')
+    assert audit.correlation_id == 'corr-full-flow'
+    assert audit.metadata['threshold'] == '0.850'
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1395,6 +1409,7 @@ def test_curate_passthrough_route_audits_curator_promoted() -> None:
     assert audit.metadata['decision'] == 'passthrough'
     assert audit.metadata['memory_id'] == str(result.memory.id)
     assert audit.metadata['candidate_id'] == str(candidate.id)
+    assert audit.metadata['threshold'] is None
 
 
 @pytest.mark.django_db
@@ -1416,6 +1431,7 @@ def test_curate_no_duplicate_route_audits_curator_promoted() -> None:
     audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
     assert audit.metadata['decision'] == 'no_duplicate'
     assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] == '0.850'
 
 
 @pytest.mark.django_db
@@ -1436,6 +1452,7 @@ def test_curate_embedding_unavailable_route_audits_curator_promoted() -> None:
     audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
     assert audit.metadata['decision'] == 'embedding_unavailable'
     assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] is None
 
 
 @pytest.mark.django_db
@@ -1451,6 +1468,7 @@ def test_curate_judge_keep_both_route_audits_curator_promoted() -> None:
     audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
     assert audit.metadata['decision'] == 'judge_keep_both'
     assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] == '1.050'
     assert 'judge' in audit.metadata
 
 
