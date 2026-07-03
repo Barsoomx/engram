@@ -392,3 +392,36 @@ def test_memory_diff_project_id_wins_over_repository_url() -> None:
 
     assert response.status_code == 200
     assert response.json()['from']['version'] == 1
+
+
+@pytest.mark.django_db
+def test_memory_diff_repository_url_resolving_elsewhere_never_leaks_object_from_another_project() -> None:
+    organization, team, project_a, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    Project.objects.create(
+        organization=organization,
+        name='Project B',
+        slug='project-b-diff-leak-probe',
+        repository_url='git@github.com:acme/project-b-diff.git',
+    )
+    memory, _v1, _doc = create_approved_memory_document(
+        organization,
+        team,
+        project_a,
+        body='Project A secret memory body',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/diff',
+        {
+            'repository_url': 'https://github.com/acme/project-b-diff',
+            'from_version': 1,
+            'to_version': 1,
+        },
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'memory_not_found'
+    assert 'Project A secret memory body' not in str(response.json())

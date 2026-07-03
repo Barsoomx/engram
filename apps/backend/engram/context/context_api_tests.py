@@ -20,6 +20,7 @@ from engram.core.models import (
     Agent,
     AgentSession,
     AuditEvent,
+    AuditResult,
     ContextBundle,
     ContextBundleItem,
     Memory,
@@ -500,6 +501,192 @@ def test_session_start_denies_wrong_project_before_retrieval() -> None:
     assert response.status_code == 403
     assert response.json()['code'] == 'project_scope_denied'
     assert ContextBundle.objects.count() == 0
+
+
+CONTEXT_AGENT_RAW_KEY = 'egk_test_context_agent_0123456789abcdefghijklmnopqrstuvwxyz'
+CONTEXT_AGENT_CAPS = ('memories:read', 'projects:agent')
+
+
+def create_context_org_agent_key(organization: Organization) -> None:
+    from engram.access.models import IdentityType, RoleCapability
+
+    role, _ = Role.objects.get_or_create(code='organization_owner', defaults={'name': 'owner'})
+    for code in CONTEXT_AGENT_CAPS:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.SERVICE_ACCOUNT,
+        external_id='context-agent',
+        display_name='Context agent',
+        active=True,
+    )
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role, active=True)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=identity,
+        name='context agent key',
+        key_prefix=api_key_prefix(CONTEXT_AGENT_RAW_KEY),
+        key_hash=hash_api_key(CONTEXT_AGENT_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(CONTEXT_AGENT_RAW_KEY),
+        active=True,
+    )
+    for code in CONTEXT_AGENT_CAPS:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
+
+
+@pytest.mark.django_db
+def test_session_start_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/context-demo.git'
+    project.save(update_fields=['repository_url'])
+    create_context_org_agent_key(organization)
+    create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            project_id=None,
+            team_id=None,
+            repository_url='https://github.com/acme/context-demo',
+            request_id='request-context-repo-url',
+        ),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {CONTEXT_AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+
+
+@pytest.mark.django_db
+def test_session_start_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-context',
+        repository_url='git@github.com:acme/foreign-context.git',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            project_id=None,
+            repository_url='https://github.com/acme/foreign-context',
+            request_id='request-context-foreign-inorg',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+    audit = AuditEvent.objects.get(event_type='AccessScopeResolved', project_id=foreign_project.id)
+    assert audit.result == AuditResult.DENIED
+    assert audit.metadata['resolved_project_id'] == str(foreign_project.id)
+    assert ContextBundle.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_session_start_bound_key_with_agent_capability_denied_for_foreign_project() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-context-footgun',
+        repository_url='git@github.com:acme/foreign-context-footgun.git',
+    )
+    agent_raw_key = 'egk_test_context_footgun_0123456789abcdefghijklmnopqrstuv'
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        raw_key=agent_raw_key,
+        capabilities=('memories:read', 'projects:agent'),
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            project_id=None,
+            repository_url='https://github.com/acme/foreign-context-footgun',
+            request_id='request-context-footgun-denied',
+        ),
+        format='json',
+        **auth_headers(agent_raw_key),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_session_start_bound_key_with_agent_capability_allowed_for_own_project() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/own-context-project.git'
+    project.save(update_fields=['repository_url'])
+    agent_raw_key = 'egk_test_context_footgun_own_0123456789abcdefghijklmnopqrstuv'
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        raw_key=agent_raw_key,
+        capabilities=('memories:read', 'projects:agent'),
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            project_id=None,
+            repository_url='https://github.com/acme/own-context-project',
+            request_id='request-context-footgun-allowed',
+        ),
+        format='json',
+        **auth_headers(agent_raw_key),
+    )
+
+    assert response.status_code == 200, response.json()
+
+
+@pytest.mark.django_db
+def test_session_start_bound_key_unknown_repository_url_returns_404_without_creating_project() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    project_count_before = Project.objects.filter(organization=organization).count()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            project_id=None,
+            repository_url='https://github.com/acme/never-created-context',
+            request_id='request-context-unknown-repo',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+    assert Project.objects.filter(organization=organization).count() == project_count_before
 
 
 @pytest.mark.django_db

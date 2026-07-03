@@ -842,3 +842,33 @@ def test_observation_detail_project_id_wins_over_repository_url() -> None:
 
     assert response.status_code == 200
     assert response.json()['observation_id'] == str(obs.id)
+
+
+@pytest.mark.django_db
+def test_observation_detail_repository_url_resolving_elsewhere_never_leaks_object_from_another_project() -> None:
+    organization, team, project_a, _owner, _api_key = create_project_scope()
+    Project.objects.create(
+        organization=organization,
+        name='Project B',
+        slug='project-b-obs-leak-probe',
+        repository_url='git@github.com:acme/project-b-obs.git',
+    )
+    create_org_agent_key(organization)
+    obs = create_observation(
+        organization,
+        team,
+        project_a,
+        title='Project A secret observation',
+        content_hash='h-leak-probe-detail',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'repository_url': 'https://github.com/acme/project-b-obs'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'observation_not_found'
+    assert 'Project A secret observation' not in str(response.json())
