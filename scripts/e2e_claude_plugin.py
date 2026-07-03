@@ -195,6 +195,71 @@ def install_plugin(home: Path, mock_port: int) -> None:
         raise E2EError(f'Plugin not visible after install:\n{listing.stdout}\n{listing.stderr}')
 
 
+def locate_installed_plugin_root(home: Path) -> Path:
+    for plugin_manifest in (home / '.claude').rglob('plugin.json'):
+        try:
+            manifest = json.loads(plugin_manifest.read_text(encoding='utf-8'))
+        except json.JSONDecodeError:
+            continue
+        if manifest.get('name') != 'engram':
+            continue
+        if plugin_manifest.parent.name == '.claude-plugin':
+            return plugin_manifest.parent.parent
+
+        return plugin_manifest.parent
+
+    raise E2EError(f'Could not locate installed engram plugin root under {home / ".claude"}')
+
+
+def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path) -> None:
+    mcp_manifest = plugin_root / '.mcp.json'
+    mcp_shim = plugin_root / 'hooks' / 'mcp.py'
+    if not mcp_manifest.exists() or not mcp_shim.exists():
+        raise E2EError(f'plugin mcp files missing under {plugin_root}')
+
+    manifest = json.loads(mcp_manifest.read_text(encoding='utf-8'))
+    entry = manifest.get('mcpServers', {}).get('engram', {})
+    if entry.get('command') != 'python3' or 'env' in entry:
+        raise E2EError(f'unexpected mcp entry in {mcp_manifest}: {entry}')
+
+    env = dict(os.environ)
+    env['ENGRAM_HOME'] = str(engram_home)
+    requests = [
+        {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
+        {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
+        {
+            'jsonrpc': '2.0',
+            'id': 3,
+            'method': 'tools/call',
+            'params': {'name': 'engram_search', 'arguments': {'query': 'e2e'}},
+        },
+    ]
+    completed = run(
+        ['python3', str(mcp_shim)],
+        cwd=plugin_root,
+        env=env,
+        secret='',
+        input_text='\n'.join(json.dumps(request) for request in requests) + '\n',
+        timeout=120,
+    )
+
+    lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+    if len(lines) != 3:
+        raise E2EError(f'expected 3 JSON-RPC responses from plugin mcp bridge, got {len(lines)}:\n{completed.stdout}')
+
+    if lines[0].get('result', {}).get('protocolVersion') != '2024-11-05':
+        raise E2EError(f'plugin mcp initialize failed: {lines[0]}')
+
+    tools = lines[1].get('result', {}).get('tools') or []
+    if len(tools) != 6:
+        raise E2EError(f'plugin mcp tools/list did not return 6 tools: {tools}')
+
+    content = lines[2].get('result', {}).get('content') or []
+    search_text = content[0].get('text', '') if content else ''
+    if not search_text or search_text.startswith('Engram call failed'):
+        raise E2EError(f'plugin mcp search failed: {lines[2]}')
+
+
 def connect_cli(home: Path, agent_key: str) -> None:
     env = dict(os.environ)
     env['HOME'] = str(home)
@@ -1060,6 +1125,11 @@ def main() -> int:
             progress('Connecting engram CLI in isolated home')
             connect_cli(home, agent_key)
             install_plugin(home, mock_port)
+
+            progress('Verifying plugin ships a working MCP bridge')
+            plugin_root = locate_installed_plugin_root(home)
+            assert_plugin_mcp_bridge(plugin_root, home / '.engram')
+            progress('plugin MCP bridge passed')
 
             claude_result = run_claude_prompt(home, repo, mock_port)
             progress(f'claude exited with {claude_result.returncode}')
