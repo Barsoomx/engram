@@ -8,8 +8,6 @@ References:
 
 - `docs/operations-and-deployment.md` for deployment profiles and runtime
   components.
-- `docs/verification-matrix.md` for the per-slice verification evidence and
-  commands used during the development cycle.
 - `docs/client-installation.md` for client install and hook bootstrap flow.
 
 ## 0. Prerequisites
@@ -140,7 +138,8 @@ Expected: all services stopped, no output from `docker compose ... ps --format j
 - Move `[Unreleased]` entries in `CHANGELOG.md` into a new
   `## [<VERSION>] - YYYY-MM-DD` section.
 - Reset `[Unreleased]` to empty `Added`/`Changed`/`Fixed` sections.
-- Verify every completed slice from `docs/verification-matrix.md` is represented.
+- Verify every slice merged since the last release is represented (cross-check
+  against the merged PRs / `git log`).
 
 ## 3. Tag Version
 
