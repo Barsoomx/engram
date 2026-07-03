@@ -1,10 +1,16 @@
 # Memory Loop Systemic Fix
 
 Date: 2026-07-03
-Status: accepted — §2.1 json-mode gating MERGED to master as PR #138 (the
-prod unblock; awaiting deploy to go live). §2.2-§2.7 are tracked follow-up PRs,
-not yet started — they carry migration/API/frontend/infra (broker restart)
-surface and are held for live review.
+Status: IMPLEMENTED — all sections merged to master. §2.1 json-mode gating
+(#138) + code-fence stripping companion (#143) = the prod unblock (awaiting
+deploy to go live). Follow-ups all landed: §2.3+§2.4 gateway hardening —
+failure ProviderCallRecords + real latency + OpenAI max_tokens (#146); §2.7
+chunk-budget/timeout decouple + batch prefetch=1 + rabbitmq consumer_timeout
+(#147, broker changes apply at deploy/restart); §2.5 distillation reconciler,
+cap 2 (#148); §2.2 call-time provider fallback (#149); §2.6 policy health
+fields + threshold advisory + engram_validate_policies command (#150) and the
+console UI + create-controls (#151). Deploy of master's :latest is the
+remaining step to make it all live on prod.
 Scope: session distillation reliability, structured-output capability gating,
 provider fallback, policy validation/health, promotion gating, Celery/RabbitMQ
 alignment, loop observability.
