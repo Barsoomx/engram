@@ -108,6 +108,21 @@ class McpContractTests(unittest.TestCase):
         version_schema = response["result"]["tools"][4]["inputSchema"]
         self.assertEqual(["memory_id", "body"], version_schema["required"])
 
+    def test_tools_list_all_six_schemas_expose_optional_project_id(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 11, "method": "tools/list"}, build_tools()
+        )
+        tools = response["result"]["tools"]
+
+        self.assertEqual(6, len(tools))
+        for tool in tools:
+            properties = tool["inputSchema"]["properties"]
+            self.assertIn(
+                "project_id", properties, f"{tool['name']} missing project_id"
+            )
+            self.assertEqual({"type": "string"}, properties["project_id"])
+            self.assertNotIn("project_id", tool["inputSchema"]["required"])
+
     def test_tools_list_feedback_schema(self) -> None:
         response = handle_request(
             {"jsonrpc": "2.0", "id": 10, "method": "tools/list"}, build_tools()
