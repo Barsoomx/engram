@@ -82,6 +82,7 @@ class _ReducedCandidate:
     body: str
     confidence: Decimal
     source_ids: tuple[int, ...]
+    kind: str = ''
 
 
 @dataclass(frozen=True)
@@ -138,9 +139,11 @@ def session_reduce_system_prompt() -> str:
         'Rules:\n'
         '- Output a single JSON object only, with exactly one key "memories".\n'
         '- "memories" is an array of objects with the keys '
-        '"title", "body", "confidence", "source_ids".\n'
+        '"title", "body", "confidence", "source_ids", and optionally "kind".\n'
         '- "source_ids" lists the integer ids of the input drafts merged into this memory.\n'
         '- "confidence" is a number between 0 and 1 reflecting how durable and reliable the memory is.\n'
+        '- "kind" is optional: one of "decision", "convention", "gotcha", "architecture", "incident" '
+        'when the merged memory clearly fits one of those categories, omitted otherwise.\n'
         '- Preserve exact identifiers verbatim: file paths, function names, class names, '
         'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
         '- Do not invent facts not present in the input drafts.\n'
@@ -314,6 +317,7 @@ def _parse_reduced_candidate_item(item: object) -> _ReducedCandidate | None:
         body=body.strip(),
         confidence=_clamp_confidence(item.get('confidence')),
         source_ids=source_ids,
+        kind=clamp_memory_kind(item.get('kind')),
     )
 
 
@@ -613,6 +617,8 @@ class DistillSession:
         for item in reduced:
             supporting: list[str] = []
             seen: set[str] = set()
+            best_kind = ''
+            best_confidence: Decimal | None = None
             for source_id in item.source_ids:
                 if source_id < 0 or source_id >= len(synthesized):
                     continue
@@ -623,6 +629,10 @@ class DistillSession:
                         seen.add(observation_id)
                         supporting.append(observation_id)
 
+                if best_confidence is None or draft_candidate.confidence > best_confidence:
+                    best_confidence = draft_candidate.confidence
+                    best_kind = draft_candidate.kind
+
             merged.append(
                 (
                     SynthesizedCandidate(
@@ -630,6 +640,7 @@ class DistillSession:
                         body=item.body,
                         confidence=item.confidence,
                         supporting_observation_ids=tuple(supporting),
+                        kind=item.kind or best_kind,
                     ),
                     dict(provenance),
                 ),
