@@ -38,7 +38,7 @@ to verify the key resolves to the expected actor and scope.
 ```bash
 engram connect \
   --server http://localhost:8000 \
-  --api-key sk-engram_... \
+  --api-key egk_... \
   --project <project_id> \
   --agent both
 ```
@@ -46,7 +46,7 @@ engram connect \
 | Flag              | Required | Default | Values / meaning                                     |
 |-------------------|----------|---------|------------------------------------------------------|
 | `--server`        | yes      | -       | `http(s)://host[:port]`                              |
-| `--api-key`       | yes      | -       | Scoped Engram key (a `sk-engram_` prefix is recommended) |
+| `--api-key`       | yes      | -       | Scoped Engram key (server-issued keys use the `egk_` prefix) |
 | `--project`       | yes      | -       | Project id                                           |
 | `--team`          | no       | key's bound team | Team id                                      |
 | `--agent`         | no       | `both`  | `codex`, `claude-code` (alias `claude_code`), `both` |

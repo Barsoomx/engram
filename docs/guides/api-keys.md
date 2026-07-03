@@ -11,9 +11,9 @@ This guide reflects Phase A behavior. For the endpoint contract, see
 
 ## Shape and validation
 
-- The server does not enforce a specific key prefix, but a descriptive prefix
-  such as `sk-engram_` is strongly recommended for readability and audit. Use a
-  long, random string.
+- The server does not enforce a specific key prefix, but the `egk_` prefix
+  used by server-issued keys is strongly recommended for readability and
+  audit. Use a long, random string.
 - The server stores only a hash (`key_hash`), a prefix (`key_prefix` - the first
   12 characters of the raw key, for display/lookup), and a short
   `key_fingerprint`.
@@ -97,7 +97,7 @@ for hook ingest and memory search.
 Agent/runtime endpoints expect the key as a bearer token:
 
 ```
-Authorization: Bearer sk-engram_...
+Authorization: Bearer egk_...
 ```
 
 This is distinct from the admin surface, which uses a DRF session Token
