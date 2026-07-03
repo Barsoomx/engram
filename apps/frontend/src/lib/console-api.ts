@@ -381,6 +381,9 @@ export interface ModelPolicy {
   active: boolean;
   fallback_enabled: boolean;
   context_window_tokens?: number | null;
+  json_mode?: boolean | null;
+  last_success_at?: string | null;
+  recent_error_count?: number;
 }
 
 export interface ModelPolicyCreateInput {
@@ -396,6 +399,8 @@ export interface ModelPolicyCreateInput {
   request_id: string;
   base_url?: string;
   context_window_tokens?: number;
+  fallback_enabled?: boolean;
+  json_mode?: boolean;
 }
 
 export interface ModelPolicyResolveParams {

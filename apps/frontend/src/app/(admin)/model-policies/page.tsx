@@ -3,6 +3,7 @@
 import {
   addToast,
   Button,
+  Checkbox,
   Input,
   Modal,
   ModalBody,
@@ -25,6 +26,7 @@ import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
 import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
+import { formatRelativeTime } from '@/lib/design';
 import {
   createModelPolicy,
   disableModelPolicy,
@@ -57,7 +59,7 @@ const PROVIDER_LABELS: Record<SecretProvider, string> = {
 };
 
 const GRID =
-  'minmax(0,1.3fr) minmax(0,0.9fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,1fr) auto';
+  'minmax(0,1.3fr) minmax(0,0.9fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,1fr) minmax(0,1.1fr) auto';
 
 function humanizeTask(value: string): string {
   return value
@@ -113,6 +115,41 @@ function StatusCell({
   );
 }
 
+function HealthBadge({
+  lastSuccessAt,
+  recentErrorCount,
+}: {
+  lastSuccessAt: string | null | undefined;
+  recentErrorCount: number | undefined;
+}) {
+  const errorCount = recentErrorCount ?? 0;
+
+  if (errorCount > 0) {
+    return (
+      <span className='inline-flex max-w-full items-center gap-1.5 truncate rounded-[7px] bg-danger/10 px-2.5 py-1 text-[11px] font-medium text-danger'>
+        <PulseDot color='#FB6E72' pulse />
+        {`failing · ${errorCount} error${errorCount === 1 ? '' : 's'}`}
+      </span>
+    );
+  }
+
+  if (!lastSuccessAt) {
+    return (
+      <span className='inline-flex max-w-full items-center gap-1.5 truncate rounded-[7px] bg-content3 px-2.5 py-1 text-[11px] font-medium text-default-400'>
+        <PulseDot color='#666C77' pulse={false} />
+        never succeeded
+      </span>
+    );
+  }
+
+  return (
+    <span className='inline-flex max-w-full items-center gap-1.5 truncate rounded-[7px] bg-success/10 px-2.5 py-1 text-[11px] font-medium text-success'>
+      <PulseDot color='#3DD9AC' pulse={false} />
+      {`ok · last success ${formatRelativeTime(lastSuccessAt)}`}
+    </span>
+  );
+}
+
 function ColumnHeader() {
   return (
     <div
@@ -125,6 +162,7 @@ function ColumnHeader() {
       <span>Model</span>
       <span>Scope</span>
       <span>Status</span>
+      <span>Health</span>
       <span className='sr-only'>Actions</span>
     </div>
   );
@@ -144,7 +182,7 @@ function PoliciesTable({
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[820px]'>
+        <div className='min-w-[960px]'>
           <ColumnHeader />
           {items.map((policy) => (
             <div
@@ -176,6 +214,12 @@ function PoliciesTable({
                 active={policy.active}
                 fallbackEnabled={policy.fallback_enabled}
               />
+              <div className='min-w-0'>
+                <HealthBadge
+                  lastSuccessAt={policy.last_success_at}
+                  recentErrorCount={policy.recent_error_count}
+                />
+              </div>
               <div className='flex items-center justify-end gap-2'>
                 <Button
                   size='sm'
@@ -209,7 +253,7 @@ function PoliciesTableSkeleton() {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[820px]'>
+        <div className='min-w-[960px]'>
           <ColumnHeader />
           {Array.from({ length: 6 }).map((_, index) => (
             <div
@@ -226,6 +270,7 @@ function PoliciesTableSkeleton() {
               <span className='h-3 w-32 rounded-medium bg-content2' />
               <span className='h-5 w-16 rounded-[7px] bg-content2' />
               <span className='h-3 w-16 rounded-medium bg-content2' />
+              <span className='h-5 w-24 rounded-[7px] bg-content2' />
               <div className='flex items-center justify-end gap-2'>
                 <span className='h-8 w-14 rounded-medium bg-content2' />
               </div>
@@ -253,6 +298,8 @@ interface CreatePolicyModalProps {
     secret_id: string;
     base_url?: string;
     context_window_tokens?: number;
+    fallback_enabled: boolean;
+    json_mode?: boolean;
   }) => Promise<boolean>;
 }
 
@@ -273,6 +320,8 @@ function CreatePolicyModal({
   const [secretId, setSecretId] = React.useState('');
   const [baseUrl, setBaseUrl] = React.useState('');
   const [contextWindowTokens, setContextWindowTokens] = React.useState('');
+  const [fallbackEnabled, setFallbackEnabled] = React.useState(false);
+  const [jsonMode, setJsonMode] = React.useState(false);
 
   React.useEffect(() => {
     if (!isOpen) {
@@ -284,6 +333,8 @@ function CreatePolicyModal({
       setSecretId('');
       setBaseUrl('');
       setContextWindowTokens('');
+      setFallbackEnabled(false);
+      setJsonMode(false);
     }
   }, [isOpen]);
 
@@ -335,6 +386,8 @@ function CreatePolicyModal({
         Number.isFinite(parsedContextWindowTokens)
           ? parsedContextWindowTokens
           : undefined,
+      fallback_enabled: fallbackEnabled,
+      json_mode: jsonMode ? true : undefined,
     });
 
     if (ok) {
@@ -481,6 +534,28 @@ function CreatePolicyModal({
                   description='Optional override of the model context window used to size distillation chunks; leave blank to auto-detect.'
                   classNames={{ input: 'font-mono text-xs' }}
                 />
+                <div className='space-y-2.5'>
+                  <Checkbox
+                    isSelected={fallbackEnabled}
+                    onValueChange={setFallbackEnabled}
+                    isDisabled={isPending}
+                  >
+                    <span className='text-[13px] text-foreground'>
+                      Enable provider fallback to the generation policy on
+                      failure
+                    </span>
+                  </Checkbox>
+                  <Checkbox
+                    isSelected={jsonMode}
+                    onValueChange={setJsonMode}
+                    isDisabled={isPending}
+                  >
+                    <span className='text-[13px] text-foreground'>
+                      Send response_format: json_object (JSON-mode capable
+                      models only)
+                    </span>
+                  </Checkbox>
+                </div>
                 {scope === 'team' && !teamId && (
                   <p className='text-[12px] text-warning'>
                     Select a team in the top switcher to create a team-scoped
@@ -863,6 +938,8 @@ export default function ModelPoliciesPage() {
     secret_id: string;
     base_url?: string;
     context_window_tokens?: number;
+    fallback_enabled: boolean;
+    json_mode?: boolean;
   }): Promise<boolean> {
     setCreateError(null);
 
@@ -879,6 +956,8 @@ export default function ModelPoliciesPage() {
         request_id: genRequestId(),
         base_url: input.base_url,
         context_window_tokens: input.context_window_tokens,
+        fallback_enabled: input.fallback_enabled,
+        json_mode: input.json_mode,
       });
 
       return true;

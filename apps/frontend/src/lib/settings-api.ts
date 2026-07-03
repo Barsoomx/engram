@@ -7,6 +7,10 @@ export type RetrievalSettings = {
   near_dup_threshold: number;
 };
 
+export type RetrievalSettingsUpdateResponse = RetrievalSettings & {
+  advisory?: string;
+};
+
 export type EmbeddingSettings = {
   provider: string | null;
   model: string | null;
@@ -37,9 +41,9 @@ export async function getRetrievalSettings(): Promise<RetrievalSettings> {
 
 export async function updateRetrievalSettings(
   input: RetrievalSettings,
-): Promise<RetrievalSettings> {
+): Promise<RetrievalSettingsUpdateResponse> {
   const client = apiClient();
-  const response = await client.put<RetrievalSettings>(
+  const response = await client.put<RetrievalSettingsUpdateResponse>(
     '/v1/admin/settings/retrieval',
     input,
   );

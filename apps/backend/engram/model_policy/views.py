@@ -304,6 +304,8 @@ class ModelPolicyListView(ModelPolicyBaseView):
                 scope_team_id=data.get('scope_team_id'),
                 base_url=data.get('base_url', ''),
                 context_window_tokens=data.get('context_window_tokens'),
+                fallback_enabled=data.get('fallback_enabled', False),
+                json_mode=data.get('json_mode'),
             ),
         )
 
@@ -549,6 +551,7 @@ def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
         'active': policy.active,
         'fallback_enabled': policy.fallback_enabled,
         'context_window_tokens': policy.metadata.get('context_window_tokens') if policy.metadata else None,
+        'json_mode': policy.metadata.get('json_mode') if policy.metadata else None,
         'last_success_at': last_success_at.isoformat() if last_success_at else None,
         'recent_error_count': recent_error_count,
     }

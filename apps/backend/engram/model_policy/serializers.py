@@ -47,6 +47,8 @@ class ModelPolicyCreateSerializer(serializers.Serializer):
     secret_id = serializers.UUIDField()
     base_url = serializers.URLField(required=False, allow_blank=True, max_length=500)
     context_window_tokens = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    fallback_enabled = serializers.BooleanField(required=False, default=False)
+    json_mode = serializers.BooleanField(required=False, allow_null=True)
     request_id = serializers.CharField(max_length=255)
 
 

@@ -101,6 +101,8 @@ class ModelPolicyInput:
     scope_team_id: uuid.UUID | None = None
     base_url: str = ''
     context_window_tokens: int | None = None
+    fallback_enabled: bool = False
+    json_mode: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -429,6 +431,8 @@ class CreateModelPolicy:
             metadata['base_url'] = data.base_url
         if data.context_window_tokens:
             metadata['context_window_tokens'] = data.context_window_tokens
+        if data.json_mode is not None:
+            metadata['json_mode'] = data.json_mode
 
         with transaction.atomic():
             policy = ModelPolicy.objects.create(
@@ -442,6 +446,7 @@ class CreateModelPolicy:
                 model=data.model,
                 secret=secret,
                 version=1,
+                fallback_enabled=data.fallback_enabled,
                 metadata=metadata,
             )
             audit_model_policy_event(
