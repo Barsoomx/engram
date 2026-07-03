@@ -3,8 +3,17 @@ from __future__ import annotations
 import pytest
 from rest_framework.test import APIClient
 
-from engram.access.models import ApiKey, ApiKeyCapability, Capability, Role, RoleCapability
-from engram.access.services import hash_api_key
+from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
+    Identity,
+    IdentityType,
+    OrganizationMembership,
+    Role,
+    RoleCapability,
+)
+from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import (
     OTHER_RAW_KEY,
     RAW_KEY,
@@ -13,9 +22,40 @@ from engram.context.context_api_tests import (
     create_project_scope,
     create_scoped_api_key,
 )
-from engram.core.models import AuditEvent, MemoryVersion, Project, RetrievalDocument, VisibilityScope
+from engram.core.models import AuditEvent, MemoryVersion, Organization, Project, RetrievalDocument, VisibilityScope
 
 VERSION_BODY_MAX_LENGTH = 16000
+AGENT_RAW_KEY = 'egk_test_memory_version_agent_0123456789abcdefghijklmnopqrstuv'
+AGENT_CAPS = ('memories:review', 'memories:read', 'projects:agent')
+
+
+def create_org_agent_key(organization: Organization) -> None:
+    role, _ = Role.objects.get_or_create(code='organization_owner', defaults={'name': 'owner'})
+    for code in AGENT_CAPS:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.SERVICE_ACCOUNT,
+        external_id='memory-version-agent',
+        display_name='Memory version agent',
+        active=True,
+    )
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role, active=True)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=identity,
+        name='memory version agent key',
+        key_prefix=api_key_prefix(AGENT_RAW_KEY),
+        key_hash=hash_api_key(AGENT_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(AGENT_RAW_KEY),
+        active=True,
+    )
+    for code in AGENT_CAPS:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
 
 
 def grant_review_capability(raw_key: str) -> None:
@@ -308,3 +348,261 @@ def test_update_memory_body_rejects_stale_or_refuted_memory(stale_field: str) ->
     assert response.status_code == 400
     assert response.json()['code'] == 'memory_not_editable'
     assert MemoryVersion.objects.filter(memory=memory).count() == 1
+
+
+@pytest.mark.django_db
+def test_update_memory_body_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, project_id=None, repository_url=project.repository_url),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['current_version'] == 2
+
+
+@pytest.mark.django_db
+def test_update_memory_body_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(
+            project,
+            project_id=None,
+            repository_url='https://github.com/acme/never-created-version',
+        ),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_update_memory_body_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-version')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-version',
+        repository_url='git@github.com:acme/foreign-version.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(
+            project,
+            project_id=None,
+            repository_url='https://github.com/acme/foreign-version',
+        ),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_update_memory_body_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-version-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-version.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, foreign_project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(
+            project,
+            project_id=None,
+            repository_url='https://github.com/acme/foreign-in-org-version',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_update_memory_body_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, project_id=None),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_update_memory_body_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-version',
+        repository_url='git@github.com:acme/decoy-version.git',
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, repository_url='https://github.com/acme/decoy-version'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['current_version'] == 2
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'repository_url': project.repository_url},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'repository_url': 'https://github.com/acme/never-created-version-list'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-version-list')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-version-list',
+        repository_url='git@github.com:acme/foreign-version-list.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'repository_url': 'https://github.com/acme/foreign-version-list'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-version-list-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-version-list.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, foreign_project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'repository_url': 'https://github.com/acme/foreign-in-org-version-list'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-version-list',
+        repository_url='git@github.com:acme/decoy-version-list.git',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id), 'repository_url': 'https://github.com/acme/decoy-version-list'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['count'] == 1

@@ -90,6 +90,8 @@ def resolve_project_for_scope(
     repository_url: str,
     allow_create: bool = False,
     repository_root: str = '',
+    request_id: str = '',
+    correlation_id: str = '',
 ) -> Project:
     if project_id is not None:
         try:
@@ -115,7 +117,7 @@ def resolve_project_for_scope(
         else:
             raise ProjectNotFoundError('no project matches this repository in the requesting organization')
 
-    _authorize_resolved_project(scope, project)
+    _authorize_resolved_project(scope, project, request_id=request_id, correlation_id=correlation_id)
 
     return project
 
@@ -124,7 +126,13 @@ def _unbound_agent_capability(scope: EffectiveScope) -> bool:
     return scope.actor_type == 'api_key' and not scope.project_bound and 'projects:agent' in scope.capabilities
 
 
-def _authorize_resolved_project(scope: EffectiveScope, project: Project) -> None:
+def _authorize_resolved_project(
+    scope: EffectiveScope,
+    project: Project,
+    *,
+    request_id: str = '',
+    correlation_id: str = '',
+) -> None:
     allowed = project.id in scope.project_ids or _unbound_agent_capability(scope)
     if allowed:
         return
@@ -138,6 +146,8 @@ def _authorize_resolved_project(scope: EffectiveScope, project: Project) -> None
         target_type='project',
         target_id=str(project.id),
         result=AuditResult.DENIED,
+        request_id=request_id,
+        correlation_id=correlation_id,
         metadata={
             'reason': 'project_scope_denied',
             'resolved_project_id': str(project.id),

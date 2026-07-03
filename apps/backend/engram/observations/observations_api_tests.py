@@ -18,10 +18,43 @@ from engram.access.models import (
     IdentityType,
     OrganizationMembership,
     Role,
+    RoleCapability,
 )
-from engram.access.services import hash_api_key
+from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import RAW_KEY, auth_headers, create_project_scope
 from engram.core.models import Agent, AgentSession, Observation, Organization, Project, RawEventEnvelope, Runtime
+
+AGENT_RAW_KEY = 'egk_test_observations_agent_0123456789abcdefghijklmnopqrstuv'
+AGENT_CAPS = ('observations:read', 'projects:agent')
+
+
+def create_org_agent_key(organization: Organization) -> None:
+    role, _ = Role.objects.get_or_create(code='organization_owner', defaults={'name': 'owner'})
+    for code in AGENT_CAPS:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.SERVICE_ACCOUNT,
+        external_id='observations-agent',
+        display_name='Observations agent',
+        active=True,
+    )
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role, active=True)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=identity,
+        name='observations agent key',
+        key_prefix=api_key_prefix(AGENT_RAW_KEY),
+        key_hash=hash_api_key(AGENT_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(AGENT_RAW_KEY),
+        active=True,
+    )
+    for code in AGENT_CAPS:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
 
 
 def grant_observations_read(raw_key: str) -> None:
@@ -559,3 +592,253 @@ def test_list_observations_filters_by_correlation_id() -> None:
     items = response.json()['items']
     assert len(items) == 1
     assert items[0]['observation_id'] == str(matching_obs.id)
+
+
+@pytest.mark.django_db
+def test_list_observations_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/observations-demo.git'
+    project.save(update_fields=['repository_url'])
+    create_org_agent_key(organization)
+    observation = create_observation(organization, team, project, content_hash='h-repo-url-list')
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'repository_url': 'https://github.com/acme/observations-demo', 'limit': 10},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    items = response.json()['items']
+    assert len(items) == 1
+    assert items[0]['observation_id'] == str(observation.id)
+
+
+@pytest.mark.django_db
+def test_list_observations_unknown_repository_returns_404() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'repository_url': 'https://github.com/acme/never-created', 'limit': 10},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_observations_cross_org_repository_url_returns_404() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    other_organization = Organization.objects.create(name='Globex', slug='globex-obs-list')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-obs-list',
+        repository_url='git@github.com:acme/foreign-org-list.git',
+    )
+    create_org_agent_key(organization)
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'repository_url': 'https://github.com/acme/foreign-org-list', 'limit': 10},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_observations_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-obs-list-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-list.git',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'repository_url': 'https://github.com/acme/foreign-in-org-list', 'limit': 10},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_list_observations_missing_project_and_repository_url_returns_400() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'limit': 10},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_list_observations_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    observation = create_observation(organization, team, project, content_hash='h-repo-url-wins')
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-obs-list',
+        repository_url='git@github.com:acme/decoy-list.git',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {
+            'project_id': str(project.id),
+            'repository_url': 'https://github.com/acme/decoy-list',
+            'limit': 10,
+        },
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    items = response.json()['items']
+    assert len(items) == 1
+    assert items[0]['observation_id'] == str(observation.id)
+
+
+@pytest.mark.django_db
+def test_observation_detail_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/observations-detail-demo.git'
+    project.save(update_fields=['repository_url'])
+    create_org_agent_key(organization)
+    obs = create_observation(organization, team, project, content_hash='h-repo-url-detail')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'repository_url': 'https://github.com/acme/observations-detail-demo'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['observation_id'] == str(obs.id)
+
+
+@pytest.mark.django_db
+def test_observation_detail_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    obs = create_observation(organization, team, project, content_hash='h-detail-unknown-repo')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'repository_url': 'https://github.com/acme/never-created-detail'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_observation_detail_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-obs-detail')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-detail',
+        repository_url='git@github.com:acme/foreign-detail.git',
+    )
+    obs = create_observation(organization, team, project, content_hash='h-detail-cross-org')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'repository_url': 'https://github.com/acme/foreign-detail'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_observation_detail_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-obs-detail-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-detail.git',
+    )
+    obs = create_observation(organization, team, project, content_hash='h-detail-foreign-in-org')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'repository_url': 'https://github.com/acme/foreign-in-org-detail'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_observation_detail_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    obs = create_observation(organization, team, project, content_hash='h-detail-missing-both')
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_observation_detail_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    obs = create_observation(organization, team, project, content_hash='h-detail-project-wins')
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-obs-detail',
+        repository_url='git@github.com:acme/decoy-detail.git',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/observations/{obs.id}',
+        {'project_id': str(project.id), 'repository_url': 'https://github.com/acme/decoy-detail'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['observation_id'] == str(obs.id)

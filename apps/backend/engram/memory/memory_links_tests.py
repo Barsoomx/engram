@@ -6,15 +6,56 @@ import pytest
 import structlog
 from rest_framework.test import APIClient
 
-from engram.access.models import ApiKey, ApiKeyCapability, Capability, Role, RoleCapability
-from engram.access.services import hash_api_key
+from engram.access.models import (
+    ApiKey,
+    ApiKeyCapability,
+    Capability,
+    Identity,
+    IdentityType,
+    OrganizationMembership,
+    Role,
+    RoleCapability,
+)
+from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import (
     RAW_KEY,
     auth_headers,
     create_approved_memory_document,
     create_project_scope,
 )
-from engram.core.models import AuditEvent, MemoryLink, Project, Team, VisibilityScope
+from engram.core.models import AuditEvent, MemoryLink, Organization, Project, Team, VisibilityScope
+
+AGENT_RAW_KEY = 'egk_test_memory_link_agent_0123456789abcdefghijklmnopqrstuvwxyz'
+AGENT_CAPS = ('memories:review', 'memories:read', 'projects:agent')
+
+
+def create_org_agent_key(organization: Organization) -> None:
+    role, _ = Role.objects.get_or_create(code='organization_owner', defaults={'name': 'owner'})
+    for code in AGENT_CAPS:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+    identity = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.SERVICE_ACCOUNT,
+        external_id='memory-link-agent',
+        display_name='Memory link agent',
+        active=True,
+    )
+    OrganizationMembership.objects.create(organization=organization, identity=identity, role=role, active=True)
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=identity,
+        name='memory link agent key',
+        key_prefix=api_key_prefix(AGENT_RAW_KEY),
+        key_hash=hash_api_key(AGENT_RAW_KEY),
+        key_fingerprint=api_key_fingerprint(AGENT_RAW_KEY),
+        active=True,
+    )
+    for code in AGENT_CAPS:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
 
 
 def grant_review_capability(raw_key: str) -> None:
@@ -309,3 +350,466 @@ def test_create_memory_link_logs_memory_link_recorded() -> None:
     assert link_events[0]['item_id'] == body['link_id']
     assert link_events[0]['link_type'] == 'file'
     assert link_events[0]['created'] is True
+
+
+@pytest.mark.django_db
+def test_create_memory_link_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, project_id=None, repository_url=project.repository_url),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 201, response.json()
+    assert response.json()['created'] is True
+
+
+@pytest.mark.django_db
+def test_create_memory_link_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, project_id=None, repository_url='https://github.com/acme/never-created-link'),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_create_memory_link_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-link')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-link',
+        repository_url='git@github.com:acme/foreign-link.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, project_id=None, repository_url='https://github.com/acme/foreign-link'),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_create_memory_link_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-link-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-link.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, foreign_project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, project_id=None, repository_url='https://github.com/acme/foreign-in-org-link'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_create_memory_link_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, project_id=None),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_create_memory_link_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-link',
+        repository_url='git@github.com:acme/decoy-link.git',
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, repository_url='https://github.com/acme/decoy-link'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 201, response.json()
+    assert response.json()['created'] is True
+
+
+@pytest.mark.django_db
+def test_list_memory_links_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {'repository_url': project.repository_url},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_list_memory_links_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {'repository_url': 'https://github.com/acme/never-created-link-list'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_memory_links_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-link-list')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-link-list',
+        repository_url='git@github.com:acme/foreign-link-list.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {'repository_url': 'https://github.com/acme/foreign-link-list'},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+
+
+@pytest.mark.django_db
+def test_list_memory_links_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-link-list-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-link-list.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, foreign_project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {'repository_url': 'https://github.com/acme/foreign-in-org-link-list'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_list_memory_links_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {},
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+
+
+@pytest.mark.django_db
+def test_list_memory_links_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-link-list',
+        repository_url='git@github.com:acme/decoy-link-list.git',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'repository_url': 'https://github.com/acme/decoy-link-list'},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_routes_by_repository_url_with_org_agent_key() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {
+            'repository_url': project.repository_url,
+            'link_id': str(link.id),
+            'request_id': 'request-link-del-repo-url',
+        },
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['deleted'] is True
+    assert MemoryLink.objects.filter(id=link.id).count() == 0
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_unknown_repository_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {
+            'repository_url': 'https://github.com/acme/never-created-link-del',
+            'link_id': str(link.id),
+            'request_id': 'request-link-del-unknown-repo',
+        },
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+    assert MemoryLink.objects.filter(id=link.id).count() == 1
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_cross_org_repository_url_returns_404() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    other_organization = Organization.objects.create(name='Globex', slug='globex-link-del')
+    Project.objects.create(
+        organization=other_organization,
+        name='Foreign',
+        slug='foreign-link-del',
+        repository_url='git@github.com:acme/foreign-link-del.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {
+            'repository_url': 'https://github.com/acme/foreign-link-del',
+            'link_id': str(link.id),
+            'request_id': 'request-link-del-cross-org',
+        },
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+    assert MemoryLink.objects.filter(id=link.id).count() == 1
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-link-del-inorg',
+        repository_url='git@github.com:acme/foreign-in-org-link-del.git',
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, foreign_project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=foreign_project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {
+            'repository_url': 'https://github.com/acme/foreign-in-org-link-del',
+            'link_id': str(link.id),
+            'request_id': 'request-link-del-foreign-inorg',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+    assert MemoryLink.objects.filter(id=link.id).count() == 1
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_missing_project_and_repository_url_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_org_agent_key(organization)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'link_id': str(link.id), 'request_id': 'request-link-del-missing-both'},
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'project_or_repository_required'
+    assert MemoryLink.objects.filter(id=link.id).count() == 1
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_project_id_wins_over_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type='file',
+        target='apps/backend/engram/memory/services.py',
+        label='versioning service',
+    )
+    Project.objects.create(
+        organization=organization,
+        name='Decoy',
+        slug='decoy-link-del',
+        repository_url='git@github.com:acme/decoy-link-del.git',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {
+            'project_id': str(project.id),
+            'repository_url': 'https://github.com/acme/decoy-link-del',
+            'link_id': str(link.id),
+            'request_id': 'request-link-del-project-wins',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['deleted'] is True
