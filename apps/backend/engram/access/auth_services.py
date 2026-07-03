@@ -207,6 +207,7 @@ def resolve_user_scope(user: User) -> EffectiveScope:
         capabilities=tuple(sorted(capabilities)),
         actor_type='user',
         actor_id=str(user.id),
+        project_bound=False,
     )
 
 
@@ -262,6 +263,7 @@ def resolve_user_scope_for_organization(
         capabilities=tuple(sorted(capabilities)),
         actor_type='user',
         actor_id=str(user.id),
+        project_bound=False,
     )
 
 

@@ -224,6 +224,7 @@ def test_project_scoped_api_key_resolves_effective_scope_without_audit_row() -> 
     assert scope.project_ids == (project.id,)
     assert scope.team_ids == (team.id,)
     assert 'observations:write' in scope.capabilities
+    assert scope.project_bound is True
     assert api_key.last_used_at is not None
     assert not AuditEvent.objects.filter(request_id='request-allow-1').exists()
 
@@ -410,6 +411,7 @@ def test_unbound_api_key_with_project_capability_resolves_scope_without_audit_ro
     assert scope.api_key_id == api_key.id
     assert scope.project_ids == (project.id,)
     assert scope.team_ids == ()
+    assert scope.project_bound is False
     assert not AuditEvent.objects.filter(request_id='request-unbound-project-allow-1').exists()
 
 

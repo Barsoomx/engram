@@ -71,7 +71,9 @@ class McpToolsTests(unittest.TestCase):
         )
 
     def test_resolve_runtime_returns_none_without_any_config(self) -> None:
-        with mock.patch.object(mcp_tools, "git_remote_url", return_value=""):
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value=""
+        ):
             runtime = mcp_tools.resolve_runtime(self.config_dir)
 
         self.assertIsNone(runtime)
@@ -96,12 +98,36 @@ class McpToolsTests(unittest.TestCase):
     def test_repository_url_fallback_without_project_id(self) -> None:
         self.write_local_config(project_id="")
         with mock.patch.object(
-            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
         ):
             runtime = mcp_tools.resolve_runtime(self.config_dir)
 
         self.assertEqual("", runtime.project_id)
         self.assertEqual("https://github.com/a/b", runtime.repository_url)
+
+    def test_project_id_argument_wins_over_env_config_and_repo(self) -> None:
+        self.write_local_config(project_id="")
+        os.environ["ENGRAM_PROJECT_ID"] = "env-project"
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            runtime = mcp_tools.resolve_runtime(
+                self.config_dir, project_override="arg-project"
+            )
+
+        self.assertEqual("arg-project", runtime.project_id)
+        self.assertEqual("", runtime.repository_url)
+
+    def test_env_project_id_wins_over_config_and_repo(self) -> None:
+        self.write_local_config(project_id="")
+        os.environ["ENGRAM_PROJECT_ID"] = "env-project"
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            runtime = mcp_tools.resolve_runtime(self.config_dir)
+
+        self.assertEqual("env-project", runtime.project_id)
+        self.assertEqual("", runtime.repository_url)
 
     def test_search_posts_scope_and_renders_items(self) -> None:
         self.write_local_config()
@@ -147,13 +173,23 @@ class McpToolsTests(unittest.TestCase):
         self.write_local_config(project_id="")
         transport = StubTransport(body={"items": []})
         with mock.patch.object(
-            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
         ):
             mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
 
         payload = transport.calls[0][3]
         self.assertNotIn("project_id", payload)
         self.assertEqual("https://github.com/a/b", payload["repository_url"])
+
+    def test_search_tool_argument_project_id_overrides_config(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "project_id": "arg-project"}, self.config_dir, transport
+        )
+
+        payload = transport.calls[0][3]
+        self.assertEqual("arg-project", payload["project_id"])
 
     def test_search_renders_error_without_secret(self) -> None:
         self.write_local_config()
@@ -291,20 +327,79 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("stale=True", text)
         self.assertTrue(transport.calls[0][1].endswith("/v1/memories/m-1/feedback"))
 
-    def test_project_required_for_writes_in_repo_mode(self) -> None:
+    def test_four_handlers_send_repository_url_without_project_gate(self) -> None:
         self.write_local_config(project_id="")
         with mock.patch.object(
-            mcp_tools, "git_remote_url", return_value="https://github.com/a/b"
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
         ):
-            version_text = mcp_tools.update_memory_version(
-                {"memory_id": "m-1", "body": "x"}, self.config_dir, StubTransport()
+            version_transport = StubTransport(
+                body={"memory_id": "m-1", "current_version": 2}
             )
+            version_text = mcp_tools.update_memory_version(
+                {"memory_id": "m-1", "body": "x"}, self.config_dir, version_transport
+            )
+            observations_transport = StubTransport(body={"items": []})
             observations_text = mcp_tools.list_observations(
-                {}, self.config_dir, StubTransport()
+                {}, self.config_dir, observations_transport
+            )
+            link_transport = StubTransport(
+                status=201, body={"link_id": "l-1", "created": True}
+            )
+            link_text = mcp_tools.create_memory_link(
+                {"memory_id": "m-1", "link_type": "file", "target": "a.py"},
+                self.config_dir,
+                link_transport,
+            )
+            feedback_transport = StubTransport(
+                body={"memory_id": "m-1", "action": "stale", "stale": True}
+            )
+            feedback_text = mcp_tools.submit_memory_feedback(
+                {"memory_id": "m-1", "action": "stale", "reason": "outdated"},
+                self.config_dir,
+                feedback_transport,
             )
 
-        self.assertIn("requires a connected project", version_text)
-        self.assertIn("requires a connected project", observations_text)
+        self.assertNotIn("requires a connected project", version_text)
+        self.assertNotIn("requires a connected project", observations_text)
+        self.assertNotIn("requires a connected project", link_text)
+        self.assertNotIn("requires a connected project", feedback_text)
+        self.assertEqual(
+            "https://github.com/a/b", version_transport.calls[0][3]["repository_url"]
+        )
+        self.assertIn(
+            "repository_url=", observations_transport.calls[0][1]
+        )
+        self.assertEqual(
+            "https://github.com/a/b", link_transport.calls[0][3]["repository_url"]
+        )
+        self.assertEqual(
+            "https://github.com/a/b", feedback_transport.calls[0][3]["repository_url"]
+        )
+
+    def test_project_not_found_renders_guidance_text(self) -> None:
+        self.write_local_config(project_id="")
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            transport = StubTransport(
+                status=404, body={"code": "project_not_found", "detail": "no project"}
+            )
+            text = mcp_tools.list_observations({}, self.config_dir, transport)
+
+        self.assertEqual(mcp_tools.PROJECT_NOT_FOUND_MESSAGE, text)
+
+    def test_observations_sends_project_id_argument_and_query_param(self) -> None:
+        self.write_local_config(project_id="")
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.list_observations(
+                {"project_id": "arg-project"}, self.config_dir, transport
+            )
+
+        self.assertIn("project_id=arg-project", transport.calls[0][1])
+        self.assertNotIn("repository_url=", transport.calls[0][1])
 
     def test_build_tools_exposes_six_tools(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())

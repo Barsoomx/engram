@@ -20,7 +20,7 @@ from engram.core.models import (
     Team,
 )
 from engram.core.redaction import RedactionResult, redact_value
-from engram.core.repository import resolve_or_create_project
+from engram.core.repository import resolve_project_for_scope
 from engram.memory.tasks import distill_session, process_observation_recorded
 
 logger = structlog.get_logger(__name__)
@@ -75,14 +75,15 @@ class IngestHookEvent:
             target_id=data.event_id,
         )
         organization = Organization.objects.get(id=scope.organization_id)
-        if data.project_id:
-            project = Project.objects.get(organization=organization, id=data.project_id)
-        else:
-            project = resolve_or_create_project(
-                organization=organization,
-                repository_url=data.repository_url,
-                repository_root=data.repository_root,
-            )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.project_id,
+            repository_url=data.repository_url,
+            allow_create=True,
+            repository_root=data.repository_root,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+        )
         team = self._resolve_team(organization, data.team_id, scope)
         duplicate = self._find_duplicate(organization, project, data)
         if duplicate is not None:

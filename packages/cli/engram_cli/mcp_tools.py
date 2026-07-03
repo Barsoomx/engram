@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram_cli.commands import git_remote_url
+from engram_cli.commands import workspace_repository_url
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
@@ -18,9 +18,9 @@ NOT_CONFIGURED_MESSAGE = (
     "Engram MCP bridge is not configured. Run `engram connect` first, or set "
     "ENGRAM_SERVER_URL and ENGRAM_API_KEY."
 )
-PROJECT_REQUIRED_MESSAGE = (
-    "This tool requires a connected project. Run `engram connect --project ...` "
-    "or set ENGRAM_PROJECT_ID."
+PROJECT_NOT_FOUND_MESSAGE = (
+    "No Engram project exists for this repository yet — it is created on the "
+    "first hook ingest."
 )
 
 
@@ -34,7 +34,9 @@ class McpRuntime:
     agent_runtime: str
 
 
-def resolve_runtime(config_dir: str | None = None) -> McpRuntime | None:
+def resolve_runtime(
+    config_dir: str | None = None, *, project_override: str = ""
+) -> McpRuntime | None:
     paths = local_paths(config_dir)
     config = _read_optional_json(paths.config)
     credentials = _read_optional_json(paths.credentials)
@@ -42,12 +44,14 @@ def resolve_runtime(config_dir: str | None = None) -> McpRuntime | None:
         os.environ.get("ENGRAM_SERVER_URL") or as_string(config.get("server_url"))
     ).rstrip("/")
     api_key = os.environ.get("ENGRAM_API_KEY") or as_string(credentials.get("api_key"))
-    project_id = os.environ.get("ENGRAM_PROJECT_ID") or as_string(
-        config.get("project_id")
+    project_id = (
+        project_override
+        or os.environ.get("ENGRAM_PROJECT_ID")
+        or as_string(config.get("project_id"))
     )
     team_id = os.environ.get("ENGRAM_TEAM_ID") or as_string(config.get("team_id"))
     agent_runtime = os.environ.get("ENGRAM_AGENT_RUNTIME") or "codex"
-    repository_url = "" if project_id else git_remote_url(os.getcwd())
+    repository_url = "" if project_id else workspace_repository_url()
     if not server_url or not api_key:
         return None
 
@@ -65,14 +69,11 @@ def resolve_runtime(config_dir: str | None = None) -> McpRuntime | None:
 
 
 def _require_runtime(
-    config_dir: str | None, *, require_project: bool = False
+    config_dir: str | None, *, project_override: str = ""
 ) -> tuple[McpRuntime | None, str]:
-    runtime = resolve_runtime(config_dir)
+    runtime = resolve_runtime(config_dir, project_override=project_override)
     if runtime is None:
         return None, NOT_CONFIGURED_MESSAGE
-
-    if require_project and not runtime.project_id:
-        return None, PROJECT_REQUIRED_MESSAGE
 
     return runtime, ""
 
@@ -101,7 +102,9 @@ def build_tools(
 def search_memory(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime, error = _require_runtime(config_dir)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
@@ -145,7 +148,9 @@ def fetch_context(
     if not session_id:
         return "engram_context requires session_id."
 
-    runtime, error = _require_runtime(config_dir)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
@@ -187,11 +192,13 @@ def create_memory_link(
     if not memory_id or not link_type or not target:
         return "engram_memory_link requires memory_id, link_type, and target."
 
-    runtime, error = _require_runtime(config_dir, require_project=True)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
-    payload = _project_payload(runtime)
+    payload = _scope_payload(runtime)
     payload.update(
         {
             "link_type": link_type,
@@ -219,14 +226,17 @@ def create_memory_link(
 def list_observations(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime, error = _require_runtime(config_dir, require_project=True)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
-    params: dict[str, str] = {
-        "project_id": runtime.project_id,
-        "limit": str(arguments.get("limit") or 10),
-    }
+    params: dict[str, str] = {"limit": str(arguments.get("limit") or 10)}
+    if runtime.project_id:
+        params["project_id"] = runtime.project_id
+    elif runtime.repository_url:
+        params["repository_url"] = runtime.repository_url
     if runtime.team_id:
         params["team_id"] = runtime.team_id
     status, body = get_json(
@@ -263,11 +273,13 @@ def update_memory_version(
     if not memory_id or not body_text:
         return "engram_memory_version requires memory_id and body."
 
-    runtime, error = _require_runtime(config_dir, require_project=True)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
-    payload = _project_payload(runtime)
+    payload = _scope_payload(runtime)
     payload.update(
         {
             "body": body_text,
@@ -304,11 +316,13 @@ def submit_memory_feedback(
             "(stale or refuted), and reason."
         )
 
-    runtime, error = _require_runtime(config_dir, require_project=True)
+    runtime, error = _require_runtime(
+        config_dir, project_override=as_string(arguments.get("project_id"))
+    )
     if runtime is None:
         return error
 
-    payload = _project_payload(runtime)
+    payload = _scope_payload(runtime)
     payload.update(
         {
             "action": action,
@@ -353,14 +367,6 @@ def _scope_payload(runtime: McpRuntime) -> dict[str, object]:
     return payload
 
 
-def _project_payload(runtime: McpRuntime) -> dict[str, object]:
-    payload: dict[str, object] = {"project_id": runtime.project_id}
-    if runtime.team_id:
-        payload["team_id"] = runtime.team_id
-
-    return payload
-
-
 def _new_request_id(arguments: dict[str, Any]) -> str:
     provided = as_string(arguments.get("request_id"))
 
@@ -369,6 +375,9 @@ def _new_request_id(arguments: dict[str, Any]) -> str:
 
 def _error_text(status: int, body: dict[str, object]) -> str:
     code = as_string(body.get("code")) or "error"
+    if status == 404 and code == "project_not_found":
+        return PROJECT_NOT_FOUND_MESSAGE
+
     detail = as_string(body.get("detail")) or "request failed"
 
     return f"Engram call failed: HTTP {status} {code}: {detail}"

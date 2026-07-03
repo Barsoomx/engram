@@ -75,6 +75,7 @@ def main() -> int:
             assert_secret_absent('bootstrap response', json.dumps(bootstrap), agent_key)
             project_id = required_string(bootstrap, 'project_id')
             team_id = required_string(bootstrap, 'team_id')
+            repository_url = required_string(bootstrap, 'repository_url')
             cli_env = pythonpath_env()
 
             progress('Connecting host CLI')
@@ -199,6 +200,75 @@ def main() -> int:
             )
             progress('MCP stdio bridge passed')
 
+            progress('Submitting second hook observation for repo-url-mode drive')
+            run_id_repo_url = f'{run_id}-repourl'
+            post_tool_use_repo_url = run_json(
+                [
+                    sys.executable,
+                    '-m',
+                    'engram_cli',
+                    'hook',
+                    'post-tool-use',
+                    '--config-dir',
+                    config_dir,
+                ],
+                cwd=ROOT,
+                env=cli_env,
+                input_text=json.dumps(post_tool_use_payload(run_id_repo_url)),
+                secret=api_key,
+            )
+            assert_equal(post_tool_use_repo_url.get('status'), 'accepted', 'post-tool-use (repo-url) status')
+            assert_secret_absent('post-tool-use (repo-url) response', json.dumps(post_tool_use_repo_url), api_key)
+
+            progress('Waiting for second worker-created retrieval document')
+            worker_memory_repo_url = wait_for_worker_memory(project_id, run_id_repo_url, api_key)
+            repo_url_memory_id = required_string(worker_memory_repo_url, 'memory_id')
+
+            progress('Preparing repo-url-mode workspace')
+            repo_url_config_dir = os.path.join(config_dir, 'mcp-repo-url')
+            os.makedirs(repo_url_config_dir, exist_ok=True)
+            workspace_dir = Path(os.path.join(config_dir, 'workspace'))
+            workspace_dir.mkdir(parents=True, exist_ok=True)
+            run(['git', 'init'], cwd=workspace_dir, secret=agent_key)
+            run(['git', 'remote', 'add', 'origin', repository_url], cwd=workspace_dir, secret=agent_key)
+
+            progress('Connecting host CLI with agent key (repo-url mode, no project)')
+            agent_connect_repo_url = run(
+                [
+                    sys.executable,
+                    '-m',
+                    'engram_cli',
+                    'connect',
+                    '--server',
+                    SERVER_URL,
+                    '--api-key',
+                    agent_key,
+                    '--agent',
+                    'codex',
+                    '--agent-version',
+                    'e2e',
+                    '--config-dir',
+                    repo_url_config_dir,
+                ],
+                cwd=ROOT,
+                env=cli_env,
+                secret=agent_key,
+            )
+            assert_secret_absent('agent connect (repo-url) stdout', agent_connect_repo_url.stdout, agent_key)
+            assert_secret_absent('agent connect (repo-url) stderr', agent_connect_repo_url.stderr, agent_key)
+
+            progress('Driving MCP stdio bridge in repo-url mode')
+            drive_mcp_stdio(
+                config_dir=repo_url_config_dir,
+                env=cli_env,
+                memory_id=repo_url_memory_id,
+                run_id=run_id_repo_url,
+                secrets_list=[api_key, agent_key],
+                cwd=workspace_dir,
+                feedback_action='refuted',
+            )
+            progress('MCP repo-url mode passed')
+
         progress('Compose golden path passed')
 
         failed = False
@@ -229,6 +299,8 @@ def drive_mcp_stdio(
     memory_id: str,
     run_id: str,
     secrets_list: list[str],
+    cwd: Path = ROOT,
+    feedback_action: str = 'stale',
 ) -> None:
     requests = [
         {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
@@ -257,12 +329,12 @@ def drive_mcp_stdio(
         _tool_call(
             9,
             'engram_memory_feedback',
-            {'memory_id': memory_id, 'action': 'stale', 'reason': f'mcp e2e {run_id}'},
+            {'memory_id': memory_id, 'action': feedback_action, 'reason': f'mcp e2e {run_id}'},
         ),
     ]
     process = subprocess.Popen(
         [sys.executable, '-m', 'engram_cli', 'mcp', 'serve', '--config-dir', config_dir],
-        cwd=ROOT,
+        cwd=cwd,
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -298,7 +370,7 @@ def drive_mcp_stdio(
         raise SystemExit(
             f'mcp version replayed or empty: {texts[7]} / {texts[8]}'
         )
-    if 'stale=True' not in texts[9]:
+    if f'{feedback_action}=True' not in texts[9] or 'already_applied=False' not in texts[9]:
         raise SystemExit(f'mcp feedback failed: {texts[9]}')
 
 

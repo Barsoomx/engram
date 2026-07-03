@@ -26,6 +26,7 @@ def _effective_scope(organization: object, team: object) -> EffectiveScope:
         capabilities=(),
         actor_type='api_key',
         actor_id='svc-inspection-test',
+        project_bound=False,
     )
 
 

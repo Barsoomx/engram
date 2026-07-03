@@ -32,7 +32,7 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.core.redaction import redact_value
-from engram.core.repository import resolve_or_create_project
+from engram.core.repository import resolve_project_for_scope
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,
@@ -888,14 +888,15 @@ class BuildContextBundle:
             target_id=data.request_id,
         )
         organization = Organization.objects.get(id=scope.organization_id)
-        if data.project_id:
-            project = Project.objects.get(organization=organization, id=data.project_id)
-        else:
-            project = resolve_or_create_project(
-                organization=organization,
-                repository_url=data.repository_url,
-                repository_root=data.repository_root,
-            )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.project_id,
+            repository_url=data.repository_url,
+            allow_create=True,
+            repository_root=data.repository_root,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+        )
         existing_bundle = self._existing_bundle(organization, project, data.request_id)
         if existing_bundle is not None:
             if not self._bundle_authorized_for_scope(existing_bundle, scope):

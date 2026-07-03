@@ -14,7 +14,16 @@ from engram.context.context_api_tests import (
     create_scoped_api_key,
 )
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
-from engram.core.models import Memory, MemoryStatus, MemoryVersion, Project, Team, VisibilityScope
+from engram.core.models import (
+    AuditEvent,
+    AuditResult,
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Project,
+    Team,
+    VisibilityScope,
+)
 
 
 def search_payload(project: Project, **overrides: object) -> dict[str, object]:
@@ -289,3 +298,130 @@ def test_search_without_project_and_repository_url_is_rejected() -> None:
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_search_project_scoped_key_denies_foreign_in_org_repository_url() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-search',
+        repository_url='git@github.com:acme/foreign-search.git',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {
+            'query': 'authorization',
+            'file_paths': [],
+            'symbols': [],
+            'limit': 5,
+            'repository_url': 'https://github.com/acme/foreign-search',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+    audit = AuditEvent.objects.get(event_type='AccessScopeResolved', project_id=foreign_project.id)
+    assert audit.result == AuditResult.DENIED
+    assert audit.metadata['resolved_project_id'] == str(foreign_project.id)
+
+
+@pytest.mark.django_db
+def test_search_bound_key_with_agent_capability_denied_for_foreign_project() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    Project.objects.create(
+        organization=organization,
+        name='Foreign',
+        slug='foreign-search-footgun',
+        repository_url='git@github.com:acme/foreign-search-footgun.git',
+    )
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        raw_key=OTHER_RAW_KEY,
+        capabilities=('search:query', 'projects:agent'),
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {
+            'query': 'authorization',
+            'file_paths': [],
+            'symbols': [],
+            'limit': 5,
+            'repository_url': 'https://github.com/acme/foreign-search-footgun',
+        },
+        format='json',
+        **auth_headers(OTHER_RAW_KEY),
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_search_bound_key_with_agent_capability_allowed_for_own_project() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    project.repository_url = 'git@github.com:acme/own-search-project.git'
+    project.save(update_fields=['repository_url'])
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        raw_key=OTHER_RAW_KEY,
+        capabilities=('search:query', 'projects:agent'),
+    )
+    memory, _version, document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {
+            'query': 'authorization ranking',
+            'file_paths': document.file_paths,
+            'symbols': [],
+            'limit': 5,
+            'repository_url': 'https://github.com/acme/own-search-project',
+        },
+        format='json',
+        **auth_headers(OTHER_RAW_KEY),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert len(response.json()['items']) == 1
+    assert response.json()['items'][0]['memory_id'] == str(memory.id)
+
+
+@pytest.mark.django_db
+def test_search_bound_key_unknown_repository_url_returns_404_without_creating_project() -> None:
+    organization, _team, _project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    project_count_before = Project.objects.filter(organization=organization).count()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        {
+            'query': 'anything',
+            'file_paths': [],
+            'symbols': [],
+            'limit': 5,
+            'repository_url': 'https://github.com/acme/never-created-search',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'project_not_found'
+    assert Project.objects.filter(organization=organization).count() == project_count_before

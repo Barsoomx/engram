@@ -9,6 +9,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
+from engram.core.repository import resolve_project_for_scope
 from engram.observations.serializers import ObservationDetailQuerySerializer, ObservationListQuerySerializer
 from engram.observations.services import (
     GetObservation,
@@ -32,16 +33,23 @@ class ObservationListView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='observations:read',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='observation_list',
             target_id='list',
             request_id=request_id,
         )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
+            request_id=request_id,
+            correlation_id=data.get('correlation_id', ''),
+        )
         result = ListObservations().execute(
             ObservationListInput(
                 scope=scope,
-                project_id=data['project_id'],
+                project_id=project.id,
                 team_id=data.get('team_id'),
                 limit=data.get('limit', 20),
                 offset=data.get('offset', 0),
@@ -72,16 +80,22 @@ class ObservationDetailView(APIView):
             scope = resolve_request_scope(
                 request,
                 required_capability='observations:read',
-                project_id=data['project_id'],
+                project_id=data.get('project_id'),
                 team_id=data.get('team_id'),
                 target_type='observation',
                 target_id=str(observation_id),
                 request_id=request_id,
             )
+            project = resolve_project_for_scope(
+                scope=scope,
+                project_id=data.get('project_id'),
+                repository_url=data.get('repository_url', ''),
+                request_id=request_id,
+            )
             observation = GetObservation().execute(
                 ObservationDetailInput(
                     scope=scope,
-                    project_id=data['project_id'],
+                    project_id=project.id,
                     team_id=data.get('team_id'),
                     observation_id=observation_id,
                 ),

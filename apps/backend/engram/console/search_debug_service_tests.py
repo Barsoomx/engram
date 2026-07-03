@@ -33,6 +33,7 @@ def _make_scope(organization: Organization) -> EffectiveScope:
         capabilities=(),
         actor_type='user',
         actor_id='debug-tester',
+        project_bound=False,
     )
 
 

@@ -13,6 +13,7 @@ from engram.access.request_scope import resolve_request_scope
 from engram.access.services import EffectiveScope
 from engram.core.models import MemoryLink, MemoryVersion
 from engram.core.redaction import redact_value
+from engram.core.repository import resolve_project_for_scope
 from engram.memory.serializers import (
     MemoryDiffQuerySerializer,
     MemoryFeedbackSerializer,
@@ -58,13 +59,20 @@ class MemoryFeedbackView(APIView):
             scope = resolve_request_scope(
                 request,
                 required_capability='memories:review',
-                project_id=data['project_id'],
+                project_id=data.get('project_id'),
                 team_id=data.get('team_id'),
                 target_type='memory',
                 target_id=str(memory_id),
                 request_id=data['request_id'],
             )
-            result = RecordMemoryFeedback().execute(self._input(memory_id, data, scope))
+            project = resolve_project_for_scope(
+                scope=scope,
+                project_id=data.get('project_id'),
+                repository_url=data.get('repository_url', ''),
+                request_id=data['request_id'],
+                correlation_id=data.get('correlation_id', ''),
+            )
+            result = RecordMemoryFeedback().execute(self._input(memory_id, data, scope, project.id))
         except MemoryFeedbackError as error:
             return Response(
                 {'code': error.code, 'detail': str(error)},
@@ -73,11 +81,17 @@ class MemoryFeedbackView(APIView):
 
         return Response(result.to_response())
 
-    def _input(self, memory_id: uuid.UUID, data: dict[str, Any], scope: EffectiveScope) -> MemoryFeedbackInput:
+    def _input(
+        self,
+        memory_id: uuid.UUID,
+        data: dict[str, Any],
+        scope: EffectiveScope,
+        project_id: uuid.UUID,
+    ) -> MemoryFeedbackInput:
         return MemoryFeedbackInput(
             scope=scope,
             memory_id=memory_id,
-            project_id=data['project_id'],
+            project_id=project_id,
             team_id=data.get('team_id'),
             action=data['action'],
             reason=data['reason'],
@@ -97,16 +111,21 @@ class MemoryVersionView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='memories:read',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='memory',
             target_id=str(memory_id),
+        )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
         )
 
         versions = list(
             MemoryVersion.objects.filter(
                 organization_id=scope.organization_id,
-                project_id=data['project_id'],
+                project_id=project.id,
                 memory_id=memory_id,
             ).order_by('-version')
         )
@@ -122,17 +141,24 @@ class MemoryVersionView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='memories:review',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='memory',
             target_id=str(memory_id),
             request_id=data['request_id'],
         )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
+            request_id=data['request_id'],
+            correlation_id=data.get('correlation_id', ''),
+        )
         result = UpdateMemoryBody().execute(
             UpdateMemoryBodyInput(
                 scope=scope,
                 memory_id=memory_id,
-                project_id=data['project_id'],
+                project_id=project.id,
                 team_id=data.get('team_id'),
                 body=data['body'],
                 reason=data.get('reason', ''),
@@ -165,16 +191,21 @@ class MemoryLinksView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='memories:read',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='memory_link',
             target_id=str(memory_id),
+        )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
         )
 
         links = list(
             MemoryLink.objects.filter(
                 organization_id=scope.organization_id,
-                project_id=data['project_id'],
+                project_id=project.id,
                 memory_id=memory_id,
             ).order_by('link_type', 'target')
         )
@@ -190,17 +221,24 @@ class MemoryLinksView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='memories:review',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='memory_link',
             target_id=str(memory_id),
             request_id=data['request_id'],
         )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
+            request_id=data['request_id'],
+            correlation_id=data.get('correlation_id', ''),
+        )
         result = RecordMemoryLink().execute(
             MemoryLinkInput(
                 scope=scope,
                 memory_id=memory_id,
-                project_id=data['project_id'],
+                project_id=project.id,
                 team_id=data.get('team_id'),
                 link_type=data['link_type'],
                 target=data['target'],
@@ -226,17 +264,24 @@ class MemoryLinksView(APIView):
         scope = resolve_request_scope(
             request,
             required_capability='memories:review',
-            project_id=data['project_id'],
+            project_id=data.get('project_id'),
             team_id=data.get('team_id'),
             target_type='memory_link',
             target_id=str(memory_id),
             request_id=data['request_id'],
         )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.get('project_id'),
+            repository_url=data.get('repository_url', ''),
+            request_id=data['request_id'],
+            correlation_id=data.get('correlation_id', ''),
+        )
         result = RemoveMemoryLink().execute(
             RemoveMemoryLinkInput(
                 scope=scope,
                 memory_id=memory_id,
-                project_id=data['project_id'],
+                project_id=project.id,
                 team_id=data.get('team_id'),
                 link_id=data['link_id'],
                 request_id=data['request_id'],
@@ -268,14 +313,19 @@ class MemoryDiffView(APIView):
             scope = resolve_request_scope(
                 request,
                 required_capability='memories:read',
-                project_id=data['project_id'],
+                project_id=data.get('project_id'),
                 team_id=data.get('team_id'),
+            )
+            project = resolve_project_for_scope(
+                scope=scope,
+                project_id=data.get('project_id'),
+                repository_url=data.get('repository_url', ''),
             )
             result = ResolveMemoryDiff().execute(
                 MemoryDiffInput(
                     scope=scope,
                     memory_id=memory_id,
-                    project_id=data['project_id'],
+                    project_id=project.id,
                     from_version=data['from_version'],
                     to_version=data['to_version'],
                 ),

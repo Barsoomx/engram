@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from datetime import datetime
 
@@ -264,6 +265,7 @@ class SearchPayloadTests(unittest.TestCase):
             file_paths=[],
             symbols=[],
             limit=5,
+            project_id="proj-1",
             repository_url="git@github.com:acme/x.git",
         )
 
@@ -279,9 +281,60 @@ class SearchPayloadTests(unittest.TestCase):
             file_paths=["a.py"],
             symbols=[],
             limit=3,
+            project_id="",
             repository_url="git@github.com:acme/x.git",
         )
 
         self.assertNotIn("project_id", payload)
         self.assertEqual("git@github.com:acme/x.git", payload["repository_url"])
         self.assertEqual(3, payload["limit"])
+
+
+class HookProjectLadderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._env_project_id = os.environ.pop("ENGRAM_PROJECT_ID", None)
+
+    def tearDown(self) -> None:
+        if self._env_project_id is not None:
+            os.environ["ENGRAM_PROJECT_ID"] = self._env_project_id
+        else:
+            os.environ.pop("ENGRAM_PROJECT_ID", None)
+
+    def test_harness_input_project_id_wins_over_env_and_config(self) -> None:
+        os.environ["ENGRAM_PROJECT_ID"] = "env-project"
+        config = {"project_id": "config-project", "team_id": "", "agent_version": ""}
+        built = build_generic_hook_payload(
+            config,
+            "claude_code",
+            {
+                "session_id": "s1",
+                "project_id": "harness-project",
+                "repository_url": REPO,
+            },
+            "post_tool_use",
+        )
+
+        self.assertEqual("harness-project", built["project_id"])
+
+    def test_env_project_id_wins_over_config_when_no_harness_input(self) -> None:
+        os.environ["ENGRAM_PROJECT_ID"] = "env-project"
+        config = {"project_id": "config-project", "team_id": "", "agent_version": ""}
+        built = build_generic_hook_payload(
+            config,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO},
+            "post_tool_use",
+        )
+
+        self.assertEqual("env-project", built["project_id"])
+
+    def test_config_project_id_used_when_no_harness_input_or_env(self) -> None:
+        config = {"project_id": "config-project", "team_id": "", "agent_version": ""}
+        built = build_generic_hook_payload(
+            config,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO},
+            "post_tool_use",
+        )
+
+        self.assertEqual("config-project", built["project_id"])

@@ -592,7 +592,26 @@ def git_remote_url(path: str) -> str:
     if result.returncode != 0:
         return ""
 
-    return result.stdout.strip()
+    return _strip_url_userinfo(result.stdout.strip())
+
+
+def _strip_url_userinfo(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not (parsed.username or parsed.password):
+        return url
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def workspace_repository_url() -> str:
+    claude_project_dir = os.environ.get("CLAUDE_PROJECT_DIR", "").strip()
+    if claude_project_dir:
+        return git_remote_url(claude_project_dir)
+
+    return git_remote_url(os.getcwd())
 
 
 def run_install(
@@ -1281,7 +1300,11 @@ def base_hook_payload(
         "agent_runtime": runtime,
         "agent_version": as_string(config.get("agent_version")),
     }
-    project_id = as_string(config.get("project_id"))
+    project_id = (
+        payload_string(input_payload, "project_id")
+        or os.environ.get("ENGRAM_PROJECT_ID", "").strip()
+        or as_string(config.get("project_id"))
+    )
     if project_id:
         payload["project_id"] = project_id
     team_id = as_string(config.get("team_id"))
@@ -1675,6 +1698,7 @@ def build_search_payload(
     symbols: list[str],
     limit: int,
     repository_url: str,
+    project_id: str = "",
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "query": query,
@@ -1682,7 +1706,6 @@ def build_search_payload(
         "symbols": symbols,
         "limit": limit,
     }
-    project_id = as_string(config.get("project_id"))
     if project_id:
         payload["project_id"] = project_id
     elif repository_url:
@@ -1692,6 +1715,37 @@ def build_search_payload(
         payload["team_id"] = team_id
 
     return payload
+
+
+def _ladder_project_id(args: Namespace, config: dict[str, object]) -> str:
+    return (
+        as_string(getattr(args, "project", None)).strip()
+        or os.environ.get("ENGRAM_PROJECT_ID", "").strip()
+        or as_string(config.get("project_id"))
+    )
+
+
+def _resolve_repository_scope(
+    args: Namespace, config: dict[str, object]
+) -> tuple[str, str]:
+    project_id = _ladder_project_id(args, config)
+    repository_url = "" if project_id else git_remote_url(os.getcwd())
+
+    return project_id, repository_url
+
+
+def _require_repository_scope(
+    args: Namespace, config: dict[str, object]
+) -> tuple[str, str]:
+    project_id, repository_url = _resolve_repository_scope(args, config)
+    if not project_id and not repository_url:
+        raise CliError(
+            "missing_project",
+            "Set --project, ENGRAM_PROJECT_ID, or run inside a git repository",
+            remediation_for("missing_project"),
+        )
+
+    return project_id, repository_url
 
 
 def run_search(
@@ -1717,15 +1771,14 @@ def run_search(
                 remediation_for("missing_credential"),
             )
         server_url = normalize_server_url(as_string(config.get("server_url")))
-        repository_url = ""
-        if not as_string(config.get("project_id")):
-            repository_url = git_remote_url(os.getcwd())
+        project_id, repository_url = _resolve_repository_scope(args, config)
         payload = build_search_payload(
             config,
             query=args.query or "",
             file_paths=list(args.file_path or []),
             symbols=list(args.symbol or []),
             limit=args.limit,
+            project_id=project_id,
             repository_url=repository_url,
         )
         active_transport = transport or urllib_transport
@@ -1789,11 +1842,15 @@ def run_memory_version(
     api_key = ""
     try:
         _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
         payload: dict[str, object] = {
-            "project_id": as_string(config.get("project_id")),
             "body": args.body,
             "request_id": args.request_id or f"engram-cli-{uuid.uuid4()}",
         }
+        if project_id:
+            payload["project_id"] = project_id
+        elif repository_url:
+            payload["repository_url"] = repository_url
         if args.reason:
             payload["reason"] = args.reason
         if team_id:
@@ -1828,12 +1885,16 @@ def run_memory_link(
     api_key = ""
     try:
         _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
         payload: dict[str, object] = {
-            "project_id": as_string(config.get("project_id")),
             "link_type": args.link_type,
             "target": args.target,
             "request_id": args.request_id or f"engram-cli-{uuid.uuid4()}",
         }
+        if project_id:
+            payload["project_id"] = project_id
+        elif repository_url:
+            payload["repository_url"] = repository_url
         if args.label:
             payload["label"] = args.label
         if team_id:
@@ -1868,7 +1929,12 @@ def run_memory_links(
     api_key = ""
     try:
         _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
-        params: dict[str, str] = {"project_id": as_string(config.get("project_id"))}
+        project_id, repository_url = _require_repository_scope(args, config)
+        params: dict[str, str] = {}
+        if project_id:
+            params["project_id"] = project_id
+        elif repository_url:
+            params["repository_url"] = repository_url
         if team_id:
             params["team_id"] = team_id
         active_transport = transport or urllib_transport
@@ -1919,10 +1985,12 @@ def run_observations(
                 remediation_for("missing_credential"),
             )
         server_url = normalize_server_url(as_string(config.get("server_url")))
-        params: dict[str, str] = {
-            "project_id": as_string(config.get("project_id")),
-            "limit": str(args.limit),
-        }
+        project_id, repository_url = _require_repository_scope(args, config)
+        params: dict[str, str] = {"limit": str(args.limit)}
+        if project_id:
+            params["project_id"] = project_id
+        elif repository_url:
+            params["repository_url"] = repository_url
         team_id = as_string(config.get("team_id"))
         if team_id:
             params["team_id"] = team_id

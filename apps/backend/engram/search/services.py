@@ -15,8 +15,8 @@ from engram.context.services import (
     score_retrieval_document,
     semantic_retrieval_matches,
 )
-from engram.core.models import Organization, OrganizationSettings, Project, Team
-from engram.core.repository import resolve_or_create_project
+from engram.core.models import Organization, OrganizationSettings, Team
+from engram.core.repository import resolve_project_for_scope
 
 
 @dataclass(frozen=True)
@@ -80,14 +80,15 @@ class SearchMemories:
             target_id=data.request_id,
         )
         organization = Organization.objects.get(id=scope.organization_id)
-        if data.project_id:
-            project = Project.objects.get(organization=organization, id=data.project_id)
-        else:
-            project = resolve_or_create_project(
-                organization=organization,
-                repository_url=data.repository_url,
-                repository_root=data.repository_root,
-            )
+        project = resolve_project_for_scope(
+            scope=scope,
+            project_id=data.project_id,
+            repository_url=data.repository_url,
+            allow_create=True,
+            repository_root=data.repository_root,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+        )
         documents = authorized_retrieval_documents(organization, project, scope)
         has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
         exact_matches: list[RetrievalMatch] = []

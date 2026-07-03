@@ -127,6 +127,16 @@ what the issuer's own role grants.
 All runtime endpoints require `Authorization: Bearer <engram-api-key>`. The
 key's capabilities and project/team scope govern what may be ingested or read.
 
+Hooks, context, search, observations, and memory endpoints all accept project
+scope as either a `project_id` (UUID) or a `repository_url` (matched against
+a project's canonicalized repository URL inside the caller's own
+organization); `project_id` wins when both are present. Hooks, context, and
+search may auto-create a project for an unmatched `repository_url` (org-wide
+agent keys only); observations and memory endpoints are resolve-only and
+return `404 project_not_found` instead. See
+[backend-contracts.md](backend-contracts.md#project-routing-contract) for the
+full resolver and authorization contract.
+
 ### Hooks
 
 | Method | Path                              | Description                                       |
@@ -223,7 +233,8 @@ Runtime endpoints that fail key resolution return a JSON body:
 
 Common codes: `missing_api_key`, `invalid_key`, `inactive_key`,
 `revoked_key`, `expired_key`, `inactive_owner`, `missing_capability`,
-`project_scope_denied`, `team_scope_denied`.
+`project_scope_denied`, `team_scope_denied`, `project_not_found`,
+`project_or_repository_required`.
 
 Admin endpoints denied by capability return HTTP 403 and write an
 `AccessDenied` audit event with `metadata.required_capability`.

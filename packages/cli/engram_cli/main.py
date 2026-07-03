@@ -161,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--config-dir")
     search.add_argument("--json", action="store_true", dest="as_json")
+    search.add_argument("--project", default="")
 
     memory = subparsers.add_parser("memory")
     memory_subparsers = memory.add_subparsers(dest="memory_command")
@@ -171,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     memory_version.add_argument("--reason", default="")
     memory_version.add_argument("--request-id", dest="request_id", default="")
     memory_version.add_argument("--config-dir")
+    memory_version.add_argument("--project", default="")
 
     memory_link = memory_subparsers.add_parser("link")
     memory_link.add_argument("memory_id")
@@ -184,13 +186,16 @@ def build_parser() -> argparse.ArgumentParser:
     memory_link.add_argument("--label", default="")
     memory_link.add_argument("--request-id", dest="request_id", default="")
     memory_link.add_argument("--config-dir")
+    memory_link.add_argument("--project", default="")
 
     memory_links = memory_subparsers.add_parser("links")
     memory_links.add_argument("memory_id")
     memory_links.add_argument("--config-dir")
+    memory_links.add_argument("--project", default="")
 
     observations = subparsers.add_parser("observations")
     observations.add_argument("--limit", type=int, default=20)
     observations.add_argument("--config-dir")
+    observations.add_argument("--project", default="")
 
     return parser

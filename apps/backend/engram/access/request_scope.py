@@ -100,6 +100,7 @@ def _session_scope(
         capabilities=scope.capabilities,
         actor_type=scope.actor_type,
         actor_id=scope.actor_id,
+        project_bound=False,
     )
 
 

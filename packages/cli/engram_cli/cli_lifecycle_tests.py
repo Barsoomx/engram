@@ -4,6 +4,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,7 +14,12 @@ from unittest import mock
 
 from engram_cli.config import credential_fingerprint
 from engram_cli import main
-from engram_cli.commands import build_engram_mcp_entry, run_connect
+from engram_cli.commands import (
+    build_engram_mcp_entry,
+    git_remote_url,
+    run_connect,
+    workspace_repository_url,
+)
 
 
 RAW_KEY = "egk_test_cli_0123456789abcdefghijklmnopqrstuvwxyz"
@@ -1671,6 +1677,47 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_search_project_flag_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [(200, {"request_id": "r", "items": [], "warnings": []})]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "search",
+                    "--query",
+                    "auth",
+                    "--project",
+                    "flag-project",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("flag-project", call["payload"]["project_id"])
+
+    def test_search_env_project_id_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [(200, {"request_id": "r", "items": [], "warnings": []})]
+            )
+            with mock.patch.dict(os.environ, {"ENGRAM_PROJECT_ID": "env-project"}):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["search", "--query", "auth", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("env-project", call["payload"]["project_id"])
+
     def test_search_reports_missing_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -1736,6 +1783,128 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("current_version=2", stdout)
             self.assertNotIn(RAW_KEY, stdout)
 
+    def test_memory_version_project_flag_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "memory_id": "mem-1",
+                "current_version": 2,
+                "memory_version_id": "ver-2",
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "version",
+                    "mem-1",
+                    "--body",
+                    "Updated body",
+                    "--project",
+                    "flag-project",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("flag-project", call["payload"]["project_id"])
+
+    def test_memory_version_falls_back_to_repository_url_without_project(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            response = {
+                "memory_id": "mem-1",
+                "current_version": 2,
+                "memory_version_id": "ver-2",
+            }
+            transport = FakeTransport([(200, response)])
+            with mock.patch(
+                "engram_cli.commands.git_remote_url",
+                return_value="git@github.com:acme/x.git",
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "memory",
+                        "version",
+                        "mem-1",
+                        "--body",
+                        "Updated body",
+                        "--config-dir",
+                        str(config_dir),
+                    ],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertNotIn("project_id", call["payload"])
+            self.assertEqual(
+                "git@github.com:acme/x.git", call["payload"]["repository_url"]
+            )
+
+    def test_memory_version_reports_missing_project_when_nothing_resolves(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([])
+            with mock.patch("engram_cli.commands.git_remote_url", return_value=""):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "memory",
+                        "version",
+                        "mem-1",
+                        "--body",
+                        "Updated body",
+                        "--config-dir",
+                        str(config_dir),
+                    ],
+                    transport,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual(0, len(transport.calls))
+            self.assertIn("missing_project", stderr)
+
     def test_memory_link_posts_link_and_prints_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -1775,6 +1944,134 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("link_id=link-1", stdout)
             self.assertIn("apps/backend/engram/memory/services.py", stdout)
 
+    def test_memory_link_project_flag_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "memory_id": "mem-1",
+                "link_id": "link-1",
+                "link_type": "file",
+                "target": "a.py",
+                "created": True,
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "link",
+                    "mem-1",
+                    "--link-type",
+                    "file",
+                    "--target",
+                    "a.py",
+                    "--project",
+                    "flag-project",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("flag-project", call["payload"]["project_id"])
+
+    def test_memory_link_falls_back_to_repository_url_without_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            response = {
+                "memory_id": "mem-1",
+                "link_id": "link-1",
+                "link_type": "file",
+                "target": "a.py",
+                "created": True,
+            }
+            transport = FakeTransport([(200, response)])
+            with mock.patch(
+                "engram_cli.commands.git_remote_url",
+                return_value="git@github.com:acme/x.git",
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "memory",
+                        "link",
+                        "mem-1",
+                        "--link-type",
+                        "file",
+                        "--target",
+                        "a.py",
+                        "--config-dir",
+                        str(config_dir),
+                    ],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertNotIn("project_id", call["payload"])
+            self.assertEqual(
+                "git@github.com:acme/x.git", call["payload"]["repository_url"]
+            )
+
+    def test_memory_link_reports_missing_project_when_nothing_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([])
+            with mock.patch("engram_cli.commands.git_remote_url", return_value=""):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "memory",
+                        "link",
+                        "mem-1",
+                        "--link-type",
+                        "file",
+                        "--target",
+                        "a.py",
+                        "--config-dir",
+                        str(config_dir),
+                    ],
+                    transport,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual(0, len(transport.calls))
+            self.assertIn("missing_project", stderr)
+
     def test_memory_links_lists_recorded_links(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -1803,6 +2100,117 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("project_id=", call["url"])
             self.assertIn("file: apps/backend/engram/memory/services.py", stdout)
 
+    def test_memory_links_project_flag_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "links",
+                    "mem-1",
+                    "--project",
+                    "flag-project",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("project_id=flag-project", call["url"])
+
+    def test_memory_links_falls_back_to_repository_url_without_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([(200, {"items": []})])
+            with mock.patch(
+                "engram_cli.commands.git_remote_url",
+                return_value="git@github.com:acme/x.git",
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["memory", "links", "mem-1", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("repository_url=", call["url"])
+            self.assertNotIn("project_id=", call["url"])
+
+    def test_memory_links_reports_missing_project_when_nothing_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([])
+            with mock.patch("engram_cli.commands.git_remote_url", return_value=""):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["memory", "links", "mem-1", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual(0, len(transport.calls))
+            self.assertIn("missing_project", stderr)
+
+    def test_observations_project_flag_wins_over_env_and_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": []})])
+            with mock.patch.dict(os.environ, {"ENGRAM_PROJECT_ID": "env-project"}):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "observations",
+                        "--project",
+                        "flag-project",
+                        "--config-dir",
+                        str(config_dir),
+                    ],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("project_id=flag-project", call["url"])
+            self.assertNotIn("env-project", call["url"])
+            self.assertNotIn(PROJECT_ID, call["url"])
+
     def test_observations_lists_recorded_observations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -1830,6 +2238,170 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("/v1/observations/", call["url"])
             self.assertIn("project_id=", call["url"])
             self.assertIn("Obs one", stdout)
+
+    def test_observations_project_flag_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "observations",
+                    "--project",
+                    "flag-project",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("project_id=flag-project", call["url"])
+
+    def test_observations_env_project_id_wins_over_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": []})])
+            with mock.patch.dict(os.environ, {"ENGRAM_PROJECT_ID": "env-project"}):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["observations", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("project_id=env-project", call["url"])
+
+    def test_observations_falls_back_to_repository_url_without_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([(200, {"items": []})])
+            with mock.patch(
+                "engram_cli.commands.git_remote_url",
+                return_value="git@github.com:acme/x.git",
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["observations", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertIn("repository_url=", call["url"])
+            self.assertNotIn("project_id=", call["url"])
+
+    def test_observations_reports_missing_project_when_nothing_resolves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            connect_transport = FakeTransport(
+                [(200, dry_run_ok()), (200, dry_run_ok())]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "connect",
+                    "--server",
+                    "https://engram.example",
+                    "--api-key",
+                    RAW_KEY,
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                connect_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+
+            transport = FakeTransport([])
+            with mock.patch("engram_cli.commands.git_remote_url", return_value=""):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["observations", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertEqual(0, len(transport.calls))
+            self.assertIn("missing_project", stderr)
+
+
+class WorkspaceRepositoryUrlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._claude_project_dir = os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        self._cwd = os.getcwd()
+
+    def tearDown(self) -> None:
+        os.chdir(self._cwd)
+        if self._claude_project_dir is not None:
+            os.environ["CLAUDE_PROJECT_DIR"] = self._claude_project_dir
+        else:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+
+    def init_repo(self, path: Path, remote_url: str) -> None:
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+        subprocess.run(
+            ["git", "-C", str(path), "remote", "add", "origin", remote_url],
+            check=True,
+        )
+
+    def test_claude_project_dir_beats_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as cwd_repo, tempfile.TemporaryDirectory() as claude_repo:
+            self.init_repo(Path(cwd_repo), "git@github.com:acme/cwd-repo.git")
+            self.init_repo(Path(claude_repo), "git@github.com:acme/claude-repo.git")
+            os.environ["CLAUDE_PROJECT_DIR"] = claude_repo
+            os.chdir(cwd_repo)
+
+            url = workspace_repository_url()
+
+        self.assertEqual("git@github.com:acme/claude-repo.git", url)
+
+    def test_cwd_fallback_when_claude_project_dir_unset(self) -> None:
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        with tempfile.TemporaryDirectory() as cwd_repo:
+            self.init_repo(Path(cwd_repo), "git@github.com:acme/cwd-repo.git")
+            os.chdir(cwd_repo)
+
+            url = workspace_repository_url()
+
+        self.assertEqual("git@github.com:acme/cwd-repo.git", url)
+
+    def test_git_remote_url_strips_https_userinfo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            self.init_repo(Path(repo), "https://user:token@github.com/acme/x.git")
+            url = git_remote_url(repo)
+
+        self.assertEqual("https://github.com/acme/x.git", url)
+
+    def test_git_remote_url_leaves_scp_form_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            self.init_repo(Path(repo), "git@github.com:acme/x.git")
+            url = git_remote_url(repo)
+
+        self.assertEqual("git@github.com:acme/x.git", url)
+
+    def test_git_remote_url_strips_password_only_userinfo(self) -> None:
+        with tempfile.TemporaryDirectory() as repo:
+            self.init_repo(Path(repo), "https://:TOKEN@github.com/acme/x.git")
+            url = git_remote_url(repo)
+
+        self.assertEqual("https://github.com/acme/x.git", url)
+        self.assertNotIn("TOKEN", url)
 
 
 class StubPrompt:
