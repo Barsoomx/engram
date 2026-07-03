@@ -7,12 +7,19 @@ capability used to build the smallest useful context bundle for a concrete agent
 task.
 
 Retrieval must combine exact/grep-style matching with semantic retrieval in V1.
-Exact matching is authoritative for file paths and memory titles today; other
-categories (symbols, ticket ids, commands, error strings) fall back to
-full-text substring matching because no memory-write path currently populates
-the `symbols`/`exact_terms` metadata needed to index them. Semantic retrieval
-is required for recall across paraphrases and related decisions. Neither path
-is sufficient alone.
+Exact matching is authoritative for file paths and memory titles today.
+Symbols and exact terms are derived deterministically at index time from a
+memory's title and body: backticked identifiers and call forms, dotted paths,
+and CamelCase/snake_case tokens become symbols; ticket ids, error classes,
+UPPER_SNAKE constants, and backticked non-identifier commands become exact
+terms. Extraction is regex-based, not semantic, and merges with any explicit
+values already present in `Memory.metadata['symbols']`/`Memory.metadata['exact_terms']`.
+The symbol tier (score 80) and exact-terms tier (score 60) rank between
+file-path matches (score 100) and full-text substring matching (score 40).
+`RetrievalDocument` rows indexed before this extraction landed can be
+recomputed with the operator command `engram_backfill_retrieval_terms`.
+Semantic retrieval is required for recall across paraphrases and related
+decisions. Neither path is sufficient alone.
 
 Agent memory needs reliable answers to questions like "what did we decide about
 this file?", "where did this error happen?", and "which review found this bug?"

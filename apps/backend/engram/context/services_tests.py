@@ -20,9 +20,12 @@ from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api
 from engram.context.services import (
     BuildContextBundle,
     ContextBundleInput,
+    IndexMemoryVersion,
+    IndexMemoryVersionInput,
     RetrievalMatch,
     _pack_to_budget,
     _semantic_retrieval_matches_python,
+    derive_retrieval_terms,
     estimate_tokens,
     fuse_retrieval_legs,
     fuse_semantic_lexical,
@@ -33,6 +36,7 @@ from engram.context.services import (
     resolve_lexical_recall_enabled,
     resolve_require_provenance_enabled,
     resolve_retrieval_strategy,
+    score_retrieval_document,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
@@ -495,6 +499,66 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
 
     assert [match.document.id for match in matches] == [document.id]
     assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
+
+
+# IndexMemoryVersion — extracted symbols/exact_terms
+
+
+def test_derive_retrieval_terms_merges_metadata_and_extracted_values() -> None:
+    symbols, exact_terms = derive_retrieval_terms(
+        {'symbols': ['legacy_symbol'], 'exact_terms': ['LEGACY-1']},
+        'Scope resolver gotcha',
+        '`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.',
+    )
+
+    assert 'legacy_symbol' in symbols
+    assert 'resolve_scope' in symbols
+    assert 'legacy-1' in exact_terms
+    assert 'accessdeniederror' in exact_terms
+
+
+def test_derive_retrieval_terms_defaults_missing_metadata_to_empty_lists() -> None:
+    symbols, exact_terms = derive_retrieval_terms({}, 'Plain title', 'plain body without markers')
+
+    assert symbols == []
+    assert exact_terms == ['plain title']
+
+
+@pytest.mark.django_db
+def test_index_memory_version_merges_extracted_symbols_and_exact_terms(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Scope resolver gotcha',
+        body='`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.',
+        status=MemoryStatus.APPROVED,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-resolve-scope',
+    )
+
+    result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = result.retrieval_document
+    assert 'resolve_scope' in document.symbols
+    assert 'accessdeniederror' in document.exact_terms
+    match = score_retrieval_document(
+        document,
+        query='',
+        file_paths=(),
+        symbols=('resolve_scope',),
+        has_request_terms=True,
+    )
+    assert match is not None
+    assert match.score == 80
 
 
 # lexical fusion (RRF)

@@ -23,6 +23,7 @@ WORKER_MEMORY_NOT_READY_ERROR = 'worker-created retrieval document not ready'
 WORKER_MEMORY_TIMEOUT_SECONDS = 120.0
 WORKER_MEMORY_POLL_INTERVAL_SECONDS = 2.0
 CONTEXT_AUDIT_NOT_READY_ERROR = 'context audit evidence not ready'
+SYMBOL_TERM = 'plan_lookup_helper'
 
 
 @dataclass(frozen=True)
@@ -324,10 +325,14 @@ def drive_mcp_stdio(
         _tool_call(
             8,
             'engram_memory_version',
-            {'memory_id': memory_id, 'body': f'mcp e2e second update {run_id}'},
+            {
+                'memory_id': memory_id,
+                'body': f'mcp e2e second update {run_id} calls `{SYMBOL_TERM}()` during planning.',
+            },
         ),
+        _tool_call(9, 'engram_search', {'query': '', 'symbols': [SYMBOL_TERM]}),
         _tool_call(
-            9,
+            10,
             'engram_memory_feedback',
             {'memory_id': memory_id, 'action': feedback_action, 'reason': f'mcp e2e {run_id}'},
         ),
@@ -354,7 +359,7 @@ def drive_mcp_stdio(
             responses[message['id']] = message
     tool_names = [tool['name'] for tool in responses[2]['result']['tools']]
     assert_equal(len(tool_names), 6, 'mcp tools count')
-    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9)}
+    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9, 10)}
     for rid, text in texts.items():
         for secret in secrets_list:
             assert_secret_absent(f'mcp response {rid}', text, secret)
@@ -370,8 +375,10 @@ def drive_mcp_stdio(
         raise SystemExit(
             f'mcp version replayed or empty: {texts[7]} / {texts[8]}'
         )
-    if f'{feedback_action}=True' not in texts[9] or 'already_applied=False' not in texts[9]:
-        raise SystemExit(f'mcp feedback failed: {texts[9]}')
+    if f'memory_id={memory_id}' not in texts[9]:
+        raise SystemExit(f'mcp symbol search missed memory_id: {texts[9][:400]}')
+    if f'{feedback_action}=True' not in texts[10] or 'already_applied=False' not in texts[10]:
+        raise SystemExit(f'mcp feedback failed: {texts[10]}')
 
 
 def _tool_call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, object]:
