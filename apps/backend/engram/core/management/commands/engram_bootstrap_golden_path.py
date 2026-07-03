@@ -57,6 +57,7 @@ class Command(BaseCommand):
         self.stdout.write(f'organization_id={result["organization_id"]}')
         self.stdout.write(f'project_id={result["project_id"]}')
         self.stdout.write(f'team_id={result["team_id"]}')
+        self.stdout.write(f'repository_url={result["repository_url"]}')
         self.stdout.write(f'api_key_fingerprint={result["api_key_fingerprint"]}')
 
 
@@ -247,6 +248,7 @@ def bootstrap_golden_path(
             'organization_id': str(organization.id),
             'team_id': str(team.id),
             'project_id': str(project.id),
+            'repository_url': project.repository_url,
             'identity_id': str(identity.id),
             'api_key_id': str(api_key.id),
             'api_key_fingerprint': api_key.key_fingerprint,
