@@ -13,7 +13,7 @@ ERROR_STATUS = {
 
 
 class ModelPolicyError(DomainError):
-    def __init__(self, code: str, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, code: str, message: str, *, retryable: bool = False, http_status: int | None = None) -> None:
         super().__init__(
             message,
             error_code=code,
@@ -21,6 +21,7 @@ class ModelPolicyError(DomainError):
         )
         self.code = code
         self.retryable = retryable
+        self.http_status = http_status
 
 
 class ProviderSecretError(DomainError):

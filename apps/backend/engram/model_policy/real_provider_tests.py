@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from engram.context.context_api_tests import create_project_scope
+from engram.core.models import AuditResult
 from engram.model_policy import services
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
@@ -24,6 +25,7 @@ from engram.model_policy.services import (
     get_provider_gateway,
     policy_supports_json_object,
     resolve_context_window_tokens,
+    resolve_max_tokens,
 )
 
 
@@ -1566,3 +1568,244 @@ def test_openai_gateway_constructor_timeout_overrides_env(monkeypatch: pytest.Mo
     )
 
     assert opener.timeouts == [9]
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment'])
+def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    content = '{"memories": []}' if response_kind != 'single' else 'Title\nBody'
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': content}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id=f'max-tokens-{response_kind}',
+            trace_id=f'max-tokens-{response_kind}',
+            prompt='prompt text',
+            response_kind=response_kind,
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == resolve_max_tokens(policy, response_kind)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_chat_payload_max_tokens_metadata_override_respected() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation', metadata={'max_tokens': 2048})
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': '{"memories": []}'}}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='max-tokens-override-1',
+            trace_id='max-tokens-override-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == 2048
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embed_payload_omits_max_tokens() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    opener = _opener_returning(json.dumps({'data': [{'embedding': [0.1, 0.2, 0.3]}]}).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='embed-no-max-tokens-1',
+            trace_id='embed-no-max-tokens-1',
+            text='text to embed',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'max_tokens' not in sent_body
+
+
+@pytest.mark.django_db
+def test_openai_gateway_call_http_400_creates_error_record_and_still_raises() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(urllib.error.HTTPError('url', 400, 'bad request', {}, None))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        policy=policy,
+        request_id='error-record-call-1',
+        trace_id='error-record-call-1',
+        prompt='PROMPT_MARKER_call_should_never_leak_into_error_metadata',
+    )
+
+    with pytest.raises(ModelPolicyError):
+        gateway.call(data)
+
+    records = ProviderCallRecord.objects.filter(request_id='error-record-call-1')
+    assert records.count() == 1
+    record = records.get()
+    assert record.result == AuditResult.ERROR
+    assert record.metadata['http_status'] == 400
+    assert record.metadata['error_code'] == 'provider_http_error'
+    assert 'PROMPT_MARKER_call_should_never_leak_into_error_metadata' not in json.dumps(record.metadata)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embed_http_400_creates_error_record_and_still_raises() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='embedding')
+    opener = _opener_raising(urllib.error.HTTPError('url', 400, 'bad request', {}, None))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    data = EmbeddingCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        policy=policy,
+        request_id='error-record-embed-1',
+        trace_id='error-record-embed-1',
+        text='EMBED_MARKER_should_never_leak_into_error_metadata',
+    )
+
+    with pytest.raises(ModelPolicyError):
+        gateway.embed(data)
+
+    records = ProviderCallRecord.objects.filter(request_id='error-record-embed-1')
+    assert records.count() == 1
+    record = records.get()
+    assert record.result == AuditResult.ERROR
+    assert record.metadata['http_status'] == 400
+    assert record.metadata['error_code'] == 'provider_http_error'
+    assert 'EMBED_MARKER_should_never_leak_into_error_metadata' not in json.dumps(record.metadata)
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_call_http_400_creates_error_record_and_still_raises() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic', base_url='https://api.z.ai/api/anthropic')
+    opener = _opener_raising(urllib.error.HTTPError('url', 400, 'bad request', {}, None))
+    gateway = AnthropicMessagesGateway(base_url='https://api.z.ai/api/anthropic', api_key='key', opener=opener)
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        policy=policy,
+        request_id='anthropic-error-record-call-1',
+        trace_id='anthropic-error-record-call-1',
+        prompt='ANTHROPIC_PROMPT_MARKER_should_never_leak_into_error_metadata',
+    )
+
+    with pytest.raises(ModelPolicyError):
+        gateway.call(data)
+
+    records = ProviderCallRecord.objects.filter(request_id='anthropic-error-record-call-1')
+    assert records.count() == 1
+    record = records.get()
+    assert record.result == AuditResult.ERROR
+    assert record.metadata['http_status'] == 400
+    assert record.metadata['error_code'] == 'provider_http_error'
+    assert 'ANTHROPIC_PROMPT_MARKER_should_never_leak_into_error_metadata' not in json.dumps(record.metadata)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_call_timeout_creates_error_record_with_no_http_status() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_raising(TimeoutError())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        policy=policy,
+        request_id='error-record-timeout-1',
+        trace_id='error-record-timeout-1',
+        prompt='prompt text',
+    )
+
+    with pytest.raises(ModelPolicyError):
+        gateway.call(data)
+
+    record = ProviderCallRecord.objects.get(request_id='error-record-timeout-1')
+    assert record.result == AuditResult.ERROR
+    assert record.metadata['http_status'] is None
+    assert record.metadata['error_code'] == 'provider_timeout'
+
+
+@pytest.mark.django_db
+def test_openai_gateway_call_records_measured_latency_not_hardcoded_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {'choices': [{'message': {'content': 'Title\nBody'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    monotonic_values = iter([100.0, 100.25])
+    monkeypatch.setattr('time.monotonic', lambda: next(monotonic_values))
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='latency-measured-1',
+            trace_id='latency-measured-1',
+            prompt='prompt text',
+        ),
+    )
+
+    record = ProviderCallRecord.objects.get(id=result.call_record_id)
+    assert record.latency_ms == 250
+    assert record.latency_ms > 0
+
+
+@pytest.mark.django_db
+def test_openai_gateway_call_success_creates_single_recorded_record_no_error_record() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    completion = {'choices': [{'message': {'content': 'Memory title\nMemory body'}}]}
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='regression-success-1',
+            trace_id='regression-success-1',
+            prompt='prompt text',
+        ),
+    )
+
+    assert result.generated_title == 'Memory title'
+    assert result.generated_body == 'Memory body'
+    records = ProviderCallRecord.objects.filter(request_id='regression-success-1')
+    assert records.count() == 1
+    record = records.get()
+    assert record.result == AuditResult.RECORDED
+    assert not ProviderCallRecord.objects.filter(
+        request_id='regression-success-1',
+        result=AuditResult.ERROR,
+    ).exists()
