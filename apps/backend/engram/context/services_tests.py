@@ -20,6 +20,8 @@ from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api
 from engram.context.services import (
     BuildContextBundle,
     ContextBundleInput,
+    IndexMemoryVersion,
+    IndexMemoryVersionInput,
     RetrievalMatch,
     _pack_to_budget,
     _semantic_retrieval_matches_python,
@@ -33,6 +35,7 @@ from engram.context.services import (
     resolve_lexical_recall_enabled,
     resolve_require_provenance_enabled,
     resolve_retrieval_strategy,
+    score_retrieval_document,
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
@@ -495,6 +498,46 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
 
     assert [match.document.id for match in matches] == [document.id]
     assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
+
+
+# IndexMemoryVersion — extracted symbols/exact_terms
+
+
+@pytest.mark.django_db
+def test_index_memory_version_merges_extracted_symbols_and_exact_terms(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Scope resolver gotcha',
+        body='`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.',
+        status=MemoryStatus.APPROVED,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='hash-resolve-scope',
+    )
+
+    result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = result.retrieval_document
+    assert 'resolve_scope' in document.symbols
+    assert 'accessdeniederror' in document.exact_terms
+    match = score_retrieval_document(
+        document,
+        query='',
+        file_paths=(),
+        symbols=('resolve_scope',),
+        has_request_terms=True,
+    )
+    assert match is not None
+    assert match.score == 80
 
 
 # lexical fusion (RRF)

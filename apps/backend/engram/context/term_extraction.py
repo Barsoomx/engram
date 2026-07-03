@@ -4,6 +4,7 @@ _MAX_TERMS = 32
 _MAX_TERM_LENGTH = 120
 _MIN_SYMBOL_LENGTH = 3
 _MIN_EXACT_TERM_LENGTH = 4
+_MIN_DOTTED_PATH_LENGTH = 6
 
 _BACKTICK_RE = re.compile(r'`([^`\n]{2,120})`')
 _IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*(?:\(\))?$')
@@ -42,7 +43,7 @@ def extract_symbols(title: str, body: str) -> tuple[str, ...]:
             found.append(candidate.removesuffix('()'))
     for match in _DOTTED_PATH_RE.finditer(text):
         value = match.group(0)
-        if len(value) >= 6:
+        if len(value) >= _MIN_DOTTED_PATH_LENGTH:
             found.append(value)
     found.extend(_CALL_RE.findall(text))
     found.extend(_CAMEL_CASE_RE.findall(text))

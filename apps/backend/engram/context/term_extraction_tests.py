@@ -37,3 +37,8 @@ def test_caps_and_dedupe() -> None:
     symbols = extract_symbols('t', body)
     assert len(symbols) == 32
     assert len({s.casefold() for s in symbols}) == 32
+
+
+def test_extract_functions_handle_empty_strings() -> None:
+    assert extract_symbols('', '') == ()
+    assert extract_exact_terms('', '') == ()

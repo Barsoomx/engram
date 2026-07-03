@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.context.term_extraction import extract_exact_terms, extract_symbols
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
@@ -724,12 +725,16 @@ class IndexMemoryVersion:
             observation.files_read if observation is not None else [],
             observation.files_modified if observation is not None else [],
         )
-        symbols = unique_text_values(metadata.get('symbols', []))
+        symbols = unique_text_values(
+            metadata.get('symbols', []),
+            extract_symbols(memory.title, version.body),
+        )
         exact_terms = list(
             normalize_lookup_values(
                 [
                     *metadata.get('exact_terms', []),
                     memory.title,
+                    *extract_exact_terms(memory.title, version.body),
                 ],
             ),
         )
