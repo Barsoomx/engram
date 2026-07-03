@@ -1,9 +1,17 @@
 # Project Routing Parity: repository_url on the Memory Read/Write Surface
 
-Date: 2026-07-03
+Date: 2026-07-03 (amended same day per operator directive)
 Status: Proposed (design)
 Branch: `feat/project-routing-parity`
 Base: `f7ec20eb` (origin/master)
+
+Operator directive (decided requirement, not an option to weigh): project
+resolution must happen automatically from the current repository, everywhere —
+MCP tools, hooks, CLI. The credential (agent key) is user/org-scoped by
+design, so "which project is this" semantics belongs to the
+client/plugin/server layer, never to per-project config pinning. A single
+`project_id` in `~/.engram/config.json` is structurally wrong for multi-repo
+use and is demoted to an optional override at most.
 
 ## Problem
 
@@ -102,22 +110,71 @@ goal.md's tenancy contract ("A project-scoped key cannot read or write
 another project") and must be closed by the same resolver this spec
 introduces.
 
+### Latent mis-routing finding: MCP server cwd is not the workspace
+
+`resolve_runtime` derives the repo from `git_remote_url(os.getcwd())`
+(`mcp_tools.py:50`), and the plugin MCP wrapper
+(`packages/claude-plugin/hooks/mcp.py`) does not chdir — the server inherits
+whatever cwd Claude Code gives it. Claude Code does NOT guarantee the
+workspace as cwd for stdio MCP servers; for user-scope plugin installs the
+process cwd points at the **plugin cache**, a known bug
+(github.com/anthropics/claude-code issue #42687). The documented mechanism is
+the `CLAUDE_PROJECT_DIR` environment variable, set for spawned stdio MCP
+servers since Claude Code v2.1.139 (code.claude.com/docs/en/mcp.md).
+
+This is worse than a dead fallback: the plugin cache of a git-installed
+marketplace is itself a git checkout, so `git remote get-url origin` inside it
+returns the **marketplace repo's** URL — today's "working" `engram_search` /
+`engram_context` fallback can silently resolve (and auto-create) a project for
+the marketplace repo and route memory there. The fix below makes
+`CLAUDE_PROJECT_DIR` the primary derivation source.
+
 ## Decision
 
-**Server-side symmetry (option a), with a single shared, scope-enforcing
-project resolver applied to every repo-url path — plus the thin client change
-that stops gating on project_id.** No new endpoints, no client-side project
-cache, no connect-time pinning.
+Per the operator directive, automatic per-repository routing is the addressing
+model for the entire agent surface. Concretely:
 
-Semantics: **resolve-only** (never auto-create) for the memory/observation
-read/write endpoints. The mutating endpoints target an existing `memory_id`;
-a project that does not exist cannot contain that memory, so auto-creating one
-as a side effect of a failed write is pure garbage-row generation.
-Observations list similarly reads existing data. Auto-create remains where it
-belongs: hook ingest (first write of real data). When both `project_id` and
-`repository_url` are sent, `project_id` wins and `repository_url` is ignored —
-matching `hooks/services.py:78`, `search/services.py:83`,
-`context/services.py:891`.
+**Server-side symmetry across ALL agent-facing endpoints, with a single
+shared, scope-enforcing project resolver — plus clients that always derive
+`repository_url` from the current repository when no explicit project
+override is given.** No new endpoints, no client-side project cache, no
+connect-time pinning (rejected up front by the directive).
+
+### Resolve semantics per endpoint class
+
+| Endpoint class | Semantics | Justification |
+|---|---|---|
+| Hooks ingest (`/v1/hooks/*`) | resolve-or-**create** | First write of real data; a new repo legitimately becomes a Project here. Unchanged. |
+| Context bundles (`/v1/context/*`) | resolve-or-create (unchanged) | Session-start may precede the first hook event of a brand-new repo; the session row needs a project to attach to. |
+| Search (`/v1/search/`) | resolve-or-create (unchanged) | Pre-existing behavior preserved to keep the slice reviewable; converting to resolve-only is flagged as a follow-up decision (a read path creating projects is a wart). |
+| Observations read (`/v1/observations/`, `/{id}`) | resolve-**only**, 404 `project_not_found` | Reads existing data; a repo with no project has no observations — creating an empty project as a read side effect is garbage-row generation. |
+| Memory mutations (`/v1/memories/{id}/feedback\|version\|links`) | resolve-only, 404 | The target `memory_id` must already exist inside the project; a just-created project cannot contain it, so auto-create could only ever precede a 404. |
+| Memory reads (`/v1/memories/{id}/version\|links\|diff` GET) | resolve-only, 404 | Same argument as observations. |
+
+When both `project_id` and `repository_url` are sent, `project_id` wins and
+`repository_url` is ignored — matching `hooks/services.py:78`,
+`search/services.py:83`, `context/services.py:891`.
+
+### One precedence ladder, everywhere (client-side)
+
+Project selection follows a single documented ladder on every surface; the
+server always re-authorizes the outcome, so no rung can expand scope:
+
+1. **Explicit per-call argument** — new optional `project_id` argument on all
+   six MCP tools; new optional `--project` flag on `engram search`,
+   `engram observations`, `engram memory version|link|links`. Hooks: the
+   harness-input `project_id` field (already supported).
+2. **`ENGRAM_PROJECT_ID` env var** (already read by `resolve_runtime`,
+   `mcp_tools.py:45-47`; hooks currently skip env — harmonized by this slice).
+3. **`~/.engram/config.json` `project_id`** — optional override only;
+   `engram connect` keeps working without `--project` as the default flow.
+4. **Repo-derived `repository_url`** — the normal case, derived from the
+   current repository (derivation source ladder in §4).
+
+Rungs 1-3 produce a `project_id` payload/param; rung 4 produces
+`repository_url`. The ladder replaces today's mixed behaviors (MCP: env >
+config > cwd for two tools, hard-fail for four; CLI: config-only; hooks:
+config > payload url > payload cwd).
 
 ### Rejected alternatives
 
@@ -132,10 +189,21 @@ matching `hooks/services.py:78`, `search/services.py:83`,
   Server symmetry makes the whole problem disappear without client state; a
   resolve endpoint can still be added later for `engram doctor` UX.
 - **(c) Connect-time pinning (`engram connect` writing project_id).**
+  Rejected up front by the operator directive, and structurally wrong:
   `~/.engram/config.json` is global while developers work in many repos; a
   single pinned project is exactly the model PR #118 removed because "every
   repo writes into one project". Pinning would fix one repo and silently
   corrupt routing for all others.
+- **MCP `roots` capability as the repo-derivation source.** The
+  protocol-native option (client-provided workspace roots) was evaluated and
+  rejected for now: Claude Code advertises `roots` in its initialize
+  capabilities but does not implement it — server-initiated `roots/list`
+  requests time out (claude-code issues #3315, #31893) and
+  `notifications/roots/list_changed` is never sent (#26663). Our stdio server
+  is also a passive request/reply loop (`mcp_server.py:162-180`) with no
+  server-initiated request machinery. Deferred: revisit when Claude Code
+  implements `roots`; the derivation ladder in §4 leaves room to slot it in
+  above the cwd fallback.
 - **Client-only fallback without server changes** is impossible: the server
   serializers reject requests without a `project_id` UUID.
 
@@ -185,12 +253,36 @@ Behavior:
 3. Resolve within `scope.organization_id` only. Missing project:
    `allow_create=True` → create (hooks ingest); else `ProjectNotFoundError`
    (404).
-4. **Membership guard**: allow iff `project.id in scope.project_ids` or
-   `'projects:agent' in scope.capabilities` (the agent branch also covers
-   projects just created in step 3, which cannot be in the precomputed
-   all-org tuple from `access/services.py:293-296`). Otherwise raise
-   `AccessDeniedError('project_scope_denied')` and write a DENIED audit event
-   carrying the resolved project id.
+4. **Membership guard** — binding wins over capability:
+
+   ```python
+   allowed = project.id in scope.project_ids or (
+       scope.actor_type == 'api_key'
+       and not scope.project_bound
+       and 'projects:agent' in scope.capabilities
+   )
+   ```
+
+   Otherwise raise `AccessDeniedError('project_scope_denied')` and write a
+   DENIED audit event carrying the resolved project id.
+
+   The capability branch exists only to admit projects auto-created in
+   step 3, which cannot be in the precomputed all-org tuple
+   (`access/services.py:293-296`) — and it applies ONLY to org-wide
+   (unbound) API-key scopes. A project-BOUND key never takes the branch:
+   its binding is the sole rule, even if the key was (mis)granted
+   `projects:agent`. `EffectiveScope` (`access/services.py:43-51`) does not
+   currently expose the binding, and `project_ids` shape is ambiguous (an
+   org-wide key in a one-project org also yields a length-1 tuple), so this
+   slice adds an explicit `project_bound: bool` field: set from
+   `bool(key.project_id)` where `ResolveApiKeyScope.execute` constructs the
+   scope (`access/services.py:204-213`; the bound branch at
+   `access/services.py:282-288` already forces
+   `project_ids == (key.project_id,)` regardless of capabilities), and
+   `False` in `_session_scope` (`access/request_scope.py:94-103`) — where it
+   is inert anyway, because the `actor_type == 'api_key'` conjunct excludes
+   session scopes from the capability branch (console users are governed by
+   membership/grants alone).
 
 Consumers:
 
@@ -200,9 +292,10 @@ Consumers:
   `search/services.py`, `context/services.py` (`allow_create=True`, existing
   behavior) replace their inline `if data.project_id / resolve_or_create_project`
   blocks so the membership guard applies everywhere. Org-wide agent keys see
-  no behavior change (their `project_ids` covers the org, and the
-  `projects:agent` branch covers auto-create); project-scoped keys sending a
-  mismatched repo url are now denied — that is the fix for the latent finding.
+  no behavior change (their `project_ids` covers the org, and the unbound
+  capability branch covers auto-create); project-BOUND keys sending a
+  mismatched repo url are now denied — with or without `projects:agent` —
+  that is the fix for the latent finding.
 
 ### 2. Serializer changes (backend)
 
@@ -255,26 +348,50 @@ by their grants the same way.
 
 ### 4. Client changes (CLI + MCP bridge)
 
+**Repo-derivation source ladder** (which directory the repository URL is read
+from), shared by a new helper (e.g. `workspace_repository_url()` next to
+`git_remote_url`):
+
+1. MCP bridge: `CLAUDE_PROJECT_DIR` env var when set — the documented
+   workspace pointer Claude Code gives stdio MCP servers (v2.1.139+); fixes
+   the plugin-cache mis-routing finding for `engram_search`/`engram_context`
+   too;
+2. fallback: `os.getcwd()` (correct for `engram mcp serve` launched manually
+   and for other runtimes);
+3. CLI commands: `os.getcwd()` (the user runs them inside the repo);
+4. hooks: unchanged — harness input `repository_url`, else
+   `repository_root`/`cwd` from the hook payload (`commands.py:1290-1293`),
+   which Claude Code populates with the session directory;
+5. deferred rung: MCP `roots/list` above the cwd fallback, once Claude Code
+   implements it (see Rejected alternatives).
+
 `packages/cli/engram_cli/mcp_tools.py`:
 
 - delete the `require_project=True` gate from the four handlers and retire
-  `PROJECT_REQUIRED_MESSAGE`; `resolve_runtime` already returns a
-  repo-url-bearing runtime (`mcp_tools.py:50`) and returns `None` when neither
-  resolves (`mcp_tools.py:54-55`) — the `NOT_CONFIGURED_MESSAGE` path stays;
+  `PROJECT_REQUIRED_MESSAGE`; `resolve_runtime` keeps returning `None` only
+  when neither a project override nor a repo URL resolves
+  (`mcp_tools.py:54-55`) — the `NOT_CONFIGURED_MESSAGE` path stays;
+- `resolve_runtime` derives `repository_url` via the source ladder above
+  instead of bare `os.getcwd()` (`mcp_tools.py:50`);
+- add optional `project_id` to all six tool input schemas
+  (`mcp_server.py:list_tools`), consumed as ladder rung 1;
 - replace `_project_payload` with `_scope_payload` for the three POST tools;
-- `list_observations`: send `repository_url` as a query param when
-  `runtime.project_id` is empty;
+- `list_observations`: send `repository_url` as a query param when no project
+  override resolves;
 - map the new `project_not_found` error to guidance text: "No Engram project
   exists for this repository yet — it is created on the first hook ingest."
 
 `packages/cli/engram_cli/commands.py`:
 
 - `run_observations`, `run_memory_version`, `run_memory_link`,
-  `run_memory_links`: when `config.project_id` is empty, derive
+  `run_memory_links`: apply the precedence ladder — new `--project` flag, then
+  `ENGRAM_PROJECT_ID`, then config `project_id`, then
   `repository_url = git_remote_url(os.getcwd())` exactly like `run_search`
-  (`commands.py:1720-1722`) and send it instead of `project_id`; when neither
-  resolves, fail client-side with the existing `missing_project`-style
-  CliError instead of shipping an empty UUID;
+  (`commands.py:1720-1722`); when nothing resolves, fail client-side with the
+  existing `missing_project`-style CliError instead of shipping an empty UUID;
+- `run_search` gains the same `--project`/env rungs so the ladder is uniform;
+- hook payload builders (`base_hook_payload`, `commands.py:1284-1286`): insert
+  the `ENGRAM_PROJECT_ID` rung between harness-input `project_id` and config;
 - `git_remote_url` (`commands.py:580-595`): strip URL userinfo
   (`https://user:token@host/...` → `https://host/...`) before returning, so
   embedded credentials never leave the machine in any payload or query string
@@ -292,6 +409,9 @@ Vendored plugin bundle: rerun `scripts/sync_plugin_bundle.py` so
   version bump). New error code `project_not_found` (404) is additive.
 - Update `docs/guides/mcp.md:108-116` (remove the documented asymmetry),
   `docs/mcp-tools.md`, `docs/api-reference.md`, `docs/backend-contracts.md`.
+- Document the precedence ladder once (in `docs/guides/mcp.md` +
+  `docs/client-installation.md`) and reference it from the tool/command docs
+  instead of restating per surface.
 
 ## Security
 
@@ -336,12 +456,36 @@ Threat cases and how the design answers them:
    `requested_project_id=None` in repo-url mode. The membership guard adds the
    resolved project id to allow/deny audit metadata so repo-url actions remain
    attributable to a concrete project.
+9. **Per-call `project_id` tool argument is selection, not authorization.**
+   The documented stance "tool arguments cannot expand organization/team/
+   project scope" (`docs/mcp-tools.md:88-89`) stays true: the argument only
+   chooses which project the client asks for; the server's scope narrowing
+   (`ResolveApiKeyScope` with `requested_project_id`) and the membership guard
+   decide. Negative test: tool-arg project_id outside the key's scope →
+   `project_scope_denied`.
+10. **Wrong-workspace routing.** Deriving the repo from an unrelated cwd
+   (plugin cache, home dir) routes memory to the wrong project silently. The
+   `CLAUDE_PROJECT_DIR`-first derivation ladder plus the resolve-only 404 on
+   read/write endpoints bound the blast radius; hooks/context auto-create
+   remains the only place a wrong derivation can mint a project, unchanged
+   from today but now always in-org and membership-guarded.
+11. **Capability-grant foot-gun (bound key with `projects:agent`).** A
+   project-bound key that was (mis)granted `projects:agent` at issue time
+   must NOT be able to use `repository_url` to route into other in-org
+   projects — that would recreate, via a capability grant, the exact hole
+   this spec closes. The guard's `not scope.project_bound` conjunct makes the
+   binding win over the capability on every repo-url path. Required pinning
+   negative test: project-bound key WITH `projects:agent` + foreign in-org
+   repo url → `project_scope_denied` (and the same key + its OWN project's
+   repo url → allowed), on hooks, search, context, and each new endpoint.
 
 ## Testing
 
 - **Unit (backend)**: serializer one-of validation for all nine serializers;
   `resolve_project_for_scope` matrix (project_id path, canonical match,
-  not-found, membership deny, `projects:agent` allow incl. just-created,
+  not-found, membership deny, unbound `projects:agent` allow incl.
+  just-created, bound key WITH `projects:agent` denied for a foreign project
+  and allowed for its own, session scope never takes the capability branch,
   cross-org isolation).
 - **API tests** (next to modules, `*_tests.py` convention):
   `observations_api_tests.py`, `memory_feedback_tests.py`,
@@ -352,15 +496,21 @@ Threat cases and how the design answers them:
   missing both → 400 `project_or_repository_required`, project_id override
   still works, project_id+repository_url → project_id wins.
 - **Retrofit regression tests**: search/context/hooks with a project-scoped
-  key + foreign repo-url now denied; org-wide agent key behavior unchanged
+  key + foreign repo-url now denied — including the pinning case where that
+  key also carries `projects:agent`; org-wide agent key behavior unchanged
   (existing tests keep passing).
 - **CLI tests** (`packages/cli/engram_cli/*_tests.py`): the four commands
   derive repo-url from git when config project_id is null; explicit
   `missing_project` error when neither resolves; userinfo stripped from
-  `git_remote_url` output.
+  `git_remote_url` output; precedence ladder order proven
+  (`--project` > `ENGRAM_PROJECT_ID` > config > repo-derived) for search,
+  observations, and memory commands; hooks honor `ENGRAM_PROJECT_ID`.
 - **MCP tests** (`mcp_tools_tests.py`): four tools send `repository_url` in
   repo-url mode and no longer return the project-required message; observation
-  GET carries the query param; `project_not_found` rendered as guidance text.
+  GET carries the query param; `project_not_found` rendered as guidance text;
+  `project_id` tool argument wins over env/config/repo; `CLAUDE_PROJECT_DIR`
+  wins over cwd when both point at different git repos (plugin-cache
+  mis-routing regression).
 - **E2E**: extend `scripts/e2e_golden_path.py` with a second
   `drive_mcp_stdio` pass using a config dir WITHOUT `project_id`
   (`scripts/e2e_golden_path.py:110-129` currently pins it) and cwd inside a
@@ -376,11 +526,18 @@ Threat cases and how the design answers them:
    succeed from a git repo whose remote maps to an existing project.
 2. From a repo with no matching project, resolve-only endpoints return 404
    `project_not_found` (MCP renders guidance); hooks ingest still auto-creates.
-3. Explicit `project_id` (env or config) behaves exactly as before on every
-   endpoint; console/frontend flows unchanged.
+3. The precedence ladder (tool arg/`--project` > `ENGRAM_PROJECT_ID` > config
+   `project_id` > repo-derived) holds identically on MCP, CLI, and hooks, and
+   is documented in one place; explicit `project_id` behaves exactly as before
+   on every endpoint; console/frontend flows unchanged.
+3a. Under Claude Code, the plugin MCP server derives the repo from
+   `CLAUDE_PROJECT_DIR`, not from its process cwd; a plugin-cache cwd can no
+   longer influence routing.
 4. Project-scoped key + foreign in-org repo-url is denied with
    `project_scope_denied` on hooks, search, context, and all new repo-url
-   endpoints, with DENIED audit events carrying the resolved project id.
+   endpoints, with DENIED audit events carrying the resolved project id —
+   including when the bound key also carries `projects:agent` (binding wins
+   over capability).
 5. Cross-org url resolution is impossible by construction; negative tests
    prove 404 (not foreign data) for every new endpoint.
 6. No payload or stored row contains URL-embedded credentials.
