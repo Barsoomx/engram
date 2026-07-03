@@ -41,9 +41,15 @@ integration, client surfaces, and operations.
   (OpenAI, GLM/ZhipuAI, OpenRouter, local). `ENGRAM_PROVIDER_MODE=real` opts in.
 - Anthropic Messages gateway: Anthropic-compatible adapter for GLM-compatible
   providers routing through the Messages API schema.
-- MCP bridge: newline-delimited JSON-RPC stdio server in `packages/mcp`
-  exposing `engram_search`, `engram_context`, `engram_memory_link`, plus
-  observations and memory-version tools; no local store, embeddings, or secrets.
+- MCP bridge: newline-delimited JSON-RPC stdio server shipped inside
+  `engram-connect` (`engram_cli/mcp_server.py`, `engram_cli/mcp_tools.py`)
+  exposing `engram_search`, `engram_context`, `engram_memory_link`,
+  `engram_observations`, `engram_memory_version`, and
+  `engram_memory_feedback`; delivered automatically to Claude Code via the
+  plugin (plugin-root `.mcp.json`) and registered elsewhere with
+  `engram mcp install`/`engram mcp serve`; no local store, embeddings, or
+  secrets, and no API key written into agent configs. The standalone
+  `packages/mcp` package is retired.
 - CLI commands: `engram search` (calls `POST /v1/search`),
   `engram memory version <id>`, `engram memory link <id>`,
   `engram memory links <id>`, and `engram observations` over existing
@@ -90,9 +96,9 @@ integration, client surfaces, and operations.
   memory, retrieval, and future-session context injection through Compose.
 - Backend health endpoints: `/-/healthz/`, `/-/readyz/`, `/-/startup/`.
 - Repository quality CI, layout contract, and monorepo skeleton across
-  `apps/backend`, `apps/frontend`, `packages/cli`, `packages/mcp`,
+  `apps/backend`, `apps/frontend`, `packages/cli`,
   `packages/claude-plugin`, `packages/codex-plugin`, `plugin-repository`, and
-  `deploy/compose`.
+  `deploy/compose` (the former `packages/mcp` merged into `packages/cli`).
 
 ### Changed
 

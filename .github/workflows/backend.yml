@@ -103,9 +103,6 @@ jobs:
       - name: Run CLI tests
         run: PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v
 
-      - name: Run MCP tests
-        run: PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v
-
       - name: Run Claude plugin contract tests
         run: PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v
 

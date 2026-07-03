@@ -77,12 +77,15 @@ Expected: full CLI suite passes, including `connect`, `doctor`, `disconnect`,
 
 ### 1.6 MCP bridge contract tests
 
+The MCP bridge ships inside `engram-connect` (`engram_cli/mcp_server.py`,
+`engram_cli/mcp_tools.py`), so its contract tests run as part of the CLI suite
+in 1.5.
+
 ```bash
-PYTHONPATH=packages/mcp python3 -m unittest discover -s packages/mcp -p '*_tests.py' -v
-python3 -m compileall packages/cli/engram_cli packages/mcp/engram_mcp
+python3 -m compileall packages/cli/engram_cli
 ```
 
-Expected: contract tests pass and both packages compile without syntax errors.
+Expected: the package compiles without syntax errors.
 
 ### 1.7 Claude Code and Codex plugin contract tests
 

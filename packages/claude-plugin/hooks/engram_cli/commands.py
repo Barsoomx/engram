@@ -577,7 +577,7 @@ def _as_text(value: object) -> str:
     return str(value)
 
 
-def _git_remote_url(path: str) -> str:
+def git_remote_url(path: str) -> str:
     if not path:
         return ""
     try:
@@ -630,7 +630,10 @@ def run_install(
 
         return 1
 
-    return run_doctor(args, stdout, stderr, active_transport)
+    doctor_code = run_doctor(args, stdout, stderr, active_transport)
+    stdout.write("MCP tools ship with the Claude Code plugin (no extra setup).\n")
+
+    return doctor_code
 
 
 def install_claude_plugin(
@@ -1284,7 +1287,7 @@ def base_hook_payload(
     team_id = as_string(config.get("team_id"))
     if team_id:
         payload["team_id"] = team_id
-    repository_url = payload_string(input_payload, "repository_url") or _git_remote_url(
+    repository_url = payload_string(input_payload, "repository_url") or git_remote_url(
         payload_string(input_payload, "repository_root")
         or payload_string(input_payload, "cwd")
     )
@@ -1541,11 +1544,7 @@ def run_mcp_install(
                 remediation_for("missing_config"),
             )
         targets = resolve_mcp_targets(args)
-        entry = build_engram_mcp_entry(
-            server_url=server_url,
-            api_key=api_key,
-            project_id=project_id,
-        )
+        entry = build_engram_mcp_entry(config_dir=args.config_dir)
         written: list[str] = []
         skipped: list[str] = []
         for label, path in targets:
@@ -1583,21 +1582,18 @@ def run_mcp_install(
         return 1
 
 
-def build_engram_mcp_entry(
-    *,
-    server_url: str,
-    api_key: str,
-    project_id: str,
-) -> dict[str, object]:
-    return {
-        "command": "python",
-        "args": ["-m", "engram_mcp"],
-        "env": {
-            "ENGRAM_SERVER_URL": server_url,
-            "ENGRAM_API_KEY": api_key,
-            "ENGRAM_PROJECT_ID": project_id,
-        },
-    }
+def build_engram_mcp_entry(*, config_dir: str | None = None) -> dict[str, object]:
+    engram_bin = shutil.which("engram")
+    if engram_bin:
+        command = engram_bin
+        args_list = ["mcp", "serve"]
+    else:
+        command = sys.executable
+        args_list = ["-m", "engram_cli", "mcp", "serve"]
+    if config_dir:
+        args_list.extend(["--config-dir", config_dir])
+
+    return {"command": command, "args": args_list}
 
 
 def write_engram_mcp_entry(path: Path, entry: dict[str, object]) -> None:
@@ -1723,7 +1719,7 @@ def run_search(
         server_url = normalize_server_url(as_string(config.get("server_url")))
         repository_url = ""
         if not as_string(config.get("project_id")):
-            repository_url = _git_remote_url(os.getcwd())
+            repository_url = git_remote_url(os.getcwd())
         payload = build_search_payload(
             config,
             query=args.query or "",

@@ -1,9 +1,10 @@
 # Engram for Claude Code
 
-Active native Claude Code plugin package for Engram hook capture. The plugin
-registers Claude Code hook events and forwards them to the Engram server through
-a hook runtime bundled inside the plugin. It ships no local worker, no local
-database, and no provider secret storage of its own.
+Active native Claude Code plugin package for Engram hook capture and MCP
+memory tools. The plugin registers Claude Code hook events and an MCP server,
+both backed by a runtime bundled inside the plugin, and forwards everything to
+the Engram server. It ships no local worker, no local database, and no
+provider secret storage of its own.
 
 ## What this plugin does
 
@@ -14,6 +15,9 @@ Claude Code into that memory:
   lifecycle) by emitting hook events.
 - Forwards each event to the Engram server via the bundled hook runtime
   (`hooks/hook.py`, which vendors the thin `engram_cli` client).
+- Registers the bundled Engram MCP server (`hooks/mcp.py`) so Claude Code can
+  call memory tools (search, context, link, observations, version, feedback)
+  directly during a session.
 - Lets future Claude Code sessions recall relevant, server-backed context.
 
 The plugin is a thin adapter. All persistence, retrieval, and secret handling
@@ -21,17 +25,16 @@ live in the Engram server.
 
 ## Prerequisites
 
-1. `python3` >= 3.12 must be on `PATH`. The hook runtime is bundled with the
-   plugin (`hooks/hook.py` + `hooks/engram_cli/`), so a separate `engram` CLI
-   install is **not** required for hooks to fire.
+1. `python3` >= 3.12 must be on `PATH`. The hook and MCP runtime is bundled
+   with the plugin (`hooks/hook.py`, `hooks/mcp.py` + `hooks/engram_cli/`), so
+   a separate `engram` CLI install is **not** required for hooks or MCP tools
+   to work.
 2. Local credentials must exist under `~/.engram` (`config.json`,
    `credentials.json`). These are written by `engram install` / `engram connect`
    (or by the dashboard **Connect agent** button, which prints the one-line
    install command). Until they exist, the hooks fail with the
-   `missing_config` / `missing_credential` error.
-3. (Optional) Register the Engram MCP server with
-   `engram mcp install --runtime claude_code` so Claude Code can query Engram
-   memory directly during a session.
+   `missing_config` / `missing_credential` error, and MCP tools return a
+   not-configured message.
 
 ## Install
 
@@ -103,6 +106,26 @@ The bundled `hooks/engram_cli/` is kept in lockstep with the source at
 `packages/cli/engram_cli/` by `scripts/sync_plugin_bundle.py` (guarded by
 `bundle_sync_tests.py`). The plugin never stores provider secrets and never
 opens a database connection.
+
+## MCP tools
+
+The plugin ships an `.mcp.json` at plugin root that registers the bundled
+Engram MCP server with Claude Code automatically - no separate
+`engram mcp install` step is needed for Claude Code. The entry runs
+`python3 "${CLAUDE_PLUGIN_ROOT}/hooks/mcp.py"`, a `sys.path` shim (mirroring
+`hooks/hook.py`) that starts the vendored `engram_cli` MCP server over stdio.
+
+Six tools are exposed: `engram_search`, `engram_context`,
+`engram_memory_link`, `engram_observations`, `engram_memory_version`, and
+`engram_memory_feedback`. Each resolves server URL, API key, and project/team
+scope from `~/.engram` the same way the hooks do, and calls the Engram server
+under the connected project's RBAC scope. See
+[../../docs/guides/mcp.md](../../docs/guides/mcp.md) and
+[../../docs/mcp-tools.md](../../docs/mcp-tools.md) for the full contract.
+
+To register the same MCP server for Claude Desktop or another MCP client, run
+`engram mcp install --agent claude_desktop`, or point the client at
+`engram mcp serve` directly.
 
 ## Versioning
 
