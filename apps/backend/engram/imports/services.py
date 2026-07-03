@@ -35,6 +35,20 @@ from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidat
 
 ImportReport = dict[str, object]
 
+_MAX_OBSERVATION_TEXT_CHARS = 16000
+_MAX_OBSERVATION_LIST_ITEMS = 100
+
+
+def _capped_text(value: str, cap: int) -> str:
+    return value[:cap]
+
+
+def _capped_list(value: object, cap: int) -> list:
+    if not isinstance(value, list):
+        return []
+
+    return value[:cap]
+
 
 class ClaudeMemImportError(DomainError):
     default_error_code = 'claude_mem_import_error'
@@ -221,6 +235,7 @@ class ClaudeMemImporter:
             'unsupported': [],
             'warnings': [],
             'redactions': {'redacted': False},
+            'truncations': {'truncated': False},
         }
 
     def _zero_counts(self) -> dict[str, dict[str, int]]:
@@ -433,6 +448,7 @@ class ClaudeMemImporter:
             team = Team.objects.get(organization=organization, id=import_input.team_id)
 
         redacted = False
+        truncated = False
         with transaction.atomic():
             sessions, agents_created, sessions_created, session_duplicates, sessions_redacted = self._import_sessions(
                 import_input,
@@ -476,6 +492,7 @@ class ClaudeMemImporter:
                     observation,
                 )
                 redacted = redacted or result['redacted']
+                truncated = truncated or result['truncated']
                 self._record_memory_result(report, result)
 
             for summary in rows['session_summaries']:
@@ -488,10 +505,13 @@ class ClaudeMemImporter:
                     summary,
                 )
                 redacted = redacted or result['redacted']
+                truncated = truncated or result['truncated']
                 self._record_memory_result(report, result)
 
         if redacted:
             report['redactions'] = {'redacted': True}
+        if truncated:
+            report['truncations'] = {'truncated': True}
 
     def _import_sessions(
         self,
@@ -764,6 +784,20 @@ class ClaudeMemImporter:
             redacted=payload_redacted,
         )
         content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
+        raw_body = str(observation_data.get('body') or '')
+        raw_narrative = str(observation_data.get('narrative') or '')
+        raw_facts = observation_data.get('facts') or []
+        raw_concepts = observation_data.get('concepts') or []
+        capped_body = _capped_text(raw_body, _MAX_OBSERVATION_TEXT_CHARS)
+        capped_narrative = _capped_text(raw_narrative, _MAX_OBSERVATION_TEXT_CHARS)
+        capped_facts = _capped_list(raw_facts, _MAX_OBSERVATION_LIST_ITEMS)
+        capped_concepts = _capped_list(raw_concepts, _MAX_OBSERVATION_LIST_ITEMS)
+        truncated = (
+            capped_body != raw_body
+            or capped_narrative != raw_narrative
+            or capped_facts != raw_facts
+            or capped_concepts != raw_concepts
+        )
         observation, observation_created = Observation.objects.get_or_create(
             organization=organization,
             project=project,
@@ -776,10 +810,10 @@ class ClaudeMemImporter:
                 'observation_type': observation_type,
                 'title': str(observation_data.get('title') or '')[:255],
                 'subtitle': str(observation_data.get('subtitle') or '')[:255],
-                'body': str(observation_data.get('body') or ''),
-                'facts': observation_data.get('facts') or [],
-                'narrative': str(observation_data.get('narrative') or ''),
-                'concepts': observation_data.get('concepts') or [],
+                'body': capped_body,
+                'facts': capped_facts,
+                'narrative': capped_narrative,
+                'concepts': capped_concepts,
                 'files_read': observation_data.get('files_read') or [],
                 'files_modified': observation_data.get('files_modified') or [],
                 'prompt_number': int(prompt_number) if prompt_number is not None else None,
@@ -811,6 +845,7 @@ class ClaudeMemImporter:
 
         return {
             'redacted': payload_redacted or observation_redacted,
+            'truncated': truncated,
             'raw_event_created': raw_created,
             'observation_created': observation_created,
             **memory_result,
@@ -819,6 +854,7 @@ class ClaudeMemImporter:
     def _empty_memory_result(self, redacted: bool) -> dict[str, object]:
         return {
             'redacted': redacted,
+            'truncated': False,
             'raw_event_created': False,
             'observation_created': False,
             'candidate_created': False,
