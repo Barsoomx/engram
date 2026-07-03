@@ -31,6 +31,7 @@ from engram.console.exceptions import (
     ProjectSlugTakenError,
     TeamSlugTakenError,
 )
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
@@ -44,8 +45,10 @@ from engram.core.models import (
     MemoryVersion,
     Organization,
     Project,
+    RetrievalDocument,
     Team,
 )
+from engram.core.redaction import redact_value as core_redact_value
 from engram.core.repository import canonicalize_repository_url
 from engram.memory.conflict_links import clear_candidate_conflict_links
 
@@ -430,6 +433,18 @@ def _lock_memory_or_404(
     return memory
 
 
+def _redact_text(value: str) -> str:
+    return str(core_redact_value(value).value)
+
+
+def _candidate_file_paths(candidate: MemoryCandidate) -> list[str]:
+    observation = candidate.source_observation
+    if observation is None:
+        return []
+
+    return [_redact_text(file_path) for file_path in [*observation.files_read, *observation.files_modified]]
+
+
 @transaction.atomic
 def approve_memory_candidate(
     organization: Organization,
@@ -461,7 +476,7 @@ def approve_memory_candidate(
         },
     )
 
-    MemoryVersion.objects.create(
+    version = MemoryVersion.objects.create(
         organization=memory.organization,
         project=memory.project,
         memory=memory,
@@ -470,6 +485,17 @@ def approve_memory_candidate(
         content_hash=candidate.content_hash,
         source_observation=candidate.source_observation,
     )
+
+    index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = index_result.retrieval_document
+
+    file_paths = _candidate_file_paths(candidate)
+
+    if document.file_paths != file_paths:
+        document.file_paths = file_paths
+
+        document.save(update_fields=['file_paths', 'updated_at'])
 
     candidate.status = CandidateStatus.PROMOTED
 
@@ -501,6 +527,9 @@ def edit_memory_body(
 ) -> MemoryVersion:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    if memory.kind == 'digest':
+        raise MemoryReviewError('invalid_state', 'digest memories cannot be edited')
+
     next_version = memory.current_version + 1
 
     version = MemoryVersion.objects.create(
@@ -517,6 +546,9 @@ def edit_memory_body(
     memory.current_version = next_version
 
     memory.save(update_fields=['body', 'current_version', 'updated_at'])
+
+    if memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted:
+        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     audit_admin_action(
         organization=organization,
@@ -564,6 +596,8 @@ def supersede_memory(
     memory.stale = True
 
     memory.save(update_fields=['stale', 'updated_at'])
+
+    RetrievalDocument.objects.filter(memory=memory).update(stale=True, updated_at=timezone.now())
 
     return _record_memory_link(
         organization=organization,
@@ -653,7 +687,11 @@ def reject_review_item(
 
         item.status = MemoryStatus.REFUTED
 
-        item.save(update_fields=['status', 'updated_at'])
+        item.refuted = True
+
+        item.save(update_fields=['status', 'refuted', 'updated_at'])
+
+        RetrievalDocument.objects.filter(memory=item).update(refuted=True, updated_at=timezone.now())
 
         target_type = 'memory'
 

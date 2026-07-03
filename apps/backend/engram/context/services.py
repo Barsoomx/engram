@@ -12,6 +12,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.context.term_extraction import extract_exact_terms, extract_symbols
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
@@ -705,6 +706,24 @@ def resolve_query_embedding(
     return result
 
 
+def derive_retrieval_terms(metadata: dict[str, object], title: str, body: str) -> tuple[list[str], list[str]]:
+    symbols = unique_text_values(
+        metadata.get('symbols', []),
+        extract_symbols(title, body),
+    )
+    exact_terms = list(
+        normalize_lookup_values(
+            [
+                *metadata.get('exact_terms', []),
+                title,
+                *extract_exact_terms(title, body),
+            ],
+        ),
+    )
+
+    return symbols, exact_terms
+
+
 class IndexMemoryVersion:
     def execute(self, data: IndexMemoryVersionInput) -> IndexMemoryVersionResult:
         version = MemoryVersion.objects.select_related(
@@ -724,15 +743,7 @@ class IndexMemoryVersion:
             observation.files_read if observation is not None else [],
             observation.files_modified if observation is not None else [],
         )
-        symbols = unique_text_values(metadata.get('symbols', []))
-        exact_terms = list(
-            normalize_lookup_values(
-                [
-                    *metadata.get('exact_terms', []),
-                    memory.title,
-                ],
-            ),
-        )
+        symbols, exact_terms = derive_retrieval_terms(metadata, memory.title, version.body)
         full_text = f'{memory.title}\n\n{version.body}'.strip()
 
         retrieval_document, created = RetrievalDocument.objects.update_or_create(

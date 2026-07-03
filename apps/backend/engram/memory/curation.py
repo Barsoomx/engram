@@ -8,6 +8,7 @@ from decimal import Decimal
 import structlog
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents, cosine_similarity
@@ -260,6 +261,7 @@ def supersede_memory_system(
 
     loser.stale = True
     loser.save(update_fields=['stale', 'updated_at'])
+    RetrievalDocument.objects.filter(memory=loser).update(stale=True, updated_at=timezone.now())
     link, _created = MemoryLink.objects.get_or_create(
         memory=loser,
         link_type=LinkType.SUPERSEDED_BY,

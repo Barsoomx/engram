@@ -11,6 +11,7 @@ from django.db import connection
 from django.test.utils import CaptureQueriesContext
 
 from engram.access.models import Capability, Identity, IdentityType, Role
+from engram.access.services import EffectiveScope
 from engram.console.exceptions import (
     MemberAlreadyInvitedError,
     ProjectSlugTakenError,
@@ -36,6 +37,7 @@ from engram.console.services import (
     revoke_api_key,
     supersede_memory,
 )
+from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
     CandidateStatus,
     LinkType,
@@ -45,6 +47,7 @@ from engram.core.models import (
     MemoryStatus,
     Organization,
     Project,
+    RetrievalDocument,
     VisibilityScope,
 )
 
@@ -111,6 +114,7 @@ def _make_memory(
     project: Project,
     *,
     status: str = MemoryStatus.CONFLICT,
+    kind: str = '',
 ) -> Memory:
     counter = Memory.objects.count()
 
@@ -122,6 +126,21 @@ def _make_memory(
         status=status,
         visibility_scope=VisibilityScope.PROJECT,
         confidence='0.500',
+        metadata={'kind': kind} if kind else {},
+    )
+
+
+def _read_scope(organization: Organization, project: Project) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(project.id,),
+        team_ids=(),
+        capabilities=(),
+        actor_type='user',
+        actor_id='reader',
+        project_bound=True,
     )
 
 
@@ -233,6 +252,25 @@ def test_approve_memory_candidate_promotes_candidate(
 
 
 @pytest.mark.django_db
+def test_approve_memory_candidate_creates_indexed_retrieval_document(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    document = RetrievalDocument.objects.get(memory=memory)
+
+    assert document.full_text.startswith(memory.title)
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [authorized_document.memory_id for authorized_document in authorized]
+
+
+@pytest.mark.django_db
 def test_approve_memory_candidate_clears_conflict_links(
     f_organization: Organization,
     f_project: Project,
@@ -287,6 +325,39 @@ def test_edit_memory_body_creates_new_version(
 
 
 @pytest.mark.django_db
+def test_edit_memory_body_reindexes_retrieval_document(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, status=MemoryStatus.APPROVED)
+
+    version = edit_memory_body(f_organization, f_actor_identity, memory, 'updated body text', 'reason')
+
+    document = RetrievalDocument.objects.get(memory_version=version)
+
+    assert 'updated body text' in document.full_text
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_rejects_digest_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, kind='digest')
+
+    with pytest.raises(MemoryReviewError) as error:
+        edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    assert error.value.code == 'invalid_state'
+
+    memory.refresh_from_db()
+
+    assert memory.current_version == 1
+
+
+@pytest.mark.django_db
 def test_narrow_memory_creates_link(
     f_organization: Organization,
     f_project: Project,
@@ -318,6 +389,23 @@ def test_supersede_memory_marks_stale_and_creates_link(
     assert memory.stale is True
 
     assert link.target == str(target.id)
+
+
+@pytest.mark.django_db
+def test_supersede_memory_marks_loser_retrieval_document_stale(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+
+    target = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+
+    supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
+
+    document = RetrievalDocument.objects.get(memory=memory)
+
+    assert document.stale is True
 
 
 @pytest.mark.django_db
@@ -385,6 +473,29 @@ def test_reject_review_item_refutes_memory(
     memory.refresh_from_db()
 
     assert memory.status == MemoryStatus.REFUTED
+
+
+@pytest.mark.django_db
+def test_reject_review_item_refutes_memory_and_syncs_retrieval_document(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+
+    reject_review_item(f_organization, f_actor_identity, memory, 'reason')
+
+    memory.refresh_from_db()
+
+    document = RetrievalDocument.objects.get(memory=memory)
+
+    assert memory.refuted is True
+
+    assert document.refuted is True
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id not in [authorized_document.memory_id for authorized_document in authorized]
 
 
 @pytest.mark.django_db
