@@ -106,7 +106,11 @@ class McpToolsTests(unittest.TestCase):
     def test_search_posts_scope_and_renders_items(self) -> None:
         self.write_local_config()
         transport = StubTransport(
-            body={"items": [{"citation": "c-1", "title": "T", "body": "B"}]}
+            body={
+                "items": [
+                    {"citation": "c-1", "title": "T", "body": "B", "memory_id": "m-1"}
+                ]
+            }
         )
         text = mcp_tools.search_memory(
             {"query": "auth"}, self.config_dir, transport
@@ -119,14 +123,14 @@ class McpToolsTests(unittest.TestCase):
             "11111111-1111-1111-1111-111111111111", payload["project_id"]
         )
         self.assertEqual("Bearer egk_file_key", headers["Authorization"])
-        self.assertIn("[c-1] T", text)
+        self.assertIn("[c-1] T (memory_id=m-1)", text)
 
     def test_search_renders_valid_entries_and_skips_garbage(self) -> None:
         self.write_local_config()
         transport = StubTransport(
             body={
                 "items": [
-                    {"citation": "c-1", "title": "T", "body": "B"},
+                    {"citation": "c-1", "title": "T", "body": "B", "memory_id": "m-1"},
                     "garbage",
                     None,
                 ]
@@ -136,7 +140,7 @@ class McpToolsTests(unittest.TestCase):
             {"query": "auth"}, self.config_dir, transport
         )
 
-        self.assertIn("[c-1] T", text)
+        self.assertIn("[c-1] T (memory_id=m-1)", text)
         self.assertNotIn("garbage", text)
 
     def test_search_uses_repository_url_when_no_project(self) -> None:

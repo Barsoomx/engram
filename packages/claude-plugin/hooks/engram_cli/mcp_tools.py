@@ -132,7 +132,7 @@ def search_memory(
     for item in items:
         if not isinstance(item, dict):
             continue
-        lines.append(f"[{item.get('citation')}] {item.get('title')}")
+        lines.append(f"[{item.get('citation')}] {item.get('title')} (memory_id={item.get('memory_id')})")
         lines.append(f"  {item.get('body')}")
 
     return "\n".join(lines)
