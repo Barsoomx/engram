@@ -51,7 +51,10 @@ from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
     AnthropicMessagesGateway,
     FakeProviderGateway,
+    ModelPolicyError,
     OpenAICompatibleGateway,
+    ProviderCallInput,
+    ProviderCallResult,
     _completion_body,
 )
 
@@ -91,6 +94,16 @@ def sequenced_opener(bodies: list[bytes]) -> Any:
 
 def candidates_body(items: list[dict[str, Any]] | dict[str, Any]) -> bytes:
     return json.dumps({'choices': [{'message': {'content': json.dumps(items)}}]}).encode()
+
+
+class _RaisingGateway:
+    def __init__(self, error: ModelPolicyError) -> None:
+        self._error = error
+        self.calls = 0
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self.calls += 1
+        raise self._error
 
 
 def anthropic_tool_body(memories: list[dict[str, Any]]) -> bytes:
@@ -170,7 +183,13 @@ def create_observation(
     )
 
 
-def create_curation_policy(organization: Organization, team: Team, project: Project) -> ModelPolicy:
+def create_curation_policy(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    fallback_enabled: bool = False,
+) -> ModelPolicy:
     secret = ProviderSecret.objects.create(
         organization=organization,
         team=team,
@@ -201,6 +220,7 @@ def create_curation_policy(organization: Organization, team: Team, project: Proj
         model='gpt-4.1-mini',
         secret=secret,
         version=2,
+        fallback_enabled=fallback_enabled,
     )
 
 
@@ -901,6 +921,45 @@ def test_distill_session_candidate_evidence_matches_its_own_chunk_provider_call(
 
     assert candidate0.evidence[0]['provider_call_id'] == str(record0.id)
     assert candidate1.evidence[0]['provider_call_id'] == str(record1.id)
+
+
+@pytest.mark.django_db
+def test_distill_session_falls_back_to_generation_policy_and_is_sticky_across_chunks(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project, fallback_enabled=True)
+    create_generation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    error = ModelPolicyError('provider_http_error', 'provider returned 400', retryable=False, http_status=400)
+    raising_gateway = _RaisingGateway(error)
+    generation_gateway = FakeProviderGateway()
+
+    def stub_get_provider_gateway(policy: ModelPolicy, **_kwargs: Any) -> Any:
+        if policy.task_type == 'curation':
+            return raising_gateway
+
+        return generation_gateway
+
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', stub_get_provider_gateway)
+    m_monkeypatch.setattr('engram.memory.services.get_provider_gateway', stub_get_provider_gateway)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id, correlation_id='sticky-1'))
+
+    assert raising_gateway.calls == 1
+    assert len(result.provider_call_ids) == 2
+    records = ProviderCallRecord.objects.filter(id__in=result.provider_call_ids)
+    assert records.count() == 2
+    assert all(record.task_type == 'generation' for record in records)
+    candidates = MemoryCandidate.objects.filter(project=project)
+    assert candidates.exists()
+    for candidate in candidates:
+        assert candidate.evidence[0]['task_type'] == 'generation'
+    audit = AuditEvent.objects.get(event_type='ProviderFallbackUsed')
+    assert audit.metadata['task_type'] == 'curation'
+    assert audit.metadata['error_code'] == 'provider_http_error'
 
 
 @pytest.mark.django_db
