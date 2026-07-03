@@ -504,7 +504,7 @@ class CurateMemoryCandidate:
         reason: str,
         data: CurateMemoryCandidateInput,
     ) -> CurateMemoryCandidateResult:
-        truncated_reason = reason[:200]
+        stored_reason = redact_text(reason)[:200]
         already_settled = False
         with transaction.atomic():
             locked = self._lock_candidate(candidate.id)
@@ -517,12 +517,6 @@ class CurateMemoryCandidate:
                     and entry.get('memory_id') == str(existing_memory.id)
                     for entry in locked.evidence
                 )
-                if not has_conflict_entry:
-                    locked.evidence = [
-                        *locked.evidence,
-                        {'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': truncated_reason},
-                    ]
-                    locked.save(update_fields=['evidence', 'updated_at'])
                 MemoryLink.objects.get_or_create(
                     memory=existing_memory,
                     link_type=LinkType.CONFLICTS_WITH,
@@ -533,24 +527,30 @@ class CurateMemoryCandidate:
                         'label': 'contradiction claim',
                     },
                 )
-                AuditEvent.objects.create(
-                    organization=locked.organization,
-                    project=locked.project,
-                    team=locked.team,
-                    event_type='MemoryConflictDetected',
-                    actor_type='system',
-                    target_type='memory_candidate',
-                    target_id=str(locked.id),
-                    capability='memories:review',
-                    result=AuditResult.RECORDED,
-                    correlation_id=data.correlation_id,
-                    metadata={
-                        'candidate_id': str(locked.id),
-                        'memory_id': str(existing_memory.id),
-                        'near_dup_score': f'{score:.2f}',
-                        'reason': truncated_reason,
-                    },
-                )
+                if not has_conflict_entry:
+                    locked.evidence = [
+                        *locked.evidence,
+                        {'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': stored_reason},
+                    ]
+                    locked.save(update_fields=['evidence', 'updated_at'])
+                    AuditEvent.objects.create(
+                        organization=locked.organization,
+                        project=locked.project,
+                        team=locked.team,
+                        event_type='MemoryConflictDetected',
+                        actor_type='system',
+                        target_type='memory_candidate',
+                        target_id=str(locked.id),
+                        capability='memories:review',
+                        result=AuditResult.RECORDED,
+                        correlation_id=data.correlation_id,
+                        metadata={
+                            'candidate_id': str(locked.id),
+                            'memory_id': str(existing_memory.id),
+                            'near_dup_score': f'{score:.2f}',
+                            'reason': stored_reason,
+                        },
+                    )
 
         if already_settled:
             return self._reconcile_already_handled(locked)

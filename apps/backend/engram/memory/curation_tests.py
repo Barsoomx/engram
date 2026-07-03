@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -895,12 +896,62 @@ def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.Monkey
 
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
     second = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+    third = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
 
     duplicate.refresh_from_db()
     assert second.decision == 'held_conflict'
+    assert third.decision == 'held_conflict'
     conflict_entries = [entry for entry in duplicate.evidence if entry.get('type') == 'conflict']
     assert len(conflict_entries) == 1
     assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == 1
+    assert AuditEvent.objects.filter(event_type='MemoryConflictDetected').count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_judge_contradicts_redacts_reason_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(
+        monkeypatch,
+        _JudgeGatewayStub(
+            '{"decision": "contradicts", "reason": "opposite of token sk-abcdef0123456789 already stored"}',
+        ),
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    duplicate.refresh_from_db()
+    conflict_entry = next(entry for entry in duplicate.evidence if entry.get('type') == 'conflict')
+    assert 'sk-abcdef0123456789' not in conflict_entry['reason']
+    assert '[REDACTED]' in conflict_entry['reason']
+    audit = AuditEvent.objects.get(event_type='MemoryConflictDetected')
+    assert 'sk-abcdef0123456789' not in audit.metadata['reason']
+    assert '[REDACTED]' in audit.metadata['reason']
+
+
+@pytest.mark.django_db
+def test_curate_judge_contradicts_truncates_stored_reason_to_200_chars(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    long_reason = 'x' * 250
+    patch_judge_gateway(
+        monkeypatch,
+        _JudgeGatewayStub(json.dumps({'decision': 'contradicts', 'reason': long_reason})),
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    duplicate.refresh_from_db()
+    conflict_entry = next(entry for entry in duplicate.evidence if entry.get('type') == 'conflict')
+    assert len(conflict_entry['reason']) <= 200
+    audit = AuditEvent.objects.get(event_type='MemoryConflictDetected')
+    assert len(audit.metadata['reason']) <= 200
 
 
 @pytest.mark.django_db
