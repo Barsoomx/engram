@@ -362,3 +362,36 @@ def test_resolve_project_for_scope_bound_key_with_agent_capability_allowed_for_o
     resolved = resolve_project_for_scope(scope=scope, project_id=None, repository_url=CANONICAL)
 
     assert resolved.id == project.id
+
+
+@pytest.mark.django_db
+def test_resolve_project_for_scope_bound_key_never_creates_a_project_it_cannot_pass_the_guard_for() -> None:
+    organization, team, project = create_project_scope()
+    owner = create_owner(organization, role_code='organization_admin')
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        capabilities=('observations:write', 'projects:agent'),
+    )
+
+    scope = ResolveApiKeyScope().execute(
+        raw_key=RAW_KEY,
+        required_capability='observations:write',
+        requested_project_id=project.id,
+        request_id='request-bound-agent-nonexistent-1',
+    )
+
+    assert scope.project_bound is True
+    project_count_before = Project.objects.filter(organization=organization).count()
+
+    with pytest.raises(ProjectNotFoundError):
+        resolve_project_for_scope(
+            scope=scope,
+            project_id=None,
+            repository_url='https://gitlab.com/team/never-created.git',
+            allow_create=True,
+        )
+
+    assert Project.objects.filter(organization=organization).count() == project_count_before

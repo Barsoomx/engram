@@ -103,28 +103,29 @@ def resolve_project_for_scope(
             raise RepositoryUrlRequiredError('a resolvable repository_url is required to route memory')
 
         organization = Organization.objects.get(id=scope.organization_id)
-        if allow_create:
+        matched = _match_project(organization, canonical)
+        if matched is not None:
+            project = matched
+        elif allow_create and _unbound_agent_capability(scope):
             project = resolve_or_create_project(
                 organization=organization,
                 repository_url=canonical,
                 repository_root=repository_root,
             )
         else:
-            matched = _match_project(organization, canonical)
-            if matched is None:
-                raise ProjectNotFoundError('no project matches this repository in the requesting organization')
-
-            project = matched
+            raise ProjectNotFoundError('no project matches this repository in the requesting organization')
 
     _authorize_resolved_project(scope, project)
 
     return project
 
 
+def _unbound_agent_capability(scope: EffectiveScope) -> bool:
+    return scope.actor_type == 'api_key' and not scope.project_bound and 'projects:agent' in scope.capabilities
+
+
 def _authorize_resolved_project(scope: EffectiveScope, project: Project) -> None:
-    allowed = project.id in scope.project_ids or (
-        scope.actor_type == 'api_key' and not scope.project_bound and 'projects:agent' in scope.capabilities
-    )
+    allowed = project.id in scope.project_ids or _unbound_agent_capability(scope)
     if allowed:
         return
 
