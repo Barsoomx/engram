@@ -19,6 +19,7 @@ from engram_cli.commands import (
     run_search,
 )
 from engram_cli.http import Transport
+from engram_cli.mcp_server import run_mcp_serve
 
 
 def main(
@@ -46,6 +47,11 @@ def main(
         return run_disconnect(args, output, errors)
     if args.command == "mcp-install":
         return run_mcp_install(args, output, errors, transport)
+    if args.command == "mcp":
+        if args.mcp_command == "install":
+            return run_mcp_install(args, output, errors, transport)
+        if args.mcp_command == "serve":
+            return run_mcp_serve(args, stdin or sys.stdin, output, transport)
     if args.command == "hook":
         return run_hook(args, stdin or sys.stdin, output, errors, transport)
     if args.command == "search":
@@ -119,6 +125,20 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_install.add_argument("--config-dir")
     mcp_install.add_argument("--claude-code-config")
     mcp_install.add_argument("--claude-desktop-config")
+
+    mcp = subparsers.add_parser("mcp")
+    mcp_subparsers = mcp.add_subparsers(dest="mcp_command")
+    mcp_install_group = mcp_subparsers.add_parser("install")
+    mcp_install_group.add_argument(
+        "--agent",
+        choices=("claude_code", "claude_desktop", "both"),
+        default="both",
+    )
+    mcp_install_group.add_argument("--config-dir")
+    mcp_install_group.add_argument("--claude-code-config")
+    mcp_install_group.add_argument("--claude-desktop-config")
+    mcp_serve = mcp_subparsers.add_parser("serve")
+    mcp_serve.add_argument("--config-dir")
 
     hook = subparsers.add_parser("hook")
     hook_subparsers = hook.add_subparsers(dest="hook_command")

@@ -15,6 +15,12 @@ REQUIRED_PACKAGE_FILES = (
     HOOK_MANIFEST_PATH,
 )
 REQUIRED_HOOK_EVENTS = ("SessionStart", "PostToolUse", "SessionEnd", "UserPromptSubmit")
+MCP_MANIFEST_PATH = PACKAGE_ROOT / ".mcp.json"
+MCP_SHIM_PATH = PACKAGE_ROOT / "hooks" / "mcp.py"
+BUNDLED_MCP_MODULES = (
+    PACKAGE_ROOT / "hooks" / "engram_cli" / "mcp_server.py",
+    PACKAGE_ROOT / "hooks" / "engram_cli" / "mcp_tools.py",
+)
 
 
 class ClaudePluginContractTests(unittest.TestCase):
@@ -50,6 +56,32 @@ class ClaudePluginContractTests(unittest.TestCase):
             self.assertIn("--agent claude_code", command)
             self.assertIn("--response-format claude-code", command)
             self.assertNotIn("claude-mem", command)
+
+    def test_claude_plugin_ships_mcp_server(self) -> None:
+        self.assertTrue(MCP_MANIFEST_PATH.exists(), MCP_MANIFEST_PATH)
+        manifest = json.loads(MCP_MANIFEST_PATH.read_text(encoding="utf-8"))
+        entry = manifest["mcpServers"]["engram"]
+
+        self.assertEqual("python3", entry["command"])
+        self.assertEqual(["${CLAUDE_PLUGIN_ROOT}/hooks/mcp.py"], entry["args"])
+        self.assertNotIn("env", entry)
+        self.assertTrue(MCP_SHIM_PATH.exists(), MCP_SHIM_PATH)
+        shim_text = MCP_SHIM_PATH.read_text(encoding="utf-8")
+        self.assertIn('main(["mcp", "serve"])', shim_text)
+        for path in BUNDLED_MCP_MODULES:
+            self.assertTrue(path.exists(), path)
+
+    def test_plugin_versions_match(self) -> None:
+        plugin_version = json.loads(
+            PLUGIN_MANIFEST_PATH.read_text(encoding="utf-8")
+        )["version"]
+        marketplace = json.loads(
+            (PACKAGE_ROOT.parents[1] / ".claude-plugin" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+        self.assertEqual(plugin_version, marketplace["plugins"][0]["version"])
 
 
 if __name__ == "__main__":

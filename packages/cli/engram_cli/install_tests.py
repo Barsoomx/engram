@@ -145,6 +145,7 @@ class InstallTests(unittest.TestCase):
             self.assertTrue((config_dir / "credentials.json").exists())
             self.assertTrue((config_dir / "hooks" / "claude_code.json").exists())
             self.assertIn("All required checks passed", stdout)
+            self.assertIn("MCP tools ship with the Claude Code plugin", stdout)
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 

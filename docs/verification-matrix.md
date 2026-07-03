@@ -1296,3 +1296,35 @@ still resolves and the provider call raises.
 Local e2e (not committed): `ENGRAM_PROVIDER_MODE=real` + a runtime-injected key
 into the encrypted envelope (GLM base_url via `metadata`). Recorded for when a
 local key is available; no key committed.
+
+## 2026-07-03: MCP Delivery (bridge merged into engram-connect, plugin auto-registration)
+
+Branch: `feat/mcp-delivery` (PR #144).
+
+The MCP bridge moved from the orphaned `packages/mcp` into the `engram-connect`
+dist (`engram_cli/mcp_server.py` + `engram_cli/mcp_tools.py`, still
+zero-dependency stdlib). The Claude Code plugin ships plugin-root `.mcp.json` +
+`hooks/mcp.py`, so `engram install` delivers hooks and MCP in one step.
+`engram mcp install|serve` replaces `mcp-install` (kept as deprecated alias);
+the written entry resolves via `engram` on PATH or `sys.executable -m
+engram_cli mcp serve` and carries no API key (credentials resolve at call time
+from env, then `~/.engram`). Six tools ship: search, context, memory_link,
+observations, memory_version, memory_feedback. `packages/mcp` is deleted; its
+contract tests were ported into the CLI suite.
+
+| Check | Local command | CI job | Required | Status | Notes |
+| --- | --- | --- | --- | --- | --- |
+| CLI suite (incl. MCP server + tools tests) | `PYTHONPATH=packages/cli python3 -m unittest discover -s packages/cli -p '*_tests.py' -v` | Backend / Run CLI tests | yes | pass | 136 passed: 20 mcp_tools, 16 mcp_server, adapted mcp-install group, no regressions. |
+| Claude plugin contract tests | `PYTHONPATH=packages/claude-plugin python3 -m unittest discover -s packages/claude-plugin -p '*_tests.py' -v` | Backend / Run Claude plugin contract tests | yes | pass | 8 passed incl. `.mcp.json` shape, shim content, bundled MCP modules, version match. |
+| plugin bundle sync | `python3 scripts/sync_plugin_bundle.py --check` | Repository Quality | yes | pass | Bundle in sync (mcp modules included). |
+| compose golden path + MCP stdio | `python3 scripts/e2e_golden_path.py` | Compose E2E | yes | pass | `MCP stdio bridge passed`: all six tools over real stdio with an org-wide agent key; two `engram_memory_version` calls returned different `current_version` values (2→3, replay excluded); no secret in responses. Local run excluded the frontend image (pre-existing pnpm/proxy env blocker; CI builds the full stack). |
+| claude plugin e2e + MCP | `python3 scripts/e2e_claude_plugin.py` | Claude plugin E2E | yes | pass | `plugin MCP bridge passed`: installed plugin contains `.mcp.json` + `hooks/mcp.py`; shim answered initialize/tools-list (6 tools) and a live search via `ENGRAM_HOME`. |
+
+First decisive failures: fixed default `request_id` values were silently
+replayed by backend idempotency (fixed with per-call `mcp-<uuid4>`);
+`engram_search` output lacked `memory_id`, so agents could not chain
+search → link/version/feedback (now rendered per hit); the fake provider
+distills observations into `Provider-generated memory <hash>` text, so the e2e
+search anchors on `file_paths` + memory_id instead of the run marker; an
+org-wide agent key cannot bind `--team` (`team_scope_denied`), so the agent
+connect omits it.

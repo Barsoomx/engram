@@ -36,7 +36,9 @@ The interactive wizard can wrap the same fields later:
 3. Authenticate by device/browser flow or paste a scoped API key.
 4. Choose organization, team, project, and repository binding.
 5. Install thin hook config for the selected agent.
-6. Optionally install the local MCP bridge for memory tools.
+6. Register the MCP bridge: automatic for Claude Code (bundled with the
+   plugin); explicit via `engram mcp install` for Claude Desktop or other
+   clients.
 7. Run a dry-run hook call and print the resolved identity/scope.
 
 The command must not install Bun, local vector databases, local SQLite stores,
@@ -130,8 +132,11 @@ Build the smallest useful client package:
 
 - `connect`: write thin hooks and verify server scope;
 - `doctor`: validate installed hooks and server reachability;
-- `mcp install`: configure the local MCP bridge without creating a local memory
-  store;
+- `mcp install` / `mcp serve`: register or run the local MCP bridge without
+  creating a local memory store. The Claude Code plugin bundles `mcp serve`
+  and registers it automatically; `mcp install` targets Claude Desktop and
+  other clients that need a config entry written for them. See
+  [guides/mcp.md](guides/mcp.md).
 - `disconnect`: remove local hook entries created by the package.
 
 Everything else stays server-side.
