@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable
+from datetime import timedelta
 from typing import Any
 
-from django.db.models import Q, QuerySet
+from django.db.models import Count, IntegerField, OuterRef, Q, QuerySet, Subquery
+from django.db.models.functions import Coalesce
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
@@ -14,8 +17,9 @@ from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
 from engram.access.services import EffectiveScope
+from engram.core.models import AuditResult
 from engram.model_policy.filters import ModelPolicyFilterSet, ProviderSecretFilterSet
-from engram.model_policy.models import ModelPolicy, ProviderSecret
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 from engram.model_policy.serializers import (
     ModelPolicyCreateSerializer,
     ModelPolicyDisableSerializer,
@@ -49,6 +53,10 @@ from engram.model_policy.services import (
     UpdateProviderSecret,
     UpdateProviderSecretInput,
 )
+
+POLICY_HEALTH_ERROR_WINDOW_HOURS = 24
+
+_HEALTH_UNANNOTATED = object()
 
 
 def _paginated_list_response(
@@ -263,6 +271,7 @@ class ModelPolicyListView(ModelPolicyBaseView):
 
         policies = scoped_policies(scope)
         policies = ModelPolicyFilterSet(data=request.query_params, queryset=policies).qs
+        policies = _annotate_policy_health(policies)
 
         return _paginated_list_response(policies, data, model_policy_response)
 
@@ -472,7 +481,58 @@ def scoped_policies(scope: EffectiveScope) -> QuerySet[ModelPolicy]:
     )
 
 
+def _annotate_policy_health(queryset: QuerySet[ModelPolicy]) -> QuerySet[ModelPolicy]:
+    window_start = timezone.now() - timedelta(hours=POLICY_HEALTH_ERROR_WINDOW_HOURS)
+    last_success_sq = Subquery(
+        ProviderCallRecord.objects.filter(
+            policy_id=OuterRef('id'),
+            result=AuditResult.RECORDED,
+        )
+        .order_by('-created_at')
+        .values('created_at')[:1],
+    )
+    recent_error_sq = Subquery(
+        ProviderCallRecord.objects.filter(
+            policy_id=OuterRef('id'),
+            result=AuditResult.ERROR,
+            created_at__gte=window_start,
+        )
+        .order_by()
+        .values('policy_id')
+        .annotate(error_count=Count('id'))
+        .values('error_count'),
+        output_field=IntegerField(),
+    )
+
+    return queryset.annotate(
+        last_success_at=last_success_sq,
+        recent_error_count=Coalesce(recent_error_sq, 0, output_field=IntegerField()),
+    )
+
+
+def _policy_health_from_db(policy_id: uuid.UUID) -> tuple[Any, int]:
+    window_start = timezone.now() - timedelta(hours=POLICY_HEALTH_ERROR_WINDOW_HOURS)
+    last_success_at = (
+        ProviderCallRecord.objects.filter(policy_id=policy_id, result=AuditResult.RECORDED)
+        .order_by('-created_at')
+        .values_list('created_at', flat=True)
+        .first()
+    )
+    recent_error_count = ProviderCallRecord.objects.filter(
+        policy_id=policy_id,
+        result=AuditResult.ERROR,
+        created_at__gte=window_start,
+    ).count()
+
+    return last_success_at, recent_error_count
+
+
 def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
+    last_success_at = getattr(policy, 'last_success_at', _HEALTH_UNANNOTATED)
+    recent_error_count = getattr(policy, 'recent_error_count', _HEALTH_UNANNOTATED)
+    if last_success_at is _HEALTH_UNANNOTATED or recent_error_count is _HEALTH_UNANNOTATED:
+        last_success_at, recent_error_count = _policy_health_from_db(policy.id)
+
     return {
         'id': str(policy.id),
         'policy_id': str(policy.id),
@@ -489,4 +549,6 @@ def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
         'active': policy.active,
         'fallback_enabled': policy.fallback_enabled,
         'context_window_tokens': policy.metadata.get('context_window_tokens') if policy.metadata else None,
+        'last_success_at': last_success_at.isoformat() if last_success_at else None,
+        'recent_error_count': recent_error_count,
     }

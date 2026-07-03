@@ -34,6 +34,18 @@ _BOOLEAN_SETTINGS_FIELDS = (
     'curator_llm_judge_enabled',
 )
 
+DISTILLATION_THRESHOLD_ADVISORY_CEILING = Decimal('0.6')
+DISTILLATION_THRESHOLD_ADVISORY_MESSAGE = (
+    'per-observation candidates will always be held; session distillation must be healthy for memory to be promoted'
+)
+
+
+def _distillation_threshold_advisory(threshold: Decimal | None) -> str | None:
+    if threshold is not None and threshold > DISTILLATION_THRESHOLD_ADVISORY_CEILING:
+        return DISTILLATION_THRESHOLD_ADVISORY_MESSAGE
+
+    return None
+
 
 def _parse_unit_threshold(raw: object) -> Decimal:
     try:
@@ -115,7 +127,12 @@ class RetrievalSettingsView(APIView):
             target_id=str(settings.id),
         )
 
-        return Response(_serialize_retrieval_settings(settings))
+        response_data = _serialize_retrieval_settings(settings)
+        advisory = _distillation_threshold_advisory(settings.distillation_auto_approve_threshold)
+        if advisory is not None:
+            response_data['advisory'] = advisory
+
+        return Response(response_data)
 
 
 class EmbeddingSettingsView(APIView):
