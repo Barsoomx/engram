@@ -25,6 +25,7 @@ from engram.core.models import (
     RetrievalDocument,
 )
 from engram.memory.conflict_links import clear_candidate_conflict_links
+from engram.memory.escalation import escalation_reason
 from engram.memory.services import (
     MemoryWorkerError,
     PromoteMemoryCandidate,
@@ -298,11 +299,15 @@ class CurateMemoryCandidate:
         if candidate.status != CandidateStatus.PROPOSED:
             raise MemoryWorkerError('Only proposed memory candidates can be curated')
 
-        if not resolve_curator_enabled(candidate.organization):
-            return self._promote(candidate, 'passthrough')
-
         if is_low_signal(candidate):
             return self._reject(candidate, data)
+
+        reason = escalation_reason(candidate)
+        if reason:
+            return self._hold_for_escalation(candidate, reason, data)
+
+        if not resolve_curator_enabled(candidate.organization):
+            return self._promote(candidate, 'passthrough')
 
         embedding = embed_candidate(candidate)
         if embedding is not None:
@@ -497,6 +502,48 @@ class CurateMemoryCandidate:
             return self._replay(candidate)
 
         return CurateMemoryCandidateResult(decision='rejected', candidate=candidate, memory=None)
+
+    def _hold_for_escalation(
+        self,
+        candidate: MemoryCandidate,
+        reason: str,
+        data: CurateMemoryCandidateInput,
+    ) -> CurateMemoryCandidateResult:
+        metadata_reason = f'escalation:{reason}'
+        already_settled = False
+        with transaction.atomic():
+            locked = self._lock_candidate(candidate.id)
+            if locked.status != CandidateStatus.PROPOSED:
+                already_settled = True
+            elif not self._has_escalation_audit(locked):
+                AuditEvent.objects.create(
+                    organization=locked.organization,
+                    project=locked.project,
+                    team=locked.team,
+                    event_type='MemoryCandidateHeldForReview',
+                    actor_type='system',
+                    target_type='memory_candidate',
+                    target_id=str(locked.id),
+                    capability='memories:review',
+                    result=AuditResult.RECORDED,
+                    correlation_id=data.correlation_id,
+                    metadata={'reason': metadata_reason, 'candidate_id': str(locked.id)},
+                )
+
+        if already_settled:
+            return self._reconcile_already_handled(locked)
+
+        return CurateMemoryCandidateResult(decision='held_escalation', candidate=locked, memory=None)
+
+    def _has_escalation_audit(self, candidate: MemoryCandidate) -> bool:
+        audits = AuditEvent.objects.filter(
+            organization=candidate.organization,
+            target_type='memory_candidate',
+            target_id=str(candidate.id),
+            event_type='MemoryCandidateHeldForReview',
+        )
+
+        return any(str(audit.metadata.get('reason', '')).startswith('escalation:') for audit in audits)
 
     def _hold_for_conflict(
         self,

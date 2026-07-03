@@ -116,6 +116,7 @@ def create_candidate(
     body: str,
     content_hash: str,
     confidence: str = '0.900',
+    visibility_scope: str = VisibilityScope.PROJECT,
 ) -> MemoryCandidate:
     return MemoryCandidate.objects.create(
         organization=organization,
@@ -125,7 +126,7 @@ def create_candidate(
         title=title,
         body=body,
         status=CandidateStatus.PROPOSED,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         evidence=[{'kind': 'test'}],
         content_hash=content_hash,
         confidence=Decimal(confidence),
@@ -240,6 +241,14 @@ class _JudgeGatewayStub(FakeProviderGateway):
 class _ExplodingJudgeGateway(FakeProviderGateway):
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         raise AssertionError('the LLM judge must not be consulted on this path')
+
+
+class _ExplodingGateway(FakeProviderGateway):
+    def embed(self, data: object) -> object:
+        raise AssertionError('the embedding provider must not be consulted on this path')
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        raise AssertionError('the judge provider must not be consulted on this path')
 
 
 class _CountingJudgeGatewayStub(FakeProviderGateway):
@@ -607,8 +616,8 @@ def test_curate_disabled_passes_through_to_plain_promotion() -> None:
         organization,
         team,
         project,
-        title='noise',
-        body='noise',
+        title='Networking port',
+        body='Use port 8443 not 8080',
         content_hash='hash-disabled',
     )
 
@@ -1176,6 +1185,130 @@ def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory
     assert len(results) == 2
     assert Memory.objects.count() == 1
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Deploy notes',
+        body='Remember to rotate the client secret before the release goes out',
+        content_hash='hash-escalation-sensitive',
+    )
+    patch_judge_gateway(monkeypatch, _ExplodingGateway())
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    assert result.decision == 'held_escalation'
+    assert result.memory is None
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert Memory.objects.count() == 0
+    assert ProviderCallRecord.objects.count() == 0
+    audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
+    assert audit.actor_type == 'system'
+    assert audit.capability == 'memories:review'
+    assert audit.target_type == 'memory_candidate'
+    assert audit.target_id == str(candidate.id)
+    assert audit.metadata['reason'] == 'escalation:security_sensitive'
+    assert audit.metadata['candidate_id'] == str(candidate.id)
+
+
+@pytest.mark.django_db
+def test_curate_escalates_org_wide_candidate_without_creating_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Org-wide rollout',
+        body=_LONG_BODY,
+        content_hash='hash-escalation-org-wide',
+        visibility_scope=VisibilityScope.ORGANIZATION,
+    )
+    patch_judge_gateway(monkeypatch, _ExplodingGateway())
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    assert result.decision == 'held_escalation'
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert Memory.objects.count() == 0
+    audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
+    assert audit.metadata['reason'] == 'escalation:org_wide_scope'
+
+
+@pytest.mark.django_db
+def test_curate_benign_candidate_promotes_without_escalation() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Networking port',
+        body='Use port 8443 not 8080',
+        content_hash='hash-escalation-benign',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    assert result.decision == 'promoted'
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert Memory.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_escalation_rerun_writes_single_audit_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Deploy notes',
+        body='Remember to rotate the client secret before the release goes out',
+        content_hash='hash-escalation-rerun',
+    )
+    patch_judge_gateway(monkeypatch, _ExplodingGateway())
+
+    first = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    second = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    third = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert first.decision == 'held_escalation'
+    assert second.decision == 'held_escalation'
+    assert third.decision == 'held_escalation'
+    assert AuditEvent.objects.filter(event_type='MemoryCandidateHeldForReview').count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_escalation_holds_even_when_curator_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    set_curator_settings(organization, enabled=False)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Deploy notes',
+        body='Remember to rotate the client secret before the release goes out',
+        content_hash='hash-escalation-disabled-curator',
+    )
+    patch_judge_gateway(monkeypatch, _ExplodingGateway())
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    candidate.refresh_from_db()
+    assert result.decision == 'held_escalation'
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert Memory.objects.count() == 0
 
 
 @pytest.mark.django_db

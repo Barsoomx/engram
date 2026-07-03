@@ -41,15 +41,40 @@ It does:
 - merge duplicates (near-dup merge via embedding cosine similarity);
 - reject low-value observations;
 - promote high-confidence repeated facts to approved memory;
-- escalate ambiguous (gray-band confidence) changes to an LLM judge.
+- escalate ambiguous (gray-band confidence) changes to an LLM judge;
+- escalate candidates that trip a deterministic policy rule, regardless of
+  confidence;
+- hold a candidate that contradicts an existing approved memory.
 
-Marking refuted memories, detecting contradictions, lowering confidence on
-conflicting evidence, archiving, and narrowing scope are human review actions
-(see Human Review), not automated curator outcomes.
+Marking refuted memories, lowering confidence on conflicting evidence,
+archiving, and narrowing scope are human review actions (see Human Review),
+not automated curator outcomes.
 
-Escalation is a single confidence-threshold gate: a candidate below the org's
-auto-approve confidence threshold is held for human review instead of being
-auto-promoted or auto-rejected.
+Escalation to human review happens through three independent gates, any one of
+which is sufficient:
+
+1. **Confidence threshold.** A candidate below the org's auto-approve
+   confidence threshold is held instead of being auto-promoted or
+   auto-rejected.
+2. **Deterministic policy rules.** A candidate is held, without ever reaching
+   the embedding/judge pipeline, when it is organization-wide scoped
+   (`visibility_scope=organization`) or its title/body contains a
+   configured sensitive term (secrets, API keys, CVE identifiers, and
+   similar). Both rules fail closed: they run even when the curator is
+   otherwise disabled for the org
+   (`OrganizationSettings.curator_enabled=False`), and even when the
+   low-signal reject check has already passed. The rule set is
+   configurable via `ENGRAM_CURATOR_ESCALATION_ENABLED` (default on) and
+   `ENGRAM_CURATOR_SENSITIVE_TERMS`.
+3. **Contradiction detection.** When the LLM judge is enabled and classifies a
+   near-duplicate pair as `contradicts` (the candidate asserts the opposite of
+   an existing approved memory), the candidate is held rather than merged,
+   kept, or rejected. The existing memory is left untouched — still approved
+   and retrievable — and a `CONFLICTS_WITH` link is recorded from the existing
+   memory to the held candidate. Re-running curation on the same held
+   candidate is idempotent: it does not create duplicate links or audit rows.
+   Approving or rejecting the candidate during human review clears its
+   conflict links.
 
 ## Human Review
 
@@ -63,13 +88,18 @@ Human review is exception-based:
 
 ## Audit
 
-Audit records are written only for the supersede and auto-reject curator
-outcomes (MemorySuperseded, MemoryAutoRejected); auto-promote does not create
-an audit record. Recorded metadata is narrow: MemorySuperseded stores the
-winning memory id and near-dup score; MemoryAutoRejected stores the reject
-reason, body length, and optional near-dup score. Model policy, provider,
-input window, before/after memory version, and a human-review-required flag
-are not recorded.
+Audit records are written for these curator outcomes: MemorySuperseded
+(near-dup merge), MemoryAutoRejected (low-signal or judge reject),
+MemoryCandidateHeldForReview (deterministic policy escalation), and
+MemoryConflictDetected (judge contradiction hold). Auto-promote does not
+create an audit record. Recorded metadata is narrow: MemorySuperseded stores
+the winning memory id and near-dup score; MemoryAutoRejected stores the reject
+reason, body length, and optional near-dup score;
+MemoryCandidateHeldForReview stores an `escalation:<rule>` reason and the
+candidate id; MemoryConflictDetected stores the candidate id, the conflicting
+memory id, the near-dup score, and a redacted, length-capped judge reason.
+Model policy, provider, input window, before/after memory version, and a
+human-review-required flag are not recorded.
 
 Automatic deletion should be soft-delete/archive in V1. Hard deletion is a later
 retention feature.
