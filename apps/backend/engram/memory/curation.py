@@ -64,7 +64,7 @@ class CurateMemoryCandidateResult:
 
 
 _GRAY_BAND_WIDTH = Decimal('0.10')
-_JUDGE_DECISIONS = frozenset({'merge', 'keep_both', 'reject'})
+_JUDGE_DECISIONS = frozenset({'merge', 'keep_both', 'reject', 'contradicts'})
 _DEFAULT_JUDGE_DECISION = 'keep_both'
 
 
@@ -98,11 +98,13 @@ def curation_judge_system_prompt() -> str:
         '\n'
         'Rules:\n'
         '- Output a single JSON object only, with exactly two keys "decision" and "reason".\n'
-        '- "decision" is one of "merge", "keep_both", "reject".\n'
+        '- "decision" is one of "merge", "keep_both", "reject", "contradicts".\n'
         '- "reason" is one short sentence explaining the decision.\n'
         '- "merge": the same durable fact; the new candidate should supersede the existing memory.\n'
         '- "keep_both": the two memories are distinct durable facts and both should be kept.\n'
         '- "reject": the new candidate adds no durable value beyond the existing memory.\n'
+        '- "contradicts": the candidate asserts the opposite of the existing memory '
+        '(not a duplicate, not unrelated).\n'
         '- Do not name any AI assistant, tool, or product by brand.'
     )
 

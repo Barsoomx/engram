@@ -641,6 +641,7 @@ def test_parse_curation_decision_reads_known_decisions() -> None:
     assert parse_curation_decision('{"decision": "merge"}') == 'merge'
     assert parse_curation_decision('{"decision": "keep_both"}') == 'keep_both'
     assert parse_curation_decision('{"decision": "reject"}') == 'reject'
+    assert parse_curation_decision('{"decision": "contradicts", "reason": "opposite claim"}') == 'contradicts'
 
 
 def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable() -> None:

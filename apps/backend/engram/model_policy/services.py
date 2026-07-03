@@ -938,7 +938,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
         'input_schema': {
             'type': 'object',
             'properties': {
-                'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject']},
+                'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject', 'contradicts']},
                 'reason': {'type': 'string'},
             },
             'required': ['decision', 'reason'],
