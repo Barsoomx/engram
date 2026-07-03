@@ -375,6 +375,9 @@ class ModelPolicyDetailView(ModelPolicyBaseView):
                 task_type=data.get('task_type'),
                 base_url=data.get('base_url'),
                 context_window_tokens=data.get('context_window_tokens'),
+                clear_context_window_tokens=(
+                    'context_window_tokens' in data and data.get('context_window_tokens') is None
+                ),
             ),
         )
 
