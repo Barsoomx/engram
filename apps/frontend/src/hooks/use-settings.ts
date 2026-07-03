@@ -18,6 +18,7 @@ import {
   type EmbeddingSettingsInput,
   type PurgeResult,
   type RetrievalSettings,
+  type RetrievalSettingsUpdateResponse,
 } from '@/lib/settings-api';
 
 export function useRetrievalSettings(
@@ -35,7 +36,7 @@ export function useRetrievalSettings(
 export function useUpdateRetrievalSettings(orgId: string | null) {
   const queryClient = useQueryClient();
 
-  return useMutation<RetrievalSettings, unknown, RetrievalSettings>({
+  return useMutation<RetrievalSettingsUpdateResponse, unknown, RetrievalSettings>({
     mutationFn: (input: RetrievalSettings) => updateRetrievalSettings(input),
     onSuccess: (data) => {
       queryClient.setQueryData(adminQueryKeys.settingsRetrieval(orgId), data);

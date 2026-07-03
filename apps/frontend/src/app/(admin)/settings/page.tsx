@@ -140,6 +140,7 @@ function NumberField({
   onCommit,
   disabled = false,
   allowNull = false,
+  notice = null,
 }: {
   label: string;
   description: string;
@@ -147,6 +148,7 @@ function NumberField({
   onCommit: (next: number | null) => void;
   disabled?: boolean;
   allowNull?: boolean;
+  notice?: string | null;
 }) {
   const [draft, setDraft] = React.useState(value === null ? '' : String(value));
   const [error, setError] = React.useState<string | null>(null);
@@ -204,6 +206,11 @@ function NumberField({
         />
       </div>
       {error && <p className='mt-1.5 text-[11.5px] text-danger'>{error}</p>}
+      {!error && notice && (
+        <p className='mt-1.5 rounded-[9px] border border-warning/30 bg-warning/10 px-2.5 py-1.5 text-[11.5px] leading-relaxed text-warning-600'>
+          {notice}
+        </p>
+      )}
     </div>
   );
 }
@@ -492,6 +499,7 @@ export default function SettingsPage() {
               onCommit={handleAutoApproveChange}
               disabled={!retrieval || retrievalMutation.isPending}
               allowNull
+              notice={retrievalMutation.data?.advisory ?? null}
             />
             <NumberField
               label='Near-duplicate threshold'

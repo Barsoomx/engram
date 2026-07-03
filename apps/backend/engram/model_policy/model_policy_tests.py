@@ -1729,6 +1729,164 @@ def test_model_policy_create_without_context_window_tokens_returns_null() -> Non
 
 
 @pytest.mark.django_db
+def test_model_policy_create_with_fallback_enabled_true_persists_true() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Fallback', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Fallback enabled policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'fallback_enabled': True,
+            'request_id': 'request-policy-fallback-create-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['fallback_enabled'] is True
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.fallback_enabled is True
+
+
+@pytest.mark.django_db
+def test_model_policy_create_without_fallback_enabled_defaults_to_false() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI No Fallback', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'Fallback default policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-fallback-default-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['fallback_enabled'] is False
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.fallback_enabled is False
+
+
+@pytest.mark.django_db
+def test_model_policy_create_with_json_mode_true_stores_in_metadata_and_echoes() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI JSON Mode True', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'JSON mode true policy',
+            'scope': 'team',
+            'task_type': 'curation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'json_mode': True,
+            'request_id': 'request-policy-json-mode-true-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['json_mode'] is True
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.metadata.get('json_mode') is True
+
+
+@pytest.mark.django_db
+def test_model_policy_create_with_json_mode_false_stores_false_in_metadata() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI JSON Mode False', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'JSON mode false policy',
+            'scope': 'team',
+            'task_type': 'curation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'json_mode': False,
+            'request_id': 'request-policy-json-mode-false-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['json_mode'] is False
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert policy.metadata.get('json_mode') is False
+
+
+@pytest.mark.django_db
+def test_model_policy_create_without_json_mode_key_absent_from_metadata() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI JSON Mode Omitted', 'openai')
+
+    response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'JSON mode omitted policy',
+            'scope': 'team',
+            'task_type': 'curation',
+            'provider': 'openai',
+            'model': 'gpt-4o-mini',
+            'secret_id': secret_id,
+            'request_id': 'request-policy-json-mode-omitted-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert response.status_code == 201
+    assert response.json()['json_mode'] is None
+    policy = ModelPolicy.objects.get(id=response.json()['id'])
+    assert 'json_mode' not in policy.metadata
+
+
+@pytest.mark.django_db
 def test_model_policy_update_context_window_tokens_sets_metadata_key() -> None:
     scope = create_project_scope()
     _organization, team, project, _owner, _api_key = scope
