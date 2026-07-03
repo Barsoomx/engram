@@ -49,6 +49,25 @@ from engram.model_policy.services import (
 logger = structlog.get_logger(__name__)
 
 
+def strip_json_fence(raw_body: str) -> str:
+    if not isinstance(raw_body, str):
+        return raw_body
+
+    stripped = raw_body.strip()
+    if not stripped.startswith('```'):
+        return raw_body
+
+    body_lines = stripped.splitlines()[1:]
+    closing_index = next(
+        (index for index in range(len(body_lines) - 1, -1, -1) if body_lines[index].strip() == '```'),
+        None,
+    )
+    if closing_index is None:
+        return raw_body
+
+    return '\n'.join(body_lines[:closing_index]).strip()
+
+
 @dataclass(frozen=True)
 class MemoryCandidateWorkerInput:
     observation_id: uuid.UUID

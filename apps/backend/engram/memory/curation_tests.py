@@ -650,6 +650,18 @@ def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable()
     assert parse_curation_decision('{}') == 'keep_both'
 
 
+def test_parse_curation_decision_strips_json_fence() -> None:
+    assert parse_curation_decision('```json\n{"decision": "reject"}\n```') == 'reject'
+
+
+def test_parse_curation_decision_unfenced_still_parses() -> None:
+    assert parse_curation_decision('{"decision": "reject"}') == 'reject'
+
+
+def test_parse_curation_decision_invalid_still_defaults() -> None:
+    assert parse_curation_decision('this is not json and not fenced either') == 'keep_both'
+
+
 def test_curation_judge_system_prompt_requires_reason() -> None:
     prompt = curation_judge_system_prompt()
 
@@ -662,6 +674,18 @@ def test_parse_curation_reason_reads_reason() -> None:
     assert parse_curation_reason('{"decision": "merge"}') == ''
     assert parse_curation_reason('not json') == ''
     assert parse_curation_reason('[]') == ''
+
+
+def test_parse_curation_reason_strips_json_fence() -> None:
+    assert parse_curation_reason('```json\n{"reason": "dup"}\n```') == 'dup'
+
+
+def test_parse_curation_reason_unfenced_still_parses() -> None:
+    assert parse_curation_reason('{"reason": "dup"}') == 'dup'
+
+
+def test_parse_curation_reason_invalid_still_defaults() -> None:
+    assert parse_curation_reason('this is not json and not fenced either') == ''
 
 
 @pytest.mark.django_db

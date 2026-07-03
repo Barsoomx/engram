@@ -21,6 +21,7 @@ from engram.memory.services import (
     derive_observation_confidence,
     distillation_system_prompt,
     provider_prompt,
+    strip_json_fence,
 )
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import FakeProviderGateway, ProviderCallResult
@@ -425,3 +426,43 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
         == 1
     )
     assert second_run_calls == []
+
+
+def test_strip_json_fence_strips_json_tagged_fence() -> None:
+    fenced = '```json\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_strips_bare_fence() -> None:
+    fenced = '```\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_strips_uppercase_json_tag() -> None:
+    fenced = '```JSON\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_tolerates_trailing_whitespace_and_newlines() -> None:
+    fenced = '```json\n{"memories": []}\n```\n\n   '
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_returns_unfenced_json_unchanged() -> None:
+    unfenced = '{"memories": []}'
+
+    assert strip_json_fence(unfenced) == unfenced
+
+
+def test_strip_json_fence_returns_non_fence_text_unchanged() -> None:
+    text = 'not json at all'
+
+    assert strip_json_fence(text) == text
+
+
+def test_strip_json_fence_returns_non_str_input_unchanged() -> None:
+    assert strip_json_fence(None) is None  # type: ignore[arg-type]
