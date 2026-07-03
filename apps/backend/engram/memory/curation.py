@@ -101,7 +101,7 @@ def curation_judge_system_prompt() -> str:
         '- "decision" is one of "merge", "keep_both", "reject", "contradicts".\n'
         '- "reason" is one short sentence explaining the decision.\n'
         '- "merge": the same durable fact; the new candidate should supersede the existing memory.\n'
-        '- "keep_both": the two memories are distinct durable facts and both should be kept.\n'
+        '- "keep_both": the two memories are distinct, compatible durable facts and both should be kept.\n'
         '- "reject": the new candidate adds no durable value beyond the existing memory.\n'
         '- "contradicts": the candidate asserts the opposite of the existing memory '
         '(not a duplicate, not unrelated).\n'
@@ -336,7 +336,7 @@ class CurateMemoryCandidate:
         data: CurateMemoryCandidateInput,
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
-        decision = self._judge_decision(candidate, document.memory, data)
+        decision, reason = self._judge_decision(candidate, document.memory, data)
         if decision == 'merge':
             return self._supersede(candidate, near_dup, data)
 
@@ -348,6 +348,9 @@ class CurateMemoryCandidate:
                 metadata_extra={'near_dup_score': f'{score:.2f}'},
             )
 
+        if decision == 'contradicts':
+            return self._hold_for_conflict(candidate, document.memory, score, reason, data)
+
         return self._promote(candidate, 'promoted')
 
     def _judge_decision(
@@ -355,7 +358,7 @@ class CurateMemoryCandidate:
         candidate: MemoryCandidate,
         memory: Memory,
         data: CurateMemoryCandidateInput,
-    ) -> str:
+    ) -> tuple[str, str]:
         try:
             resolved = self._resolve_judge_policy(candidate)
             result = get_provider_gateway(resolved.policy).call(
@@ -372,18 +375,19 @@ class CurateMemoryCandidate:
                 ),
             )
         except (ModelPolicyError, ProviderSecretError):
-            return _DEFAULT_JUDGE_DECISION
+            return _DEFAULT_JUDGE_DECISION, ''
 
         decision = parse_curation_decision(result.generated_body)
+        reason = parse_curation_reason(result.generated_body)
         logger.info(
             'curation_judge_decision',
             candidate_id=str(candidate.id),
             memory_id=str(memory.id),
             decision=decision,
-            reason=redact_text(parse_curation_reason(result.generated_body)),
+            reason=redact_text(reason),
         )
 
-        return decision
+        return decision, reason
 
     def _resolve_judge_policy(self, candidate: MemoryCandidate) -> ResolvedModelPolicy:
         try:
@@ -491,6 +495,69 @@ class CurateMemoryCandidate:
             return self._replay(candidate)
 
         return CurateMemoryCandidateResult(decision='rejected', candidate=candidate, memory=None)
+
+    def _hold_for_conflict(
+        self,
+        candidate: MemoryCandidate,
+        existing_memory: Memory,
+        score: float,
+        reason: str,
+        data: CurateMemoryCandidateInput,
+    ) -> CurateMemoryCandidateResult:
+        truncated_reason = reason[:200]
+        already_settled = False
+        with transaction.atomic():
+            locked = self._lock_candidate(candidate.id)
+            if locked.status != CandidateStatus.PROPOSED:
+                already_settled = True
+            else:
+                has_conflict_entry = any(
+                    isinstance(entry, dict)
+                    and entry.get('type') == 'conflict'
+                    and entry.get('memory_id') == str(existing_memory.id)
+                    for entry in locked.evidence
+                )
+                if not has_conflict_entry:
+                    locked.evidence = [
+                        *locked.evidence,
+                        {'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': truncated_reason},
+                    ]
+                    locked.save(update_fields=['evidence', 'updated_at'])
+                MemoryLink.objects.get_or_create(
+                    memory=existing_memory,
+                    link_type=LinkType.CONFLICTS_WITH,
+                    target=f'candidate:{locked.id}',
+                    defaults={
+                        'organization': existing_memory.organization,
+                        'project': existing_memory.project,
+                        'label': 'contradiction claim',
+                    },
+                )
+                AuditEvent.objects.create(
+                    organization=locked.organization,
+                    project=locked.project,
+                    team=locked.team,
+                    event_type='MemoryConflictDetected',
+                    actor_type='system',
+                    target_type='memory_candidate',
+                    target_id=str(locked.id),
+                    capability='memories:review',
+                    result=AuditResult.RECORDED,
+                    correlation_id=data.correlation_id,
+                    metadata={
+                        'candidate_id': str(locked.id),
+                        'memory_id': str(existing_memory.id),
+                        'near_dup_score': f'{score:.2f}',
+                        'reason': truncated_reason,
+                    },
+                )
+
+        if already_settled:
+            return self._reconcile_already_handled(locked)
+
+        return CurateMemoryCandidateResult(
+            decision='held_conflict', candidate=locked, memory=None, near_dup_score=score
+        )
 
     def _supersede(
         self,

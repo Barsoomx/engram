@@ -9,7 +9,8 @@ import pytest
 import structlog
 from django.db import connection
 
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
+from engram.access.services import EffectiveScope
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput, authorized_retrieval_documents
 from engram.core.models import (
     AuditEvent,
     AuditResult,
@@ -18,6 +19,7 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryLink,
+    MemoryStatus,
     Organization,
     OrganizationSettings,
     Project,
@@ -259,6 +261,20 @@ class _CountingJudgeGatewayStub(FakeProviderGateway):
 
 def patch_judge_gateway(monkeypatch: pytest.MonkeyPatch, gateway: FakeProviderGateway) -> None:
     monkeypatch.setattr('engram.memory.curation.get_provider_gateway', lambda *_, **__: gateway)
+
+
+def build_scope(organization: Organization, team: Team, project: Project) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=organization.id,
+        api_key_id=organization.id,
+        project_ids=(project.id,),
+        team_ids=(team.id,),
+        capabilities=(),
+        actor_type='system',
+        actor_id='test',
+        project_bound=False,
+    )
 
 
 def test_is_low_signal_flags_empty_and_title_echo_bodies() -> None:
@@ -670,6 +686,13 @@ def test_curation_judge_system_prompt_requires_reason() -> None:
     assert '"decision"' in prompt
 
 
+def test_curation_judge_system_prompt_keep_both_requires_compatibility() -> None:
+    prompt = curation_judge_system_prompt()
+
+    keep_both_bullet = next(line for line in prompt.splitlines() if line.startswith('- "keep_both"'))
+    assert 'compatible' in keep_both_bullet
+
+
 def test_parse_curation_reason_reads_reason() -> None:
     assert parse_curation_reason('{"decision": "merge", "reason": "same fact"}') == 'same fact'
     assert parse_curation_reason('{"decision": "merge"}') == ''
@@ -821,6 +844,63 @@ def test_curate_judge_reject_applies_even_with_pre_existing_provider_call_record
     assert result.decision == 'rejected'
     assert duplicate.status == CandidateStatus.REJECTED
     assert stub.calls >= 1
+
+
+@pytest.mark.django_db
+def test_curate_judge_contradicts_holds_candidate_and_links(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    duplicate.refresh_from_db()
+    assert result.decision == 'held_conflict'
+    assert result.memory is None
+    assert duplicate.status == CandidateStatus.PROPOSED
+    conflict_entries = [entry for entry in duplicate.evidence if entry.get('type') == 'conflict']
+    assert len(conflict_entries) == 1
+    assert conflict_entries[0]['memory_id'] == str(existing.id)
+    assert conflict_entries[0]['reason'] == 'opposite claim'
+    link = MemoryLink.objects.get(link_type=LinkType.CONFLICTS_WITH)
+    assert link.memory_id == existing.id
+    assert link.target == f'candidate:{duplicate.id}'
+    audit = AuditEvent.objects.get(event_type='MemoryConflictDetected')
+    assert audit.actor_type == 'system'
+    assert audit.capability == 'memories:review'
+    assert audit.target_type == 'memory_candidate'
+    assert audit.target_id == str(duplicate.id)
+    assert audit.metadata['candidate_id'] == str(duplicate.id)
+    assert audit.metadata['memory_id'] == str(existing.id)
+    assert audit.metadata['reason'] == 'opposite claim'
+    assert existing.status == MemoryStatus.APPROVED
+    assert existing.stale is False
+    assert existing.refuted is False
+    documents = authorized_retrieval_documents(organization, project, build_scope(organization, team, project))
+    assert any(document.memory_id == existing.id for document in documents)
+
+
+@pytest.mark.django_db
+def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+    second = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    duplicate.refresh_from_db()
+    assert second.decision == 'held_conflict'
+    conflict_entries = [entry for entry in duplicate.evidence if entry.get('type') == 'conflict']
+    assert len(conflict_entries) == 1
+    assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == 1
 
 
 @pytest.mark.django_db
