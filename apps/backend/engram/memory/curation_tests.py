@@ -39,7 +39,7 @@ from engram.memory.curation import (
     supersede_memory_system,
 )
 from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
-from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
     FakeProviderGateway,
@@ -237,6 +237,24 @@ class _JudgeGatewayStub(FakeProviderGateway):
 class _ExplodingJudgeGateway(FakeProviderGateway):
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         raise AssertionError('the LLM judge must not be consulted on this path')
+
+
+class _CountingJudgeGatewayStub(FakeProviderGateway):
+    def __init__(self, body: str) -> None:
+        self._body = body
+        self.calls = 0
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self.calls += 1
+
+        return ProviderCallResult(
+            provider=data.policy.provider,
+            model=data.policy.model,
+            call_record_id=uuid.uuid4(),
+            redaction_state='clean',
+            generated_title='',
+            generated_body=self._body,
+        )
 
 
 def patch_judge_gateway(monkeypatch: pytest.MonkeyPatch, gateway: FakeProviderGateway) -> None:
@@ -632,6 +650,18 @@ def test_parse_curation_decision_defaults_keep_both_for_unknown_or_unparseable()
     assert parse_curation_decision('{}') == 'keep_both'
 
 
+def test_parse_curation_decision_strips_json_fence() -> None:
+    assert parse_curation_decision('```json\n{"decision": "reject"}\n```') == 'reject'
+
+
+def test_parse_curation_decision_unfenced_still_parses() -> None:
+    assert parse_curation_decision('{"decision": "reject"}') == 'reject'
+
+
+def test_parse_curation_decision_invalid_still_defaults() -> None:
+    assert parse_curation_decision('this is not json and not fenced either') == 'keep_both'
+
+
 def test_curation_judge_system_prompt_requires_reason() -> None:
     prompt = curation_judge_system_prompt()
 
@@ -644,6 +674,18 @@ def test_parse_curation_reason_reads_reason() -> None:
     assert parse_curation_reason('{"decision": "merge"}') == ''
     assert parse_curation_reason('not json') == ''
     assert parse_curation_reason('[]') == ''
+
+
+def test_parse_curation_reason_strips_json_fence() -> None:
+    assert parse_curation_reason('```json\n{"reason": "dup"}\n```') == 'dup'
+
+
+def test_parse_curation_reason_unfenced_still_parses() -> None:
+    assert parse_curation_reason('{"reason": "dup"}') == 'dup'
+
+
+def test_parse_curation_reason_invalid_still_defaults() -> None:
+    assert parse_curation_reason('this is not json and not fenced either') == ''
 
 
 @pytest.mark.django_db
@@ -740,6 +782,44 @@ def test_curate_judge_reject_rejects_candidate(monkeypatch: pytest.MonkeyPatch) 
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
     audit = AuditEvent.objects.get(event_type='MemoryAutoRejected', target_id=str(duplicate.id))
     assert audit.metadata['reason'] == 'near_dup_judge_reject'
+
+
+@pytest.mark.django_db
+def test_curate_judge_reject_applies_even_with_pre_existing_provider_call_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    judge_policy = create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        policy=judge_policy,
+        secret=judge_policy.secret,
+        provider=judge_policy.provider,
+        model=judge_policy.model,
+        task_type=judge_policy.task_type,
+        policy_version=judge_policy.version,
+        request_id=f'curator:{duplicate.id}:judge',
+        trace_id='trace-preexisting-judge',
+        redaction_state='clean',
+        token_usage={'input_tokens': 1, 'output_tokens': 0},
+        cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+        metadata={'prompt_retained': False},
+    )
+    stub = _CountingJudgeGatewayStub('{"decision": "reject"}')
+    patch_judge_gateway(monkeypatch, stub)
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    existing.refresh_from_db()
+    duplicate.refresh_from_db()
+    assert result.decision == 'rejected'
+    assert duplicate.status == CandidateStatus.REJECTED
+    assert stub.calls >= 1
 
 
 @pytest.mark.django_db

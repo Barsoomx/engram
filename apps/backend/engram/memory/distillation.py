@@ -32,6 +32,7 @@ from engram.memory.services import (
     redact_text,
     redact_value,
     resolve_auto_approve_threshold,
+    strip_json_fence,
 )
 from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (
@@ -239,7 +240,7 @@ def _fallback_candidate(raw_body: str) -> SynthesizedCandidate:
 
 def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, ...]:
     try:
-        parsed = json.loads(raw_body)
+        parsed = json.loads(strip_json_fence(raw_body))
     except (json.JSONDecodeError, TypeError):
         return (_fallback_candidate(raw_body),)
 
@@ -313,7 +314,7 @@ def _parse_reduced_candidate_item(item: object) -> _ReducedCandidate | None:
 
 def _parse_reduced_candidates(raw_body: str) -> tuple[_ReducedCandidate, ...] | None:
     try:
-        parsed = json.loads(raw_body)
+        parsed = json.loads(strip_json_fence(raw_body))
     except (json.JSONDecodeError, TypeError):
         return None
 

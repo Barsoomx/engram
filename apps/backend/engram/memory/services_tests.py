@@ -21,7 +21,9 @@ from engram.memory.services import (
     derive_observation_confidence,
     distillation_system_prompt,
     provider_prompt,
+    strip_json_fence,
 )
+from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import FakeProviderGateway, ProviderCallResult
 
 
@@ -257,6 +259,54 @@ def test_generate_candidate_provider_call_has_no_open_transaction(monkeypatch: p
     assert observed_in_atomic == [False]
 
 
+@pytest.mark.django_db
+def test_process_observation_generation_uses_fresh_provider_response_on_repeated_request_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    policy = create_generation_policy(organization, team, project)
+    request_id = f'memory-worker:{observation.id}:generation'
+    ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        policy=policy,
+        secret=policy.secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type=policy.task_type,
+        policy_version=policy.version,
+        request_id=request_id,
+        trace_id='trace-preexisting-generation',
+        redaction_state='clean',
+        token_usage={'input_tokens': 1, 'output_tokens': 0},
+        cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+        metadata={'prompt_retained': False},
+    )
+
+    class _ProviderResponseGateway(FakeProviderGateway):
+        def call(self, data: object) -> ProviderCallResult:
+            real = FakeProviderGateway.call(self, data)
+
+            return ProviderCallResult(
+                provider=real.provider,
+                model=real.model,
+                call_record_id=real.call_record_id,
+                redaction_state=real.redaction_state,
+                generated_title='Fresh provider title',
+                generated_body='Fresh provider body distinct from prompt',
+            )
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _ProviderResponseGateway())
+
+    result = execute_worker(observation)
+
+    assert result.candidate is not None
+    assert result.candidate.body == 'Fresh provider body distinct from prompt'
+    assert provider_prompt(observation) not in result.candidate.body
+    assert ProviderCallRecord.objects.filter(request_id=request_id).count() == 2
+
+
 @pytest.mark.django_db(transaction=True)
 def test_promote_memory_candidate_index_embed_has_no_open_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
@@ -376,3 +426,43 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
         == 1
     )
     assert second_run_calls == []
+
+
+def test_strip_json_fence_strips_json_tagged_fence() -> None:
+    fenced = '```json\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_strips_bare_fence() -> None:
+    fenced = '```\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_strips_uppercase_json_tag() -> None:
+    fenced = '```JSON\n{"memories": []}\n```'
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_tolerates_trailing_whitespace_and_newlines() -> None:
+    fenced = '```json\n{"memories": []}\n```\n\n   '
+
+    assert strip_json_fence(fenced) == '{"memories": []}'
+
+
+def test_strip_json_fence_returns_unfenced_json_unchanged() -> None:
+    unfenced = '{"memories": []}'
+
+    assert strip_json_fence(unfenced) == unfenced
+
+
+def test_strip_json_fence_returns_non_fence_text_unchanged() -> None:
+    text = 'not json at all'
+
+    assert strip_json_fence(text) == text
+
+
+def test_strip_json_fence_returns_non_str_input_unchanged() -> None:
+    assert strip_json_fence(None) is None  # type: ignore[arg-type]

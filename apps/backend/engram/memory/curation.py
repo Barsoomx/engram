@@ -29,6 +29,7 @@ from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     redact_text,
+    strip_json_fence,
 )
 from engram.model_policy.services import (
     EmbeddingCallInput,
@@ -129,7 +130,7 @@ def curation_judge_prompt(candidate: MemoryCandidate, memory: Memory) -> str:
 
 def parse_curation_decision(raw_body: str) -> str:
     try:
-        parsed = json.loads(raw_body)
+        parsed = json.loads(strip_json_fence(raw_body))
     except (json.JSONDecodeError, TypeError):
         return _DEFAULT_JUDGE_DECISION
 
@@ -145,7 +146,7 @@ def parse_curation_decision(raw_body: str) -> str:
 
 def parse_curation_reason(raw_body: str) -> str:
     try:
-        parsed = json.loads(raw_body)
+        parsed = json.loads(strip_json_fence(raw_body))
     except (json.JSONDecodeError, TypeError):
         return ''
 
