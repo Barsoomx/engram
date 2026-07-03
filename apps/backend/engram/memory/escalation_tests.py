@@ -4,6 +4,7 @@ from django.test import override_settings
 
 from engram.core.models import MemoryCandidate, VisibilityScope
 from engram.memory.escalation import escalation_reason
+from settings.settings import _DEFAULT_CURATOR_SENSITIVE_TERMS, csv
 
 
 def test_escalation_reason_flags_sensitive_term_in_body() -> None:
@@ -79,3 +80,14 @@ def test_escalation_reason_reads_custom_sensitive_terms_from_settings() -> None:
 
     assert escalation_reason(default_term_candidate) == ''
     assert escalation_reason(custom_term_candidate) == 'security_sensitive'
+
+
+def test_curator_sensitive_terms_env_value_present_but_empty_falls_back_to_defaults() -> None:
+    parsed_from_empty_env = tuple(term.casefold() for term in csv('', default=_DEFAULT_CURATOR_SENSITIVE_TERMS))
+
+    assert parsed_from_empty_env == _DEFAULT_CURATOR_SENSITIVE_TERMS
+
+    with override_settings(ENGRAM_CURATOR_SENSITIVE_TERMS=parsed_from_empty_env):
+        candidate = MemoryCandidate(title='Deploy notes', body='Rotate the client secret before release')
+
+        assert escalation_reason(candidate) == 'security_sensitive'

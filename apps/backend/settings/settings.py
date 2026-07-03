@@ -195,9 +195,11 @@ _DEFAULT_CURATOR_SENSITIVE_TERMS = (
     'security incident',
 )
 ENGRAM_CURATOR_SENSITIVE_TERMS = tuple(
-    term.strip().casefold()
-    for term in os.environ.get('ENGRAM_CURATOR_SENSITIVE_TERMS', ','.join(_DEFAULT_CURATOR_SENSITIVE_TERMS)).split(',')
-    if term.strip()
+    term.casefold()
+    for term in csv(
+        os.environ.get('ENGRAM_CURATOR_SENSITIVE_TERMS', ','.join(_DEFAULT_CURATOR_SENSITIVE_TERMS)),
+        default=_DEFAULT_CURATOR_SENSITIVE_TERMS,
+    )
 )
 
 CACHES = {
