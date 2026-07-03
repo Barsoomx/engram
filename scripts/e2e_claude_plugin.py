@@ -211,7 +211,7 @@ def locate_installed_plugin_root(home: Path) -> Path:
     raise E2EError(f'Could not locate installed engram plugin root under {home / ".claude"}')
 
 
-def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path) -> None:
+def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path, repo: Path) -> None:
     mcp_manifest = plugin_root / '.mcp.json'
     mcp_shim = plugin_root / 'hooks' / 'mcp.py'
     if not mcp_manifest.exists() or not mcp_shim.exists():
@@ -236,7 +236,7 @@ def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path) -> None:
     ]
     completed = run(
         ['python3', str(mcp_shim)],
-        cwd=plugin_root,
+        cwd=repo,
         env=env,
         secret='',
         input_text='\n'.join(json.dumps(request) for request in requests) + '\n',
@@ -1131,7 +1131,7 @@ def main() -> int:
 
             progress('Verifying plugin ships a working MCP bridge')
             plugin_root = locate_installed_plugin_root(home)
-            assert_plugin_mcp_bridge(plugin_root, home / '.engram')
+            assert_plugin_mcp_bridge(plugin_root, home / '.engram', repo)
             progress('plugin MCP bridge passed')
 
             claude_result = run_claude_prompt(home, repo, mock_port)
