@@ -1244,6 +1244,7 @@ def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory
     assert len(results) == 2
     assert Memory.objects.count() == 1
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+    assert AuditEvent.objects.filter(event_type='MemoryCuratorPromoted').count() == 1
 
 
 @pytest.mark.django_db
@@ -1433,6 +1434,7 @@ def test_curate_no_duplicate_route_audits_curator_promoted() -> None:
     assert audit.metadata['decision'] == 'no_duplicate'
     assert audit.metadata['memory_id'] == str(result.memory.id)
     assert audit.metadata['threshold'] == '0.850'
+    assert 'judge' not in audit.metadata
 
 
 @pytest.mark.django_db

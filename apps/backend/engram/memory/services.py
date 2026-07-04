@@ -510,11 +510,15 @@ class ProcessObservationRecorded:
             target_id=str(candidate.id),
             capability='memories:review',
             result=AuditResult.RECORDED,
-            metadata={
-                'confidence': str(candidate.confidence),
-                'threshold': str(threshold),
-                'observation_id': str(observation.id),
-            },
+            metadata=redact_value(
+                {
+                    'reason': 'below_auto_approve_threshold',
+                    'candidate_id': str(candidate.id),
+                    'confidence': str(candidate.confidence) if candidate.confidence is not None else None,
+                    'threshold': str(threshold),
+                    'source_observation_id': str(observation.id),
+                },
+            ),
         )
 
 
