@@ -972,9 +972,7 @@ class BuildContextBundle:
         )
         kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
         retrieval_latency_ms = round((time.monotonic() - retrieval_started_at) * 1000)
-        tokens_used = sum(
-            estimate_tokens(_render_block(m.document.memory, i)) for i, m in enumerate(kept, start=1)
-        )
+        tokens_used = sum(estimate_tokens(_render_block(m.document.memory, i)) for i, m in enumerate(kept, start=1))
         query_result = redact_value(data.query)
         retrieval_strategy = resolve_retrieval_strategy(matches)
         has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
