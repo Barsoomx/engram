@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import uuid
 from dataclasses import dataclass
@@ -32,12 +33,15 @@ from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     redact_text,
+    redact_value,
     strip_json_fence,
 )
+from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (
     EmbeddingCallInput,
     ModelPolicyError,
     ProviderCallInput,
+    ProviderCallResult,
     ProviderSecretError,
     ResolvedModelPolicy,
     ResolveModelPolicy,
@@ -66,9 +70,132 @@ class CurateMemoryCandidateResult:
     near_dup_score: float | None = None
 
 
+@dataclass(frozen=True)
+class _JudgeOutcome:
+    decision: str
+    reason: str
+    judge_context: dict[str, object] | None = None
+
+
 _GRAY_BAND_WIDTH = Decimal('0.10')
 _JUDGE_DECISIONS = frozenset({'merge', 'keep_both', 'reject', 'contradicts'})
 _DEFAULT_JUDGE_DECISION = 'keep_both'
+_EVIDENCE_ID_KEY_SUFFIXES = ('_id', '_ids')
+_MAX_EVIDENCE_SOURCE_IDS = 50
+
+
+def _evidence_entry_ids(entry: object) -> list[str]:
+    if isinstance(entry, str):
+        return [entry]
+
+    if not isinstance(entry, dict):
+        return []
+
+    if entry.get('type') == 'conflict':
+        return []
+
+    ids: list[str] = []
+    for key, value in entry.items():
+        if not str(key).endswith(_EVIDENCE_ID_KEY_SUFFIXES):
+            continue
+        if isinstance(value, list | tuple):
+            ids.extend(str(item) for item in value if item)
+        elif value:
+            ids.append(str(value))
+
+    return ids
+
+
+def _evidence_source_ids(candidate: MemoryCandidate) -> list[str]:
+    collected: list[str] = []
+    for entry in candidate.evidence:
+        collected.extend(_evidence_entry_ids(entry))
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in collected:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+        if len(unique) >= _MAX_EVIDENCE_SOURCE_IDS:
+            break
+
+    return unique
+
+
+def _audit_curator_action(
+    *,
+    candidate: MemoryCandidate,
+    event_type: str,
+    decision: str,
+    reason: str = '',
+    near_dup_score: float | None = None,
+    threshold: Decimal | None = None,
+    judge_context: dict[str, object] | None = None,
+    extra: dict[str, object] | None = None,
+    target_type: str = 'memory_candidate',
+    target_id: str | None = None,
+    request_id: str = '',
+    correlation_id: str = '',
+) -> None:
+    metadata: dict[str, object] = {
+        'candidate_id': str(candidate.id),
+        'decision': decision,
+        'reason': reason,
+        'near_dup_score': f'{near_dup_score:.2f}' if near_dup_score is not None else None,
+        'threshold': str(threshold) if threshold is not None else None,
+        'source_observation_id': str(candidate.source_observation_id) if candidate.source_observation_id else None,
+        'evidence_source_ids': _evidence_source_ids(candidate),
+    }
+    if judge_context:
+        metadata['judge'] = judge_context
+    if extra:
+        metadata.update(extra)
+
+    AuditEvent.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        event_type=event_type,
+        actor_type='system',
+        actor_id='curator',
+        target_type=target_type,
+        target_id=target_id if target_id is not None else str(candidate.id),
+        capability='memories:review',
+        result=AuditResult.RECORDED,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        metadata=redact_value(metadata),
+    )
+
+
+def _judge_context_snapshot(title: str, body: str) -> dict[str, object]:
+    return {
+        'title': redact_text(title)[:120],
+        'body_sha256': hashlib.sha256(body.encode()).hexdigest(),
+        'body_length': len(body),
+    }
+
+
+def _build_judge_context(
+    policy: ModelPolicy,
+    result: ProviderCallResult,
+    candidate: MemoryCandidate,
+    memory: Memory,
+) -> dict[str, object]:
+    return {
+        'policy_id': str(policy.id),
+        'policy_version': policy.version,
+        'provider': result.provider,
+        'model': result.model,
+        'provider_call_record_id': str(result.call_record_id),
+        'candidate': _judge_context_snapshot(candidate.title, candidate.body),
+        'existing_memory': {
+            'memory_id': str(memory.id),
+            **_judge_context_snapshot(memory.title, memory.body),
+        },
+    }
 
 
 def resolve_curator_enabled(organization: Organization) -> bool:
@@ -250,10 +377,13 @@ def find_near_duplicate(
 def supersede_memory_system(
     loser: Memory,
     winner: Memory,
+    candidate: MemoryCandidate,
     *,
+    score: float | None = None,
+    threshold: Decimal | None = None,
+    judge_context: dict[str, object] | None = None,
     request_id: str = '',
     correlation_id: str = '',
-    score: float | None = None,
 ) -> MemoryLink | None:
     loser = Memory.objects.select_for_update().get(id=loser.id)
     if loser.stale:
@@ -272,22 +402,18 @@ def supersede_memory_system(
             'label': '',
         },
     )
-    AuditEvent.objects.create(
-        organization=loser.organization,
-        project=loser.project,
-        team=loser.team,
+    _audit_curator_action(
+        candidate=candidate,
         event_type='MemorySuperseded',
-        actor_type='system',
+        decision='superseded',
+        near_dup_score=score,
+        threshold=threshold,
+        judge_context=judge_context,
         target_type='memory',
         target_id=str(loser.id),
-        capability='memories:review',
-        result=AuditResult.RECORDED,
         request_id=request_id,
         correlation_id=correlation_id,
-        metadata={
-            'winner_memory_id': str(winner.id),
-            'near_dup_score': f'{score:.2f}' if score is not None else '',
-        },
+        extra={'winner_memory_id': str(winner.id), 'loser_memory_id': str(loser.id)},
     )
 
     return link
@@ -309,13 +435,13 @@ class CurateMemoryCandidate:
             return self._hold_for_escalation(candidate, reason, data)
 
         if not resolve_curator_enabled(candidate.organization):
-            return self._promote(candidate, 'passthrough')
+            return self._promote(candidate, 'passthrough', data, route='passthrough')
 
         embedding = embed_candidate(candidate)
         if embedding is not None:
             return self._curate_with_embedding(candidate, embedding, data)
 
-        return self._promote(candidate, 'promoted')
+        return self._promote(candidate, 'promoted', data, route='embedding_unavailable')
 
     def _curate_with_embedding(
         self,
@@ -329,44 +455,63 @@ class CurateMemoryCandidate:
         documents = self._authorized_documents(candidate)
         near_dup = find_near_duplicate(embedding, documents, floor)
         if near_dup is None:
-            return self._promote(candidate, 'promoted')
+            return self._promote(candidate, 'promoted', data, route='no_duplicate', threshold=threshold)
 
         _document, score = near_dup
         if score >= float(threshold):
-            return self._supersede(candidate, near_dup, data)
+            return self._supersede(candidate, near_dup, data, threshold=threshold)
 
-        return self._judge(candidate, near_dup, data)
+        return self._judge(candidate, near_dup, data, threshold=threshold)
 
     def _judge(
         self,
         candidate: MemoryCandidate,
         near_dup: tuple[RetrievalDocument, float],
         data: CurateMemoryCandidateInput,
+        *,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
-        decision, reason = self._judge_decision(candidate, document.memory, data)
-        if decision == 'merge':
-            return self._supersede(candidate, near_dup, data)
+        outcome = self._judge_decision(candidate, document.memory, data)
+        if outcome.decision == 'merge':
+            return self._supersede(candidate, near_dup, data, judge_context=outcome.judge_context, threshold=threshold)
 
-        if decision == 'reject':
+        if outcome.decision == 'reject':
             return self._reject(
                 candidate,
                 data,
                 reason='near_dup_judge_reject',
-                metadata_extra={'near_dup_score': f'{score:.2f}'},
+                near_dup_score=score,
+                judge_context=outcome.judge_context,
+                threshold=threshold,
             )
 
-        if decision == 'contradicts':
-            return self._hold_for_conflict(candidate, document.memory, score, reason, data)
+        if outcome.decision == 'contradicts':
+            return self._hold_for_conflict(
+                candidate,
+                document.memory,
+                score,
+                outcome.reason,
+                data,
+                judge_context=outcome.judge_context,
+                threshold=threshold,
+            )
 
-        return self._promote(candidate, 'promoted')
+        return self._promote(
+            candidate,
+            'promoted',
+            data,
+            route='judge_keep_both',
+            judge_context=outcome.judge_context,
+            threshold=threshold,
+        )
 
     def _judge_decision(
         self,
         candidate: MemoryCandidate,
         memory: Memory,
         data: CurateMemoryCandidateInput,
-    ) -> tuple[str, str]:
+    ) -> _JudgeOutcome:
         try:
             resolved = self._resolve_judge_policy(candidate)
             result = get_provider_gateway(resolved.policy).call(
@@ -383,7 +528,7 @@ class CurateMemoryCandidate:
                 ),
             )
         except (ModelPolicyError, ProviderSecretError):
-            return _DEFAULT_JUDGE_DECISION, ''
+            return _JudgeOutcome(_DEFAULT_JUDGE_DECISION, '')
 
         decision = parse_curation_decision(result.generated_body)
         reason = parse_curation_reason(result.generated_body)
@@ -395,7 +540,7 @@ class CurateMemoryCandidate:
             reason=redact_text(reason),
         )
 
-        return decision, reason
+        return _JudgeOutcome(decision, reason, _build_judge_context(resolved.policy, result, candidate, memory))
 
     def _resolve_judge_policy(self, candidate: MemoryCandidate) -> ResolvedModelPolicy:
         try:
@@ -445,8 +590,27 @@ class CurateMemoryCandidate:
             duplicate=True,
         )
 
-    def _promote(self, candidate: MemoryCandidate, decision: str) -> CurateMemoryCandidateResult:
+    def _promote(
+        self,
+        candidate: MemoryCandidate,
+        decision: str,
+        data: CurateMemoryCandidateInput,
+        *,
+        route: str,
+        judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
+    ) -> CurateMemoryCandidateResult:
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+        if not promotion.duplicate:
+            _audit_curator_action(
+                candidate=promotion.candidate,
+                event_type='MemoryCuratorPromoted',
+                decision=route,
+                judge_context=judge_context,
+                threshold=threshold,
+                correlation_id=data.correlation_id,
+                extra={'memory_id': str(promotion.memory.id)},
+            )
 
         return CurateMemoryCandidateResult(
             decision=decision,
@@ -463,7 +627,9 @@ class CurateMemoryCandidate:
         data: CurateMemoryCandidateInput,
         *,
         reason: str = 'low_signal',
-        metadata_extra: dict[str, object] | None = None,
+        near_dup_score: float | None = None,
+        judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         already_settled = False
         with transaction.atomic():
@@ -474,24 +640,16 @@ class CurateMemoryCandidate:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
                 clear_candidate_conflict_links(locked)
-                metadata: dict[str, object] = {
-                    'reason': reason,
-                    'body_length': len(redact_text(locked.body).strip()),
-                }
-                if metadata_extra:
-                    metadata.update(metadata_extra)
-                AuditEvent.objects.create(
-                    organization=locked.organization,
-                    project=locked.project,
-                    team=locked.team,
+                _audit_curator_action(
+                    candidate=locked,
                     event_type='MemoryAutoRejected',
-                    actor_type='system',
-                    target_type='memory_candidate',
-                    target_id=str(locked.id),
-                    capability='memories:review',
-                    result=AuditResult.RECORDED,
+                    decision='rejected',
+                    reason=reason,
+                    near_dup_score=near_dup_score,
+                    judge_context=judge_context,
+                    threshold=threshold,
                     correlation_id=data.correlation_id,
-                    metadata=metadata,
+                    extra={'body_length': len(redact_text(locked.body).strip())},
                 )
 
         if already_settled:
@@ -518,18 +676,12 @@ class CurateMemoryCandidate:
             if locked.status != CandidateStatus.PROPOSED:
                 already_settled = True
             elif not self._has_escalation_audit(locked):
-                AuditEvent.objects.create(
-                    organization=locked.organization,
-                    project=locked.project,
-                    team=locked.team,
+                _audit_curator_action(
+                    candidate=locked,
                     event_type='MemoryCandidateHeldForReview',
-                    actor_type='system',
-                    target_type='memory_candidate',
-                    target_id=str(locked.id),
-                    capability='memories:review',
-                    result=AuditResult.RECORDED,
+                    decision='held_escalation',
+                    reason=metadata_reason,
                     correlation_id=data.correlation_id,
-                    metadata={'reason': metadata_reason, 'candidate_id': str(locked.id)},
                 )
 
         if already_settled:
@@ -554,6 +706,9 @@ class CurateMemoryCandidate:
         score: float,
         reason: str,
         data: CurateMemoryCandidateInput,
+        *,
+        judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         stored_reason = redact_text(reason)[:200]
         already_settled = False
@@ -584,23 +739,16 @@ class CurateMemoryCandidate:
                         {'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': stored_reason},
                     ]
                     locked.save(update_fields=['evidence', 'updated_at'])
-                    AuditEvent.objects.create(
-                        organization=locked.organization,
-                        project=locked.project,
-                        team=locked.team,
+                    _audit_curator_action(
+                        candidate=locked,
                         event_type='MemoryConflictDetected',
-                        actor_type='system',
-                        target_type='memory_candidate',
-                        target_id=str(locked.id),
-                        capability='memories:review',
-                        result=AuditResult.RECORDED,
+                        decision='held_conflict',
+                        reason=stored_reason,
+                        near_dup_score=score,
+                        judge_context=judge_context,
+                        threshold=threshold,
                         correlation_id=data.correlation_id,
-                        metadata={
-                            'candidate_id': str(locked.id),
-                            'memory_id': str(existing_memory.id),
-                            'near_dup_score': f'{score:.2f}',
-                            'reason': stored_reason,
-                        },
+                        extra={'memory_id': str(existing_memory.id)},
                     )
 
         if already_settled:
@@ -615,6 +763,9 @@ class CurateMemoryCandidate:
         candidate: MemoryCandidate,
         near_dup: tuple[RetrievalDocument, float],
         data: CurateMemoryCandidateInput,
+        *,
+        judge_context: dict[str, object] | None = None,
+        threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
         loser = document.memory
@@ -633,9 +784,12 @@ class CurateMemoryCandidate:
             supersede_memory_system(
                 loser,
                 promotion.memory,
+                promotion.candidate,
+                score=score,
+                threshold=threshold,
+                judge_context=judge_context,
                 request_id=f'curator:{candidate.id}',
                 correlation_id=data.correlation_id,
-                score=score,
             )
 
         return CurateMemoryCandidateResult(

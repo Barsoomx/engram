@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import uuid
@@ -117,6 +118,7 @@ def create_candidate(
     content_hash: str,
     confidence: str = '0.900',
     visibility_scope: str = VisibilityScope.PROJECT,
+    evidence: list[dict[str, object]] | None = None,
 ) -> MemoryCandidate:
     return MemoryCandidate.objects.create(
         organization=organization,
@@ -127,7 +129,7 @@ def create_candidate(
         body=body,
         status=CandidateStatus.PROPOSED,
         visibility_scope=visibility_scope,
-        evidence=[{'kind': 'test'}],
+        evidence=evidence if evidence is not None else [{'kind': 'test'}],
         content_hash=content_hash,
         confidence=Decimal(confidence),
     )
@@ -365,11 +367,24 @@ def test_supersede_memory_system_marks_loser_and_links_winner() -> None:
     loser = promote_candidate(
         create_candidate(organization, team, project, title='Old fact', body=_LONG_BODY, content_hash='hash-loser'),
     )
-    winner = promote_candidate(
-        create_candidate(organization, team, project, title='New fact', body=_LONG_BODY, content_hash='hash-winner'),
+    winner_candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='New fact',
+        body=_LONG_BODY,
+        content_hash='hash-winner',
     )
+    winner = promote_candidate(winner_candidate)
 
-    link = supersede_memory_system(loser, winner, request_id='req-1', correlation_id='corr-1', score=0.97)
+    link = supersede_memory_system(
+        loser,
+        winner,
+        winner_candidate,
+        score=0.97,
+        threshold=Decimal('0.850'),
+        correlation_id='corr-1',
+    )
 
     loser.refresh_from_db()
     assert loser.stale is True
@@ -379,9 +394,13 @@ def test_supersede_memory_system_marks_loser_and_links_winner() -> None:
     audit = AuditEvent.objects.get(event_type='MemorySuperseded')
     assert audit.actor_type == 'system'
     assert audit.result == AuditResult.RECORDED
+    assert audit.target_type == 'memory'
     assert audit.target_id == str(loser.id)
+    assert audit.correlation_id == 'corr-1'
     assert audit.metadata['winner_memory_id'] == str(winner.id)
+    assert audit.metadata['loser_memory_id'] == str(loser.id)
     assert audit.metadata['near_dup_score'] == '0.97'
+    assert audit.metadata['threshold'] == '0.850'
 
 
 @pytest.mark.django_db
@@ -397,18 +416,17 @@ def test_supersede_memory_system_marks_loser_retrieval_document_stale() -> None:
             content_hash='hash-loser-doc',
         ),
     )
-    winner = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='New fact',
-            body=_LONG_BODY,
-            content_hash='hash-winner-doc',
-        ),
+    winner_candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='New fact',
+        body=_LONG_BODY,
+        content_hash='hash-winner-doc',
     )
+    winner = promote_candidate(winner_candidate)
 
-    supersede_memory_system(loser, winner, score=0.97)
+    supersede_memory_system(loser, winner, winner_candidate, score=0.97)
 
     document = RetrievalDocument.objects.get(memory=loser)
     assert document.stale is True
@@ -420,12 +438,18 @@ def test_supersede_memory_system_is_idempotent_when_already_stale() -> None:
     loser = promote_candidate(
         create_candidate(organization, team, project, title='Old fact', body=_LONG_BODY, content_hash='hash-loser'),
     )
-    winner = promote_candidate(
-        create_candidate(organization, team, project, title='New fact', body=_LONG_BODY, content_hash='hash-winner'),
+    winner_candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='New fact',
+        body=_LONG_BODY,
+        content_hash='hash-winner',
     )
-    supersede_memory_system(loser, winner, score=0.97)
+    winner = promote_candidate(winner_candidate)
+    supersede_memory_system(loser, winner, winner_candidate, score=0.97)
 
-    second = supersede_memory_system(loser, winner, score=0.97)
+    second = supersede_memory_system(loser, winner, winner_candidate, score=0.97)
 
     assert second is None
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 1
@@ -1108,13 +1132,18 @@ def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch:
     existing, duplicate = seed_existing_and_duplicate(organization, team, project)
     patch_judge_gateway(monkeypatch, _ExplodingJudgeGateway())
 
-    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+    result = CurateMemoryCandidate().execute(
+        CurateMemoryCandidateInput(candidate_id=duplicate.id, correlation_id='corr-full-flow'),
+    )
 
     existing.refresh_from_db()
     assert result.decision == 'superseded'
     assert result.superseded_memory is not None
     assert result.superseded_memory.id == existing.id
     assert existing.stale is True
+    audit = AuditEvent.objects.get(event_type='MemorySuperseded')
+    assert audit.correlation_id == 'corr-full-flow'
+    assert audit.metadata['threshold'] == '0.850'
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1215,6 +1244,7 @@ def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory
     assert len(results) == 2
     assert Memory.objects.count() == 1
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+    assert AuditEvent.objects.filter(event_type='MemoryCuratorPromoted').count() == 1
 
 
 @pytest.mark.django_db
@@ -1355,3 +1385,266 @@ def test_promote_memory_candidate_clears_conflict_links_at_promotion(monkeypatch
     PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=duplicate.id))
 
     assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == 0
+
+
+@pytest.mark.django_db
+def test_curate_passthrough_route_audits_curator_promoted() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization, enabled=False)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Networking port',
+        body='Use port 8443 not 8080',
+        content_hash='hash-audit-passthrough',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.actor_type == 'system'
+    assert audit.actor_id == 'curator'
+    assert audit.target_type == 'memory_candidate'
+    assert audit.target_id == str(candidate.id)
+    assert audit.metadata['decision'] == 'passthrough'
+    assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['candidate_id'] == str(candidate.id)
+    assert audit.metadata['threshold'] is None
+
+
+@pytest.mark.django_db
+def test_curate_no_duplicate_route_audits_curator_promoted() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-audit-no-dup',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['decision'] == 'no_duplicate'
+    assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] == '0.850'
+    assert 'judge' not in audit.metadata
+
+
+@pytest.mark.django_db
+def test_curate_embedding_unavailable_route_audits_curator_promoted() -> None:
+    organization, team, project = create_scope()
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-audit-embed-unavailable',
+    )
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['decision'] == 'embedding_unavailable'
+    assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] is None
+
+
+@pytest.mark.django_db
+def test_curate_judge_keep_both_route_audits_curator_promoted() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+
+    result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['decision'] == 'judge_keep_both'
+    assert audit.metadata['memory_id'] == str(result.memory.id)
+    assert audit.metadata['threshold'] == '1.050'
+    assert 'judge' in audit.metadata
+
+
+@pytest.mark.django_db
+def test_curate_replay_does_not_double_audit_curator_promoted() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-audit-replay',
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert AuditEvent.objects.filter(event_type='MemoryCuratorPromoted').count() == 1
+
+
+@pytest.mark.django_db
+def test_curate_judge_outcome_audit_includes_judge_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    judge_policy = create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "keep_both"}'))
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    judge = audit.metadata['judge']
+    assert judge['policy_id'] == str(judge_policy.id)
+    assert judge['policy_version'] == judge_policy.version
+    assert judge['provider'] == judge_policy.provider
+    assert judge['model'] == judge_policy.model
+    assert judge['provider_call_record_id']
+    assert judge['candidate']['title'] == duplicate.title
+    assert judge['candidate']['body_sha256'] == hashlib.sha256(_LONG_BODY.encode()).hexdigest()
+    assert judge['candidate']['body_length'] == len(_LONG_BODY)
+    assert judge['existing_memory']['memory_id'] == str(existing.id)
+    assert judge['existing_memory']['title'] == existing.title
+    assert judge['existing_memory']['body_sha256'] == hashlib.sha256(_LONG_BODY.encode()).hexdigest()
+    assert judge['existing_memory']['body_length'] == len(_LONG_BODY)
+
+
+@pytest.mark.django_db
+def test_curate_redacts_secret_from_all_audit_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    secret_body = f'{_LONG_BODY} Token sk-abcdef0123456789 is embedded here.'
+    promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Retrieval ranking',
+            body=secret_body,
+            content_hash='hash-existing-secret',
+        ),
+    )
+    duplicate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=secret_body,
+        content_hash='hash-duplicate-secret',
+    )
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "reject"}'))
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryAutoRejected', target_id=str(duplicate.id))
+    assert audit.metadata['judge']['candidate']['body_sha256'] == hashlib.sha256(secret_body.encode()).hexdigest()
+    for audit_event in AuditEvent.objects.all():
+        assert 'sk-abcdef0123456789' not in json.dumps(audit_event.metadata)
+
+
+@pytest.mark.django_db
+def test_curate_audit_collects_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-ids',
+        evidence=[{'observation_id': 'obs-1', 'supporting_observation_ids': ['obs-2', 'obs-3']}],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert set(audit.metadata['evidence_source_ids']) == {'obs-1', 'obs-2', 'obs-3'}
+
+
+@pytest.mark.django_db
+def test_curate_audit_dedupes_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-dedup',
+        evidence=[
+            {'observation_id': 'obs-dup'},
+            {'observation_id': 'obs-dup'},
+            {'supporting_observation_ids': ['obs-dup', 'obs-unique']},
+        ],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ['obs-dup', 'obs-unique']
+
+
+@pytest.mark.django_db
+def test_curate_audit_caps_evidence_source_ids_at_fifty_in_order() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    ids = [f'obs-{index}' for index in range(60)]
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-cap',
+        evidence=[{'supporting_observation_ids': ids}],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ids[:50]
+
+
+@pytest.mark.django_db
+def test_curate_audit_excludes_conflict_entries_from_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-conflict',
+        evidence=[
+            {'observation_id': 'obs-real'},
+            {'type': 'conflict', 'memory_id': 'mem-should-be-excluded'},
+        ],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ['obs-real']
