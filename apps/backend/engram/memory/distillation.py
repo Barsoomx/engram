@@ -736,11 +736,18 @@ class DistillSession:
             result=AuditResult.RECORDED,
             request_id=data.request_id,
             correlation_id=data.correlation_id,
-            metadata={
-                'confidence': str(confidence),
-                'threshold': str(threshold),
-                'session_id': str(session.id),
-            },
+            metadata=redact_value(
+                {
+                    'reason': 'below_auto_approve_threshold',
+                    'candidate_id': str(candidate.id),
+                    'confidence': str(confidence) if confidence is not None else None,
+                    'threshold': str(threshold),
+                    'source_observation_id': (
+                        str(candidate.source_observation_id) if candidate.source_observation_id else None
+                    ),
+                    'session_id': str(session.id),
+                },
+            ),
         )
 
     def _audit_truncated(

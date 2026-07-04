@@ -552,8 +552,12 @@ def test_distill_session_auto_promotes_high_confidence_and_holds_low_confidence(
     audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert audit.actor_type == 'system'
     assert audit.target_id == str(held.id)
+    assert audit.metadata['reason'] == 'below_auto_approve_threshold'
+    assert audit.metadata['candidate_id'] == str(held.id)
     assert audit.metadata['confidence'] == '0.400'
     assert audit.metadata['threshold'] == '0.800'
+    assert audit.metadata['source_observation_id'] is None
+    assert audit.metadata['session_id'] == str(session.id)
 
 
 @pytest.mark.django_db
