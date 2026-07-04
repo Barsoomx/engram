@@ -9,10 +9,11 @@ session data into useful summaries, memory changes, and review exceptions.
 
 ## Schedule
 
-V1 runs two global scheduled jobs, the same for every org/team/project:
+V1 runs three global scheduled jobs, the same for every org/team/project:
 
 - daily digest (crontab, 02:00 UTC);
-- weekly digest (crontab, Monday 03:00 UTC).
+- weekly digest (crontab, Monday 03:00 UTC);
+- confidence decay (crontab, Monday 04:00 UTC).
 
 There is no per-team/per-project schedule tuning.
 The model used by each workflow is resolved through organization/team model
@@ -75,6 +76,43 @@ which is sufficient:
    candidate is idempotent: it does not create duplicate links or audit rows.
    Approving or rejecting the candidate during human review clears its
    conflict links.
+
+## Confidence Decay
+
+Approved memories that go untouched for a long time gradually lose confidence
+until they surface for human review. A weekly beat job
+(`engram.memory.decay_memory_confidence`, Monday 04:00 UTC) walks every
+organization with `OrganizationSettings.confidence_decay_enabled=True`
+(default on) and steps down the confidence of every approved, non-stale,
+non-refuted memory whose `updated_at` is older than the configured minimum
+age.
+
+The staircase is deliberately simple and env-tunable:
+
+- **step** — how much confidence drops per run
+  (`ENGRAM_CONFIDENCE_DECAY_STEP`, default `0.050`);
+- **floor** — the value decay will not push confidence below
+  (`ENGRAM_CONFIDENCE_DECAY_FLOOR`, default `0.200`);
+- **min age** — how many days a memory must sit untouched before it becomes
+  eligible (`ENGRAM_CONFIDENCE_DECAY_MIN_AGE_DAYS`, default `30`).
+
+`updated_at` is the age anchor, not `created_at`: any edit that touches a
+memory's content or status resets its age, so actively-maintained memories
+never decay. Digest memories (`kind=digest`) are excluded, since they are
+periodic summaries rather than standalone facts; stale and refuted memories
+are excluded because they are already out of the active set.
+
+Decay feeds the same review queue as the curator's other escalation gates:
+once an approved memory's confidence reaches the review threshold used by
+`MemoryReviewViewSet` (`confidence <= 0.300`), it appears in the human review
+queue alongside conflicted and refuted memories, even though no one manually
+flagged it. Each run writes one `MemoryConfidenceDecayed` audit event per
+project that had at least one memory decayed, recording the affected memory
+ids (capped at 200), the count, the step, and the floor.
+
+The org-level toggle is exposed at `GET/PUT /v1/admin/settings/retrieval`
+(`confidence_decay_enabled`, default on) alongside the curator's other
+retrieval settings.
 
 ## Human Review
 
