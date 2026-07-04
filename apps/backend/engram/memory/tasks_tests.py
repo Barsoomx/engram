@@ -20,7 +20,9 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
 )
+from engram.memory.confidence_decay import DecayMemoryConfidenceResult
 from engram.memory.tasks import (
+    decay_memory_confidence,
     distill_session,
     generate_daily_digest,
     generate_weekly_digest,
@@ -70,6 +72,18 @@ def test_beat_schedule_registers_retry_failed_distillations() -> None:
 
     assert entry['task'] == 'engram.memory.retry_failed_distillations'
     assert entry['schedule'] == timedelta(minutes=30)
+
+
+def test_task_routes_send_decay_memory_confidence_to_batch_queue() -> None:
+    assert celeryconfig.task_routes['engram.memory.decay_memory_confidence']['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_beat_schedule_registers_confidence_decay() -> None:
+    assert 'confidence-decay' in celeryconfig.beat_schedule
+
+    entry = celeryconfig.beat_schedule['confidence-decay']
+
+    assert entry['task'] == 'engram.memory.decay_memory_confidence'
 
 
 @pytest.fixture
@@ -175,3 +189,13 @@ def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible(
 
     m_delay.assert_not_called()
     assert result == {'retried': 0}
+
+
+def test_decay_memory_confidence_invokes_the_service() -> None:
+    m_result = DecayMemoryConfidenceResult(organizations=2, projects=3, memories=5)
+
+    with mock.patch('engram.memory.tasks.DecayMemoryConfidence.execute', return_value=m_result) as m_execute:
+        result = decay_memory_confidence()
+
+    m_execute.assert_called_once_with()
+    assert result == {'organizations': 2, 'projects': 3, 'memories': 5}
