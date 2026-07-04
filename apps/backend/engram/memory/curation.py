@@ -26,7 +26,6 @@ from engram.core.models import (
     OrganizationSettings,
     RetrievalDocument,
 )
-from engram.core.redaction import redact_value
 from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.memory.escalation import escalation_reason
 from engram.memory.services import (
@@ -34,6 +33,7 @@ from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     redact_text,
+    redact_value,
     strip_json_fence,
 )
 from engram.model_policy.models import ModelPolicy
@@ -87,7 +87,11 @@ _MAX_EVIDENCE_SOURCE_IDS = 50
 def _evidence_entry_ids(entry: object) -> list[str]:
     if isinstance(entry, str):
         return [entry]
+
     if not isinstance(entry, dict):
+        return []
+
+    if entry.get('type') == 'conflict':
         return []
 
     ids: list[str] = []
@@ -120,7 +124,7 @@ def _evidence_source_ids(candidate: MemoryCandidate) -> list[str]:
     return unique
 
 
-def audit_curator_action(
+def _audit_curator_action(
     *,
     candidate: MemoryCandidate,
     event_type: str,
@@ -162,7 +166,7 @@ def audit_curator_action(
         result=AuditResult.RECORDED,
         request_id=request_id,
         correlation_id=correlation_id,
-        metadata=redact_value(metadata).value,
+        metadata=redact_value(metadata),
     )
 
 
@@ -174,7 +178,7 @@ def _judge_context_snapshot(title: str, body: str) -> dict[str, object]:
     }
 
 
-def build_judge_context(
+def _build_judge_context(
     policy: ModelPolicy,
     result: ProviderCallResult,
     candidate: MemoryCandidate,
@@ -398,7 +402,7 @@ def supersede_memory_system(
             'label': '',
         },
     )
-    audit_curator_action(
+    _audit_curator_action(
         candidate=candidate,
         event_type='MemorySuperseded',
         decision='superseded',
@@ -536,7 +540,7 @@ class CurateMemoryCandidate:
             reason=redact_text(reason),
         )
 
-        return _JudgeOutcome(decision, reason, build_judge_context(resolved.policy, result, candidate, memory))
+        return _JudgeOutcome(decision, reason, _build_judge_context(resolved.policy, result, candidate, memory))
 
     def _resolve_judge_policy(self, candidate: MemoryCandidate) -> ResolvedModelPolicy:
         try:
@@ -598,7 +602,7 @@ class CurateMemoryCandidate:
     ) -> CurateMemoryCandidateResult:
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
         if not promotion.duplicate:
-            audit_curator_action(
+            _audit_curator_action(
                 candidate=promotion.candidate,
                 event_type='MemoryCuratorPromoted',
                 decision=route,
@@ -636,7 +640,7 @@ class CurateMemoryCandidate:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
                 clear_candidate_conflict_links(locked)
-                audit_curator_action(
+                _audit_curator_action(
                     candidate=locked,
                     event_type='MemoryAutoRejected',
                     decision='rejected',
@@ -672,7 +676,7 @@ class CurateMemoryCandidate:
             if locked.status != CandidateStatus.PROPOSED:
                 already_settled = True
             elif not self._has_escalation_audit(locked):
-                audit_curator_action(
+                _audit_curator_action(
                     candidate=locked,
                     event_type='MemoryCandidateHeldForReview',
                     decision='held_escalation',
@@ -735,7 +739,7 @@ class CurateMemoryCandidate:
                         {'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': stored_reason},
                     ]
                     locked.save(update_fields=['evidence', 'updated_at'])
-                    audit_curator_action(
+                    _audit_curator_action(
                         candidate=locked,
                         event_type='MemoryConflictDetected',
                         decision='held_conflict',

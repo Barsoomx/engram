@@ -118,6 +118,7 @@ def create_candidate(
     content_hash: str,
     confidence: str = '0.900',
     visibility_scope: str = VisibilityScope.PROJECT,
+    evidence: list[dict[str, object]] | None = None,
 ) -> MemoryCandidate:
     return MemoryCandidate.objects.create(
         organization=organization,
@@ -128,7 +129,7 @@ def create_candidate(
         body=body,
         status=CandidateStatus.PROPOSED,
         visibility_scope=visibility_scope,
-        evidence=[{'kind': 'test'}],
+        evidence=evidence if evidence is not None else [{'kind': 'test'}],
         content_hash=content_hash,
         confidence=Decimal(confidence),
     )
@@ -1553,3 +1554,95 @@ def test_curate_redacts_secret_from_all_audit_metadata(monkeypatch: pytest.Monke
     assert audit.metadata['judge']['candidate']['body_sha256'] == hashlib.sha256(secret_body.encode()).hexdigest()
     for audit_event in AuditEvent.objects.all():
         assert 'sk-abcdef0123456789' not in json.dumps(audit_event.metadata)
+
+
+@pytest.mark.django_db
+def test_curate_audit_collects_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-ids',
+        evidence=[{'observation_id': 'obs-1', 'supporting_observation_ids': ['obs-2', 'obs-3']}],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert set(audit.metadata['evidence_source_ids']) == {'obs-1', 'obs-2', 'obs-3'}
+
+
+@pytest.mark.django_db
+def test_curate_audit_dedupes_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-dedup',
+        evidence=[
+            {'observation_id': 'obs-dup'},
+            {'observation_id': 'obs-dup'},
+            {'supporting_observation_ids': ['obs-dup', 'obs-unique']},
+        ],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ['obs-dup', 'obs-unique']
+
+
+@pytest.mark.django_db
+def test_curate_audit_caps_evidence_source_ids_at_fifty_in_order() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    ids = [f'obs-{index}' for index in range(60)]
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-cap',
+        evidence=[{'supporting_observation_ids': ids}],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ids[:50]
+
+
+@pytest.mark.django_db
+def test_curate_audit_excludes_conflict_entries_from_evidence_source_ids() -> None:
+    organization, team, project = create_scope()
+    create_embedding_policy(organization, team, project)
+    set_curator_settings(organization)
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Retrieval ranking',
+        body=_LONG_BODY,
+        content_hash='hash-evidence-conflict',
+        evidence=[
+            {'observation_id': 'obs-real'},
+            {'type': 'conflict', 'memory_id': 'mem-should-be-excluded'},
+        ],
+    )
+
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
+    assert audit.metadata['evidence_source_ids'] == ['obs-real']
