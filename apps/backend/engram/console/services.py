@@ -863,6 +863,55 @@ def archive_memory(
 
 
 @transaction.atomic
+def restore_memory(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    reason: str,
+) -> Memory:
+    memory = _lock_memory_or_404(organization, memory.id)
+
+    if memory.status == MemoryStatus.APPROVED and not memory.refuted and not memory.stale:
+        raise MemoryReviewError('invalid_state', 'memory is already active')
+
+    version = memory.versions.order_by('-version').first()
+
+    if version is None:
+        raise MemoryReviewError('invalid_state', 'memory has no version to restore')
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='restore',
+        reason=reason,
+    )
+
+    memory.status = MemoryStatus.APPROVED
+
+    memory.refuted = False
+
+    memory.stale = False
+
+    memory.save(update_fields=['status', 'refuted', 'stale', 'updated_at'])
+
+    RetrievalDocument.objects.filter(memory=memory).update(refuted=False, stale=False, updated_at=timezone.now())
+
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory',
+        target_id=str(memory.id),
+        metadata={'action': 'restore', 'reason': reason},
+    )
+
+    return memory
+
+
+@transaction.atomic
 def bulk_archive_memories(
     organization: Organization,
     actor_identity: Identity,
