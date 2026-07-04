@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 import pytest
 
 from engram.access.services import EffectiveScope
+from engram.console import search_debug_service
 from engram.console.search_debug_service import ReplaySearchDebug
 from engram.context.context_api_tests import create_embedding_policy
 from engram.core.models import (
@@ -19,6 +21,7 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
 )
+from engram.model_policy.services import EmbeddingCallResult
 
 pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
 
@@ -54,6 +57,8 @@ def _seed_lexical_recall_document(
     body: str,
     exact_terms: list[str],
     sequence: int,
+    kind: str = '',
+    confidence: Decimal | None = None,
 ) -> RetrievalDocument:
     memory = Memory.objects.create(
         organization=organization,
@@ -63,6 +68,8 @@ def _seed_lexical_recall_document(
         body=body,
         status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
+        metadata={'kind': kind} if kind else {},
+        confidence=confidence,
     )
     version = MemoryVersion.objects.create(
         organization=organization,
@@ -131,7 +138,7 @@ def test_replay_lexical_stage_surfaces_lexical_only_match_when_enabled() -> None
     organization, project, team = _make_org_project_team()
     create_embedding_policy(organization, team, project)
     OrganizationSettings.objects.create(organization=organization, lexical_recall_enabled=True)
-    _seed_lexical_recall_document(
+    anchor = _seed_lexical_recall_document(
         organization,
         project,
         team,
@@ -139,6 +146,8 @@ def test_replay_lexical_stage_surfaces_lexical_only_match_when_enabled() -> None
         body='Authorization anchor',
         exact_terms=['authorization'],
         sequence=1,
+        kind='decision',
+        confidence=Decimal('0.700'),
     )
     fuzzy = _seed_lexical_recall_document(
         organization,
@@ -148,6 +157,8 @@ def test_replay_lexical_stage_surfaces_lexical_only_match_when_enabled() -> None
         body='authorisation',
         exact_terms=[],
         sequence=2,
+        kind='gotcha',
+        confidence=Decimal('0.910'),
     )
 
     result = ReplaySearchDebug().execute(
@@ -165,3 +176,65 @@ def test_replay_lexical_stage_surfaces_lexical_only_match_when_enabled() -> None
     assert fuzzy.memory_id in matched_ids
     fuzzy_candidate = next(c for c in result.lexical_candidates if c.memory_id == fuzzy.memory_id)
     assert fuzzy_candidate.matched_on.startswith('lexical match:')
+    assert fuzzy_candidate.kind == 'gotcha'
+    assert fuzzy_candidate.confidence == '0.910'
+
+    anchor_match = next(m for m in result.exact_matches if m.memory_id == anchor.memory_id)
+    assert anchor_match.kind == 'decision'
+    assert anchor_match.confidence == '0.700'
+
+    packed_by_id = {p.memory_id: p for p in result.packed_context}
+    assert packed_by_id[anchor.memory_id].kind == 'decision'
+    assert packed_by_id[anchor.memory_id].confidence == '0.700'
+    assert packed_by_id[fuzzy.memory_id].kind == 'gotcha'
+    assert packed_by_id[fuzzy.memory_id].confidence == '0.910'
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_replay_semantic_stage_surfaces_kind_and_confidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, project, team = _make_org_project_team()
+    OrganizationSettings.objects.create(organization=organization, hybrid_retrieval_enabled=True)
+    semantic_doc = _seed_lexical_recall_document(
+        organization,
+        project,
+        team,
+        title='semantic only memory',
+        body='semantic only memory',
+        exact_terms=[],
+        sequence=1,
+        kind='architecture',
+        confidence=Decimal('0.640'),
+    )
+    semantic_doc.embedding_vector = [1.0, 0.0, 0.0]
+    semantic_doc.save(update_fields=['embedding_vector'])
+
+    def m_resolve_query_embedding(*args: object, **kwargs: object) -> EmbeddingCallResult:
+        return EmbeddingCallResult(
+            provider='fake',
+            model='fake-embed',
+            call_record_id=uuid.uuid4(),
+            redaction_state='none',
+            embedding=(1.0, 0.0, 0.0),
+        )
+
+    monkeypatch.setattr(search_debug_service, 'resolve_query_embedding', m_resolve_query_embedding)
+
+    result = ReplaySearchDebug().execute(
+        organization=organization,
+        project=project,
+        scope=_make_scope(organization),
+        query='unrelated text',
+        team_id=None,
+        file_paths=(),
+        symbols=(),
+    )
+
+    assert result.semantic_enabled is True
+    semantic_candidate = next(c for c in result.semantic_candidates if c.memory_id == semantic_doc.memory_id)
+    assert semantic_candidate.kind == 'architecture'
+    assert semantic_candidate.confidence == '0.640'
+
+    packed_by_id = {p.memory_id: p for p in result.packed_context}
+    assert packed_by_id[semantic_doc.memory_id].kind == 'architecture'
+    assert packed_by_id[semantic_doc.memory_id].confidence == '0.640'

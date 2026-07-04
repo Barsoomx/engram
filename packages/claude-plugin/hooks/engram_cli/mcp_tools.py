@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram_cli.commands import workspace_repository_url
+from engram_cli.commands import search_item_suffix, workspace_repository_url
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
@@ -135,7 +135,10 @@ def search_memory(
     for item in items:
         if not isinstance(item, dict):
             continue
-        lines.append(f"[{item.get('citation')}] {item.get('title')} (memory_id={item.get('memory_id')})")
+        lines.append(
+            f"[{item.get('citation')}] {item.get('title')} (memory_id={item.get('memory_id')})"
+            f"{search_item_suffix(item)}"
+        )
         lines.append(f"  {item.get('body')}")
 
     return "\n".join(lines)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
 from django.utils import timezone
@@ -115,7 +116,14 @@ def create_audit_key(project_team_scope: tuple[object, Team, object, object, obj
     )
 
 
-def create_context_bundle(team: Team, *, request_id: str = 'request-inspection-context-1') -> ContextBundle:
+def create_context_bundle(
+    team: Team,
+    *,
+    request_id: str = 'request-inspection-context-1',
+    kind: str = '',
+    confidence: Decimal | None = None,
+    warnings: list[dict[str, object]] | None = None,
+) -> ContextBundle:
     organization = team.organization
     project = team.project_links.get().project
     memory, _version, document = create_approved_memory_document(
@@ -125,6 +133,8 @@ def create_context_bundle(team: Team, *, request_id: str = 'request-inspection-c
         title=f'Inspectable context {team.slug}',
         body='Inspect context bundle content with citations.',
         visibility_scope=VisibilityScope.TEAM,
+        confidence=confidence,
+        kind=kind,
     )
     agent = Agent.objects.create(
         organization=organization,
@@ -151,6 +161,7 @@ def create_context_bundle(team: Team, *, request_id: str = 'request-inspection-c
         rendered_text=f'[M1] Inspectable context {RAW_KEY}',
         authorization_scope={'capability': 'memories:read', 'authorization': f'Bearer {RAW_KEY}'},
         selected_count=1,
+        metadata={'warnings': warnings} if warnings is not None else {},
     )
     ContextBundleItem.objects.create(
         bundle=bundle,
@@ -567,6 +578,38 @@ def test_context_bundle_inspection_returns_items_and_hides_other_team_bundles() 
     assert RAW_KEY not in str(detail)
     assert denied_detail.status_code == 404
     assert denied_detail.json()['code'] == 'context_bundle_not_found'
+
+
+@pytest.mark.django_db
+def test_context_bundle_inspection_detail_exposes_warnings_and_item_kind_confidence() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    bundle = create_context_bundle(
+        team,
+        request_id=f'request-warnings-context-{RAW_KEY}',
+        kind='gotcha',
+        confidence=Decimal('0.850'),
+        warnings=[
+            {'code': 'stale_match', 'message': f'stale memory matched: "{RAW_KEY}"', 'memory_id': None},
+        ],
+    )
+    client = APIClient()
+
+    detail_response = client.get(
+        f'/v1/inspection/context-bundles/{bundle.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
+    assert detail['warnings'] == [
+        {'code': 'stale_match', 'message': 'stale memory matched: "[REDACTED]"', 'memory_id': None},
+    ]
+    assert detail['items'][0]['kind'] == 'gotcha'
+    assert detail['items'][0]['confidence'] == '0.850'
+    assert RAW_KEY not in str(detail)
 
 
 @pytest.mark.django_db
