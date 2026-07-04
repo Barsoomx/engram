@@ -4,11 +4,10 @@ import uuid
 from dataclasses import dataclass
 
 from engram.access.services import EffectiveScope, ResolveApiKeyScope
+from engram.context.retrieval_warnings import RetrievalWarning, compute_retrieval_warnings, semantic_retrieval_gap
 from engram.context.services import (
     RetrievalMatch,
-    RetrievalWarning,
     authorized_retrieval_documents,
-    compute_retrieval_warnings,
     fuse_retrieval_legs,
     lexical_fusion_matches,
     lexical_recall_matches,
@@ -16,7 +15,6 @@ from engram.context.services import (
     request_has_terms,
     resolve_query_embedding,
     score_retrieval_document,
-    semantic_retrieval_gap,
     semantic_retrieval_matches,
 )
 from engram.core.models import Organization, OrganizationSettings, Project, Team

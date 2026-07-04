@@ -1827,6 +1827,48 @@ def test_session_start_caps_stale_and_refuted_warnings_at_three() -> None:
 
 
 @pytest.mark.django_db
+def test_session_start_stale_warning_excludes_memory_outside_team_scope() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    other_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=other_team, project=project)
+    stale_memory, _version, _document = create_approved_memory_document(
+        organization,
+        other_team,
+        project,
+        title='Security-only stale memory',
+        body='Security-only stale memory body',
+        visibility_scope=VisibilityScope.TEAM,
+        file_paths=[],
+        symbols=[],
+        exact_terms=['security stale scoped phrase'],
+    )
+    stale_memory.stale = True
+    stale_memory.save(update_fields=['stale'])
+    RetrievalDocument.objects.filter(memory=stale_memory).update(stale=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='security stale scoped phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-stale-team-scope',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == []
+    assert stale_memory.title not in str(body)
+
+
+@pytest.mark.django_db
 def test_session_start_warns_about_unresolved_conflicting_memory() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     memory, _version, _document = create_approved_memory_document(organization, team, project)
