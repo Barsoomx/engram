@@ -895,6 +895,43 @@ class MemoryLink(TimestampedModel):
         return f'{self.link_type}:{self.target}'
 
 
+class MemoryReviewExample(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_review_examples')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_review_examples')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='memory_review_examples',
+    )
+    item_type = models.CharField(max_length=40)
+    item_id = models.CharField(max_length=64)
+    action = models.CharField(max_length=40)
+    snapshot = models.JSONField(default=dict)
+    curator_context = models.JSONField(default=dict, blank=True)
+    reason = models.TextField(blank=True)
+    actor_id = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'project', 'created_at']),
+            models.Index(fields=['organization', 'action']),
+        ]
+        ordering = ['organization_id', 'project_id', '-created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'{self.item_type}:{self.item_id}:{self.action}'
+
+
 class WorkflowRunType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'

@@ -41,6 +41,7 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryLink,
+    MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
     Organization,
@@ -445,6 +446,74 @@ def _candidate_file_paths(candidate: MemoryCandidate) -> list[str]:
     return [_redact_text(file_path) for file_path in [*observation.files_read, *observation.files_modified]]
 
 
+def _review_example_curator_context(item: MemoryCandidate | Memory) -> dict[str, object]:
+    if not isinstance(item, MemoryCandidate):
+        return {}
+
+    context: dict[str, object] = {}
+
+    conflicts = [entry for entry in item.evidence if isinstance(entry, dict) and entry.get('type') == 'conflict']
+
+    if conflicts:
+        context['conflicts'] = conflicts
+
+    held_event = (
+        AuditEvent.objects.filter(
+            organization=item.organization,
+            target_type='memory_candidate',
+            target_id=str(item.id),
+            event_type='MemoryCandidateHeldForReview',
+        )
+        .order_by('-created_at')
+        .first()
+    )
+
+    if held_event is not None:
+        context['held_reason'] = held_event.metadata.get('reason', '')
+
+    return context
+
+
+def _record_review_example(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    item: MemoryCandidate | Memory,
+    action: str,
+    reason: str,
+    curator_context: dict[str, object] | None = None,
+) -> MemoryReviewExample:
+    is_candidate = isinstance(item, MemoryCandidate)
+
+    if is_candidate:
+        evidence = item.evidence
+    else:
+        evidence = item.metadata.get('evidence', []) if isinstance(item.metadata, dict) else []
+
+    snapshot = {
+        'title': item.title,
+        'body': _redact_text(item.body),
+        'status': item.status,
+        'confidence': str(item.confidence) if item.confidence is not None else None,
+        'kind': item.kind,
+        'visibility_scope': item.visibility_scope,
+        'evidence': evidence,
+    }
+
+    return MemoryReviewExample.objects.create(
+        organization=organization,
+        project=item.project,
+        team=item.team,
+        item_type='memory_candidate' if is_candidate else 'memory',
+        item_id=str(item.id),
+        action=action,
+        snapshot=snapshot,
+        curator_context=curator_context if curator_context is not None else _review_example_curator_context(item),
+        reason=reason,
+        actor_id=str(actor_identity.id),
+    )
+
+
 @transaction.atomic
 def approve_memory_candidate(
     organization: Organization,
@@ -459,6 +528,14 @@ def approve_memory_candidate(
             'invalid_state',
             'only proposed candidates can be approved',
         )
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=candidate,
+        action='approve',
+        reason=reason,
+    )
 
     metadata: dict[str, object] = {
         'source': 'memory_candidate',
@@ -534,6 +611,14 @@ def edit_memory_body(
     if memory.kind == 'digest':
         raise MemoryReviewError('invalid_state', 'digest memories cannot be edited')
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='edit',
+        reason=reason,
+    )
+
     next_version = memory.current_version + 1
 
     version = MemoryVersion.objects.create(
@@ -576,6 +661,14 @@ def narrow_memory(
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='narrow',
+        reason=reason,
+    )
+
     return _record_memory_link(
         organization=organization,
         actor_identity=actor_identity,
@@ -596,6 +689,14 @@ def supersede_memory(
     reason: str,
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='supersede',
+        reason=reason,
+    )
 
     memory.stale = True
 
@@ -675,6 +776,14 @@ def reject_review_item(
                 'only proposed candidates can be rejected',
             )
 
+        _record_review_example(
+            organization=organization,
+            actor_identity=actor_identity,
+            item=item,
+            action='reject',
+            reason=reason,
+        )
+
         item.status = CandidateStatus.REJECTED
 
         item.save(update_fields=['status', 'updated_at'])
@@ -688,6 +797,14 @@ def reject_review_item(
 
         if item.status == MemoryStatus.REFUTED:
             return
+
+        _record_review_example(
+            organization=organization,
+            actor_identity=actor_identity,
+            item=item,
+            action='reject',
+            reason=reason,
+        )
 
         item.status = MemoryStatus.REFUTED
 
@@ -720,6 +837,14 @@ def archive_memory(
 
     if memory.status == MemoryStatus.ARCHIVED:
         return memory
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='archive',
+        reason=reason,
+    )
 
     memory.status = MemoryStatus.ARCHIVED
 
