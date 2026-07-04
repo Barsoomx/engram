@@ -96,6 +96,7 @@ class ContextBundleInput:
     limit: int
     token_budget: int | None
     purpose: str
+    kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -310,6 +311,7 @@ def authorized_retrieval_documents(
     organization: Organization,
     project: Project,
     scope: EffectiveScope,
+    kinds: tuple[str, ...] = (),
 ) -> tuple[RetrievalDocument, ...]:
     documents = RetrievalDocument.objects.select_related(
         'memory',
@@ -324,6 +326,8 @@ def authorized_retrieval_documents(
         stale=False,
         refuted=False,
     )
+    if kinds:
+        documents = documents.filter(memory__kind__in=kinds)
 
     return filter_documents_by_team_visibility(documents, scope)
 
@@ -958,7 +962,7 @@ class BuildContextBundle:
         agent = self._get_or_create_agent(organization, data)
         session = self._get_or_create_session(organization, project, team, agent, data)
         retrieval_started_at = time.monotonic()
-        authorized_documents = self._authorized_documents(organization, project, scope)
+        authorized_documents = self._authorized_documents(organization, project, scope, data.kinds)
         matches, has_semantic, embedding_result, semantic_unavailable = self._rank_matches(
             authorized_documents,
             data,
@@ -985,6 +989,7 @@ class BuildContextBundle:
             included_matches=kept,
             semantic_unavailable=semantic_unavailable,
             dropped_for_budget=len(budget_dropped),
+            kinds=data.kinds,
         )
         metadata: dict[str, object] = {'retrieval_strategy': retrieval_strategy}
         if query_result.redacted:
@@ -1158,8 +1163,9 @@ class BuildContextBundle:
         organization: Organization,
         project: Project,
         scope: EffectiveScope,
+        kinds: tuple[str, ...] = (),
     ) -> tuple[RetrievalDocument, ...]:
-        documents = authorized_retrieval_documents(organization, project, scope)
+        documents = authorized_retrieval_documents(organization, project, scope, kinds)
         if resolve_require_provenance_enabled(organization):
             documents = tuple(
                 document for document in documents if document.memory_version.source_observation_id is not None

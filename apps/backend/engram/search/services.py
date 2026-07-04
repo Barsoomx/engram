@@ -34,6 +34,7 @@ class SearchInput:
     correlation_id: str
     repository_url: str = ''
     repository_root: str = ''
+    kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class SearchMemories:
             request_id=data.request_id,
             correlation_id=data.correlation_id,
         )
-        documents = authorized_retrieval_documents(organization, project, scope)
+        documents = authorized_retrieval_documents(organization, project, scope, data.kinds)
         has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
         exact_matches: list[RetrievalMatch] = []
         for document in documents:
@@ -166,6 +167,7 @@ class SearchMemories:
             has_request_terms=request_has_terms(data.query, data.file_paths, data.symbols),
             included_matches=matches,
             semantic_unavailable=semantic_unavailable,
+            kinds=data.kinds,
         )
 
         return SearchResult(matches=matches, warnings=tuple(warnings))

@@ -541,3 +541,77 @@ def test_search_warns_about_unresolved_conflicting_memory() -> None:
             'memory_id': str(memory.id),
         },
     ]
+
+
+@pytest.mark.django_db
+def test_search_kinds_filter_returns_only_matching_kind() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    gotcha_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Gotcha memory',
+        body='Gotcha memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds filter phrase'],
+        kind='gotcha',
+    )
+    decision_memory, _decision_version, _decision_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Decision memory',
+        body='Decision memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds filter phrase'],
+        kind='decision',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, query='kinds filter phrase', file_paths=[], symbols=[], kinds=['gotcha']),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item['memory_id'] for item in body['items']] == [str(gotcha_memory.id)]
+    assert str(decision_memory.id) not in str(body)
+
+
+@pytest.mark.django_db
+def test_search_kinds_invalid_value_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, kinds=['bogus']),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert 'bogus' in str(response.json())
+
+
+@pytest.mark.django_db
+def test_search_kinds_max_items_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, kinds=['gotcha'] * 7),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400

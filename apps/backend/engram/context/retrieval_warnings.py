@@ -70,17 +70,19 @@ def stale_and_refuted_warnings(
     file_paths: tuple[str, ...],
     symbols: tuple[str, ...],
     has_request_terms: bool,
+    kinds: tuple[str, ...] = (),
 ) -> list[RetrievalWarning]:
     from engram.context.services import filter_documents_by_team_visibility, redact_text, score_retrieval_document
 
     if not has_request_terms:
         return []
 
-    documents = (
-        RetrievalDocument.objects.filter(organization=organization, project=project)
-        .filter(Q(memory__stale=True) | Q(memory__refuted=True) | Q(memory__status=MemoryStatus.REFUTED))
-        .select_related('memory')[:200]
+    documents = RetrievalDocument.objects.filter(organization=organization, project=project).filter(
+        Q(memory__stale=True) | Q(memory__refuted=True) | Q(memory__status=MemoryStatus.REFUTED),
     )
+    if kinds:
+        documents = documents.filter(memory__kind__in=kinds)
+    documents = documents.select_related('memory')[:200]
     authorized_documents = filter_documents_by_team_visibility(documents, scope)
 
     warnings: list[RetrievalWarning] = []
@@ -186,6 +188,7 @@ def compute_retrieval_warnings(
     included_matches: tuple[RetrievalMatch, ...],
     semantic_unavailable: bool,
     dropped_for_budget: int = 0,
+    kinds: tuple[str, ...] = (),
 ) -> list[RetrievalWarning]:
     warnings: list[RetrievalWarning] = []
     budget_warning = budget_dropped_warning(dropped_for_budget)
@@ -197,7 +200,16 @@ def compute_retrieval_warnings(
         warnings.append(semantic_warning)
 
     warnings.extend(
-        stale_and_refuted_warnings(organization, project, scope, query, file_paths, symbols, has_request_terms),
+        stale_and_refuted_warnings(
+            organization,
+            project,
+            scope,
+            query,
+            file_paths,
+            symbols,
+            has_request_terms,
+            kinds,
+        ),
     )
     warnings.extend(conflicting_memory_warnings(included_matches))
 

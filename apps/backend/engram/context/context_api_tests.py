@@ -1961,3 +1961,142 @@ def test_session_start_replay_returns_persisted_warnings_verbatim_after_state_ch
     assert first.json()['warnings'] == expected_warnings
     assert second.json()['warnings'] == expected_warnings
     assert ContextBundle.objects.filter(request_id='req-warn-replay').count() == 1
+
+
+@pytest.mark.django_db
+def test_session_start_kinds_filter_returns_only_matching_kind() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    gotcha_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Gotcha memory',
+        body='Gotcha memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds filter phrase'],
+        kind='gotcha',
+    )
+    decision_memory, _decision_version, _decision_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Decision memory',
+        body='Decision memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds filter phrase'],
+        kind='decision',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='kinds filter phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-kinds-filter',
+            kinds=['gotcha'],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item['memory_id'] for item in body['items']] == [str(gotcha_memory.id)]
+    assert str(decision_memory.id) not in str(body)
+
+
+@pytest.mark.django_db
+def test_session_start_kinds_invalid_value_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, request_id='req-kinds-invalid', kinds=['bogus']),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert 'bogus' in str(response.json())
+
+
+@pytest.mark.django_db
+def test_session_start_kinds_max_items_returns_400() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(project, team, request_id='req-kinds-too-many', kinds=['gotcha'] * 7),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_session_start_kinds_narrows_stale_warning_scan() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    gotcha_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Stale gotcha memory',
+        body='Stale gotcha memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds stale phrase'],
+        kind='gotcha',
+    )
+    gotcha_memory.stale = True
+    gotcha_memory.save(update_fields=['stale'])
+    RetrievalDocument.objects.filter(memory=gotcha_memory).update(stale=True)
+    decision_memory, _decision_version, _decision_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Stale decision memory',
+        body='Stale decision memory body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['kinds stale phrase'],
+        kind='decision',
+    )
+    decision_memory.stale = True
+    decision_memory.save(update_fields=['stale'])
+    RetrievalDocument.objects.filter(memory=decision_memory).update(stale=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='kinds stale phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-kinds-stale-scope',
+            kinds=['gotcha'],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == [
+        {
+            'code': 'stale_match',
+            'message': f'stale memory matched: "{gotcha_memory.title}"',
+            'memory_id': str(gotcha_memory.id),
+        },
+    ]
