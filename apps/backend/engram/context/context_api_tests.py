@@ -22,9 +22,13 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     AuditResult,
+    CandidateStatus,
     ContextBundle,
     ContextBundleItem,
+    LinkType,
     Memory,
+    MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Observation,
@@ -1608,3 +1612,310 @@ def test_user_prompt_submit_returns_cited_exact_context_and_persists_bundle() ->
     assert memory.title in body['rendered_context']
     bundle = ContextBundle.objects.get(request_id='request-ups-1')
     assert bundle.purpose == 'user_prompt_submit'
+
+
+@pytest.mark.django_db
+def test_session_start_warns_when_matches_dropped_for_budget() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory1, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='A',
+        body='B',
+        file_paths=['src/rank1.py'],
+        symbols=[],
+        exact_terms=[],
+    )
+    _memory2, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='C',
+        body='D',
+        file_paths=[],
+        symbols=['RankTwo'],
+        exact_terms=[],
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='',
+            file_paths=['src/rank1.py'],
+            symbols=['RankTwo'],
+            token_budget=4,
+            request_id='req-warn-budget',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == [
+        {'code': 'budget_dropped', 'message': '1 matching memories dropped for token budget', 'memory_id': None},
+    ]
+    assert '> Warnings:' in body['rendered_context']
+    assert '> - 1 matching memories dropped for token budget' in body['rendered_context']
+    assert [item['memory_id'] for item in body['items']] == [str(memory1.id)]
+
+
+@pytest.mark.django_db
+def test_session_start_warns_when_semantic_retrieval_unavailable() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='color behavior optimization',
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-semantic',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == [
+        {
+            'code': 'semantic_unavailable',
+            'message': 'semantic retrieval unavailable: embedding could not be resolved',
+            'memory_id': None,
+        },
+    ]
+    assert '> Warnings:' in body['rendered_context']
+
+
+@pytest.mark.django_db
+def test_session_start_warns_and_hides_stale_matching_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    stale_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Stale rollout notes',
+        body='Stale rollout notes body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['stale rollout phrase'],
+    )
+    stale_memory.stale = True
+    stale_memory.save(update_fields=['stale'])
+    RetrievalDocument.objects.filter(memory=stale_memory).update(stale=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='stale rollout phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-stale',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == [
+        {
+            'code': 'stale_match',
+            'message': f'stale memory matched: "{stale_memory.title}"',
+            'memory_id': str(stale_memory.id),
+        },
+    ]
+    assert '> - stale memory matched:' in body['rendered_context']
+
+
+@pytest.mark.django_db
+def test_session_start_prefers_refuted_over_stale_for_matched_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Refuted overlap notes',
+        body='Refuted overlap notes body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['refuted overlap phrase'],
+    )
+    memory.stale = True
+    memory.refuted = True
+    memory.save(update_fields=['stale', 'refuted'])
+    RetrievalDocument.objects.filter(memory=memory).update(stale=True, refuted=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='refuted overlap phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-refuted-precedence',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == [
+        {
+            'code': 'refuted_match',
+            'message': f'refuted memory matched: "{memory.title}"',
+            'memory_id': str(memory.id),
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_session_start_caps_stale_and_refuted_warnings_at_three() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    for index in range(4):
+        memory, _version, _document = create_approved_memory_document(
+            organization,
+            team,
+            project,
+            title=f'Stale note {index}',
+            body='Stale note body',
+            file_paths=[],
+            symbols=[],
+            exact_terms=['shared stale cap phrase'],
+        )
+        memory.stale = True
+        memory.save(update_fields=['stale'])
+        RetrievalDocument.objects.filter(memory=memory).update(stale=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query='shared stale cap phrase',
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-cap',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    stale_warnings = [warning for warning in body['warnings'] if warning['code'] == 'stale_match']
+    assert len(stale_warnings) == 3
+
+
+@pytest.mark.django_db
+def test_session_start_warns_about_unresolved_conflicting_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Conflicting candidate',
+        body='Conflicting candidate body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='conflict-candidate-hash',
+    )
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(project, team, request_id='req-warn-conflict'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == [
+        {
+            'code': 'conflicting_memory',
+            'message': 'memory has an unresolved contradiction claim',
+            'memory_id': str(memory.id),
+        },
+    ]
+    assert '> - memory has an unresolved contradiction claim' in body['rendered_context']
+
+    MemoryLink.objects.filter(memory=memory, link_type=LinkType.CONFLICTS_WITH).delete()
+    response_after_resolution = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(project, team, request_id='req-warn-conflict-resolved'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response_after_resolution.status_code == 200
+    assert response_after_resolution.json()['warnings'] == []
+
+
+@pytest.mark.django_db
+def test_session_start_replay_returns_persisted_warnings_verbatim_after_state_change() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Conflicting candidate',
+        body='Conflicting candidate body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='conflict-candidate-hash-replay',
+    )
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+    client = APIClient()
+    payload = valid_context_payload(project, team, request_id='req-warn-replay')
+    expected_warnings = [
+        {
+            'code': 'conflicting_memory',
+            'message': 'memory has an unresolved contradiction claim',
+            'memory_id': str(memory.id),
+        },
+    ]
+
+    first = client.post('/v1/context/session-start', payload, format='json', **auth_headers())
+    MemoryLink.objects.filter(memory=memory, link_type=LinkType.CONFLICTS_WITH).delete()
+    second = client.post('/v1/context/session-start', payload, format='json', **auth_headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()['warnings'] == expected_warnings
+    assert second.json()['warnings'] == expected_warnings
+    assert ContextBundle.objects.filter(request_id='req-warn-replay').count() == 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -20,9 +21,13 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     AuditResult,
+    CandidateStatus,
     ContextBundle,
     ContextBundleItem,
+    LinkType,
     Memory,
+    MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Organization,
@@ -101,6 +106,16 @@ class RetrievalMatch:
 
 
 @dataclass(frozen=True)
+class RetrievalWarning:
+    code: str
+    message: str
+    memory_id: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {'code': self.code, 'message': self.message, 'memory_id': self.memory_id}
+
+
+@dataclass(frozen=True)
 class ContextBundleResult:
     bundle: ContextBundle
     matches: tuple[RetrievalMatch, ...]
@@ -127,7 +142,7 @@ class ContextBundleResult:
             'rendered_context': rendered_context,
             'hook_specific_output': hook_specific_output,
             'items': [self._item_response(match) for match in self.matches],
-            'warnings': [],
+            'warnings': list(self.bundle.metadata.get('warnings', [])),
         }
 
     def _item_response(self, match: RetrievalMatch) -> dict[str, object]:
@@ -285,6 +300,21 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def filter_documents_by_team_visibility(
+    documents: Iterable[RetrievalDocument],
+    scope: EffectiveScope,
+) -> tuple[RetrievalDocument, ...]:
+    authorized: list[RetrievalDocument] = []
+    allowed_team_ids = set(scope.team_ids)
+    for document in documents:
+        if document.visibility_scope == VisibilityScope.PROJECT:
+            authorized.append(document)
+        elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
+            authorized.append(document)
+
+    return tuple(authorized)
+
+
 def authorized_retrieval_documents(
     organization: Organization,
     project: Project,
@@ -303,15 +333,12 @@ def authorized_retrieval_documents(
         stale=False,
         refuted=False,
     )
-    authorized: list[RetrievalDocument] = []
-    allowed_team_ids = set(scope.team_ids)
-    for document in documents:
-        if document.visibility_scope == VisibilityScope.PROJECT:
-            authorized.append(document)
-        elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
-            authorized.append(document)
 
-    return tuple(authorized)
+    return filter_documents_by_team_visibility(documents, scope)
+
+
+def request_has_terms(query: str, file_paths: tuple[str, ...], symbols: tuple[str, ...]) -> bool:
+    return bool(query.strip() or file_paths or symbols)
 
 
 def score_retrieval_document(
@@ -727,6 +754,176 @@ def resolve_query_embedding(
     return result
 
 
+STALE_REFUTED_WARNING_CAP = 3
+STALE_REFUTED_MIN_SCORE = 60
+CONFLICTING_MEMORY_WARNING_CAP = 5
+CONFLICTING_MEMORY_CANDIDATE_TARGET_PREFIX = 'candidate:'
+
+
+def budget_dropped_warning(dropped_count: int) -> RetrievalWarning | None:
+    if dropped_count <= 0:
+        return None
+
+    return RetrievalWarning(
+        code='budget_dropped',
+        message=f'{dropped_count} matching memories dropped for token budget',
+    )
+
+
+def semantic_unavailable_warning(unavailable: bool) -> RetrievalWarning | None:
+    if not unavailable:
+        return None
+
+    return RetrievalWarning(
+        code='semantic_unavailable',
+        message='semantic retrieval unavailable: embedding could not be resolved',
+    )
+
+
+def semantic_retrieval_gap(has_request_terms: bool, exact_matches: list[RetrievalMatch]) -> bool:
+    return has_request_terms and not exact_matches
+
+
+def stale_and_refuted_warnings(
+    organization: Organization,
+    project: Project,
+    scope: EffectiveScope,
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    has_request_terms: bool,
+) -> list[RetrievalWarning]:
+    if not has_request_terms:
+        return []
+
+    documents = (
+        RetrievalDocument.objects.filter(organization=organization, project=project)
+        .filter(Q(memory__stale=True) | Q(memory__refuted=True) | Q(memory__status=MemoryStatus.REFUTED))
+        .select_related('memory')[:200]
+    )
+    authorized_documents = filter_documents_by_team_visibility(documents, scope)
+
+    warnings: list[RetrievalWarning] = []
+    seen_memory_ids: set[uuid.UUID] = set()
+    for document in authorized_documents:
+        if len(warnings) >= STALE_REFUTED_WARNING_CAP:
+            break
+        if document.memory_id in seen_memory_ids:
+            continue
+
+        match = score_retrieval_document(document, query, file_paths, symbols, has_request_terms)
+        if match is None or match.score < STALE_REFUTED_MIN_SCORE:
+            continue
+
+        memory = document.memory
+        seen_memory_ids.add(memory.id)
+        if memory.refuted or memory.status == MemoryStatus.REFUTED:
+            warnings.append(
+                RetrievalWarning(
+                    code='refuted_match',
+                    message=f'refuted memory matched: "{redact_text(memory.title)}"',
+                    memory_id=str(memory.id),
+                ),
+            )
+        else:
+            warnings.append(
+                RetrievalWarning(
+                    code='stale_match',
+                    message=f'stale memory matched: "{redact_text(memory.title)}"',
+                    memory_id=str(memory.id),
+                ),
+            )
+
+    return warnings
+
+
+def _conflict_candidate_id(target: str) -> uuid.UUID | None:
+    if not target.startswith(CONFLICTING_MEMORY_CANDIDATE_TARGET_PREFIX):
+        return None
+
+    raw_id = target[len(CONFLICTING_MEMORY_CANDIDATE_TARGET_PREFIX) :]
+    try:
+        return uuid.UUID(raw_id)
+    except ValueError:
+        return None
+
+
+def conflicting_memory_warnings(included_matches: tuple[RetrievalMatch, ...]) -> list[RetrievalWarning]:
+    memory_ids = [match.document.memory_id for match in included_matches]
+    if not memory_ids:
+        return []
+
+    candidate_id_by_memory_id: dict[uuid.UUID, uuid.UUID] = {}
+    for link in MemoryLink.objects.filter(memory_id__in=memory_ids, link_type=LinkType.CONFLICTS_WITH):
+        candidate_id = _conflict_candidate_id(link.target)
+        if candidate_id is not None:
+            candidate_id_by_memory_id.setdefault(link.memory_id, candidate_id)
+    if not candidate_id_by_memory_id:
+        return []
+
+    proposed_candidate_ids = set(
+        MemoryCandidate.objects.filter(
+            id__in=candidate_id_by_memory_id.values(),
+            status=CandidateStatus.PROPOSED,
+        ).values_list('id', flat=True),
+    )
+    if not proposed_candidate_ids:
+        return []
+
+    warnings: list[RetrievalWarning] = []
+    seen_memory_ids: set[uuid.UUID] = set()
+    for memory_id in memory_ids:
+        if len(warnings) >= CONFLICTING_MEMORY_WARNING_CAP:
+            break
+        if memory_id in seen_memory_ids:
+            continue
+
+        candidate_id = candidate_id_by_memory_id.get(memory_id)
+        if candidate_id is None or candidate_id not in proposed_candidate_ids:
+            continue
+
+        seen_memory_ids.add(memory_id)
+        warnings.append(
+            RetrievalWarning(
+                code='conflicting_memory',
+                message='memory has an unresolved contradiction claim',
+                memory_id=str(memory_id),
+            ),
+        )
+
+    return warnings
+
+
+def compute_retrieval_warnings(
+    *,
+    organization: Organization,
+    project: Project,
+    scope: EffectiveScope,
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    has_request_terms: bool,
+    included_matches: tuple[RetrievalMatch, ...],
+    semantic_unavailable: bool,
+    dropped_for_budget: int = 0,
+) -> list[RetrievalWarning]:
+    warnings: list[RetrievalWarning] = []
+    budget_warning = budget_dropped_warning(dropped_for_budget)
+    if budget_warning is not None:
+        warnings.append(budget_warning)
+
+    semantic_warning = semantic_unavailable_warning(semantic_unavailable)
+    if semantic_warning is not None:
+        warnings.append(semantic_warning)
+
+    warnings.extend(
+        stale_and_refuted_warnings(organization, project, scope, query, file_paths, symbols, has_request_terms),
+    )
+    warnings.extend(conflicting_memory_warnings(included_matches))
+
+    return warnings
+
+
 def derive_retrieval_terms(metadata: dict[str, object], title: str, body: str) -> tuple[list[str], list[str]]:
     symbols = unique_text_values(
         metadata.get('symbols', []),
@@ -941,7 +1138,7 @@ class BuildContextBundle:
         session = self._get_or_create_session(organization, project, team, agent, data)
         retrieval_started_at = time.monotonic()
         authorized_documents = self._authorized_documents(organization, project, scope)
-        matches, has_semantic, embedding_result = self._rank_matches(
+        matches, has_semantic, embedding_result, semantic_unavailable = self._rank_matches(
             authorized_documents,
             data,
             organization,
@@ -955,6 +1152,19 @@ class BuildContextBundle:
         )
         query_result = redact_value(data.query)
         retrieval_strategy = resolve_retrieval_strategy(matches)
+        has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
+        warnings = compute_retrieval_warnings(
+            organization=organization,
+            project=project,
+            scope=scope,
+            query=data.query,
+            file_paths=data.file_paths,
+            symbols=data.symbols,
+            has_request_terms=has_request_terms,
+            included_matches=kept,
+            semantic_unavailable=semantic_unavailable,
+            dropped_for_budget=len(budget_dropped),
+        )
         metadata: dict[str, object] = {'retrieval_strategy': retrieval_strategy}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
@@ -963,6 +1173,7 @@ class BuildContextBundle:
         metadata['token_budget'] = data.token_budget
         metadata['tokens_used'] = tokens_used
         metadata['dropped_for_budget'] = len(budget_dropped)
+        metadata['warnings'] = [warning.to_dict() for warning in warnings]
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -981,7 +1192,7 @@ class BuildContextBundle:
                 retrieval_latency_ms=retrieval_latency_ms,
             )
             persisted_matches = self._create_items(bundle, kept)
-            bundle.rendered_text = self._render_context(persisted_matches)
+            bundle.rendered_text = self._render_context(persisted_matches, warnings)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
             self._audit_retrieval(
@@ -1142,8 +1353,8 @@ class BuildContextBundle:
         organization: Organization,
         project: Project,
         team: Team | None,
-    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None]:
-        has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
+    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None, bool]:
+        has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
         exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = self._score_document(document, data, has_request_terms)
@@ -1158,15 +1369,16 @@ class BuildContextBundle:
             ),
         )
         if len(exact_matches) >= data.limit:
-            return tuple(exact_matches[: data.limit]), False, None
+            return tuple(exact_matches[: data.limit]), False, None, False
 
         org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
         if not org_settings.hybrid_retrieval_enabled:
-            return tuple(exact_matches), False, None
+            return tuple(exact_matches), False, None, False
 
         embedding_result = self._resolve_query_embedding(data, organization, project, team)
         if embedding_result is None:
-            return tuple(exact_matches), False, None
+            semantic_unavailable = semantic_retrieval_gap(has_request_terms, exact_matches)
+            return tuple(exact_matches), False, None, semantic_unavailable
 
         query_vector = list(embedding_result.embedding)
         semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
@@ -1185,6 +1397,7 @@ class BuildContextBundle:
             tuple((exact_matches + list(tail))[: data.limit]),
             bool(tail),
             embedding_result,
+            False,
         )
 
     def _semantic_matches(
@@ -1248,15 +1461,22 @@ class BuildContextBundle:
 
         return tuple(persisted)
 
-    def _render_context(self, matches: tuple[RetrievalMatch, ...]) -> str:
+    def _render_context(self, matches: tuple[RetrievalMatch, ...], warnings: list[RetrievalWarning]) -> str:
         if not matches:
-            return '# Engram context\n\nNo approved memory matched this request.'
+            base = '# Engram context\n\nNo approved memory matched this request.'
+        else:
+            lines = ['# Engram context', '']
+            for index, match in enumerate(matches, start=1):
+                lines.append(_render_block(match.document.memory, index))
+            base = '\n'.join(lines)
 
-        lines = ['# Engram context', '']
-        for index, match in enumerate(matches, start=1):
-            lines.append(_render_block(match.document.memory, index))
+        if not warnings:
+            return base
 
-        return '\n'.join(lines)
+        warning_lines = ['', '> Warnings:']
+        warning_lines.extend(f'> - {warning.message}' for warning in warnings)
+
+        return base + '\n' + '\n'.join(warning_lines)
 
     def _authorization_scope(self, scope: EffectiveScope) -> dict[str, object]:
         return {

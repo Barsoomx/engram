@@ -19,10 +19,15 @@ from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     AuditEvent,
     AuditResult,
+    CandidateStatus,
+    LinkType,
     Memory,
+    MemoryCandidate,
+    MemoryLink,
     MemoryStatus,
     MemoryVersion,
     Project,
+    RetrievalDocument,
     Team,
     VisibilityScope,
 )
@@ -79,6 +84,7 @@ def test_search_returns_ranked_cited_matches() -> None:
     assert item['scope_evidence']['project_id'] == str(project.id)
     assert item['scope_evidence']['visibility_scope'] == VisibilityScope.PROJECT
     assert RAW_KEY not in str(body)
+    assert body['warnings'] == []
 
 
 @pytest.mark.django_db
@@ -454,3 +460,84 @@ def test_search_bound_key_unknown_repository_url_returns_404_without_creating_pr
     assert response.status_code == 404
     assert response.json()['code'] == 'project_not_found'
     assert Project.objects.filter(organization=organization).count() == project_count_before
+
+
+@pytest.mark.django_db
+def test_search_warns_about_stale_matching_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    create_embedding_policy(organization, team, project)
+    stale_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Stale search note',
+        body='Stale search note body',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['stale search phrase'],
+    )
+    stale_memory.stale = True
+    stale_memory.save(update_fields=['stale'])
+    RetrievalDocument.objects.filter(memory=stale_memory).update(stale=True)
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, query='stale search phrase', file_paths=[], symbols=[]),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == [
+        {
+            'code': 'stale_match',
+            'message': f'stale memory matched: "{stale_memory.title}"',
+            'memory_id': str(stale_memory.id),
+        },
+    ]
+
+
+@pytest.mark.django_db
+def test_search_warns_about_unresolved_conflicting_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    memory, _version, document = create_approved_memory_document(organization, team, project)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Conflicting candidate',
+        body='Conflicting candidate body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='search-conflict-candidate-hash',
+    )
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, file_paths=document.file_paths),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['warnings'] == [
+        {
+            'code': 'conflicting_memory',
+            'message': 'memory has an unresolved contradiction claim',
+            'memory_id': str(memory.id),
+        },
+    ]
