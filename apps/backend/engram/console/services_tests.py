@@ -21,6 +21,7 @@ from engram.console.services import (
     MemoryReviewError,
     _lock_candidate_or_404,
     _lock_memory_or_404,
+    _redact_text,
     activate_member,
     approve_memory_candidate,
     archive_memory,
@@ -34,17 +35,22 @@ from engram.console.services import (
     issue_api_key,
     narrow_memory,
     reject_review_item,
+    restore_memory,
     revoke_api_key,
     supersede_memory,
 )
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
+    AuditEvent,
+    AuditResult,
     CandidateStatus,
     LinkType,
     Memory,
     MemoryCandidate,
     MemoryLink,
+    MemoryReviewExample,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
     RetrievalDocument,
@@ -130,6 +136,16 @@ def _make_memory(
         confidence='0.500',
         metadata={'kind': kind} if kind else {},
     )
+
+
+def _make_approved_memory(
+    organization: Organization,
+    project: Project,
+    actor_identity: Identity,
+) -> Memory:
+    candidate = _make_candidate(organization, project)
+
+    return approve_memory_candidate(organization, actor_identity, candidate, 'reason')
 
 
 def _read_scope(organization: Organization, project: Project) -> EffectiveScope:
@@ -929,3 +945,607 @@ def test_concurrent_approve_and_reject_on_same_candidate_serializes_transition(
     assert outcomes['reject_error'].code == 'invalid_state'
 
     assert candidate.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_records_review_example(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project, kind='gotcha')
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'looks solid')
+
+    examples = MemoryReviewExample.objects.filter(item_type='memory_candidate', item_id=str(candidate.id))
+
+    assert examples.count() == 1
+
+    example = examples.get()
+
+    assert example.action == 'approve'
+
+    assert example.organization_id == f_organization.id
+
+    assert example.project_id == f_project.id
+
+    assert example.reason == 'looks solid'
+
+    assert example.actor_id == str(f_actor_identity.id)
+
+    assert example.snapshot['title'] == _redact_text(candidate.title)
+
+    assert example.snapshot['status'] == CandidateStatus.PROPOSED
+
+    assert example.snapshot['kind'] == 'gotcha'
+
+    assert example.snapshot['confidence'] == '0.500'
+
+    assert example.snapshot['visibility_scope'] == candidate.visibility_scope
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_review_example_captures_conflict_curator_context(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    existing_memory = _make_memory(f_organization, f_project)
+
+    candidate.evidence = [{'type': 'conflict', 'memory_id': str(existing_memory.id), 'reason': 'contradiction claim'}]
+
+    candidate.save(update_fields=['evidence', 'updated_at'])
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory_candidate', item_id=str(candidate.id))
+
+    assert example.curator_context['conflicts'] == candidate.evidence
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_review_example_captures_held_reason(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    AuditEvent.objects.create(
+        organization=f_organization,
+        project=f_project,
+        event_type='MemoryCandidateHeldForReview',
+        actor_type='system',
+        actor_id='curator',
+        target_type='memory_candidate',
+        target_id=str(candidate.id),
+        result=AuditResult.RECORDED,
+        metadata={'reason': 'escalation: low confidence'},
+    )
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory_candidate', item_id=str(candidate.id))
+
+    assert example.curator_context['held_reason'] == 'escalation: low confidence'
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_does_not_record_review_example_on_invalid_state(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'first')
+
+    candidate.refresh_from_db()
+
+    with pytest.raises(MemoryReviewError):
+        approve_memory_candidate(f_organization, f_actor_identity, candidate, 'second')
+
+    assert MemoryReviewExample.objects.filter(item_type='memory_candidate', item_id=str(candidate.id)).count() == 1
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_records_review_example_with_pre_mutation_body(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    old_body = memory.body
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert example.action == 'edit'
+
+    assert example.snapshot['body'] == old_body
+
+    memory.refresh_from_db()
+
+    assert memory.body == 'new body'
+
+    assert example.snapshot['body'] != memory.body
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_review_example_redacts_secret_shaped_old_body(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    memory.body = 'token egk_abcdefghijklmnopqrstuvwxyz0123456789'
+
+    memory.save(update_fields=['body', 'updated_at'])
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert 'egk_' not in example.snapshot['body']
+
+    assert '[REDACTED]' in example.snapshot['body']
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_review_example_redacts_secret_shaped_title(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    memory.title = 'token egk_abcdefghijklmnopqrstuvwxyz0123456789'
+
+    memory.save(update_fields=['title', 'updated_at'])
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert 'egk_' not in example.snapshot['title']
+
+    assert '[REDACTED]' in example.snapshot['title']
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_does_not_record_review_example_when_digest(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, kind='digest')
+
+    with pytest.raises(MemoryReviewError):
+        edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    assert MemoryReviewExample.objects.filter(item_type='memory', item_id=str(memory.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_narrow_memory_records_review_example(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    target = _make_memory(f_organization, f_project)
+
+    narrow_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id), action='narrow')
+
+    assert example.reason == 'reason'
+
+    assert example.actor_id == str(f_actor_identity.id)
+
+
+@pytest.mark.django_db
+def test_supersede_memory_records_review_example(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    target = _make_memory(f_organization, f_project)
+
+    supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id), action='supersede')
+
+    assert example.snapshot['status'] == MemoryStatus.CONFLICT
+
+
+@pytest.mark.django_db
+def test_reject_review_item_records_review_example_for_candidate(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    reject_review_item(f_organization, f_actor_identity, candidate, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory_candidate', item_id=str(candidate.id))
+
+    assert example.action == 'reject'
+
+    assert example.snapshot['status'] == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_reject_review_item_records_review_example_for_memory_with_pre_mutation_status(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, status=MemoryStatus.CONFLICT)
+
+    reject_review_item(f_organization, f_actor_identity, memory, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert example.action == 'reject'
+
+    assert example.snapshot['status'] == MemoryStatus.CONFLICT
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.REFUTED
+
+    assert example.snapshot['status'] != memory.status
+
+
+@pytest.mark.django_db
+def test_reject_review_item_does_not_record_review_example_on_invalid_state(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    candidate.refresh_from_db()
+
+    with pytest.raises(MemoryReviewError):
+        reject_review_item(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert MemoryReviewExample.objects.filter(item_type='memory_candidate', item_id=str(candidate.id)).count() == 1
+
+
+@pytest.mark.django_db
+def test_archive_memory_records_review_example(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    archive_memory(f_organization, f_actor_identity, memory, 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert example.action == 'archive'
+
+    assert example.curator_context == {}
+
+
+@pytest.mark.django_db
+def test_archive_memory_does_not_record_review_example_when_already_archived(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    archive_memory(f_organization, f_actor_identity, memory, 'first')
+
+    memory.refresh_from_db()
+
+    archive_memory(f_organization, f_actor_identity, memory, 'second')
+
+    assert MemoryReviewExample.objects.filter(item_type='memory', item_id=str(memory.id)).count() == 1
+
+
+@pytest.mark.django_db
+def test_restore_memory_raises_invalid_state_when_already_active(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    with pytest.raises(MemoryReviewError) as error:
+        restore_memory(f_organization, f_actor_identity, memory, 'reason')
+
+    assert error.value.code == 'invalid_state'
+
+
+@pytest.mark.django_db
+def test_restore_memory_reinstates_console_rejected_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    reject_review_item(f_organization, f_actor_identity, memory, 'refuted')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.REFUTED
+
+    assert memory.refuted is True
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo refute')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    assert memory.refuted is False
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
+def test_restore_memory_reinstates_feedback_refuted_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    memory.refuted = True
+
+    memory.save(update_fields=['refuted', 'updated_at'])
+
+    RetrievalDocument.objects.filter(memory=memory).update(refuted=True)
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo feedback refute')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    assert memory.refuted is False
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
+def test_restore_memory_reinstates_archived_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.ARCHIVED
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
+def test_restore_memory_reinstates_conflict_status_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    memory.status = MemoryStatus.CONFLICT
+
+    memory.save(update_fields=['status', 'updated_at'])
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo conflict hold')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
+def test_restore_memory_reinstates_stale_superseded_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    supersede_memory(f_organization, f_actor_identity, memory, target.id, 'superseded')
+
+    memory.refresh_from_db()
+
+    assert memory.stale is True
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo supersede')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    assert memory.stale is False
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
+def test_restore_memory_raises_invalid_state_on_second_restore(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    reject_review_item(f_organization, f_actor_identity, memory, 'refuted')
+
+    memory.refresh_from_db()
+
+    restore_memory(f_organization, f_actor_identity, memory, 'first restore')
+
+    memory.refresh_from_db()
+
+    with pytest.raises(MemoryReviewError) as error:
+        restore_memory(f_organization, f_actor_identity, memory, 'second restore')
+
+    assert error.value.code == 'invalid_state'
+
+
+@pytest.mark.django_db
+def test_restore_memory_raises_invalid_state_when_no_version_exists(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project, status=MemoryStatus.ARCHIVED)
+
+    with pytest.raises(MemoryReviewError) as error:
+        restore_memory(f_organization, f_actor_identity, memory, 'reason')
+
+    assert error.value.code == 'invalid_state'
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.ARCHIVED
+
+    assert MemoryReviewExample.objects.filter(item_type='memory', item_id=str(memory.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_restore_memory_reindexes_latest_memory_version(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'second version body', 'edit')
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    latest_version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
+
+    document = RetrievalDocument.objects.get(memory_version=latest_version)
+
+    assert 'second version body' in document.full_text
+
+    assert document.stale is False
+
+    assert document.refuted is False
+
+
+@pytest.mark.django_db
+def test_restore_memory_does_not_touch_conflicts_with_links(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    candidate = _make_candidate(f_organization, f_project)
+
+    conflict_link = MemoryLink.objects.create(
+        organization=f_organization,
+        project=f_project,
+        memory=memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='contradiction claim',
+    )
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    assert MemoryLink.objects.filter(id=conflict_link.id).exists()
+
+
+@pytest.mark.django_db
+def test_restore_memory_records_review_example_with_pre_mutation_status(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id), action='restore')
+
+    assert example.snapshot['status'] == MemoryStatus.ARCHIVED
+
+    assert example.reason == 'undo archive'
+
+    assert example.actor_id == str(f_actor_identity.id)
+
+    memory.refresh_from_db()
+
+    assert example.snapshot['status'] != memory.status
+
+
+@pytest.mark.django_db
+@postgres_only
+def test_restore_memory_locks_memory_row_for_update(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    with CaptureQueriesContext(connection) as queries:
+        restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    sql = _select_sql(queries, 'core_memory"')
+
+    assert 'FOR UPDATE' in sql.upper()

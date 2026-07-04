@@ -11,6 +11,7 @@ from engram.core.models import (
     ContextBundleItem,
     Memory,
     MemoryCandidate,
+    MemoryReviewExample,
     MemoryVersion,
     Observation,
     ObservationSource,
@@ -395,6 +396,47 @@ def test_memory_candidate_rejects_cross_scope_source_observation_on_create() -> 
             title='Cross candidate',
             body='This candidate points at another project.',
             content_hash='cross-candidate-hash',
+        )
+
+
+@pytest.mark.django_db
+def test_memory_review_example_rejects_cross_scope_project_on_create() -> None:
+    organization, team, project, _agent, _session = create_scope()
+    other_organization, _other_team, other_project, _other_agent, _other_session = create_second_scope()
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=organization,
+            project=other_project,
+            team=team,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
+        )
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=other_organization,
+            project=project,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
+        )
+
+
+@pytest.mark.django_db
+def test_memory_review_example_rejects_cross_scope_team_on_create() -> None:
+    organization, _team, project, _agent, _session = create_scope()
+    _other_organization, other_team, _other_project, _other_agent, _other_session = create_second_scope()
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=organization,
+            project=project,
+            team=other_team,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
         )
 
 
@@ -822,6 +864,14 @@ def test_context_bundle_has_created_at_composite_index() -> None:
 
 def test_agent_session_has_updated_at_composite_index() -> None:
     assert ('organization', 'project', 'updated_at') in index_field_sets(AgentSession)
+
+
+def test_memory_review_example_has_org_project_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'created_at') in index_field_sets(MemoryReviewExample)
+
+
+def test_memory_review_example_has_org_action_composite_index() -> None:
+    assert ('organization', 'action') in index_field_sets(MemoryReviewExample)
 
 
 @pytest.mark.django_db
