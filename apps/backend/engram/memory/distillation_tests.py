@@ -478,6 +478,46 @@ def test_session_distillation_system_prompt_declares_memories_object_contract() 
     assert '0.9' in prompt
 
 
+def test_session_distillation_system_prompt_mentions_optional_kind_vocabulary() -> None:
+    prompt = session_distillation_system_prompt()
+
+    assert '"kind"' in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
+
+
+def test_parse_synthesized_candidates_reads_kind() -> None:
+    raw = json.dumps({'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'kind': 'gotcha'}]})
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert candidates[0].kind == 'gotcha'
+
+
+def test_parse_synthesized_candidates_clamps_unknown_kind_to_empty_string() -> None:
+    raw = json.dumps({'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'kind': 'random'}]})
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert candidates[0].kind == ''
+
+
+def test_parse_synthesized_candidates_clamps_digest_kind_to_empty_string() -> None:
+    raw = json.dumps({'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'kind': 'digest'}]})
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert candidates[0].kind == ''
+
+
+def test_parse_synthesized_candidates_missing_kind_defaults_to_empty_string() -> None:
+    raw = json.dumps({'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9}]})
+
+    candidates = parse_synthesized_candidates(raw)
+
+    assert candidates[0].kind == ''
+
+
 @pytest.mark.django_db
 def test_distill_session_auto_promotes_high_confidence_and_holds_low_confidence() -> None:
     organization, team, project, agent, session = create_session_scope()
@@ -512,8 +552,12 @@ def test_distill_session_auto_promotes_high_confidence_and_holds_low_confidence(
     audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert audit.actor_type == 'system'
     assert audit.target_id == str(held.id)
+    assert audit.metadata['reason'] == 'below_auto_approve_threshold'
+    assert audit.metadata['candidate_id'] == str(held.id)
     assert audit.metadata['confidence'] == '0.400'
     assert audit.metadata['threshold'] == '0.800'
+    assert audit.metadata['source_observation_id'] is None
+    assert audit.metadata['session_id'] == str(session.id)
 
 
 @pytest.mark.django_db
@@ -871,6 +915,30 @@ def test_distill_session_small_session_makes_exactly_one_provider_call(m_monkeyp
     assert record.request_id == f'distill-session:{session.id}:small-test-1:curation:chunk:0'
     assert len(result.auto_promoted) == 1
     assert len(result.queued_for_review) == 1
+
+
+@pytest.mark.django_db
+def test_distill_session_candidate_kind_flows_to_promoted_memory_metadata_and_column(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    body = candidates_body(
+        [{'title': 'gotcha title', 'body': 'gotcha body', 'confidence': 0.95, 'kind': 'gotcha'}],
+    )
+    opener = sequenced_opener([body])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    result = DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    candidate = MemoryCandidate.objects.get(title='gotcha title')
+    assert candidate.kind == 'gotcha'
+    assert len(result.auto_promoted) == 1
+    memory = result.auto_promoted[0]
+    assert memory.metadata['kind'] == 'gotcha'
+    assert memory.kind == 'gotcha'
 
 
 @pytest.mark.django_db
@@ -1405,6 +1473,34 @@ def test_parse_reduced_candidates_truly_invalid_still_returns_none() -> None:
     assert _parse_reduced_candidates('this is not json and not fenced either') is None
 
 
+def test_parse_reduced_candidates_reads_and_clamps_kind() -> None:
+    raw = json.dumps(
+        {'memories': [{'title': 'm', 'body': 'b', 'confidence': 0.75, 'source_ids': [0], 'kind': 'gotcha'}]},
+    )
+
+    parsed = _parse_reduced_candidates(raw)
+
+    assert parsed[0].kind == 'gotcha'
+
+
+def test_parse_reduced_candidates_clamps_unknown_kind_to_empty_string() -> None:
+    raw = json.dumps(
+        {'memories': [{'title': 'm', 'body': 'b', 'confidence': 0.75, 'source_ids': [0], 'kind': 'random'}]},
+    )
+
+    parsed = _parse_reduced_candidates(raw)
+
+    assert parsed[0].kind == ''
+
+
+def test_parse_reduced_candidates_missing_kind_defaults_to_empty_string() -> None:
+    raw = json.dumps({'memories': [{'title': 'm', 'body': 'b', 'confidence': 0.75, 'source_ids': [0]}]})
+
+    parsed = _parse_reduced_candidates(raw)
+
+    assert parsed[0].kind == ''
+
+
 def _reduce_scope(
     m_monkeypatch: pytest.MonkeyPatch,
     *,
@@ -1739,3 +1835,110 @@ def test_distill_session_reduce_parses_successfully_under_fake_provider(
     candidates = MemoryCandidate.objects.filter(project=project)
     assert candidates.count() == 2
     assert all(candidate.evidence[0].get('reduced') is True for candidate in candidates)
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_round_trip_preserves_fake_provider_kind(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session, policy = _reduce_scope(m_monkeypatch)
+    observations = list(Observation.objects.filter(project=project).order_by('prompt_number'))
+    budget = _distill_chunk_char_budget(policy)
+    chunks = chunk_observations(observations, budget)
+    assert len(chunks) >= 2
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    candidates = MemoryCandidate.objects.filter(project=project)
+    assert candidates.count() == 2
+    assert {candidate.kind for candidate in candidates} == {'gotcha', ''}
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_uses_llm_provided_kind_over_inherited_kind(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '300')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    chunk_bodies = [
+        candidates_body(
+            [{'title': 'draft0', 'body': 'body0', 'confidence': 0.5, 'kind': 'convention'}],
+        ),
+        candidates_body(
+            [{'title': 'draft1', 'body': 'body1', 'confidence': 0.5, 'kind': 'decision'}],
+        ),
+    ]
+    reduce_items = [
+        {'title': 'merged', 'body': 'merged body', 'confidence': 0.8, 'source_ids': [0, 1], 'kind': 'architecture'},
+    ]
+    opener = sequenced_opener([*chunk_bodies, candidates_body({'memories': reduce_items})])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    candidate = MemoryCandidate.objects.get(project=project)
+    assert candidate.kind == 'architecture'
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_inherits_kind_from_highest_confidence_source_when_reduce_omits_kind(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '300')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    chunk_bodies = [
+        candidates_body(
+            [{'title': 'low confidence convention', 'body': 'body0', 'confidence': 0.5, 'kind': 'convention'}],
+        ),
+        candidates_body(
+            [{'title': 'high confidence decision', 'body': 'body1', 'confidence': 0.9, 'kind': 'decision'}],
+        ),
+    ]
+    reduce_items = [
+        {'title': 'merged no kind', 'body': 'merged body no kind', 'confidence': 0.8, 'source_ids': [0, 1]},
+    ]
+    opener = sequenced_opener([*chunk_bodies, candidates_body({'memories': reduce_items})])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    candidate = MemoryCandidate.objects.get(project=project)
+    assert candidate.kind == 'decision'
+
+
+@pytest.mark.django_db
+def test_distill_session_reduce_kind_stays_empty_when_no_source_carries_one(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '300')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    chunk_bodies = [
+        candidates_body([{'title': 'draft0', 'body': 'body0', 'confidence': 0.5}]),
+        candidates_body([{'title': 'draft1', 'body': 'body1', 'confidence': 0.9}]),
+    ]
+    reduce_items = [
+        {'title': 'merged still no kind', 'body': 'merged body', 'confidence': 0.8, 'source_ids': [0, 1]},
+    ]
+    opener = sequenced_opener([*chunk_bodies, candidates_body({'memories': reduce_items})])
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id))
+
+    candidate = MemoryCandidate.objects.get(project=project)
+    assert candidate.kind == ''

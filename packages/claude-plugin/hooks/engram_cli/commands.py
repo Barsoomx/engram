@@ -1740,6 +1740,16 @@ def _require_repository_scope(
     return project_id, repository_url
 
 
+def search_item_suffix(item: dict[str, object]) -> str:
+    kind = as_string(item.get("kind"))
+    confidence = as_string(item.get("confidence"))
+    parts = [part for part in (kind, f"conf {confidence}" if confidence else "") if part]
+    if not parts:
+        return ""
+
+    return f" [{', '.join(parts)}]"
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,
@@ -1795,7 +1805,7 @@ def run_search(
             return 0
 
         for item in items:
-            stdout.write(f"{item.get('citation')}: {item.get('title')}\n")
+            stdout.write(f"{item.get('citation')}: {item.get('title')}{search_item_suffix(item)}\n")
             stdout.write(f"  {item.get('body')}\n")
 
         return 0

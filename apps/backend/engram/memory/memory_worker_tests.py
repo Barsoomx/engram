@@ -355,8 +355,11 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     held_audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert held_audit.actor_type == 'system'
     assert held_audit.target_id == str(candidate.id)
+    assert held_audit.metadata['reason'] == 'below_auto_approve_threshold'
+    assert held_audit.metadata['candidate_id'] == str(candidate.id)
     assert held_audit.metadata['confidence'] == '0.600'
     assert held_audit.metadata['threshold'] == '0.800'
+    assert held_audit.metadata['source_observation_id'] == str(observation.id)
     assert candidate.content_hash == memory_candidate_content_hash(observation)
     assert candidate.evidence == [
         {

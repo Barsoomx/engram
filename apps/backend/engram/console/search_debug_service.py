@@ -12,6 +12,7 @@ from engram.context.services import (
     score_retrieval_document,
 )
 from engram.core.models import (
+    Memory,
     MemoryStatus,
     Organization,
     OrganizationSettings,
@@ -24,12 +25,21 @@ from engram.core.models import (
 DEFAULT_PACK_LIMIT = 20
 
 
+def _confidence_str(memory: Memory) -> str | None:
+    if memory.confidence is None:
+        return None
+
+    return str(memory.confidence)
+
+
 @dataclass(frozen=True)
 class DebugMatch:
     memory_id: uuid.UUID
     title: str
     score: int
     matched_on: str
+    kind: str
+    confidence: str | None
 
 
 @dataclass(frozen=True)
@@ -37,12 +47,16 @@ class DebugSemanticCandidate:
     memory_id: uuid.UUID
     title: str
     score: float
+    kind: str
+    confidence: str | None
 
 
 @dataclass(frozen=True)
 class DebugPackedItem:
     memory_id: uuid.UUID
     title: str
+    kind: str
+    confidence: str | None
 
 
 @dataclass(frozen=True)
@@ -108,10 +122,10 @@ class ReplaySearchDebug:
             authorized, scored, semantic_matched_ids, query, org_settings
         )
 
-        combined: list[tuple[uuid.UUID, str]] = (
-            [(doc.memory_id, doc.memory.title) for doc, _, _ in scored]
-            + [(c.memory_id, c.title) for c in semantic_candidates]
-            + [(c.memory_id, c.title) for c in lexical_candidates]
+        combined: list[tuple[uuid.UUID, str, str, str | None]] = (
+            [(doc.memory_id, doc.memory.title, doc.memory.kind, _confidence_str(doc.memory)) for doc, _, _ in scored]
+            + [(c.memory_id, c.title, c.kind, c.confidence) for c in semantic_candidates]
+            + [(c.memory_id, c.title, c.kind, c.confidence) for c in lexical_candidates]
         )
 
         packed_context, budget_excluded = self._pack(combined)
@@ -123,6 +137,8 @@ class ReplaySearchDebug:
                 title=doc.memory.title,
                 score=score,
                 matched_on=inclusion_reason,
+                kind=doc.memory.kind,
+                confidence=_confidence_str(doc.memory),
             )
             for doc, score, inclusion_reason in scored
         ]
@@ -243,6 +259,8 @@ class ReplaySearchDebug:
                 memory_id=doc.memory_id,
                 title=doc.memory.title,
                 score=round(similarity, 4),
+                kind=doc.memory.kind,
+                confidence=_confidence_str(doc.memory),
             )
             for similarity, doc in semantic_scored
         ]
@@ -269,6 +287,8 @@ class ReplaySearchDebug:
                 title=match.document.memory.title,
                 score=match.score,
                 matched_on=match.inclusion_reason,
+                kind=match.document.memory.kind,
+                confidence=_confidence_str(match.document.memory),
             )
             for match in matches
         ]
@@ -277,14 +297,14 @@ class ReplaySearchDebug:
 
     def _pack(
         self,
-        combined: list[tuple[uuid.UUID, str]],
+        combined: list[tuple[uuid.UUID, str, str, str | None]],
     ) -> tuple[list[DebugPackedItem], list[DebugExcluded]]:
         packed: list[DebugPackedItem] = []
         excluded: list[DebugExcluded] = []
 
-        for i, (memory_id, title) in enumerate(combined):
+        for i, (memory_id, title, kind, confidence) in enumerate(combined):
             if i < DEFAULT_PACK_LIMIT:
-                packed.append(DebugPackedItem(memory_id=memory_id, title=title))
+                packed.append(DebugPackedItem(memory_id=memory_id, title=title, kind=kind, confidence=confidence))
             else:
                 excluded.append(
                     DebugExcluded(

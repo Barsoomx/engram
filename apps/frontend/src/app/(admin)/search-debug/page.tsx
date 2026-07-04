@@ -8,6 +8,7 @@ import {
   Ban,
   Filter,
   Layers,
+  ListTree,
   Play,
   Sparkles,
   Target,
@@ -17,6 +18,7 @@ import * as React from 'react';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { ConfidenceTrack } from '@/components/ui/confidence-track';
 import { EmptyState } from '@/components/ui/empty-state';
+import { KindBadge } from '@/components/ui/kind-badge';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
@@ -28,6 +30,22 @@ import {
 } from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
+
+function confidencePct(value: string | null): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const pct = parsed <= 1 ? parsed * 100 : parsed;
+
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
 
 function splitTokens(value: string): string[] {
   return value
@@ -149,6 +167,20 @@ function ScoreReadout({ value, max }: { value: number; max: number }) {
   );
 }
 
+function ConfidenceReadout({ value }: { value: string | null }) {
+  const pct = confidencePct(value);
+
+  if (pct === null) {
+    return null;
+  }
+
+  return (
+    <span className='tnum shrink-0 font-mono text-[11px] text-default-400'>
+      {pct}% conf
+    </span>
+  );
+}
+
 function SearchDebugResults({ result }: { result: SearchDebugResult }) {
   const [scopeOpen, setScopeOpen] = React.useState(false);
 
@@ -169,6 +201,15 @@ function SearchDebugResults({ result }: { result: SearchDebugResult }) {
     () =>
       semanticCandidates.reduce((max, item) => Math.max(max, item.score), 0),
     [semanticCandidates],
+  );
+
+  const lexicalCandidates = React.useMemo(
+    () => [...result.lexical_candidates].sort((a, b) => b.score - a.score),
+    [result.lexical_candidates],
+  );
+  const lexicalMax = React.useMemo(
+    () => lexicalCandidates.reduce((max, item) => Math.max(max, item.score), 0),
+    [lexicalCandidates],
   );
 
   return (
@@ -203,14 +244,18 @@ function SearchDebugResults({ result }: { result: SearchDebugResult }) {
                 <span className='tnum inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary-soft font-mono text-[12px] font-semibold text-primary-300'>
                   {index + 1}
                 </span>
-                <div className='min-w-0'>
-                  <p className='truncate text-[13.5px] font-medium text-foreground'>
-                    {item.title || '(untitled)'}
-                  </p>
+                <div className='min-w-0 flex-1'>
+                  <div className='flex items-center gap-2'>
+                    <KindBadge kind={item.kind} />
+                    <p className='min-w-0 truncate text-[13.5px] font-medium text-foreground'>
+                      {item.title || '(untitled)'}
+                    </p>
+                  </div>
                   <p className='truncate font-mono text-[11.5px] text-primary-300'>
                     {item.memory_id}
                   </p>
                 </div>
+                <ConfidenceReadout value={item.confidence} />
               </li>
             ))}
           </ol>
@@ -235,14 +280,18 @@ function SearchDebugResults({ result }: { result: SearchDebugResult }) {
                 key={item.memory_id}
                 className='flex items-center gap-4 border-b border-divider py-3 last:border-b-0'
               >
-                <div className='min-w-0 flex-1'>
-                  <p className='truncate text-[13.5px] font-medium text-foreground'>
-                    {item.title || '(untitled)'}
-                  </p>
-                  <p className='truncate font-mono text-[11.5px] text-default-400'>
-                    {item.memory_id}
-                  </p>
+                <div className='flex min-w-0 flex-1 items-center gap-2'>
+                  <KindBadge kind={item.kind} />
+                  <div className='min-w-0'>
+                    <p className='truncate text-[13.5px] font-medium text-foreground'>
+                      {item.title || '(untitled)'}
+                    </p>
+                    <p className='truncate font-mono text-[11.5px] text-default-400'>
+                      {item.memory_id}
+                    </p>
+                  </div>
                 </div>
+                <ConfidenceReadout value={item.confidence} />
                 <span className='shrink-0 rounded-[7px] bg-content3 px-2 py-1 font-mono text-[11px] text-default-500'>
                   {item.matched_on}
                 </span>
@@ -270,9 +319,13 @@ function SearchDebugResults({ result }: { result: SearchDebugResult }) {
                   key={item.memory_id}
                   className='flex items-center gap-4 border-b border-divider py-3 last:border-b-0'
                 >
-                  <p className='min-w-0 flex-1 truncate text-[13.5px] font-medium text-foreground'>
-                    {item.title || '(untitled)'}
-                  </p>
+                  <div className='flex min-w-0 flex-1 items-center gap-2'>
+                    <KindBadge kind={item.kind} />
+                    <p className='min-w-0 truncate text-[13.5px] font-medium text-foreground'>
+                      {item.title || '(untitled)'}
+                    </p>
+                  </div>
+                  <ConfidenceReadout value={item.confidence} />
                   <ScoreReadout value={item.score} max={semanticMax} />
                 </div>
               ))}
@@ -280,6 +333,40 @@ function SearchDebugResults({ result }: { result: SearchDebugResult }) {
           ) : (
             <p className='mt-3 text-[13px] text-default-500'>
               No semantic candidates.
+            </p>
+          )}
+        </div>
+      )}
+
+      {result.lexical_enabled && (
+        <div className='surface-card p-[22px]'>
+          <SectionHeading
+            icon={<ListTree className='h-4 w-4' strokeWidth={1.8} />}
+            title='Lexical candidates'
+            count={lexicalCandidates.length}
+            accent='default'
+          />
+          {lexicalCandidates.length > 0 ? (
+            <div className='mt-3'>
+              {lexicalCandidates.map((item) => (
+                <div
+                  key={item.memory_id}
+                  className='flex items-center gap-4 border-b border-divider py-3 last:border-b-0'
+                >
+                  <div className='flex min-w-0 flex-1 items-center gap-2'>
+                    <KindBadge kind={item.kind} />
+                    <p className='min-w-0 truncate text-[13.5px] font-medium text-foreground'>
+                      {item.title || '(untitled)'}
+                    </p>
+                  </div>
+                  <ConfidenceReadout value={item.confidence} />
+                  <ScoreReadout value={item.score} max={lexicalMax} />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className='mt-3 text-[13px] text-default-500'>
+              No lexical candidates.
             </p>
           )}
         </div>

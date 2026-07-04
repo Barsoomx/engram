@@ -15,6 +15,7 @@ from engram.console.services import (
     get_review_memory_or_404,
     narrow_memory,
     reject_review_item,
+    restore_memory,
     supersede_memory,
 )
 from engram.core.domain.usecases.base import BaseUseCaseInputDTO, BaseUseCaseOutputDTO
@@ -46,6 +47,7 @@ class ReviewActionUseCase(UseCaseTransactional[ReviewActionInput, ReviewActionOu
         'supersede': '_apply_supersede',
         'reject': '_apply_reject',
         'archive': '_apply_archive',
+        'restore': '_apply_restore',
     }
 
     def _execute(self, input_dto: ReviewActionInput | None) -> ReviewActionOutput:
@@ -180,5 +182,15 @@ class ReviewActionUseCase(UseCaseTransactional[ReviewActionInput, ReviewActionOu
 
         return {
             'action': 'archive',
+            'memory_id': str(memory.id),
+        }
+
+    def _apply_restore(self, input_dto: ReviewActionInput) -> dict[str, Any]:
+        memory = get_review_memory_or_404(input_dto.organization, input_dto.item_id)
+
+        restore_memory(input_dto.organization, input_dto.actor_identity, memory, input_dto.reason)
+
+        return {
+            'action': 'restore',
             'memory_id': str(memory.id),
         }

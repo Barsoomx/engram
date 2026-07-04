@@ -837,6 +837,7 @@ def generated_candidates_payload(prompt: str) -> str:
             'confidence': 0.9,
             'supporting_observation_ids': [],
             'source_ids': [0],
+            'kind': 'gotcha',
         },
         {
             'title': f'Provider-synthesized memory {digest} low',
@@ -924,6 +925,10 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                             'confidence': {'type': 'number'},
                             'supporting_observation_ids': {'type': 'array', 'items': {'type': 'string'}},
                             'source_ids': {'type': 'array', 'items': {'type': 'integer'}},
+                            'kind': {
+                                'type': 'string',
+                                'enum': ['decision', 'convention', 'gotcha', 'architecture', 'incident'],
+                            },
                         },
                         'required': ['title', 'body', 'confidence'],
                     },
@@ -938,7 +943,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
         'input_schema': {
             'type': 'object',
             'properties': {
-                'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject']},
+                'decision': {'type': 'string', 'enum': ['merge', 'keep_both', 'reject', 'contradicts']},
                 'reason': {'type': 'string'},
             },
             'required': ['decision', 'reason'],

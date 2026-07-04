@@ -59,6 +59,16 @@ class MemoryStatus(models.TextChoices):
     CONFLICT = 'conflict', 'Conflict'
 
 
+MEMORY_KINDS = ('decision', 'convention', 'gotcha', 'architecture', 'incident', 'digest')
+
+
+def clamp_memory_kind(value: object) -> str:
+    if value in MEMORY_KINDS and value != 'digest':
+        return value
+
+    return ''
+
+
 class ContextBundleStatus(models.TextChoices):
     CREATED = 'created', 'Created'
     INJECTED = 'injected', 'Injected'
@@ -149,6 +159,7 @@ class OrganizationSettings(TimestampedModel):
     )
     curator_enabled = models.BooleanField(default=True)
     curator_llm_judge_enabled = models.BooleanField(default=False)
+    confidence_decay_enabled = models.BooleanField(default=True)
     lexical_fusion_enabled = models.BooleanField(default=False)
     lexical_recall_enabled = models.BooleanField(default=False)
     near_dup_threshold = models.DecimalField(
@@ -489,6 +500,7 @@ class MemoryCandidate(TimestampedModel):
     evidence = models.JSONField(default=list, blank=True)
     content_hash = models.CharField(max_length=128)
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    kind = models.CharField(max_length=40, blank=True, default='')
 
     class Meta:
         constraints = [
@@ -849,6 +861,7 @@ class LinkType(models.TextChoices):
     ISSUE = 'issue', 'Issue'
     NARROWED_BY = 'narrowed_by', 'Narrowed by'
     SUPERSEDED_BY = 'superseded_by', 'Superseded by'
+    CONFLICTS_WITH = 'conflicts_with', 'Conflicts With'
 
 
 class MemoryLink(TimestampedModel):
@@ -881,6 +894,43 @@ class MemoryLink(TimestampedModel):
 
     def __str__(self) -> str:
         return f'{self.link_type}:{self.target}'
+
+
+class MemoryReviewExample(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_review_examples')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_review_examples')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name='memory_review_examples',
+    )
+    item_type = models.CharField(max_length=40)
+    item_id = models.CharField(max_length=64)
+    action = models.CharField(max_length=40)
+    snapshot = models.JSONField(default=dict)
+    curator_context = models.JSONField(default=dict, blank=True)
+    reason = models.TextField(blank=True)
+    actor_id = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['organization', 'project', 'created_at']),
+            models.Index(fields=['organization', 'action']),
+        ]
+        ordering = ['organization_id', 'project_id', '-created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'{self.item_type}:{self.item_id}:{self.action}'
 
 
 class WorkflowRunType(models.TextChoices):

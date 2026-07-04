@@ -247,6 +247,30 @@ def test_promote_memory_candidate_existing_result_skips_reindex_for_stale_memory
     assert RetrievalDocument.objects.count() == 1
 
 
+@pytest.mark.django_db
+def test_promote_memory_candidate_writes_kind_into_memory_metadata_when_set() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    candidate = create_memory_candidate(observation)
+    candidate.kind = 'gotcha'
+    candidate.save(update_fields=['kind', 'updated_at'])
+
+    result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert result.memory.metadata['kind'] == 'gotcha'
+    assert result.memory.kind == 'gotcha'
+
+
+@pytest.mark.django_db
+def test_promote_memory_candidate_omits_kind_from_memory_metadata_when_unset() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    candidate = create_memory_candidate(observation)
+
+    result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+
+    assert 'kind' not in result.memory.metadata
+    assert result.memory.kind == ''
+
+
 @pytest.mark.django_db(transaction=True)
 def test_generate_candidate_provider_call_has_no_open_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
@@ -541,6 +565,42 @@ def test_process_observation_normal_title_and_body_preserved(monkeypatch: pytest
     candidate = MemoryCandidate.objects.get(source_observation=observation)
     assert candidate.title == 'Config lives in settings.py'
     assert candidate.body == 'Uses pgvector cosine.'
+
+
+@pytest.mark.django_db
+def test_process_observation_durable_type_sets_candidate_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    observation.observation_type = 'gotcha'
+    observation.save(update_fields=['observation_type', 'updated_at'])
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is False
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.kind == 'gotcha'
+
+
+@pytest.mark.django_db
+def test_process_observation_non_durable_type_leaves_candidate_kind_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    observation.observation_type = 'other'
+    observation.save(update_fields=['observation_type', 'updated_at'])
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is False
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.kind == ''
 
 
 def test_strip_json_fence_strips_json_tagged_fence() -> None:

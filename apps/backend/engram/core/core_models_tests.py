@@ -3,6 +3,7 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 
 from engram.core.models import (
+    MEMORY_KINDS,
     Agent,
     AgentSession,
     AuditEvent,
@@ -10,6 +11,7 @@ from engram.core.models import (
     ContextBundleItem,
     Memory,
     MemoryCandidate,
+    MemoryReviewExample,
     MemoryVersion,
     Observation,
     ObservationSource,
@@ -19,6 +21,7 @@ from engram.core.models import (
     RawEventEnvelope,
     RetrievalDocument,
     Team,
+    clamp_memory_kind,
 )
 
 
@@ -397,6 +400,47 @@ def test_memory_candidate_rejects_cross_scope_source_observation_on_create() -> 
 
 
 @pytest.mark.django_db
+def test_memory_review_example_rejects_cross_scope_project_on_create() -> None:
+    organization, team, project, _agent, _session = create_scope()
+    other_organization, _other_team, other_project, _other_agent, _other_session = create_second_scope()
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=organization,
+            project=other_project,
+            team=team,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
+        )
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=other_organization,
+            project=project,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
+        )
+
+
+@pytest.mark.django_db
+def test_memory_review_example_rejects_cross_scope_team_on_create() -> None:
+    organization, _team, project, _agent, _session = create_scope()
+    _other_organization, other_team, _other_project, _other_agent, _other_session = create_second_scope()
+
+    with pytest.raises(ValidationError):
+        MemoryReviewExample.objects.create(
+            organization=organization,
+            project=project,
+            team=other_team,
+            item_type='memory_candidate',
+            item_id='cand-1',
+            action='approve',
+        )
+
+
+@pytest.mark.django_db
 def test_memory_version_rejects_cross_scope_memory_on_create() -> None:
     organization, _team, project, _agent, _session = create_scope()
     other_organization, other_team, other_project, _other_agent, _other_session = create_second_scope()
@@ -733,6 +777,59 @@ def test_memory_kind_full_save_mirrors_changed_metadata_kind() -> None:
     assert refreshed.kind == 'summary'
 
 
+def test_clamp_memory_kind_accepts_non_digest_vocabulary_values() -> None:
+    for kind in MEMORY_KINDS:
+        if kind == 'digest':
+            continue
+        assert clamp_memory_kind(kind) == kind
+
+
+def test_clamp_memory_kind_rejects_digest() -> None:
+    assert clamp_memory_kind('digest') == ''
+
+
+def test_clamp_memory_kind_rejects_unknown_value() -> None:
+    assert clamp_memory_kind('random') == ''
+
+
+def test_clamp_memory_kind_rejects_none_and_empty_string() -> None:
+    assert clamp_memory_kind(None) == ''
+    assert clamp_memory_kind('') == ''
+
+
+@pytest.mark.django_db
+def test_memory_candidate_kind_defaults_to_empty_string() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Candidate without kind',
+        body='Body text.',
+        content_hash='candidate-kind-default-hash',
+    )
+
+    assert candidate.kind == ''
+
+
+@pytest.mark.django_db
+def test_memory_candidate_kind_persists_explicit_value() -> None:
+    organization, team, project, _agent, _session = create_scope()
+
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Candidate with kind',
+        body='Body text.',
+        content_hash='candidate-kind-explicit-hash',
+        kind='gotcha',
+    )
+
+    assert candidate.kind == 'gotcha'
+
+
 def index_field_sets(model: type) -> set[tuple[str, ...]]:
     return {tuple(index.fields) for index in model._meta.indexes}
 
@@ -767,6 +864,14 @@ def test_context_bundle_has_created_at_composite_index() -> None:
 
 def test_agent_session_has_updated_at_composite_index() -> None:
     assert ('organization', 'project', 'updated_at') in index_field_sets(AgentSession)
+
+
+def test_memory_review_example_has_org_project_created_at_composite_index() -> None:
+    assert ('organization', 'project', 'created_at') in index_field_sets(MemoryReviewExample)
+
+
+def test_memory_review_example_has_org_action_composite_index() -> None:
+    assert ('organization', 'action') in index_field_sets(MemoryReviewExample)
 
 
 @pytest.mark.django_db

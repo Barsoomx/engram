@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 
 from engram.access.services import EffectiveScope, ResolveApiKeyScope
+from engram.context.retrieval_warnings import RetrievalWarning, compute_retrieval_warnings, semantic_retrieval_gap
 from engram.context.services import (
     RetrievalMatch,
     authorized_retrieval_documents,
@@ -11,11 +12,12 @@ from engram.context.services import (
     lexical_fusion_matches,
     lexical_recall_matches,
     redact_text,
+    request_has_terms,
     resolve_query_embedding,
     score_retrieval_document,
     semantic_retrieval_matches,
 )
-from engram.core.models import Organization, OrganizationSettings, Team
+from engram.core.models import Organization, OrganizationSettings, Project, Team
 from engram.core.repository import resolve_project_for_scope
 
 
@@ -32,18 +34,20 @@ class SearchInput:
     correlation_id: str
     repository_url: str = ''
     repository_root: str = ''
+    kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class SearchResult:
     matches: tuple[RetrievalMatch, ...]
+    warnings: tuple[RetrievalWarning, ...] = ()
 
     def to_response(self) -> dict[str, object]:
         items = [self._item_response(match, f'M{index}') for index, match in enumerate(self.matches, start=1)]
 
         return {
             'items': items,
-            'warnings': [],
+            'warnings': [warning.to_dict() for warning in self.warnings],
         }
 
     def _item_response(self, match: RetrievalMatch, citation: str) -> dict[str, object]:
@@ -57,6 +61,8 @@ class SearchResult:
             'retrieval_document_id': str(document.id),
             'title': redact_text(memory.title),
             'body': redact_text(memory.body),
+            'confidence': str(memory.confidence) if memory.confidence is not None else None,
+            'kind': memory.kind,
             'inclusion_reason': match.inclusion_reason,
             'scope_evidence': {
                 'visibility_scope': document.visibility_scope,
@@ -89,8 +95,8 @@ class SearchMemories:
             request_id=data.request_id,
             correlation_id=data.correlation_id,
         )
-        documents = authorized_retrieval_documents(organization, project, scope)
-        has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
+        documents = authorized_retrieval_documents(organization, project, scope, data.kinds)
+        has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
         exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = score_retrieval_document(document, data.query, data.file_paths, data.symbols, has_request_terms)
@@ -105,11 +111,11 @@ class SearchMemories:
             ),
         )
         if len(exact_matches) >= data.limit:
-            return SearchResult(matches=tuple(exact_matches[: data.limit]))
+            return self._result(organization, project, scope, data, tuple(exact_matches[: data.limit]), False)
 
         org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
         if not org_settings.hybrid_retrieval_enabled:
-            return SearchResult(matches=tuple(exact_matches))
+            return self._result(organization, project, scope, data, tuple(exact_matches), False)
 
         embedding_result = resolve_query_embedding(
             data.query,
@@ -122,7 +128,8 @@ class SearchMemories:
             data.request_id,
         )
         if embedding_result is None:
-            return SearchResult(matches=tuple(exact_matches))
+            semantic_unavailable = semantic_retrieval_gap(has_request_terms, exact_matches)
+            return self._result(organization, project, scope, data, tuple(exact_matches), semantic_unavailable)
 
         query_vector = list(embedding_result.embedding)
         semantic_matches = semantic_retrieval_matches(documents, exact_matches, query_vector)
@@ -137,7 +144,33 @@ class SearchMemories:
         else:
             tail = semantic_matches
 
-        return SearchResult(matches=tuple((exact_matches + list(tail))[: data.limit]))
+        matches = tuple((exact_matches + list(tail))[: data.limit])
+
+        return self._result(organization, project, scope, data, matches, False)
+
+    def _result(
+        self,
+        organization: Organization,
+        project: Project,
+        scope: EffectiveScope,
+        data: SearchInput,
+        matches: tuple[RetrievalMatch, ...],
+        semantic_unavailable: bool,
+    ) -> SearchResult:
+        warnings = compute_retrieval_warnings(
+            organization=organization,
+            project=project,
+            scope=scope,
+            query=data.query,
+            file_paths=data.file_paths,
+            symbols=data.symbols,
+            has_request_terms=request_has_terms(data.query, data.file_paths, data.symbols),
+            included_matches=matches,
+            semantic_unavailable=semantic_unavailable,
+            kinds=data.kinds,
+        )
+
+        return SearchResult(matches=matches, warnings=tuple(warnings))
 
     def _resolve_team(self, data: SearchInput, scope: EffectiveScope) -> Team | None:
         selected_team_id = data.team_id

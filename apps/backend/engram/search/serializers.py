@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from engram.core.models import MEMORY_KINDS
+
 SEARCH_QUERY_MAX_LENGTH = 8000
 SEARCH_LIST_VALUE_MAX_LENGTH = 1024
 SEARCH_LIST_MAX_ITEMS = 100
+SEARCH_KINDS_MAX_ITEMS = 6
 
 
 def _limit_error(code: str, detail: str) -> dict[str, list[str]]:
@@ -45,6 +48,12 @@ class SearchRequestSerializer(serializers.Serializer):
     query = serializers.CharField(required=False, allow_blank=True, default='')
     file_paths = serializers.ListField(child=serializers.CharField(), required=False, default=list)
     symbols = serializers.ListField(child=serializers.CharField(), required=False, default=list)
+    kinds = serializers.ListField(
+        child=serializers.CharField(max_length=40),
+        required=False,
+        default=list,
+        max_length=SEARCH_KINDS_MAX_ITEMS,
+    )
     limit = serializers.IntegerField(required=False, min_value=1, max_value=10, default=5)
     request_id = serializers.CharField(required=False, allow_blank=True, max_length=255)
     correlation_id = serializers.CharField(required=False, allow_blank=True, default='', max_length=255)
@@ -89,3 +98,12 @@ class SearchRequestSerializer(serializers.Serializer):
             item_code='search_symbols_value_too_long',
             label='symbols',
         )
+
+    def validate_kinds(self, value: list[str]) -> list[str]:
+        invalid = [item for item in value if item not in MEMORY_KINDS]
+        if invalid:
+            raise serializers.ValidationError(
+                _limit_error('search_kinds_invalid', f'Invalid kind(s): {", ".join(invalid)}.'),
+            )
+
+        return value

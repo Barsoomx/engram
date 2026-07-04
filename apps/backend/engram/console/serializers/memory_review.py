@@ -16,6 +16,7 @@ class MemoryReviewActionSerializer(serializers.Serializer):
             'supersede',
             'reject',
             'archive',
+            'restore',
         ),
     )
 

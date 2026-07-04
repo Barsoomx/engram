@@ -31,6 +31,7 @@ from engram.console.exceptions import (
     ProjectSlugTakenError,
     TeamSlugTakenError,
 )
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
@@ -40,13 +41,17 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryLink,
+    MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
     Organization,
     Project,
+    RetrievalDocument,
     Team,
 )
+from engram.core.redaction import redact_value as core_redact_value
 from engram.core.repository import canonicalize_repository_url
+from engram.memory.conflict_links import clear_candidate_conflict_links
 
 logger = structlog.get_logger(__name__)
 
@@ -429,6 +434,86 @@ def _lock_memory_or_404(
     return memory
 
 
+def _redact_text(value: str) -> str:
+    return str(core_redact_value(value).value)
+
+
+def _candidate_file_paths(candidate: MemoryCandidate) -> list[str]:
+    observation = candidate.source_observation
+    if observation is None:
+        return []
+
+    return [_redact_text(file_path) for file_path in [*observation.files_read, *observation.files_modified]]
+
+
+def _review_example_curator_context(item: MemoryCandidate | Memory) -> dict[str, object]:
+    if not isinstance(item, MemoryCandidate):
+        return {}
+
+    context: dict[str, object] = {}
+
+    conflicts = [entry for entry in item.evidence if isinstance(entry, dict) and entry.get('type') == 'conflict']
+
+    if conflicts:
+        context['conflicts'] = conflicts
+
+    held_event = (
+        AuditEvent.objects.filter(
+            organization=item.organization,
+            target_type='memory_candidate',
+            target_id=str(item.id),
+            event_type='MemoryCandidateHeldForReview',
+        )
+        .order_by('-created_at')
+        .first()
+    )
+
+    if held_event is not None:
+        context['held_reason'] = held_event.metadata.get('reason', '')
+
+    return context
+
+
+def _record_review_example(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    item: MemoryCandidate | Memory,
+    action: str,
+    reason: str,
+    curator_context: dict[str, object] | None = None,
+) -> MemoryReviewExample:
+    is_candidate = isinstance(item, MemoryCandidate)
+
+    if is_candidate:
+        evidence = list(item.evidence)
+    else:
+        evidence = list(item.metadata.get('evidence', [])) if isinstance(item.metadata, dict) else []
+
+    snapshot = {
+        'title': _redact_text(item.title),
+        'body': _redact_text(item.body),
+        'status': item.status,
+        'confidence': str(item.confidence) if item.confidence is not None else None,
+        'kind': item.kind,
+        'visibility_scope': item.visibility_scope,
+        'evidence': evidence,
+    }
+
+    return MemoryReviewExample.objects.create(
+        organization=organization,
+        project=item.project,
+        team=item.team,
+        item_type='memory_candidate' if is_candidate else 'memory',
+        item_id=str(item.id),
+        action=action,
+        snapshot=snapshot,
+        curator_context=curator_context if curator_context is not None else _review_example_curator_context(item),
+        reason=reason,
+        actor_id=str(actor_identity.id),
+    )
+
+
 @transaction.atomic
 def approve_memory_candidate(
     organization: Organization,
@@ -444,6 +529,22 @@ def approve_memory_candidate(
             'only proposed candidates can be approved',
         )
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=candidate,
+        action='approve',
+        reason=reason,
+    )
+
+    metadata: dict[str, object] = {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+    }
+    if candidate.kind:
+        metadata['kind'] = candidate.kind
+
     memory = Memory.objects.create(
         organization=candidate.organization,
         project=candidate.project,
@@ -453,14 +554,10 @@ def approve_memory_candidate(
         status=MemoryStatus.APPROVED,
         visibility_scope=candidate.visibility_scope,
         confidence=candidate.confidence,
-        metadata={
-            'source': 'memory_candidate',
-            'memory_candidate_id': str(candidate.id),
-            'evidence': candidate.evidence,
-        },
+        metadata=metadata,
     )
 
-    MemoryVersion.objects.create(
+    version = MemoryVersion.objects.create(
         organization=memory.organization,
         project=memory.project,
         memory=memory,
@@ -470,11 +567,24 @@ def approve_memory_candidate(
         source_observation=candidate.source_observation,
     )
 
+    index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    document = index_result.retrieval_document
+
+    file_paths = _candidate_file_paths(candidate)
+
+    if document.file_paths != file_paths:
+        document.file_paths = file_paths
+
+        document.save(update_fields=['file_paths', 'updated_at'])
+
     candidate.status = CandidateStatus.PROMOTED
 
     candidate.promoted_memory = memory
 
     candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+
+    clear_candidate_conflict_links(candidate)
 
     audit_admin_action(
         organization=organization,
@@ -498,6 +608,17 @@ def edit_memory_body(
 ) -> MemoryVersion:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    if memory.kind == 'digest':
+        raise MemoryReviewError('invalid_state', 'digest memories cannot be edited')
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='edit',
+        reason=reason,
+    )
+
     next_version = memory.current_version + 1
 
     version = MemoryVersion.objects.create(
@@ -514,6 +635,9 @@ def edit_memory_body(
     memory.current_version = next_version
 
     memory.save(update_fields=['body', 'current_version', 'updated_at'])
+
+    if memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted:
+        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     audit_admin_action(
         organization=organization,
@@ -537,6 +661,14 @@ def narrow_memory(
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='narrow',
+        reason=reason,
+    )
+
     return _record_memory_link(
         organization=organization,
         actor_identity=actor_identity,
@@ -558,9 +690,19 @@ def supersede_memory(
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='supersede',
+        reason=reason,
+    )
+
     memory.stale = True
 
     memory.save(update_fields=['stale', 'updated_at'])
+
+    RetrievalDocument.objects.filter(memory=memory).update(stale=True, updated_at=timezone.now())
 
     return _record_memory_link(
         organization=organization,
@@ -634,9 +776,19 @@ def reject_review_item(
                 'only proposed candidates can be rejected',
             )
 
+        _record_review_example(
+            organization=organization,
+            actor_identity=actor_identity,
+            item=item,
+            action='reject',
+            reason=reason,
+        )
+
         item.status = CandidateStatus.REJECTED
 
         item.save(update_fields=['status', 'updated_at'])
+
+        clear_candidate_conflict_links(item)
 
         target_type = 'memory_candidate'
 
@@ -646,9 +798,21 @@ def reject_review_item(
         if item.status == MemoryStatus.REFUTED:
             return
 
+        _record_review_example(
+            organization=organization,
+            actor_identity=actor_identity,
+            item=item,
+            action='reject',
+            reason=reason,
+        )
+
         item.status = MemoryStatus.REFUTED
 
-        item.save(update_fields=['status', 'updated_at'])
+        item.refuted = True
+
+        item.save(update_fields=['status', 'refuted', 'updated_at'])
+
+        RetrievalDocument.objects.filter(memory=item).update(refuted=True, updated_at=timezone.now())
 
         target_type = 'memory'
 
@@ -674,6 +838,14 @@ def archive_memory(
     if memory.status == MemoryStatus.ARCHIVED:
         return memory
 
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='archive',
+        reason=reason,
+    )
+
     memory.status = MemoryStatus.ARCHIVED
 
     memory.save(update_fields=['status', 'updated_at'])
@@ -685,6 +857,55 @@ def archive_memory(
         target_type='memory',
         target_id=str(memory.id),
         metadata={'action': 'archive', 'reason': reason},
+    )
+
+    return memory
+
+
+@transaction.atomic
+def restore_memory(
+    organization: Organization,
+    actor_identity: Identity,
+    memory: Memory,
+    reason: str,
+) -> Memory:
+    memory = _lock_memory_or_404(organization, memory.id)
+
+    if memory.status == MemoryStatus.APPROVED and not memory.refuted and not memory.stale:
+        raise MemoryReviewError('invalid_state', 'memory is already active')
+
+    version = memory.versions.order_by('-version').first()
+
+    if version is None:
+        raise MemoryReviewError('invalid_state', 'memory has no version to restore')
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=memory,
+        action='restore',
+        reason=reason,
+    )
+
+    memory.status = MemoryStatus.APPROVED
+
+    memory.refuted = False
+
+    memory.stale = False
+
+    memory.save(update_fields=['status', 'refuted', 'stale', 'updated_at'])
+
+    RetrievalDocument.objects.filter(memory=memory).update(refuted=False, stale=False, updated_at=timezone.now())
+
+    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemoryReviewed',
+        target_type='memory',
+        target_id=str(memory.id),
+        metadata={'action': 'restore', 'reason': reason},
     )
 
     return memory

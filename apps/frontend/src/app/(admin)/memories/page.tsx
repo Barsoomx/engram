@@ -63,6 +63,8 @@ const KIND_FILTERS: { key: KindFilter; label: string }[] = [
   { key: 'convention', label: 'Conventions' },
   { key: 'gotcha', label: 'Gotchas' },
   { key: 'architecture', label: 'Architecture' },
+  { key: 'incident', label: 'Incidents' },
+  { key: 'digest', label: 'Digests' },
 ];
 
 function confidencePct(value: string | null): number | null {

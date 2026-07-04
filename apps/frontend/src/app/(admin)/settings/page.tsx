@@ -492,6 +492,13 @@ export default function SettingsPage() {
               onChange={(next) => handleRetrievalToggle('require_provenance', next)}
               disabled={!retrieval || retrievalMutation.isPending}
             />
+            <Toggle
+              label='Confidence decay'
+              description='Aged memories gradually lose confidence and enter the review queue.'
+              checked={retrieval?.confidence_decay_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('confidence_decay_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
             <NumberField
               label='Auto-approve confidence threshold'
               description='Memory candidates at or above this confidence auto-promote; below it they wait for review.'

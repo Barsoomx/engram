@@ -1677,6 +1677,77 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_search_prints_kind_and_confidence_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "request_id": "request-search-2",
+                "items": [
+                    {
+                        "citation": "M1",
+                        "memory_id": "mem-1",
+                        "title": "Authorisation handling",
+                        "body": "Authorisation runs before ranking.",
+                        "kind": "gotcha",
+                        "confidence": "0.950",
+                    },
+                ],
+                "warnings": [],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "search",
+                    "--query",
+                    "auth ranking",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn(
+                "M1: Authorisation handling [gotcha, conf 0.950]", stdout
+            )
+
+    def test_search_as_json_omits_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "request_id": "request-search-3",
+                "items": [
+                    {
+                        "citation": "M1",
+                        "memory_id": "mem-1",
+                        "title": "Authorisation handling",
+                        "body": "Authorisation runs before ranking.",
+                        "kind": "gotcha",
+                        "confidence": "0.950",
+                    },
+                ],
+                "warnings": [],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "search",
+                    "--query",
+                    "auth ranking",
+                    "--json",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            body = json.loads(stdout)
+            self.assertEqual("gotcha", body["items"][0]["kind"])
+            self.assertNotIn("conf 0.950", stdout)
+
     def test_search_project_flag_wins_over_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

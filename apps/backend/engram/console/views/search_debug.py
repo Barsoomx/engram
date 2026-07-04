@@ -61,6 +61,8 @@ class SearchDebugView(APIView):
                         'title': m.title,
                         'score': m.score,
                         'matched_on': m.matched_on,
+                        'kind': m.kind,
+                        'confidence': m.confidence,
                     }
                     for m in result.exact_matches
                 ],
@@ -70,13 +72,29 @@ class SearchDebugView(APIView):
                         'memory_id': str(c.memory_id),
                         'title': c.title,
                         'score': c.score,
+                        'kind': c.kind,
+                        'confidence': c.confidence,
                     }
                     for c in result.semantic_candidates
+                ],
+                'lexical_enabled': result.lexical_enabled,
+                'lexical_candidates': [
+                    {
+                        'memory_id': str(m.memory_id),
+                        'title': m.title,
+                        'score': m.score,
+                        'matched_on': m.matched_on,
+                        'kind': m.kind,
+                        'confidence': m.confidence,
+                    }
+                    for m in result.lexical_candidates
                 ],
                 'packed_context': [
                     {
                         'memory_id': str(p.memory_id),
                         'title': p.title,
+                        'kind': p.kind,
+                        'confidence': p.confidence,
                     }
                     for p in result.packed_context
                 ],

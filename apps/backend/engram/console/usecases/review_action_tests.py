@@ -413,3 +413,128 @@ def test_approve_action_on_missing_candidate_raises_not_found(
         )
 
     assert error.value.code == 'not_found'
+
+
+@pytest.mark.django_db
+def test_restore_action_reactivates_archived_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    result = _execute(
+        ReviewActionInput(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            item_id=candidate.id,
+            action_name='approve',
+            reason='looks good',
+        ),
+    )
+
+    memory = Memory.objects.get(id=result['memory_id'])
+
+    _execute(
+        ReviewActionInput(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            item_id=memory.id,
+            action_name='archive',
+            reason='stale topic',
+        ),
+    )
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.ARCHIVED
+
+    result = _execute(
+        ReviewActionInput(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            item_id=memory.id,
+            action_name='restore',
+            reason='undo archive',
+        ),
+    )
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    assert result == {'action': 'restore', 'memory_id': str(memory.id)}
+
+
+@pytest.mark.django_db
+def test_restore_action_on_candidate_raises_not_found(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    with pytest.raises(MemoryReviewError) as error:
+        _execute(
+            ReviewActionInput(
+                organization=f_organization,
+                actor_identity=f_actor_identity,
+                item_id=candidate.id,
+                action_name='restore',
+                reason='nope',
+            ),
+        )
+
+    assert error.value.code == 'not_found'
+
+
+@pytest.mark.django_db
+def test_restore_action_logs_item_type_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    approved = _execute(
+        ReviewActionInput(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            item_id=candidate.id,
+            action_name='approve',
+            reason='looks good',
+        ),
+    )
+
+    memory = Memory.objects.get(id=approved['memory_id'])
+
+    archive_result = _execute(
+        ReviewActionInput(
+            organization=f_organization,
+            actor_identity=f_actor_identity,
+            item_id=memory.id,
+            action_name='archive',
+            reason='stale topic',
+        ),
+    )
+
+    assert archive_result == {'action': 'archive', 'memory_id': str(memory.id)}
+
+    with structlog.testing.capture_logs() as captured_logs:
+        _execute(
+            ReviewActionInput(
+                organization=f_organization,
+                actor_identity=f_actor_identity,
+                item_id=memory.id,
+                action_name='restore',
+                reason='undo archive',
+            ),
+        )
+
+    events = [entry for entry in captured_logs if entry['event'] == 'memory_review_action_applied']
+
+    assert len(events) == 1
+
+    assert events[0]['action'] == 'restore'
+
+    assert events[0]['item_type'] == 'memory'

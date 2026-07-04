@@ -151,6 +151,72 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("Bearer egk_file_key", headers["Authorization"])
         self.assertIn("[c-1] T (memory_id=m-1)", text)
 
+    def test_search_renders_kind_and_confidence_suffix(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "c-1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "kind": "gotcha",
+                        "confidence": "0.950",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory(
+            {"query": "auth"}, self.config_dir, transport
+        )
+
+        self.assertIn(
+            "[c-1] T (memory_id=m-1) [gotcha, conf 0.950]", text
+        )
+
+    def test_search_renders_kind_only_suffix(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "c-1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "kind": "gotcha",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory(
+            {"query": "auth"}, self.config_dir, transport
+        )
+
+        self.assertIn("[c-1] T (memory_id=m-1) [gotcha]", text)
+
+    def test_search_renders_confidence_only_suffix(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "c-1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "confidence": "0.950",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory(
+            {"query": "auth"}, self.config_dir, transport
+        )
+
+        self.assertIn("[c-1] T (memory_id=m-1) [conf 0.950]", text)
+
     def test_search_renders_valid_entries_and_skips_garbage(self) -> None:
         self.write_local_config()
         transport = StubTransport(

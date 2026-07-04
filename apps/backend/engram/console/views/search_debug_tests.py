@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from django.contrib.auth.models import User
 from rest_framework.authtoken.models import Token
@@ -93,6 +95,8 @@ def _make_retrieval_doc(
     refuted: bool = False,
     visibility_scope: str = VisibilityScope.PROJECT,
     exact_terms: list[str] | None = None,
+    kind: str = '',
+    confidence: Decimal | None = None,
 ) -> tuple[Memory, RetrievalDocument]:
     memory = Memory.objects.create(
         organization=organization,
@@ -104,6 +108,8 @@ def _make_retrieval_doc(
         visibility_scope=visibility_scope,
         stale=stale,
         refuted=refuted,
+        metadata={'kind': kind} if kind else {},
+        confidence=confidence,
     )
     version = MemoryVersion.objects.create(
         organization=organization,
@@ -201,6 +207,45 @@ def test_happy_path_returns_scope_filters_exact_matches_and_excluded(
 
     packed_ids = [p['memory_id'] for p in data['packed_context']]
     assert str(matched_memory.id) in packed_ids
+
+
+@pytest.mark.django_db
+def test_response_exposes_kind_confidence_and_lexical_fields(
+    f_admin_client: APIClient,
+    f_org_project: tuple[Organization, Project],
+) -> None:
+    org, project = f_org_project
+
+    matched_memory, _doc = _make_retrieval_doc(
+        org,
+        project,
+        None,
+        title='cache invalidation',
+        exact_terms=['cache invalidation'],
+        kind='gotcha',
+        confidence=Decimal('0.910'),
+    )
+
+    response = f_admin_client.post(
+        '/v1/admin/search-debug/',
+        {'project_id': str(project.id), 'query': 'cache invalidation'},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    data = response.data
+
+    assert 'lexical_enabled' in data
+    assert data['lexical_enabled'] is False
+    assert data['lexical_candidates'] == []
+
+    exact_match = next(m for m in data['exact_matches'] if m['memory_id'] == str(matched_memory.id))
+    assert exact_match['kind'] == 'gotcha'
+    assert exact_match['confidence'] == '0.910'
+
+    packed_item = next(p for p in data['packed_context'] if p['memory_id'] == str(matched_memory.id))
+    assert packed_item['kind'] == 'gotcha'
+    assert packed_item['confidence'] == '0.910'
 
 
 @pytest.mark.django_db
