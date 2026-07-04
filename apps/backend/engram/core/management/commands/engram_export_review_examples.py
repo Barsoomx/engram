@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from django.core.management.base import BaseCommand, CommandParser
@@ -30,7 +31,7 @@ class Command(BaseCommand):
                 write=self.stdout.write,
             )
         else:
-            with open(output, 'w', encoding='utf-8') as target:
+            with Path(output).open('w', encoding='utf-8') as target:
                 exported = export_review_examples(
                     organization_id=organization_id,
                     project_id=project_id,
