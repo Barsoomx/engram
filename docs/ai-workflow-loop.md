@@ -88,17 +88,72 @@ Human review is exception-based:
 
 ## Audit
 
-Audit records are written for these curator outcomes: MemorySuperseded
-(near-dup merge), MemoryAutoRejected (low-signal or judge reject),
-MemoryCandidateHeldForReview (deterministic policy escalation), and
-MemoryConflictDetected (judge contradiction hold). Auto-promote does not
-create an audit record. Recorded metadata is narrow: MemorySuperseded stores
-the winning memory id and near-dup score; MemoryAutoRejected stores the reject
-reason, body length, and optional near-dup score;
-MemoryCandidateHeldForReview stores an `escalation:<rule>` reason and the
-candidate id; MemoryConflictDetected stores the candidate id, the conflicting
-memory id, the near-dup score, and a redacted, length-capped judge reason.
-Model policy, provider, input window, before/after memory version, and a
+The curator (`memory/curation.py`) writes every one of its outcomes through a
+single function, `_audit_curator_action`, so all curator audit rows share one
+metadata contract. It covers five event types:
+
+- **MemoryCuratorPromoted** — written for every successful promotion except a
+  replayed rerun of an already-promoted candidate (reruns are not re-audited).
+  `decision` carries the specific route that led to promotion:
+  `passthrough` (curator disabled for the org), `no_duplicate` (embedding
+  search found no near match), `embedding_unavailable` (no embedding policy
+  configured, so dedup was skipped), or `judge_keep_both` (the LLM judge ruled
+  the near-duplicate pair compatible). `extra.memory_id` records the promoted
+  memory.
+- **MemorySuperseded** — written when a near-duplicate merge marks an older
+  memory stale. `target_type=memory` and `target_id` are the *losing* (now
+  stale) memory, not the candidate; `extra.winner_memory_id` and
+  `extra.loser_memory_id` record both sides of the merge.
+- **MemoryAutoRejected** — written when a candidate is auto-rejected.
+  `reason` is `low_signal` (empty or title-echoing body) or
+  `near_dup_judge_reject` (the LLM judge ruled the candidate adds no durable
+  value); `extra.body_length` records the rejected body's length.
+- **MemoryCandidateHeldForReview** — written by the curator only for the
+  deterministic escalation gate (`_hold_for_escalation`), when a candidate is
+  organization-wide scoped or matches a configured sensitive term and is held
+  before ever reaching the embedding/judge pipeline. `decision` is
+  `held_escalation`; `reason` is `escalation:org_wide_scope` or
+  `escalation:security_sensitive`. This event type is also written, with a
+  different reason and a narrower metadata shape (see below), by the
+  pre-curation confidence-threshold gate — the two are distinguished by the
+  `reason` field, not by decision or writer location.
+- **MemoryConflictDetected** — written when the LLM judge returns
+  `contradicts`. `decision` is `held_conflict`; `reason` is the judge's
+  redacted, 200-char-capped explanation; `extra.memory_id` is the existing
+  memory the candidate conflicts with.
+
+Every curator-written row shares this metadata shape: `candidate_id`,
+`decision`, `reason`, `near_dup_score` (2-decimal string when a near-dup score
+was computed, else null), `threshold` (the near-dup threshold in play, else
+null), `source_observation_id` (the candidate's source observation, else
+null), and `evidence_source_ids` (a deduped, order-preserving, 50-item-capped
+list of ids pulled from the candidate's evidence entries, excluding conflict
+markers). When the LLM judge was consulted, a `judge` object is added with
+`policy_id`, `policy_version`, `provider`, `model`,
+`provider_call_record_id`, and redacted before/after snapshots
+(`candidate` and `existing_memory`, each `{title (redacted, <=120 chars),
+body_sha256, body_length}`) — this is the judge's full input window without
+storing the raw bodies. `request_id`/`correlation_id` on the row propagate the
+caller's correlation id when supplied. The full metadata dict is passed
+through core redaction (`redact_value`) before being persisted, so any
+secret-shaped string is replaced with `[REDACTED]` and any secret-named key is
+fully redacted.
+
+The pre-curation confidence-threshold hold is a separate writer: it fires
+before a candidate ever reaches the curator, from `ProcessObservationRecorded`
+(`memory/services.py`, per-observation path) and `DistillSession`
+(`memory/distillation.py`, session-distillation path) when a newly created
+candidate's confidence is below the org's auto-approve threshold. Both call
+sites write the same event type and a narrower, non-uniform metadata shape:
+`reason=below_auto_approve_threshold`, `candidate_id`, `confidence`,
+`threshold`, and `source_observation_id` (null for session-distillation
+candidates, which are synthesized from multiple observations rather than tied
+to one); the distillation path additionally records `session_id`. This
+metadata is redacted the same way as the curator's.
+
+Auto-promote through the plain replay path (an already-promoted candidate
+re-curated) does not create a new audit record. Model policy input beyond the
+judge's redacted snapshot, full before/after memory version bodies, and a
 human-review-required flag are not recorded.
 
 Automatic deletion should be soft-delete/archive in V1. Hard deletion is a later
