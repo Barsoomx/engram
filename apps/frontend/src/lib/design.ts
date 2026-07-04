@@ -1,4 +1,10 @@
-export type MemoryKind = 'decision' | 'convention' | 'gotcha' | 'architecture';
+export type MemoryKind =
+  | 'decision'
+  | 'convention'
+  | 'gotcha'
+  | 'architecture'
+  | 'incident'
+  | 'digest';
 
 export interface KindStyle {
   label: string;
@@ -32,6 +38,18 @@ export const KIND_STYLES: Record<MemoryKind, KindStyle> = {
     bg: 'rgba(91,157,255,0.14)',
     dot: '#6BA6FF',
   },
+  incident: {
+    label: 'Incident',
+    text: '#FB6E72',
+    bg: 'rgba(251,110,114,0.13)',
+    dot: '#FB6E72',
+  },
+  digest: {
+    label: 'Digest',
+    text: '#8B8D93',
+    bg: 'rgba(139,141,147,0.14)',
+    dot: '#8B8D93',
+  },
 };
 
 export function resolveKind(value: string | null | undefined): MemoryKind {
@@ -51,6 +69,14 @@ export function resolveKind(value: string | null | undefined): MemoryKind {
 
   if (v.startsWith('arch')) {
     return 'architecture';
+  }
+
+  if (v.startsWith('incident')) {
+    return 'incident';
+  }
+
+  if (v.startsWith('digest')) {
+    return 'digest';
   }
 
   return 'decision';

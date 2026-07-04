@@ -33,6 +33,7 @@ class SearchView(APIView):
                 limit=data.get('limit', 5),
                 request_id=request_id,
                 correlation_id=data.get('correlation_id', ''),
+                kinds=tuple(data.get('kinds', [])),
             ),
         )
 

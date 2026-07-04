@@ -162,11 +162,33 @@ without persisting anything. The seven ingest hooks all require
 | POST   | `/v1/context`                     | Build a task context bundle for the agent         |
 | POST   | `/v1/context/session-start`       | Build a session-start context bundle              |
 
+Both accept an optional `kinds` request field (list of up to 6 values drawn
+from `decision`, `convention`, `gotcha`, `architecture`, `incident`, `digest`)
+to restrict retrieval to matching memory kinds; an invalid value returns 400.
+
+Each item in the response `items` array carries `kind` (string) and
+`confidence` (string decimal, or `null` if unset) alongside the existing
+`citation`/`memory_id`/`title`/`body` fields. The rendered context text
+annotates each memory block with `(kind, confidence X)` when either value is
+present.
+
+The response also includes a top-level `warnings` array. Each entry is
+`{code, message, memory_id}`, where `memory_id` is `null` when the warning is
+not tied to a specific memory. Codes: `budget_dropped` (matches dropped for
+token budget), `semantic_unavailable` (embedding could not be resolved),
+`stale_match` / `refuted_match` (a stale or refuted memory scored above the
+match threshold), `conflicting_memory` (an included memory has an unresolved
+contradiction claim). The array is empty when there is nothing to warn about.
+
 ### Search
 
 | Method | Path          | Description                                       |
 |--------|---------------|---------------------------------------------------|
 | POST   | `/v1/search/` | Semantic/full-text memory search within scope     |
+
+Accepts the same optional `kinds` request field as Context. The response
+`items` carry the same `kind`/`confidence` fields, and the response has the
+same top-level `warnings` array described above.
 
 ### Memories
 

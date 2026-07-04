@@ -26,7 +26,7 @@ from engram.core.models import (
     OrganizationSettings,
     RetrievalDocument,
 )
-from engram.memory.conflict_links import clear_candidate_conflict_links
+from engram.memory.conflict_links import clear_candidate_conflict_links, conflict_candidate_target
 from engram.memory.escalation import escalation_reason
 from engram.memory.services import (
     MemoryWorkerError,
@@ -726,7 +726,7 @@ class CurateMemoryCandidate:
                 MemoryLink.objects.get_or_create(
                     memory=existing_memory,
                     link_type=LinkType.CONFLICTS_WITH,
-                    target=f'candidate:{locked.id}',
+                    target=conflict_candidate_target(locked.id),
                     defaults={
                         'organization': existing_memory.organization,
                         'project': existing_memory.project,

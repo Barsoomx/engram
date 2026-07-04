@@ -45,6 +45,11 @@ lead/curator tool set yet. All six also accept an optional per-call
 neither it nor `ENGRAM_PROJECT_ID`/config resolve one - see
 [guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
 
+`engram_search` renders each result line as
+`[<citation>] <title> (memory_id=<id>) [<kind>, conf <confidence>]`. The
+trailing ` [kind, conf X]` suffix is omitted when a field is absent (for
+example a memory with no recorded confidence renders ` [gotcha]` only).
+
 These tools should feel seamless. Developers should not need to understand the
 curation pipeline to benefit from memory.
 

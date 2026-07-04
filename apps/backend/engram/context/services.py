@@ -3,7 +3,9 @@ from __future__ import annotations
 import math
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
+from decimal import Decimal
 
 import structlog
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
@@ -12,6 +14,11 @@ from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
+from engram.context.retrieval_warnings import (
+    RetrievalWarning,
+    compute_retrieval_warnings,
+    semantic_retrieval_gap,
+)
 from engram.context.term_extraction import extract_exact_terms, extract_symbols
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
@@ -89,6 +96,7 @@ class ContextBundleInput:
     limit: int
     token_budget: int | None
     purpose: str
+    kinds: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -126,7 +134,7 @@ class ContextBundleResult:
             'rendered_context': rendered_context,
             'hook_specific_output': hook_specific_output,
             'items': [self._item_response(match) for match in self.matches],
-            'warnings': [],
+            'warnings': list(self.bundle.metadata.get('warnings', [])),
         }
 
     def _item_response(self, match: RetrievalMatch) -> dict[str, object]:
@@ -140,6 +148,8 @@ class ContextBundleResult:
             'retrieval_document_id': str(document.id),
             'title': redact_text(memory.title),
             'body': redact_text(memory.body),
+            'confidence': str(memory.confidence) if memory.confidence is not None else None,
+            'kind': memory.kind,
             'inclusion_reason': match.inclusion_reason,
             'scope_evidence': self._scope_evidence(document),
             'matched_terms': list(match.matched_terms),
@@ -217,6 +227,24 @@ def estimate_tokens(text: str) -> int:
     return (len(text) + 3) // 4
 
 
+def _render_annotation(kind: str, confidence: Decimal | None) -> str:
+    parts = []
+    if kind:
+        parts.append(kind)
+    if confidence is not None:
+        parts.append(f'confidence {confidence}')
+    if not parts:
+        return ''
+
+    return f' ({", ".join(parts)})'
+
+
+def _render_block(memory: Memory, index: int) -> str:
+    annotation = _render_annotation(memory.kind, memory.confidence)
+
+    return f'- [M{index}] {redact_text(memory.title)}{annotation}\n  {redact_text(memory.body)}'
+
+
 def _pack_to_budget(
     matches: tuple[RetrievalMatch, ...],
     token_budget: int | None,
@@ -236,7 +264,7 @@ def _pack_to_budget(
 
         memory = match.document.memory
         index = len(kept) + 1
-        block = f'- [M{index}] {redact_text(memory.title)}\n  {redact_text(memory.body)}'
+        block = _render_block(memory, index)
         cost = estimate_tokens(block)
 
         if not kept or tokens_used + cost <= token_budget:
@@ -264,10 +292,26 @@ def cosine_similarity(left: list[float], right: list[float]) -> float:
     return dot / (left_norm * right_norm)
 
 
+def filter_documents_by_team_visibility(
+    documents: Iterable[RetrievalDocument],
+    scope: EffectiveScope,
+) -> tuple[RetrievalDocument, ...]:
+    authorized: list[RetrievalDocument] = []
+    allowed_team_ids = set(scope.team_ids)
+    for document in documents:
+        if document.visibility_scope == VisibilityScope.PROJECT:
+            authorized.append(document)
+        elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
+            authorized.append(document)
+
+    return tuple(authorized)
+
+
 def authorized_retrieval_documents(
     organization: Organization,
     project: Project,
     scope: EffectiveScope,
+    kinds: tuple[str, ...] = (),
 ) -> tuple[RetrievalDocument, ...]:
     documents = RetrievalDocument.objects.select_related(
         'memory',
@@ -282,15 +326,14 @@ def authorized_retrieval_documents(
         stale=False,
         refuted=False,
     )
-    authorized: list[RetrievalDocument] = []
-    allowed_team_ids = set(scope.team_ids)
-    for document in documents:
-        if document.visibility_scope == VisibilityScope.PROJECT:
-            authorized.append(document)
-        elif document.visibility_scope == VisibilityScope.TEAM and document.team_id in allowed_team_ids:
-            authorized.append(document)
+    if kinds:
+        documents = documents.filter(memory__kind__in=kinds)
 
-    return tuple(authorized)
+    return filter_documents_by_team_visibility(documents, scope)
+
+
+def request_has_terms(query: str, file_paths: tuple[str, ...], symbols: tuple[str, ...]) -> bool:
+    return bool(query.strip() or file_paths or symbols)
 
 
 def score_retrieval_document(
@@ -919,8 +962,8 @@ class BuildContextBundle:
         agent = self._get_or_create_agent(organization, data)
         session = self._get_or_create_session(organization, project, team, agent, data)
         retrieval_started_at = time.monotonic()
-        authorized_documents = self._authorized_documents(organization, project, scope)
-        matches, has_semantic, embedding_result = self._rank_matches(
+        authorized_documents = self._authorized_documents(organization, project, scope, data.kinds)
+        matches, has_semantic, embedding_result, semantic_unavailable = self._rank_matches(
             authorized_documents,
             data,
             organization,
@@ -929,12 +972,23 @@ class BuildContextBundle:
         )
         kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
         retrieval_latency_ms = round((time.monotonic() - retrieval_started_at) * 1000)
-        tokens_used = sum(
-            estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
-            for i, m in enumerate(kept, start=1)
-        )
+        tokens_used = sum(estimate_tokens(_render_block(m.document.memory, i)) for i, m in enumerate(kept, start=1))
         query_result = redact_value(data.query)
         retrieval_strategy = resolve_retrieval_strategy(matches)
+        has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
+        warnings = compute_retrieval_warnings(
+            organization=organization,
+            project=project,
+            scope=scope,
+            query=data.query,
+            file_paths=data.file_paths,
+            symbols=data.symbols,
+            has_request_terms=has_request_terms,
+            included_matches=kept,
+            semantic_unavailable=semantic_unavailable,
+            dropped_for_budget=len(budget_dropped),
+            kinds=data.kinds,
+        )
         metadata: dict[str, object] = {'retrieval_strategy': retrieval_strategy}
         if query_result.redacted:
             metadata['redaction'] = {'query_text': True}
@@ -943,6 +997,7 @@ class BuildContextBundle:
         metadata['token_budget'] = data.token_budget
         metadata['tokens_used'] = tokens_used
         metadata['dropped_for_budget'] = len(budget_dropped)
+        metadata['warnings'] = [warning.to_dict() for warning in warnings]
 
         with transaction.atomic():
             bundle = ContextBundle.objects.create(
@@ -961,7 +1016,7 @@ class BuildContextBundle:
                 retrieval_latency_ms=retrieval_latency_ms,
             )
             persisted_matches = self._create_items(bundle, kept)
-            bundle.rendered_text = self._render_context(persisted_matches)
+            bundle.rendered_text = self._render_context(persisted_matches, warnings)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
             self._audit_retrieval(
@@ -1106,8 +1161,9 @@ class BuildContextBundle:
         organization: Organization,
         project: Project,
         scope: EffectiveScope,
+        kinds: tuple[str, ...] = (),
     ) -> tuple[RetrievalDocument, ...]:
-        documents = authorized_retrieval_documents(organization, project, scope)
+        documents = authorized_retrieval_documents(organization, project, scope, kinds)
         if resolve_require_provenance_enabled(organization):
             documents = tuple(
                 document for document in documents if document.memory_version.source_observation_id is not None
@@ -1122,8 +1178,8 @@ class BuildContextBundle:
         organization: Organization,
         project: Project,
         team: Team | None,
-    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None]:
-        has_request_terms = bool(data.query.strip() or data.file_paths or data.symbols)
+    ) -> tuple[tuple[RetrievalMatch, ...], bool, EmbeddingCallResult | None, bool]:
+        has_request_terms = request_has_terms(data.query, data.file_paths, data.symbols)
         exact_matches: list[RetrievalMatch] = []
         for document in documents:
             match = self._score_document(document, data, has_request_terms)
@@ -1138,15 +1194,16 @@ class BuildContextBundle:
             ),
         )
         if len(exact_matches) >= data.limit:
-            return tuple(exact_matches[: data.limit]), False, None
+            return tuple(exact_matches[: data.limit]), False, None, False
 
         org_settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
         if not org_settings.hybrid_retrieval_enabled:
-            return tuple(exact_matches), False, None
+            return tuple(exact_matches), False, None, False
 
         embedding_result = self._resolve_query_embedding(data, organization, project, team)
         if embedding_result is None:
-            return tuple(exact_matches), False, None
+            semantic_unavailable = semantic_retrieval_gap(has_request_terms, exact_matches)
+            return tuple(exact_matches), False, None, semantic_unavailable
 
         query_vector = list(embedding_result.embedding)
         semantic_matches = self._semantic_matches(documents, exact_matches, query_vector)
@@ -1165,6 +1222,7 @@ class BuildContextBundle:
             tuple((exact_matches + list(tail))[: data.limit]),
             bool(tail),
             embedding_result,
+            False,
         )
 
     def _semantic_matches(
@@ -1228,17 +1286,22 @@ class BuildContextBundle:
 
         return tuple(persisted)
 
-    def _render_context(self, matches: tuple[RetrievalMatch, ...]) -> str:
+    def _render_context(self, matches: tuple[RetrievalMatch, ...], warnings: list[RetrievalWarning]) -> str:
         if not matches:
-            return '# Engram context\n\nNo approved memory matched this request.'
+            base = '# Engram context\n\nNo approved memory matched this request.'
+        else:
+            lines = ['# Engram context', '']
+            for index, match in enumerate(matches, start=1):
+                lines.append(_render_block(match.document.memory, index))
+            base = '\n'.join(lines)
 
-        lines = ['# Engram context', '']
-        for index, match in enumerate(matches, start=1):
-            memory = match.document.memory
-            lines.append(f'- [M{index}] {redact_text(memory.title)}')
-            lines.append(f'  {redact_text(memory.body)}')
+        if not warnings:
+            return base
 
-        return '\n'.join(lines)
+        warning_lines = ['', '> Warnings:']
+        warning_lines.extend(f'> - {warning.message}' for warning in warnings)
+
+        return base + '\n' + '\n'.join(warning_lines)
 
     def _authorization_scope(self, scope: EffectiveScope) -> dict[str, object]:
         return {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import urllib.error
 
 import pytest
@@ -16,6 +17,7 @@ from engram.model_policy.services import (
     UpdateModelPolicy,
     UpdateModelPolicyInput,
     _split_completion,
+    generated_candidates_payload,
 )
 
 
@@ -248,3 +250,18 @@ def test_curation_judgment_tool_schema_decision_enum_includes_contradicts() -> N
     decision_schema = _ANTHROPIC_STRUCTURED_TOOLS['curation_judgment']['input_schema']['properties']['decision']
 
     assert 'contradicts' in decision_schema['enum']
+
+
+def test_emit_memories_tool_schema_declares_kind_enum() -> None:
+    memory_schema = _ANTHROPIC_STRUCTURED_TOOLS['candidates']['input_schema']['properties']['memories']['items']
+    kind_schema = memory_schema['properties']['kind']
+
+    assert kind_schema['enum'] == ['decision', 'convention', 'gotcha', 'architecture', 'incident']
+
+
+def test_generated_candidates_payload_first_memory_carries_kind() -> None:
+    payload = json.loads(generated_candidates_payload('a prompt'))
+
+    memories = payload['memories']
+    assert memories[0]['kind'] == 'gotcha'
+    assert 'kind' not in memories[1]

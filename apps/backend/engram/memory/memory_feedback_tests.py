@@ -186,7 +186,7 @@ def test_memory_feedback_logs_memory_feedback_recorded() -> None:
 
 
 @pytest.mark.django_db
-def test_memory_feedback_refuted_removes_memory_from_future_context() -> None:
+def test_memory_feedback_refuted_removes_memory_from_context_items_and_surfaces_warning() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     memory, _version, _document = create_approved_memory_document(organization, team, project)
     client = APIClient()
@@ -215,8 +215,16 @@ def test_memory_feedback_refuted_removes_memory_from_future_context() -> None:
 
     assert response.status_code == 200
     assert context_response.status_code == 200
-    assert context_response.json()['items'] == []
-    assert str(memory.id) not in str(context_response.json())
+    body = context_response.json()
+    assert body['items'] == []
+    assert str(memory.id) not in [item['memory_id'] for item in body['items']]
+    assert f'- [M1] {memory.title}' not in body['rendered_context']
+    assert f'> - refuted memory matched: "{memory.title}"' in body['rendered_context']
+    assert {
+        'code': 'refuted_match',
+        'message': f'refuted memory matched: "{memory.title}"',
+        'memory_id': str(memory.id),
+    } in body['warnings']
 
 
 @pytest.mark.django_db

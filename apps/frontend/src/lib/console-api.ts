@@ -75,17 +75,23 @@ export interface SearchDebugExactMatch {
   title: string;
   score: number;
   matched_on: string;
+  kind: string;
+  confidence: string | null;
 }
 
 export interface SearchDebugSemanticCandidate {
   memory_id: string;
   title: string;
   score: number;
+  kind: string;
+  confidence: string | null;
 }
 
 export interface SearchDebugPackedItem {
   memory_id: string;
   title: string;
+  kind: string;
+  confidence: string | null;
 }
 
 export interface SearchDebugExcludedItem {
@@ -100,6 +106,8 @@ export interface SearchDebugResult {
   exact_matches: SearchDebugExactMatch[];
   semantic_enabled: boolean;
   semantic_candidates: SearchDebugSemanticCandidate[];
+  lexical_enabled: boolean;
+  lexical_candidates: SearchDebugExactMatch[];
   packed_context: SearchDebugPackedItem[];
   excluded: SearchDebugExcludedItem[];
 }
@@ -138,6 +146,8 @@ export interface ContextBundleEntry {
   bundle_id: string;
   memory_id: string;
   retrieval_document_id: string;
+  kind: string;
+  confidence: string | null;
   rank: number;
   citation: string;
   inclusion_reason: string;
@@ -147,9 +157,16 @@ export interface ContextBundleEntry {
   updated_at: string | null;
 }
 
+export interface ContextBundleWarning {
+  code: string;
+  message: string;
+  memory_id: string | null;
+}
+
 export interface ContextBundleDetail extends ContextBundleListItem {
   rendered_text: string;
   authorization_scope: Record<string, unknown> | null;
+  warnings: ContextBundleWarning[];
   metadata: Record<string, unknown> | null;
   items: ContextBundleEntry[];
 }

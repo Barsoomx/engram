@@ -55,6 +55,7 @@ class ContextView(APIView):
             limit=data.get('limit', 5),
             token_budget=data.get('token_budget'),
             purpose=self.purpose,
+            kinds=tuple(data.get('kinds', [])),
         )
 
 
