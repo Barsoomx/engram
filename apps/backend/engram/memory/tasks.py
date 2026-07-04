@@ -30,6 +30,8 @@ _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
 _DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', '600'))
 _DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
+_DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
+_DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
 
 
 @app.task(
@@ -288,7 +290,11 @@ def retry_failed_distillations() -> dict[str, int]:
     }
 
 
-@app.task(name='engram.memory.decay_memory_confidence')
+@app.task(
+    name='engram.memory.decay_memory_confidence',
+    soft_time_limit=_DECAY_SOFT_TIME_LIMIT,
+    time_limit=_DECAY_TIME_LIMIT,
+)
 def decay_memory_confidence() -> dict[str, int]:
     result = DecayMemoryConfidence().execute()
 

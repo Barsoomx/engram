@@ -23,7 +23,7 @@ _CONFIDENCE_QUANTIZE = Decimal('0.001')
 _MAX_AUDIT_MEMORY_IDS = 200
 
 
-@dataclass
+@dataclass(frozen=True)
 class DecayMemoryConfidenceResult:
     organizations: int
     projects: int
