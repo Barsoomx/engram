@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('core', '0027_memorycandidate_kind'),
+        ('core', '0028_organizationsettings_confidence_decay_enabled'),
     ]
 
     operations = [
