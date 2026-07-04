@@ -21,6 +21,7 @@ from engram.console.services import (
     MemoryReviewError,
     _lock_candidate_or_404,
     _lock_memory_or_404,
+    _redact_text,
     activate_member,
     approve_memory_candidate,
     archive_memory,
@@ -960,7 +961,7 @@ def test_approve_memory_candidate_records_review_example(
 
     assert example.actor_id == str(f_actor_identity.id)
 
-    assert example.snapshot['title'] == candidate.title
+    assert example.snapshot['title'] == _redact_text(candidate.title)
 
     assert example.snapshot['status'] == CandidateStatus.PROPOSED
 
@@ -1081,6 +1082,27 @@ def test_edit_memory_body_review_example_redacts_secret_shaped_old_body(
     assert 'egk_' not in example.snapshot['body']
 
     assert '[REDACTED]' in example.snapshot['body']
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_review_example_redacts_secret_shaped_title(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    memory.title = 'token egk_abcdefghijklmnopqrstuvwxyz0123456789'
+
+    memory.save(update_fields=['title', 'updated_at'])
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
+
+    example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id))
+
+    assert 'egk_' not in example.snapshot['title']
+
+    assert '[REDACTED]' in example.snapshot['title']
 
 
 @pytest.mark.django_db

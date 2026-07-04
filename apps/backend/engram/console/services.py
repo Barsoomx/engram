@@ -486,12 +486,12 @@ def _record_review_example(
     is_candidate = isinstance(item, MemoryCandidate)
 
     if is_candidate:
-        evidence = item.evidence
+        evidence = list(item.evidence)
     else:
-        evidence = item.metadata.get('evidence', []) if isinstance(item.metadata, dict) else []
+        evidence = list(item.metadata.get('evidence', [])) if isinstance(item.metadata, dict) else []
 
     snapshot = {
-        'title': item.title,
+        'title': _redact_text(item.title),
         'body': _redact_text(item.body),
         'status': item.status,
         'confidence': str(item.confidence) if item.confidence is not None else None,
