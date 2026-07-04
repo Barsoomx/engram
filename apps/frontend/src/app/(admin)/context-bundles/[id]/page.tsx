@@ -7,15 +7,34 @@ import { useParams } from 'next/navigation';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { ConfidenceTrack } from '@/components/ui/confidence-track';
 import { EmptyState } from '@/components/ui/empty-state';
+import { KindBadge } from '@/components/ui/kind-badge';
 import { fetchMe, type MeResponse } from '@/lib/auth';
 import {
   getContextBundle,
   type ContextBundleDetail,
   type ContextBundleEntry,
+  type ContextBundleWarning,
 } from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
+
+function confidencePct(value: string | null): number | null {
+  if (value === null) {
+    return null;
+  }
+
+  const parsed = Number(value);
+
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+
+  const pct = parsed <= 1 ? parsed * 100 : parsed;
+
+  return Math.max(0, Math.min(100, Math.round(pct)));
+}
 
 function statusTone(status: string): { text: string; bg: string } {
   const value = status.toLowerCase();
@@ -91,22 +110,70 @@ function MetaRow({
 }
 
 function BundleItem({ item }: { item: ContextBundleEntry }) {
+  const pct = confidencePct(item.confidence);
+
   return (
     <div className='surface-card flex items-start gap-3 p-4'>
       <span className='tnum inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] bg-content3 font-mono text-[12px] font-semibold text-primary-300'>
         {item.rank}
       </span>
       <div className='min-w-0 flex-1 space-y-1.5'>
-        <p className='text-[13.5px] font-medium leading-snug text-foreground'>
-          {item.citation || '(no citation)'}
-        </p>
+        <div className='flex flex-wrap items-center gap-2'>
+          <KindBadge kind={item.kind} />
+          <p className='min-w-0 truncate text-[13.5px] font-medium leading-snug text-foreground'>
+            {item.citation || '(no citation)'}
+          </p>
+        </div>
         <p className='truncate font-mono text-[11.5px] text-primary-300'>
           {item.memory_id || '—'}
         </p>
         <p className='text-[12.5px] leading-relaxed text-default-500'>
           {item.inclusion_reason || 'No inclusion reason recorded.'}
         </p>
+        {pct !== null && (
+          <div className='flex items-center gap-2.5 pt-0.5'>
+            <span className='tnum font-mono text-[12px] text-default-400'>
+              {pct}% conf
+            </span>
+            <ConfidenceTrack value={pct} />
+          </div>
+        )}
       </div>
+    </div>
+  );
+}
+
+function WarningsBanner({ warnings }: { warnings: ContextBundleWarning[] }) {
+  if (warnings.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className='space-y-2 rounded-[16px] border border-warning/30 bg-warning/[0.06] px-5 py-4'>
+      <div className='flex items-center gap-2'>
+        <AlertTriangle className='h-4 w-4 shrink-0 text-warning' strokeWidth={1.8} />
+        <span className='text-[13px] font-semibold text-warning'>
+          Warnings
+          <span className='tnum ml-2 font-normal text-warning/70'>
+            {warnings.length}
+          </span>
+        </span>
+      </div>
+      <ul className='space-y-1.5'>
+        {warnings.map((warning, index) => (
+          <li
+            key={`${warning.code}-${warning.memory_id ?? index}`}
+            className='flex items-start gap-2.5'
+          >
+            <span className='tnum shrink-0 rounded-[6px] bg-warning/15 px-1.5 py-0.5 font-mono text-[10.5px] text-warning'>
+              {warning.code}
+            </span>
+            <span className='text-[12.5px] leading-relaxed text-warning/90'>
+              {warning.message}
+            </span>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -145,6 +212,8 @@ function BundleDetailContent({ data }: { data: ContextBundleDetail }) {
               </p>
             )}
           </div>
+
+          <WarningsBanner warnings={data.warnings ?? []} />
 
           <div className='space-y-3'>
             <h2 className='text-[14.5px] font-semibold text-foreground'>
