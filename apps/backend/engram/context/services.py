@@ -4,6 +4,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 
 import structlog
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
@@ -140,6 +141,8 @@ class ContextBundleResult:
             'retrieval_document_id': str(document.id),
             'title': redact_text(memory.title),
             'body': redact_text(memory.body),
+            'confidence': str(memory.confidence) if memory.confidence is not None else None,
+            'kind': memory.kind,
             'inclusion_reason': match.inclusion_reason,
             'scope_evidence': self._scope_evidence(document),
             'matched_terms': list(match.matched_terms),
@@ -217,6 +220,24 @@ def estimate_tokens(text: str) -> int:
     return (len(text) + 3) // 4
 
 
+def _render_annotation(kind: str, confidence: Decimal | None) -> str:
+    parts = []
+    if kind:
+        parts.append(kind)
+    if confidence is not None:
+        parts.append(f'confidence {confidence}')
+    if not parts:
+        return ''
+
+    return f' ({", ".join(parts)})'
+
+
+def _render_block(memory: Memory, index: int) -> str:
+    annotation = _render_annotation(memory.kind, memory.confidence)
+
+    return f'- [M{index}] {redact_text(memory.title)}{annotation}\n  {redact_text(memory.body)}'
+
+
 def _pack_to_budget(
     matches: tuple[RetrievalMatch, ...],
     token_budget: int | None,
@@ -236,7 +257,7 @@ def _pack_to_budget(
 
         memory = match.document.memory
         index = len(kept) + 1
-        block = f'- [M{index}] {redact_text(memory.title)}\n  {redact_text(memory.body)}'
+        block = _render_block(memory, index)
         cost = estimate_tokens(block)
 
         if not kept or tokens_used + cost <= token_budget:
@@ -930,8 +951,7 @@ class BuildContextBundle:
         kept, budget_dropped = _pack_to_budget(matches, data.token_budget, data.limit)
         retrieval_latency_ms = round((time.monotonic() - retrieval_started_at) * 1000)
         tokens_used = sum(
-            estimate_tokens(f'- [M{i}] {redact_text(m.document.memory.title)}\n  {redact_text(m.document.memory.body)}')
-            for i, m in enumerate(kept, start=1)
+            estimate_tokens(_render_block(m.document.memory, i)) for i, m in enumerate(kept, start=1)
         )
         query_result = redact_value(data.query)
         retrieval_strategy = resolve_retrieval_strategy(matches)
@@ -1234,9 +1254,7 @@ class BuildContextBundle:
 
         lines = ['# Engram context', '']
         for index, match in enumerate(matches, start=1):
-            memory = match.document.memory
-            lines.append(f'- [M{index}] {redact_text(memory.title)}')
-            lines.append(f'  {redact_text(memory.body)}')
+            lines.append(_render_block(match.document.memory, index))
 
         return '\n'.join(lines)
 

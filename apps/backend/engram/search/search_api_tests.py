@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 from rest_framework.test import APIClient
 
@@ -77,6 +79,33 @@ def test_search_returns_ranked_cited_matches() -> None:
     assert item['scope_evidence']['project_id'] == str(project.id)
     assert item['scope_evidence']['visibility_scope'] == VisibilityScope.PROJECT
     assert RAW_KEY not in str(body)
+
+
+@pytest.mark.django_db
+def test_search_item_includes_confidence_and_kind() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    memory, _version, document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        confidence=Decimal('0.950'),
+        kind='gotcha',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, file_paths=document.file_paths),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    item = response.json()['items'][0]
+    assert item['memory_id'] == str(memory.id)
+    assert item['confidence'] == '0.950'
+    assert item['kind'] == 'gotcha'
 
 
 @pytest.mark.django_db

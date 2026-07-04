@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -180,7 +181,16 @@ def create_approved_memory_document(
     file_paths: list[str] | None = None,
     symbols: list[str] | None = None,
     exact_terms: list[str] | None = None,
+    confidence: Decimal | None = None,
+    kind: str = '',
 ) -> tuple[Memory, MemoryVersion, RetrievalDocument]:
+    metadata: dict[str, Any] = {
+        'file_paths': file_paths or ['apps/backend/engram/context/services.py'],
+        'symbols': symbols or ['BuildContextBundle'],
+        'exact_terms': exact_terms or ['context bundle', 'authorization before ranking'],
+    }
+    if kind:
+        metadata['kind'] = kind
     memory = Memory.objects.create(
         organization=organization,
         project=project,
@@ -189,11 +199,8 @@ def create_approved_memory_document(
         body=body,
         status=MemoryStatus.APPROVED,
         visibility_scope=visibility_scope,
-        metadata={
-            'file_paths': file_paths or ['apps/backend/engram/context/services.py'],
-            'symbols': symbols or ['BuildContextBundle'],
-            'exact_terms': exact_terms or ['context bundle', 'authorization before ranking'],
-        },
+        confidence=confidence,
+        metadata=metadata,
     )
     version = MemoryVersion.objects.create(
         organization=organization,
@@ -247,6 +254,8 @@ def test_session_start_returns_cited_exact_context_and_persists_bundle() -> None
             'retrieval_document_id': str(document.id),
             'title': 'Authorization before ranking',
             'body': 'Authorization before ranking protects context bundles.',
+            'confidence': None,
+            'kind': '',
             'inclusion_reason': 'exact match: apps/backend/engram/context/services.py',
             'scope_evidence': {
                 'visibility_scope': 'project',
@@ -783,6 +792,31 @@ def test_session_start_replay_returns_existing_bundle_without_duplicate_audit() 
     assert ContextBundle.objects.count() == 1
     assert ContextBundleItem.objects.count() == 1
     assert AuditEvent.objects.filter(event_type='MemoryRetrieved').count() == 1
+
+
+@pytest.mark.django_db
+def test_session_start_item_and_rendered_context_include_confidence_and_kind() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        confidence=Decimal('0.950'),
+        kind='gotcha',
+    )
+    client = APIClient()
+    payload = valid_context_payload(project, team, request_id='request-confidence-kind')
+
+    first = client.post('/v1/context/session-start', payload, format='json', **auth_headers())
+    second = client.post('/v1/context/session-start', payload, format='json', **auth_headers())
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    for response in (first, second):
+        body = response.json()
+        assert body['items'][0]['confidence'] == '0.950'
+        assert body['items'][0]['kind'] == 'gotcha'
+        assert f'{memory.title} (gotcha, confidence 0.950)' in body['rendered_context']
 
 
 @pytest.mark.django_db

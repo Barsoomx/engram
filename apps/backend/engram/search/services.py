@@ -57,6 +57,8 @@ class SearchResult:
             'retrieval_document_id': str(document.id),
             'title': redact_text(memory.title),
             'body': redact_text(memory.body),
+            'confidence': str(memory.confidence) if memory.confidence is not None else None,
+            'kind': memory.kind,
             'inclusion_reason': match.inclusion_reason,
             'scope_evidence': {
                 'visibility_scope': document.visibility_scope,

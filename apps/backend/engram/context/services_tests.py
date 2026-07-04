@@ -4,6 +4,7 @@ import math
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -24,6 +25,7 @@ from engram.context.services import (
     IndexMemoryVersionInput,
     RetrievalMatch,
     _pack_to_budget,
+    _render_annotation,
     _semantic_retrieval_matches_python,
     derive_retrieval_terms,
     estimate_tokens,
@@ -65,6 +67,8 @@ PROVENANCE_RAW_KEY = 'egk_test_services_provenance_0123456789abcdefghijklmnopqrs
 class _MemoryStub:
     title: str
     body: str
+    kind: str = ''
+    confidence: Decimal | None = None
 
 
 @dataclass
@@ -109,6 +113,25 @@ def test_estimate_tokens_formula() -> None:
         text = 'a' * length
         expected = (length + 3) // 4
         assert estimate_tokens(text) == expected, f'failed for length={length}'
+
+
+# _render_annotation
+
+
+def test_render_annotation_kind_and_confidence() -> None:
+    assert _render_annotation('gotcha', Decimal('0.950')) == ' (gotcha, confidence 0.950)'
+
+
+def test_render_annotation_kind_only() -> None:
+    assert _render_annotation('gotcha', None) == ' (gotcha)'
+
+
+def test_render_annotation_confidence_only() -> None:
+    assert _render_annotation('', Decimal('0.950')) == ' (confidence 0.950)'
+
+
+def test_render_annotation_neither() -> None:
+    assert _render_annotation('', None) == ''
 
 
 # _pack_to_budget — None budget (item-count behavior)
