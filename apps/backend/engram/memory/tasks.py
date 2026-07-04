@@ -10,6 +10,7 @@ from django.utils import timezone
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import Memory, MemoryStatus, Project
+from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
@@ -29,6 +30,8 @@ _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
 _DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', '600'))
 _DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
+_DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
+_DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
 
 
 @app.task(
@@ -284,6 +287,28 @@ def retry_failed_distillations() -> dict[str, int]:
 
     return {
         'retried': len(result.retriable_session_ids),
+    }
+
+
+@app.task(
+    name='engram.memory.decay_memory_confidence',
+    soft_time_limit=_DECAY_SOFT_TIME_LIMIT,
+    time_limit=_DECAY_TIME_LIMIT,
+)
+def decay_memory_confidence() -> dict[str, int]:
+    result = DecayMemoryConfidence().execute()
+
+    logger.info(
+        'confidence_decay_completed',
+        organizations=result.organizations,
+        projects=result.projects,
+        memories=result.memories,
+    )
+
+    return {
+        'organizations': result.organizations,
+        'projects': result.projects,
+        'memories': result.memories,
     }
 
 

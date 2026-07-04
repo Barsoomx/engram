@@ -32,6 +32,7 @@ _BOOLEAN_SETTINGS_FIELDS = (
     'lexical_recall_enabled',
     'lexical_fusion_enabled',
     'curator_llm_judge_enabled',
+    'confidence_decay_enabled',
 )
 
 DISTILLATION_THRESHOLD_ADVISORY_CEILING = Decimal('0.6')
@@ -66,6 +67,7 @@ def _serialize_retrieval_settings(settings: OrganizationSettings) -> dict:
         'lexical_recall_enabled': settings.lexical_recall_enabled,
         'lexical_fusion_enabled': settings.lexical_fusion_enabled,
         'curator_llm_judge_enabled': settings.curator_llm_judge_enabled,
+        'confidence_decay_enabled': settings.confidence_decay_enabled,
         'near_dup_threshold': settings.near_dup_threshold,
         'distillation_auto_approve_threshold': settings.distillation_auto_approve_threshold,
     }

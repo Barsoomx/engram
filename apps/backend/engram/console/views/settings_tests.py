@@ -260,6 +260,48 @@ def test_retrieval_settings_put_round_trip_extended(f_org_admin_client: APIClien
 
 
 @pytest.mark.django_db
+def test_retrieval_settings_get_includes_confidence_decay_enabled_default(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert response.status_code == 200
+    assert response.json()['confidence_decay_enabled'] is True
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_flips_confidence_decay_enabled(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'confidence_decay_enabled': False},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    assert response.json()['confidence_decay_enabled'] is False
+
+    get_response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert get_response.status_code == 200
+    assert get_response.json()['confidence_decay_enabled'] is False
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_confidence_decay_enabled_writes_audit_event(f_org_admin_client: APIClient) -> None:
+    organization = Organization.objects.get(slug='settings-org')
+
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'confidence_decay_enabled': False},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    audit = AuditEvent.objects.get(organization=organization, event_type='RetrievalSettingsUpdated')
+    settings, _ = OrganizationSettings.objects.get_or_create(organization=organization)
+    assert audit.target_id == str(settings.id)
+    assert settings.confidence_decay_enabled is False
+
+
+@pytest.mark.django_db
 def test_retrieval_settings_put_rejects_out_of_range_near_dup_threshold(f_org_admin_client: APIClient) -> None:
     response = f_org_admin_client.put(
         '/v1/admin/settings/retrieval',

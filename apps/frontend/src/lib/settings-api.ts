@@ -3,6 +3,7 @@ import { apiClient } from '@/lib/auth';
 export type RetrievalSettings = {
   hybrid_retrieval_enabled: boolean;
   require_provenance: boolean;
+  confidence_decay_enabled: boolean;
   distillation_auto_approve_threshold: number | null;
   near_dup_threshold: number;
 };
