@@ -84,7 +84,18 @@ Human review is exception-based:
 - queue is available through the console API (admin UI), gated by
   memories:review/memories:admin capabilities;
 - every item includes the curator's recommendation and evidence;
-- reviewer can approve, edit, narrow scope, reject, archive, or supersede.
+- reviewer can approve, edit, narrow scope, reject, archive, restore, or
+  supersede.
+
+Every reviewer decision (approve, edit, narrow, reject, archive, restore, or
+supersede) is persisted as an immutable `MemoryReviewExample` snapshot: a
+redacted title/body, the item's pre-mutation status/confidence/kind/evidence,
+the curator context that produced the recommendation, the reviewer's reason,
+and the actor id. These snapshots are not read back into the review flow —
+they exist so a future curator evaluation pass can be scored against real
+human decisions. Export them for offline evaluation with
+`manage.py engram_export_review_examples --organization <uuid> [--project
+<uuid>] [--output <path or ->]`, which writes one JSON object per line.
 
 ## Audit
 

@@ -1355,6 +1355,29 @@ def test_restore_memory_reinstates_archived_memory(
 
 
 @pytest.mark.django_db
+def test_restore_memory_reinstates_conflict_status_memory(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    memory.status = MemoryStatus.CONFLICT
+
+    memory.save(update_fields=['status', 'updated_at'])
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo conflict hold')
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+    authorized = authorized_retrieval_documents(f_organization, f_project, _read_scope(f_organization, f_project))
+
+    assert memory.id in [document.memory_id for document in authorized]
+
+
+@pytest.mark.django_db
 def test_restore_memory_reinstates_stale_superseded_memory(
     f_organization: Organization,
     f_project: Project,
