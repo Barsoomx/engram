@@ -131,10 +131,12 @@ list of ids pulled from the candidate's evidence entries, excluding conflict
 markers). When the LLM judge was consulted, a `judge` object is added with
 `policy_id`, `policy_version`, `provider`, `model`,
 `provider_call_record_id`, and redacted before/after snapshots
-(`candidate` and `existing_memory`, each `{title (redacted, <=120 chars),
-body_sha256, body_length}`) — this is the judge's full input window without
-storing the raw bodies. `request_id`/`correlation_id` on the row propagate the
-caller's correlation id when supplied. The full metadata dict is passed
+(`candidate` as `{title (redacted, <=120 chars), body_sha256, body_length}`,
+`existing_memory` with the same fields plus `memory_id`) — this is the judge's
+full input window without storing the raw bodies. `correlation_id` on the row
+propagates the caller's correlation id when supplied; `request_id` is either
+empty or a synthetic curator-generated value (for example
+`curator:<candidate id>`), never a caller-supplied request id. The full metadata dict is passed
 through core redaction (`redact_value`) before being persisted, so any
 secret-shaped string is replaced with `[REDACTED]` and any secret-named key is
 fully redacted.
