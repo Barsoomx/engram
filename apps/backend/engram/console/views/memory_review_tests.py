@@ -1318,3 +1318,81 @@ def test_retrieve_denied_without_review_capability() -> None:
     response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_queue_includes_agent_refuted_approved_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    memory.refuted = True
+
+    memory.save(update_fields=['refuted', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    items = {item['id']: item for item in response.data['results']}
+
+    assert str(memory.id) in items
+
+    assert items[str(memory.id)]['refuted'] is True
+
+
+@pytest.mark.django_db
+def test_queue_excludes_stale_superseded_approved_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    memory.stale = True
+
+    memory.save(update_fields=['stale', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    ids = {item['id'] for item in response.data['results']}
+
+    assert str(memory.id) not in ids
+
+
+@pytest.mark.django_db
+def test_action_restore_reactivates_agent_refuted_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    _make_version(memory, 1, 'body')
+
+    memory.refuted = True
+
+    memory.save(update_fields=['refuted', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        f'/v1/admin/memory-review/{memory.id}/action/',
+        {'action': 'restore', 'reason': 'undo feedback refute'},
+    )
+
+    assert response.status_code == 200
+
+    memory.refresh_from_db()
+
+    assert memory.refuted is False
+
+    assert memory.status == MemoryStatus.APPROVED

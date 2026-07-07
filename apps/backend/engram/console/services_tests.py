@@ -41,6 +41,8 @@ from engram.console.services import (
 )
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
+    Agent,
+    AgentSession,
     AuditEvent,
     AuditResult,
     CandidateStatus,
@@ -51,9 +53,11 @@ from engram.core.models import (
     MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
+    Observation,
     Organization,
     Project,
     RetrievalDocument,
+    Runtime,
     VisibilityScope,
 )
 
@@ -1549,3 +1553,179 @@ def test_restore_memory_locks_memory_row_for_update(
     sql = _select_sql(queries, 'core_memory"')
 
     assert 'FOR UPDATE' in sql.upper()
+
+
+def _make_provenanced_candidate(
+    organization: Organization,
+    project: Project,
+) -> MemoryCandidate:
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id='codex-local',
+    )
+
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        agent=agent,
+        external_session_id='session-provenance',
+    )
+
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        agent=agent,
+        session=session,
+        observation_type='tool_use',
+        title='pytest failure fixed',
+        body='pytest failed then exits 0',
+        files_read=['apps/backend/engram/core/models.py'],
+        files_modified=['apps/backend/engram/memory/services.py'],
+        content_hash='hash-obs-provenance',
+    )
+
+    return MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        source_observation=observation,
+        title='Provenanced candidate',
+        body='Provenanced body',
+        status=CandidateStatus.PROPOSED,
+        visibility_scope=VisibilityScope.PROJECT,
+        evidence=[
+            {
+                'observation_id': str(observation.id),
+                'provider_call_id': 'pc-1',
+                'provider': 'openai',
+                'model': 'gpt-x',
+                'policy_id': 'pol-1',
+                'policy_version': 2,
+                'task_type': 'generation',
+                'redaction_state': 'redacted',
+            },
+        ],
+        content_hash='hash-c-provenance',
+        confidence='0.900',
+    )
+
+
+@pytest.mark.django_db
+def test_approve_memory_candidate_metadata_matches_curator_promotion(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_provenanced_candidate(f_organization, f_project)
+
+    observation = candidate.source_observation
+
+    agent = observation.agent
+
+    expected_metadata = {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+        'file_paths': observation.files_read + observation.files_modified,
+        'provider_call_id': 'pc-1',
+        'provider': 'openai',
+        'model': 'gpt-x',
+        'policy_id': 'pol-1',
+        'policy_version': 2,
+        'task_type': 'generation',
+        'redaction_state': 'redacted',
+        'captured_by': {
+            'agent_runtime': agent.runtime,
+            'agent_external_id': agent.external_id,
+        },
+    }
+
+    memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert memory.metadata == expected_metadata
+
+
+@pytest.mark.django_db
+def test_supersede_memory_nonexistent_target_raises_not_found_and_leaves_source_active(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    with pytest.raises(MemoryReviewError) as error:
+        supersede_memory(f_organization, f_actor_identity, memory, uuid.uuid4(), 'reason')
+
+    assert error.value.code == 'not_found'
+
+    memory.refresh_from_db()
+
+    assert memory.stale is False
+
+    assert not MemoryLink.objects.filter(memory=memory, link_type=LinkType.SUPERSEDED_BY).exists()
+
+    assert MemoryReviewExample.objects.filter(item_type='memory', item_id=str(memory.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_supersede_memory_cross_org_target_raises_not_found_and_leaves_source_active(
+    f_organization: Organization,
+    f_foreign_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    foreign_project = Project.objects.create(organization=f_foreign_organization, name='Foreign', slug='foreign')
+
+    foreign_target = _make_memory(f_foreign_organization, foreign_project, status=MemoryStatus.APPROVED)
+
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    with pytest.raises(MemoryReviewError) as error:
+        supersede_memory(f_organization, f_actor_identity, memory, foreign_target.id, 'reason')
+
+    assert error.value.code == 'not_found'
+
+    memory.refresh_from_db()
+
+    assert memory.stale is False
+
+    assert not MemoryLink.objects.filter(memory=memory, link_type=LinkType.SUPERSEDED_BY).exists()
+
+
+@pytest.mark.django_db
+def test_narrow_memory_nonexistent_target_raises_not_found_and_writes_no_link(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_memory(f_organization, f_project)
+
+    with pytest.raises(MemoryReviewError) as error:
+        narrow_memory(f_organization, f_actor_identity, memory, uuid.uuid4(), 'reason')
+
+    assert error.value.code == 'not_found'
+
+    assert not MemoryLink.objects.filter(memory=memory, link_type=LinkType.NARROWED_BY).exists()
+
+    assert MemoryReviewExample.objects.filter(item_type='memory', item_id=str(memory.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_narrow_memory_cross_org_target_raises_not_found(
+    f_organization: Organization,
+    f_foreign_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    foreign_project = Project.objects.create(organization=f_foreign_organization, name='Foreign', slug='foreign')
+
+    foreign_target = _make_memory(f_foreign_organization, foreign_project)
+
+    memory = _make_memory(f_organization, f_project)
+
+    with pytest.raises(MemoryReviewError) as error:
+        narrow_memory(f_organization, f_actor_identity, memory, foreign_target.id, 'reason')
+
+    assert error.value.code == 'not_found'
+
+    assert not MemoryLink.objects.filter(memory=memory, link_type=LinkType.NARROWED_BY).exists()
