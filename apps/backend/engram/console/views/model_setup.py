@@ -9,7 +9,12 @@ from django.db.models import Q
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.status import HTTP_400_BAD_REQUEST, HTTP_403_FORBIDDEN, HTTP_404_NOT_FOUND
+from rest_framework.status import (
+    HTTP_400_BAD_REQUEST,
+    HTTP_403_FORBIDDEN,
+    HTTP_404_NOT_FOUND,
+    HTTP_409_CONFLICT,
+)
 from rest_framework.views import APIView
 
 from engram.console.model_presets import ALL_TASK_TYPES, PRESET_BY_KEY, PRESETS
@@ -105,9 +110,20 @@ class ApplyPresetView(APIView):
         project_id: uuid.UUID = data['project_id']
         team_id: uuid.UUID | None = data['team_id']
         scope: str = data['scope']
+        replace_existing: bool = data['replace_existing']
         request_id: str = data['request_id']
         org = request.active_organization
         actor_id: str = request.effective_scope.actor_id
+
+        existing_policies = _existing_policies_for_preset(org, preset, scope, project_id, team_id)
+        if existing_policies and not replace_existing:
+            return Response(
+                {
+                    'code': 'existing_policies',
+                    'policies_to_replace': [str(policy.id) for policy in existing_policies],
+                },
+                status=HTTP_409_CONFLICT,
+            )
 
         secret_scope = 'team' if scope == 'team' else 'organization'
         secret_team_id = team_id if scope == 'team' else None
@@ -115,6 +131,7 @@ class ApplyPresetView(APIView):
 
         created_secret_ids: list[str] = []
         created_policy_ids: list[str] = []
+        disabled_policy_ids: list[str] = []
 
         key_slot_provider: dict[str, str] = {}
         for tm in preset['task_models']:
@@ -161,6 +178,7 @@ class ApplyPresetView(APIView):
                             allowed_team_ids=allowed_team_ids,
                         ),
                     )
+                    disabled_policy_ids.append(str(policy.id))
 
                 secret = slot_to_secret[tm['key_slot']]
                 policy = CreateModelPolicy().execute(
@@ -194,6 +212,7 @@ class ApplyPresetView(APIView):
             {
                 'created_secret_ids': created_secret_ids,
                 'created_policy_ids': created_policy_ids,
+                'disabled_policy_ids': disabled_policy_ids,
                 'status': _build_status(org, project_id, team_id),
             }
         )
@@ -219,6 +238,21 @@ def _active_policies_in_scope(
         qs = qs.filter(scope='team', team_id=team_id)
 
     return qs
+
+
+def _existing_policies_for_preset(
+    org: Organization,
+    preset: dict[str, Any],
+    scope: str,
+    project_id: uuid.UUID | None,
+    team_id: uuid.UUID | None,
+) -> list[ModelPolicy]:
+    by_id: dict[uuid.UUID, ModelPolicy] = {}
+    for tm in preset['task_models']:
+        for policy in _active_policies_in_scope(org, tm['task_type'], scope, project_id, team_id):
+            by_id[policy.id] = policy
+
+    return list(by_id.values())
 
 
 def _build_status(
