@@ -982,6 +982,16 @@ class WorkflowRun(TimestampedModel):
     )
 
     class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['project', 'run_type'],
+                condition=models.Q(
+                    run_type='daily_digest',
+                    status__in=('queued', 'running'),
+                ),
+                name='core_workflowrun_uniq_active_daily_digest',
+            ),
+        ]
         indexes = [
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['organization', 'created_at']),

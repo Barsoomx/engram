@@ -38,10 +38,18 @@ ImportReport = dict[str, object]
 
 _MAX_OBSERVATION_TEXT_CHARS = 16000
 _MAX_OBSERVATION_LIST_ITEMS = 100
+_MAX_SESSION_KEY_CHARS = 255
+_MAX_PLATFORM_SOURCE_CHARS = 80
+_MAX_OBSERVATION_TYPE_CHARS = 80
+_MAX_GENERATED_MODEL_CHARS = 120
 
 
 def _capped_text(value: str, cap: int) -> str:
     return value[:cap]
+
+
+def _capped_session_key(value: object) -> str:
+    return str(value or '')[:_MAX_SESSION_KEY_CHARS]
 
 
 def _capped_list(value: object, cap: int) -> list:
@@ -264,7 +272,7 @@ class ClaudeMemImporter:
         rows: list[dict[str, object]],
         report: ImportReport,
     ) -> tuple[int, int, int]:
-        _sessions, agents_created, sessions_created, session_duplicates, redacted = self._import_sessions(
+        _sessions, agents_created, sessions_created, session_duplicates, redacted, unsupported = self._import_sessions(
             context,
             rows,
             [],
@@ -272,10 +280,11 @@ class ClaudeMemImporter:
         report['created']['agents'] += agents_created
         report['created']['sessions'] += sessions_created
         report['duplicates']['sessions'] += session_duplicates
+        report['unsupported'].extend(unsupported)
         if redacted:
             report['redactions'] = {'redacted': True}
 
-        return sessions_created, session_duplicates, 0
+        return sessions_created, session_duplicates, len(unsupported)
 
     def _apply_prompt_batch(
         self,
@@ -352,7 +361,7 @@ class ClaudeMemImporter:
         return created, duplicates, skipped
 
     def _session_for_prompt(self, context: ImportContext, row: dict[str, object]) -> AgentSession | None:
-        content_session_id = str(row.get('content_session_id') or '')
+        content_session_id = _capped_session_key(row.get('content_session_id'))
         if not content_session_id:
             return None
 
@@ -369,7 +378,7 @@ class ClaudeMemImporter:
         )
 
     def _session_for_memory(self, context: ImportContext, row: dict[str, object]) -> AgentSession | None:
-        memory_session_id = str(row.get('memory_session_id') or '')
+        memory_session_id = _capped_session_key(row.get('memory_session_id'))
         if not memory_session_id:
             return None
 
@@ -668,18 +677,21 @@ class ClaudeMemImporter:
         redacted = False
         truncated = False
         with transaction.atomic():
-            sessions, agents_created, sessions_created, session_duplicates, sessions_redacted = self._import_sessions(
-                context,
-                rows['sdk_sessions'],
-                rows['observations'],
+            sessions, agents_created, sessions_created, session_duplicates, sessions_redacted, sessions_unsupported = (
+                self._import_sessions(
+                    context,
+                    rows['sdk_sessions'],
+                    rows['observations'],
+                )
             )
             report['created']['agents'] = agents_created
             report['created']['sessions'] = sessions_created
             report['duplicates']['sessions'] = session_duplicates
+            report['unsupported'].extend(sessions_unsupported)
             redacted = redacted or sessions_redacted
 
             for prompt in rows['user_prompts']:
-                session = sessions.get(str(prompt.get('content_session_id') or ''))
+                session = sessions.get(_capped_session_key(prompt.get('content_session_id')))
                 raw_event, created, prompt_result, prompt_unsupported = self._import_prompt(context, session, prompt)
                 redacted = redacted or prompt_result.redacted
                 if prompt_unsupported is not None:
@@ -692,7 +704,7 @@ class ClaudeMemImporter:
                     report['duplicates']['raw_events'] += 1
 
             for observation in rows['observations']:
-                session = sessions.get(str(observation.get('memory_session_id') or ''))
+                session = sessions.get(_capped_session_key(observation.get('memory_session_id')))
                 result = self._import_observation_memory(
                     context,
                     session,
@@ -705,7 +717,7 @@ class ClaudeMemImporter:
                 self._record_memory_result(report, result)
 
             for summary in rows['session_summaries']:
-                session = sessions.get(str(summary.get('memory_session_id') or ''))
+                session = sessions.get(_capped_session_key(summary.get('memory_session_id')))
                 result = self._import_summary_memory(
                     context,
                     session,
@@ -727,7 +739,7 @@ class ClaudeMemImporter:
         context: ImportContext,
         session_rows: list[dict[str, object]],
         observation_rows: list[dict[str, object]],
-    ) -> tuple[dict[str, AgentSession], int, int, int, bool]:
+    ) -> tuple[dict[str, AgentSession], int, int, int, bool, list[dict[str, str]]]:
         organization = context.organization
         project = context.project
         team = context.team
@@ -736,7 +748,20 @@ class ClaudeMemImporter:
         sessions_created = 0
         session_duplicates = 0
         sessions_redacted = False
+        unsupported: list[dict[str, str]] = []
         for row in session_rows:
+            content_session_id = _capped_session_key(row.get('content_session_id'))
+            if not content_session_id:
+                unsupported.append(
+                    {
+                        'source_type': 'sdk_sessions',
+                        'source_id': f'sdk_sessions:{row.get("id")}',
+                        'reason': 'missing_content_session_id',
+                    },
+                )
+                continue
+
+            memory_session_id = _capped_session_key(row.get('memory_session_id'))
             runtime = self._runtime(row.get('platform_source'))
             agent_external_id_result = redact_value(self._agent_external_id(context, row, observation_rows))
             agent_external_id = str(agent_external_id_result.value)[:255]
@@ -757,7 +782,7 @@ class ClaudeMemImporter:
             if agent_created:
                 agents_created += 1
 
-            external_session_id = self._session_source_id(context, row['content_session_id'])
+            external_session_id = self._session_source_id(context, content_session_id)
             session, session_created = AgentSession.objects.get_or_create(
                 organization=organization,
                 project=project,
@@ -765,10 +790,10 @@ class ClaudeMemImporter:
                 defaults={
                     'team': team,
                     'agent': agent,
-                    'content_session_id': str(row.get('content_session_id') or ''),
-                    'memory_session_id': str(row.get('memory_session_id') or ''),
+                    'content_session_id': content_session_id,
+                    'memory_session_id': memory_session_id,
                     'runtime': runtime,
-                    'platform_source': str(row.get('platform_source') or ''),
+                    'platform_source': str(row.get('platform_source') or '')[:_MAX_PLATFORM_SOURCE_CHARS],
                     'repository_root': str(row.get('project') or project.repository_root),
                     'cwd': str(row.get('project') or project.repository_root),
                     'branch': branch,
@@ -783,10 +808,11 @@ class ClaudeMemImporter:
                 sessions_created += 1
             else:
                 session_duplicates += 1
-            sessions[str(row.get('content_session_id') or '')] = session
-            sessions[str(row.get('memory_session_id') or '')] = session
+            sessions[content_session_id] = session
+            if memory_session_id:
+                sessions[memory_session_id] = session
 
-        return sessions, agents_created, sessions_created, session_duplicates, sessions_redacted
+        return sessions, agents_created, sessions_created, session_duplicates, sessions_redacted, unsupported
 
     def _import_prompt(
         self,
@@ -868,10 +894,10 @@ class ClaudeMemImporter:
             session=session,
             source_id=source_id,
             event_type='claude_mem.observation',
-            observation_type=str(row.get('type') or 'observation'),
+            observation_type=str(row.get('type') or 'observation')[:_MAX_OBSERVATION_TYPE_CHARS],
             occurred_at=self._datetime(row.get('created_at')),
             prompt_number=row.get('prompt_number'),
-            generated_model=str(row.get('generated_by_model') or ''),
+            generated_model=str(row.get('generated_by_model') or '')[:_MAX_GENERATED_MODEL_CHARS],
             payload=payload_result.value,
             payload_redacted=payload_result.redacted,
             observation_data=observation_result.value,
@@ -1213,19 +1239,33 @@ class ClaudeMemImporter:
             report['duplicates']['memories'] += 1
 
     def _session_source_id(self, context: ImportContext, content_session_id: object) -> str:
-        return f'claude-mem:{context.source_store_id}:sdk_session:{content_session_id}'
+        return self._bounded_source_id(
+            f'claude-mem:{context.source_store_id}:sdk_session:{_capped_session_key(content_session_id)}',
+        )
 
     def _observation_source_id(self, context: ImportContext, row: dict[str, object]) -> str:
-        return f'claude-mem:{context.source_store_id}:observation:{row.get("memory_session_id")}:{row.get("id")}'
+        return self._bounded_source_id(
+            f'claude-mem:{context.source_store_id}:observation:{row.get("memory_session_id")}:{row.get("id")}',
+        )
 
     def _summary_source_id(self, context: ImportContext, row: dict[str, object]) -> str:
-        return f'claude-mem:{context.source_store_id}:session_summary:{row.get("memory_session_id")}:{row.get("id")}'
+        return self._bounded_source_id(
+            f'claude-mem:{context.source_store_id}:session_summary:{row.get("memory_session_id")}:{row.get("id")}',
+        )
 
     def _prompt_source_id(self, context: ImportContext, row: dict[str, object]) -> str:
-        return (
+        return self._bounded_source_id(
             f'claude-mem:{context.source_store_id}:user_prompt:'
-            f'{row.get("content_session_id")}:{row.get("prompt_number")}:{row.get("id")}'
+            f'{row.get("content_session_id")}:{row.get("prompt_number")}:{row.get("id")}',
         )
+
+    def _bounded_source_id(self, source_id: str) -> str:
+        if len(source_id) <= _MAX_SESSION_KEY_CHARS:
+            return source_id
+
+        digest = hashlib.sha256(source_id.encode()).hexdigest()[:32]
+
+        return f'{source_id[: _MAX_SESSION_KEY_CHARS - 33]}:{digest}'
 
     def _runtime(self, value: object) -> str:
         normalized = str(value or '').strip().lower()

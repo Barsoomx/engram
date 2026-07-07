@@ -8,7 +8,7 @@ from typing import Any
 from django.db.models import Prefetch, QuerySet
 from django.utils import timezone
 
-from engram.core.models import Memory, MemoryStatus, RetrievalDocument
+from engram.core.models import Memory, MemoryStatus, MemoryVersion, RetrievalDocument
 from engram.core.redaction import redact_value
 
 EXPORT_STREAM_CHUNK_SIZE = 200
@@ -29,9 +29,11 @@ def export_queryset(
         .prefetch_related(
             Prefetch(
                 'retrieval_documents',
-                queryset=RetrievalDocument.objects.select_related('memory_version'),
+                queryset=RetrievalDocument.objects.select_related('memory_version').order_by(
+                    '-memory_version__version',
+                ),
             ),
-            'versions',
+            Prefetch('versions', queryset=MemoryVersion.objects.order_by('version')),
             'links',
         )
         .order_by('title')
@@ -113,7 +115,7 @@ def _serialize_memory(memory: Memory) -> dict[str, Any]:
             'content_hash': redact_value(version.content_hash).value,
             'source_observation_id': str(version.source_observation_id) if version.source_observation_id else None,
         }
-        for version in memory.versions.all().order_by('version')
+        for version in memory.versions.all()
     ]
 
     retrieval_document = _serialize_retrieval_document(memory)
@@ -148,7 +150,8 @@ def _serialize_memory(memory: Memory) -> dict[str, Any]:
 
 
 def _serialize_retrieval_document(memory: Memory) -> dict[str, Any] | None:
-    document = memory.retrieval_documents.order_by('-memory_version__version').first()
+    documents = list(memory.retrieval_documents.all())
+    document = documents[0] if documents else None
 
     if document is None:
         return None

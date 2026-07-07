@@ -81,6 +81,7 @@ task_routes = {
     'engram.memory.retry_failed_distillations': {'queue': QUEUE_BATCH},
     'engram.memory.decay_memory_confidence': {'queue': QUEUE_BATCH},
     'engram.memory.expire_stale_candidates': {'queue': QUEUE_BATCH},
+    'engram.imports.expire_stale_import_jobs': {'queue': QUEUE_BATCH},
 }
 
 task_soft_time_limit = 120
@@ -152,6 +153,11 @@ beat_schedule: dict[str, dict] = {
     },
     'expire-stale-candidates': {
         'task': 'engram.memory.expire_stale_candidates',
+        'schedule': timedelta(minutes=30),
+        'options': {'queue': QUEUE_BATCH},
+    },
+    'expire-stale-import-jobs': {
+        'task': 'engram.imports.expire_stale_import_jobs',
         'schedule': timedelta(minutes=30),
         'options': {'queue': QUEUE_BATCH},
     },

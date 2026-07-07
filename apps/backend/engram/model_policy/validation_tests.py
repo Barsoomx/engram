@@ -49,6 +49,14 @@ class _UnknownErrorGateway:
         raise ModelPolicyError('some_internal_code', 'internal boom 0xdeadbeef')
 
 
+class _WeirdResponseGateway:
+    def __init__(self, raised: Exception) -> None:
+        self._raised = raised
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        raise self._raised
+
+
 class _RecordingGateway:
     def __init__(self, sink: list[ProviderCallInput]) -> None:
         self._sink = sink
@@ -199,6 +207,29 @@ def test_validate_policy_unknown_error_code_falls_back(f_policy: ModelPolicy) ->
     assert result.error_code == 'provider_error'
     assert result.public_error
     assert '0xdeadbeef' not in result.public_error
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'raised',
+    [
+        KeyError('choices'),
+        IndexError('list index out of range'),
+        TypeError("'NoneType' object is not subscriptable"),
+        ValueError('malformed payload 0xcafe'),
+    ],
+)
+def test_validate_policy_weird_provider_response_returns_invalid_code(
+    f_policy: ModelPolicy,
+    raised: Exception,
+) -> None:
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_WeirdResponseGateway(raised)))
+
+    assert result.ok is False
+    assert result.error_code == 'provider_response_invalid'
+    assert result.public_error
+    assert 'choices' not in result.public_error
+    assert '0xcafe' not in result.public_error
 
 
 @pytest.mark.django_db

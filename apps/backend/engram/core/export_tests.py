@@ -282,6 +282,58 @@ def test_stream_export_excludes_non_approved_unless_all_statuses() -> None:
 
 
 @pytest.mark.django_db
+def test_stream_export_query_count_does_not_scale_with_memories() -> None:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    organization, team, project = create_organization_project_team()
+    create_approved_memory(organization, project, team, title='Alpha memory')
+    create_approved_memory(organization, project, team, title='Beta memory')
+
+    with CaptureQueriesContext(connection) as small:
+        stream_export(organization, project)
+
+    create_approved_memory(organization, project, team, title='Gamma memory')
+    create_approved_memory(organization, project, team, title='Delta memory')
+    create_approved_memory(organization, project, team, title='Epsilon memory')
+
+    with CaptureQueriesContext(connection) as large:
+        stream_export(organization, project)
+
+    assert len(large.captured_queries) == len(small.captured_queries)
+
+
+@pytest.mark.django_db
+def test_stream_export_orders_versions_and_picks_latest_retrieval_document() -> None:
+    organization, team, project = create_organization_project_team()
+    memory, _version, _document = create_approved_memory(organization, project, team, title='Versioned memory')
+    second_version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=2,
+        body='Second body',
+        content_hash='versioned-memory-hash-2',
+    )
+    RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=second_version,
+        visibility_scope=VisibilityScope.PROJECT,
+        full_text='latest full text',
+    )
+    Memory.objects.filter(id=memory.id).update(current_version=2)
+
+    payload = stream_export(organization, project)
+
+    exported = payload['memories'][0]
+    assert [entry['version'] for entry in exported['versions']] == [1, 2]
+    assert exported['retrieval_document']['full_text'] == 'latest full text'
+
+
+@pytest.mark.django_db
 def test_stream_export_redacts_token_shaped_values() -> None:
     organization, team, project = create_organization_project_team()
     create_approved_memory(

@@ -54,7 +54,13 @@ def _make_proposed_candidate(org: Organization, project: Project, *, created_at:
     return candidate
 
 
-def _make_provider_error(org: Organization, project: Project, *, created_at: object = None) -> ProviderCallRecord:
+def _make_provider_error(
+    org: Organization,
+    project: Project,
+    *,
+    created_at: object = None,
+    request_id: str = '',
+) -> ProviderCallRecord:
     counter = ProviderCallRecord.objects.count()
     team = Team.objects.create(organization=org, name=f'Team {counter}', slug=f'team-{counter}')
     secret = ProviderSecret.objects.create(
@@ -87,7 +93,7 @@ def _make_provider_error(org: Organization, project: Project, *, created_at: obj
         model='gpt-4.1-mini',
         task_type='generation',
         policy_version=1,
-        request_id=f'req-{counter}',
+        request_id=request_id or f'req-{counter}',
         redaction_state='clean',
         result=AuditResult.ERROR,
     )
@@ -214,7 +220,12 @@ def test_ops_overview_scopes_counts_to_active_organization(f_admin_client: APICl
 
     assert response.status_code == 200
     m_workflow_run.objects.filter.assert_called_once_with(status=WorkflowRunStatus.FAILED, organization=org)
-    m_retrieval_document.objects.filter.assert_called_once_with(embedding_pgvector__isnull=True, organization=org)
+    m_retrieval_document.objects.filter.assert_called_once_with(
+        embedding_pgvector__isnull=True,
+        organization=org,
+        stale=False,
+        refuted=False,
+    )
     assert response.json()['failed_workflow_runs'] == 2
     assert response.json()['pending_embedding_count'] == 5
 
@@ -300,6 +311,25 @@ def test_ops_overview_review_gauges_scoped_to_active_organization(f_admin_client
     body = response.json()
     assert body['review_backlog_count'] == 1
     assert body['provider_errors_24h'] == 1
+
+
+@pytest.mark.django_db
+def test_ops_overview_excludes_validation_calls_from_provider_errors(f_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='ops-org')
+    project = _make_project(org)
+
+    _make_provider_error(org, project, created_at=timezone.now() - timedelta(hours=1))
+    _make_provider_error(
+        org,
+        project,
+        created_at=timezone.now() - timedelta(hours=1),
+        request_id='engram_validate_policies:policy-id:attempt-id',
+    )
+
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    assert response.json()['provider_errors_24h'] == 1
 
 
 @pytest.mark.django_db

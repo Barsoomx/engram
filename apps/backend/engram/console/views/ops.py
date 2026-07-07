@@ -23,6 +23,7 @@ from engram.core.models import (
     WorkflowRunStatus,
 )
 from engram.model_policy.models import ProviderCallRecord
+from engram.model_policy.validation import VALIDATION_REQUEST_ID_PREFIX
 
 _PROVIDER_ERROR_WINDOW = timedelta(hours=24)
 
@@ -55,11 +56,15 @@ class OpsOverviewView(APIView):
         if oldest_proposed_created is not None:
             oldest_proposed_age_seconds = int((timezone.now() - oldest_proposed_created).total_seconds())
 
-        provider_errors_24h = ProviderCallRecord.objects.filter(
-            organization=request.active_organization,
-            result=AuditResult.ERROR,
-            created_at__gte=timezone.now() - _PROVIDER_ERROR_WINDOW,
-        ).count()
+        provider_errors_24h = (
+            ProviderCallRecord.objects.filter(
+                organization=request.active_organization,
+                result=AuditResult.ERROR,
+                created_at__gte=timezone.now() - _PROVIDER_ERROR_WINDOW,
+            )
+            .exclude(request_id__startswith=VALIDATION_REQUEST_ID_PREFIX)
+            .count()
+        )
 
         payload: dict[str, object] = {
             'failed_workflow_runs': failed_workflow_runs,
@@ -98,4 +103,6 @@ def _pending_embedding_count(organization: Organization) -> int:
     return RetrievalDocument.objects.filter(
         embedding_pgvector__isnull=True,
         organization=organization,
+        stale=False,
+        refuted=False,
     ).count()
