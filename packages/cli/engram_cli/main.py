@@ -211,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     claude_mem.add_argument("--store-id", default="")
     claude_mem.add_argument("--dry-run", action="store_true")
     claude_mem.add_argument("--apply", action="store_true")
+    claude_mem.add_argument("--replace", action="store_true")
     claude_mem.add_argument("--skip-observations", action="store_true")
     claude_mem.add_argument("--batch-size", type=int, default=200)
     claude_mem.add_argument("--config-dir")

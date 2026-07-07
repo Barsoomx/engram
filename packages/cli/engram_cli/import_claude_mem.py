@@ -48,10 +48,26 @@ class ImportBatchTooLargeError(ClaudeMemImportError):
     pass
 
 
+class ImportConflictError(ClaudeMemImportError):
+    def __init__(
+        self,
+        code: str,
+        detail: str,
+        remediation: str,
+        active_import_id: str = '',
+    ) -> None:
+        super().__init__(code, detail, remediation)
+        self.active_import_id = active_import_id
+
+
 _IMPORT_REMEDIATION: dict[str, str] = {
     'missing_capability': (
         'Use an API key with memories:admin for imports '
         '(mint one on the console API Keys page).'
+    ),
+    'import_job_conflict': (
+        'An active import exists for this store. Re-run with --replace to cancel '
+        'it and start over (already-imported rows deduplicate).'
     ),
 }
 
@@ -260,6 +276,13 @@ def build_plan(
 def _error_from_body(body: dict[str, object], fallback: str) -> ClaudeMemImportError:
     code = as_string(body.get('code')) or fallback
     detail = as_string(body.get('detail')) or code
+    if code == 'import_job_conflict':
+        return ImportConflictError(
+            code,
+            detail,
+            _import_remediation(code),
+            as_string(body.get('active_import_id')),
+        )
 
     return ClaudeMemImportError(code, detail, _import_remediation(code))
 
@@ -349,6 +372,74 @@ def create_import(
         )
 
     return import_id
+
+
+def cancel_import(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    import_id: str,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    return _post_with_retry(
+        transport=transport,
+        server_url=server_url,
+        api_key=api_key,
+        path=f'/v1/imports/claude-mem/{import_id}/cancel',
+        payload={},
+        fallback='import_cancel_failed',
+        sleep=sleep,
+    )
+
+
+def _create_import_with_replace(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    project_id: str,
+    source_store_id: str,
+    manifest: dict[str, object],
+    replace: bool,
+    stdout: TextIO,
+    sleep: Callable[[float], None],
+) -> str:
+    try:
+        return create_import(
+            transport=transport,
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            source_store_id=source_store_id,
+            manifest=manifest,
+            sleep=sleep,
+        )
+    except ImportConflictError as conflict:
+        if not replace or not conflict.active_import_id:
+            raise
+
+        stdout.write(
+            f'--replace: cancelling active import {conflict.active_import_id} '
+            'before starting over.\n',
+        )
+        cancel_import(
+            transport=transport,
+            server_url=server_url,
+            api_key=api_key,
+            import_id=conflict.active_import_id,
+            sleep=sleep,
+        )
+
+        return create_import(
+            transport=transport,
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            source_store_id=source_store_id,
+            manifest=manifest,
+            sleep=sleep,
+        )
 
 
 def send_batch(
@@ -462,6 +553,7 @@ def stream_plan(
     schema_version_head: int,
     batch_size: int,
     stdout: TextIO,
+    replace: bool = False,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     effective_size = min(max(1, batch_size), _MAX_BATCH_ROWS)
@@ -469,13 +561,15 @@ def stream_plan(
         'schema_version_head': schema_version_head,
         'tables': dict(plan.counts),
     }
-    import_id = create_import(
+    import_id = _create_import_with_replace(
         transport=transport,
         server_url=server_url,
         api_key=api_key,
         project_id=project_id,
         source_store_id=source_store_id,
         manifest=manifest,
+        replace=replace,
+        stdout=stdout,
         sleep=sleep,
     )
     stdout.write(f'import_id={import_id}\n')
@@ -595,10 +689,17 @@ def run_import_claude_mem(
                 schema_version_head=reader.schema_version_head(),
                 batch_size=int(getattr(args, 'batch_size', _MAX_BATCH_ROWS)),
                 stdout=stdout,
+                replace=bool(getattr(args, 'replace', False)),
             )
             _print_report(report, stdout)
 
         return 0
+    except ImportConflictError as conflict:
+        emit_error(stderr, conflict, api_key)
+        if conflict.active_import_id:
+            stderr.write(f'active_import_id: {conflict.active_import_id}\n')
+
+        return 1
     except CliError as error:
         emit_error(stderr, error, api_key)
 
