@@ -9,7 +9,12 @@ import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { TimeStamp } from '@/components/ui/time-stamp';
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { useProjects } from '@/hooks/use-projects';
+import { useTeams } from '@/hooks/use-teams';
 import { useRerunWorkflowRun, useWorkflowRun } from '@/hooks/use-workflow-runs';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import { auditResultChipColor } from '@/lib/design';
@@ -19,6 +24,7 @@ import type {
   WorkflowRunDetail,
   WorkflowRunProviderCall,
   WorkflowRunStatus,
+  WorkflowRunType,
 } from '@/lib/admin-api';
 
 const STATUS_CHIP_COLOR: Record<
@@ -31,19 +37,21 @@ const STATUS_CHIP_COLOR: Record<
   failed: 'danger',
 };
 
-function formatDateTime(value: string | null): string {
-  if (!value) {
+const RUN_TYPE_LABELS: Record<WorkflowRunType, string> = {
+  daily_digest: 'Daily digest',
+  observation_processing: 'Observation processing',
+  session_distillation: 'Session distillation',
+  weekly_digest: 'Weekly digest',
+};
 
-    return '—';
-  }
+const RERUNNABLE_TYPES: ReadonlySet<WorkflowRunType> = new Set<WorkflowRunType>([
+  'daily_digest',
+  'weekly_digest',
+  'session_distillation',
+]);
 
-  try {
-
-    return new Date(value).toLocaleString();
-  } catch {
-
-    return value;
-  }
+function runTypeLabel(runType: WorkflowRunType): string {
+  return RUN_TYPE_LABELS[runType] ?? runType;
 }
 
 function formatDuration(
@@ -161,53 +169,51 @@ function CuratorActionsFeed({
   }
 
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Event type</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Actor</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Target</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Result</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Created at</th>
+    <ResponsiveTable minWidth={620}>
+      <thead>
+        <tr className='border-b border-divider'>
+          <th className='py-2 px-3 text-default-500 font-medium'>Event type</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Actor</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Target</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Result</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
+        </tr>
+      </thead>
+      <tbody>
+        {actions.map((action) => (
+          <tr key={action.id} className='border-b border-divider/50'>
+            <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              {action.event_type}
+            </td>
+            <td className='py-2 px-3 text-default-700'>
+              <span className='font-mono text-xs'>{action.actor_type}</span>
+            </td>
+            <td className='py-2 px-3 text-default-700'>
+              {action.target_type ? (
+                <span className='font-mono text-xs'>
+                  {action.target_type}
+                  {action.target_id ? ` · ${shortId(action.target_id)}` : ''}
+                </span>
+              ) : (
+                <span className='text-default-500'>—</span>
+              )}
+            </td>
+            <td className='py-2 px-3'>
+              <Chip
+                size='sm'
+                variant='flat'
+                color={auditResultChipColor(action.result)}
+              >
+                {action.result}
+              </Chip>
+            </td>
+            <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+              <TimeStamp value={action.created_at} />
+            </td>
           </tr>
-        </thead>
-        <tbody>
-          {actions.map((action) => (
-            <tr key={action.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {action.event_type}
-              </td>
-              <td className='py-2 px-3 text-default-700'>
-                <span className='font-mono text-xs'>{action.actor_type}</span>
-              </td>
-              <td className='py-2 px-3 text-default-700'>
-                {action.target_type ? (
-                  <span className='font-mono text-xs'>
-                    {action.target_type}
-                    {action.target_id ? ` · ${shortId(action.target_id)}` : ''}
-                  </span>
-                ) : (
-                  <span className='text-default-500'>—</span>
-                )}
-              </td>
-              <td className='py-2 px-3'>
-                <Chip
-                  size='sm'
-                  variant='flat'
-                  color={auditResultChipColor(action.result)}
-                >
-                  {action.result}
-                </Chip>
-              </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {formatDateTime(action.created_at)}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </ResponsiveTable>
   );
 }
 
@@ -222,44 +228,42 @@ function ProviderCallsTable({
   }
 
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Provider</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Model</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Task type</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Result</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Latency</th>
+    <ResponsiveTable minWidth={620}>
+      <thead>
+        <tr className='border-b border-divider'>
+          <th className='py-2 px-3 text-default-500 font-medium'>Provider</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Model</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Task type</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Result</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Latency</th>
+        </tr>
+      </thead>
+      <tbody>
+        {calls.map((call) => (
+          <tr key={call.id} className='border-b border-divider/50'>
+            <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              {call.provider}
+            </td>
+            <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              {call.model}
+            </td>
+            <td className='py-2 px-3 text-default-700'>{call.task_type}</td>
+            <td className='py-2 px-3'>
+              <Chip
+                size='sm'
+                variant='flat'
+                color={auditResultChipColor(call.result)}
+              >
+                {call.result}
+              </Chip>
+            </td>
+            <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+              {call.latency_ms !== null ? `${call.latency_ms} ms` : '—'}
+            </td>
           </tr>
-        </thead>
-        <tbody>
-          {calls.map((call) => (
-            <tr key={call.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {call.provider}
-              </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {call.model}
-              </td>
-              <td className='py-2 px-3 text-default-700'>{call.task_type}</td>
-              <td className='py-2 px-3'>
-                <Chip
-                  size='sm'
-                  variant='flat'
-                  color={auditResultChipColor(call.result)}
-                >
-                  {call.result}
-                </Chip>
-              </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {call.latency_ms !== null ? `${call.latency_ms} ms` : '—'}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </ResponsiveTable>
   );
 }
 
@@ -271,7 +275,7 @@ function StatusHeader({ run }: { run: WorkflowRunDetail }) {
           <div className='flex items-center gap-2'>
             <Workflow className='w-5 h-5 text-default-500' />
             <h2 className='text-lg font-semibold text-foreground'>
-              {run.run_type}
+              {runTypeLabel(run.run_type)}
             </h2>
             <Chip
               size='sm'
@@ -290,8 +294,12 @@ function StatusHeader({ run }: { run: WorkflowRunDetail }) {
           <p className='font-mono text-xs text-default-500 break-all'>{run.id}</p>
         </div>
         <div className='text-sm text-default-500 space-y-0.5'>
-          <p>Started: {formatDateTime(run.started_at)}</p>
-          <p>Finished: {formatDateTime(run.finished_at)}</p>
+          <p className='flex items-center justify-end gap-1'>
+            Started: <TimeStamp value={run.started_at} />
+          </p>
+          <p className='flex items-center justify-end gap-1'>
+            Finished: <TimeStamp value={run.finished_at} />
+          </p>
           <p>Duration: {formatDuration(run.started_at, run.finished_at)}</p>
         </div>
       </div>
@@ -317,9 +325,19 @@ export default function WorkflowRunDetailPage() {
   const runQuery = useWorkflowRun(activeOrgId, id);
   const rerunMutation = useRerunWorkflowRun(activeOrgId);
 
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
+  const teamsQuery = useTeams(activeOrgId, { pageSize: 200 });
+
   const [rerunOpen, setRerunOpen] = React.useState(false);
 
   const canAdmin = hasCapability(capabilities, 'memories:admin');
+  const run = runQuery.data;
+  const canRerun = run ? RERUNNABLE_TYPES.has(run.run_type) : false;
+  const projectName =
+    (run && projectsQuery.data?.results.find((p) => p.id === run.project_id)?.name) || run?.project_id;
+  const teamName = run?.team_id
+    ? teamsQuery.data?.results.find((t) => t.id === run.team_id)?.name ?? run.team_id
+    : null;
 
   async function handleRerun() {
     try {
@@ -357,14 +375,13 @@ export default function WorkflowRunDetailPage() {
             <ArrowLeft className='w-4 h-4' />
             Back to workflow runs
           </Link>
-          {canAdmin && (
+          {canAdmin && canRerun && (
             <Button
               color='primary'
               variant='flat'
               startContent={<RotateCw className='w-4 h-4' />}
               onPress={() => setRerunOpen(true)}
               isLoading={rerunMutation.isPending}
-              isDisabled={runQuery.data === undefined}
             >
               Rerun
             </Button>
@@ -376,11 +393,14 @@ export default function WorkflowRunDetailPage() {
         )}
 
         {runQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {runQuery.error instanceof Error
-              ? runQuery.error.message
-              : 'Failed to load workflow run.'}
-          </pre>
+          <ErrorState
+            message={
+              runQuery.error instanceof Error
+                ? runQuery.error.message
+                : 'Failed to load workflow run.'
+            }
+            onRetry={() => runQuery.refetch()}
+          />
         )}
 
         {runQuery.data && (
@@ -392,16 +412,16 @@ export default function WorkflowRunDetailPage() {
                 Details
               </h3>
               <dl className='flex flex-col'>
-                <DetailRow label='Run type'>{runQuery.data.run_type}</DetailRow>
+                <DetailRow label='Run type'>{runTypeLabel(runQuery.data.run_type)}</DetailRow>
                 <DetailRow label='Project'>
-                  <span className='font-mono text-xs'>
-                    {shortId(runQuery.data.project_id)}
-                  </span>
+                  <span title={runQuery.data.project_id}>{projectName}</span>
                 </DetailRow>
                 <DetailRow label='Team'>
-                  <span className='font-mono text-xs'>
-                    {shortId(runQuery.data.team_id)}
-                  </span>
+                  {teamName ? (
+                    <span title={runQuery.data.team_id ?? undefined}>{teamName}</span>
+                  ) : (
+                    <span className='text-default-500'>—</span>
+                  )}
                 </DetailRow>
                 <DetailRow label='Request ID'>
                   <span className='font-mono text-xs break-all'>
@@ -441,7 +461,7 @@ export default function WorkflowRunDetailPage() {
                   </DetailRow>
                 )}
                 <DetailRow label='Created at'>
-                  {formatDateTime(runQuery.data.created_at)}
+                  <TimeStamp value={runQuery.data.created_at} relative={false} />
                 </DetailRow>
               </dl>
             </div>
