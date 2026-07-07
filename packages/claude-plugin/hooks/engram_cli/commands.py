@@ -62,6 +62,7 @@ MAX_SERVER_RETRIES = 3
 PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
 USER_PROMPT_SUBMIT_TOKEN_BUDGET = 1200
 SESSION_START_TOKEN_BUDGET = 2000
+CONTEXT_QUERY_MIN_PROMPT_LENGTH = 20
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -705,6 +706,16 @@ def run_disconnect(args: Namespace, stdout: TextIO, _stderr: TextIO) -> int:
     return 0
 
 
+def should_skip_context_query(prompt: str) -> bool:
+    stripped = prompt.strip()
+    if len(stripped) < CONTEXT_QUERY_MIN_PROMPT_LENGTH:
+        return True
+    if stripped.startswith("/") or stripped.startswith("<command-"):
+        return True
+
+    return False
+
+
 def run_hook(
     args: Namespace,
     stdin: TextIO,
@@ -811,6 +822,10 @@ def run_hook(
             )
             if hook_status < 200 or hook_status >= 300:
                 raise error_from_body(hook_body, fallback="http_error")
+            if should_skip_context_query(payload_string(input_payload, "prompt")):
+                stdout.write("{}\n")
+
+                return 0
             status, body = post_json(
                 transport=active_transport,
                 server_url=server_url,
