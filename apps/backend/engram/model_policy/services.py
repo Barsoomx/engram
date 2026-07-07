@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import structlog
@@ -735,6 +736,120 @@ def _log_repeat_attempt(data: ProviderCallInput | EmbeddingCallInput) -> None:
     )
 
 
+_COST_QUANTUM = Decimal('0.000001')
+_ONE_MILLION = Decimal(1_000_000)
+
+
+def _coerce_token_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float) and value.is_integer() and value >= 0:
+        return int(value)
+
+    return None
+
+
+def _parse_openai_usage(response: dict[str, Any]) -> dict[str, int] | None:
+    usage = response.get('usage')
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _coerce_token_count(usage.get('prompt_tokens'))
+    output_tokens = _coerce_token_count(usage.get('completion_tokens'))
+    total_tokens = _coerce_token_count(usage.get('total_tokens'))
+    if input_tokens is None and output_tokens is None and total_tokens is None:
+        return None
+    input_tokens = input_tokens or 0
+    output_tokens = output_tokens or 0
+    if total_tokens is None:
+        total_tokens = input_tokens + output_tokens
+
+    return {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': total_tokens}
+
+
+def _parse_anthropic_usage(response: dict[str, Any]) -> dict[str, int] | None:
+    usage = response.get('usage')
+    if not isinstance(usage, dict):
+        return None
+    input_tokens = _coerce_token_count(usage.get('input_tokens'))
+    output_tokens = _coerce_token_count(usage.get('output_tokens'))
+    if input_tokens is None and output_tokens is None:
+        return None
+    input_tokens = input_tokens or 0
+    output_tokens = output_tokens or 0
+
+    return {'input_tokens': input_tokens, 'output_tokens': output_tokens, 'total_tokens': input_tokens + output_tokens}
+
+
+def _build_token_usage(
+    real_usage: dict[str, int] | None,
+    input_estimate: int,
+    output_estimate: int,
+) -> dict[str, Any]:
+    if real_usage is not None:
+        return {
+            'input_tokens': real_usage['input_tokens'],
+            'output_tokens': real_usage['output_tokens'],
+            'total_tokens': real_usage['total_tokens'],
+            'source': 'provider',
+        }
+
+    return {'input_tokens': input_estimate, 'output_tokens': output_estimate, 'source': 'estimated'}
+
+
+def _resolve_policy_pricing(policy: ModelPolicy) -> dict[str, Decimal] | None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    raw = metadata.get('pricing')
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning('provider_pricing_malformed', policy_id=str(policy.id), reason='not_a_mapping')
+
+        return None
+    pricing: dict[str, Decimal] = {}
+    for key in ('input_per_mtok', 'output_per_mtok'):
+        if raw.get(key) is None:
+            continue
+        try:
+            value = Decimal(str(raw[key]))
+        except (InvalidOperation, TypeError, ValueError):
+            logger.warning('provider_pricing_malformed', policy_id=str(policy.id), field=key)
+
+            return None
+        if value < 0:
+            logger.warning('provider_pricing_malformed', policy_id=str(policy.id), field=key, reason='negative')
+
+            return None
+        pricing[key] = value
+    if 'input_per_mtok' not in pricing:
+        logger.warning('provider_pricing_malformed', policy_id=str(policy.id), reason='missing_input_per_mtok')
+
+        return None
+
+    return pricing
+
+
+def _build_cost_metadata(
+    policy: ModelPolicy,
+    real_usage: dict[str, int] | None,
+    *,
+    output_billable: bool = True,
+) -> dict[str, Any]:
+    pricing = _resolve_policy_pricing(policy)
+    if pricing is None:
+        return {'estimated': True, 'cost_usd': '0.0000', 'pricing_source': 'unknown'}
+    if real_usage is None:
+        return {'estimated': True, 'cost_usd': '0.0000', 'pricing_source': 'no_usage'}
+    input_cost = (Decimal(real_usage['input_tokens']) / _ONE_MILLION) * pricing['input_per_mtok']
+    output_cost = Decimal(0)
+    if output_billable:
+        output_cost = (Decimal(real_usage['output_tokens']) / _ONE_MILLION) * pricing.get('output_per_mtok', Decimal(0))
+    total = (input_cost + output_cost).quantize(_COST_QUANTUM)
+
+    return {'estimated': False, 'cost_usd': str(total), 'pricing_source': 'policy'}
+
+
 class FakeProviderGateway:
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -763,9 +878,9 @@ class FakeProviderGateway:
             request_id=data.request_id,
             trace_id=data.trace_id,
             redaction_state='redacted' if prompt_was_redacted else 'clean',
-            token_usage={'input_tokens': token_count, 'output_tokens': 0},
+            token_usage=_build_token_usage(None, token_count, 0),
             latency_ms=0,
-            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            cost_metadata=_build_cost_metadata(policy, None),
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False},
         )
@@ -806,9 +921,9 @@ class FakeProviderGateway:
             request_id=data.request_id,
             trace_id=data.trace_id,
             redaction_state='redacted' if text_was_redacted else 'clean',
-            token_usage={'input_tokens': token_count, 'output_tokens': 0},
+            token_usage=_build_token_usage(None, token_count, 0),
             latency_ms=0,
-            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            cost_metadata=_build_cost_metadata(policy, None, output_billable=False),
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False},
         )
@@ -1026,7 +1141,7 @@ class OpenAICompatibleGateway:
         extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
         started_at = time.monotonic()
         try:
-            content = self._chat_completion(
+            content, real_usage = self._chat_completion(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
@@ -1043,7 +1158,8 @@ class OpenAICompatibleGateway:
             data,
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
-            token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+            token_usage=_build_token_usage(real_usage, len(prompt_text.split()), len(content.split())),
+            cost_metadata=_build_cost_metadata(policy, real_usage),
             latency_ms=latency_ms,
         )
 
@@ -1064,7 +1180,7 @@ class OpenAICompatibleGateway:
 
         started_at = time.monotonic()
         try:
-            embedding = self._embeddings(policy.model, text_value)
+            embedding, real_usage = self._embeddings(policy.model, text_value)
         except ModelPolicyError as error:
             self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
             raise
@@ -1074,7 +1190,8 @@ class OpenAICompatibleGateway:
             data,
             policy,
             redaction_state='redacted' if redacted_text.redacted or '[REDACTED]' in data.text else 'clean',
-            token_usage={'input_tokens': len(text_value.split()), 'output_tokens': 0},
+            token_usage=_build_token_usage(real_usage, len(text_value.split()), 0),
+            cost_metadata=_build_cost_metadata(policy, real_usage, output_billable=False),
             latency_ms=latency_ms,
         )
 
@@ -1092,7 +1209,8 @@ class OpenAICompatibleGateway:
         policy: ModelPolicy,
         *,
         redaction_state: str,
-        token_usage: dict[str, int],
+        token_usage: dict[str, Any],
+        cost_metadata: dict[str, Any],
         latency_ms: int,
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
@@ -1110,7 +1228,7 @@ class OpenAICompatibleGateway:
             redaction_state=redaction_state,
             token_usage=token_usage,
             latency_ms=latency_ms,
-            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            cost_metadata=cost_metadata,
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False, 'transport': 'http'},
         )
@@ -1154,7 +1272,7 @@ class OpenAICompatibleGateway:
         prompt: str,
         system_prompt: str = '',
         extra: dict[str, object] | None = None,
-    ) -> str:
+    ) -> tuple[str, dict[str, int] | None]:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
@@ -1169,14 +1287,14 @@ class OpenAICompatibleGateway:
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/chat/completions', payload, timeout=self._timeout)
 
-        return str(response['choices'][0]['message']['content'])
+        return str(response['choices'][0]['message']['content']), _parse_openai_usage(response)
 
-    def _embeddings(self, model: str, text: str) -> tuple[float, ...]:
+    def _embeddings(self, model: str, text: str) -> tuple[tuple[float, ...], dict[str, int] | None]:
         payload = json.dumps({'model': model, 'input': text}).encode()
         response = self._open(self._base_url + '/embeddings', payload, timeout=_embedding_http_timeout())
         embedding = tuple(float(component) for component in response['data'][0]['embedding'])
 
-        return fit_embedding_dimension(embedding)
+        return fit_embedding_dimension(embedding), _parse_openai_usage(response)
 
     def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
@@ -1282,7 +1400,7 @@ class AnthropicMessagesGateway:
 
         started_at = time.monotonic()
         try:
-            content = self._messages(
+            content, real_usage = self._messages(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
@@ -1300,7 +1418,8 @@ class AnthropicMessagesGateway:
             data,
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
-            token_usage={'input_tokens': len(prompt_text.split()), 'output_tokens': len(content.split())},
+            token_usage=_build_token_usage(real_usage, len(prompt_text.split()), len(content.split())),
+            cost_metadata=_build_cost_metadata(policy, real_usage),
             latency_ms=latency_ms,
         )
 
@@ -1325,7 +1444,8 @@ class AnthropicMessagesGateway:
         policy: ModelPolicy,
         *,
         redaction_state: str,
-        token_usage: dict[str, int],
+        token_usage: dict[str, Any],
+        cost_metadata: dict[str, Any],
         latency_ms: int,
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
@@ -1343,7 +1463,7 @@ class AnthropicMessagesGateway:
             redaction_state=redaction_state,
             token_usage=token_usage,
             latency_ms=latency_ms,
-            cost_metadata={'estimated': True, 'cost_usd': '0.0000'},
+            cost_metadata=cost_metadata,
             result=AuditResult.RECORDED,
             metadata={'prompt_retained': False, 'transport': 'http-anthropic'},
         )
@@ -1389,7 +1509,7 @@ class AnthropicMessagesGateway:
         *,
         response_kind: str = 'single',
         max_tokens: int = _DEFAULT_MAX_TOKENS,
-    ) -> str:
+    ) -> tuple[str, dict[str, int] | None]:
         payload_dict: dict[str, object] = {
             'model': model,
             'max_tokens': max_tokens,
@@ -1404,7 +1524,7 @@ class AnthropicMessagesGateway:
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/v1/messages', payload, timeout=self._timeout)
 
-        return _anthropic_content_text(response)
+        return _anthropic_content_text(response), _parse_anthropic_usage(response)
 
     def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
