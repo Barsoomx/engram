@@ -31,13 +31,14 @@ def _make_scope(
     project: Project,
     *,
     capabilities: tuple[str, ...] = ('memories:read',),
+    team_ids: tuple[uuid.UUID, ...] = (),
 ) -> EffectiveScope:
     return EffectiveScope(
         organization_id=organization.id,
         identity_id=uuid.uuid4(),
         api_key_id=uuid.uuid4(),
         project_ids=(project.id,),
-        team_ids=(),
+        team_ids=team_ids,
         capabilities=capabilities,
         actor_type='user',
         actor_id='debug-tester',
@@ -64,6 +65,7 @@ def _seed_lexical_recall_document(
     sequence: int,
     kind: str = '',
     confidence: Decimal | None = None,
+    visibility_scope: str = VisibilityScope.PROJECT,
 ) -> RetrievalDocument:
     memory = Memory.objects.create(
         organization=organization,
@@ -72,7 +74,7 @@ def _seed_lexical_recall_document(
         title=title,
         body=body,
         status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         metadata={'kind': kind} if kind else {},
         confidence=confidence,
     )
@@ -91,7 +93,7 @@ def _seed_lexical_recall_document(
         team=team,
         memory=memory,
         memory_version=version,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         source_observation_ids=[],
         file_paths=[],
         symbols=[],
@@ -292,3 +294,106 @@ def test_replay_allows_full_org_admin_for_project_not_in_scope() -> None:
     )
 
     assert result.scope_filters['project_id'] == str(project.id)
+
+
+@pytest.mark.django_db
+def test_replay_denies_foreign_team_id_for_non_admin() -> None:
+    organization, project, team = _make_org_project_team()
+    foreign_team = Team.objects.create(organization=organization, name='Foreign', slug='foreign-search-debug')
+    scope = _make_scope(organization, project, team_ids=(team.id,))
+
+    with pytest.raises(AccessDeniedError) as exc:
+        ReplaySearchDebug().execute(
+            organization=organization,
+            project=project,
+            scope=scope,
+            query='authorization',
+            team_id=foreign_team.id,
+            file_paths=(),
+            symbols=(),
+        )
+
+    assert exc.value.error_code == 'team_scope_denied'
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.django_db
+def test_replay_member_team_id_narrows_within_scope() -> None:
+    organization, project, team = _make_org_project_team()
+    second_team = Team.objects.create(organization=organization, name='Second', slug='second-search-debug')
+    in_scope_doc = _seed_lexical_recall_document(
+        organization,
+        project,
+        team,
+        title='team a anchor',
+        body='team a anchor',
+        exact_terms=['authorization'],
+        sequence=1,
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    other_doc = _seed_lexical_recall_document(
+        organization,
+        project,
+        second_team,
+        title='team b anchor',
+        body='team b anchor',
+        exact_terms=['authorization'],
+        sequence=2,
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    scope = _make_scope(organization, project, team_ids=(team.id, second_team.id))
+
+    result = ReplaySearchDebug().execute(
+        organization=organization,
+        project=project,
+        scope=scope,
+        query='authorization',
+        team_id=team.id,
+        file_paths=(),
+        symbols=(),
+    )
+
+    assert in_scope_doc.memory_id in {m.memory_id for m in result.exact_matches}
+    excluded_reasons = {e.memory_id: e.reason for e in result.excluded}
+    assert excluded_reasons.get(other_doc.memory_id) == 'team_not_in_scope'
+    assert result.scope_filters['team_ids'] == [str(team.id)]
+
+
+@pytest.mark.django_db
+def test_replay_admin_narrows_to_requested_team_and_authorizes_team_document() -> None:
+    organization, project, team = _make_org_project_team()
+    team_doc = _seed_lexical_recall_document(
+        organization,
+        project,
+        team,
+        title='team scoped anchor',
+        body='team scoped anchor',
+        exact_terms=['authorization'],
+        sequence=1,
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    scope = EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=(),
+        capabilities=('projects:*',),
+        actor_type='user',
+        actor_id='debug-admin',
+        project_bound=False,
+    )
+
+    result = ReplaySearchDebug().execute(
+        organization=organization,
+        project=project,
+        scope=scope,
+        query='authorization',
+        team_id=team.id,
+        file_paths=(),
+        symbols=(),
+    )
+
+    assert team_doc.memory_id in {m.memory_id for m in result.exact_matches}
+    assert team_doc.memory_id not in {e.memory_id for e in result.excluded}
+    assert result.scope_filters['team_ids'] == [str(team.id)]

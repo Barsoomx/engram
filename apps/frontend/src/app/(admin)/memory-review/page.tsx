@@ -447,7 +447,7 @@ interface ReviewTableProps {
 }
 
 function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, onRowAction }: ReviewTableProps) {
-  const allIds = items.map((item) => item.id);
+  const allIds = items.filter((item) => item.type === 'memory').map((item) => item.id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selectedIds.has(id));
   const someSelected = allIds.some((id) => selectedIds.has(id));
 
@@ -483,11 +483,13 @@ function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, o
             <tr key={`${item.type}-${item.id}`} className='border-b border-divider/50'>
               {canAdmin && (
                 <td className='px-3 py-2'>
-                  <Checkbox
-                    isSelected={isSelected}
-                    onValueChange={() => onToggleRow(item.id)}
-                    aria-label={`Select ${item.title}`}
-                  />
+                  {item.type === 'memory' ? (
+                    <Checkbox
+                      isSelected={isSelected}
+                      onValueChange={() => onToggleRow(item.id)}
+                      aria-label={`Select ${item.title}`}
+                    />
+                  ) : null}
                 </td>
               )}
               <td className='px-3 py-2'>
@@ -987,6 +989,8 @@ export default function MemoryReviewPage() {
       const result = await bulkMutation.mutateAsync({
         confidence__lte: threshold.toFixed(3),
         reason: thresholdReason.trim(),
+        ...(filters.project_id ? { project_id: filters.project_id } : {}),
+        ...(filters.team_id ? { team_id: filters.team_id } : {}),
       });
 
       addToast({
@@ -1267,7 +1271,9 @@ export default function MemoryReviewPage() {
                 <ModalBody>
                   <div className='space-y-3'>
                     <p className='text-sm text-default-500'>
-                      Archives every reviewable memory whose confidence is at or below the threshold. Recorded in the audit log and permanent.
+                      Archives reviewable memories whose confidence is at or below the threshold
+                      {filters.project_id || filters.team_id ? ', scoped to the active project and team filters' : ''}. Recorded in the audit
+                      log and permanent.
                     </p>
                     <Input
                       label='Confidence ≤'

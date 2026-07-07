@@ -86,11 +86,13 @@ class ListInspectionMemories:
             organization_id=inspection_scope.scope.organization_id,
             project=inspection_scope.project,
         ).filter(inspection_scope.team_filter)
-        qs = qs.filter(status=inspection_scope.status or MemoryStatus.APPROVED)
-        if inspection_scope.kind:
-            qs = qs.filter(kind=inspection_scope.kind)
+        filter_data = {
+            'status': inspection_scope.status or MemoryStatus.APPROVED,
+            'kind': inspection_scope.kind,
+            'search': inspection_scope.search,
+        }
 
-        return qs.count()
+        return InspectionMemoryFilterSet(data=filter_data, queryset=qs).qs.count()
 
     def related_memories(
         self,

@@ -41,6 +41,10 @@ class BulkArchiveSerializer(serializers.Serializer):
         required=False,
     )
 
+    project_id = serializers.UUIDField(required=False)
+
+    team_id = serializers.UUIDField(required=False)
+
     reason = serializers.CharField(min_length=1, max_length=1024)
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:

@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Any
 
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import F
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -28,26 +28,20 @@ from engram.console.serializers.memory_review import (
     version_slice,
 )
 from engram.console.services import (
+    REVIEW_MEMORY_STATUSES,
     MemoryReviewError,
     bulk_archive_memories,
     get_review_candidate_or_404,
     get_review_memory_or_404,
+    reviewable_memory_filter,
 )
 from engram.console.usecases.review_action import ReviewActionInput, ReviewActionUseCase
 from engram.core.models import (
     CandidateStatus,
     Memory,
     MemoryCandidate,
-    MemoryStatus,
     MemoryVersion,
 )
-
-REVIEW_MEMORY_STATUSES = (
-    MemoryStatus.CONFLICT,
-    MemoryStatus.REFUTED,
-)
-
-REVIEW_MEMORY_CONFIDENCE_THRESHOLD = '0.300'
 
 PAGE_SIZE = 50
 
@@ -189,6 +183,8 @@ class MemoryReviewViewSet(
             reason=data['reason'],
             ids=ids,
             confidence_lte=confidence_lte,
+            project_id=data.get('project_id'),
+            team_id=data.get('team_id'),
         )
 
         payload = {
@@ -286,11 +282,7 @@ class MemoryReviewViewSet(
     def _filtered_memories(self, request: Request, organization: Any) -> Any:
         queryset = (
             Memory.objects.filter(organization=organization)
-            .filter(
-                Q(status__in=REVIEW_MEMORY_STATUSES)
-                | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD)
-                | Q(status=MemoryStatus.APPROVED, refuted=True),
-            )
+            .filter(reviewable_memory_filter())
             .select_related('project', 'team')
         )
 

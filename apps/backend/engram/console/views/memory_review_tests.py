@@ -1212,6 +1212,68 @@ def test_bulk_archive_by_confidence_threshold(
 
 
 @pytest.mark.django_db
+def test_bulk_archive_by_confidence_threshold_scopes_to_project(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    other_project = Project.objects.create(organization=f_admin_org, name='Other', slug='other')
+
+    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+
+    out_of_scope = _make_memory(f_admin_org, other_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-archive/',
+        {'confidence__lte': '0.300', 'project_id': str(f_project.id), 'reason': 'scoped cleanup'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['archived_ids'] == [str(in_scope.id)]
+
+    in_scope.refresh_from_db()
+
+    out_of_scope.refresh_from_db()
+
+    assert in_scope.status == MemoryStatus.ARCHIVED
+
+    assert out_of_scope.status == MemoryStatus.CONFLICT
+
+
+@pytest.mark.django_db
+def test_bulk_archive_by_confidence_threshold_skips_approved_above_review_threshold(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200')
+
+    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450')
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-archive/',
+        {'confidence__lte': '0.500', 'reason': 'threshold cleanup'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['archived_ids'] == [str(reviewable.id)]
+
+    reviewable.refresh_from_db()
+
+    active.refresh_from_db()
+
+    assert reviewable.status == MemoryStatus.ARCHIVED
+
+    assert active.status == MemoryStatus.APPROVED
+
+
+@pytest.mark.django_db
 def test_bulk_archive_requires_reason(
     f_admin_token: str,
     f_admin_org: Organization,

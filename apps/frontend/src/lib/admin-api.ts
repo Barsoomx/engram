@@ -547,6 +547,8 @@ export type MemoryReviewActionResult = {
 export type BulkArchiveMemoryReviewPayload = {
   ids?: string[];
   confidence__lte?: string;
+  project_id?: string;
+  team_id?: string;
   reason: string;
 };
 

@@ -770,7 +770,8 @@ export interface DigestCounts {
 }
 
 export interface WeeklyDigest {
-  digest_memory_id: string;
+  digest_memory_id: string | null;
+  built?: boolean;
   window_start: string | null;
   window_end: string | null;
   window_days: number;

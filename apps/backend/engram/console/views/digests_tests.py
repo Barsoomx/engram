@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import structlog
 from django.contrib.auth.models import User
+from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
@@ -22,8 +23,10 @@ from engram.core.models import (
     AuditEvent,
     Memory,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
+    RetrievalDocument,
     VisibilityScope,
 )
 from engram.memory.services import WeeklyDigestResult
@@ -231,6 +234,34 @@ def test_get_weekly_digest_returns_expected_structure(
 
     assert data['ready'] is False
 
+    assert data['built'] is True
+
+
+@pytest.mark.django_db
+def test_get_weekly_digest_past_week_never_built_returns_not_built_without_writing(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'weeks_back': '3'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['built'] is False
+
+    assert response.data['digest_memory_id'] is None
+
+    assert response.data['window_start'] is not None
+
+    assert Memory.objects.filter(organization=f_org).count() == 0
+
+    assert MemoryVersion.objects.count() == 0
+
+    assert RetrievalDocument.objects.count() == 0
+
 
 @pytest.mark.django_db
 def test_weekly_digest_forwards_weeks_back(
@@ -238,8 +269,10 @@ def test_weekly_digest_forwards_weeks_back(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    now = timezone.now()
+
     with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
+        m_service_cls.return_value.find_existing.return_value = (_fake_weekly_result(f_project), now, now)
 
         response = f_read_client.get(
             '/v1/admin/digests/weekly',
@@ -248,7 +281,9 @@ def test_weekly_digest_forwards_weeks_back(
 
     assert response.status_code == 200
 
-    passed_input = m_service_cls.return_value.execute.call_args.args[0]
+    m_service_cls.return_value.execute.assert_not_called()
+
+    passed_input = m_service_cls.return_value.find_existing.call_args.args[0]
 
     assert passed_input.weeks_back == 2
 
