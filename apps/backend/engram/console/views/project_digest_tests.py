@@ -187,7 +187,7 @@ def test_post_digest_run_returns_workflow_visibility_hint(
 
     assert workflow['project_id'] == str(f_project.id)
 
-    assert workflow['request_id'] == f'daily-digest:{f_project.id}'
+    assert workflow['request_id'].startswith(f'daily-digest:{f_project.id}:')
 
 
 @pytest.mark.django_db
@@ -245,6 +245,70 @@ def test_post_digest_run_empty_window_writes_no_audit_event(
         organization=f_org,
         event_type='DailyDigestRunRequested',
     ).exists()
+
+
+@pytest.mark.django_db
+def test_post_digest_run_creates_queued_workflow_run(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_approved_memory(f_org, f_project)
+
+    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
+        response = f_admin_client.post(_endpoint(f_project.id))
+
+    assert response.status_code == 202
+
+    run = WorkflowRun.objects.get(
+        organization=f_org,
+        project=f_project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+    )
+
+    assert run.status == WorkflowRunStatus.QUEUED
+
+    assert run.input_snapshot['memory_ids'] == [str(memory.id)]
+
+    assert response.data['workflow']['request_id'] == run.request_id
+
+    assert m_task.delay.call_args[1]['workflow_run_id'] == str(run.id)
+
+
+@pytest.mark.django_db
+def test_post_digest_run_concurrent_second_request_conflicts(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    _make_approved_memory(f_org, f_project)
+
+    with (
+        patch('engram.console.views.project_digest.generate_daily_digest') as m_task,
+        patch(
+            'engram.console.views.project_digest._has_active_daily_digest_run',
+            return_value=False,
+        ),
+    ):
+        first = f_admin_client.post(_endpoint(f_project.id))
+        second = f_admin_client.post(_endpoint(f_project.id))
+
+    assert first.status_code == 202
+
+    assert second.status_code == 409
+
+    assert second.data['code'] == 'daily_digest_already_running'
+
+    assert m_task.delay.call_count == 1
+
+    assert (
+        WorkflowRun.objects.filter(
+            organization=f_org,
+            project=f_project,
+            run_type=WorkflowRunType.DAILY_DIGEST,
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db

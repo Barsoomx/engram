@@ -131,11 +131,13 @@ def generate_daily_digest(
     organization_id: object,
     project_id: object,
     memory_ids: list[str],
+    workflow_run_id: object = None,
 ) -> str:
     try:
         parsed_organization_id = uuid.UUID(str(organization_id))
         parsed_project_id = uuid.UUID(project_id)
         parsed_memory_ids = tuple(uuid.UUID(value) for value in memory_ids)
+        parsed_workflow_run_id = uuid.UUID(str(workflow_run_id)) if workflow_run_id is not None else None
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed daily digest input') from error
 
@@ -152,6 +154,7 @@ def generate_daily_digest(
             memory_ids=parsed_memory_ids,
             request_id=request_id,
             correlation_id=request_id,
+            existing_run_id=parsed_workflow_run_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:

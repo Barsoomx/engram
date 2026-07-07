@@ -130,7 +130,7 @@ def f_admin_client(f_org: Organization) -> APIClient:
     return _client_for_org('validate-admin', f_org, ('model_policy:*', 'secrets:*'))
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_all_active_policies_returns_results(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -153,7 +153,7 @@ def test_validate_all_active_policies_returns_results(
         assert item.get('error_code') is None
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_single_policy_by_id(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -172,7 +172,7 @@ def test_validate_single_policy_by_id(
     assert results[0]['ok'] is True
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_sanitizes_provider_error(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -204,7 +204,7 @@ def test_validate_sanitizes_provider_error(
     assert results[0]['public_error']
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_records_audit_event(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -225,6 +225,85 @@ def test_validate_records_audit_event(
 
 
 @pytest.mark.django_db
+def test_validate_all_respects_global_deadline(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time
+
+    from engram.console.views import model_policy_validation as views_module
+    from engram.model_policy.validation import PolicyValidationResult
+
+    secret = _make_secret(f_org)
+    fast = _make_policy(f_org, f_project, secret, task_type='generation', name='fast')
+    slow = _make_policy(f_org, f_project, secret, task_type='curation', name='slow')
+
+    def m_validate(policy: ModelPolicy, *, timeout: int = 0) -> PolicyValidationResult:
+        if policy.id == slow.id:
+            time.sleep(3)
+
+        return PolicyValidationResult(
+            policy_id=str(policy.id),
+            task_type=policy.task_type,
+            provider=policy.provider,
+            model=policy.model,
+            ok=True,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(views_module, 'validate_policy', m_validate)
+    monkeypatch.setattr(views_module, 'VALIDATION_DEADLINE_SECONDS', 0.5)
+
+    response = f_admin_client.post(VALIDATE_URL, {}, format='json')
+
+    assert response.status_code == 200
+    results = {item['policy_id']: item for item in response.json()['results']}
+    assert len(results) == 2
+    slow_result = results[str(slow.id)]
+    assert slow_result['ok'] is False
+    assert slow_result['error_code'] == 'validation_timeout'
+    assert slow_result['public_error']
+    assert results[str(fast.id)]['ok'] is True
+
+
+@pytest.mark.django_db
+def test_validate_all_lowers_per_call_timeout(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.console.views import model_policy_validation as views_module
+    from engram.model_policy.validation import PolicyValidationResult
+
+    secret = _make_secret(f_org)
+    policy = _make_policy(f_org, f_project, secret, task_type='generation', name='gen')
+    seen_timeouts: list[int] = []
+
+    def m_validate(target: ModelPolicy, *, timeout: int = 0) -> PolicyValidationResult:
+        seen_timeouts.append(timeout)
+
+        return PolicyValidationResult(
+            policy_id=str(target.id),
+            task_type=target.task_type,
+            provider=target.provider,
+            model=target.model,
+            ok=True,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(views_module, 'validate_policy', m_validate)
+
+    response = f_admin_client.post(VALIDATE_URL, {'policy_id': str(policy.id)}, format='json')
+
+    assert response.status_code == 200
+    assert seen_timeouts == [views_module.VALIDATION_CALL_TIMEOUT_SECONDS]
+    assert views_module.VALIDATION_CALL_TIMEOUT_SECONDS == 10
+
+
+@pytest.mark.django_db
 def test_validate_unknown_policy_id_returns_404(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -235,7 +314,7 @@ def test_validate_unknown_policy_id_returns_404(
     assert response.status_code == 404
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_ignores_inactive_policies(
     f_admin_client: APIClient,
     f_org: Organization,
@@ -252,7 +331,7 @@ def test_validate_ignores_inactive_policies(
     assert results[0]['task_type'] == 'generation'
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_validate_scopes_to_active_organization(
     f_admin_client: APIClient,
     f_org: Organization,

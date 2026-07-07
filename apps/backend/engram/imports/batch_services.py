@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 
+import structlog
+from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.utils import timezone
 
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import AuditEvent, AuditResult, Organization, Project, Team
@@ -17,6 +22,10 @@ from engram.imports.services import (
     ImportReport,
     empty_batch_report,
 )
+
+logger = structlog.get_logger(__name__)
+
+_BATCH_APPLY_ERRORS = (ClaudeMemImportError, ValidationError, LookupError, TypeError, ValueError)
 
 _REJECTION_MESSAGES = {
     'import_job_terminal': 'import job is already finalized',
@@ -172,7 +181,13 @@ class ApplyImportBatch:
                 try:
                     with transaction.atomic():
                         self._apply(job, data)
-                except ClaudeMemImportError:
+                except _BATCH_APPLY_ERRORS:
+                    logger.exception(
+                        'import_batch_apply_failed',
+                        import_id=str(data.import_id),
+                        seq=data.seq,
+                        table=data.table,
+                    )
                     failed = True
                 else:
                     return ApplyImportBatchResult(
@@ -294,8 +309,27 @@ class FinalizeImportJob:
                 raise ImportJobStateError('import job is already finalized')
 
             job.report = self._build_report(job, data.client_row_counts)
-            job.status = ImportJobStatus.SUCCEEDED
-            job.save(update_fields=['report', 'status', 'updated_at'])
+            discrepancies = self._stream_discrepancies(job)
+            if discrepancies:
+                job.report['discrepancies'] = discrepancies
+                job.status = ImportJobStatus.FAILED
+                job.failure_reason = 'incomplete_stream'
+                job.save(update_fields=['report', 'status', 'failure_reason', 'updated_at'])
+            else:
+                job.status = ImportJobStatus.SUCCEEDED
+                job.save(update_fields=['report', 'status', 'updated_at'])
+
+        if discrepancies:
+            _emit_job_audit(
+                job,
+                event_type='ImportFailed',
+                result=AuditResult.ERROR,
+                actor_id=data.api_key_id,
+                metadata={'reason': 'incomplete_stream', 'discrepancies': discrepancies},
+                request_id=data.request_id,
+            )
+
+            return job
 
         _emit_job_audit(
             job,
@@ -320,11 +354,92 @@ class FinalizeImportJob:
 
         return report
 
+    def _stream_discrepancies(self, job: ImportJob) -> dict[str, dict[str, int]]:
+        manifest_tables = job.manifest.get('tables') if isinstance(job.manifest, dict) else None
+        if not isinstance(manifest_tables, dict):
+            return {}
+
+        received: dict[str, int] = {}
+        applied = job.applied_batches if isinstance(job.applied_batches, dict) else {}
+        for batch in applied.values():
+            if not isinstance(batch, dict):
+                continue
+
+            table = str(batch.get('table') or '')
+            rows = int(batch.get('created') or 0) + int(batch.get('duplicates') or 0) + int(batch.get('skipped') or 0)
+            received[table] = received.get(table, 0) + rows
+
+        discrepancies: dict[str, dict[str, int]] = {}
+        for table, declared in manifest_tables.items():
+            if table not in TABLE_PHASE:
+                continue
+
+            expected = int(declared or 0)
+            actual = received.get(table, 0)
+            if expected != actual:
+                discrepancies[table] = {'expected': expected, 'received': actual}
+
+        return discrepancies
+
     def _lock_job(self, organization: Organization, import_id: uuid.UUID) -> ImportJob:
         try:
             return ImportJob.objects.select_for_update().get(organization=organization, id=import_id)
         except ImportJob.DoesNotExist:
             raise ImportJobNotFoundError('import job was not found') from None
+
+
+class ExpireStaleImportJobs:
+    def execute(self) -> dict[str, int]:
+        ttl_hours = int(getattr(settings, 'ENGRAM_IMPORT_JOB_TTL_HOURS', 24))
+        cutoff = timezone.now() - timedelta(hours=ttl_hours)
+        stale_ids = list(
+            ImportJob.objects.filter(
+                status__in=NON_TERMINAL_IMPORT_STATUSES,
+                updated_at__lt=cutoff,
+            ).values_list('id', flat=True),
+        )
+        expired = 0
+        for job_id in stale_ids:
+            job = self._expire(job_id, cutoff)
+            if job is None:
+                continue
+
+            _emit_job_audit(
+                job,
+                event_type='ImportFailed',
+                result=AuditResult.ERROR,
+                actor_id=None,
+                metadata={'reason': 'expired', 'source_store_id': job.source_store_id},
+                request_id='',
+            )
+            logger.info(
+                'import_job_expired',
+                import_id=str(job.id),
+                source_store_id=job.source_store_id,
+            )
+            expired += 1
+
+        return {'expired': expired}
+
+    def _expire(self, job_id: uuid.UUID, cutoff: object) -> ImportJob | None:
+        with transaction.atomic():
+            job = (
+                ImportJob.objects.select_for_update()
+                .filter(
+                    id=job_id,
+                    status__in=NON_TERMINAL_IMPORT_STATUSES,
+                    updated_at__lt=cutoff,
+                )
+                .first()
+            )
+            if job is None:
+                return None
+
+            job.status = ImportJobStatus.EXPIRED
+            job.failure_reason = 'expired'
+            job.save(update_fields=['status', 'failure_reason', 'updated_at'])
+
+        return job
 
 
 def get_import_job(organization: Organization, import_id: uuid.UUID) -> ImportJob:

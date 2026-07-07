@@ -26,5 +26,7 @@ def authorize_job_project(scope: EffectiveScope, job: ImportJob, request_id: str
 
 def request_too_large(request: Request) -> bool:
     declared = int(request.META.get('CONTENT_LENGTH') or 0)
+    if declared > MAX_REQUEST_BYTES:
+        return True
 
-    return declared > MAX_REQUEST_BYTES
+    return len(request.body) > MAX_REQUEST_BYTES

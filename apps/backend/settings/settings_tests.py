@@ -54,3 +54,11 @@ def test_resolve_allowed_hosts_keeps_local_defaults_in_dev() -> None:
     hosts = resolve_allowed_hosts(raw_allowed_hosts='', environment='dev')
 
     assert '127.0.0.1' in hosts
+
+
+def test_data_upload_cap_matches_import_request_cap() -> None:
+    from django.conf import settings
+
+    from engram.imports.serializers import MAX_REQUEST_BYTES
+
+    assert settings.DATA_UPLOAD_MAX_MEMORY_SIZE == MAX_REQUEST_BYTES

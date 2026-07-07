@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait
 from typing import Any
 
 import structlog
+from django.db import connections
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -15,9 +17,17 @@ from engram.console.permissions import RequireCapability
 from engram.console.serializers.model_policy_validation import ValidateModelPoliciesSerializer
 from engram.console.services import audit_admin_action
 from engram.model_policy.models import ModelPolicy
-from engram.model_policy.validation import PolicyValidationResult, validate_policy
+from engram.model_policy.validation import (
+    PolicyValidationResult,
+    validate_policy,
+    validation_timeout_failure,
+)
 
 logger = structlog.get_logger(__name__)
+
+VALIDATION_CALL_TIMEOUT_SECONDS = 10
+VALIDATION_DEADLINE_SECONDS = 25
+_VALIDATION_MAX_WORKERS = 4
 
 
 class ValidateModelPoliciesView(APIView):
@@ -49,7 +59,7 @@ class ValidateModelPoliciesView(APIView):
                 status=HTTP_404_NOT_FOUND,
             )
 
-        results = [validate_policy(policy) for policy in policies]
+        results = _run_validations(policies)
 
         passed = sum(1 for result in results if result.ok)
         audit_admin_action(
@@ -74,6 +84,38 @@ class ValidateModelPoliciesView(APIView):
         )
 
         return Response({'results': [_result_response(result) for result in results]})
+
+
+def _run_validations(policies: list[ModelPolicy]) -> list[PolicyValidationResult]:
+    if not policies:
+        return []
+
+    executor = ThreadPoolExecutor(max_workers=min(_VALIDATION_MAX_WORKERS, len(policies)))
+    try:
+        futures = [executor.submit(_validate_closing_connections, policy) for policy in policies]
+        done, _pending = wait(futures, timeout=VALIDATION_DEADLINE_SECONDS)
+        results = []
+        for policy, future in zip(policies, futures, strict=True):
+            if future in done:
+                results.append(future.result())
+            else:
+                results.append(
+                    validation_timeout_failure(
+                        policy,
+                        latency_ms=int(VALIDATION_DEADLINE_SECONDS * 1000),
+                    ),
+                )
+
+        return results
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _validate_closing_connections(policy: ModelPolicy) -> PolicyValidationResult:
+    try:
+        return validate_policy(policy, timeout=VALIDATION_CALL_TIMEOUT_SECONDS)
+    finally:
+        connections.close_all()
 
 
 def _result_response(result: PolicyValidationResult) -> dict[str, Any]:

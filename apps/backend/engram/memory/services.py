@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import structlog
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
 from rest_framework import status as drf_status
@@ -1547,21 +1547,37 @@ def run_daily_digest_with_tracking(
     window_days: int = DAILY_DIGEST_WINDOW_DAYS,
     request_id: str = '',
     correlation_id: str = '',
+    existing_run_id: uuid.UUID | None = None,
 ) -> DigestResult:
     project = Project.objects.get(id=project_id, organization_id=organization_id)
 
-    run = WorkflowRun.objects.create(
-        organization=project.organization,
-        project=project,
-        run_type=WorkflowRunType.DAILY_DIGEST,
-        status=WorkflowRunStatus.QUEUED,
-        input_snapshot={
-            'memory_ids': [str(value) for value in memory_ids],
-            'window_days': window_days,
-        },
-        request_id=request_id,
-        correlation_id=correlation_id,
-    )
+    run = None
+    if existing_run_id is not None:
+        run = WorkflowRun.objects.filter(
+            id=existing_run_id,
+            organization=project.organization,
+            project=project,
+            run_type=WorkflowRunType.DAILY_DIGEST,
+            status=WorkflowRunStatus.QUEUED,
+        ).first()
+
+    if run is None:
+        try:
+            with transaction.atomic():
+                run = WorkflowRun.objects.create(
+                    organization=project.organization,
+                    project=project,
+                    run_type=WorkflowRunType.DAILY_DIGEST,
+                    status=WorkflowRunStatus.QUEUED,
+                    input_snapshot={
+                        'memory_ids': [str(value) for value in memory_ids],
+                        'window_days': window_days,
+                    },
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                )
+        except IntegrityError as error:
+            raise MemoryWorkerError('daily digest run is already active for this project') from error
 
     run.status = WorkflowRunStatus.RUNNING
 

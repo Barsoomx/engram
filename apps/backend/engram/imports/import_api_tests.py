@@ -424,6 +424,34 @@ def test_detail_reports_progress(f_scope: ImportScope) -> None:
 
 
 @pytest.mark.django_db
+def test_batch_row_type_error_fails_job_and_frees_store_for_replacement(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='wedge-store')
+    row = session_row()
+    row['prompt_counter'] = 'not-a-number'
+
+    response = _apply_batch(f_scope, import_id, 0, 'sdk_sessions', [row])
+
+    assert response.status_code == 409
+    job = ImportJob.objects.get(id=import_id)
+    assert job.status == ImportJobStatus.FAILED
+    assert job.failure_reason == 'batch_apply_error'
+    assert 'not-a-number' not in str(response.data)
+    assert AuditEvent.objects.filter(
+        organization=f_scope.organization,
+        event_type='ImportFailed',
+        target_id=str(job.id),
+    ).exists()
+
+    replacement = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(f_scope.project.id), 'source_store_id': 'wedge-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(f_scope.raw_key),
+    )
+    assert replacement.status_code == 201
+
+
+@pytest.mark.django_db
 def test_batch_apply_error_marks_job_failed_and_rolls_back(
     f_scope: ImportScope,
     m_monkeypatch: pytest.MonkeyPatch,

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from engram.core.models import Memory, Observation, Organization, Project
+from engram.core.models import AgentSession, Memory, Observation, Organization, Project
 from engram.imports.services import ClaudeMemImporter, ImportContext
 
 
@@ -121,6 +121,71 @@ def test_import_batch_skips_observation_without_source_session(f_core_scope: Cor
     assert result.created == 0
     assert result.skipped == 1
     assert not Memory.objects.filter(organization=f_core_scope.organization).exists()
+
+
+@pytest.mark.django_db
+def test_import_batch_caps_oversized_session_char_fields(f_core_scope: CoreScope) -> None:
+    importer = ClaudeMemImporter()
+    row = _session_row()
+    row['platform_source'] = 'p' * 200
+    row['content_session_id'] = 'c' * 300
+    row['memory_session_id'] = 'm' * 300
+
+    result = importer.import_batch(f_core_scope.context, 'sdk_sessions', [row])
+
+    assert result.created == 1
+    session = AgentSession.objects.get(organization=f_core_scope.organization)
+    assert session.platform_source == 'p' * 80
+    assert session.content_session_id == 'c' * 255
+    assert session.memory_session_id == 'm' * 255
+    assert len(session.external_session_id) <= 255
+
+
+@pytest.mark.django_db
+def test_import_batch_resolves_memories_for_capped_session_ids(f_core_scope: CoreScope) -> None:
+    importer = ClaudeMemImporter()
+    session = _session_row()
+    session['memory_session_id'] = 'm' * 300
+    observation = _observation_row(memory_session_id='m' * 300)
+
+    importer.import_batch(f_core_scope.context, 'sdk_sessions', [session])
+    result = importer.import_batch(f_core_scope.context, 'observations', [observation], defer_embedding=True)
+
+    assert result.created == 1
+    assert result.skipped == 0
+
+
+@pytest.mark.django_db
+def test_import_batch_skips_session_row_missing_content_session_id(f_core_scope: CoreScope) -> None:
+    importer = ClaudeMemImporter()
+    row = _session_row()
+    del row['content_session_id']
+
+    result = importer.import_batch(f_core_scope.context, 'sdk_sessions', [row, _session_row()])
+
+    assert result.created == 1
+    assert result.skipped == 1
+    unsupported = result.report['unsupported']
+    assert len(unsupported) == 1
+    assert unsupported[0]['source_type'] == 'sdk_sessions'
+    assert unsupported[0]['reason'] == 'missing_content_session_id'
+    assert AgentSession.objects.filter(organization=f_core_scope.organization).count() == 1
+
+
+@pytest.mark.django_db
+def test_import_batch_caps_observation_type_and_generated_model(f_core_scope: CoreScope) -> None:
+    importer = ClaudeMemImporter()
+    importer.import_batch(f_core_scope.context, 'sdk_sessions', [_session_row()])
+    row = _observation_row()
+    row['type'] = 't' * 200
+    row['generated_by_model'] = 'g' * 300
+
+    result = importer.import_batch(f_core_scope.context, 'observations', [row], defer_embedding=True)
+
+    assert result.created == 1
+    observation = Observation.objects.get(organization=f_core_scope.organization)
+    assert observation.observation_type == 't' * 80
+    assert observation.generated_model == 'g' * 120
 
 
 @pytest.mark.django_db

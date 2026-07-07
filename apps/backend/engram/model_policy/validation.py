@@ -13,11 +13,14 @@ from engram.model_policy.services import ProviderCallInput, get_provider_gateway
 
 VALIDATION_PROMPT = 'engram_validate_policies health check: respond with a minimal completion.'
 NO_PROJECT_AVAILABLE_ERROR_CODE = 'no_project_available'
+VALIDATION_REQUEST_ID_PREFIX = 'engram_validate_policies:'
 
 VALIDATION_HTTP_TIMEOUT_SECONDS = 15
 
 _PROVIDER_SECRET_ERROR_CODE = 'provider_secret_unavailable'
 _FALLBACK_ERROR_CODE = 'provider_error'
+_RESPONSE_INVALID_ERROR_CODE = 'provider_response_invalid'
+_VALIDATION_TIMEOUT_ERROR_CODE = 'validation_timeout'
 
 _SANITIZED_ERROR_CODES = {
     'provider_http_error': 'provider_http_error',
@@ -43,6 +46,8 @@ _PUBLIC_ERROR_MESSAGES = {
     NO_PROJECT_AVAILABLE_ERROR_CODE: 'No project is available to route this validation.',
     _PROVIDER_SECRET_ERROR_CODE: 'The provider secret is missing or disabled.',
     _FALLBACK_ERROR_CODE: 'The validation call failed.',
+    _RESPONSE_INVALID_ERROR_CODE: 'The provider returned an unexpected response.',
+    _VALIDATION_TIMEOUT_ERROR_CODE: 'The validation did not finish before the deadline.',
 }
 
 
@@ -71,7 +76,7 @@ def validate_policy(
         return _failure(policy, NO_PROJECT_AVAILABLE_ERROR_CODE, latency_ms=0)
 
     response_kind = 'candidates' if policy.task_type == TaskType.CURATION else 'single'
-    request_id = f'engram_validate_policies:{policy.id}:{uuid.uuid4()}'
+    request_id = f'{VALIDATION_REQUEST_ID_PREFIX}{policy.id}:{uuid.uuid4()}'
     started_at = time.monotonic()
     try:
         factory(policy, timeout=timeout).call(
@@ -92,6 +97,8 @@ def validate_policy(
         return _failure(policy, _sanitize_error_code(raw_code), latency_ms=_elapsed_ms(started_at))
     except ProviderSecretError:
         return _failure(policy, _PROVIDER_SECRET_ERROR_CODE, latency_ms=_elapsed_ms(started_at))
+    except (KeyError, IndexError, TypeError, ValueError):
+        return _failure(policy, _RESPONSE_INVALID_ERROR_CODE, latency_ms=_elapsed_ms(started_at))
 
     return PolicyValidationResult(
         policy_id=str(policy.id),
@@ -101,6 +108,10 @@ def validate_policy(
         ok=True,
         latency_ms=_elapsed_ms(started_at),
     )
+
+
+def validation_timeout_failure(policy: ModelPolicy, *, latency_ms: int) -> PolicyValidationResult:
+    return _failure(policy, _VALIDATION_TIMEOUT_ERROR_CODE, latency_ms=latency_ms)
 
 
 def _sanitize_error_code(raw_code: str) -> str:
