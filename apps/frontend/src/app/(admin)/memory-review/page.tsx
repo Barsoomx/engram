@@ -447,7 +447,7 @@ interface ReviewTableProps {
 }
 
 function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, onRowAction }: ReviewTableProps) {
-  const allIds = items.map((item) => item.id);
+  const allIds = items.filter((item) => item.type === 'memory').map((item) => item.id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selectedIds.has(id));
   const someSelected = allIds.some((id) => selectedIds.has(id));
 
@@ -483,11 +483,13 @@ function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, o
             <tr key={`${item.type}-${item.id}`} className='border-b border-divider/50'>
               {canAdmin && (
                 <td className='px-3 py-2'>
-                  <Checkbox
-                    isSelected={isSelected}
-                    onValueChange={() => onToggleRow(item.id)}
-                    aria-label={`Select ${item.title}`}
-                  />
+                  {item.type === 'memory' ? (
+                    <Checkbox
+                      isSelected={isSelected}
+                      onValueChange={() => onToggleRow(item.id)}
+                      aria-label={`Select ${item.title}`}
+                    />
+                  ) : null}
                 </td>
               )}
               <td className='px-3 py-2'>
