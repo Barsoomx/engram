@@ -12,7 +12,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'generation',
                 'provider': 'anthropic',
-                'model': 'claude-sonnet-5',
+                'model': 'claude-haiku-4-5',
                 'base_url': '',
                 'key_slot': 'anthropic',
             },
@@ -48,7 +48,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'generation',
                 'provider': 'openai',
-                'model': 'gpt-5.4',
+                'model': 'gpt-5.4-mini',
                 'base_url': '',
                 'key_slot': 'openai',
             },
@@ -84,7 +84,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'generation',
                 'provider': 'deepseek',
-                'model': 'deepseek-v4-pro',
+                'model': 'deepseek-v4-flash',
                 'base_url': '',
                 'key_slot': 'deepseek',
             },
@@ -120,7 +120,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'generation',
                 'provider': 'openai',
-                'model': 'glm-4.7',
+                'model': 'glm-4.7-flash',
                 'base_url': 'https://api.z.ai/api/paas/v4',
                 'key_slot': 'glm',
             },
