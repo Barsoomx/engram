@@ -47,7 +47,7 @@ interface SidebarNavGroup {
 
 const NAV_GROUPS: SidebarNavGroup[] = [
   {
-    title: 'Workspace',
+    title: 'Pipeline',
     items: [
       { href: '/', label: 'Dashboard', icon: LayoutDashboard },
       { href: '/memories', label: 'Memories', icon: Database },
@@ -57,24 +57,6 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         label: 'Memory Review',
         icon: ShieldCheck,
         capability: 'memories:review',
-      },
-      {
-        href: '/projects',
-        label: 'Projects',
-        icon: FolderTree,
-        capability: 'projects:read',
-      },
-      {
-        href: '/search-debug',
-        label: 'Search Debugger',
-        icon: SearchCode,
-        capability: 'memories:read',
-      },
-      {
-        href: '/hook-debug',
-        label: 'Hook Debugger',
-        icon: Webhook,
-        capability: 'observations:write',
       },
       {
         href: '/context-bundles',
@@ -97,14 +79,25 @@ const NAV_GROUPS: SidebarNavGroup[] = [
     ],
   },
   {
-    title: 'Administration',
+    title: 'Debug',
     items: [
       {
-        href: '/secrets',
-        label: 'Secrets',
-        icon: KeyRound,
-        capability: 'secrets:read',
+        href: '/search-debug',
+        label: 'Search Debugger',
+        icon: SearchCode,
+        capability: 'memories:read',
       },
+      {
+        href: '/hook-debug',
+        label: 'Hook Debugger',
+        icon: Webhook,
+        capability: 'observations:write',
+      },
+    ],
+  },
+  {
+    title: 'Models',
+    items: [
       {
         href: '/model-policies',
         label: 'Model Policies',
@@ -117,6 +110,11 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         icon: SlidersHorizontal,
         capability: 'model_policy:read',
       },
+    ],
+  },
+  {
+    title: 'Access',
+    items: [
       {
         href: '/organizations',
         label: 'Organizations',
@@ -124,6 +122,12 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         capability: 'organizations:read',
       },
       { href: '/teams', label: 'Teams', icon: Users, capability: 'teams:read' },
+      {
+        href: '/projects',
+        label: 'Projects',
+        icon: FolderTree,
+        capability: 'projects:read',
+      },
       {
         href: '/members',
         label: 'Members',
@@ -142,6 +146,17 @@ const NAV_GROUPS: SidebarNavGroup[] = [
         icon: Key,
         capability: 'api_keys:read',
       },
+      {
+        href: '/secrets',
+        label: 'Secrets',
+        icon: KeyRound,
+        capability: 'secrets:read',
+      },
+    ],
+  },
+  {
+    title: 'System',
+    items: [
       {
         href: '/audit',
         label: 'Audit log',
@@ -242,7 +257,7 @@ export function Sidebar({ isOpen, onClose, onLogout, capabilities }: SidebarProp
         <nav className='flex-1 space-y-5 overflow-y-auto px-4 py-4'>
           {groups.map((group) => (
             <div key={group.title} className='space-y-1'>
-              <p className='px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-default-400'>
+              <p className='truncate whitespace-nowrap px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] text-default-400'>
                 {group.title}
               </p>
               {group.items.map((item) => (

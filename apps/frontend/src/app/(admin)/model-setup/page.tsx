@@ -1,28 +1,39 @@
 'use client';
 
-import { addToast, Button, Input } from '@heroui/react';
+import { addToast, Button, Input, Select, SelectItem } from '@heroui/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, CheckCircle2, Cpu, XCircle } from 'lucide-react';
+import { AlertTriangle, ArrowRight, CheckCircle2, Cpu, XCircle } from 'lucide-react';
+import Link from 'next/link';
 import * as React from 'react';
 
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   applyPreset,
+  existingPoliciesConflict,
   genRequestId,
   getModelPresets,
   getModelSetupStatus,
   POLICY_TASK_TYPES,
+  type ExistingPoliciesConflict,
   type ModelPreset,
   type ModelSetupStatus,
+  type PolicyScope,
   type TaskTypeStatus,
 } from '@/lib/console-api';
 import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import { adminQueryKeys } from '@/lib/query-keys';
 import { useTeamStore } from '@/lib/team-store';
+
+const PRESET_SCOPE_OPTIONS: { key: PolicyScope; label: string }[] = [
+  { key: 'organization', label: 'Organization' },
+  { key: 'project', label: 'Project' },
+  { key: 'team', label: 'Team' },
+];
 
 function humanizeTask(value: string): string {
   return value
@@ -45,6 +56,18 @@ function extractDetail(error: unknown, fallback: string): string {
   }
 
   return fallback;
+}
+
+function ModelPoliciesLink() {
+  return (
+    <Link
+      href='/model-policies'
+      className='inline-flex items-center gap-1.5 rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground'
+    >
+      Model policies
+      <ArrowRight size={14} strokeWidth={1.9} />
+    </Link>
+  );
 }
 
 function ReadinessBanner({ status }: { status: ModelSetupStatus }) {
@@ -133,39 +156,60 @@ function TaskCard({ task }: { task: TaskTypeStatus }) {
 function PresetCard({
   preset,
   projectId,
+  teamId,
   canApply,
   onApplied,
 }: {
   preset: ModelPreset;
   projectId: string;
+  teamId: string | null;
   canApply: boolean;
   onApplied: () => void;
 }) {
   const [expanded, setExpanded] = React.useState(false);
   const [keys, setKeys] = React.useState<Record<string, string>>({});
+  const [scope, setScope] = React.useState<PolicyScope>('organization');
   const [applyError, setApplyError] = React.useState<string | null>(null);
+  const [conflict, setConflict] =
+    React.useState<ExistingPoliciesConflict | null>(null);
 
   const applyMutation = useMutation({
-    mutationFn: () =>
+    mutationFn: (replaceExisting: boolean) =>
       applyPreset({
         project_id: projectId,
-        scope: 'organization',
+        team_id: scope === 'team' ? teamId : null,
+        scope,
         preset_key: preset.key,
         provider_keys: keys,
         request_id: genRequestId(),
+        replace_existing: replaceExisting,
       }),
-    onSuccess: () => {
+    onSuccess: (result) => {
+      const replaced = result.disabled_policy_ids.length;
       addToast({
         title: 'Preset applied',
-        description: `${preset.name} is now active.`,
+        description:
+          replaced > 0
+            ? `${preset.name} is now active; ${replaced} previous ${replaced === 1 ? 'policy' : 'policies'} replaced.`
+            : `${preset.name} is now active.`,
         color: 'success',
       });
       setExpanded(false);
       setKeys({});
       setApplyError(null);
+      setConflict(null);
       onApplied();
     },
     onError: (error) => {
+      const existing = existingPoliciesConflict(error);
+
+      if (existing) {
+        setConflict(existing);
+
+        return;
+      }
+
+      setConflict(null);
       setApplyError(extractDetail(error, 'Failed to apply preset.'));
     },
   });
@@ -177,11 +221,32 @@ function PresetCard({
   const allFilled = preset.providers_needed.every(
     (slot) => (keys[slot] ?? '').trim().length > 0,
   );
+  const teamScopeMissing = scope === 'team' && !teamId;
+  const canSubmit = allFilled && !teamScopeMissing && !applyMutation.isPending;
+
+  const affectedTaskLabels = React.useMemo(() => {
+    const seen = new Set<string>();
+    const labels: string[] = [];
+
+    for (const tm of preset.task_models) {
+      if (!seen.has(tm.task_type)) {
+        seen.add(tm.task_type);
+        labels.push(humanizeTask(tm.task_type));
+      }
+    }
+
+    return labels;
+  }, [preset.task_models]);
+
+  const conflictCount = conflict?.policies_to_replace.length ?? 0;
+  const conflictDescription = conflict
+    ? `${conflictCount} active ${conflictCount === 1 ? 'policy' : 'policies'} in the ${scope} scope will be disabled and replaced for these task types: ${affectedTaskLabels.join(', ')}.`
+    : undefined;
 
   return (
     <div className='surface-card overflow-hidden'>
       <div className='p-5'>
-        <div className='flex items-start justify-between gap-3'>
+        <div className='flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between'>
           <div className='min-w-0 space-y-1'>
             <h3 className='text-[14px] font-semibold text-foreground'>
               {preset.name}
@@ -192,6 +257,7 @@ function PresetCard({
           </div>
           {canApply && (
             <Button
+              className='w-full shrink-0 sm:w-auto'
               size='sm'
               color='primary'
               variant='flat'
@@ -205,15 +271,26 @@ function PresetCard({
           )}
         </div>
 
-        {preset.providers_needed.length > 0 && (
-          <div className='mt-3 flex flex-wrap gap-1.5'>
-            {preset.providers_needed.map((slot) => (
-              <span
-                key={slot}
-                className='rounded-[7px] bg-content3 px-2.5 py-0.5 text-[11.5px] font-medium text-default-500'
+        {preset.task_models.length > 0 && (
+          <div className='mt-3 space-y-1.5 rounded-[12px] border border-divider bg-content2/30 px-3.5 py-3'>
+            <p className='text-[10px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+              Writes these policies
+            </p>
+            {preset.task_models.map((tm) => (
+              <div
+                key={tm.task_type}
+                className='flex items-center justify-between gap-3 text-[12px]'
               >
-                {slot.charAt(0).toUpperCase() + slot.slice(1)}
-              </span>
+                <span className='shrink-0 text-default-600'>
+                  {humanizeTask(tm.task_type)}
+                </span>
+                <span
+                  className='truncate font-mono text-[11.5px] text-default-500'
+                  title={`${tm.provider} · ${tm.model}`}
+                >
+                  {tm.provider} · {tm.model}
+                </span>
+              </div>
             ))}
           </div>
         )}
@@ -221,6 +298,31 @@ function PresetCard({
 
       {expanded && canApply && (
         <div className='border-t border-divider bg-content2/30 px-5 py-4 space-y-4'>
+          <Select
+            label='Apply to scope'
+            labelPlacement='outside'
+            size='sm'
+            variant='bordered'
+            selectedKeys={new Set([scope])}
+            disallowEmptySelection
+            isDisabled={applyMutation.isPending}
+            onSelectionChange={(selection) => {
+              const next = Array.from(selection)[0];
+
+              if (typeof next === 'string') {
+                setScope(next as PolicyScope);
+              }
+            }}
+          >
+            {PRESET_SCOPE_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+          {teamScopeMissing && (
+            <p className='text-[12px] text-warning'>
+              Select a team in the top switcher to apply a team-scoped preset.
+            </p>
+          )}
           {preset.providers_needed.map((slot) => (
             <Input
               key={slot}
@@ -243,9 +345,9 @@ function PresetCard({
           )}
           <Button
             color='primary'
-            isDisabled={!allFilled}
+            isDisabled={!canSubmit}
             isLoading={applyMutation.isPending}
-            onPress={() => applyMutation.mutate()}
+            onPress={() => applyMutation.mutate(false)}
           >
             Apply preset
           </Button>
@@ -261,6 +363,17 @@ function PresetCard({
           </p>
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={conflict !== null}
+        title='Replace existing policies?'
+        description={conflictDescription}
+        confirmLabel='Replace policies'
+        confirmColor='danger'
+        isLoading={applyMutation.isPending}
+        onClose={() => setConflict(null)}
+        onConfirm={() => applyMutation.mutate(true)}
+      />
     </div>
   );
 }
@@ -310,6 +423,7 @@ export default function ModelSetupPage() {
         <PageHeader
           title='Model Setup'
           subtitle='Configure which model serves each task type via presets.'
+          actions={<ModelPoliciesLink />}
         />
         <EmptyState
           title='Select a project'
@@ -337,6 +451,7 @@ export default function ModelSetupPage() {
       <PageHeader
         title='Model Setup'
         subtitle='Configure which model serves each task type via presets.'
+        actions={<ModelPoliciesLink />}
       />
 
       {statusQuery.isError && (
@@ -360,7 +475,7 @@ export default function ModelSetupPage() {
             </h2>
             <div className='grid gap-3 sm:grid-cols-2 lg:grid-cols-3'>
               {statusQuery.isLoading
-                ? Array.from({ length: 6 }).map((_, i) => (
+                ? Array.from({ length: POLICY_TASK_TYPES.length }).map((_, i) => (
                     <div
                       key={i}
                       className='surface-card h-[100px] animate-pulse bg-content2/50'
@@ -396,6 +511,7 @@ export default function ModelSetupPage() {
                     key={preset.key}
                     preset={preset}
                     projectId={activeProjectId}
+                    teamId={activeTeamId}
                     canApply={canManage}
                     onApplied={invalidateStatus}
                   />

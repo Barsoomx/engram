@@ -2,8 +2,8 @@
 
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Menu } from 'lucide-react';
-import { useRouter } from 'next/navigation';
+import { Globe, Menu } from 'lucide-react';
+import { usePathname, useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { BrandMark } from '@/components/brand/brand-logo';
@@ -63,15 +63,50 @@ function Divider() {
   return <span className='text-default-400'>/</span>;
 }
 
+// Routes whose pages do not read the active project (they never call
+// useProjectStore). Keep in sync when a page starts scoping by project.
+const ORG_SCOPED_ROUTES = [
+  '/api-keys',
+  '/audit',
+  '/health',
+  '/members',
+  '/memory-review',
+  '/organizations',
+  '/projects',
+  '/roles',
+  '/teams',
+  '/workflow-runs',
+];
+
+function isOrgScopedRoute(pathname: string): boolean {
+  return ORG_SCOPED_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+}
+
+function OrgWideBadge() {
+  return (
+    <span
+      className='inline-flex items-center gap-1.5 rounded-[7px] bg-content2 px-2 py-0.5 text-[11px] font-medium text-default-500'
+      title='This page is organization-wide; the project selector does not filter it.'
+    >
+      <Globe size={12} strokeWidth={1.9} />
+      Org-wide
+    </span>
+  );
+}
+
 export default function AdminShellLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
   const router = useRouter();
+  const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = React.useState(false);
   const [hasToken, setHasToken] = React.useState<boolean | null>(null);
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
+  const orgScoped = isOrgScopedRoute(pathname);
 
   React.useEffect(() => {
     setHasToken(Boolean(getToken()));
@@ -169,6 +204,7 @@ export default function AdminShellLayout({
                 <>
                   <Divider />
                   <ProjectSwitcher />
+                  {orgScoped && <OrgWideBadge />}
                 </>
               )}
             {profile && hasCapability(profile.capabilities, 'teams:read') && (
