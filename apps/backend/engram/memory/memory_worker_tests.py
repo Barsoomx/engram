@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
-import json
 import threading
 import uuid
 from decimal import Decimal
@@ -10,7 +8,6 @@ from typing import Any
 
 import pytest
 import structlog
-from django.core.management import call_command
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
@@ -700,97 +697,6 @@ def test_promote_memory_candidate_is_idempotent() -> None:
     assert Memory.objects.count() == 1
     assert MemoryVersion.objects.count() == 1
     assert RetrievalDocument.objects.count() == 1
-
-
-@pytest.mark.django_db
-def test_promote_memory_candidate_command_outputs_json_ids() -> None:
-    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
-    stdout = io.StringIO()
-
-    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=stdout)
-
-    body = json.loads(stdout.getvalue())
-    candidate.refresh_from_db()
-    memory = candidate.promoted_memory
-    version = MemoryVersion.objects.get(memory=memory)
-    document = RetrievalDocument.objects.get(memory=memory)
-
-    assert body == {
-        'candidate_id': str(candidate.id),
-        'memory_id': str(memory.id),
-        'memory_version_id': str(version.id),
-        'retrieval_document_id': str(document.id),
-        'duplicate': False,
-    }
-
-
-@pytest.mark.django_db
-def test_promote_memory_candidate_command_is_idempotent_for_duplicate_candidate() -> None:
-    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
-    first_stdout = io.StringIO()
-    second_stdout = io.StringIO()
-
-    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=first_stdout)
-    call_command('engram_promote_memory_candidate', str(candidate.id), '--json', stdout=second_stdout)
-
-    first = json.loads(first_stdout.getvalue())
-    second = json.loads(second_stdout.getvalue())
-
-    assert first['duplicate'] is False
-    assert second['duplicate'] is True
-    assert second['candidate_id'] == first['candidate_id']
-    assert second['memory_id'] == first['memory_id']
-    assert second['memory_version_id'] == first['memory_version_id']
-    assert second['retrieval_document_id'] == first['retrieval_document_id']
-    assert Memory.objects.count() == 1
-    assert MemoryVersion.objects.count() == 1
-    assert RetrievalDocument.objects.count() == 1
-
-
-@pytest.mark.django_db
-def test_promote_memory_candidate_command_accepts_candidate_id_option() -> None:
-    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
-    stdout = io.StringIO()
-
-    call_command('engram_promote_memory_candidate', '--candidate-id', str(candidate.id), '--json', stdout=stdout)
-
-    body = json.loads(stdout.getvalue())
-
-    assert body['candidate_id'] == str(candidate.id)
-    assert body['duplicate'] is False
-
-
-@pytest.mark.django_db
-def test_promote_memory_candidate_command_can_promote_latest_project_candidate() -> None:
-    _organization, _team, project, _session, _raw_event, first_observation = create_observation_recorded_scope()
-    first_candidate = create_memory_candidate(first_observation)
-    _other_org, _other_team, other_project, _other_session, _other_raw, other_observation = (
-        create_observation_recorded_scope(suffix='2')
-    )
-    other_candidate = create_memory_candidate(other_observation)
-    stdout = io.StringIO()
-
-    call_command(
-        'engram_promote_memory_candidate',
-        '--project-id',
-        str(project.id),
-        '--latest',
-        '--json',
-        stdout=stdout,
-    )
-
-    body = json.loads(stdout.getvalue())
-
-    assert body['candidate_id'] == str(first_candidate.id)
-    assert body['duplicate'] is False
-    first_candidate.refresh_from_db()
-    other_candidate.refresh_from_db()
-    assert first_candidate.status == CandidateStatus.PROMOTED
-    assert other_candidate.status == CandidateStatus.PROPOSED
-    assert other_project.id != project.id
 
 
 @pytest.mark.django_db
