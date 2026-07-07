@@ -34,11 +34,14 @@ export type ActivityEvent = {
 };
 
 export type OpsOverview = {
-  outbox_backlog_count: number;
-  outbox_oldest_age_seconds: number | null;
-  dead_letter_count: number;
   failed_workflow_runs: number;
   pending_embedding_count: number;
+  review_backlog_count: number;
+  oldest_proposed_age_seconds: number | null;
+  provider_errors_24h: number;
+  outbox_backlog_count?: number;
+  outbox_oldest_age_seconds?: number | null;
+  dead_letter_count?: number;
 };
 
 export type MetricsScopeParams = {
