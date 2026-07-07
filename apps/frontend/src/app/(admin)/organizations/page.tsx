@@ -18,6 +18,7 @@ import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
 import { StatusPill } from '@/components/ui/status-pill';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { TimeStamp } from '@/components/ui/time-stamp';
@@ -38,67 +39,65 @@ function OrganizationsTable({
   onEdit: (organization: Organization) => void;
 }) {
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Members</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Your role</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
+    <ResponsiveTable minWidth={880}>
+      <thead>
+        <tr className='border-b border-divider'>
+          <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Members</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Your role</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
+          {canAdmin && (
+            <th className='py-2 px-3 text-default-500 font-medium text-right'>
+              Actions
+            </th>
+          )}
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((organization) => (
+          <tr key={organization.id} className='border-b border-divider/50'>
+            <td className='py-2 px-3 text-foreground'>{organization.name}</td>
+            <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              {organization.slug}
+            </td>
+            <td className='py-2 px-3'>
+              {organization.status ? (
+                <StatusPill status={organization.status} />
+              ) : (
+                <span className='text-default-400 text-xs'>—</span>
+              )}
+            </td>
+            <td className='py-2 px-3 tnum text-default-700'>
+              {typeof organization.member_count === 'number'
+                ? organization.member_count
+                : '—'}
+            </td>
+            <td className='py-2 px-3 text-default-700'>
+              {organization.viewer_role ?? '—'}
+            </td>
+            <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+              <TimeStamp value={organization.created_at} />
+            </td>
             {canAdmin && (
-              <th className='py-2 px-3 text-default-500 font-medium text-right'>
-                Actions
-              </th>
+              <td className='py-2 px-3'>
+                <div className='flex items-center justify-end gap-2'>
+                  <Button
+                    size='sm'
+                    variant='flat'
+                    startContent={<Pencil className='w-3.5 h-3.5' />}
+                    onPress={() => onEdit(organization)}
+                  >
+                    Edit
+                  </Button>
+                </div>
+              </td>
             )}
           </tr>
-        </thead>
-        <tbody>
-          {items.map((organization) => (
-            <tr key={organization.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 text-foreground'>{organization.name}</td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {organization.slug}
-              </td>
-              <td className='py-2 px-3'>
-                {organization.status ? (
-                  <StatusPill status={organization.status} />
-                ) : (
-                  <span className='text-default-400 text-xs'>—</span>
-                )}
-              </td>
-              <td className='py-2 px-3 tnum text-default-700'>
-                {typeof organization.member_count === 'number'
-                  ? organization.member_count
-                  : '—'}
-              </td>
-              <td className='py-2 px-3 text-default-700'>
-                {organization.viewer_role ?? '—'}
-              </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                <TimeStamp value={organization.created_at} />
-              </td>
-              {canAdmin && (
-                <td className='py-2 px-3'>
-                  <div className='flex items-center justify-end gap-2'>
-                    <Button
-                      size='sm'
-                      variant='flat'
-                      startContent={<Pencil className='w-3.5 h-3.5' />}
-                      onPress={() => onEdit(organization)}
-                    >
-                      Edit
-                    </Button>
-                  </div>
-                </td>
-              )}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </ResponsiveTable>
   );
 }
 
