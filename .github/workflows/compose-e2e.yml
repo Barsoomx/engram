@@ -24,3 +24,6 @@ jobs:
 
       - name: Run Compose golden path
         run: python3 scripts/e2e_golden_path.py
+
+      - name: Run Compose claude-mem import
+        run: python3 scripts/e2e_claude_mem_import.py
