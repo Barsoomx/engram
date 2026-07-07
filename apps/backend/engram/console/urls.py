@@ -5,6 +5,7 @@ from engram.console.views.api_keys import ApiKeyViewSet
 from engram.console.views.audit_log import AuditEventViewSet
 from engram.console.views.digests import DigestReviewView, WeeklyDigestView
 from engram.console.views.members import MemberViewSet
+from engram.console.views.memory_export import MemoryExportView
 from engram.console.views.memory_review import MemoryReviewViewSet
 from engram.console.views.metrics import (
     MetricsActivityView,
@@ -39,6 +40,7 @@ router.register('memory-review', MemoryReviewViewSet, basename='admin-memory-rev
 router.register('audit-events', AuditEventViewSet, basename='admin-audit-event')
 
 urlpatterns = router.urls + [
+    path('memories/export', MemoryExportView.as_view(), name='admin-memory-export'),
     path('digests/weekly', WeeklyDigestView.as_view(), name='admin-digests-weekly'),
     path('digests/<uuid:memory_id>/review', DigestReviewView.as_view(), name='admin-digests-review'),
     path('search-debug/', SearchDebugView.as_view(), name='admin-search-debug'),
