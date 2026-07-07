@@ -199,20 +199,29 @@ export default function AdminShellLayout({
             {profile && hasCapability(profile.capabilities, 'organizations:read') && (
               <OrgSwitcher orgId={activeOrgId} />
             )}
-            {profile &&
-              hasCapability(profile.capabilities, 'projects:read') && (
-                <>
-                  <Divider />
-                  <ProjectSwitcher />
-                  {orgScoped && <OrgWideBadge />}
-                </>
-              )}
             {profile && hasCapability(profile.capabilities, 'teams:read') && (
               <>
                 <Divider />
                 <TeamSwitcher />
               </>
             )}
+            {profile &&
+              hasCapability(profile.capabilities, 'projects:read') && (
+                <>
+                  <Divider />
+                  <span
+                    className={`inline-flex items-center transition-opacity ${orgScoped ? 'opacity-50' : ''}`}
+                    title={
+                      orgScoped
+                        ? 'This page is organization-wide; the project selector does not filter it.'
+                        : undefined
+                    }
+                  >
+                    <ProjectSwitcher />
+                  </span>
+                  {orgScoped && <OrgWideBadge />}
+                </>
+              )}
           </div>
 
           <div className='flex items-center gap-3'>

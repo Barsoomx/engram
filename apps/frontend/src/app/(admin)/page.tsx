@@ -268,7 +268,7 @@ function MemoryIngest({
           </span>
         }
       />
-      <div className='flex h-[132px] items-end gap-[6px]'>
+      <div className='flex h-[132px] items-stretch gap-[6px]'>
         {series.map((point, index) => {
           const pct = point.count > 0 ? Math.max(6, (point.count / max) * 100) : 0;
 
