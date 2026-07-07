@@ -674,7 +674,7 @@ def run(
 
 
 def assert_context_response(response: dict[str, object], worker_memory: dict[str, object]) -> None:
-    assert_equal(response.get('status'), 'created', 'context status')
+    assert_equal(response.get('status'), 'injected', 'context status')
     assert_equal(response.get('purpose'), 'session_start', 'context purpose')
     items = response.get('items')
     if not isinstance(items, list) or not items:

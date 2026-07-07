@@ -346,6 +346,7 @@ def test_apply_rerun_disables_prior_active_policies(
             'preset_key': 'openai_all',
             'provider_keys': {'openai': 'sk-openai-key-2'},
             'request_id': 'req-apply-second',
+            'replace_existing': True,
         },
         format='json',
     )
@@ -356,6 +357,137 @@ def test_apply_rerun_disables_prior_active_policies(
         active=True,
     ).count()
     assert active_count == 4
+
+
+@pytest.mark.django_db
+def test_apply_existing_policies_without_replace_returns_409_and_no_mutation(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    first = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-conflict-first',
+        },
+        format='json',
+    )
+    prior_policy_ids = set(first.json()['created_policy_ids'])
+
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key-2'},
+            'request_id': 'req-conflict-second',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 409
+    body = response.json()
+    assert body['code'] == 'existing_policies'
+    assert set(body['policies_to_replace']) == prior_policy_ids
+    assert ProviderSecret.objects.filter(organization=f_setup_org).count() == 1
+    active_ids = {
+        str(policy_id)
+        for policy_id in ModelPolicy.objects.filter(
+            organization=f_setup_org,
+            active=True,
+        ).values_list('id', flat=True)
+    }
+    assert active_ids == prior_policy_ids
+
+
+@pytest.mark.django_db
+def test_apply_replace_existing_disables_prior_and_returns_disabled_ids(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    first = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-replace-first',
+        },
+        format='json',
+    )
+    prior_policy_ids = set(first.json()['created_policy_ids'])
+
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key-2'},
+            'request_id': 'req-replace-second',
+            'replace_existing': True,
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body['disabled_policy_ids']) == prior_policy_ids
+    active_count = ModelPolicy.objects.filter(
+        organization=f_setup_org,
+        active=True,
+    ).count()
+    assert active_count == 4
+
+
+@pytest.mark.django_db
+def test_apply_first_time_returns_empty_disabled_ids(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+) -> None:
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-first-empty-disabled',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    assert response.json()['disabled_policy_ids'] == []
+
+
+@pytest.mark.django_db
+def test_apply_team_scope_requires_team_id(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+) -> None:
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'team',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-team-no-team-id',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 400
+    assert ModelPolicy.objects.count() == 0
+    assert ProviderSecret.objects.count() == 0
 
 
 @pytest.mark.django_db

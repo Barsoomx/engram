@@ -216,8 +216,6 @@ def test_hook_dry_run_resolves_scope_without_echoing_raw_key() -> None:
         {
             'project_id': str(project.id),
             'team_id': str(team.id),
-            'agent_runtime': 'codex',
-            'agent_version': '0.1.0',
             'request_id': 'dry-run-1',
         },
         format='json',
@@ -238,6 +236,29 @@ def test_hook_dry_run_resolves_scope_without_echoing_raw_key() -> None:
 
 
 @pytest.mark.django_db
+def test_hook_dry_run_resolves_scope_without_agent_runtime() -> None:
+    _organization, team, project, _owner, api_key = create_project_scope()
+    client = APIClient()
+
+    response = client.post(
+        '/v1/hooks/dry-run',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'request_id': 'dry-run-no-runtime',
+        },
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['status'] == 'ok'
+    assert body['request_id'] == 'dry-run-no-runtime'
+    assert body['resolved_actor'] == {'type': 'api_key', 'id': str(api_key.id)}
+
+
+@pytest.mark.django_db
 def test_hook_dry_run_requires_bearer_api_key() -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
     client = APIClient()
@@ -247,8 +268,6 @@ def test_hook_dry_run_requires_bearer_api_key() -> None:
         {
             'project_id': str(project.id),
             'team_id': str(team.id),
-            'agent_runtime': 'codex',
-            'agent_version': '0.1.0',
             'request_id': 'dry-run-missing-key',
         },
         format='json',
@@ -269,8 +288,6 @@ def test_hook_dry_run_denies_wrong_project() -> None:
         {
             'project_id': str(other_project.id),
             'team_id': str(team.id),
-            'agent_runtime': 'codex',
-            'agent_version': '0.1.0',
             'request_id': 'dry-run-wrong-project',
         },
         format='json',
@@ -292,8 +309,6 @@ def test_hook_dry_run_denied_response_matches_global_domain_error_shape() -> Non
         {
             'project_id': str(other_project.id),
             'team_id': str(team.id),
-            'agent_runtime': 'codex',
-            'agent_version': '0.1.0',
             'request_id': 'dry-run-shape-check',
         },
         format='json',
@@ -1182,8 +1197,6 @@ def test_hook_dry_run_denied_when_organization_suspended() -> None:
         {
             'project_id': str(project.id),
             'team_id': str(team.id),
-            'agent_runtime': 'codex',
-            'agent_version': '0.1.0',
             'request_id': 'dry-run-suspended',
         },
         format='json',

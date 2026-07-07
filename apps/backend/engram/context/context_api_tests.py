@@ -246,7 +246,7 @@ def test_session_start_returns_cited_exact_context_and_persists_bundle() -> None
 
     assert response.status_code == 200
     body = response.json()
-    assert body['status'] == 'created'
+    assert body['status'] == 'injected'
     assert body['request_id'] == 'request-context-1'
     assert body['purpose'] == 'session_start'
     assert body['context_bundle_id']
@@ -1600,7 +1600,7 @@ def test_user_prompt_submit_returns_cited_exact_context_and_persists_bundle() ->
 
     assert response.status_code == 200
     body = response.json()
-    assert body['status'] == 'created'
+    assert body['status'] == 'injected'
     assert body['request_id'] == 'request-ups-1'
     assert body['purpose'] == 'user_prompt_submit'
     assert body['context_bundle_id']
