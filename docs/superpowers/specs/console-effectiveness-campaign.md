@@ -71,9 +71,25 @@ Shared kit; canonical patterns picked from existing best implementations:
 - API client: typed functions/params for every B1 contract line above
   (console-api.ts / admin-api.ts / metrics-api.ts), unused-by-pages until later
   slices wire them.
+- `ResponsiveTable` wrapper (visual audit: ~12 table pages clip columns off
+  the 390px viewport with NO horizontal scroll — memory-review loses every
+  column but Title, audit crushes ACTOR/TARGET to 1-2px slivers): overflow-x
+  auto container + min-width on the table so it scrolls inside its card;
+  members-desktop is the canonical column-layout model. Also fix roles-mobile
+  pathology: the clipped-off capabilities column still sets desktop row
+  heights -> huge dead vertical space; stack chips under the role name on
+  narrow widths.
 - Apply kit to two exemplar pages: roles (add description column, drop dead
-  'Type' column, ErrorState) and organizations (show status/member_count/
-  viewer_role, search box, TimeStamp) as living proof.
+  'Type' column, ErrorState, mobile chip stacking) and organizations (show
+  status/member_count/viewer_role, search box, TimeStamp, ResponsiveTable) as
+  living proof.
+- CONTRACT FOR ALL LATER F-SLICES: every table a slice touches gets wrapped in
+  ResponsiveTable; every raw UUID rendered gets resolved to a name (or linked
+  + truncated with a copy affordance); every timestamp goes through TimeStamp.
+  390px must not clip content unreachably. Long names/titles that get
+  clamped/truncated must expose the full text (title attr or tooltip) —
+  live-data check: 120-char titles are cut mid-word with no way to read the
+  rest.
 
 ### F1 feat/memories-overhaul (frontend; after B1+F0)
 List: server-side kind/status/search/ordering (newest-first default), real
@@ -81,6 +97,8 @@ pagination with URL state, status+stale+refuted badges (archived/refuted must
 be visually distinct), TimeStamp. Detail: link source observation + session,
 show version history, remove dead 'Add to context bundle' button, rebuild
 'Related memories' as labeled links (drop version/doc-hash noise), ErrorState.
+Visual audit: provenance Team renders a raw UUID instead of the team name;
+superseded_by link shows raw UUID beside its title — resolve/clean both.
 
 ### F2 feat/dashboard-cockpit (frontend; after B1+F0)
 Dashboard: ops-health strip via existing useOpsOverview (outbox backlog +
@@ -106,8 +124,14 @@ not the word 'multiple'), owner+expiry columns, expiry input in issue modal iff
 backend accepts it (verify; else drop), status filter + search, ErrorState.
 secrets: fix org-scope mutations blocked when team selected (scope the request
 explicitly, guard modal), provider/scope/active filters, timestamps, error
-state, pager. members: search/role/status filters incl. deactivated view +
-reactivate, remove dead Suspended branches, keepPreviousData, URL state.
+state, pager; visual audit: drop the redundant 'Active / Active' status+
+rotation duplication and stop rendering the 'list may be temporarily
+unavailable' hint under a populated table (error-state only). members:
+search/role/status filters incl. deactivated view + reactivate, remove dead
+Suspended branches, keepPreviousData, URL state. IMPORTANT: restoring a
+deactivated member calls the NEW `reactivate` action (POST
+/members/{id}/reactivate/) — NOT the pre-existing `activate` action, which
+has different semantics (invited→active onboarding).
 teams: search, pagination, archive failure surfaced, drill-in links (members
 filtered by team, projects). projects: search, pagination + total, links to
 memories/observations filtered by project, honest archive copy (or restore if
@@ -115,9 +139,12 @@ trivially exposed). organizations/roles: covered in F0 exemplars; extend if
 gaps remain.
 
 ### F4 feat/pipeline-pages-a (frontend; after B1+F0)
-audit: actor/project/team/target_type filters, result as enum Select,
+audit: actor/project/team/target_type filters, result as enum Select
+(allowed/denied/recorded/error — 'error' IS real, written by failure records),
 until-date inclusive (end-of-day), URL deep-link incl. selected event, actor/
-target entity links, use shared audit color helper, placeholderData.
+target entity links, use shared audit color helper + add error→danger to the
+result color map (today real 'error' rows fall to neutral gray),
+placeholderData.
 workflow-runs: run-type list matches backend enum (add observation_processing,
 drop nonexistent 'session'), project names not UUIDs (names already loaded),
 rerun button only for rerunnable types, request/correlation search, until-date
@@ -128,6 +155,16 @@ raw ISO inputs, observation_type Select, session_id links to filtered
 observations view, TimeStamp, URL state, totals.
 
 ### F5 feat/pipeline-pages-b (frontend; after B1+B2+F0)
+Enum truth (recon-verified 2026-07-07): memory-review STATUS_OPTIONS drops
+'conflict' (MemoryStatus.CONFLICT is never written by any backend path);
+VISIBILITY_SCOPES drops phantom 'global'/'user' (not in the backend enum —
+filters on them always return empty) and hides 'team' until a team-visibility
+writer exists (only PROJECT is ever written today); SOURCE_TYPES replaces
+phantom file/git/web/tool with the real source types (hook_event, claude_mem,
+user_prompts, observations, session_summaries). context-bundles statusTone
+rewritten to the REAL status set: created→neutral, injected→success,
+skipped→muted — delete the ~15 phantom entries (rendered/authorized/building/
+queued/rejected/…) that no bundle ever has.
 memory-review: project filter, restore-refuted action (backend exists),
 bulk-archive-below-threshold UI, team Select instead of raw UUID box, fix
 error+empty simultaneous render, keepPreviousData, confidence sort, version
@@ -136,7 +173,8 @@ state. context-bundles: honest status pill (post-B2) + status/session/date
 filters, bundle items link to memory detail, show retrieval latency + scope
 evidence on detail, ErrorState parity with list. digests: week navigation
 (window params exist server-side), changelog actually newest-first, rows link
-to memories, PrimaryButton, honest 'last completed week' header. search-debug:
+to memories, PrimaryButton, honest 'last completed week' header, fix the
+'Not ready' badge showing on a populated digest (visual audit). search-debug:
 memory links, reset stale results on scope switch, excluded list grouped by
 reason with identifiers, human enum labels, lexical enablement indicator, URL
 state. settings: wire the 3 unreachable retrieval/curation toggles, surface
@@ -160,7 +198,10 @@ through the B3 replace_existing contract: ConfirmDialog lists
 policies_to_replace from the 409 before retrying with replace_existing=true;
 preset cards show the model assignments they will write; drop phantom
 task types rerank/admin_assistant from console-api.ts:377-383,478-485 —
-backend TaskType has 4) / Access (organizations, teams, members, roles,
+backend TaskType has 4; model-policies page also lands here: task_type/
+provider/scope/active filters (backend supports), show base_url (B1 exposes)
+and json_mode, keepPreviousData pager, widen truncating NAME/MODEL columns,
+ResponsiveTable) / Access (organizations, teams, members, roles,
 api keys, secrets) / System (audit, settings, health). Align nav labels, page
 titles, routes. Org-scoped pages that ignore the project switcher get an
 explicit 'Org-wide' badge. Sidebar group headers render broken tracking
