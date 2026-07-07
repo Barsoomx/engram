@@ -77,6 +77,16 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 class CliLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        hook_error_markers = tempfile.TemporaryDirectory()
+        self.addCleanup(hook_error_markers.cleanup)
+        patcher = mock.patch(
+            "engram_cli.commands.tempfile.gettempdir",
+            return_value=hook_error_markers.name,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_cli(
         self,
         argv: list[str],
@@ -889,7 +899,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
-    def test_hook_session_end_non_2xx_response_exits_with_1(self) -> None:
+    def test_hook_session_end_non_2xx_response_fails_open_with_0(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
             self.connect(config_dir)
@@ -923,7 +933,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=stdin,
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertIn("server_error", stderr)
 
     def test_hook_session_start_posts_event_then_requests_context_with_connected_scope(
@@ -1280,7 +1290,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=io.StringIO("{not-json"),
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertEqual("", stdout)
             self.assertIn("invalid_response", stderr)
             self.assertEqual([], transport.calls)
@@ -1293,7 +1303,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=io.StringIO("{}"),
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertEqual("", stdout)
             self.assertIn("missing_config", stderr)
 
@@ -1515,7 +1525,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
-    def test_hook_user_prompt_submit_non_2xx_hook_response_exits_with_1(
+    def test_hook_user_prompt_submit_non_2xx_hook_response_fails_open_with_0(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1551,8 +1561,49 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=stdin,
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertIn("server_error", stderr)
+
+    def test_hook_error_suppresses_repeated_stderr_within_cooldown_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            failing_response = (
+                500,
+                {"code": "server_error", "detail": "Internal Server Error"},
+            )
+            transport = FakeTransport([failing_response, failing_response])
+            stdin_payload = json.dumps(
+                {"session_id": "session-1", "event_id": "session-end-event-1"},
+            )
+
+            first_exit, _first_stdout, first_stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=io.StringIO(stdin_payload),
+            )
+            second_exit, _second_stdout, second_stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=io.StringIO(stdin_payload),
+            )
+
+            self.assertEqual(0, first_exit)
+            self.assertEqual(0, second_exit)
+            self.assertIn("server_error", first_stderr)
+            self.assertEqual("", second_stderr)
 
     def test_hook_user_prompt_submit_skips_context_query_for_short_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -6,6 +6,8 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -63,6 +65,7 @@ PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
 USER_PROMPT_SUBMIT_TOKEN_BUDGET = 1200
 SESSION_START_TOKEN_BUDGET = 2000
 CONTEXT_QUERY_MIN_PROMPT_LENGTH = 20
+HOOK_ERROR_COOLDOWN_SECONDS = 300
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -706,6 +709,28 @@ def run_disconnect(args: Namespace, stdout: TextIO, _stderr: TextIO) -> int:
     return 0
 
 
+def hook_error_marker_path(server_url: str) -> Path:
+    suffix = (
+        hashlib.sha256(server_url.encode()).hexdigest()[:12] if server_url else "default"
+    )
+
+    return Path(tempfile.gettempdir()) / f"engram-hook-error-{suffix}"
+
+
+def should_emit_hook_error(server_url: str) -> bool:
+    marker = hook_error_marker_path(server_url)
+    if not marker.exists():
+        return True
+
+    return time.time() - marker.stat().st_mtime >= HOOK_ERROR_COOLDOWN_SECONDS
+
+
+def touch_hook_error_marker(server_url: str) -> None:
+    marker = hook_error_marker_path(server_url)
+    marker.touch(exist_ok=True)
+    os.utime(marker, None)
+
+
 def should_skip_context_query(prompt: str) -> bool:
     stripped = prompt.strip()
     if len(stripped) < CONTEXT_QUERY_MIN_PROMPT_LENGTH:
@@ -724,6 +749,7 @@ def run_hook(
     transport: Transport | None = None,
 ) -> int:
     api_key = ""
+    server_url = ""
     try:
         paths = local_paths(args.config_dir)
         config = load_required_json(
@@ -852,9 +878,11 @@ def run_hook(
 
         return 0
     except CliError as error:
-        emit_error(stderr, error, api_key)
+        if should_emit_hook_error(server_url):
+            emit_error(stderr, error, api_key)
+        touch_hook_error_marker(server_url)
 
-        return 1
+        return 0
 
 
 def normalize_server_url(value: str | None) -> str:
