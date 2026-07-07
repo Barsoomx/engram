@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from django.core.management import call_command
 
+from engram.core.export import iter_export_memories_json
 from engram.core.models import (
     Memory,
     MemoryStatus,
@@ -188,6 +189,120 @@ def test_export_redacts_token_shaped_values_in_title_body_and_full_text(tmp_path
     assert LEAKED_TOKEN not in exported['title']
     assert LEAKED_TOKEN not in exported['body']
     assert LEAKED_TOKEN not in exported['retrieval_document']['full_text']
+
+
+def stream_export(
+    organization: Organization,
+    project: Project,
+    team_id: uuid.UUID | None = None,
+    all_statuses: bool = False,
+) -> dict[str, Any]:
+    chunks = list(
+        iter_export_memories_json(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team_id,
+            all_statuses=all_statuses,
+        ),
+    )
+
+    return json.loads(''.join(chunks))
+
+
+@pytest.mark.django_db
+def test_stream_export_matches_pure_export_shape() -> None:
+    organization, team, project = create_organization_project_team()
+    memory, version, document = create_approved_memory(organization, project, team)
+
+    payload = stream_export(organization, project)
+
+    assert payload['organization_id'] == str(organization.id)
+    assert payload['project_id'] == str(project.id)
+    assert payload['team_id'] is None
+    assert payload['exported_at']
+    assert payload['memory_count'] == 1
+
+    exported = payload['memories'][0]
+    assert exported['id'] == str(memory.id)
+    assert exported['title'] == memory.title
+    assert exported['body'] == memory.body
+    assert exported['versions'][0]['content_hash'] == version.content_hash
+    assert exported['retrieval_document']['full_text'] == document.full_text
+
+
+@pytest.mark.django_db
+def test_stream_export_empty_project_is_valid_json() -> None:
+    organization, _team, project = create_organization_project_team()
+
+    payload = stream_export(organization, project)
+
+    assert payload['memory_count'] == 0
+    assert payload['memories'] == []
+
+
+@pytest.mark.django_db
+def test_stream_export_multiple_memories_are_comma_separated() -> None:
+    organization, team, project = create_organization_project_team()
+    create_approved_memory(organization, project, team, title='Alpha memory')
+    create_approved_memory(organization, project, team, title='Beta memory')
+    create_approved_memory(organization, project, team, title='Gamma memory')
+
+    payload = stream_export(organization, project)
+
+    assert payload['memory_count'] == 3
+    assert [entry['title'] for entry in payload['memories']] == [
+        'Alpha memory',
+        'Beta memory',
+        'Gamma memory',
+    ]
+
+
+@pytest.mark.django_db
+def test_stream_export_excludes_non_approved_unless_all_statuses() -> None:
+    organization, team, project = create_organization_project_team()
+    create_approved_memory(organization, project, team, title='Approved memory')
+    Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Archived memory',
+        body='Archived body',
+        status=MemoryStatus.ARCHIVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+
+    approved_only = stream_export(organization, project)
+    assert [entry['title'] for entry in approved_only['memories']] == ['Approved memory']
+
+    everything = stream_export(organization, project, all_statuses=True)
+    assert [entry['title'] for entry in everything['memories']] == [
+        'Approved memory',
+        'Archived memory',
+    ]
+
+
+@pytest.mark.django_db
+def test_stream_export_redacts_token_shaped_values() -> None:
+    organization, team, project = create_organization_project_team()
+    create_approved_memory(
+        organization,
+        project,
+        team,
+        title=f'Redact {LEAKED_TOKEN}',
+        body=f'Body leaks {LEAKED_TOKEN}.',
+    )
+
+    chunks = list(
+        iter_export_memories_json(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+        ),
+    )
+    serialized = ''.join(chunks)
+
+    assert LEAKED_TOKEN not in serialized
+    assert '[REDACTED]' in serialized
 
 
 @pytest.mark.django_db
