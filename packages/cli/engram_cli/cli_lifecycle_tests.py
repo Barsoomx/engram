@@ -1115,7 +1115,15 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "session_start",
                             "rendered_context": "Relevant Engram context",
-                            "items": [{"citation": "M1"}],
+                            "items": [
+                                {
+                                    "citation": "M1",
+                                    "title": "Ingest replay handling",
+                                    "body": "Hook events are deduped by idempotency key.",
+                                    "kind": "decision",
+                                    "confidence": "0.9",
+                                },
+                            ],
                         },
                     ),
                 ],
@@ -1147,13 +1155,18 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual("", stderr)
             body = json.loads(stdout)
             self.assertEqual(True, body["continue"])
-            self.assertEqual("Relevant Engram context", body["systemMessage"])
             self.assertEqual(
-                {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": "Relevant Engram context",
-                },
-                body["hookSpecificOutput"],
+                "Engram: 1 memories injected (1 decision) — search deeper: engram_search",
+                body["systemMessage"],
+            )
+            self.assertEqual("SessionStart", body["hookSpecificOutput"]["hookEventName"])
+            self.assertIn(
+                "# Engram context — 1 memories for this project",
+                body["hookSpecificOutput"]["additionalContext"],
+            )
+            self.assertIn(
+                "- [M1] Ingest replay handling (decision, confidence 0.9)",
+                body["hookSpecificOutput"]["additionalContext"],
             )
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
@@ -1180,7 +1193,15 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "session_start",
                             "rendered_context": "Relevant Engram context",
-                            "items": [{"citation": "M1"}],
+                            "items": [
+                                {
+                                    "citation": "M1",
+                                    "title": "Ingest replay handling",
+                                    "body": "Hook events are deduped by idempotency key.",
+                                    "kind": "decision",
+                                    "confidence": "0.9",
+                                },
+                            ],
                         },
                     ),
                 ],
@@ -1212,13 +1233,18 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual("", stderr)
             body = json.loads(stdout)
             self.assertNotIn("continue", body)
-            self.assertEqual("Relevant Engram context", body["systemMessage"])
             self.assertEqual(
-                {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": "Relevant Engram context",
-                },
-                body["hookSpecificOutput"],
+                "Engram: 1 memories injected (1 decision) — search deeper: engram_search",
+                body["systemMessage"],
+            )
+            self.assertEqual("SessionStart", body["hookSpecificOutput"]["hookEventName"])
+            self.assertIn(
+                "# Engram context — 1 memories for this project",
+                body["hookSpecificOutput"]["additionalContext"],
+            )
+            self.assertIn(
+                "- [M1] Ingest replay handling (decision, confidence 0.9)",
+                body["hookSpecificOutput"]["additionalContext"],
             )
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
@@ -1448,7 +1474,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual("", stderr)
             body = json.loads(stdout)
             self.assertEqual(True, body["continue"])
-            self.assertEqual("Relevant Engram context", body["systemMessage"])
+            self.assertNotIn("systemMessage", body)
             self.assertEqual(
                 {
                     "hookEventName": "UserPromptSubmit",
@@ -1514,7 +1540,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual("", stderr)
             body = json.loads(stdout)
             self.assertNotIn("continue", body)
-            self.assertEqual("Relevant Engram context", body["systemMessage"])
+            self.assertNotIn("systemMessage", body)
             self.assertEqual(
                 {
                     "hookEventName": "UserPromptSubmit",

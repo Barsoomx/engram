@@ -402,7 +402,30 @@ class FormatHookResponseEmptyInjectionTests(unittest.TestCase):
             "user-prompt-submit",
         )
 
-        self.assertEqual("Relevant Engram context", result["systemMessage"])
+        self.assertNotIn("systemMessage", result)
+        self.assertEqual(
+            {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "Relevant Engram context",
+            },
+            result["hookSpecificOutput"],
+        )
+
+    def test_user_prompt_submit_default_format_nonempty_items_has_no_system_message(
+        self,
+    ) -> None:
+        result = format_hook_response(
+            {
+                "status": "created",
+                "items": [{"citation": "M1"}],
+                "rendered_context": "Relevant Engram context",
+            },
+            "codex",
+            "user-prompt-submit",
+        )
+
+        self.assertTrue(result["continue"])
+        self.assertNotIn("systemMessage", result)
         self.assertEqual(
             {
                 "hookEventName": "UserPromptSubmit",
@@ -432,24 +455,143 @@ class FormatHookResponseEmptyInjectionTests(unittest.TestCase):
             result,
         )
 
-    def test_session_start_nonempty_items_still_injects_full_render(self) -> None:
+    def test_session_start_nonempty_items_renders_compact_model_index(self) -> None:
         result = format_hook_response(
             {
                 "status": "created",
-                "items": [{"citation": "M1"}],
                 "rendered_context": "Relevant Engram context",
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "Realtime candidate gating",
+                        "body": "Realtime confidence is a metadata heuristic capped at 0.6.",
+                        "kind": "decision",
+                        "confidence": "0.95",
+                    },
+                    {
+                        "citation": "M2",
+                        "title": "Reconciler drops stale sessions",
+                        "body": "Sessions stuck for hours never resolve.",
+                        "kind": "gotcha",
+                        "confidence": None,
+                    },
+                    {
+                        "citation": "M3",
+                        "title": "No kind or confidence recorded",
+                        "body": "Plain memory without annotation.",
+                        "kind": "",
+                        "confidence": None,
+                    },
+                ],
             },
             "claude-code",
             "session-start",
         )
 
-        self.assertEqual("Relevant Engram context", result["systemMessage"])
         self.assertEqual(
+            "\n".join(
+                [
+                    "# Engram context — 3 memories for this project",
+                    "",
+                    "- [M1] Realtime candidate gating (decision, confidence 0.95)",
+                    "  Realtime confidence is a metadata heuristic capped at 0.6.",
+                    "- [M2] Reconciler drops stale sessions (gotcha)",
+                    "  Sessions stuck for hours never resolve.",
+                    "- [M3] No kind or confidence recorded",
+                    "  Plain memory without annotation.",
+                    "",
+                    "Before non-trivial tasks, search deeper with the engram_search "
+                    "MCP tool. If any memory above is wrong or outdated, mark it via "
+                    "engram_memory_feedback.",
+                ]
+            ),
+            result["hookSpecificOutput"]["additionalContext"],
+        )
+        self.assertEqual("SessionStart", result["hookSpecificOutput"]["hookEventName"])
+        self.assertEqual(
+            "Engram: 3 memories injected (1 decision, 1 gotcha, 1 other) "
+            "— search deeper: engram_search",
+            result["systemMessage"],
+        )
+
+    def test_session_start_human_summary_orders_kinds_by_count_then_first_seen(
+        self,
+    ) -> None:
+        result = format_hook_response(
             {
-                "hookEventName": "SessionStart",
-                "additionalContext": "Relevant Engram context",
+                "status": "created",
+                "rendered_context": "Relevant Engram context",
+                "items": [
+                    {"citation": "M1", "title": "A", "body": "a", "kind": "digest"},
+                    {"citation": "M2", "title": "B", "body": "b", "kind": "decision"},
+                    {"citation": "M3", "title": "C", "body": "c", "kind": "digest"},
+                    {"citation": "M4", "title": "D", "body": "d", "kind": "decision"},
+                    {"citation": "M5", "title": "E", "body": "e", "kind": "gotcha"},
+                ],
             },
-            result["hookSpecificOutput"],
+            "claude-code",
+            "session-start",
+        )
+
+        self.assertEqual(
+            "Engram: 5 memories injected (2 digest, 2 decision, 1 gotcha) "
+            "— search deeper: engram_search",
+            result["systemMessage"],
+        )
+
+    def test_session_start_item_body_truncated_to_400_chars(self) -> None:
+        long_body = "a" * 450
+        result = format_hook_response(
+            {
+                "status": "created",
+                "rendered_context": "Relevant Engram context",
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "Long memory",
+                        "body": long_body,
+                        "kind": "note",
+                        "confidence": "0.5",
+                    },
+                ],
+            },
+            "claude-code",
+            "session-start",
+        )
+
+        additional_context = result["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"  {'a' * 400}…", additional_context)
+        self.assertNotIn("a" * 401, additional_context)
+
+    def test_session_start_default_format_nonempty_items_includes_continue(
+        self,
+    ) -> None:
+        result = format_hook_response(
+            {
+                "status": "created",
+                "rendered_context": "Relevant Engram context",
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "kind": "",
+                        "confidence": None,
+                    },
+                ],
+            },
+            "codex",
+            "session-start",
+        )
+
+        self.assertTrue(result["continue"])
+        self.assertEqual(
+            "Engram: 1 memories injected (1 other) — search deeper: engram_search",
+            result["systemMessage"],
+        )
+        self.assertIn(
+            "# Engram context — 1 memories for this project",
+            result["hookSpecificOutput"]["additionalContext"],
         )
 
     def test_server_response_format_passes_body_through_unchanged(self) -> None:

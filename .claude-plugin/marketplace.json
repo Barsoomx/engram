@@ -7,7 +7,7 @@
       "name": "engram",
       "source": "./packages/claude-plugin",
       "description": "Thin Engram hook adapter and MCP bridge for Claude Code.",
-      "version": "0.1.10",
+      "version": "0.1.11",
       "category": "Productivity",
       "metadata": { "author": "Engram", "license": "MIT" }
     }
