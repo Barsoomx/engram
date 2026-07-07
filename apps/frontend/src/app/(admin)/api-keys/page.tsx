@@ -4,20 +4,24 @@ import {
   Button,
   Checkbox,
   CheckboxGroup,
+  Chip,
   Input,
   Modal,
   ModalBody,
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Select,
+  SelectItem,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import {
   Check,
   Copy,
   KeyRound,
   Plus,
+  Search,
   ShieldAlert,
   ShieldCheck,
   Trash2,
@@ -26,15 +30,28 @@ import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
 import { PrimaryButton } from '@/components/ui/primary-button';
-import { PulseDot } from '@/components/ui/pulse-dot';
+import { StatusPill } from '@/components/ui/status-pill';
+import { TimeStamp } from '@/components/ui/time-stamp';
 import { useApiKeys, useIssueApiKey, useRevokeApiKey } from '@/hooks/use-api-keys';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
-import type { ApiKey } from '@/lib/admin-api';
-import { formatRelativeTime } from '@/lib/design';
+import type { ApiKey, ApiKeyStatus } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
+
+const KEY_FILTER_DEFAULTS = { search: '', status: '', page: 1 };
+const KEY_PAGE_SIZE = 20;
+
+const STATUS_OPTIONS: { key: ApiKeyStatus; label: string }[] = [
+  { key: 'active', label: 'Active' },
+  { key: 'expired', label: 'Expired' },
+  { key: 'revoked', label: 'Revoked' },
+];
 
 const KNOWN_CAPABILITY_SUBCODES: Record<string, readonly string[]> = {
   api_keys: ['read', 'issue', 'revoke'],
@@ -75,7 +92,7 @@ function expandGrantableCapabilities(capabilities: string[]): string[] {
   return Array.from(grantable).sort();
 }
 
-type KeyStatus = 'active' | 'revoked' | 'expired';
+type KeyStatus = ApiKeyStatus;
 
 function deriveStatus(key: ApiKey): KeyStatus {
   if (key.revoked_at) {
@@ -95,41 +112,33 @@ function deriveStatus(key: ApiKey): KeyStatus {
   return 'active';
 }
 
-function deriveScope(key: ApiKey): string {
-  if (key.capabilities.length === 0) {
+function CapabilityChips({ capabilities }: { capabilities: string[] }) {
+  if (capabilities.length === 0) {
 
-    return '—';
+    return <span className='text-default-400 text-xs'>—</span>;
   }
-
-  if (key.capabilities.length === 1) {
-
-    return key.capabilities[0];
-  }
-
-  return 'multiple';
-}
-
-const STATUS_META: Record<KeyStatus, { label: string; color: string; text: string }> = {
-  active: { label: 'Active', color: '#3DD9AC', text: 'text-success' },
-  revoked: { label: 'Revoked', color: '#FB6E72', text: 'text-danger' },
-  expired: { label: 'Expired', color: '#F2B765', text: 'text-warning' },
-};
-
-function StatusCell({ status }: { status: KeyStatus }) {
-  const meta = STATUS_META[status];
 
   return (
-    <span className={`inline-flex items-center gap-2 text-[12px] font-medium ${meta.text}`}>
-      <PulseDot color={meta.color} size={7} pulse={status === 'active'} />
-      {meta.label}
-    </span>
+    <div className='flex flex-wrap gap-1.5'>
+      {capabilities.map((capability) => (
+        <Chip
+          key={capability}
+          size='sm'
+          variant='bordered'
+          className='font-mono text-[11px]'
+        >
+          {capability}
+        </Chip>
+      ))}
+    </div>
   );
 }
 
+const GRID_COLUMNS_BASE =
+  'minmax(0,1.1fr) minmax(0,0.9fr) minmax(0,1.6fr) minmax(0,1fr) minmax(0,0.8fr) minmax(0,0.9fr) minmax(0,0.7fr)';
+
 function gridColumns(canRevoke: boolean): string {
-  return canRevoke
-    ? 'minmax(0,1.2fr) minmax(0,1.3fr) minmax(0,1.1fr) minmax(0,0.8fr) minmax(0,0.8fr) auto'
-    : 'minmax(0,1.2fr) minmax(0,1.3fr) minmax(0,1.1fr) minmax(0,0.8fr) minmax(0,0.8fr)';
+  return canRevoke ? `${GRID_COLUMNS_BASE} auto` : GRID_COLUMNS_BASE;
 }
 
 function ColumnHeader({ canRevoke }: { canRevoke: boolean }) {
@@ -140,8 +149,10 @@ function ColumnHeader({ canRevoke }: { canRevoke: boolean }) {
     >
       <span>Name</span>
       <span>Key</span>
-      <span>Scope</span>
+      <span>Capabilities</span>
+      <span>Owner</span>
       <span>Last used</span>
+      <span>Expires</span>
       <span>Status</span>
       {canRevoke && <span className='sr-only'>Actions</span>}
     </div>
@@ -160,7 +171,7 @@ function ApiKeysTable({
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[720px]'>
+        <div className='min-w-[1080px]'>
           <ColumnHeader canRevoke={canRevoke} />
           {items.map((key) => {
             const status = deriveStatus(key);
@@ -168,31 +179,43 @@ function ApiKeysTable({
             return (
               <div
                 key={key.id}
-                className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
+                className='grid items-start gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
                 style={{ gridTemplateColumns: gridColumns(canRevoke) }}
               >
                 <div className='flex min-w-0 items-center gap-3'>
                   <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
                     <KeyRound className='h-[15px] w-[15px]' strokeWidth={1.8} />
                   </span>
-                  <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                  <span
+                    className='truncate text-[13.5px] font-semibold text-foreground'
+                    title={key.name}
+                  >
                     {key.name}
                   </span>
                 </div>
-                <span className='truncate font-mono text-[12px] text-default-500'>
+                <span className='truncate pt-1.5 font-mono text-[12px] text-default-500'>
                   {key.key_prefix}…
                 </span>
-                <div className='min-w-0'>
-                  <span className='inline-block max-w-full truncate rounded-[7px] bg-primary-soft px-2 py-0.5 align-middle font-mono text-[11.5px] leading-5 text-primary-300'>
-                    {deriveScope(key)}
-                  </span>
+                <div className='min-w-0 pt-0.5'>
+                  <CapabilityChips capabilities={key.capabilities} />
                 </div>
-                <span className='whitespace-nowrap text-[12px] text-default-400'>
-                  {formatRelativeTime(key.last_used_at)}
+                <span
+                  className='truncate pt-1.5 text-[12px] text-default-500'
+                  title={key.owner_identity?.display_name ?? undefined}
+                >
+                  {key.owner_identity?.display_name ?? '—'}
                 </span>
-                <StatusCell status={status} />
+                <span className='whitespace-nowrap pt-1.5 text-[12px] text-default-400'>
+                  <TimeStamp value={key.last_used_at} />
+                </span>
+                <span className='whitespace-nowrap pt-1.5 text-[12px] text-default-400'>
+                  <TimeStamp value={key.expires_at} relative={false} />
+                </span>
+                <span className='pt-1'>
+                  <StatusPill status={status} />
+                </span>
                 {canRevoke && (
-                  <div className='flex items-center justify-end'>
+                  <div className='flex items-center justify-end pt-0.5'>
                     <Button
                       size='sm'
                       color='danger'
@@ -218,7 +241,7 @@ function ApiKeysTableSkeleton({ canRevoke }: { canRevoke: boolean }) {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[720px]'>
+        <div className='min-w-[1080px]'>
           <ColumnHeader canRevoke={canRevoke} />
           {Array.from({ length: 6 }).map((_, index) => (
             <div
@@ -231,8 +254,10 @@ function ApiKeysTableSkeleton({ canRevoke }: { canRevoke: boolean }) {
                 <span className='h-3.5 w-28 rounded-medium bg-content2' />
               </div>
               <span className='h-3 w-24 rounded-medium bg-content2' />
-              <span className='h-5 w-20 rounded-[7px] bg-content2' />
+              <span className='h-5 w-32 rounded-[7px] bg-content2' />
+              <span className='h-3 w-20 rounded-medium bg-content2' />
               <span className='h-3 w-12 rounded-medium bg-content2' />
+              <span className='h-3 w-16 rounded-medium bg-content2' />
               <span className='h-3 w-16 rounded-medium bg-content2' />
               {canRevoke && (
                 <div className='flex items-center justify-end'>
@@ -253,7 +278,11 @@ interface IssueModalProps {
   grantableCapabilities: string[];
   isIssuing: boolean;
   issueError: string | null;
-  onIssue: (input: { name: string; capabilities: string[] }) => Promise<
+  onIssue: (input: {
+    name: string;
+    capabilities: string[];
+    expires_at: string | null;
+  }) => Promise<
     { plaintext: string; key_prefix: string; key_fingerprint: string } | null
   >;
 }
@@ -267,7 +296,10 @@ function IssueModal({
   onIssue,
 }: IssueModalProps) {
   const [name, setName] = React.useState('');
-  const [selectedCapabilities, setSelectedCapabilities] = React.useState<string[]>([]);
+  const [selectedCapabilities, setSelectedCapabilities] = React.useState<
+    string[]
+  >([]);
+  const [expiresAt, setExpiresAt] = React.useState('');
   const [issuedSecret, setIssuedSecret] = React.useState<{
     plaintext: string;
     key_prefix: string;
@@ -279,6 +311,7 @@ function IssueModal({
     if (!isOpen) {
       setName('');
       setSelectedCapabilities([]);
+      setExpiresAt('');
       setIssuedSecret(null);
       setCopied(false);
     }
@@ -296,9 +329,12 @@ function IssueModal({
       return;
     }
 
+    const isoExpiry = expiresAt ? new Date(expiresAt).toISOString() : null;
+
     const result = await onIssue({
       name: name.trim(),
       capabilities: selectedCapabilities,
+      expires_at: isoExpiry,
     });
 
     if (result) {
@@ -376,7 +412,11 @@ function IssueModal({
                     color='primary'
                     variant='flat'
                     startContent={
-                      copied ? <Check className='w-4 h-4' /> : <Copy className='w-4 h-4' />
+                      copied ? (
+                        <Check className='w-4 h-4' />
+                      ) : (
+                        <Copy className='w-4 h-4' />
+                      )
                     }
                     onPress={handleCopy}
                   >
@@ -392,6 +432,15 @@ function IssueModal({
                     value={name}
                     onValueChange={setName}
                     maxLength={255}
+                    isDisabled={isIssuing}
+                  />
+                  <Input
+                    label='Expiry (optional)'
+                    labelPlacement='outside'
+                    type='datetime-local'
+                    value={expiresAt}
+                    onValueChange={setExpiresAt}
+                    description='Leave blank for a key that never expires.'
                     isDisabled={isIssuing}
                   />
                   <div>
@@ -411,7 +460,9 @@ function IssueModal({
                         <div className='grid grid-cols-1 sm:grid-cols-2 gap-2'>
                           {grantableCapabilities.map((capability) => (
                             <Checkbox key={capability} value={capability}>
-                              <span className='font-mono text-xs'>{capability}</span>
+                              <span className='font-mono text-xs'>
+                                {capability}
+                              </span>
                             </Checkbox>
                           ))}
                         </div>
@@ -475,8 +526,31 @@ export default function ApiKeysPage() {
     [capabilities],
   );
 
-  const params = React.useMemo(() => ({ page: 1, pageSize: 50 }), []);
-  const keysQuery = useApiKeys(activeOrgId, params);
+  const [filters, setFilters] = useUrlFilters(KEY_FILTER_DEFAULTS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
+
+  React.useEffect(() => {
+    if (debouncedSearch === filters.search) {
+
+      return;
+    }
+
+    setFilters({ search: debouncedSearch, page: 1 });
+  }, [debouncedSearch, filters.search, setFilters]);
+
+  const params = React.useMemo(
+    () => ({
+      page: filters.page,
+      pageSize: KEY_PAGE_SIZE,
+      search: filters.search || undefined,
+      status: (filters.status || undefined) as ApiKeyStatus | undefined,
+    }),
+    [filters.page, filters.search, filters.status],
+  );
+  const keysQuery = useApiKeys(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
 
   const issueMutation = useIssueApiKey(activeOrgId);
   const revokeMutation = useRevokeApiKey(activeOrgId);
@@ -491,13 +565,19 @@ export default function ApiKeysPage() {
   async function handleIssue(input: {
     name: string;
     capabilities: string[];
-  }): Promise<{ plaintext: string; key_prefix: string; key_fingerprint: string } | null> {
+    expires_at: string | null;
+  }): Promise<{
+    plaintext: string;
+    key_prefix: string;
+    key_fingerprint: string;
+  } | null> {
     setIssueError(null);
 
     try {
       const result = await issueMutation.mutateAsync({
         name: input.name,
         capabilities: input.capabilities,
+        expires_at: input.expires_at,
       });
 
       return {
@@ -536,7 +616,9 @@ export default function ApiKeysPage() {
 
   const isLoading = meQuery.isLoading || keysQuery.isLoading;
   const items = keysQuery.data?.results ?? [];
+  const total = keysQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
+  const hasFilters = filters.search.length > 0 || filters.status.length > 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='api_keys:read'>
@@ -557,15 +639,63 @@ export default function ApiKeysPage() {
           }
         />
 
+        <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-end'>
+          <Input
+            aria-label='Search API keys'
+            placeholder='Search by name or prefix…'
+            value={searchInput}
+            onValueChange={setSearchInput}
+            variant='bordered'
+            size='sm'
+            isClearable
+            onClear={() => setSearchInput('')}
+            startContent={<Search className='w-4 h-4 text-default-400' />}
+            className='max-w-xs'
+          />
+          <Select
+            aria-label='Filter by status'
+            placeholder='All statuses'
+            selectedKeys={filters.status ? new Set([filters.status]) : new Set()}
+            variant='bordered'
+            size='sm'
+            className='max-w-[180px]'
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({
+                status: typeof next === 'string' ? next : '',
+                page: 1,
+              });
+            }}
+          >
+            {STATUS_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+        </div>
+
         {isLoading ? (
           <ApiKeysTableSkeleton canRevoke={canRevoke} />
+        ) : keysQuery.isError ? (
+          <ErrorState
+            message={
+              keysQuery.error instanceof Error
+                ? keysQuery.error.message
+                : 'Failed to load API keys.'
+            }
+            onRetry={() => keysQuery.refetch()}
+          />
         ) : items.length === 0 ? (
           <EmptyState
-            title='No API keys yet'
-            description='Issue a key to enable programmatic access for this organization.'
+            title={hasFilters ? 'No matching keys' : 'No API keys yet'}
+            description={
+              hasFilters
+                ? 'No API keys match the current filters.'
+                : 'Issue a key to enable programmatic access for this organization.'
+            }
             icon={<KeyRound className='w-6 h-6' />}
             action={
-              canIssue ? (
+              canIssue && !hasFilters ? (
                 <PrimaryButton
                   startContent={<Plus className='w-4 h-4' />}
                   onPress={() => setIssueOpen(true)}
@@ -583,26 +713,23 @@ export default function ApiKeysPage() {
           />
         )}
 
-        {items.length > 0 && (
-          <div className='flex items-center justify-between text-[12px] text-default-400'>
-            <p>
-              Showing {items.length} key{items.length === 1 ? '' : 's'}.
-            </p>
+        {!keysQuery.isError && total > 0 && (
+          <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+            <PaginationFooter
+              page={filters.page}
+              pageSize={KEY_PAGE_SIZE}
+              total={total}
+              noun='key'
+              onPageChange={(page) => setFilters({ page })}
+              isDisabled={keysQuery.isFetching}
+            />
             {canRevoke && (
-              <p className='flex items-center gap-1.5'>
+              <p className='flex items-center gap-1.5 text-[12px] text-default-400'>
                 <ShieldCheck className='w-3.5 h-3.5' />
                 Revoke is permanent and cannot be undone.
               </p>
             )}
           </div>
-        )}
-
-        {keysQuery.isError && (
-          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
-            {keysQuery.error instanceof Error
-              ? keysQuery.error.message
-              : 'Failed to load API keys.'}
-          </pre>
         )}
 
         <IssueModal
