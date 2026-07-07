@@ -1,11 +1,13 @@
 'use client';
 
+import { addToast, Button } from '@heroui/react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { DatabaseZap, Import } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { CopyButton } from '@/components/ui/copy-button';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorState } from '@/components/ui/error-state';
@@ -15,8 +17,8 @@ import { ResponsiveTable } from '@/components/ui/responsive-table';
 import { StatusPill } from '@/components/ui/status-pill';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { TimeStamp } from '@/components/ui/time-stamp';
-import { useImports } from '@/hooks/use-imports';
-import { fetchMe, type MeResponse } from '@/lib/auth';
+import { useCancelImport, useImports } from '@/hooks/use-imports';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import { useOrgStore } from '@/lib/org-store';
 import { isTerminalImportStatus, type ImportJob } from '@/lib/admin-api';
 
@@ -147,10 +149,20 @@ function importStatusTone(job: ImportJob) {
   return job.status === 'receiving' ? ('info' as const) : undefined;
 }
 
-function ImportsTable({ items }: { items: ImportJob[] }) {
+function ImportsTable({
+  items,
+  canManage,
+  cancellingId,
+  onCancel,
+}: {
+  items: ImportJob[];
+  canManage: boolean;
+  cancellingId: string | null;
+  onCancel: (job: ImportJob) => void;
+}) {
   return (
     <div className='surface-card p-2'>
-      <ResponsiveTable minWidth={820}>
+      <ResponsiveTable minWidth={canManage ? 940 : 820}>
         <thead>
           <tr className='border-b border-divider'>
             <th className='py-2 px-3 font-medium text-default-500'>Source store</th>
@@ -158,6 +170,11 @@ function ImportsTable({ items }: { items: ImportJob[] }) {
             <th className='py-2 px-3 font-medium text-default-500'>Project</th>
             <th className='py-2 px-3 font-medium text-default-500'>Progress</th>
             <th className='py-2 px-3 font-medium text-default-500'>Created</th>
+            {canManage && (
+              <th className='py-2 px-3 text-right font-medium text-default-500'>
+                Actions
+              </th>
+            )}
           </tr>
         </thead>
         <tbody>
@@ -194,6 +211,23 @@ function ImportsTable({ items }: { items: ImportJob[] }) {
               <td className='py-2 px-3 whitespace-nowrap text-default-700'>
                 <TimeStamp value={job.created_at} />
               </td>
+              {canManage && (
+                <td className='py-2 px-3 text-right'>
+                  {isTerminalImportStatus(job.status) ? (
+                    <span className='text-default-400'>—</span>
+                  ) : (
+                    <Button
+                      size='sm'
+                      variant='flat'
+                      color='danger'
+                      isLoading={cancellingId === job.id}
+                      onPress={() => onCancel(job)}
+                    >
+                      Cancel
+                    </Button>
+                  )}
+                </td>
+              )}
             </tr>
           ))}
         </tbody>
@@ -213,6 +247,7 @@ export default function ImportsPage() {
     () => meQuery.data?.capabilities ?? [],
     [meQuery.data?.capabilities],
   );
+  const canManage = hasCapability(capabilities, 'memories:admin');
 
   const [page, setPage] = React.useState(1);
   const params = React.useMemo(
@@ -223,6 +258,33 @@ export default function ImportsPage() {
   const importsQuery = useImports(activeOrgId, params, {
     placeholderData: keepPreviousData,
   });
+
+  const cancelMutation = useCancelImport(activeOrgId);
+  const [cancelTarget, setCancelTarget] = React.useState<ImportJob | null>(null);
+
+  async function handleConfirmCancel() {
+    if (!cancelTarget) {
+      return;
+    }
+
+    const target = cancelTarget;
+    try {
+      await cancelMutation.mutateAsync(target.id);
+      addToast({
+        title: 'Migration canceled',
+        description: `${target.source_store_id || target.id} was canceled.`,
+        color: 'success',
+      });
+    } catch (error) {
+      addToast({
+        title: 'Failed to cancel migration',
+        description: error instanceof Error ? error.message : 'Unexpected error.',
+        color: 'danger',
+      });
+    } finally {
+      setCancelTarget(null);
+    }
+  }
 
   const items = importsQuery.data?.results ?? [];
   const total = importsQuery.data?.count ?? 0;
@@ -288,7 +350,12 @@ export default function ImportsPage() {
             />
           ) : (
             <div className='space-y-3'>
-              <ImportsTable items={items} />
+              <ImportsTable
+                items={items}
+                canManage={canManage}
+                cancellingId={cancelMutation.isPending ? cancelTarget?.id ?? null : null}
+                onCancel={setCancelTarget}
+              />
               <PaginationFooter
                 page={page}
                 pageSize={PAGE_SIZE}
@@ -300,6 +367,22 @@ export default function ImportsPage() {
             </div>
           )}
         </div>
+
+        <ConfirmDialog
+          isOpen={cancelTarget !== null}
+          onClose={() => setCancelTarget(null)}
+          onConfirm={handleConfirmCancel}
+          title='Cancel this migration?'
+          description={
+            cancelTarget
+              ? `This marks "${cancelTarget.source_store_id || cancelTarget.id}" as failed and frees the source store so you can start a fresh import. Rows already imported are kept and deduplicate on re-import.`
+              : undefined
+          }
+          confirmLabel='Cancel migration'
+          cancelLabel='Keep running'
+          confirmColor='danger'
+          isLoading={cancelMutation.isPending}
+        />
       </section>
     </CapabilityGate>
   );
