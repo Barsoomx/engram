@@ -711,6 +711,25 @@ def test_context_bundle_inspection_detail_exposes_warnings_and_item_kind_confide
 
 
 @pytest.mark.django_db
+def test_context_bundle_inspection_detail_exposes_retrieval_latency() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    bundle = create_context_bundle(team, request_id=f'request-latency-context-{RAW_KEY}')
+    ContextBundle.objects.filter(id=bundle.id).update(retrieval_latency_ms=42)
+    client = APIClient()
+
+    detail_response = client.get(
+        f'/v1/inspection/context-bundles/{bundle.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert detail_response.status_code == 200
+    assert detail_response.json()['retrieval_latency_ms'] == 42
+
+
+@pytest.mark.django_db
 def test_audit_inspection_requires_audit_read_and_redacts_metadata() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope

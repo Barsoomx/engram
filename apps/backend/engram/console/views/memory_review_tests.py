@@ -810,6 +810,27 @@ def test_queue_serializer_includes_provenance_and_citations(
 
 
 @pytest.mark.django_db
+def test_queue_serializer_includes_current_version_for_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    Memory.objects.filter(id=memory.id).update(current_version=3)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    memory_item = next(item for item in response.data['results'] if item['id'] == str(memory.id))
+
+    assert memory_item['current_version'] == 3
+
+
+@pytest.mark.django_db
 def test_diff_returns_from_and_to_versions(
     f_admin_token: str,
     f_admin_org: Organization,

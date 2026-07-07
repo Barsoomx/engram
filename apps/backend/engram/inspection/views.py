@@ -337,6 +337,7 @@ def context_bundle_response(bundle: ContextBundle, *, include_detail: bool) -> d
         'query_text': redacted_text(bundle.query_text),
         'rendered_text': redacted_text(bundle.rendered_text),
         'authorization_scope': redacted(bundle.authorization_scope),
+        'retrieval_latency_ms': bundle.retrieval_latency_ms,
         'token_budget': bundle.token_budget,
         'selected_count': bundle.selected_count,
         'status': bundle.status,
