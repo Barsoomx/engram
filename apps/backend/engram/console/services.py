@@ -895,7 +895,11 @@ def restore_memory(
 
     memory.save(update_fields=['status', 'refuted', 'stale', 'updated_at'])
 
-    RetrievalDocument.objects.filter(memory=memory).update(refuted=False, stale=False, updated_at=timezone.now())
+    RetrievalDocument.objects.filter(memory=memory, memory_version=version).update(
+        refuted=False,
+        stale=False,
+        updated_at=timezone.now(),
+    )
 
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 

@@ -1549,3 +1549,54 @@ def test_restore_memory_locks_memory_row_for_update(
     sql = _select_sql(queries, 'core_memory"')
 
     assert 'FOR UPDATE' in sql.upper()
+
+
+@pytest.mark.django_db
+def test_edit_memory_body_stales_previous_version_retrieval_document(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+    first_document = RetrievalDocument.objects.get(memory=memory)
+
+    version = edit_memory_body(f_organization, f_actor_identity, memory, 'corrected body text', 'reason')
+
+    live_documents = RetrievalDocument.objects.filter(memory=memory, stale=False)
+
+    assert live_documents.count() == 1
+
+    live_document = live_documents.get()
+
+    assert live_document.memory_version_id == version.id
+
+    first_document.refresh_from_db()
+
+    assert first_document.stale is True
+
+
+@pytest.mark.django_db
+def test_restore_memory_keeps_only_current_version_document_live(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
+
+    edit_memory_body(f_organization, f_actor_identity, memory, 'second version body', 'edit')
+
+    archive_memory(f_organization, f_actor_identity, memory, 'archive it')
+
+    memory.refresh_from_db()
+
+    restore_memory(f_organization, f_actor_identity, memory, 'undo archive')
+
+    memory.refresh_from_db()
+
+    live_documents = RetrievalDocument.objects.filter(memory=memory, stale=False, refuted=False)
+
+    assert live_documents.count() == 1
+
+    current_version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
+
+    assert live_documents.get().memory_version_id == current_version.id
