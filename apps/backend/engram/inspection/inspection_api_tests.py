@@ -31,6 +31,8 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    ContextBundleStatus,
+    Memory,
     MemoryLink,
     Organization,
     Project,
@@ -974,6 +976,151 @@ def test_memory_list_filter_by_status() -> None:
     body = response.json()
     assert body['count'] == 1
     assert body['items'][0]['id'] == str(approved.id)
+
+
+@pytest.mark.django_db
+def test_memory_list_search_matches_title_or_body() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    match, _mv, _md = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Vector index tuning',
+        body='Ranking notes.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Unrelated memory',
+        body='Nothing relevant.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'search': 'vector index'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item['id'] for item in body['items']] == [str(match.id)]
+
+
+@pytest.mark.django_db
+def test_memory_list_defaults_to_newest_first_and_honors_ordering() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    older, _ov, _od = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Older memory',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    newer, _nv, _nd = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Newer memory',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    Memory.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
+    Memory.objects.filter(id=newer.id).update(created_at=timezone.now())
+    client = APIClient()
+
+    default_response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+    ascending_response = client.get(
+        '/v1/inspection/memories',
+        {'project_id': str(project.id), 'ordering': 'created_at'},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert [item['id'] for item in default_response.json()['items']] == [str(newer.id), str(older.id)]
+    assert [item['id'] for item in ascending_response.json()['items']] == [str(older.id), str(newer.id)]
+
+
+def _bundle_with_session(
+    organization: Organization,
+    team: Team,
+    project: Project,
+    *,
+    request_id: str,
+    session_external_id: str,
+    status: str,
+) -> ContextBundle:
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id=f'agent-{request_id}',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=session_external_id,
+        runtime=Runtime.CODEX,
+    )
+
+    return ContextBundle.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        request_id=request_id,
+        purpose='session_start',
+        status=status,
+    )
+
+
+@pytest.mark.django_db
+def test_context_bundle_list_filters_by_status_and_session() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    injected = _bundle_with_session(
+        organization,
+        team,
+        project,
+        request_id='request-injected-context',
+        session_external_id='session-injected',
+        status=ContextBundleStatus.INJECTED,
+    )
+    _bundle_with_session(
+        organization,
+        team,
+        project,
+        request_id='request-skipped-context',
+        session_external_id='session-skipped',
+        status=ContextBundleStatus.SKIPPED,
+    )
+    client = APIClient()
+
+    status_response = client.get(
+        '/v1/inspection/context-bundles',
+        {'project_id': str(project.id), 'status': ContextBundleStatus.INJECTED},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+    session_response = client.get(
+        '/v1/inspection/context-bundles',
+        {'project_id': str(project.id), 'session_id': str(injected.session_id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert [item['id'] for item in status_response.json()['items']] == [str(injected.id)]
+    assert [item['id'] for item in session_response.json()['items']] == [str(injected.id)]
 
 
 @pytest.mark.django_db

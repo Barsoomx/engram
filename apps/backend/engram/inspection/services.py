@@ -39,6 +39,9 @@ class InspectionScope:
     offset: int = 0
     status: str | None = None
     kind: str | None = None
+    search: str | None = None
+    ordering: str | None = None
+    session_id: str | None = None
     event_type: str | None = None
     correlation_id: str | None = None
     since: datetime | None = None
@@ -49,12 +52,27 @@ class InspectionScope:
         return Q(team__isnull=True) | Q(team_id__in=self.scope.team_ids)
 
 
+MEMORY_ORDERING_FIELDS = ('created_at', '-created_at')
+DEFAULT_MEMORY_ORDERING = '-created_at'
+
+
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
-        qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
-        filter_data = {'status': inspection_scope.status, 'kind': inspection_scope.kind}
+        ordering = self._ordering(inspection_scope.ordering)
+        qs = self._base_queryset(inspection_scope).order_by(ordering, 'id')
+        filter_data = {
+            'status': inspection_scope.status,
+            'kind': inspection_scope.kind,
+            'search': inspection_scope.search,
+        }
 
         return InspectionMemoryFilterSet(data=filter_data, queryset=qs).qs
+
+    def _ordering(self, ordering: str | None) -> str:
+        if ordering in MEMORY_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_MEMORY_ORDERING
 
     def detail(self, inspection_scope: InspectionScope, memory_id: uuid.UUID) -> Memory:
         memory = self._base_queryset(inspection_scope).filter(id=memory_id).first()
@@ -158,7 +176,12 @@ class ListInspectionMemories:
 class ListInspectionContextBundles:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[ContextBundle]:
         qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
-        filter_data = {'since': inspection_scope.since, 'until': inspection_scope.until}
+        filter_data = {
+            'since': inspection_scope.since,
+            'until': inspection_scope.until,
+            'status': inspection_scope.status,
+            'session_id': inspection_scope.session_id,
+        }
 
         return InspectionContextBundleFilterSet(data=filter_data, queryset=qs).qs
 
