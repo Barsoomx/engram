@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from django.db import transaction
@@ -49,6 +50,9 @@ REVIEW_MEMORY_STATUSES = (
 REVIEW_MEMORY_CONFIDENCE_THRESHOLD = '0.300'
 
 PAGE_SIZE = 50
+
+REVIEW_ORDERING_FIELDS = ('confidence', '-confidence', 'created_at', '-created_at')
+DEFAULT_REVIEW_ORDERING = '-created_at'
 
 
 class MemoryReviewViewSet(
@@ -209,13 +213,31 @@ class MemoryReviewViewSet(
 
         memories = list(memories_qs.prefetch_related('links', 'versions__source_observation'))
 
-        combined = sorted(
-            candidates + memories,
-            key=lambda item: item.created_at,
-            reverse=True,
-        )
+        return self._sort_items(candidates + memories, self._ordering(request))
 
-        return combined
+    def _ordering(self, request: Request) -> str:
+        ordering = request.query_params.get('ordering')
+
+        if ordering in REVIEW_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_REVIEW_ORDERING
+
+    def _sort_items(self, items: list, ordering: str) -> list:
+        reverse = ordering.startswith('-')
+
+        field = ordering.lstrip('-')
+
+        if field == 'confidence':
+            return sorted(items, key=self._confidence_key, reverse=reverse)
+
+        return sorted(items, key=lambda item: item.created_at, reverse=reverse)
+
+    def _confidence_key(self, item: Any) -> Decimal:
+        if item.confidence is None:
+            return Decimal(0)
+
+        return item.confidence
 
     def _filtered_candidates(self, request: Request, organization: Any) -> Any:
         queryset = MemoryCandidate.objects.filter(
