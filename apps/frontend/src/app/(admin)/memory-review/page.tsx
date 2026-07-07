@@ -127,6 +127,10 @@ function formatDateTime(value: string | null | undefined): string {
   }
 }
 
+function versionOptions(current: number): number[] {
+  return Array.from({ length: Math.max(0, current) }, (_, index) => index + 1);
+}
+
 function confidenceColor(value: string | null): 'default' | 'success' | 'warning' | 'danger' {
   if (value === null) {
     return 'default';
@@ -922,8 +926,9 @@ export default function MemoryReviewPage() {
 
   function handleRowAction(item: MemoryReviewItem, rowAction: RowAction) {
     if (rowAction.kind === 'view-diff') {
+      const latest = Math.max(1, item.current_version);
       setDiffVersionPrompt(item);
-      setDiffVersionInput({ from: '', to: '' });
+      setDiffVersionInput({ from: String(Math.max(1, latest - 1)), to: String(latest) });
 
       return;
     }
@@ -1138,30 +1143,53 @@ export default function MemoryReviewPage() {
                 <ModalHeader className='flex flex-col gap-1 text-foreground'>Compare versions</ModalHeader>
                 <ModalBody>
                   <div className='space-y-4'>
-                    <p className='text-sm text-default-500'>
-                      Enter two version numbers to compare for{' '}
-                      <span className='font-medium text-foreground'>{diffVersionPrompt?.title ?? ''}</span>.
-                    </p>
-                    <div className='grid grid-cols-2 gap-3'>
-                      <Input
-                        label='From version'
-                        labelPlacement='outside'
-                        placeholder='1'
-                        type='number'
-                        min={1}
-                        value={diffVersionInput.from}
-                        onValueChange={(value) => setDiffVersionInput((prev) => ({ ...prev, from: value }))}
-                      />
-                      <Input
-                        label='To version'
-                        labelPlacement='outside'
-                        placeholder='2'
-                        type='number'
-                        min={1}
-                        value={diffVersionInput.to}
-                        onValueChange={(value) => setDiffVersionInput((prev) => ({ ...prev, to: value }))}
-                      />
-                    </div>
+                    {diffVersionPrompt && diffVersionPrompt.current_version >= 2 ? (
+                      <>
+                        <p className='text-sm text-default-500'>
+                          Compare two versions of{' '}
+                          <span className='font-medium text-foreground'>{diffVersionPrompt.title || 'this memory'}</span> (v1–v
+                          {diffVersionPrompt.current_version}).
+                        </p>
+                        <div className='grid grid-cols-2 gap-3'>
+                          <Select
+                            label='From version'
+                            labelPlacement='outside'
+                            selectedKeys={diffVersionInput.from ? new Set([diffVersionInput.from]) : new Set<string>()}
+                            onSelectionChange={(keys) => {
+                              const next = Array.from(keys)[0];
+
+                              if (typeof next === 'string') {
+                                setDiffVersionInput((prev) => ({ ...prev, from: next }));
+                              }
+                            }}
+                          >
+                            {versionOptions(diffVersionPrompt.current_version).map((v) => (
+                              <SelectItem key={String(v)}>{`v${v}`}</SelectItem>
+                            ))}
+                          </Select>
+                          <Select
+                            label='To version'
+                            labelPlacement='outside'
+                            selectedKeys={diffVersionInput.to ? new Set([diffVersionInput.to]) : new Set<string>()}
+                            onSelectionChange={(keys) => {
+                              const next = Array.from(keys)[0];
+
+                              if (typeof next === 'string') {
+                                setDiffVersionInput((prev) => ({ ...prev, to: next }));
+                              }
+                            }}
+                          >
+                            {versionOptions(diffVersionPrompt.current_version).map((v) => (
+                              <SelectItem key={String(v)}>{`v${v}`}</SelectItem>
+                            ))}
+                          </Select>
+                        </div>
+                      </>
+                    ) : (
+                      <p className='text-sm text-default-500'>
+                        This memory has only one version, so there is nothing to compare.
+                      </p>
+                    )}
                   </div>
                 </ModalBody>
                 <ModalFooter>
@@ -1171,7 +1199,12 @@ export default function MemoryReviewPage() {
                   <Button
                     color='primary'
                     onPress={confirmDiffVersions}
-                    isDisabled={diffVersionInput.from.trim().length === 0 || diffVersionInput.to.trim().length === 0}
+                    isDisabled={
+                      !diffVersionPrompt ||
+                      diffVersionPrompt.current_version < 2 ||
+                      diffVersionInput.from.trim().length === 0 ||
+                      diffVersionInput.to.trim().length === 0
+                    }
                   >
                     Compare
                   </Button>

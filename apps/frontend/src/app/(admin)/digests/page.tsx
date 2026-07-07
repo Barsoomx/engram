@@ -1,8 +1,7 @@
 'use client';
 
-import { Select, SelectItem } from '@heroui/react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { BookOpen, Calendar, CheckCircle2 } from 'lucide-react';
+import { BookOpen, Calendar, CheckCircle2, ChevronLeft, ChevronRight } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -23,11 +22,13 @@ import {
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
-const WINDOW_OPTIONS = [
-  { value: '7', label: 'Last 7 days' },
-  { value: '14', label: 'Last 14 days' },
-  { value: '30', label: 'Last 30 days' },
-];
+function weekLabel(weeksBack: number): string {
+  if (weeksBack === 0) {
+    return 'Last completed week';
+  }
+
+  return `${weeksBack} week${weeksBack === 1 ? '' : 's'} earlier`;
+}
 
 function formatDate(iso: string | null): string {
   if (!iso) {
@@ -190,11 +191,11 @@ export default function DigestsPage() {
   const meQuery = useQuery<MeResponse>({ queryKey: ['auth', 'me'], queryFn: fetchMe });
   const capabilities = React.useMemo(() => meQuery.data?.capabilities ?? [], [meQuery.data?.capabilities]);
 
-  const [windowDays, setWindowDays] = React.useState(7);
+  const [weeksBack, setWeeksBack] = React.useState(0);
 
   const digestQuery = useQuery<WeeklyDigest>({
-    queryKey: ['digests', 'weekly', activeProjectId, activeTeamId, windowDays],
-    queryFn: () => getWeeklyDigest({ projectId: activeProjectId!, teamId: activeTeamId }, windowDays),
+    queryKey: ['digests', 'weekly', activeProjectId, activeTeamId, weeksBack],
+    queryFn: () => getWeeklyDigest({ projectId: activeProjectId!, teamId: activeTeamId }, undefined, weeksBack),
     enabled: !!activeProjectId,
   });
 
@@ -205,23 +206,26 @@ export default function DigestsPage() {
           title='Weekly Digest'
           subtitle='Memory changes merged, retired, and refuted across your project.'
           actions={
-            <Select
-              aria-label='Digest window'
-              size='sm'
-              className='w-[160px]'
-              selectedKeys={new Set([String(windowDays)])}
-              onSelectionChange={(keys) => {
-                const next = Array.from(keys)[0];
-
-                if (typeof next === 'string') {
-                  setWindowDays(Number(next));
-                }
-              }}
-            >
-              {WINDOW_OPTIONS.map((option) => (
-                <SelectItem key={option.value}>{option.label}</SelectItem>
-              ))}
-            </Select>
+            <div className='flex items-center gap-1.5'>
+              <button
+                type='button'
+                aria-label='Older week'
+                onClick={() => setWeeksBack((w) => w + 1)}
+                className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground'
+              >
+                <ChevronLeft size={16} strokeWidth={2} />
+              </button>
+              <span className='min-w-[150px] text-center text-[12.5px] font-medium text-default-600'>{weekLabel(weeksBack)}</span>
+              <button
+                type='button'
+                aria-label='Newer week'
+                onClick={() => setWeeksBack((w) => Math.max(0, w - 1))}
+                disabled={weeksBack === 0}
+                className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40'
+              >
+                <ChevronRight size={16} strokeWidth={2} />
+              </button>
+            </div>
           }
         />
 
