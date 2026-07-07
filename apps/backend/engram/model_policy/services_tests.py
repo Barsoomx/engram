@@ -8,20 +8,28 @@ import pytest
 from structlog.testing import capture_logs
 
 from engram.context.context_api_tests import create_project_scope
+from engram.core.models import AuditEvent
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
     AnthropicMessagesGateway,
+    CreateProviderSecret,
     EmbeddingCallInput,
     OpenAICompatibleGateway,
     ProviderCallInput,
+    ProviderSecretInput,
+    RotateProviderSecret,
+    RotateProviderSecretInput,
     UpdateModelPolicy,
     UpdateModelPolicyInput,
     _split_completion,
     generated_candidates_payload,
+    secret_fingerprint,
 )
+
+PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
 
 
 def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
@@ -511,3 +519,62 @@ def test_generated_candidates_payload_first_memory_carries_kind() -> None:
     memories = payload['memories']
     assert memories[0]['kind'] == 'gotcha'
     assert 'kind' not in memories[1]
+
+
+@pytest.mark.django_db
+def test_create_provider_secret_audit_stores_fingerprint_not_cleartext() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    secret = CreateProviderSecret().execute(
+        ProviderSecretInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+            name='Team OpenAI',
+            provider='openai',
+            scope='team',
+            raw_secret=PLAINTEXT_PROVIDER_SECRET,
+            request_id='req-create-audit',
+            actor_id=str(owner.id),
+        ),
+    )
+    event = AuditEvent.objects.get(target_id=str(secret.id), event_type='ProviderSecretCreated')
+
+    assert 'raw_secret' not in event.metadata
+    assert event.metadata['fingerprint'] == secret_fingerprint(PLAINTEXT_PROVIDER_SECRET)
+    assert PLAINTEXT_PROVIDER_SECRET not in json.dumps(event.metadata)
+
+
+@pytest.mark.django_db
+def test_rotate_provider_secret_audit_stores_fingerprint_not_cleartext() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    secret = CreateProviderSecret().execute(
+        ProviderSecretInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+            name='Team OpenAI',
+            provider='openai',
+            scope='team',
+            raw_secret=PLAINTEXT_PROVIDER_SECRET,
+            request_id='req-create-audit-2',
+            actor_id=str(owner.id),
+        ),
+    )
+    rotated = 'rotated-plaintext-value-xyz789'
+    RotateProviderSecret().execute(
+        RotateProviderSecretInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+            secret_id=secret.id,
+            raw_secret=rotated,
+            request_id='req-rotate-audit',
+            actor_id=str(owner.id),
+            allowed_team_ids=(team.id,),
+        ),
+    )
+    event = AuditEvent.objects.get(target_id=str(secret.id), event_type='ProviderSecretRotated')
+
+    assert 'raw_secret' not in event.metadata
+    assert event.metadata['fingerprint'] == secret_fingerprint(rotated)
+    assert rotated not in json.dumps(event.metadata)

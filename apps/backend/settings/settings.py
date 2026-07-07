@@ -7,10 +7,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import structlog
+from django.core.exceptions import ImproperlyConfigured
+
+from engram.core.environments import is_non_production
 
 from .logs import configure_logger
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+DEFAULT_DEV_SECRET_KEY = 'engram-development-secret'
 
 
 def to_bool(value: str | bool | None) -> bool:
@@ -48,11 +53,38 @@ def database_config(url: str) -> dict[str, str]:
     }
 
 
-SECRET_KEY = os.environ.get('ENGRAM_SECRET_KEY', 'engram-development-secret')
+def require_secret_key(*, raw_secret_key: str, environment: str) -> str:
+    if is_non_production(environment):
+        return raw_secret_key or DEFAULT_DEV_SECRET_KEY
+
+    if not raw_secret_key or raw_secret_key == DEFAULT_DEV_SECRET_KEY:
+        raise ImproperlyConfigured(
+            'ENGRAM_SECRET_KEY must be set to a strong non-default value outside dev/test environments',
+        )
+
+    return raw_secret_key
+
+
+def resolve_allowed_hosts(*, raw_allowed_hosts: str, environment: str) -> list[str]:
+    if is_non_production(environment):
+        return csv(raw_allowed_hosts or 'localhost,127.0.0.1,0.0.0.0', default=('localhost',))
+
+    if not raw_allowed_hosts.strip():
+        raise ImproperlyConfigured(
+            'ENGRAM_ALLOWED_HOSTS must be set explicitly outside dev/test environments',
+        )
+
+    return csv(raw_allowed_hosts, default=('localhost',))
+
+
+ENVIRONMENT = os.environ.get('ENGRAM_ENVIRONMENT', 'dev')
+SECRET_KEY = require_secret_key(raw_secret_key=os.environ.get('ENGRAM_SECRET_KEY', ''), environment=ENVIRONMENT)
 ENGRAM_SECRET_ENCRYPTION_KEY = os.environ.get('ENGRAM_SECRET_ENCRYPTION_KEY', '')
 DEBUG = to_bool(os.environ.get('ENGRAM_DEBUG', 'false'))
-ENVIRONMENT = os.environ.get('ENGRAM_ENVIRONMENT', 'dev')
-ALLOWED_HOSTS = csv(os.environ.get('ENGRAM_ALLOWED_HOSTS', 'localhost,127.0.0.1,0.0.0.0'), default=('localhost',))
+ALLOWED_HOSTS = resolve_allowed_hosts(
+    raw_allowed_hosts=os.environ.get('ENGRAM_ALLOWED_HOSTS', ''),
+    environment=ENVIRONMENT,
+)
 ROOT_URLCONF = 'settings.urls'
 WSGI_APPLICATION = 'settings.wsgi.application'
 ASGI_APPLICATION = 'settings.asgi.application'
