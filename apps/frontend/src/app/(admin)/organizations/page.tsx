@@ -9,25 +9,30 @@ import {
   ModalFooter,
   ModalHeader,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Building2, Pencil } from 'lucide-react';
+import { Building2, Pencil, Search } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
 import { ResponsiveTable } from '@/components/ui/responsive-table';
 import { StatusPill } from '@/components/ui/status-pill';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { TimeStamp } from '@/components/ui/time-stamp';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useOrganizations, useUpdateOrganization } from '@/hooks/use-organizations';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type { Organization, OrganizationWriteInput } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
 
 const COLUMN_COUNT = 6;
+const ORG_FILTER_DEFAULTS = { search: '', page: 1 };
+const ORG_PAGE_SIZE = 20;
 
 function OrganizationsTable({
   items,
@@ -225,13 +230,35 @@ export default function OrganizationsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const organizationsQuery = useOrganizations(activeOrgId);
+  const [filters, setFilters] = useUrlFilters(ORG_FILTER_DEFAULTS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
+
+  React.useEffect(() => {
+    if (debouncedSearch === filters.search) {
+
+      return;
+    }
+
+    setFilters({ search: debouncedSearch, page: 1 });
+  }, [debouncedSearch, filters.search, setFilters]);
+
+  const params = React.useMemo(
+    () => ({
+      page: filters.page,
+      pageSize: ORG_PAGE_SIZE,
+      search: filters.search || undefined,
+    }),
+    [filters.page, filters.search],
+  );
+  const organizationsQuery = useOrganizations(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
   const updateMutation = useUpdateOrganization(activeOrgId);
 
   const [editTarget, setEditTarget] = React.useState<Organization | null>(null);
   const [modalOpen, setModalOpen] = React.useState(false);
   const [modalError, setModalError] = React.useState<string | null>(null);
-  const [search, setSearch] = React.useState('');
 
   const canAdmin = hasCapability(capabilities, 'organizations:admin');
 
@@ -270,17 +297,10 @@ export default function OrganizationsPage() {
 
   const isLoading = meQuery.isLoading || organizationsQuery.isLoading;
   const items = organizationsQuery.data?.results ?? [];
+  const total = organizationsQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
   const skeletonColumns = canAdmin ? COLUMN_COUNT + 1 : COLUMN_COUNT;
-
-  const normalizedSearch = search.trim().toLowerCase();
-  const filteredItems = normalizedSearch
-    ? items.filter(
-        (organization) =>
-          organization.name.toLowerCase().includes(normalizedSearch) ||
-          organization.slug.toLowerCase().includes(normalizedSearch),
-      )
-    : items;
+  const hasSearch = filters.search.length > 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='organizations:read'>
@@ -292,15 +312,15 @@ export default function OrganizationsPage() {
 
         <div className='surface-card p-4'>
           <Input
-            label='Search'
-            labelPlacement='outside'
-            placeholder='Name or slug…'
-            value={search}
-            onValueChange={setSearch}
+            aria-label='Search organizations'
+            placeholder='Search by name or slug…'
+            value={searchInput}
+            onValueChange={setSearchInput}
             variant='bordered'
             size='sm'
             isClearable
-            onClear={() => setSearch('')}
+            onClear={() => setSearchInput('')}
+            startContent={<Search className='w-4 h-4 text-default-400' />}
             className='max-w-xs'
           />
         </div>
@@ -331,13 +351,11 @@ export default function OrganizationsPage() {
               }
               onRetry={() => organizationsQuery.refetch()}
             />
-          ) : filteredItems.length === 0 ? (
+          ) : items.length === 0 ? (
             <EmptyState
-              title={
-                normalizedSearch ? 'No matching organizations' : 'No organizations'
-              }
+              title={hasSearch ? 'No matching organizations' : 'No organizations'}
               description={
-                normalizedSearch
+                hasSearch
                   ? 'No organizations match your search.'
                   : 'You do not belong to any organization yet.'
               }
@@ -345,21 +363,22 @@ export default function OrganizationsPage() {
             />
           ) : (
             <OrganizationsTable
-              items={filteredItems}
+              items={items}
               canAdmin={canAdmin}
               onEdit={openEdit}
             />
           )}
         </div>
 
-        {!organizationsQuery.isError && filteredItems.length > 0 && (
-          <div className='flex items-center justify-between text-xs text-default-500'>
-            <p>
-              Showing {filteredItems.length} organization
-              {filteredItems.length === 1 ? '' : 's'}
-              {normalizedSearch ? ` of ${items.length}` : ''}.
-            </p>
-          </div>
+        {!organizationsQuery.isError && total > 0 && (
+          <PaginationFooter
+            page={filters.page}
+            pageSize={ORG_PAGE_SIZE}
+            total={total}
+            noun='organization'
+            onPageChange={(page) => setFilters({ page })}
+            isDisabled={organizationsQuery.isFetching}
+          />
         )}
 
         {canAdmin && meLoaded && (

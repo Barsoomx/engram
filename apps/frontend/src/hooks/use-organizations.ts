@@ -18,11 +18,12 @@ import { adminQueryKeys } from '@/lib/query-keys';
 
 export function useOrganizations(
   orgId: string | null,
+  params?: Parameters<typeof adminQueryKeys.organizations>[1],
   options?: Partial<UseQueryOptions<Paginated<Organization>>>,
 ) {
   return useQuery<Paginated<Organization>>({
-    queryKey: adminQueryKeys.organizations(orgId),
-    queryFn: () => listOrganizations(),
+    queryKey: adminQueryKeys.organizations(orgId, params),
+    queryFn: () => listOrganizations(params),
     ...options,
   });
 }
