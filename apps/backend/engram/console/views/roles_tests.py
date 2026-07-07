@@ -116,7 +116,7 @@ def test_list_returns_built_in_roles_with_nested_capabilities(
 
     owner = next(role for role in response.data['results'] if role['code'] == 'organization_owner')
 
-    assert set(owner.keys()) == {'id', 'code', 'name', 'built_in', 'capabilities'}
+    assert set(owner.keys()) == {'id', 'code', 'name', 'description', 'built_in', 'capabilities'}
 
     assert owner['built_in'] is True
 
@@ -125,6 +125,26 @@ def test_list_returns_built_in_roles_with_nested_capabilities(
     assert 'roles:read' in owner['capabilities']
 
     assert owner['capabilities'] == sorted(owner['capabilities'])
+
+
+@pytest.mark.django_db
+def test_list_includes_role_description(
+    f_auditor_user_token: str,
+    f_owner_org: Organization,
+) -> None:
+    role = Role.objects.get(code='auditor')
+    role.description = 'Read-only auditor access'
+    role.save(update_fields=['description'])
+
+    client = _auth_client(f_auditor_user_token, org=f_owner_org)
+
+    response = client.get('/v1/admin/roles/')
+
+    assert response.status_code == 200
+
+    auditor = next(item for item in response.data['results'] if item['code'] == 'auditor')
+
+    assert auditor['description'] == 'Read-only auditor access'
 
 
 @pytest.mark.django_db

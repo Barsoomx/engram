@@ -59,16 +59,20 @@ RAW_PROVIDER_SECRET = 'sk-test_memory_worker_secret_1234567890abcdef'
 RAW_SLACK_TOKEN = 'xoxb-123456789012-123456789012-fakeSlackWorkerToken'
 
 
+EXPECTED_GENERATED_CONFIDENCE = Decimal('0.900')
+EXPECTED_GENERATED_KIND = 'gotcha'
+
+
 def expected_generated_title(observation: Observation) -> str:
     digest = hashlib.sha256(provider_prompt(observation).encode()).hexdigest()[:12]
 
-    return f'Provider-generated memory {digest}'
+    return f'Provider-synthesized memory {digest} high'
 
 
 def expected_generated_body(observation: Observation) -> str:
     digest = hashlib.sha256(provider_prompt(observation).encode()).hexdigest()[:12]
 
-    return f'Provider-generated candidate body {digest}'
+    return f'Provider-synthesized candidate body {digest} high'
 
 
 def create_observation_recorded_scope(
@@ -135,7 +139,7 @@ def create_observation_recorded_scope(
         raw_event=raw_event,
         observation_type='tool_use',
         title='pytest failure fixed',
-        body='pytest failed on missing memory worker and now exits 0',
+        body='pytest failed on missing memory worker module and the suite now exits 0 after the fix',
         files_read=['apps/backend/engram/core/models.py'],
         files_modified=['apps/backend/engram/memory/services.py'],
         content_hash=f'hash-observation-{suffix}',
@@ -329,7 +333,7 @@ def create_memory_candidate(observation: Observation) -> MemoryCandidate:
 def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() -> None:
     organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
     policy = create_generation_policy(organization, team, project)
-    enable_auto_promote(organization, threshold='0.800')
+    enable_auto_promote(organization, threshold='0.950')
 
     result = execute_worker(observation)
 
@@ -350,15 +354,16 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
     assert candidate.body != observation.body
     assert candidate.status == CandidateStatus.PROPOSED
     assert candidate.visibility_scope == VisibilityScope.PROJECT
-    assert candidate.confidence == Decimal('0.600')
+    assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
+    assert candidate.kind == EXPECTED_GENERATED_KIND
     assert Memory.objects.count() == 0
     held_audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert held_audit.actor_type == 'system'
     assert held_audit.target_id == str(candidate.id)
     assert held_audit.metadata['reason'] == 'below_auto_approve_threshold'
     assert held_audit.metadata['candidate_id'] == str(candidate.id)
-    assert held_audit.metadata['confidence'] == '0.600'
-    assert held_audit.metadata['threshold'] == '0.800'
+    assert held_audit.metadata['confidence'] == '0.900'
+    assert held_audit.metadata['threshold'] == '0.950'
     assert held_audit.metadata['source_observation_id'] == str(observation.id)
     assert candidate.content_hash == memory_candidate_content_hash(observation)
     assert candidate.evidence == [
@@ -1126,14 +1131,14 @@ def test_rich_observation_auto_promotes_at_default_threshold() -> None:
     result = execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    assert candidate.confidence == Decimal('0.950')
+    assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
     assert result.held_for_review is False
     assert result.curated_decision is not None
     assert result.memory is not None
 
 
 @pytest.mark.django_db
-def test_thin_observation_auto_promotes_at_default_threshold() -> None:
+def test_model_confidence_auto_promotes_at_default_threshold() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     observation.files_read = []
@@ -1143,17 +1148,17 @@ def test_thin_observation_auto_promotes_at_default_threshold() -> None:
     result = execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    assert candidate.confidence == Decimal('0.500')
+    assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
     assert result.held_for_review is False
     assert result.curated_decision is not None
     assert result.memory is not None
 
 
 @pytest.mark.django_db
-def test_thin_observation_held_below_configured_threshold() -> None:
+def test_model_confidence_held_below_configured_threshold() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
-    enable_auto_promote(organization, threshold='0.800')
+    enable_auto_promote(organization, threshold='0.950')
     observation.files_read = []
     observation.files_modified = []
     observation.save(update_fields=['files_read', 'files_modified', 'updated_at'])
@@ -1161,7 +1166,7 @@ def test_thin_observation_held_below_configured_threshold() -> None:
     result = execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    assert candidate.confidence == Decimal('0.500')
+    assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
     assert result.held_for_review is True
     assert result.memory is None
     assert candidate.status == CandidateStatus.PROPOSED

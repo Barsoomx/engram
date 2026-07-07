@@ -449,6 +449,53 @@ def test_queue_filters_by_confidence_range(
 
 
 @pytest.mark.django_db
+def test_queue_ordering_by_confidence(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    low = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+
+    mid = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.500')
+
+    high = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.900')
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    ascending = client.get('/v1/admin/memory-review/', {'ordering': 'confidence'})
+    descending = client.get('/v1/admin/memory-review/', {'ordering': '-confidence'})
+
+    assert ascending.status_code == 200
+
+    assert [item['id'] for item in ascending.data['results']] == [str(low.id), str(mid.id), str(high.id)]
+
+    assert [item['id'] for item in descending.data['results']] == [str(high.id), str(mid.id), str(low.id)]
+
+
+@pytest.mark.django_db
+def test_queue_ordering_by_created_at_ascending(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    older = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    newer = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    Memory.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
+
+    Memory.objects.filter(id=newer.id).update(created_at=timezone.now())
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/', {'ordering': 'created_at'})
+
+    assert response.status_code == 200
+
+    assert [item['id'] for item in response.data['results']] == [str(older.id), str(newer.id)]
+
+
+@pytest.mark.django_db
 def test_queue_filters_by_visibility_scope(
     f_admin_token: str,
     f_admin_org: Organization,

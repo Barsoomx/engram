@@ -550,6 +550,7 @@ def model_policy_response(policy: ModelPolicy) -> dict[str, Any]:
         'version': policy.version,
         'active': policy.active,
         'fallback_enabled': policy.fallback_enabled,
+        'base_url': policy.metadata.get('base_url') if policy.metadata else None,
         'context_window_tokens': policy.metadata.get('context_window_tokens') if policy.metadata else None,
         'json_mode': policy.metadata.get('json_mode') if policy.metadata else None,
         'last_success_at': last_success_at.isoformat() if last_success_at else None,

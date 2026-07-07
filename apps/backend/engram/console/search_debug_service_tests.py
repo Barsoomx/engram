@@ -5,7 +5,7 @@ from decimal import Decimal
 
 import pytest
 
-from engram.access.services import EffectiveScope
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.console import search_debug_service
 from engram.console.search_debug_service import ReplaySearchDebug
 from engram.context.context_api_tests import create_embedding_policy
@@ -26,14 +26,19 @@ from engram.model_policy.services import EmbeddingCallResult
 pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
 
 
-def _make_scope(organization: Organization) -> EffectiveScope:
+def _make_scope(
+    organization: Organization,
+    project: Project,
+    *,
+    capabilities: tuple[str, ...] = ('memories:read',),
+) -> EffectiveScope:
     return EffectiveScope(
         organization_id=organization.id,
         identity_id=uuid.uuid4(),
         api_key_id=uuid.uuid4(),
-        project_ids=(),
+        project_ids=(project.id,),
         team_ids=(),
-        capabilities=(),
+        capabilities=capabilities,
         actor_type='user',
         actor_id='debug-tester',
         project_bound=False,
@@ -120,7 +125,7 @@ def test_replay_flag_off_lexical_stage_disabled() -> None:
     result = ReplaySearchDebug().execute(
         organization=organization,
         project=project,
-        scope=_make_scope(organization),
+        scope=_make_scope(organization, project),
         query='authorization',
         team_id=None,
         file_paths=(),
@@ -164,7 +169,7 @@ def test_replay_lexical_stage_surfaces_lexical_only_match_when_enabled() -> None
     result = ReplaySearchDebug().execute(
         organization=organization,
         project=project,
-        scope=_make_scope(organization),
+        scope=_make_scope(organization, project),
         query='authorization',
         team_id=None,
         file_paths=(),
@@ -223,7 +228,7 @@ def test_replay_semantic_stage_surfaces_kind_and_confidence(monkeypatch: pytest.
     result = ReplaySearchDebug().execute(
         organization=organization,
         project=project,
-        scope=_make_scope(organization),
+        scope=_make_scope(organization, project),
         query='unrelated text',
         team_id=None,
         file_paths=(),
@@ -238,3 +243,52 @@ def test_replay_semantic_stage_surfaces_kind_and_confidence(monkeypatch: pytest.
     packed_by_id = {p.memory_id: p for p in result.packed_context}
     assert packed_by_id[semantic_doc.memory_id].kind == 'architecture'
     assert packed_by_id[semantic_doc.memory_id].confidence == '0.640'
+
+
+@pytest.mark.django_db
+def test_replay_denies_project_not_in_scope() -> None:
+    organization, project, _team = _make_org_project_team()
+    other_project = Project.objects.create(organization=organization, name='Other', slug='other-search-debug')
+    scope = _make_scope(organization, other_project)
+
+    with pytest.raises(AccessDeniedError) as exc:
+        ReplaySearchDebug().execute(
+            organization=organization,
+            project=project,
+            scope=scope,
+            query='authorization',
+            team_id=None,
+            file_paths=(),
+            symbols=(),
+        )
+
+    assert exc.value.error_code == 'project_scope_denied'
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.django_db
+def test_replay_allows_full_org_admin_for_project_not_in_scope() -> None:
+    organization, project, _team = _make_org_project_team()
+    scope = EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=(),
+        capabilities=('projects:*',),
+        actor_type='user',
+        actor_id='debug-admin',
+        project_bound=False,
+    )
+
+    result = ReplaySearchDebug().execute(
+        organization=organization,
+        project=project,
+        scope=scope,
+        query='',
+        team_id=None,
+        file_paths=(),
+        symbols=(),
+    )
+
+    assert result.scope_filters['project_id'] == str(project.id)

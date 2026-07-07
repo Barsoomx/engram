@@ -254,6 +254,43 @@ def activate_member(
     return membership
 
 
+def reactivate_member(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    membership_id: uuid.UUID,
+) -> OrganizationMembership:
+    membership = (
+        OrganizationMembership.objects.select_for_update().filter(organization=organization, id=membership_id).first()
+    )
+
+    if membership is None:
+        raise MemberNotFoundError('member not found')
+
+    if membership.active:
+        return membership
+
+    membership.active = True
+
+    membership.save(update_fields=['active', 'updated_at'])
+
+    audit_admin_action(
+        organization=organization,
+        actor_identity=actor_identity,
+        event_type='MemberReactivated',
+        target_type='member',
+        target_id=str(membership.id),
+    )
+
+    logger.info(
+        'member_reactivated',
+        organization_id=str(organization.id),
+        identity_id=str(membership.identity_id),
+    )
+
+    return membership
+
+
 class CapabilityWideningError(DomainError):
     default_error_code = 'capability_widening'
     default_status_code = status.HTTP_400_BAD_REQUEST
@@ -865,7 +902,11 @@ def restore_memory(
 
     memory.save(update_fields=['status', 'refuted', 'stale', 'updated_at'])
 
-    RetrievalDocument.objects.filter(memory=memory).update(refuted=False, stale=False, updated_at=timezone.now())
+    RetrievalDocument.objects.filter(memory=memory, memory_version=version).update(
+        refuted=False,
+        stale=False,
+        updated_at=timezone.now(),
+    )
 
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 

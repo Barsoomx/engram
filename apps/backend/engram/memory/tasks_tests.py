@@ -64,6 +64,11 @@ def test_distill_session_has_a_per_task_time_limit_override_above_the_global_def
     assert celeryconfig.task_time_limit == 180
 
 
+def test_process_observation_recorded_has_a_per_task_time_limit() -> None:
+    assert process_observation_recorded.soft_time_limit == 60
+    assert process_observation_recorded.time_limit == 90
+
+
 def test_task_routes_send_retry_failed_distillations_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.retry_failed_distillations']['queue'] == celeryconfig.QUEUE_BATCH
 

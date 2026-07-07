@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -49,6 +50,9 @@ REVIEW_MEMORY_STATUSES = (
 REVIEW_MEMORY_CONFIDENCE_THRESHOLD = '0.300'
 
 PAGE_SIZE = 50
+
+REVIEW_ORDERING_FIELDS = ('confidence', '-confidence', 'created_at', '-created_at')
+DEFAULT_REVIEW_ORDERING = '-created_at'
 
 
 class MemoryReviewViewSet(
@@ -199,9 +203,17 @@ class MemoryReviewViewSet(
     def _reviewable_page(self, request: Request) -> dict[str, Any]:
         organization = request.active_organization
 
-        candidates_qs = self._filtered_candidates(request, organization).order_by('-created_at')
+        ordering = self._ordering(request)
 
-        memories_qs = self._filtered_memories(request, organization).order_by('-created_at')
+        candidates_qs = self._order_queryset(
+            self._filtered_candidates(request, organization),
+            ordering,
+        )
+
+        memories_qs = self._order_queryset(
+            self._filtered_memories(request, organization),
+            ordering,
+        )
 
         page_number = self._page_number(request)
 
@@ -213,11 +225,7 @@ class MemoryReviewViewSet(
 
         memories = list(memories_qs.prefetch_related('links', 'versions__source_observation')[:end])
 
-        combined = sorted(
-            candidates + memories,
-            key=lambda item: item.created_at,
-            reverse=True,
-        )
+        combined = self._sort_items(candidates + memories, ordering)
 
         page_items = combined[start:end]
 
@@ -229,6 +237,41 @@ class MemoryReviewViewSet(
             'previous': self._page_url(request, page_number - 1) if page_number > 1 else None,
             'items': page_items,
         }
+
+    def _order_queryset(self, queryset: Any, ordering: str) -> Any:
+        field = ordering.lstrip('-')
+
+        if field == 'confidence':
+            if ordering.startswith('-'):
+                return queryset.order_by(F('confidence').desc(nulls_last=True), '-created_at')
+
+            return queryset.order_by(F('confidence').asc(nulls_first=True), '-created_at')
+
+        return queryset.order_by(ordering)
+
+    def _ordering(self, request: Request) -> str:
+        ordering = request.query_params.get('ordering')
+
+        if ordering in REVIEW_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_REVIEW_ORDERING
+
+    def _sort_items(self, items: list, ordering: str) -> list:
+        reverse = ordering.startswith('-')
+
+        field = ordering.lstrip('-')
+
+        if field == 'confidence':
+            return sorted(items, key=self._confidence_key, reverse=reverse)
+
+        return sorted(items, key=lambda item: item.created_at, reverse=reverse)
+
+    def _confidence_key(self, item: Any) -> Decimal:
+        if item.confidence is None:
+            return Decimal(0)
+
+        return item.confidence
 
     def _filtered_candidates(self, request: Request, organization: Any) -> Any:
         queryset = MemoryCandidate.objects.filter(

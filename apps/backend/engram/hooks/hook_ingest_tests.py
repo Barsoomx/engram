@@ -27,6 +27,7 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
+    OrganizationSettings,
     Project,
     ProjectTeam,
     RawEventEnvelope,
@@ -117,6 +118,13 @@ def create_hook_scope() -> tuple[Organization, Project, Team, str]:
     organization, team, project, _owner, _api_key = create_project_scope()
 
     return organization, project, team, RAW_KEY
+
+
+def enable_realtime_candidates(organization: Organization) -> None:
+    OrganizationSettings.objects.update_or_create(
+        organization=organization,
+        defaults={'realtime_candidates_enabled': True},
+    )
 
 
 def auth_headers(raw_key: str = RAW_KEY) -> dict[str, str]:
@@ -373,7 +381,8 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_ta
 def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     provider_secret = 'sk-test-secret123456789'
 
@@ -418,7 +427,8 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
 
 @pytest.mark.django_db
 def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits() -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     data = hook_event_input(project, team)
 
     with transaction.atomic():
@@ -429,7 +439,8 @@ def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits
 
 @pytest.mark.django_db
 def test_ingest_hook_event_does_not_dispatch_worker_tasks_when_transaction_rolls_back() -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     data = hook_event_input(project, team)
 
     class RollbackSentinelError(Exception):
@@ -448,7 +459,8 @@ def test_ingest_hook_event_does_not_dispatch_worker_tasks_when_transaction_rolls
 def test_ingest_hook_event_dispatches_worker_task_exactly_once_on_commit(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     data = hook_event_input(project, team)
 
     with f_capture_on_commit(execute=True):
@@ -461,10 +473,55 @@ def test_ingest_hook_event_dispatches_worker_task_exactly_once_on_commit(
 
 
 @pytest.mark.django_db
+def test_ingest_hook_event_does_not_enqueue_realtime_task_by_default(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+
+    with f_capture_on_commit(execute=True):
+        IngestHookEvent().execute(data)
+
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 0
+
+
+@pytest.mark.django_db
+def test_ingest_hook_event_default_off_still_enqueues_distill_on_session_end(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team, event_type='session_end')
+
+    with f_capture_on_commit(execute=True):
+        result = IngestHookEvent().execute(data)
+
+    outbox_tasks = [row.task_name for row in CeleryOutbox.objects.all()]
+    assert outbox_tasks == ['engram.memory.distill_session']
+    distill_task = CeleryOutbox.objects.get(task_name='engram.memory.distill_session')
+    assert distill_task.args == [str(result.session.id)]
+
+
+@pytest.mark.django_db
+def test_ingest_hook_event_enqueues_realtime_task_when_setting_enabled(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+
+    with f_capture_on_commit(execute=True):
+        result = IngestHookEvent().execute(data)
+
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
+    assert queued.args == [str(result.observation.id)]
+
+
+@pytest.mark.django_db
 def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     organization, project, team, raw_key = create_hook_scope()
+    enable_realtime_candidates(organization)
     payload = valid_hook_payload(
         project,
         team,
@@ -498,7 +555,8 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
 def test_error_hook_persists_error_event_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     payload = valid_hook_payload(
         project,
         team,
@@ -532,7 +590,8 @@ def test_error_hook_persists_error_event_and_queues_worker_task(
 def test_decision_hook_persists_decision_event_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     payload = valid_hook_payload(
         project,
         team,
@@ -594,7 +653,8 @@ def test_hook_event_endpoint_rejects_mismatched_event_type_before_writes() -> No
 def test_error_hook_replay_returns_duplicate_without_new_records_or_queued_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(
         project,
@@ -747,7 +807,8 @@ def test_post_tool_use_uses_key_bound_team_when_request_omits_team_id() -> None:
 def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(project, team)
     replay = {
@@ -774,7 +835,8 @@ def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows(
 def test_post_tool_use_replay_by_session_event_id_returns_existing_rows(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(project, team)
     replay = {
@@ -797,7 +859,8 @@ def test_post_tool_use_replay_by_session_event_id_returns_existing_rows(
 
 @pytest.mark.django_db(transaction=True)
 def test_post_tool_use_replay_race_returns_existing_rows(m_monkeypatch: pytest.MonkeyPatch) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(project, team)
     first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
@@ -975,7 +1038,8 @@ def test_post_tool_use_rejects_malformed_payload() -> None:
 def test_session_end_marks_session_ended_and_writes_durable_event(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(
         project,
@@ -1147,7 +1211,8 @@ def test_hook_dry_run_denied_when_organization_suspended() -> None:
 def test_pre_tool_use_ingests_raw_event_observation_source_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
-    _organization, team, project, _owner, _api_key = create_project_scope()
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
     client = APIClient()
     payload = valid_hook_payload(
         project,
@@ -1261,6 +1326,7 @@ def test_user_prompt_submit_hook_persists_event_and_queues_worker_task(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     organization, project, team, raw_key = create_hook_scope()
+    enable_realtime_candidates(organization)
     payload = valid_hook_payload(
         project,
         team,

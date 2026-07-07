@@ -5,7 +5,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 import structlog
 from django.db import transaction
@@ -25,6 +25,13 @@ from engram.core.models import (
     WorkflowRunType,
     clamp_memory_kind,
 )
+from engram.memory.candidate_parsing import (
+    SynthesizedCandidate,
+    _clamp_confidence,
+    parse_synthesized_candidates,
+    strip_json_fence,
+    truncate_with_marker,
+)
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.services import (
     MemoryWorkerError,
@@ -34,7 +41,6 @@ from engram.memory.services import (
     redact_text,
     redact_value,
     resolve_auto_approve_threshold,
-    strip_json_fence,
 )
 from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (
@@ -54,9 +60,6 @@ from engram.model_policy.services import (
 
 logger = structlog.get_logger(__name__)
 
-_FALLBACK_CONFIDENCE = Decimal('0.500')
-_CONFIDENCE_QUANTUM = Decimal('0.001')
-
 
 @dataclass(frozen=True)
 class DistillSessionInput:
@@ -65,15 +68,6 @@ class DistillSessionInput:
     correlation_id: str = ''
     auto_approve_threshold: Decimal | None = None
     run_id: str = ''
-
-
-@dataclass(frozen=True)
-class SynthesizedCandidate:
-    title: str
-    body: str
-    confidence: Decimal
-    supporting_observation_ids: tuple[str, ...]
-    kind: str = ''
 
 
 @dataclass(frozen=True)
@@ -164,13 +158,7 @@ def _observation_block(observation: Observation, cap: int) -> str:
             f'Files modified: {redact_value(observation.files_modified)}',
         ],
     )
-    if len(block) <= cap:
-        return block
-
-    marker = f'\n[truncated {len(block) - cap} chars]'
-    head = block[: max(cap - len(marker), 0)]
-
-    return head + marker
+    return truncate_with_marker(block, cap)
 
 
 def session_distillation_prompt(observations: list[Observation], cap: int) -> str:
@@ -220,66 +208,6 @@ def chunk_observations(observations: list[Observation], budget: int) -> list[lis
 
 def session_candidate_content_hash(session_id: uuid.UUID, title: str, body: str) -> str:
     return hashlib.sha256(f'{session_id}:{title}:{body}'.encode()).hexdigest()
-
-
-def _clamp_confidence(value: object) -> Decimal:
-    try:
-        confidence = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return _FALLBACK_CONFIDENCE
-
-    confidence = max(Decimal('0'), min(Decimal('1'), confidence))
-
-    return confidence.quantize(_CONFIDENCE_QUANTUM)
-
-
-def _fallback_candidate(raw_body: str) -> SynthesizedCandidate:
-    text = raw_body.strip()
-    title = text.splitlines()[0][:255] if text else 'Session distillation'
-
-    return SynthesizedCandidate(
-        title=title,
-        body=text or title,
-        confidence=_FALLBACK_CONFIDENCE,
-        supporting_observation_ids=(),
-    )
-
-
-def parse_synthesized_candidates(raw_body: str) -> tuple[SynthesizedCandidate, ...]:
-    try:
-        parsed = json.loads(strip_json_fence(raw_body))
-    except (json.JSONDecodeError, TypeError):
-        return (_fallback_candidate(raw_body),)
-
-    if isinstance(parsed, dict):
-        items = parsed.get('memories')
-        if not isinstance(items, list):
-            return (_fallback_candidate(raw_body),)
-    elif isinstance(parsed, list):
-        items = parsed
-    else:
-        return (_fallback_candidate(raw_body),)
-
-    candidates: list[SynthesizedCandidate] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get('title') or '').strip()
-        body = str(item.get('body') or '').strip()
-        if not title and not body:
-            continue
-        supporting = tuple(str(value) for value in (item.get('supporting_observation_ids') or []))
-        candidates.append(
-            SynthesizedCandidate(
-                title=(title or body)[:255],
-                body=body or title,
-                confidence=_clamp_confidence(item.get('confidence')),
-                supporting_observation_ids=supporting,
-                kind=clamp_memory_kind(item.get('kind')),
-            ),
-        )
-
-    return tuple(candidates)
 
 
 def _parse_reduced_source_ids(raw: object) -> tuple[int, ...] | None:
@@ -423,7 +351,7 @@ class DistillSession:
                 if not created:
                     self._classify_existing(candidate, auto_promoted, queued)
                     continue
-                if is_auto_promotable(candidate_input.confidence, threshold):
+                if is_auto_promotable(candidate_input.confidence, threshold) and not candidate_input.parse_fallback:
                     to_curate.append(candidate)
                 else:
                     self._audit_held(locked_session, candidate, candidate_input.confidence, threshold, data)
@@ -695,6 +623,8 @@ class DistillSession:
             'kind': 'session_distillation',
             'supporting_observation_ids': list(candidate_input.supporting_observation_ids),
         }
+        if candidate_input.parse_fallback:
+            evidence['parse_fallback'] = True
         evidence.update(provenance)
 
         return [

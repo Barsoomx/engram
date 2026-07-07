@@ -812,6 +812,10 @@ class IndexMemoryVersion:
                 'metadata': {},
             },
         )
+        RetrievalDocument.objects.filter(memory=memory).exclude(memory_version=version).update(
+            stale=True,
+            updated_at=timezone.now(),
+        )
         self._embed_document(retrieval_document, memory, version)
 
         return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=created)

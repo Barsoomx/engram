@@ -2,20 +2,26 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import structlog
 from django.utils import timezone
 
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
-from engram.core.models import Memory, MemoryStatus, Project
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    Project,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+)
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
-    DAILY_DIGEST_WINDOW_DAYS,
     WEEKLY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
     MemoryWorkerError,
@@ -29,6 +35,8 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
+_OBSERVATION_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_OBSERVATION_SOFT_TIME_LIMIT', '60'))
+_OBSERVATION_TIME_LIMIT = int(os.environ.get('ENGRAM_OBSERVATION_TIME_LIMIT', '90'))
 _DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', '600'))
 _DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
 _DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
@@ -41,6 +49,8 @@ _DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
+    soft_time_limit=_OBSERVATION_SOFT_TIME_LIMIT,
+    time_limit=_OBSERVATION_TIME_LIMIT,
 )
 def process_observation_recorded(self: object, observation_id: object) -> str:
     try:
@@ -327,8 +337,39 @@ def expire_stale_candidates() -> dict[str, int]:
     return {'scanned': result.scanned, 'rejected': result.rejected}
 
 
+def _daily_digest_window_days() -> int:
+    return int(os.environ.get('ENGRAM_DAILY_DIGEST_WINDOW_DAYS', '1'))
+
+
+def _daily_digest_max_window_days() -> int:
+    return int(os.environ.get('ENGRAM_DAILY_DIGEST_MAX_WINDOW_DAYS', '7'))
+
+
+def daily_digest_window_start(project: Project, now: datetime | None = None) -> datetime:
+    now = now or timezone.now()
+    floor_start = now - timedelta(days=_daily_digest_max_window_days())
+    last_success = (
+        WorkflowRun.objects.filter(
+            organization_id=project.organization_id,
+            project=project,
+            run_type=WorkflowRunType.DAILY_DIGEST,
+            status=WorkflowRunStatus.SUCCEEDED,
+            finished_at__isnull=False,
+        )
+        .order_by('-finished_at')
+        .values_list('finished_at', flat=True)
+        .first()
+    )
+    if last_success is not None:
+        candidate = last_success
+    else:
+        candidate = now - timedelta(days=_daily_digest_window_days())
+
+    return max(candidate, floor_start)
+
+
 def _recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
-    window_start = timezone.now() - timedelta(days=DAILY_DIGEST_WINDOW_DAYS)
+    window_start = daily_digest_window_start(project)
 
     return list(
         Memory.objects.filter(

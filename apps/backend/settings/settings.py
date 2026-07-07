@@ -227,6 +227,8 @@ ENGRAM_CANDIDATE_TTL_BATCH = int(os.environ.get('ENGRAM_CANDIDATE_TTL_BATCH', '5
 
 ENGRAM_CURATOR_ESCALATION_ENABLED = to_bool(os.environ.get('ENGRAM_CURATOR_ESCALATION_ENABLED', 'true'))
 
+ENGRAM_OPS_GLOBAL_COUNTERS = to_bool(os.environ.get('ENGRAM_OPS_GLOBAL_COUNTERS', 'true'))
+
 _DEFAULT_CURATOR_SENSITIVE_TERMS = (
     'password',
     'private key',

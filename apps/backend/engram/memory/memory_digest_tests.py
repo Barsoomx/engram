@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import timedelta
 
 import pytest
+from django.utils import timezone
 
 from engram.context.context_api_tests import create_project_scope
 from engram.core.models import (
     AuditEvent,
+    AuditResult,
     Memory,
     MemoryStatus,
     MemoryVersion,
@@ -16,12 +19,16 @@ from engram.core.models import (
     RetrievalDocument,
     Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
 )
 from engram.memory.services import (
     DigestInput,
     GenerateDigest,
     MemoryWorkerError,
     digest_content_hash,
+    digest_prompt,
     run_daily_digest_with_tracking,
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
@@ -364,3 +371,96 @@ def test_generate_digest_does_not_fall_back_when_disabled(m_monkeypatch: pytest.
 
     assert Memory.objects.filter(metadata__kind='digest').count() == 0
     assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
+
+
+class _PromptSource:
+    def __init__(self, title: str, body: str) -> None:
+        self.title = title
+        self.body = body
+
+
+def test_digest_prompt_truncates_long_source_line() -> None:
+    source = _PromptSource(title='Ttl', body='x' * 500)
+
+    prompt = digest_prompt((source,), cap=60)
+
+    assert len(prompt) <= 60
+    assert '[truncated' in prompt
+
+
+def test_digest_prompt_keeps_short_source_line_intact() -> None:
+    source = _PromptSource(title='Short', body='body')
+
+    prompt = digest_prompt((source,), cap=1000)
+
+    assert prompt == '- Short: body'
+    assert '[truncated' not in prompt
+
+
+@pytest.mark.django_db
+def test_generate_digest_caps_sources_and_audits_truncation(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    m_monkeypatch.setenv('ENGRAM_DIGEST_MAX_SOURCES', '2')
+    recent = create_source_memory(organization, team, project, title='AAA recent')
+    middle = create_source_memory(organization, team, project, title='BBB middle')
+    oldest = create_source_memory(organization, team, project, title='CCC oldest')
+    now = timezone.now()
+    Memory.objects.filter(id=recent.id).update(updated_at=now)
+    Memory.objects.filter(id=middle.id).update(updated_at=now - timedelta(hours=1))
+    Memory.objects.filter(id=oldest.id).update(updated_at=now - timedelta(hours=2))
+
+    result = GenerateDigest().execute(
+        DigestInput(
+            project_id=project.id,
+            memory_ids=(recent.id, middle.id, oldest.id),
+            request_id='digest-cap',
+        ),
+    )
+
+    assert result.memory.metadata['source_memory_ids'] == [str(recent.id), str(middle.id)]
+    assert str(oldest.id) not in result.memory.metadata['source_memory_ids']
+    audit = AuditEvent.objects.get(event_type='DigestSourcesTruncated', target_id=str(project.id))
+    assert audit.metadata['total_sources'] == 3
+    assert audit.metadata['sources_used'] == 2
+
+
+@pytest.mark.django_db
+def test_generate_digest_does_not_audit_truncation_within_cap(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    m_monkeypatch.setenv('ENGRAM_DIGEST_MAX_SOURCES', '10')
+    source = create_source_memory(organization, team, project, title='Only source')
+
+    GenerateDigest().execute(
+        DigestInput(project_id=project.id, memory_ids=(source.id,), request_id='digest-no-cap'),
+    )
+
+    assert not AuditEvent.objects.filter(event_type='DigestSourcesTruncated').exists()
+
+
+@pytest.mark.django_db
+def test_daily_digest_non_retryable_failure_audits_and_marks_run_failed(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_digest_policy(organization, team, project)
+    source = create_source_memory(organization, team, project, title='Failing source')
+    error = ModelPolicyError('provider_payment_required', 'provider returned 402', retryable=False, http_status=402)
+    m_monkeypatch.setattr('engram.memory.services.get_provider_gateway', digest_policy_routed_gateway(error))
+    request_id = f'daily-digest:{project.id}'
+
+    with pytest.raises(MemoryWorkerError):
+        run_daily_digest_with_tracking(
+            organization_id=organization.id,
+            project_id=project.id,
+            memory_ids=(source.id,),
+            request_id=request_id,
+            correlation_id=request_id,
+        )
+
+    run = WorkflowRun.objects.get(project=project, run_type=WorkflowRunType.DAILY_DIGEST)
+    assert run.status == WorkflowRunStatus.FAILED
+    audit = AuditEvent.objects.get(event_type='DigestFailed', target_id=str(project.id))
+    assert audit.result == AuditResult.ERROR
+    assert audit.metadata['digest_kind'] == 'daily_structured'
