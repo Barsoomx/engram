@@ -10,7 +10,7 @@ from engram_cli.mcp_tools import ToolFn, build_tools
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "engram"
-SERVER_VERSION = "0.3.3"
+SERVER_VERSION = "0.4.0"
 
 ToolMap = dict[str, ToolFn]
 
