@@ -1162,12 +1162,20 @@ def send_hook_event(
     )
 
 
+SESSION_START_EMPTY_MESSAGE = "Engram: no project memory yet."
+
+
 def format_hook_response(
     body: dict[str, object], response_format: str, hook_command: str
 ) -> dict[str, object]:
     if response_format == "server":
         return body
     if hook_command == "session-start":
+        if not body.get("items"):
+            if response_format == "claude-code":
+                return {"systemMessage": SESSION_START_EMPTY_MESSAGE}
+
+            return {"continue": True, "systemMessage": SESSION_START_EMPTY_MESSAGE}
         rendered = as_string(body.get("rendered_context"))
         if response_format == "claude-code":
             return {
@@ -1187,6 +1195,11 @@ def format_hook_response(
             },
         }
     if hook_command == "user-prompt-submit":
+        if not body.get("items"):
+            if response_format == "claude-code":
+                return {}
+
+            return {"continue": True}
         rendered = as_string(body.get("rendered_context"))
         if response_format == "claude-code":
             return {

@@ -10,6 +10,7 @@ from engram_cli.commands import (
     build_session_start_hook_payload,
     build_session_start_payload,
     build_user_prompt_submit_payload,
+    format_hook_response,
 )
 
 CONFIG: dict[str, object] = {"project_id": "", "team_id": "", "agent_version": ""}
@@ -367,6 +368,95 @@ class SessionStartQueryPayloadTests(unittest.TestCase):
         )
 
         self.assertEqual(500, built["token_budget"])
+
+
+class FormatHookResponseEmptyInjectionTests(unittest.TestCase):
+    def test_user_prompt_submit_claude_code_empty_items_returns_empty_dict(self) -> None:
+        result = format_hook_response(
+            {"status": "created", "items": [], "rendered_context": ""},
+            "claude-code",
+            "user-prompt-submit",
+        )
+
+        self.assertEqual({}, result)
+
+    def test_user_prompt_submit_default_format_empty_items_returns_continue_only(
+        self,
+    ) -> None:
+        result = format_hook_response(
+            {"status": "created", "items": [], "rendered_context": ""},
+            "codex",
+            "user-prompt-submit",
+        )
+
+        self.assertEqual({"continue": True}, result)
+
+    def test_user_prompt_submit_nonempty_items_still_injects(self) -> None:
+        result = format_hook_response(
+            {
+                "status": "created",
+                "items": [{"citation": "M1"}],
+                "rendered_context": "Relevant Engram context",
+            },
+            "claude-code",
+            "user-prompt-submit",
+        )
+
+        self.assertEqual("Relevant Engram context", result["systemMessage"])
+        self.assertEqual(
+            {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "Relevant Engram context",
+            },
+            result["hookSpecificOutput"],
+        )
+
+    def test_session_start_empty_items_emits_friendly_message_only(self) -> None:
+        result = format_hook_response(
+            {"status": "created", "items": [], "rendered_context": ""},
+            "claude-code",
+            "session-start",
+        )
+
+        self.assertEqual({"systemMessage": "Engram: no project memory yet."}, result)
+
+    def test_session_start_empty_items_default_format_includes_continue(self) -> None:
+        result = format_hook_response(
+            {"status": "created", "items": [], "rendered_context": ""},
+            "codex",
+            "session-start",
+        )
+
+        self.assertEqual(
+            {"continue": True, "systemMessage": "Engram: no project memory yet."},
+            result,
+        )
+
+    def test_session_start_nonempty_items_still_injects_full_render(self) -> None:
+        result = format_hook_response(
+            {
+                "status": "created",
+                "items": [{"citation": "M1"}],
+                "rendered_context": "Relevant Engram context",
+            },
+            "claude-code",
+            "session-start",
+        )
+
+        self.assertEqual("Relevant Engram context", result["systemMessage"])
+        self.assertEqual(
+            {
+                "hookEventName": "SessionStart",
+                "additionalContext": "Relevant Engram context",
+            },
+            result["hookSpecificOutput"],
+        )
+
+    def test_server_response_format_passes_body_through_unchanged(self) -> None:
+        body = {"status": "created", "items": [], "rendered_context": ""}
+        result = format_hook_response(body, "server", "user-prompt-submit")
+
+        self.assertEqual(body, result)
 
 
 class HookProjectLadderTests(unittest.TestCase):
