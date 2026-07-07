@@ -3,7 +3,11 @@ import { apiClient } from '@/lib/auth';
 export type RetrievalSettings = {
   hybrid_retrieval_enabled: boolean;
   require_provenance: boolean;
+  lexical_recall_enabled: boolean;
+  lexical_fusion_enabled: boolean;
+  curator_llm_judge_enabled: boolean;
   confidence_decay_enabled: boolean;
+  realtime_candidates_enabled: boolean;
   distillation_auto_approve_threshold: number | null;
   near_dup_threshold: number;
 };

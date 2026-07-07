@@ -1,60 +1,45 @@
 'use client';
 
-import { useQuery } from '@tanstack/react-query';
-import * as React from 'react';
-import { AlertTriangle, Layers } from 'lucide-react';
+import { Input, Select, SelectItem } from '@heroui/react';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { Layers } from 'lucide-react';
 import Link from 'next/link';
+import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { StatusPill } from '@/components/ui/status-pill';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, type MeResponse } from '@/lib/auth';
-import {
-  listContextBundles,
-  type ContextBundleListItem,
-} from '@/lib/console-api';
-import { formatRelativeTime } from '@/lib/design';
+import { listContextBundles, type ContextBundleListItem } from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
 const GRID_COLUMNS =
   'minmax(0,1.7fr) minmax(0,0.9fr) minmax(0,0.6fr) minmax(0,0.7fr) minmax(0,1.3fr) minmax(0,0.7fr)';
 
-function statusTone(status: string): { text: string; bg: string } {
-  const value = status.toLowerCase();
+const STATUS_OPTIONS = ['created', 'injected', 'skipped'] as const;
 
-  if (
-    ['rendered', 'ready', 'authorized', 'active', 'completed', 'complete', 'ok'].includes(
-      value,
-    )
-  ) {
-    return { text: 'text-success', bg: 'rgba(61,217,172,0.13)' };
-  }
+const PAGE_SIZE = 50;
 
-  if (['pending', 'partial', 'rendering', 'queued', 'building'].includes(value)) {
-    return { text: 'text-warning', bg: 'rgba(242,183,101,0.14)' };
-  }
+type BundleFilters = {
+  status: string;
+  session_id: string;
+  since: string;
+  until: string;
+  page: number;
+};
 
-  if (['failed', 'error', 'denied', 'rejected', 'empty'].includes(value)) {
-    return { text: 'text-danger', bg: 'rgba(251,110,114,0.13)' };
-  }
-
-  return { text: 'text-default-500', bg: 'rgba(255,255,255,0.05)' };
-}
-
-function StatusPill({ status }: { status: string }) {
-  const tone = statusTone(status);
-
-  return (
-    <span
-      className={`inline-flex items-center gap-1.5 rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${tone.text}`}
-      style={{ backgroundColor: tone.bg }}
-    >
-      <span className='h-1.5 w-1.5 rounded-full bg-current' />
-      {status || 'unknown'}
-    </span>
-  );
-}
+const DEFAULT_FILTERS: BundleFilters = {
+  status: '',
+  session_id: '',
+  since: '',
+  until: '',
+  page: 0,
+};
 
 function ColumnHeader() {
   return (
@@ -79,30 +64,26 @@ function BundleRow({ bundle }: { bundle: ContextBundleListItem }) {
       className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
       style={{ gridTemplateColumns: GRID_COLUMNS }}
     >
-      <span className='truncate text-[13.5px] font-medium text-foreground'>
+      <span className='truncate text-[13.5px] font-medium text-foreground' title={bundle.purpose || undefined}>
         {bundle.purpose || '(no purpose)'}
       </span>
       <span className='min-w-0'>
         <StatusPill status={bundle.status} />
       </span>
-      <span className='tnum font-mono text-[12px] text-default-500'>
-        {bundle.selected_count}
-      </span>
-      <span className='tnum font-mono text-[12px] text-default-500'>
-        {bundle.token_budget?.toLocaleString() ?? '—'}
-      </span>
+      <span className='tnum font-mono text-[12px] text-default-500'>{bundle.selected_count}</span>
+      <span className='tnum font-mono text-[12px] text-default-500'>{bundle.token_budget?.toLocaleString() ?? '—'}</span>
       <span className='min-w-0'>
-        <span className='block truncate font-mono text-[11.5px] text-default-500'>
+        <span className='block truncate font-mono text-[11.5px] text-default-500' title={bundle.session_id || undefined}>
           {bundle.session_id || '—'}
         </span>
         {bundle.agent_id && (
-          <span className='block truncate font-mono text-[11px] text-default-400'>
+          <span className='block truncate font-mono text-[11px] text-default-400' title={bundle.agent_id}>
             {bundle.agent_id}
           </span>
         )}
       </span>
       <span className='whitespace-nowrap text-[12px] text-default-400'>
-        {formatRelativeTime(bundle.created_at)}
+        <TimeStamp value={bundle.created_at} />
       </span>
     </Link>
   );
@@ -149,32 +130,125 @@ function BundlesTableSkeleton() {
   );
 }
 
-const PAGE_SIZE = 50;
+function BundleFilterBar({
+  filters,
+  sessionInput,
+  onSessionInput,
+  onChange,
+  onReset,
+}: {
+  filters: BundleFilters;
+  sessionInput: string;
+  onSessionInput: (value: string) => void;
+  onChange: (next: Partial<BundleFilters>) => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className='surface-card grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-5'>
+      <Select
+        label='Status'
+        labelPlacement='outside'
+        placeholder='Any'
+        selectedKeys={filters.status ? new Set([filters.status]) : new Set<string>()}
+        onSelectionChange={(keys) => {
+          const next = Array.from(keys)[0];
+          onChange({ status: typeof next === 'string' ? next : '', page: 0 });
+        }}
+      >
+        {STATUS_OPTIONS.map((status) => (
+          <SelectItem key={status}>{status}</SelectItem>
+        ))}
+      </Select>
+      <Input
+        label='Session ID'
+        labelPlacement='outside'
+        placeholder='uuid'
+        value={sessionInput}
+        onValueChange={onSessionInput}
+        isClearable
+        onClear={() => onSessionInput('')}
+      />
+      <Input
+        label='Since'
+        labelPlacement='outside'
+        type='datetime-local'
+        value={filters.since}
+        onValueChange={(value) => onChange({ since: value, page: 0 })}
+      />
+      <Input
+        label='Until'
+        labelPlacement='outside'
+        type='datetime-local'
+        value={filters.until}
+        onValueChange={(value) => onChange({ until: value, page: 0 })}
+      />
+      <div className='flex items-end'>
+        <button
+          type='button'
+          onClick={onReset}
+          className='h-10 rounded-[10px] border border-divider bg-content1 px-3.5 text-[12.5px] font-medium text-default-500 transition-colors hover:text-foreground'
+        >
+          Reset
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function toIso(value: string): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
 
 export default function ContextBundlesPage() {
-  const meQuery = useQuery<MeResponse>({
-    queryKey: ['auth', 'me'],
-    queryFn: fetchMe,
-  });
+  const meQuery = useQuery<MeResponse>({ queryKey: ['auth', 'me'], queryFn: fetchMe });
   const capabilities = meQuery.data?.capabilities ?? [];
 
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
-  const [page, setPage] = React.useState(0);
+
+  const [filters, setFilters, resetFilters] = useUrlFilters<BundleFilters>(DEFAULT_FILTERS);
+  const [sessionInput, setSessionInput] = React.useState(filters.session_id);
 
   React.useEffect(() => {
-    setPage(0);
-  }, [activeProjectId, activeTeamId]);
+    const handle = window.setTimeout(() => {
+      if (sessionInput !== filters.session_id) {
+        setFilters({ session_id: sessionInput, page: 0 });
+      }
+    }, 300);
+
+    return () => window.clearTimeout(handle);
+  }, [sessionInput, filters.session_id, setFilters]);
 
   const query = useQuery({
-    queryKey: ['inspection', 'context-bundles', activeProjectId, activeTeamId, page],
+    queryKey: [
+      'inspection',
+      'context-bundles',
+      activeProjectId,
+      activeTeamId,
+      filters.status,
+      filters.session_id,
+      filters.since,
+      filters.until,
+      filters.page,
+    ],
     enabled: Boolean(activeProjectId),
+    placeholderData: keepPreviousData,
     queryFn: () =>
       listContextBundles({
         projectId: activeProjectId ?? '',
         teamId: activeTeamId,
         limit: PAGE_SIZE,
-        offset: page * PAGE_SIZE,
+        offset: filters.page * PAGE_SIZE,
+        status: filters.status || undefined,
+        session_id: filters.session_id || undefined,
+        since: toIso(filters.since),
+        until: toIso(filters.until),
       }),
   });
 
@@ -184,10 +258,7 @@ export default function ContextBundlesPage() {
   return (
     <CapabilityGate capabilities={capabilities} required='context:read'>
       <section className='space-y-6'>
-        <PageHeader
-          title='Context Bundles'
-          subtitle='Assembled context delivered to agents.'
-        />
+        <PageHeader title='Context Bundles' subtitle='Assembled context delivered to agents.' />
 
         {!activeProjectId ? (
           <EmptyState
@@ -195,51 +266,63 @@ export default function ContextBundlesPage() {
             description='Choose a project from the switcher above to inspect its assembled context bundles.'
             icon={<Layers className='h-6 w-6' />}
           />
-        ) : query.isLoading ? (
-          <BundlesTableSkeleton />
-        ) : query.isError ? (
-          <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-            <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-            <p className='text-[13px] leading-relaxed text-danger'>
-              {query.error instanceof Error
-                ? query.error.message
-                : 'Failed to load context bundles.'}
-            </p>
-          </div>
-        ) : items.length === 0 ? (
-          <EmptyState
-            title='No context bundles yet'
-            description='Context bundles assembled and delivered to your agents for this project will appear here.'
-            icon={<Layers className='h-6 w-6' />}
-          />
         ) : (
           <>
-            <BundlesTable items={items} />
-            <div className='flex items-center justify-between gap-3'>
-              <p className='text-[12px] text-default-400'>
-                {total > 0
-                  ? `Showing ${page * PAGE_SIZE + 1}-${page * PAGE_SIZE + items.length} of ${total}`
-                  : `Showing ${items.length} bundle${items.length === 1 ? '' : 's'}`}
-              </p>
-              <div className='flex items-center gap-2'>
-                <button
-                  type='button'
-                  onClick={() => setPage((p) => Math.max(0, p - 1))}
-                  disabled={page === 0}
-                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-                >
-                  Previous
-                </button>
-                <button
-                  type='button'
-                  onClick={() => setPage((p) => p + 1)}
-                  disabled={(page + 1) * PAGE_SIZE >= total}
-                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-                >
-                  Next
-                </button>
-              </div>
-            </div>
+            <BundleFilterBar
+              filters={filters}
+              sessionInput={sessionInput}
+              onSessionInput={setSessionInput}
+              onChange={setFilters}
+              onReset={() => {
+                setSessionInput('');
+                resetFilters();
+              }}
+            />
+
+            {query.isLoading ? (
+              <BundlesTableSkeleton />
+            ) : query.isError ? (
+              <ErrorState
+                title='Failed to load context bundles'
+                message={query.error instanceof Error ? query.error.message : 'The context bundles could not be loaded.'}
+                onRetry={() => query.refetch()}
+              />
+            ) : items.length === 0 ? (
+              <EmptyState
+                title='No context bundles'
+                description='No bundles match the current filters for this project.'
+                icon={<Layers className='h-6 w-6' />}
+              />
+            ) : (
+              <>
+                <BundlesTable items={items} />
+                <div className='flex items-center justify-between gap-3'>
+                  <p className='text-[12px] text-default-400'>
+                    {total > 0
+                      ? `Showing ${filters.page * PAGE_SIZE + 1}-${filters.page * PAGE_SIZE + items.length} of ${total}`
+                      : `Showing ${items.length} bundle${items.length === 1 ? '' : 's'}`}
+                  </p>
+                  <div className='flex items-center gap-2'>
+                    <button
+                      type='button'
+                      onClick={() => setFilters({ page: Math.max(0, filters.page - 1) })}
+                      disabled={filters.page === 0}
+                      className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                    >
+                      Previous
+                    </button>
+                    <button
+                      type='button'
+                      onClick={() => setFilters({ page: filters.page + 1 })}
+                      disabled={(filters.page + 1) * PAGE_SIZE >= total}
+                      className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
+                    >
+                      Next
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
           </>
         )}
       </section>

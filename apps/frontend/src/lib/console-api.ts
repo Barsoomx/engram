@@ -229,6 +229,7 @@ export interface ContextBundleWarning {
 export interface ContextBundleDetail extends ContextBundleListItem {
   rendered_text: string;
   authorization_scope: Record<string, unknown> | null;
+  retrieval_latency_ms?: number | null;
   warnings: ContextBundleWarning[];
   metadata: Record<string, unknown> | null;
   items: ContextBundleEntry[];
@@ -237,6 +238,8 @@ export interface ContextBundleDetail extends ContextBundleListItem {
 export interface ContextBundleListParams extends ScopeParams {
   session_id?: string;
   status?: string;
+  since?: string;
+  until?: string;
 }
 
 export async function listContextBundles(
@@ -250,6 +253,14 @@ export async function listContextBundles(
 
   if (scope.status) {
     params.status = scope.status;
+  }
+
+  if (scope.since) {
+    params.since = scope.since;
+  }
+
+  if (scope.until) {
+    params.until = scope.until;
   }
 
   const response = await apiClient().get('/v1/inspection/context-bundles', {
@@ -717,10 +728,8 @@ export async function reviewDigest(
 /* -------------------------------- Hook dry-run ---------------------------- */
 
 export interface HookDryRunInput {
-  project_id: string;
+  project_id: string | null;
   team_id?: string | null;
-  agent_runtime: string;
-  agent_version?: string;
   request_id?: string;
 }
 

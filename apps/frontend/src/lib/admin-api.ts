@@ -525,7 +525,8 @@ export type MemoryReviewActionName =
   | 'narrow'
   | 'supersede'
   | 'reject'
-  | 'archive';
+  | 'archive'
+  | 'restore';
 
 export type MemoryReviewActionPayload = {
   action: MemoryReviewActionName;

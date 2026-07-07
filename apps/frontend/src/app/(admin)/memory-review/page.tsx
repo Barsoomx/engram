@@ -20,30 +20,38 @@ import {
   SelectItem,
   Textarea,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import {
   Archive,
   GitCompareArrows,
   MoreHorizontal,
   Pencil,
+  RotateCcw,
   ShieldCheck,
   Target,
   ThumbsDown,
   ThumbsUp,
 } from 'lucide-react';
+import Link from 'next/link';
 import * as React from 'react';
 
-import { EmptyState } from '@/components/ui/empty-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { StatusPill } from '@/components/ui/status-pill';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { TimeStamp } from '@/components/ui/time-stamp';
 import {
   useBulkArchiveMemoryReview,
   useMemoryReview,
   useMemoryReviewAction,
   useMemoryReviewDiff,
 } from '@/hooks/use-memory-review';
+import { useProjects } from '@/hooks/use-projects';
+import { useTeams } from '@/hooks/use-teams';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type {
   MemoryReviewActionName,
@@ -51,25 +59,43 @@ import type {
   MemoryReviewDiffSlice,
   MemoryReviewItem,
   MemoryReviewItemType,
+  MemoryReviewOrdering,
 } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 
-const VISIBILITY_SCOPES = ['global', 'team', 'project', 'user'] as const;
+const VISIBILITY_SCOPES = ['project'] as const;
 
-const STATUS_OPTIONS = ['proposed', 'conflict', 'refuted'] as const;
+const STATUS_OPTIONS = ['proposed', 'refuted'] as const;
 
-const SOURCE_TYPES = ['file', 'git', 'web', 'tool'] as const;
+const SOURCE_TYPES = [
+  'hook_event',
+  'claude_mem',
+  'user_prompts',
+  'observations',
+  'session_summaries',
+] as const;
+
+const SOURCE_TYPE_LABELS: Record<string, string> = {
+  hook_event: 'Hook event',
+  claude_mem: 'claude-mem',
+  user_prompts: 'User prompts',
+  observations: 'Observations',
+  session_summaries: 'Session summaries',
+};
+
+const ORDERING_OPTIONS: { value: MemoryReviewOrdering; label: string }[] = [
+  { value: '-created_at', label: 'Newest first' },
+  { value: 'created_at', label: 'Oldest first' },
+  { value: '-confidence', label: 'Confidence: high → low' },
+  { value: 'confidence', label: 'Confidence: low → high' },
+];
 
 const PAGE_SIZE = 50;
 
-const ACTION_REQUIRES_TARGET: ReadonlySet<MemoryReviewActionName> = new Set([
-  'narrow',
-  'supersede',
-]);
+const ACTION_REQUIRES_TARGET: ReadonlySet<MemoryReviewActionName> = new Set(['narrow', 'supersede']);
 
-const ACTION_REQUIRES_BODY: ReadonlySet<MemoryReviewActionName> = new Set([
-  'edit',
-]);
+const ACTION_REQUIRES_BODY: ReadonlySet<MemoryReviewActionName> = new Set(['edit']);
 
 const ACTION_META: Record<
   MemoryReviewActionName,
@@ -81,77 +107,42 @@ const ACTION_META: Record<
   supersede: { label: 'Supersede', color: 'warning', icon: GitCompareArrows },
   reject: { label: 'Reject', color: 'danger', icon: ThumbsDown },
   archive: { label: 'Archive', color: 'danger', icon: Archive },
+  restore: { label: 'Restore', color: 'success', icon: RotateCcw },
 };
 
 const ACTIONS_FOR_TYPE: Record<MemoryReviewItemType, MemoryReviewActionName[]> = {
   candidate: ['approve', 'edit', 'narrow', 'supersede', 'reject'],
-  memory: ['archive', 'reject'],
+  memory: ['restore', 'archive', 'reject'],
 };
 
 function formatDateTime(value: string | null | undefined): string {
   if (!value) {
-
     return '—';
   }
 
   try {
-
     return new Date(value).toLocaleString();
   } catch {
-
     return value;
   }
 }
 
-function formatAgeDays(value: string): string {
-  const createdAt = new Date(value).getTime();
-
-  if (!Number.isFinite(createdAt)) {
-
-    return '—';
-  }
-
-  const deltaMs = Date.now() - createdAt;
-
-  if (deltaMs < 0) {
-
-    return '0d';
-  }
-
-  const days = Math.floor(deltaMs / (1000 * 60 * 60 * 24));
-
-  if (days >= 1) {
-
-    return `${days}d`;
-  }
-
-  const hours = Math.floor(deltaMs / (1000 * 60 * 60));
-
-  return `${hours}h`;
-}
-
-function confidenceColor(
-  value: string | null,
-): 'default' | 'success' | 'warning' | 'danger' {
+function confidenceColor(value: string | null): 'default' | 'success' | 'warning' | 'danger' {
   if (value === null) {
-
     return 'default';
   }
 
   const numeric = Number.parseFloat(value);
 
   if (!Number.isFinite(numeric)) {
-
     return 'default';
   }
 
   if (numeric >= 0.8) {
-
     return 'success';
   }
 
   if (numeric >= 0.4) {
-
     return 'warning';
   }
 
@@ -160,23 +151,18 @@ function confidenceColor(
 
 function extractErrorDetail(error: unknown): string {
   if (axios.isAxiosError(error)) {
-    const data = error.response?.data as
-      | { detail?: string; code?: string }
-      | undefined;
+    const data = error.response?.data as { detail?: string; code?: string } | undefined;
 
     if (data?.detail) {
-
       return data.detail;
     }
 
     if (data?.code) {
-
       return data.code;
     }
   }
 
   if (error instanceof Error) {
-
     return error.message;
   }
 
@@ -185,6 +171,7 @@ function extractErrorDetail(error: unknown): string {
 
 type FilterState = {
   search: string;
+  project_id: string;
   team_id: string;
   visibility_scope: string;
   confidence_gte: string;
@@ -192,10 +179,13 @@ type FilterState = {
   status: string;
   age_days_gte: string;
   source_type: string;
+  ordering: MemoryReviewOrdering;
+  page: number;
 };
 
-const EMPTY_FILTERS: FilterState = {
+const DEFAULT_FILTERS: FilterState = {
   search: '',
+  project_id: '',
   team_id: '',
   visibility_scope: '',
   confidence_gte: '',
@@ -203,20 +193,27 @@ const EMPTY_FILTERS: FilterState = {
   status: '',
   age_days_gte: '',
   source_type: '',
+  ordering: '-created_at',
+  page: 1,
 };
 
-function buildParams(
-  filters: FilterState,
-  page: number,
-): Record<string, string | number> {
-  const params: Record<string, string | number> = { page, pageSize: PAGE_SIZE };
+function buildParams(filters: FilterState): Record<string, string | number> {
+  const params: Record<string, string | number> = {
+    page: filters.page,
+    pageSize: PAGE_SIZE,
+    ordering: filters.ordering,
+  };
 
   if (filters.search.trim()) {
     params.search = filters.search.trim();
   }
 
-  if (filters.team_id.trim()) {
-    params.team_id = filters.team_id.trim();
+  if (filters.project_id) {
+    params.project_id = filters.project_id;
+  }
+
+  if (filters.team_id) {
+    params.team_id = filters.team_id;
   }
 
   if (filters.visibility_scope) {
@@ -250,17 +247,28 @@ function buildParams(
   return params;
 }
 
+interface NamedOption {
+  id: string;
+  name: string;
+}
+
 function FilterBar({
   filters,
+  searchInput,
+  onSearchInput,
   onChange,
+  onReset,
+  projects,
+  teams,
 }: {
   filters: FilterState;
-  onChange: (next: FilterState) => void;
+  searchInput: string;
+  onSearchInput: (value: string) => void;
+  onChange: (next: Partial<FilterState>) => void;
+  onReset: () => void;
+  projects: NamedOption[];
+  teams: NamedOption[];
 }) {
-  function update<K extends keyof FilterState>(key: K, value: FilterState[K]) {
-    onChange({ ...filters, [key]: value });
-  }
-
   return (
     <div className='surface-card p-4'>
       <div className='grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4'>
@@ -268,36 +276,77 @@ function FilterBar({
           label='Search'
           labelPlacement='outside'
           placeholder='Title or body…'
-          value={filters.search}
-          onValueChange={(value) => update('search', value)}
+          value={searchInput}
+          onValueChange={onSearchInput}
           isClearable
-          onClear={() => update('search', '')}
+          onClear={() => onSearchInput('')}
         />
-        <Input
-          label='Team ID'
+        <Select
+          label='Project'
           labelPlacement='outside'
-          placeholder='uuid'
-          value={filters.team_id}
-          onValueChange={(value) => update('team_id', value)}
-          isClearable
-          onClear={() => update('team_id', '')}
-        />
+          placeholder='Any'
+          selectedKeys={filters.project_id ? new Set([filters.project_id]) : new Set<string>()}
+          onSelectionChange={(keys) => {
+            const next = Array.from(keys)[0];
+            onChange({ project_id: typeof next === 'string' ? next : '', page: 1 });
+          }}
+        >
+          {projects.map((project) => (
+            <SelectItem key={project.id}>{project.name}</SelectItem>
+          ))}
+        </Select>
+        <Select
+          label='Team'
+          labelPlacement='outside'
+          placeholder='Any'
+          selectedKeys={filters.team_id ? new Set([filters.team_id]) : new Set<string>()}
+          onSelectionChange={(keys) => {
+            const next = Array.from(keys)[0];
+            onChange({ team_id: typeof next === 'string' ? next : '', page: 1 });
+          }}
+        >
+          {teams.map((team) => (
+            <SelectItem key={team.id}>{team.name}</SelectItem>
+          ))}
+        </Select>
+        <Select
+          label='Sort'
+          labelPlacement='outside'
+          selectedKeys={new Set([filters.ordering])}
+          onSelectionChange={(keys) => {
+            const next = Array.from(keys)[0];
+
+            if (typeof next === 'string') {
+              onChange({ ordering: next as MemoryReviewOrdering, page: 1 });
+            }
+          }}
+        >
+          {ORDERING_OPTIONS.map((option) => (
+            <SelectItem key={option.value}>{option.label}</SelectItem>
+          ))}
+        </Select>
+        <Select
+          label='Status'
+          labelPlacement='outside'
+          placeholder='Any'
+          selectedKeys={filters.status ? new Set([filters.status]) : new Set<string>()}
+          onSelectionChange={(keys) => {
+            const next = Array.from(keys)[0];
+            onChange({ status: typeof next === 'string' ? next : '', page: 1 });
+          }}
+        >
+          {STATUS_OPTIONS.map((status) => (
+            <SelectItem key={status}>{status}</SelectItem>
+          ))}
+        </Select>
         <Select
           label='Visibility scope'
           labelPlacement='outside'
           placeholder='Any'
-          selectedKeys={
-            filters.visibility_scope
-              ? new Set([filters.visibility_scope])
-              : new Set<string>()
-          }
+          selectedKeys={filters.visibility_scope ? new Set([filters.visibility_scope]) : new Set<string>()}
           onSelectionChange={(keys) => {
             const next = Array.from(keys)[0];
-
-            update(
-              'visibility_scope',
-              typeof next === 'string' ? next : '',
-            );
+            onChange({ visibility_scope: typeof next === 'string' ? next : '', page: 1 });
           }}
         >
           {VISIBILITY_SCOPES.map((scope) => (
@@ -305,20 +354,17 @@ function FilterBar({
           ))}
         </Select>
         <Select
-          label='Status'
+          label='Source type'
           labelPlacement='outside'
           placeholder='Any'
-          selectedKeys={
-            filters.status ? new Set([filters.status]) : new Set<string>()
-          }
+          selectedKeys={filters.source_type ? new Set([filters.source_type]) : new Set<string>()}
           onSelectionChange={(keys) => {
             const next = Array.from(keys)[0];
-
-            update('status', typeof next === 'string' ? next : '');
+            onChange({ source_type: typeof next === 'string' ? next : '', page: 1 });
           }}
         >
-          {STATUS_OPTIONS.map((status) => (
-            <SelectItem key={status}>{status}</SelectItem>
+          {SOURCE_TYPES.map((source) => (
+            <SelectItem key={source}>{SOURCE_TYPE_LABELS[source] ?? source}</SelectItem>
           ))}
         </Select>
         <Input
@@ -330,7 +376,7 @@ function FilterBar({
           max={1}
           step={0.05}
           value={filters.confidence_gte}
-          onValueChange={(value) => update('confidence_gte', value)}
+          onValueChange={(value) => onChange({ confidence_gte: value, page: 1 })}
         />
         <Input
           label='Confidence ≤'
@@ -341,7 +387,7 @@ function FilterBar({
           max={1}
           step={0.05}
           value={filters.confidence_lte}
-          onValueChange={(value) => update('confidence_lte', value)}
+          onValueChange={(value) => onChange({ confidence_lte: value, page: 1 })}
         />
         <Input
           label='Age ≥ (days)'
@@ -351,35 +397,11 @@ function FilterBar({
           min={0}
           step={1}
           value={filters.age_days_gte}
-          onValueChange={(value) => update('age_days_gte', value)}
+          onValueChange={(value) => onChange({ age_days_gte: value, page: 1 })}
         />
-        <Select
-          label='Source type'
-          labelPlacement='outside'
-          placeholder='Any'
-          selectedKeys={
-            filters.source_type
-              ? new Set([filters.source_type])
-              : new Set<string>()
-          }
-          onSelectionChange={(keys) => {
-            const next = Array.from(keys)[0];
-
-            update('source_type', typeof next === 'string' ? next : '');
-          }}
-        >
-          {SOURCE_TYPES.map((source) => (
-            <SelectItem key={source}>{source}</SelectItem>
-          ))}
-        </Select>
       </div>
       <div className='mt-3 flex justify-end'>
-        <Button
-          size='sm'
-          variant='light'
-          onPress={() => onChange(EMPTY_FILTERS)}
-          isDisabled={filters === EMPTY_FILTERS}
-        >
+        <Button size='sm' variant='light' onPress={onReset}>
           Reset filters
         </Button>
       </div>
@@ -399,22 +421,20 @@ function SourceSummary({ item }: { item: MemoryReviewItem }) {
   const source = item.source_observation;
 
   if (!source) {
-
     return <span className='text-default-500'>—</span>;
   }
 
-  const files = [
-    ...(source.files_read ?? []),
-    ...(source.files_modified ?? []),
-  ].slice(0, 2);
+  const files = [...(source.files_read ?? []), ...(source.files_modified ?? [])].slice(0, 2);
 
   return (
     <div className='space-y-0.5'>
       {source.title ? (
-        <p className='text-default-700 truncate max-w-[220px]'>{source.title}</p>
+        <p className='max-w-[220px] truncate text-default-700' title={source.title}>
+          {source.title}
+        </p>
       ) : null}
       {files.length > 0 ? (
-        <p className='text-xs text-default-500 font-mono truncate max-w-[220px]'>
+        <p className='max-w-[220px] truncate font-mono text-xs text-default-500' title={files.join(', ')}>
           {files.join(', ')}
         </p>
       ) : null}
@@ -422,9 +442,7 @@ function SourceSummary({ item }: { item: MemoryReviewItem }) {
   );
 }
 
-type RowAction =
-  | { kind: 'view-diff' }
-  | { kind: 'action'; action: MemoryReviewActionName };
+type RowAction = { kind: 'view-diff' } | { kind: 'action'; action: MemoryReviewActionName };
 
 interface ReviewTableProps {
   items: MemoryReviewItem[];
@@ -435,158 +453,139 @@ interface ReviewTableProps {
   onRowAction: (item: MemoryReviewItem, action: RowAction) => void;
 }
 
-function ReviewTable({
-  items,
-  selectedIds,
-  canAdmin,
-  onToggleRow,
-  onToggleAll,
-  onRowAction,
-}: ReviewTableProps) {
+function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, onRowAction }: ReviewTableProps) {
   const allIds = items.map((item) => item.id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selectedIds.has(id));
   const someSelected = allIds.some((id) => selectedIds.has(id));
 
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            {canAdmin && (
-              <th className='py-2 px-3 w-10'>
-                <Checkbox
-                  isSelected={allSelected}
-                  isIndeterminate={!allSelected && someSelected}
-                  onValueChange={() => onToggleAll(allIds)}
-                  aria-label='Select all rows'
-                />
-              </th>
-            )}
-            <th className='py-2 px-3 text-default-500 font-medium'>Title</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Type</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Confidence</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Source</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Age</th>
-            <th className='py-2 px-3 text-default-500 font-medium text-right'>
-              Actions
+    <ResponsiveTable minWidth={820}>
+      <thead>
+        <tr className='border-b border-divider'>
+          {canAdmin && (
+            <th className='w-10 px-3 py-2'>
+              <Checkbox
+                isSelected={allSelected}
+                isIndeterminate={!allSelected && someSelected}
+                onValueChange={() => onToggleAll(allIds)}
+                aria-label='Select all rows'
+              />
             </th>
-          </tr>
-        </thead>
-        <tbody>
-          {items.map((item) => {
-            const isSelected = selectedIds.has(item.id);
-            const canDiff = item.type === 'memory';
+          )}
+          <th className='px-3 py-2 font-medium text-default-500'>Title</th>
+          <th className='px-3 py-2 font-medium text-default-500'>Type</th>
+          <th className='px-3 py-2 font-medium text-default-500'>Status</th>
+          <th className='px-3 py-2 font-medium text-default-500'>Confidence</th>
+          <th className='px-3 py-2 font-medium text-default-500'>Source</th>
+          <th className='px-3 py-2 font-medium text-default-500'>Age</th>
+          <th className='px-3 py-2 text-right font-medium text-default-500'>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((item) => {
+          const isSelected = selectedIds.has(item.id);
+          const canDiff = item.type === 'memory';
 
-            return (
-              <tr key={`${item.type}-${item.id}`} className='border-b border-divider/50'>
-                {canAdmin && (
-                  <td className='py-2 px-3'>
-                    <Checkbox
-                      isSelected={isSelected}
-                      onValueChange={() => onToggleRow(item.id)}
-                      aria-label={`Select ${item.title}`}
-                    />
-                  </td>
-                )}
-                <td className='py-2 px-3'>
-                  <p className='text-foreground truncate max-w-[280px]'>
+          return (
+            <tr key={`${item.type}-${item.id}`} className='border-b border-divider/50'>
+              {canAdmin && (
+                <td className='px-3 py-2'>
+                  <Checkbox
+                    isSelected={isSelected}
+                    onValueChange={() => onToggleRow(item.id)}
+                    aria-label={`Select ${item.title}`}
+                  />
+                </td>
+              )}
+              <td className='px-3 py-2'>
+                {item.type === 'memory' ? (
+                  <Link
+                    href={`/memories/${item.id}`}
+                    className='block max-w-[280px] truncate text-foreground hover:text-primary'
+                    title={item.title || 'Untitled'}
+                  >
+                    {item.title || 'Untitled'}
+                  </Link>
+                ) : (
+                  <p className='max-w-[280px] truncate text-foreground' title={item.title || 'Untitled'}>
                     {item.title || 'Untitled'}
                   </p>
-                  {item.body ? (
-                    <p className='text-xs text-default-500 truncate max-w-[280px]'>
-                      {item.body}
-                    </p>
-                  ) : null}
-                </td>
-                <td className='py-2 px-3'>
-                  <TypeChip item={item} />
-                </td>
-                <td className='py-2 px-3'>
-                  <Chip size='sm' variant='flat' className='capitalize'>
-                    {item.status}
+                )}
+                {item.body ? (
+                  <p className='max-w-[280px] truncate text-xs text-default-500' title={item.body}>
+                    {item.body}
+                  </p>
+                ) : null}
+              </td>
+              <td className='px-3 py-2'>
+                <TypeChip item={item} />
+              </td>
+              <td className='px-3 py-2'>
+                <StatusPill status={item.status} />
+              </td>
+              <td className='px-3 py-2'>
+                {item.confidence === null ? (
+                  <span className='text-default-500'>—</span>
+                ) : (
+                  <Chip size='sm' variant='flat' color={confidenceColor(item.confidence)}>
+                    {item.confidence}
                   </Chip>
-                </td>
-                <td className='py-2 px-3'>
-                  {item.confidence === null ? (
-                    <span className='text-default-500'>—</span>
-                  ) : (
-                    <Chip
+                )}
+              </td>
+              <td className='px-3 py-2'>
+                <SourceSummary item={item} />
+              </td>
+              <td className='whitespace-nowrap px-3 py-2 text-default-700'>
+                <TimeStamp value={item.created_at} />
+              </td>
+              <td className='px-3 py-2 text-right'>
+                <div className='flex items-center justify-end gap-2'>
+                  {canDiff ? (
+                    <Button
                       size='sm'
                       variant='flat'
-                      color={confidenceColor(item.confidence)}
+                      startContent={<GitCompareArrows className='h-3.5 w-3.5' />}
+                      onPress={() => onRowAction(item, { kind: 'view-diff' })}
                     >
-                      {item.confidence}
-                    </Chip>
-                  )}
-                </td>
-                <td className='py-2 px-3'>
-                  <SourceSummary item={item} />
-                </td>
-                <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                  {formatAgeDays(item.created_at)}
-                </td>
-                <td className='py-2 px-3 text-right'>
-                  <div className='flex items-center justify-end gap-2'>
-                    {canDiff ? (
-                      <Button
-                        size='sm'
-                        variant='flat'
-                        startContent={<GitCompareArrows className='w-3.5 h-3.5' />}
-                        onPress={() => onRowAction(item, { kind: 'view-diff' })}
+                      Diff
+                    </Button>
+                  ) : null}
+                  {canAdmin ? (
+                    <Dropdown>
+                      <DropdownTrigger>
+                        <Button size='sm' variant='light' isIconOnly aria-label='Row actions'>
+                          <MoreHorizontal className='h-4 w-4' />
+                        </Button>
+                      </DropdownTrigger>
+                      <DropdownMenu
+                        aria-label='Memory review actions'
+                        items={ACTIONS_FOR_TYPE[item.type].map((name) => ({ id: name }))}
                       >
-                        Diff
-                      </Button>
-                    ) : null}
-                    {canAdmin ? (
-                      <Dropdown>
-                        <DropdownTrigger>
-                          <Button
-                            size='sm'
-                            variant='light'
-                            isIconOnly
-                            aria-label='Row actions'
-                          >
-                            <MoreHorizontal className='w-4 h-4' />
-                          </Button>
-                        </DropdownTrigger>
-                        <DropdownMenu
-                          aria-label='Memory review actions'
-                          items={ACTIONS_FOR_TYPE[item.type].map((name) => ({
-                            id: name,
-                          }))}
-                        >
-                          {(entry) => {
-                            const meta = ACTION_META[entry.id];
-                            const Icon = meta.icon;
+                        {(entry) => {
+                          const meta = ACTION_META[entry.id];
+                          const Icon = meta.icon;
 
-                            return (
-                              <DropdownItem
-                                key={entry.id}
-                                color={meta.color}
-                                startContent={<Icon className='w-3.5 h-3.5' />}
-                                onAction={() =>
-                                  onRowAction(item, {
-                                    kind: 'action',
-                                    action: entry.id,
-                                  })
-                                }
-                              >
-                                {meta.label}
-                              </DropdownItem>
-                            );
-                          }}
-                        </DropdownMenu>
-                      </Dropdown>
-                    ) : null}
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+                          return (
+                            <DropdownItem
+                              key={entry.id}
+                              color={meta.color}
+                              startContent={<Icon className='h-3.5 w-3.5' />}
+                              onAction={() => onRowAction(item, { kind: 'action', action: entry.id })}
+                            >
+                              {meta.label}
+                            </DropdownItem>
+                          );
+                        }}
+                      </DropdownMenu>
+                    </Dropdown>
+                  ) : null}
+                </div>
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </ResponsiveTable>
   );
 }
 
@@ -600,15 +599,7 @@ interface ActionModalProps {
   onSubmit: (payload: MemoryReviewActionPayload) => Promise<boolean>;
 }
 
-function ActionModal({
-  isOpen,
-  item,
-  action,
-  isPending,
-  error,
-  onClose,
-  onSubmit,
-}: ActionModalProps) {
+function ActionModal({ isOpen, item, action, isPending, error, onClose, onSubmit }: ActionModalProps) {
   const [reason, setReason] = React.useState('');
   const [body, setBody] = React.useState('');
   const [targetMemoryId, setTargetMemoryId] = React.useState('');
@@ -625,11 +616,8 @@ function ActionModal({
     setBody(item?.body ?? '');
   }, [isOpen, item]);
 
-  const requiresTarget =
-    action !== null && ACTION_REQUIRES_TARGET.has(action);
-
+  const requiresTarget = action !== null && ACTION_REQUIRES_TARGET.has(action);
   const requiresBody = action !== null && ACTION_REQUIRES_BODY.has(action);
-
   const meta = action ? ACTION_META[action] : null;
 
   const canSubmit =
@@ -641,14 +629,10 @@ function ActionModal({
 
   async function handleSubmit() {
     if (!action || !canSubmit) {
-
       return;
     }
 
-    const payload: MemoryReviewActionPayload = {
-      action,
-      reason: reason.trim(),
-    };
+    const payload: MemoryReviewActionPayload = { action, reason: reason.trim() };
 
     if (requiresBody) {
       payload.body = body.trim();
@@ -666,14 +650,7 @@ function ActionModal({
   }
 
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      placement='center'
-      size='lg'
-      isDismissable={!isPending}
-      hideCloseButton={isPending}
-    >
+    <Modal isOpen={isOpen} onClose={onClose} placement='center' size='lg' isDismissable={!isPending} hideCloseButton={isPending}>
       <ModalContent>
         {() => (
           <>
@@ -686,13 +663,9 @@ function ActionModal({
                   <div className='rounded-medium bg-content2/60 p-3 text-sm'>
                     <div className='flex items-center gap-2'>
                       <TypeChip item={item} />
-                      <Chip size='sm' variant='flat' className='capitalize'>
-                        {item.status}
-                      </Chip>
+                      <StatusPill status={item.status} />
                     </div>
-                    <p className='mt-2 text-foreground font-medium truncate'>
-                      {item.title || 'Untitled'}
-                    </p>
+                    <p className='mt-2 truncate font-medium text-foreground'>{item.title || 'Untitled'}</p>
                   </div>
                 ) : null}
                 {requiresBody ? (
@@ -731,27 +704,17 @@ function ActionModal({
                   isRequired
                 />
                 {error ? (
-                  <div className='rounded-medium bg-danger-50 dark:bg-danger-500/10 border border-danger-200 dark:border-danger-500/30 p-3'>
+                  <div className='rounded-medium border border-danger-200 bg-danger-50 p-3 dark:border-danger-500/30 dark:bg-danger-500/10'>
                     <p className='text-sm text-danger-600'>{error}</p>
                   </div>
                 ) : null}
               </div>
             </ModalBody>
             <ModalFooter>
-              <Button
-                color='default'
-                variant='light'
-                onPress={onClose}
-                isDisabled={isPending}
-              >
+              <Button color='default' variant='light' onPress={onClose} isDisabled={isPending}>
                 Cancel
               </Button>
-              <Button
-                color={meta ? meta.color : 'primary'}
-                onPress={handleSubmit}
-                isDisabled={!canSubmit}
-                isLoading={isPending}
-              >
+              <Button color={meta ? meta.color : 'primary'} onPress={handleSubmit} isDisabled={!canSubmit} isLoading={isPending}>
                 {meta ? meta.label : 'Apply'}
               </Button>
             </ModalFooter>
@@ -762,15 +725,9 @@ function ActionModal({
   );
 }
 
-function DiffVersionCard({
-  title,
-  slice,
-}: {
-  title: string;
-  slice: MemoryReviewDiffSlice | undefined;
-}) {
+function DiffVersionCard({ title, slice }: { title: string; slice: MemoryReviewDiffSlice | undefined }) {
   return (
-    <div className='rounded-medium border border-divider p-4 space-y-2'>
+    <div className='space-y-2 rounded-medium border border-divider p-4'>
       <div className='flex items-center justify-between'>
         <p className='text-sm font-medium text-foreground'>{title}</p>
         {slice ? (
@@ -781,10 +738,8 @@ function DiffVersionCard({
       </div>
       {slice ? (
         <>
-          <p className='text-xs text-default-500'>
-            {formatDateTime(slice.created_at)}
-          </p>
-          <pre className='text-xs font-mono whitespace-pre-wrap break-words bg-content2/60 rounded-medium p-3 max-h-80 overflow-auto'>
+          <p className='text-xs text-default-500'>{formatDateTime(slice.created_at)}</p>
+          <pre className='max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-medium bg-content2/60 p-3 font-mono text-xs'>
             {slice.body}
           </pre>
         </>
@@ -809,42 +764,28 @@ function DiffModal({
   onClose: () => void;
 }) {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
-  const diffQuery = useMemoryReviewDiff(
-    activeOrgId,
-    isOpen && item ? item.id : null,
-    isOpen ? fromVersion : null,
-    isOpen ? toVersion : null,
-    { enabled: isOpen && Boolean(item) },
-  );
+  const diffQuery = useMemoryReviewDiff(activeOrgId, isOpen && item ? item.id : null, isOpen ? fromVersion : null, isOpen ? toVersion : null, {
+    enabled: isOpen && Boolean(item),
+  });
 
   const fromSlice = diffQuery.data?.from;
   const toSlice = diffQuery.data?.to;
 
   return (
-    <Modal
-      isOpen={isOpen}
-      onClose={onClose}
-      placement='center'
-      size='5xl'
-      scrollBehavior='inside'
-    >
+    <Modal isOpen={isOpen} onClose={onClose} placement='center' size='5xl' scrollBehavior='inside'>
       <ModalContent>
         {() => (
           <>
-            <ModalHeader className='flex flex-col gap-1 text-foreground'>
-              Version diff: {item?.title ?? ''}
-            </ModalHeader>
+            <ModalHeader className='flex flex-col gap-1 text-foreground'>Version diff: {item?.title ?? ''}</ModalHeader>
             <ModalBody>
               <div className='grid grid-cols-1 gap-4 md:grid-cols-2'>
                 <DiffVersionCard title='From' slice={fromSlice} />
                 <DiffVersionCard title='To' slice={toSlice} />
               </div>
               {diffQuery.isError ? (
-                <div className='rounded-medium bg-danger-50 dark:bg-danger-500/10 border border-danger-200 dark:border-danger-500/30 p-3'>
+                <div className='rounded-medium border border-danger-200 bg-danger-50 p-3 dark:border-danger-500/30 dark:bg-danger-500/10'>
                   <p className='text-sm text-danger-600'>
-                    {diffQuery.error instanceof Error
-                      ? diffQuery.error.message
-                      : 'Failed to load diff.'}
+                    {diffQuery.error instanceof Error ? diffQuery.error.message : 'Failed to load diff.'}
                   </p>
                 </div>
               ) : null}
@@ -863,68 +804,62 @@ function DiffModal({
 
 export default function MemoryReviewPage() {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
-  const meQuery = useQuery<MeResponse>({
-    queryKey: ['auth', 'me'],
-    queryFn: fetchMe,
-  });
+  const meQuery = useQuery<MeResponse>({ queryKey: ['auth', 'me'], queryFn: fetchMe });
 
-  const capabilities = React.useMemo(
-    () => meQuery.data?.capabilities ?? [],
-    [meQuery.data?.capabilities],
+  const capabilities = React.useMemo(() => meQuery.data?.capabilities ?? [], [meQuery.data?.capabilities]);
+
+  const [filters, setFilters, resetFilters] = useUrlFilters<FilterState>(DEFAULT_FILTERS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
+  const teamsQuery = useTeams(activeOrgId, { pageSize: 100 });
+
+  const projects = React.useMemo<NamedOption[]>(
+    () => (projectsQuery.data?.results ?? []).map((project) => ({ id: project.id, name: project.name })),
+    [projectsQuery.data],
   );
-
-  const [filters, setFilters] = React.useState<FilterState>(EMPTY_FILTERS);
-  const [debouncedFilters, setDebouncedFilters] =
-    React.useState<FilterState>(EMPTY_FILTERS);
-  const [page, setPage] = React.useState(1);
+  const teams = React.useMemo<NamedOption[]>(
+    () => (teamsQuery.data?.results ?? []).map((team) => ({ id: team.id, name: team.name })),
+    [teamsQuery.data],
+  );
 
   const [selectedIds, setSelectedIds] = React.useState<Set<string>>(new Set());
   const [bulkReason, setBulkReason] = React.useState('');
   const [bulkOpen, setBulkOpen] = React.useState(false);
+  const [thresholdOpen, setThresholdOpen] = React.useState(false);
+  const [thresholdReason, setThresholdReason] = React.useState('');
+  const [thresholdValue, setThresholdValue] = React.useState('0.3');
 
-  const [actionItem, setActionItem] = React.useState<MemoryReviewItem | null>(
-    null,
-  );
-  const [actionName, setActionName] =
-    React.useState<MemoryReviewActionName | null>(null);
+  const [actionItem, setActionItem] = React.useState<MemoryReviewItem | null>(null);
+  const [actionName, setActionName] = React.useState<MemoryReviewActionName | null>(null);
   const [actionOpen, setActionOpen] = React.useState(false);
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const [diffItem, setDiffItem] = React.useState<MemoryReviewItem | null>(null);
-  const [diffFromVersion, setDiffFromVersion] = React.useState<number | null>(
-    null,
-  );
+  const [diffFromVersion, setDiffFromVersion] = React.useState<number | null>(null);
   const [diffToVersion, setDiffToVersion] = React.useState<number | null>(null);
-  const [diffVersionInput, setDiffVersionInput] = React.useState<{
-    from: string;
-    to: string;
-  }>({ from: '', to: '' });
-  const [diffVersionPrompt, setDiffVersionPrompt] =
-    React.useState<MemoryReviewItem | null>(null);
+  const [diffVersionInput, setDiffVersionInput] = React.useState<{ from: string; to: string }>({ from: '', to: '' });
+  const [diffVersionPrompt, setDiffVersionPrompt] = React.useState<MemoryReviewItem | null>(null);
 
   React.useEffect(() => {
     const handle = window.setTimeout(() => {
-      setDebouncedFilters(filters);
-      setPage(1);
+      if (searchInput !== filters.search) {
+        setFilters({ search: searchInput, page: 1 });
+      }
     }, 300);
 
-    return () => {
-      window.clearTimeout(handle);
-    };
-  }, [filters]);
+    return () => window.clearTimeout(handle);
+  }, [searchInput, filters.search, setFilters]);
 
-  const queryParams = React.useMemo(
-    () => buildParams(debouncedFilters, page),
-    [debouncedFilters, page],
-  );
+  const queryParams = React.useMemo(() => buildParams(filters), [filters]);
 
-  const reviewQuery = useMemoryReview(activeOrgId, queryParams);
+  const reviewQuery = useMemoryReview(activeOrgId, queryParams, { placeholderData: keepPreviousData });
   const actionMutation = useMemoryReviewAction(activeOrgId);
   const bulkMutation = useBulkArchiveMemoryReview(activeOrgId);
 
   const canAdmin = hasCapability(capabilities, 'memories:admin');
 
-  const isLoading = meQuery.isLoading || reviewQuery.isLoading;
+  const isLoading = meQuery.isLoading || (reviewQuery.isLoading && !reviewQuery.data);
   const items = reviewQuery.data?.results ?? [];
   const totalCount = reviewQuery.data?.count ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
@@ -945,8 +880,7 @@ export default function MemoryReviewPage() {
 
   function handleToggleAll(ids: string[]) {
     setSelectedIds((prev) => {
-      const allSelected =
-        ids.length > 0 && ids.every((id) => prev.has(id));
+      const allSelected = ids.length > 0 && ids.every((id) => prev.has(id));
       const next = new Set(prev);
 
       if (allSelected) {
@@ -966,14 +900,8 @@ export default function MemoryReviewPage() {
     setActionOpen(true);
   }
 
-  function openDiffVersionsPrompt(item: MemoryReviewItem) {
-    setDiffVersionPrompt(item);
-    setDiffVersionInput({ from: '', to: '' });
-  }
-
   function confirmDiffVersions() {
     if (!diffVersionPrompt) {
-
       return;
     }
 
@@ -981,11 +909,7 @@ export default function MemoryReviewPage() {
     const to = Number.parseInt(diffVersionInput.to.trim(), 10);
 
     if (!Number.isFinite(from) || !Number.isFinite(to) || from <= 0 || to <= 0) {
-      addToast({
-        title: 'Invalid versions',
-        description: 'Enter positive version numbers.',
-        color: 'danger',
-      });
+      addToast({ title: 'Invalid versions', description: 'Enter positive version numbers.', color: 'danger' });
 
       return;
     }
@@ -998,7 +922,8 @@ export default function MemoryReviewPage() {
 
   function handleRowAction(item: MemoryReviewItem, rowAction: RowAction) {
     if (rowAction.kind === 'view-diff') {
-      openDiffVersionsPrompt(item);
+      setDiffVersionPrompt(item);
+      setDiffVersionInput({ from: '', to: '' });
 
       return;
     }
@@ -1006,27 +931,19 @@ export default function MemoryReviewPage() {
     openAction(item, rowAction.action);
   }
 
-  async function handleActionSubmit(
-    payload: MemoryReviewActionPayload,
-  ): Promise<boolean> {
+  async function handleActionSubmit(payload: MemoryReviewActionPayload): Promise<boolean> {
     setActionError(null);
 
     if (!actionItem || !payload.action) {
-
       return false;
     }
 
     try {
-      const result = await actionMutation.mutateAsync({
-        id: actionItem.id,
-        payload,
-      });
+      const result = await actionMutation.mutateAsync({ id: actionItem.id, payload });
 
       addToast({
         title: `${ACTION_META[payload.action].label} applied`,
-        description: result.memory_id
-          ? `Memory ${result.memory_id}`
-          : `Candidate ${result.candidate_id ?? actionItem.id}`,
+        description: result.memory_id ? `Memory ${result.memory_id}` : `Candidate ${result.candidate_id ?? actionItem.id}`,
         color: 'success',
       });
 
@@ -1045,22 +962,13 @@ export default function MemoryReviewPage() {
     }
   }
 
-  function openBulkArchive() {
-    setBulkReason('');
-    setBulkOpen(true);
-  }
-
   async function handleBulkArchive() {
     if (selectedIds.size === 0 || bulkReason.trim().length === 0) {
-
       return;
     }
 
     try {
-      const result = await bulkMutation.mutateAsync({
-        ids: Array.from(selectedIds),
-        reason: bulkReason.trim(),
-      });
+      const result = await bulkMutation.mutateAsync({ ids: Array.from(selectedIds), reason: bulkReason.trim() });
 
       addToast({
         title: 'Memories archived',
@@ -1071,48 +979,82 @@ export default function MemoryReviewPage() {
       setSelectedIds(new Set());
       setBulkOpen(false);
     } catch (error) {
-      addToast({
-        title: 'Bulk archive failed',
-        description: extractErrorDetail(error),
-        color: 'danger',
-      });
+      addToast({ title: 'Bulk archive failed', description: extractErrorDetail(error), color: 'danger' });
     }
   }
 
-  const meLoaded = meQuery.data !== undefined;
+  async function handleThresholdArchive() {
+    const threshold = Number.parseFloat(thresholdValue.trim());
+
+    if (!Number.isFinite(threshold) || thresholdReason.trim().length === 0) {
+      return;
+    }
+
+    try {
+      const result = await bulkMutation.mutateAsync({
+        confidence__lte: threshold.toFixed(3),
+        reason: thresholdReason.trim(),
+      });
+
+      addToast({
+        title: 'Low-confidence memories archived',
+        description: `${result.archived_count} memor${result.archived_count === 1 ? 'y' : 'ies'} at or below ${threshold} archived.`,
+        color: 'success',
+      });
+
+      setThresholdOpen(false);
+      setThresholdReason('');
+    } catch (error) {
+      addToast({ title: 'Threshold archive failed', description: extractErrorDetail(error), color: 'danger' });
+    }
+  }
 
   return (
     <CapabilityGate capabilities={capabilities} required='memories:review'>
       <section className='space-y-6'>
         <PageHeader
           title='Memory Review'
-          subtitle='Curate proposed memories, resolve conflicts, and archive low-confidence noise.'
+          subtitle='Curate proposed memories, restore refuted ones, and archive low-confidence noise.'
+          actions={
+            canAdmin ? (
+              <Button variant='flat' startContent={<Archive className='h-4 w-4' />} onPress={() => setThresholdOpen(true)}>
+                Archive below threshold
+              </Button>
+            ) : undefined
+          }
         />
 
-        <FilterBar filters={filters} onChange={setFilters} />
+        <FilterBar
+          filters={filters}
+          searchInput={searchInput}
+          onSearchInput={setSearchInput}
+          onChange={setFilters}
+          onReset={() => {
+            setSearchInput('');
+            resetFilters();
+          }}
+          projects={projects}
+          teams={teams}
+        />
 
         {selectedIds.size > 0 && canAdmin ? (
           <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between'>
             <div className='flex items-center gap-2 text-sm text-default-700'>
-              <ShieldCheck className='w-4 h-4' />
-              <span>
-                {selectedIds.size} selected for bulk archive.
-              </span>
+              <ShieldCheck className='h-4 w-4' />
+              <span>{selectedIds.size} selected for bulk archive.</span>
             </div>
             <div className='flex items-center gap-2'>
-              <Button
-                color='default'
-                variant='light'
-                onPress={() => setSelectedIds(new Set())}
-                isDisabled={bulkMutation.isPending}
-              >
+              <Button color='default' variant='light' onPress={() => setSelectedIds(new Set())} isDisabled={bulkMutation.isPending}>
                 Clear
               </Button>
               <Button
                 color='danger'
                 variant='flat'
-                startContent={<Archive className='w-4 h-4' />}
-                onPress={openBulkArchive}
+                startContent={<Archive className='h-4 w-4' />}
+                onPress={() => {
+                  setBulkReason('');
+                  setBulkOpen(true);
+                }}
                 isDisabled={bulkMutation.isPending}
               >
                 Archive selected
@@ -1126,20 +1068,21 @@ export default function MemoryReviewPage() {
             <table className='w-full border-collapse text-left text-sm'>
               <thead>
                 <tr className='border-b border-divider'>
-                  {Array.from({
-                    length: canAdmin ? 8 : 7,
-                  }).map((_, index) => (
-                    <th
-                      key={index}
-                      className='py-2 px-3 text-default-500 font-medium'
-                    >
-                      <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
+                  {Array.from({ length: canAdmin ? 8 : 7 }).map((_, index) => (
+                    <th key={index} className='px-3 py-2 font-medium text-default-500'>
+                      <span className='inline-block h-3 w-16 rounded-medium bg-content2/60' />
                     </th>
                   ))}
                 </tr>
               </thead>
               <TableRowSkeleton columns={canAdmin ? 8 : 7} />
             </table>
+          ) : reviewQuery.isError ? (
+            <ErrorState
+              title='Failed to load review queue'
+              message={reviewQuery.error instanceof Error ? reviewQuery.error.message : 'The memory review queue could not be loaded.'}
+              onRetry={() => reviewQuery.refetch()}
+            />
           ) : items.length === 0 ? (
             <EmptyState
               title='No reviewable memories'
@@ -1157,27 +1100,13 @@ export default function MemoryReviewPage() {
           )}
         </div>
 
-        {totalCount > 0 ? (
+        {!reviewQuery.isError && totalCount > 0 ? (
           <div className='flex flex-col items-center gap-3'>
             <p className='text-xs text-default-500'>
-              {totalCount} item{totalCount === 1 ? '' : 's'} · page {page} of{' '}
-              {totalPages}
+              {totalCount} item{totalCount === 1 ? '' : 's'} · page {filters.page} of {totalPages}
             </p>
-            <Pagination
-              total={totalPages}
-              page={page}
-              onChange={setPage}
-              isDisabled={isLoading}
-            />
+            <Pagination total={totalPages} page={filters.page} onChange={(page) => setFilters({ page })} isDisabled={reviewQuery.isFetching} />
           </div>
-        ) : null}
-
-        {reviewQuery.isError ? (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {reviewQuery.error instanceof Error
-              ? reviewQuery.error.message
-              : 'Failed to load memory review queue.'}
-          </pre>
         ) : null}
 
         <ActionModal
@@ -1202,25 +1131,16 @@ export default function MemoryReviewPage() {
           }}
         />
 
-        <Modal
-          isOpen={diffVersionPrompt !== null}
-          onClose={() => setDiffVersionPrompt(null)}
-          placement='center'
-        >
+        <Modal isOpen={diffVersionPrompt !== null} onClose={() => setDiffVersionPrompt(null)} placement='center'>
           <ModalContent>
             {() => (
               <>
-                <ModalHeader className='flex flex-col gap-1 text-foreground'>
-                  Compare versions
-                </ModalHeader>
+                <ModalHeader className='flex flex-col gap-1 text-foreground'>Compare versions</ModalHeader>
                 <ModalBody>
                   <div className='space-y-4'>
                     <p className='text-sm text-default-500'>
                       Enter two version numbers to compare for{' '}
-                      <span className='text-foreground font-medium'>
-                        {diffVersionPrompt?.title ?? ''}
-                      </span>
-                      .
+                      <span className='font-medium text-foreground'>{diffVersionPrompt?.title ?? ''}</span>.
                     </p>
                     <div className='grid grid-cols-2 gap-3'>
                       <Input
@@ -1230,9 +1150,7 @@ export default function MemoryReviewPage() {
                         type='number'
                         min={1}
                         value={diffVersionInput.from}
-                        onValueChange={(value) =>
-                          setDiffVersionInput((prev) => ({ ...prev, from: value }))
-                        }
+                        onValueChange={(value) => setDiffVersionInput((prev) => ({ ...prev, from: value }))}
                       />
                       <Input
                         label='To version'
@@ -1241,28 +1159,19 @@ export default function MemoryReviewPage() {
                         type='number'
                         min={1}
                         value={diffVersionInput.to}
-                        onValueChange={(value) =>
-                          setDiffVersionInput((prev) => ({ ...prev, to: value }))
-                        }
+                        onValueChange={(value) => setDiffVersionInput((prev) => ({ ...prev, to: value }))}
                       />
                     </div>
                   </div>
                 </ModalBody>
                 <ModalFooter>
-                  <Button
-                    color='default'
-                    variant='light'
-                    onPress={() => setDiffVersionPrompt(null)}
-                  >
+                  <Button color='default' variant='light' onPress={() => setDiffVersionPrompt(null)}>
                     Cancel
                   </Button>
                   <Button
                     color='primary'
                     onPress={confirmDiffVersions}
-                    isDisabled={
-                      diffVersionInput.from.trim().length === 0 ||
-                      diffVersionInput.to.trim().length === 0
-                    }
+                    isDisabled={diffVersionInput.from.trim().length === 0 || diffVersionInput.to.trim().length === 0}
                   >
                     Compare
                   </Button>
@@ -1283,14 +1192,12 @@ export default function MemoryReviewPage() {
             {() => (
               <>
                 <ModalHeader className='flex flex-col gap-1 text-foreground'>
-                  Archive {selectedIds.size} item
-                  {selectedIds.size === 1 ? '' : 's'}
+                  Archive {selectedIds.size} item{selectedIds.size === 1 ? '' : 's'}
                 </ModalHeader>
                 <ModalBody>
                   <div className='space-y-3'>
                     <p className='text-sm text-default-500'>
-                      Provide a reason. This is recorded in the audit log for
-                      each archived memory and the action is permanent.
+                      Provide a reason. This is recorded in the audit log for each archived memory and the action is permanent.
                     </p>
                     <Textarea
                       label='Reason'
@@ -1307,24 +1214,77 @@ export default function MemoryReviewPage() {
                   </div>
                 </ModalBody>
                 <ModalFooter>
-                  <Button
-                    color='default'
-                    variant='light'
-                    onPress={() => setBulkOpen(false)}
-                    isDisabled={bulkMutation.isPending}
-                  >
+                  <Button color='default' variant='light' onPress={() => setBulkOpen(false)} isDisabled={bulkMutation.isPending}>
                     Cancel
                   </Button>
                   <Button
                     color='danger'
-                    startContent={<Archive className='w-4 h-4' />}
+                    startContent={<Archive className='h-4 w-4' />}
                     onPress={handleBulkArchive}
-                    isDisabled={
-                      bulkReason.trim().length === 0 || bulkMutation.isPending
-                    }
+                    isDisabled={bulkReason.trim().length === 0 || bulkMutation.isPending}
                     isLoading={bulkMutation.isPending}
                   >
                     Confirm archive
+                  </Button>
+                </ModalFooter>
+              </>
+            )}
+          </ModalContent>
+        </Modal>
+
+        <Modal
+          isOpen={thresholdOpen}
+          onClose={() => setThresholdOpen(false)}
+          placement='center'
+          isDismissable={!bulkMutation.isPending}
+          hideCloseButton={bulkMutation.isPending}
+        >
+          <ModalContent>
+            {() => (
+              <>
+                <ModalHeader className='flex flex-col gap-1 text-foreground'>Archive below confidence threshold</ModalHeader>
+                <ModalBody>
+                  <div className='space-y-3'>
+                    <p className='text-sm text-default-500'>
+                      Archives every reviewable memory whose confidence is at or below the threshold. Recorded in the audit log and permanent.
+                    </p>
+                    <Input
+                      label='Confidence ≤'
+                      labelPlacement='outside'
+                      type='number'
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={thresholdValue}
+                      onValueChange={setThresholdValue}
+                      isDisabled={bulkMutation.isPending}
+                    />
+                    <Textarea
+                      label='Reason'
+                      labelPlacement='outside'
+                      placeholder='Low-confidence cleanup…'
+                      value={thresholdReason}
+                      onValueChange={setThresholdReason}
+                      minRows={2}
+                      maxRows={6}
+                      maxLength={1024}
+                      isDisabled={bulkMutation.isPending}
+                      isRequired
+                    />
+                  </div>
+                </ModalBody>
+                <ModalFooter>
+                  <Button color='default' variant='light' onPress={() => setThresholdOpen(false)} isDisabled={bulkMutation.isPending}>
+                    Cancel
+                  </Button>
+                  <Button
+                    color='danger'
+                    startContent={<Archive className='h-4 w-4' />}
+                    onPress={handleThresholdArchive}
+                    isDisabled={thresholdReason.trim().length === 0 || bulkMutation.isPending}
+                    isLoading={bulkMutation.isPending}
+                  >
+                    Archive matching
                   </Button>
                 </ModalFooter>
               </>
