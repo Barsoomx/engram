@@ -8,6 +8,8 @@ from datetime import datetime
 from engram_cli.commands import (
     build_generic_hook_payload,
     build_session_start_hook_payload,
+    build_session_start_payload,
+    build_user_prompt_submit_payload,
 )
 
 CONFIG: dict[str, object] = {"project_id": "", "team_id": "", "agent_version": ""}
@@ -288,6 +290,83 @@ class SearchPayloadTests(unittest.TestCase):
         self.assertNotIn("project_id", payload)
         self.assertEqual("git@github.com:acme/x.git", payload["repository_url"])
         self.assertEqual(3, payload["limit"])
+
+
+class UserPromptSubmitPayloadTests(unittest.TestCase):
+    def test_query_falls_back_to_prompt_when_query_missing(self) -> None:
+        built = build_user_prompt_submit_payload(
+            CONFIG,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO, "prompt": "how does auth work"},
+        )
+
+        self.assertEqual("how does auth work", built["query"])
+
+    def test_explicit_query_wins_over_prompt(self) -> None:
+        built = build_user_prompt_submit_payload(
+            CONFIG,
+            "claude_code",
+            {
+                "session_id": "s1",
+                "repository_url": REPO,
+                "query": "explicit query",
+                "prompt": "ignored prompt",
+            },
+        )
+
+        self.assertEqual("explicit query", built["query"])
+
+    def test_defaults_token_budget_to_1200_when_not_provided(self) -> None:
+        built = build_user_prompt_submit_payload(
+            CONFIG,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO, "query": "q"},
+        )
+
+        self.assertEqual(1200, built["token_budget"])
+
+    def test_explicit_token_budget_is_preserved(self) -> None:
+        built = build_user_prompt_submit_payload(
+            CONFIG,
+            "claude_code",
+            {
+                "session_id": "s1",
+                "repository_url": REPO,
+                "query": "q",
+                "token_budget": 400,
+            },
+        )
+
+        self.assertEqual(400, built["token_budget"])
+
+
+class SessionStartQueryPayloadTests(unittest.TestCase):
+    def test_query_stays_empty_without_prompt_fallback(self) -> None:
+        built = build_session_start_payload(
+            CONFIG,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO, "prompt": "should not be used"},
+        )
+
+        self.assertEqual("", built["query"])
+
+    def test_defaults_token_budget_to_2000_when_not_provided(self) -> None:
+        built = build_session_start_payload(
+            CONFIG,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO},
+        )
+
+        self.assertEqual(2000, built["token_budget"])
+
+    def test_explicit_token_budget_is_preserved(self) -> None:
+        built = build_session_start_payload(
+            CONFIG,
+            "claude_code",
+            {"session_id": "s1", "repository_url": REPO, "token_budget": 500},
+        )
+
+        self.assertEqual(500, built["token_budget"])
 
 
 class HookProjectLadderTests(unittest.TestCase):

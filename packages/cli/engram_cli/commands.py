@@ -60,6 +60,8 @@ WIZARD_API_KEY_CAPABILITIES = (
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
 PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
+USER_PROMPT_SUBMIT_TOKEN_BUDGET = 1200
+SESSION_START_TOKEN_BUDGET = 2000
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -1220,11 +1222,13 @@ def build_user_prompt_submit_payload(
             "session_id": required_payload_string(input_payload, "session_id"),
             "request_id": payload_string(input_payload, "request_id")
             or f"engram-cli-{uuid.uuid4()}",
-            "query": payload_string(input_payload, "query"),
+            "query": payload_string(input_payload, "query")
+            or payload_string(input_payload, "prompt"),
             "file_paths": list_value(input_payload.get("file_paths")),
             "symbols": list_value(input_payload.get("symbols")),
         },
     )
+    request_payload["token_budget"] = USER_PROMPT_SUBMIT_TOKEN_BUDGET
     for field in ("limit", "token_budget"):
         value = input_payload.get(field)
         if isinstance(value, int):
@@ -1262,6 +1266,7 @@ def build_session_start_payload(
             "symbols": list_value(input_payload.get("symbols")),
         },
     )
+    request_payload["token_budget"] = SESSION_START_TOKEN_BUDGET
     for field in ("limit", "token_budget"):
         value = input_payload.get(field)
         if isinstance(value, int):
