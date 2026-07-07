@@ -336,6 +336,9 @@ def request_has_terms(query: str, file_paths: tuple[str, ...], symbols: tuple[st
     return bool(query.strip() or file_paths or symbols)
 
 
+CONTAINS_MATCH_MIN_TOKEN_LENGTH = 4
+
+
 def score_retrieval_document(
     document: RetrievalDocument,
     query: str,
@@ -363,8 +366,8 @@ def score_retrieval_document(
             inclusion_reason=f'exact match: {symbol_match}',
         )
 
-    query_terms = request_query_terms(query)
-    exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
+    contains_terms = contains_match_query_terms(query)
+    exact_match = first_contains_match(contains_terms, tuple(str(value) for value in document.exact_terms))
     if exact_match:
         return RetrievalMatch(
             document=document,
@@ -373,7 +376,7 @@ def score_retrieval_document(
             inclusion_reason=f'exact match: {exact_match}',
         )
 
-    full_text_match = first_full_text_match(query_terms, document.full_text)
+    full_text_match = first_full_text_match(contains_terms, document.full_text)
     if full_text_match:
         return RetrievalMatch(
             document=document,
@@ -1361,6 +1364,20 @@ def request_query_terms(query: str) -> tuple[str, ...]:
         return ()
     terms = [query_value]
     terms.extend(token for token in query_value.replace('/', ' ').split() if len(token.strip()) >= 2)
+
+    return normalize_lookup_values(terms)
+
+
+def contains_match_query_terms(query: str) -> tuple[str, ...]:
+    query_value = query.strip()
+    if not query_value:
+        return ()
+    terms = [query_value]
+    terms.extend(
+        token
+        for token in query_value.replace('/', ' ').split()
+        if len(token.strip()) >= CONTAINS_MATCH_MIN_TOKEN_LENGTH
+    )
 
     return normalize_lookup_values(terms)
 
