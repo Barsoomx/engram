@@ -63,7 +63,7 @@ const ORDERING_OPTIONS: { key: ProjectOrdering; label: string }[] = [
 ];
 
 const GRID_COLUMNS =
-  'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.7fr) minmax(0,0.8fr) auto';
+  'minmax(150px,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.7fr) minmax(0,0.8fr) auto';
 
 function ColumnHeader() {
   return (
