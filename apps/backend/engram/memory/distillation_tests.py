@@ -372,7 +372,8 @@ def test_parse_synthesized_candidates_falls_back_on_invalid_json() -> None:
     candidates = parse_synthesized_candidates('not json at all')
 
     assert len(candidates) == 1
-    assert candidates[0].confidence == Decimal('0.500')
+    assert candidates[0].confidence == Decimal('0.000')
+    assert candidates[0].parse_fallback is True
     assert candidates[0].body == 'not json at all'
 
 
@@ -438,7 +439,8 @@ def test_parse_synthesized_candidates_object_without_memories_falls_back() -> No
     candidates = parse_synthesized_candidates('{"other": 1}')
 
     assert len(candidates) == 1
-    assert candidates[0].confidence == Decimal('0.500')
+    assert candidates[0].confidence == Decimal('0.000')
+    assert candidates[0].parse_fallback is True
 
 
 def test_parse_synthesized_candidates_strips_json_fence_instead_of_falling_back() -> None:
@@ -466,7 +468,8 @@ def test_parse_synthesized_candidates_genuinely_invalid_still_falls_back() -> No
     candidates = parse_synthesized_candidates('this is not json and not fenced either')
 
     assert len(candidates) == 1
-    assert candidates[0].confidence == Decimal('0.500')
+    assert candidates[0].confidence == Decimal('0.000')
+    assert candidates[0].parse_fallback is True
     assert candidates[0].body == 'this is not json and not fenced either'
 
 

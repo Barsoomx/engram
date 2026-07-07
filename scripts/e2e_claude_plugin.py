@@ -1055,6 +1055,7 @@ def main() -> int:
     skip_build = os.environ.get('E2E_SKIP_BUILD') == '1'
     provider_mode = os.environ.get('E2E_PROVIDER_MODE', 'real')
     os.environ['ENGRAM_PROVIDER_MODE'] = provider_mode
+    os.environ.setdefault('ENGRAM_REALTIME_MIN_CONTENT_CHARS', '1')
     os.environ.setdefault('COMPOSE_PROJECT_NAME', 'engram-plugin-e2e')
     mock_process: subprocess.Popen[bytes] | None = None
     try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -37,6 +38,10 @@ from engram.core.models import (
     WorkflowRunType,
 )
 from engram.core.redaction import redact_value as core_redact_value
+from engram.memory.candidate_parsing import (
+    parse_synthesized_candidates,
+    truncate_with_marker,
+)
 from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.model_policy.services import (
     AnthropicMessagesGateway,
@@ -53,26 +58,6 @@ from engram.model_policy.services import (
 )
 
 logger = structlog.get_logger(__name__)
-
-
-def strip_json_fence(raw_body: str) -> str:
-    if not isinstance(raw_body, str):
-        return raw_body
-
-    stripped = raw_body.strip()
-    if not stripped.startswith('```'):
-        return raw_body
-
-    body_lines = stripped.splitlines()[1:]
-    closing_index = next(
-        (index for index in range(len(body_lines) - 1, -1, -1) if body_lines[index].strip() == '```'),
-        None,
-    )
-    if closing_index is None:
-        return raw_body
-
-    return '\n'.join(body_lines[:closing_index]).strip()
-
 
 _ProviderGateway = FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway
 
@@ -162,6 +147,8 @@ class GeneratedMemoryCandidate:
     title: str
     body: str
     evidence: list[dict[str, object]]
+    confidence: Decimal = Decimal('0.000')
+    kind: str = ''
 
 
 @dataclass(frozen=True)
@@ -323,13 +310,25 @@ class ProcessObservationRecorded:
         if self._already_skipped(observation):
             return MemoryCandidateWorkerResult(candidate=None, duplicate=True, skipped=True)
 
-        generated = self._generate_candidate(observation, correlation_id=correlation_id)
-
-        if _is_skip(generated):
-            self._audit_skipped(observation)
+        pre_llm_skip_reason = self._pre_llm_skip_reason(observation)
+        if pre_llm_skip_reason is not None:
+            self._audit_skipped(observation, reason=pre_llm_skip_reason)
             logger.info(
                 'memory_candidate_skipped',
                 observation_id=str(observation.id),
+                reason=pre_llm_skip_reason,
+            )
+
+            return MemoryCandidateWorkerResult(candidate=None, duplicate=False, skipped=True)
+
+        generated = self._generate_candidate(observation, correlation_id=correlation_id)
+
+        if _is_skip(generated):
+            self._audit_skipped(observation, reason='no_durable_signal')
+            logger.info(
+                'memory_candidate_skipped',
+                observation_id=str(observation.id),
+                reason='no_durable_signal',
             )
 
             return MemoryCandidateWorkerResult(candidate=None, duplicate=False, skipped=True)
@@ -339,7 +338,8 @@ class ProcessObservationRecorded:
             candidate, candidate_created = self._get_or_create_candidate(observation, generated)
             threshold = resolve_auto_approve_threshold(observation.organization)
             already_promoted = candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id is not None
-            should_promote = already_promoted or is_auto_promotable(candidate.confidence, threshold)
+            promotable = is_auto_promotable(candidate.confidence, threshold) and not self._is_parse_fallback(candidate)
+            should_promote = already_promoted or promotable
             if not should_promote and candidate_created:
                 self._audit_held(observation, candidate, threshold)
 
@@ -406,7 +406,9 @@ class ProcessObservationRecorded:
                 candidate.title = generated.title
                 candidate.body = generated.body
                 candidate.evidence = generated.evidence
-                candidate.save(update_fields=['title', 'body', 'evidence', 'updated_at'])
+                candidate.confidence = generated.confidence
+                candidate.kind = generated.kind
+                candidate.save(update_fields=['title', 'body', 'evidence', 'confidence', 'kind', 'updated_at'])
 
             return candidate, False
 
@@ -421,8 +423,8 @@ class ProcessObservationRecorded:
             visibility_scope=VisibilityScope.PROJECT,
             evidence=generated.evidence,
             content_hash=candidate_hash,
-            confidence=derive_observation_confidence(observation),
-            kind=observation.observation_type if observation.observation_type in _DURABLE_OBSERVATION_TYPES else '',
+            confidence=generated.confidence,
+            kind=generated.kind,
         )
 
         return candidate, True
@@ -445,8 +447,9 @@ class ProcessObservationRecorded:
                     policy=resolved.policy,
                     request_id=f'memory-worker:{observation.id}:generation',
                     trace_id=correlation_id or f'memory-worker:{observation.id}',
-                    prompt=provider_prompt(observation),
-                    system_prompt=distillation_system_prompt(),
+                    prompt=realtime_provider_prompt(observation, _realtime_prompt_char_budget()),
+                    system_prompt=realtime_generation_system_prompt(),
+                    response_kind='candidates',
                 ),
             )
         except (ModelPolicyError, ProviderSecretError) as error:
@@ -461,13 +464,21 @@ class ProcessObservationRecorded:
             'task_type': resolved.policy.task_type,
             'redaction_state': provider_result.redaction_state,
         }
-        title = (provider_result.generated_title or provider_result.generated_body)[:255]
-        body = provider_result.generated_body or provider_result.generated_title
+        candidates = parse_synthesized_candidates(provider_result.generated_body)
+        if not candidates:
+            return GeneratedMemoryCandidate(title='', body='', evidence=[])
+
+        synthesized = candidates[0]
+        evidence = candidate_evidence(observation, synthesized.title, provenance)
+        if synthesized.parse_fallback:
+            evidence[0]['parse_fallback'] = True
 
         return GeneratedMemoryCandidate(
-            title=title,
-            body=body,
-            evidence=candidate_evidence(observation, title, provenance),
+            title=synthesized.title,
+            body=synthesized.body,
+            evidence=evidence,
+            confidence=synthesized.confidence,
+            kind=synthesized.kind,
         )
 
     def _has_provider_provenance(self, candidate: MemoryCandidate) -> bool:
@@ -476,6 +487,23 @@ class ProcessObservationRecorded:
         evidence = candidate.evidence[0]
 
         return isinstance(evidence, dict) and bool(evidence.get('provider_call_id'))
+
+    def _is_parse_fallback(self, candidate: MemoryCandidate) -> bool:
+        if not candidate.evidence:
+            return False
+        evidence = candidate.evidence[0]
+
+        return isinstance(evidence, dict) and bool(evidence.get('parse_fallback'))
+
+    def _pre_llm_skip_reason(self, observation: Observation) -> str | None:
+        if observation.observation_type in _LIFECYCLE_OBSERVATION_TYPES:
+            return 'lifecycle_event'
+
+        content_length = len(observation.title.strip()) + len(observation.body.strip())
+        if content_length < _realtime_min_content_chars():
+            return 'content_below_min'
+
+        return None
 
     def _already_skipped(self, observation: Observation) -> bool:
         return AuditEvent.objects.filter(
@@ -486,7 +514,7 @@ class ProcessObservationRecorded:
             target_id=str(observation.id),
         ).exists()
 
-    def _audit_skipped(self, observation: Observation) -> None:
+    def _audit_skipped(self, observation: Observation, *, reason: str) -> None:
         AuditEvent.objects.create(
             organization=observation.organization,
             project=observation.project,
@@ -497,7 +525,7 @@ class ProcessObservationRecorded:
             target_id=str(observation.id),
             capability='memories:review',
             result=AuditResult.RECORDED,
-            metadata={'reason': 'no_durable_signal'},
+            metadata={'reason': reason},
         )
 
     def _audit_held(self, observation: Observation, candidate: MemoryCandidate, threshold: Decimal) -> None:
@@ -523,24 +551,17 @@ class ProcessObservationRecorded:
         )
 
 
-_DURABLE_OBSERVATION_TYPES = frozenset({'decision', 'architecture', 'convention', 'gotcha'})
+_LIFECYCLE_OBSERVATION_TYPES = frozenset({'session_start', 'session_end'})
+_DEFAULT_REALTIME_MIN_CONTENT_CHARS = 80
+_DEFAULT_REALTIME_PROMPT_CHAR_BUDGET = 12000
 
 
-def derive_observation_confidence(observation: Observation) -> Decimal:
-    score = Decimal('0.50')
-    if observation.facts:
-        score += Decimal('0.10')
-    if observation.files_read or observation.files_modified:
-        score += Decimal('0.10')
-    if observation.narrative.strip():
-        score += Decimal('0.10')
-    if observation.concepts:
-        score += Decimal('0.05')
-    if observation.observation_type in _DURABLE_OBSERVATION_TYPES:
-        score += Decimal('0.10')
-    score = max(Decimal('0'), min(Decimal('1'), score))
+def _realtime_min_content_chars() -> int:
+    return int(os.environ.get('ENGRAM_REALTIME_MIN_CONTENT_CHARS', str(_DEFAULT_REALTIME_MIN_CONTENT_CHARS)))
 
-    return score.quantize(Decimal('0.001'))
+
+def _realtime_prompt_char_budget() -> int:
+    return int(os.environ.get('ENGRAM_REALTIME_PROMPT_CHAR_BUDGET', str(_DEFAULT_REALTIME_PROMPT_CHAR_BUDGET)))
 
 
 def is_auto_promotable(confidence: Decimal | None, threshold: Decimal) -> bool:
@@ -620,6 +641,35 @@ def provider_prompt(observation: Observation) -> str:
             f'Files modified: {redact_value(observation.files_modified)}',
             f'Source metadata: {redact_value(observation.source_metadata)}',
         ],
+    )
+
+
+def realtime_provider_prompt(observation: Observation, cap: int) -> str:
+    return truncate_with_marker(provider_prompt(observation), cap)
+
+
+def realtime_generation_system_prompt() -> str:
+    return (
+        'You are a memory distillation engine for software engineering sessions.\n'
+        'Given a single structured observation, decide whether it carries a durable, '
+        'runtime-neutral engineering memory.\n'
+        '\n'
+        'Rules:\n'
+        '- Output a single JSON object only, with exactly one key "memories".\n'
+        '- "memories" is an array with at most one object with the keys '
+        '"title", "body", "confidence", and optionally "kind".\n'
+        '- If the observation carries no durable engineering signal (routine status checks, empty '
+        'search results, plain acknowledgements), output {"memories": []}.\n'
+        '- "confidence" is a number between 0 and 1: 0.9 or higher for verified facts with direct '
+        'evidence, 0.6-0.8 for plausible conclusions, 0.3-0.5 for unverified hypotheses, below 0.3 '
+        'for speculation.\n'
+        '- "kind" is optional: one of "decision", "convention", "gotcha", "architecture", "incident" '
+        'when the memory clearly fits one of those categories, omitted otherwise.\n'
+        '- Preserve exact identifiers verbatim: file paths, function names, class names, '
+        'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
+        '- Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
+        '- Do not invent facts not present in the input.\n'
+        '- Do not name any AI assistant, tool, or product by brand.'
     )
 
 

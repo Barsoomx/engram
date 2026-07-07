@@ -26,6 +26,7 @@ from engram.core.models import (
     OrganizationSettings,
     RetrievalDocument,
 )
+from engram.memory.candidate_parsing import strip_json_fence
 from engram.memory.conflict_links import clear_candidate_conflict_links, conflict_candidate_target
 from engram.memory.escalation import escalation_reason
 from engram.memory.services import (
@@ -34,7 +35,6 @@ from engram.memory.services import (
     PromoteMemoryCandidateInput,
     redact_text,
     redact_value,
-    strip_json_fence,
 )
 from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import uuid
 from decimal import Decimal
 
@@ -12,6 +13,7 @@ from engram.memory.memory_worker_tests import (
     create_generation_policy,
     create_memory_candidate,
     create_observation_recorded_scope,
+    enable_auto_promote,
     execute_worker,
 )
 from engram.memory.services import (
@@ -20,10 +22,10 @@ from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
     call_with_fallback,
-    derive_observation_confidence,
     distillation_system_prompt,
     provider_prompt,
-    strip_json_fence,
+    realtime_generation_system_prompt,
+    realtime_provider_prompt,
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
@@ -33,202 +35,6 @@ from engram.model_policy.services import (
     ProviderCallResult,
     ResolvedModelPolicy,
 )
-
-
-class _ObservationStub:
-    def __init__(
-        self,
-        *,
-        observation_type: str,
-        facts: list,
-        files_read: list,
-        files_modified: list,
-        narrative: str,
-        concepts: list,
-    ) -> None:
-        self.observation_type = observation_type
-        self.facts = facts
-        self.files_read = files_read
-        self.files_modified = files_modified
-        self.narrative = narrative
-        self.concepts = concepts
-
-
-def _thin() -> _ObservationStub:
-    return _ObservationStub(
-        observation_type='tool_use',
-        facts=[],
-        files_read=[],
-        files_modified=[],
-        narrative='',
-        concepts=[],
-    )
-
-
-def test_derive_observation_confidence_thin_returns_base() -> None:
-    obs = _thin()
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.500')
-
-
-def test_derive_observation_confidence_rich_all_bonuses_returns_point_nine_five() -> None:
-    obs = _ObservationStub(
-        observation_type='decision',
-        facts=['use postgres'],
-        files_read=['schema.sql'],
-        files_modified=[],
-        narrative='We decided to use postgres for reliability.',
-        concepts=['database'],
-    )
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.950')
-
-
-def test_derive_observation_confidence_facts_only_adds_point_one() -> None:
-    obs = _thin()
-    obs.facts = ['a fact']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_files_read_only_adds_point_one() -> None:
-    obs = _thin()
-    obs.files_read = ['a.py']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_files_modified_only_adds_point_one() -> None:
-    obs = _thin()
-    obs.files_modified = ['b.py']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_files_read_and_modified_counts_as_single_bonus() -> None:
-    obs = _thin()
-    obs.files_read = ['a.py']
-    obs.files_modified = ['b.py']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_narrative_whitespace_only_no_bonus() -> None:
-    obs = _thin()
-    obs.narrative = '   \n  '
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.500')
-
-
-def test_derive_observation_confidence_narrative_nonempty_adds_point_one() -> None:
-    obs = _thin()
-    obs.narrative = 'We chose this approach.'
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_concepts_nonempty_adds_point_zero_five() -> None:
-    obs = _thin()
-    obs.concepts = ['reliability']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.550')
-
-
-def test_derive_observation_confidence_durable_type_decision_adds_point_one() -> None:
-    obs = _thin()
-    obs.observation_type = 'decision'
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_durable_type_architecture_adds_point_one() -> None:
-    obs = _thin()
-    obs.observation_type = 'architecture'
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_durable_type_convention_adds_point_one() -> None:
-    obs = _thin()
-    obs.observation_type = 'convention'
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_durable_type_gotcha_adds_point_one() -> None:
-    obs = _thin()
-    obs.observation_type = 'gotcha'
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.600')
-
-
-def test_derive_observation_confidence_non_durable_types_no_bonus() -> None:
-    for obs_type in ('tool_use', 'session_summary', 'error', 'unknown'):
-        obs = _thin()
-        obs.observation_type = obs_type
-
-        result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-        assert result == Decimal('0.500'), f'expected 0.500 for type {obs_type!r}'
-
-
-def test_derive_observation_confidence_result_quantized_to_three_decimals() -> None:
-    obs = _thin()
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == result.quantize(Decimal('0.001'))
-
-
-def test_derive_observation_confidence_clamps_to_one() -> None:
-    obs = _ObservationStub(
-        observation_type='decision',
-        facts=['f'],
-        files_read=['a.py'],
-        files_modified=[],
-        narrative='text',
-        concepts=['c'],
-    )
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert Decimal('0') <= result <= Decimal('1')
-
-
-def test_derive_observation_confidence_facts_plus_files_produces_point_seven() -> None:
-    obs = _thin()
-    obs.facts = ['a fact']
-    obs.files_read = ['a.py']
-
-    result = derive_observation_confidence(obs)  # type: ignore[arg-type]
-
-    assert result == Decimal('0.700')
 
 
 @pytest.mark.django_db
@@ -398,8 +204,8 @@ def test_process_observation_skip_creates_no_candidate(monkeypatch: pytest.Monke
                 model=real.model,
                 call_record_id=real.call_record_id,
                 redaction_state=real.redaction_state,
-                generated_title='SKIP',
-                generated_body='',
+                generated_title='',
+                generated_body='{"memories": []}',
             )
 
     monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: _SkipGateway())
@@ -430,8 +236,8 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
                 model=real.model,
                 call_record_id=real.call_record_id,
                 redaction_state=real.redaction_state,
-                generated_title='SKIP',
-                generated_body='',
+                generated_title='',
+                generated_body='{"memories": []}',
             )
 
     class _CountingGateway(FakeProviderGateway):
@@ -460,9 +266,8 @@ def test_process_observation_skip_is_sticky_across_retries(monkeypatch: pytest.M
     assert second_run_calls == []
 
 
-class _TitleBodyGateway(FakeProviderGateway):
-    def __init__(self, *, title: str, body: str) -> None:
-        self._title = title
+class _CandidatesBodyGateway(FakeProviderGateway):
+    def __init__(self, body: str) -> None:
         self._body = body
 
     def call(self, data: object) -> ProviderCallResult:
@@ -473,174 +278,198 @@ class _TitleBodyGateway(FakeProviderGateway):
             model=real.model,
             call_record_id=real.call_record_id,
             redaction_state=real.redaction_state,
-            generated_title=self._title,
+            generated_title='',
             generated_body=self._body,
         )
 
 
+class _NoCallGateway(FakeProviderGateway):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def call(self, data: object) -> ProviderCallResult:
+        self.calls += 1
+
+        return FakeProviderGateway.call(self, data)
+
+
+def _single_candidate_body(*, title: str, body: str, confidence: float, kind: str | None = None) -> str:
+    memory: dict[str, object] = {'title': title, 'body': body, 'confidence': confidence}
+    if kind is not None:
+        memory['kind'] = kind
+
+    return json.dumps({'memories': [memory]})
+
+
 @pytest.mark.django_db
-def test_process_observation_empty_body_falls_back_to_title(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_process_observation_uses_model_confidence_and_kind(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
-    monkeypatch.setattr(
-        'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body=''),
+    body = _single_candidate_body(
+        title='pytest fails without the memory worker module',
+        body='Import path was wrong; adding the module makes the suite exit 0.',
+        confidence=0.85,
+        kind='gotcha',
     )
-
-    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
-
-    assert result.skipped is False
-    candidates = MemoryCandidate.objects.filter(source_observation=observation)
-    assert candidates.count() == 1
-    candidate = candidates.get()
-    assert candidate.title == 'Config lives in settings.py'
-    assert candidate.body == 'Config lives in settings.py'
-
-
-@pytest.mark.django_db
-def test_process_observation_empty_title_falls_back_to_body(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
     monkeypatch.setattr(
         'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='', body='Uses pgvector cosine.'),
-    )
-
-    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
-
-    assert result.skipped is False
-    candidate = MemoryCandidate.objects.get(source_observation=observation)
-    assert candidate.title == 'Uses pgvector cosine.'
-    assert candidate.body == 'Uses pgvector cosine.'
-
-
-@pytest.mark.django_db
-def test_process_observation_both_title_and_body_empty_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
-    monkeypatch.setattr(
-        'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='', body=''),
-    )
-
-    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
-
-    assert result.skipped is True
-    assert result.candidate is None
-    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
-    assert AuditEvent.objects.filter(
-        event_type='MemoryCandidateSkipped',
-        target_id=str(observation.id),
-    ).exists()
-
-
-@pytest.mark.django_db
-def test_process_observation_skip_title_with_empty_body_still_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
-    monkeypatch.setattr(
-        'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='SKIP', body=''),
-    )
-
-    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
-
-    assert result.skipped is True
-    assert result.candidate is None
-    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
-
-
-@pytest.mark.django_db
-def test_process_observation_normal_title_and_body_preserved(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
-    monkeypatch.setattr(
-        'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
+        lambda *_, **__: _CandidatesBodyGateway(body),
     )
 
     result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
 
     assert result.skipped is False
     candidate = MemoryCandidate.objects.get(source_observation=observation)
-    assert candidate.title == 'Config lives in settings.py'
-    assert candidate.body == 'Uses pgvector cosine.'
-
-
-@pytest.mark.django_db
-def test_process_observation_durable_type_sets_candidate_kind(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    observation.observation_type = 'gotcha'
-    observation.save(update_fields=['observation_type', 'updated_at'])
-    create_generation_policy(organization, team, project)
-    monkeypatch.setattr(
-        'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
-    )
-
-    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
-
-    assert result.skipped is False
-    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.title == 'pytest fails without the memory worker module'
+    assert candidate.confidence == Decimal('0.850')
     assert candidate.kind == 'gotcha'
 
 
 @pytest.mark.django_db
-def test_process_observation_non_durable_type_leaves_candidate_kind_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_process_observation_high_model_confidence_auto_promotes(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    observation.observation_type = 'other'
-    observation.save(update_fields=['observation_type', 'updated_at'])
     create_generation_policy(organization, team, project)
+    enable_auto_promote(organization, threshold='0.700')
+    body = _single_candidate_body(
+        title='Consumer acks before processing loses messages on restart',
+        body='worker/queue.py acknowledges before processing; ack after processing instead.',
+        confidence=0.9,
+        kind='gotcha',
+    )
     monkeypatch.setattr(
         'engram.memory.services.get_provider_gateway',
-        lambda *_, **__: _TitleBodyGateway(title='Config lives in settings.py', body='Uses pgvector cosine.'),
+        lambda *_, **__: _CandidatesBodyGateway(body),
+    )
+
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.confidence == Decimal('0.900')
+    assert result.held_for_review is False
+    assert result.memory is not None
+    assert result.memory.kind == 'gotcha'
+
+
+@pytest.mark.django_db
+def test_process_observation_handles_fenced_json_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    inner = _single_candidate_body(
+        title='Retrieval ranks by cosine similarity',
+        body='Documents are ranked by cosine similarity over pgvector embeddings.',
+        confidence=0.8,
+    )
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _CandidatesBodyGateway(f'```json\n{inner}\n```'),
     )
 
     result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
 
     assert result.skipped is False
     candidate = MemoryCandidate.objects.get(source_observation=observation)
-    assert candidate.kind == ''
+    assert candidate.title == 'Retrieval ranks by cosine similarity'
+    assert candidate.confidence == Decimal('0.800')
+    assert not candidate.title.startswith('```')
 
 
-def test_strip_json_fence_strips_json_tagged_fence() -> None:
-    fenced = '```json\n{"memories": []}\n```'
+@pytest.mark.django_db
+def test_process_observation_empty_memories_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _CandidatesBodyGateway('{"memories": []}'),
+    )
 
-    assert strip_json_fence(fenced) == '{"memories": []}'
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
 
-
-def test_strip_json_fence_strips_bare_fence() -> None:
-    fenced = '```\n{"memories": []}\n```'
-
-    assert strip_json_fence(fenced) == '{"memories": []}'
-
-
-def test_strip_json_fence_strips_uppercase_json_tag() -> None:
-    fenced = '```JSON\n{"memories": []}\n```'
-
-    assert strip_json_fence(fenced) == '{"memories": []}'
+    assert result.skipped is True
+    assert result.candidate is None
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
 
 
-def test_strip_json_fence_tolerates_trailing_whitespace_and_newlines() -> None:
-    fenced = '```json\n{"memories": []}\n```\n\n   '
+@pytest.mark.django_db
+def test_process_observation_parse_failure_yields_zero_confidence_never_promotable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    enable_auto_promote(organization, threshold='0.000')
+    monkeypatch.setattr(
+        'engram.memory.services.get_provider_gateway',
+        lambda *_, **__: _CandidatesBodyGateway('not json and not fenced either'),
+    )
 
-    assert strip_json_fence(fenced) == '{"memories": []}'
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    candidate = MemoryCandidate.objects.get(source_observation=observation)
+    assert candidate.confidence == Decimal('0.000')
+    assert candidate.evidence[0]['parse_fallback'] is True
+    assert result.held_for_review is True
+    assert result.memory is None
 
 
-def test_strip_json_fence_returns_unfenced_json_unchanged() -> None:
-    unfenced = '{"memories": []}'
+@pytest.mark.django_db
+def test_process_observation_short_content_skipped_without_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.title = 'tiny'
+    observation.body = 'note'
+    observation.save(update_fields=['title', 'body', 'updated_at'])
+    gateway = _NoCallGateway()
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: gateway)
 
-    assert strip_json_fence(unfenced) == unfenced
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert gateway.calls == 0
+    assert not MemoryCandidate.objects.filter(source_observation=observation).exists()
+    skip_audit = AuditEvent.objects.get(event_type='MemoryCandidateSkipped', target_id=str(observation.id))
+    assert skip_audit.metadata['reason'] == 'content_below_min'
 
 
-def test_strip_json_fence_returns_non_fence_text_unchanged() -> None:
-    text = 'not json at all'
+@pytest.mark.django_db
+def test_process_observation_session_start_skipped_without_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    create_generation_policy(organization, team, project)
+    observation.observation_type = 'session_start'
+    observation.save(update_fields=['observation_type', 'updated_at'])
+    gateway = _NoCallGateway()
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', lambda *_, **__: gateway)
 
-    assert strip_json_fence(text) == text
+    result = ProcessObservationRecorded().execute(MemoryCandidateWorkerInput(observation_id=observation.id))
+
+    assert result.skipped is True
+    assert gateway.calls == 0
+    skip_audit = AuditEvent.objects.get(event_type='MemoryCandidateSkipped', target_id=str(observation.id))
+    assert skip_audit.metadata['reason'] == 'lifecycle_event'
 
 
-def test_strip_json_fence_returns_non_str_input_unchanged() -> None:
-    assert strip_json_fence(None) is None  # type: ignore[arg-type]
+def test_realtime_generation_system_prompt_declares_memories_contract() -> None:
+    prompt = realtime_generation_system_prompt()
+
+    assert '"memories"' in prompt
+    assert '{"memories": []}' in prompt
+    assert 'confidence' in prompt
+
+
+def test_realtime_provider_prompt_truncates_huge_body() -> None:
+    observation = Observation(
+        title='T',
+        body='x' * 5000,
+        facts=[],
+        narrative='',
+        concepts=[],
+        files_read=[],
+        files_modified=[],
+        source_metadata={},
+    )
+
+    prompt = realtime_provider_prompt(observation, 200)
+
+    assert len(prompt) <= 200 + len('\n[truncated 99999 chars]')
+    assert '[truncated' in prompt
 
 
 def create_fallback_scope() -> tuple[Organization, Team, Project]:

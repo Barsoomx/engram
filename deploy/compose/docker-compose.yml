@@ -13,6 +13,7 @@ x-backend: &backend
     ENGRAM_CELERY_BROKER_URL: amqp://engram:engram@rabbitmq:5672/engram
     ENGRAM_CELERY_RESULT_BACKEND: redis://redis:6379/1
     ENGRAM_PROVIDER_MODE: ${ENGRAM_PROVIDER_MODE:-fake}
+    ENGRAM_REALTIME_MIN_CONTENT_CHARS: ${ENGRAM_REALTIME_MIN_CONTENT_CHARS:-80}
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:
