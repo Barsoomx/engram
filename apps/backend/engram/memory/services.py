@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -1243,8 +1244,28 @@ def digest_system_prompt() -> str:
     )
 
 
-def digest_prompt(sources: tuple[Memory, ...]) -> str:
-    lines = [f'- {source.title}: {source.body}' for source in sources]
+def _digest_source_char_budget() -> int:
+    return int(os.environ.get('ENGRAM_DIGEST_SOURCE_CHAR_BUDGET', '2000'))
+
+
+def _digest_max_sources() -> int:
+    return int(os.environ.get('ENGRAM_DIGEST_MAX_SOURCES', '200'))
+
+
+def _digest_source_line(source: Memory, cap: int) -> str:
+    line = f'- {source.title}: {source.body}'
+    if len(line) <= cap:
+        return line
+
+    marker = f'\n[truncated {len(line) - cap} chars]'
+    head = line[: max(cap - len(marker), 0)]
+
+    return head + marker
+
+
+def digest_prompt(sources: tuple[Memory, ...], cap: int | None = None) -> str:
+    budget = cap if cap is not None else _digest_source_char_budget()
+    lines = [_digest_source_line(source, budget) for source in sources]
 
     return '\n'.join(lines)
 
@@ -1258,20 +1279,30 @@ def digest_content_hash(project_id: uuid.UUID, memory_ids: tuple[uuid.UUID, ...]
 class GenerateDigest:
     def execute(self, data: DigestInput) -> DigestResult:
         project = Project.objects.get(id=data.project_id)
-        sources = tuple(
-            Memory.objects.filter(
-                id__in=data.memory_ids,
-                organization=project.organization,
-                project=project,
-                status=MemoryStatus.APPROVED,
-            ).order_by('title'),
+        base_sources = Memory.objects.filter(
+            id__in=data.memory_ids,
+            organization=project.organization,
+            project=project,
+            status=MemoryStatus.APPROVED,
         )
-        if not sources:
+        total_sources = base_sources.count()
+        if total_sources == 0:
             raise MemoryWorkerError('no approved source memories found for digest')
+
+        max_sources = _digest_max_sources()
+        selected = list(base_sources.order_by('-updated_at', 'id')[:max_sources])
+        sources = tuple(sorted(selected, key=lambda memory: (memory.title, str(memory.id))))
         content_hash = digest_content_hash(project.id, data.memory_ids)
         existing = self._find_existing(project, content_hash)
         if existing is not None:
             return existing
+        if total_sources > len(sources):
+            self._audit_sources_truncated(
+                project,
+                data,
+                total_sources=total_sources,
+                sources_used=len(sources),
+            )
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
                 organization_id=project.organization_id,
@@ -1360,6 +1391,32 @@ class GenerateDigest:
             provider_call_id=provider_result.call_record_id,
         )
 
+    def _audit_sources_truncated(
+        self,
+        project: Project,
+        data: DigestInput,
+        *,
+        total_sources: int,
+        sources_used: int,
+    ) -> None:
+        AuditEvent.objects.create(
+            organization=project.organization,
+            project=project,
+            event_type='DigestSourcesTruncated',
+            actor_type='system',
+            target_type='project',
+            target_id=str(project.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'total_sources': total_sources,
+                'sources_used': sources_used,
+                'max_sources': _digest_max_sources(),
+            },
+        )
+
     def _find_existing(self, project: Project, content_hash: str) -> DigestResult | None:
         existing_memory = (
             Memory.objects.filter(
@@ -1391,6 +1448,32 @@ class GenerateDigest:
 
 
 DAILY_DIGEST_WINDOW_DAYS = 7
+
+
+def _audit_digest_failed(
+    project: Project,
+    *,
+    digest_kind: str,
+    error: Exception,
+    request_id: str,
+    correlation_id: str,
+) -> None:
+    AuditEvent.objects.create(
+        organization=project.organization,
+        project=project,
+        event_type='DigestFailed',
+        actor_type='system',
+        target_type='project',
+        target_id=str(project.id),
+        capability='memories:review',
+        result=AuditResult.ERROR,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        metadata={
+            'digest_kind': digest_kind,
+            'reason': str(error)[:1024],
+        },
+    )
 
 
 def run_daily_digest_with_tracking(
@@ -1440,6 +1523,15 @@ def run_daily_digest_with_tracking(
         run.finished_at = timezone.now()
 
         run.save(update_fields=['status', 'failure_reason', 'finished_at', 'updated_at'])
+
+        if not getattr(error, 'retryable', False):
+            _audit_digest_failed(
+                project,
+                digest_kind='daily_structured',
+                error=error,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
 
         raise
 
@@ -1496,6 +1588,30 @@ def weekly_digest_content_hash(
     return hashlib.sha256(material.encode()).hexdigest()
 
 
+_WEEKLY_DIGEST_BUCKET_ORDER = (
+    ('added', 'Added'),
+    ('superseded', 'Superseded'),
+    ('retired', 'Retired'),
+    ('merged', 'Merged'),
+    ('refuted', 'Refuted'),
+)
+
+
+def render_weekly_digest_body(
+    memory_changes: dict[str, list[dict]],
+    window_end: datetime.datetime,
+    window_days: int,
+) -> str:
+    lines = [f'Structured weekly digest covering {window_days} days ending {window_end.date()}.']
+    for key, header in _WEEKLY_DIGEST_BUCKET_ORDER:
+        items = memory_changes.get(key, [])
+        lines.append('')
+        lines.append(f'## {header} ({len(items)})')
+        lines.extend(f'- {item.get("title", "")}' for item in items)
+
+    return '\n'.join(lines)
+
+
 class BuildWeeklyStructuredDigest:
     def execute(self, data: WeeklyDigestInput) -> WeeklyDigestResult:
         project = Project.objects.get(id=data.project_id, organization_id=data.organization_id)
@@ -1528,7 +1644,7 @@ class BuildWeeklyStructuredDigest:
                 organization=project.organization,
                 project=project,
                 title=f'Weekly Structured Digest {window_start.date()} to {window_end.date()}',
-                body=(f'Structured weekly digest covering {data.window_days} days ending {window_end.date()}.'),
+                body=render_weekly_digest_body(memory_changes, window_end, data.window_days),
                 status=MemoryStatus.APPROVED,
                 visibility_scope=VisibilityScope.PROJECT,
                 metadata={
@@ -1557,6 +1673,24 @@ class BuildWeeklyStructuredDigest:
 
             IndexMemoryVersion().execute(
                 IndexMemoryVersionInput(memory_version_id=version.id),
+            )
+
+            AuditEvent.objects.create(
+                organization=digest_memory.organization,
+                project=digest_memory.project,
+                event_type='DigestGenerated',
+                actor_type='system',
+                target_type='memory',
+                target_id=str(digest_memory.id),
+                capability='memories:review',
+                result=AuditResult.RECORDED,
+                request_id=data.request_id,
+                correlation_id=data.correlation_id,
+                metadata={
+                    'digest_kind': 'weekly_structured',
+                    'memory_version_id': str(version.id),
+                    'counts': counts,
+                },
             )
 
         return WeeklyDigestResult(
@@ -1774,6 +1908,15 @@ def run_weekly_digest_with_tracking(
         run.finished_at = timezone.now()
 
         run.save(update_fields=['status', 'failure_reason', 'finished_at', 'updated_at'])
+
+        if not getattr(error, 'retryable', False):
+            _audit_digest_failed(
+                project,
+                digest_kind='weekly_structured',
+                error=error,
+                request_id=request_id,
+                correlation_id=correlation_id,
+            )
 
         raise
 

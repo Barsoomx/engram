@@ -2,19 +2,25 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import structlog
 from django.utils import timezone
 
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
-from engram.core.models import Memory, MemoryStatus, Project
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    Project,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+)
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
-    DAILY_DIGEST_WINDOW_DAYS,
     WEEKLY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
     MemoryWorkerError,
@@ -312,8 +318,39 @@ def decay_memory_confidence() -> dict[str, int]:
     }
 
 
+def _daily_digest_window_days() -> int:
+    return int(os.environ.get('ENGRAM_DAILY_DIGEST_WINDOW_DAYS', '1'))
+
+
+def _daily_digest_max_window_days() -> int:
+    return int(os.environ.get('ENGRAM_DAILY_DIGEST_MAX_WINDOW_DAYS', '7'))
+
+
+def daily_digest_window_start(project: Project, now: datetime | None = None) -> datetime:
+    now = now or timezone.now()
+    floor_start = now - timedelta(days=_daily_digest_max_window_days())
+    last_success = (
+        WorkflowRun.objects.filter(
+            organization_id=project.organization_id,
+            project=project,
+            run_type=WorkflowRunType.DAILY_DIGEST,
+            status=WorkflowRunStatus.SUCCEEDED,
+            finished_at__isnull=False,
+        )
+        .order_by('-finished_at')
+        .values_list('finished_at', flat=True)
+        .first()
+    )
+    if last_success is not None:
+        candidate = last_success
+    else:
+        candidate = now - timedelta(days=_daily_digest_window_days())
+
+    return max(candidate, floor_start)
+
+
 def _recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
-    window_start = timezone.now() - timedelta(days=DAILY_DIGEST_WINDOW_DAYS)
+    window_start = daily_digest_window_start(project)
 
     return list(
         Memory.objects.filter(

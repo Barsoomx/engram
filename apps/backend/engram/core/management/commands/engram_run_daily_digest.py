@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand, CommandParser
 from django.utils import timezone
 
 from engram.core.models import Memory, MemoryStatus, Project
-from engram.memory.tasks import DAILY_DIGEST_WINDOW_DAYS, generate_daily_digest
+from engram.memory.tasks import daily_digest_window_start, generate_daily_digest
 
 
 class Command(BaseCommand):
@@ -17,18 +17,22 @@ class Command(BaseCommand):
         parser.add_argument(
             '--window-days',
             type=int,
-            default=DAILY_DIGEST_WINDOW_DAYS,
+            default=None,
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
-        window_days = int(options['window_days'])
-        window_start = timezone.now() - timedelta(days=window_days)
+        override_days = options['window_days']
 
         enqueued_projects = 0
         enqueued_memories = 0
         skipped_projects = 0
 
         for project in Project.objects.all():
+            if override_days is None:
+                window_start = daily_digest_window_start(project)
+            else:
+                window_start = timezone.now() - timedelta(days=int(override_days))
+
             memory_ids = list(
                 Memory.objects.filter(
                     organization_id=project.organization_id,
@@ -55,6 +59,5 @@ class Command(BaseCommand):
         self.stdout.write(
             f'enqueued_projects={enqueued_projects} '
             f'enqueued_memories={enqueued_memories} '
-            f'skipped_projects={skipped_projects} '
-            f'window_days={window_days}',
+            f'skipped_projects={skipped_projects}',
         )
