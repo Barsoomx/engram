@@ -259,7 +259,7 @@ def run_scheduled_digests() -> dict[str, int]:
     enqueued_tasks = 0
 
     for project in Project.objects.all():
-        memory_ids = _recent_approved_memory_ids(project)
+        memory_ids = recent_approved_memory_ids(project)
         if not memory_ids:
             continue
 
@@ -368,7 +368,7 @@ def daily_digest_window_start(project: Project, now: datetime | None = None) -> 
     return max(candidate, floor_start)
 
 
-def _recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
+def recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
     window_start = daily_digest_window_start(project)
 
     return list(

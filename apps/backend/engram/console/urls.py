@@ -15,6 +15,7 @@ from engram.console.views.metrics import (
 from engram.console.views.model_setup import ApplyPresetView, ModelPresetsView, ModelSetupStatusView
 from engram.console.views.ops import OpsOverviewView
 from engram.console.views.organizations import OrganizationViewSet
+from engram.console.views.project_digest import ProjectDigestRunView
 from engram.console.views.projects import ProjectViewSet
 from engram.console.views.roles import RoleViewSet
 from engram.console.views.search_debug import SearchDebugView
@@ -39,6 +40,11 @@ router.register('memory-review', MemoryReviewViewSet, basename='admin-memory-rev
 router.register('audit-events', AuditEventViewSet, basename='admin-audit-event')
 
 urlpatterns = router.urls + [
+    path(
+        'projects/<uuid:project_id>/digest/run',
+        ProjectDigestRunView.as_view(),
+        name='admin-project-digest-run',
+    ),
     path('digests/weekly', WeeklyDigestView.as_view(), name='admin-digests-weekly'),
     path('digests/<uuid:memory_id>/review', DigestReviewView.as_view(), name='admin-digests-review'),
     path('search-debug/', SearchDebugView.as_view(), name='admin-search-debug'),

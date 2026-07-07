@@ -1,7 +1,8 @@
 'use client';
 
+import { addToast } from '@heroui/react';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { BookOpen, Calendar, CheckCircle2, ChevronLeft, ChevronRight } from 'lucide-react';
+import { BookOpen, Calendar, CheckCircle2, ChevronLeft, ChevronRight, Sparkles } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -11,12 +12,15 @@ import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { TimeStamp } from '@/components/ui/time-stamp';
+import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   getWeeklyDigest,
   reviewDigest,
+  runProjectDigest,
   type DigestChangelogItem,
   type DigestCounts,
+  type DigestRunResult,
   type WeeklyDigest,
 } from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
@@ -184,12 +188,62 @@ function DigestContent({ digest, onReviewed, canReview }: { digest: WeeklyDigest
   );
 }
 
+function GenerateDigestButton({ projectId }: { projectId: string }) {
+  const runMutation = useMutation({
+    mutationFn: () => runProjectDigest(projectId),
+    onSuccess: (result: DigestRunResult) => {
+      if (!result.enqueued) {
+        addToast({
+          title: 'Nothing to digest',
+          description: 'No recent approved memories were found for this project.',
+          color: 'warning',
+        });
+
+        return;
+      }
+
+      addToast({
+        title: 'Digest generation started',
+        description: 'A daily digest is now being generated for this project.',
+        color: 'success',
+        endContent: (
+          <Link
+            href={`/workflow-runs?run_type=daily_digest&project_id=${projectId}`}
+            className='text-[12.5px] font-semibold text-primary-400 hover:underline'
+          >
+            View progress
+          </Link>
+        ),
+      });
+    },
+    onError: (error: unknown) => {
+      addToast({
+        title: 'Could not start digest',
+        description: extractApiError(error, 'The digest could not be generated. Please try again.'),
+        color: 'danger',
+      });
+    },
+  });
+
+  return (
+    <PrimaryButton
+      onPress={() => runMutation.mutate()}
+      isLoading={runMutation.isPending}
+      startContent={<Sparkles className='h-4 w-4' strokeWidth={2} />}
+    >
+      Generate digest now
+    </PrimaryButton>
+  );
+}
+
 export default function DigestsPage() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
 
   const meQuery = useQuery<MeResponse>({ queryKey: ['auth', 'me'], queryFn: fetchMe });
   const capabilities = React.useMemo(() => meQuery.data?.capabilities ?? [], [meQuery.data?.capabilities]);
+
+  const canGenerate = hasCapability(capabilities, 'memories:admin');
 
   const [weeksBack, setWeeksBack] = React.useState(0);
 
@@ -206,25 +260,28 @@ export default function DigestsPage() {
           title='Weekly Digest'
           subtitle='Memory changes merged, retired, and refuted across your project.'
           actions={
-            <div className='flex items-center gap-1.5'>
-              <button
-                type='button'
-                aria-label='Older week'
-                onClick={() => setWeeksBack((w) => w + 1)}
-                className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground'
-              >
-                <ChevronLeft size={16} strokeWidth={2} />
-              </button>
-              <span className='min-w-[150px] text-center text-[12.5px] font-medium text-default-600'>{weekLabel(weeksBack)}</span>
-              <button
-                type='button'
-                aria-label='Newer week'
-                onClick={() => setWeeksBack((w) => Math.max(0, w - 1))}
-                disabled={weeksBack === 0}
-                className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40'
-              >
-                <ChevronRight size={16} strokeWidth={2} />
-              </button>
+            <div className='flex items-center gap-3'>
+              <div className='flex items-center gap-1.5'>
+                <button
+                  type='button'
+                  aria-label='Older week'
+                  onClick={() => setWeeksBack((w) => w + 1)}
+                  className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground'
+                >
+                  <ChevronLeft size={16} strokeWidth={2} />
+                </button>
+                <span className='min-w-[150px] text-center text-[12.5px] font-medium text-default-600'>{weekLabel(weeksBack)}</span>
+                <button
+                  type='button'
+                  aria-label='Newer week'
+                  onClick={() => setWeeksBack((w) => Math.max(0, w - 1))}
+                  disabled={weeksBack === 0}
+                  className='inline-flex h-9 w-9 items-center justify-center rounded-[10px] border border-divider bg-content1 text-default-500 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40'
+                >
+                  <ChevronRight size={16} strokeWidth={2} />
+                </button>
+              </div>
+              {canGenerate && activeProjectId ? <GenerateDigestButton projectId={activeProjectId} /> : null}
             </div>
           }
         />

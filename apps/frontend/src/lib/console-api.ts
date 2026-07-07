@@ -730,6 +730,29 @@ export async function reviewDigest(
   return response.data;
 }
 
+export interface DigestRunWorkflow {
+  run_type: string;
+  project_id: string;
+  request_id: string;
+}
+
+export interface DigestRunResult {
+  enqueued: boolean;
+  reason?: string;
+  workflow?: DigestRunWorkflow;
+}
+
+export async function runProjectDigest(
+  projectId: string,
+): Promise<DigestRunResult> {
+  const response = await apiClient().post<DigestRunResult>(
+    `/v1/admin/projects/${projectId}/digest/run`,
+    {},
+  );
+
+  return response.data;
+}
+
 /* -------------------------------- Hook dry-run ---------------------------- */
 
 export interface HookDryRunInput {
