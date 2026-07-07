@@ -80,6 +80,7 @@ task_routes = {
     'engram.memory.sweep_stale_sessions': {'queue': QUEUE_BATCH},
     'engram.memory.retry_failed_distillations': {'queue': QUEUE_BATCH},
     'engram.memory.decay_memory_confidence': {'queue': QUEUE_BATCH},
+    'engram.memory.expire_stale_candidates': {'queue': QUEUE_BATCH},
 }
 
 task_soft_time_limit = 120
@@ -147,6 +148,11 @@ beat_schedule: dict[str, dict] = {
     'confidence-decay': {
         'task': 'engram.memory.decay_memory_confidence',
         'schedule': crontab(day_of_week=1, hour=4, minute=0),
+        'options': {'queue': QUEUE_BATCH},
+    },
+    'expire-stale-candidates': {
+        'task': 'engram.memory.expire_stale_candidates',
+        'schedule': timedelta(minutes=30),
         'options': {'queue': QUEUE_BATCH},
     },
 }
