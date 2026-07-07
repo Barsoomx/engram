@@ -153,6 +153,44 @@ def test_list_returns_active_projects_with_pagination(
 
 
 @pytest.mark.django_db
+def test_list_search_matches_name_or_slug(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owned_project: Project,
+) -> None:
+    billing = _make_project(f_owned_org, slug='billing', name='Billing Service')
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    by_slug = client.get('/v1/admin/projects/', {'search': 'billing'})
+    by_name = client.get('/v1/admin/projects/', {'search': 'service'})
+
+    assert by_slug.status_code == 200
+
+    assert {project['id'] for project in by_slug.data['results']} == {str(billing.id)}
+
+    assert {project['id'] for project in by_name.data['results']} == {str(billing.id)}
+
+
+@pytest.mark.django_db
+def test_list_ordering_by_name(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owned_project: Project,
+) -> None:
+    _make_project(f_owned_org, slug='apollo', name='Apollo')
+    _make_project(f_owned_org, slug='zeus', name='Zeus')
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/projects/', {'ordering': 'name'})
+
+    assert response.status_code == 200
+
+    assert [project['name'] for project in response.data['results']] == ['Apollo', 'Platform', 'Zeus']
+
+
+@pytest.mark.django_db
 def test_list_denied_without_capability(
     f_developer_user_token: str,
     f_other_org: Organization,

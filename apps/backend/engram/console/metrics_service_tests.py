@@ -18,6 +18,7 @@ from engram.core.models import (
     Project,
     Runtime,
     SessionStatus,
+    Team,
 )
 
 LOCMEM_CACHES = {
@@ -60,6 +61,78 @@ def scope_for(organization: Organization, project: Project) -> EffectiveScope:
         actor_id='actor-1',
         project_bound=False,
     )
+
+
+def _scope_with_team(
+    organization: Organization,
+    project: Project,
+    team: Team,
+) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=organization.id,
+        api_key_id=organization.id,
+        project_ids=(project.id,),
+        team_ids=(team.id,),
+        capabilities=(),
+        actor_type='api_key',
+        actor_id='actor-1',
+        project_bound=False,
+    )
+
+
+@pytest.mark.django_db
+def test_get_overview_metrics_narrows_to_team_id(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team = Team.objects.create(organization=f_org, name='Squad', slug='squad')
+    Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=team,
+        title='team-memory',
+        body='body',
+        status=MemoryStatus.APPROVED,
+    )
+    Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        title='project-memory',
+        body='body',
+        status=MemoryStatus.APPROVED,
+    )
+
+    scope = _scope_with_team(f_org, f_project, team)
+
+    unfiltered = get_overview_metrics(f_org, scope)
+    narrowed = get_overview_metrics(f_org, scope, team_id=team.id)
+
+    assert unfiltered['memories_indexed'] == 2
+    assert narrowed['memories_indexed'] == 1
+
+
+@pytest.mark.django_db
+def test_get_overview_metrics_team_id_outside_scope_returns_empty(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team = Team.objects.create(organization=f_org, name='Squad', slug='squad')
+    other_team = Team.objects.create(organization=f_org, name='Other', slug='other')
+    Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=team,
+        title='team-memory',
+        body='body',
+        status=MemoryStatus.APPROVED,
+    )
+
+    scope = _scope_with_team(f_org, f_project, team)
+
+    narrowed = get_overview_metrics(f_org, scope, team_id=other_team.id)
+
+    assert narrowed['memories_indexed'] == 0
 
 
 @pytest.mark.django_db

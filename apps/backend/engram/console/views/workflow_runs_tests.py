@@ -216,6 +216,52 @@ def test_list_filters_by_status_and_run_type(
 
 
 @pytest.mark.django_db
+def test_list_filters_by_request_id(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    _make_run(f_admin_org, project, request_id='req-target', correlation_id='corr-a')
+
+    _make_run(f_admin_org, project, request_id='req-other', correlation_id='corr-b')
+
+    response = f_admin_client.get(
+        '/v1/admin/workflow-runs/',
+        {'request_id': 'req-target'},
+    )
+
+    assert response.status_code == 200
+
+    request_ids = [entry['request_id'] for entry in response.data['results']]
+
+    assert request_ids == ['req-target']
+
+
+@pytest.mark.django_db
+def test_list_filters_by_correlation_id(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    _make_run(f_admin_org, project, request_id='run-1', correlation_id='corr-target')
+
+    _make_run(f_admin_org, project, request_id='run-2', correlation_id='corr-other')
+
+    response = f_admin_client.get(
+        '/v1/admin/workflow-runs/',
+        {'correlation_id': 'corr-target'},
+    )
+
+    assert response.status_code == 200
+
+    request_ids = [entry['request_id'] for entry in response.data['results']]
+
+    assert request_ids == ['run-1']
+
+
+@pytest.mark.django_db
 def test_list_filters_by_project_team_and_escalation(
     f_admin_client: APIClient,
     f_admin_org: Organization,

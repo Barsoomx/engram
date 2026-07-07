@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -22,6 +23,7 @@ from engram.console.services import (
     activate_member,
     audit_admin_action,
     invite_member,
+    reactivate_member,
 )
 from engram.console.usecases.members import (
     RemoveMember,
@@ -55,14 +57,48 @@ class MemberViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        return (
+        queryset = (
             OrganizationMembership.objects.filter(
                 organization=self.request.active_organization,
-                active=True,
             )
             .select_related('identity', 'role')
             .order_by('created_at')
         )
+
+        if self.action == 'reactivate':
+            return queryset
+
+        if self.action == 'list':
+            return self._filter_list(queryset)
+
+        return queryset.filter(active=True)
+
+    def _filter_list(self, queryset: Any) -> Any:
+        queryset = queryset.filter(active=self._active_param())
+
+        role = self.request.query_params.get('role')
+
+        if role:
+            queryset = queryset.filter(role__code=role)
+
+        search = self.request.query_params.get('search')
+
+        if search:
+            queryset = queryset.filter(
+                Q(identity__display_name__icontains=search)
+                | Q(identity__email__icontains=search)
+                | Q(identity__external_id__icontains=search),
+            )
+
+        return queryset
+
+    def _active_param(self) -> bool:
+        raw = self.request.query_params.get('active')
+
+        if raw is None:
+            return True
+
+        return raw.strip().lower() not in {'false', '0', 'no'}
 
     def get_serializer_context(self) -> dict:
         context = super().get_serializer_context()
@@ -132,6 +168,21 @@ class MemberViewSet(
             actor_identity=self.request.user_identity,
             membership_id=membership.id,
         )
+
+        serializer = self.get_serializer(membership)
+
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'])
+    def reactivate(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        membership = self.get_object()
+
+        with transaction.atomic():
+            membership = reactivate_member(
+                organization=self.request.active_organization,
+                actor_identity=self.request.user_identity,
+                membership_id=membership.id,
+            )
 
         serializer = self.get_serializer(membership)
 

@@ -10,8 +10,8 @@ class RoleReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Role
-        fields = ['id', 'code', 'name', 'built_in', 'capabilities']
-        read_only_fields = ['id', 'code', 'name', 'built_in', 'capabilities']
+        fields = ['id', 'code', 'name', 'description', 'built_in', 'capabilities']
+        read_only_fields = ['id', 'code', 'name', 'description', 'built_in', 'capabilities']
 
     def get_capabilities(self, role: Role) -> list[str]:
         codes = RoleCapability.objects.filter(role=role).values_list('capability__code', flat=True)
