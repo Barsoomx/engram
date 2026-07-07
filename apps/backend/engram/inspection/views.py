@@ -221,7 +221,7 @@ def _memory_source_provenance(memory: Memory) -> tuple[str | None, str | None]:
         correlation_id = None
         raw_event = observation.raw_event
         if raw_event is not None and raw_event.correlation_id:
-            correlation_id = redacted_text(raw_event.correlation_id)
+            correlation_id = raw_event.correlation_id
 
         return session_id, correlation_id
 

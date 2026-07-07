@@ -349,6 +349,74 @@ def test_memory_detail_exposes_source_session_and_correlation() -> None:
 
 
 @pytest.mark.django_db
+def test_memory_detail_emits_correlation_id_unredacted_for_lookup() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Provenanced memory with secret-shaped correlation',
+        body='Body with secret-shaped correlation.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id='provenance-agent-corr',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='provenance-session-corr',
+        runtime=Runtime.CODEX,
+    )
+    correlation_id = '123456:abcdefghijklmnopqrstuvwx'
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        client_event_id='provenance-event-corr',
+        idempotency_key='provenance-event-corr-key',
+        content_hash='provenance-corr-hash',
+        runtime=Runtime.CODEX,
+        correlation_id=correlation_id,
+        payload={'tool_name': 'bash'},
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='source observation corr',
+        content_hash='obs-provenance-corr-hash',
+    )
+    version.source_observation = observation
+    version.save(update_fields=['source_observation', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail['source_correlation_id'] == correlation_id
+    assert detail['source_correlation_id'] != '[REDACTED]'
+
+
+@pytest.mark.django_db
 def test_memory_detail_source_session_is_null_without_source_observation() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
