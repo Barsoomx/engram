@@ -138,6 +138,39 @@ class McpContractTests(unittest.TestCase):
             feedback["inputSchema"]["properties"]["action"]["enum"],
         )
 
+    def test_tools_list_descriptions_direct_proactive_search(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 12, "method": "tools/list"}, build_tools()
+        )
+        descriptions = {
+            tool["name"]: tool["description"] for tool in response["result"]["tools"]
+        }
+
+        self.assertEqual(
+            descriptions["engram_search"],
+            "Step 1 - ALWAYS search project memory BEFORE starting any non-trivial task (bug fix, feature, refactor, debugging). Returns prior decisions, gotchas, incidents and architecture notes ranked by relevance. Call it when the user references past work ('did we', 'last time', 'as before'), names a subsystem, or reports an error you have not seen this session. Prefer short 2-4 word queries (symptom, component, error text).",
+        )
+        self.assertEqual(
+            descriptions["engram_observations"],
+            "Step 2 - list recent raw observations (prompts, tool activity, hook events) captured for the connected project. Use to corroborate a memory found via engram_search with ground-truth detail, or to audit what Engram captured.",
+        )
+        self.assertEqual(
+            descriptions["engram_context"],
+            "Re-request the memory context bundle that is injected at session start (recent and relevant approved memories for this project). Use after /clear or context compaction, or when the injected Engram context looks stale.",
+        )
+        self.assertEqual(
+            descriptions["engram_memory_feedback"],
+            "Step 3 - close the loop: the moment you discover an injected or retrieved memory is outdated or wrong, mark it stale or refuted with a reason. Clean memory improves every future session; do not silently ignore bad memory.",
+        )
+        self.assertEqual(
+            descriptions["engram_memory_link"],
+            "Attach a file/symbol/commit/issue link to an approved memory so future retrieval can find it by exact file path or symbol match.",
+        )
+        self.assertEqual(
+            descriptions["engram_memory_version"],
+            "Update an approved memory body, creating a new reviewed version. Use when you verified materially better information than what the memory states.",
+        )
+
     def test_tools_call_search_returns_text_content(self) -> None:
         response = handle_request(
             {
