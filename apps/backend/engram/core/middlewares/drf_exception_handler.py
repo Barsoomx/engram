@@ -14,6 +14,8 @@ from engram.core.domain import DomainError
 
 logger = structlog.getLogger('rest_logger')
 
+GENERIC_ERROR_DETAIL = 'internal server error'
+
 MANAGER_DOMAIN_EXTRA_FIELDS = {
     'missing_capability': str,
     'limit': int,
@@ -186,7 +188,7 @@ def custom_exception_handler(exc: Exception, context: dict[str, Any]) -> Respons
     else:
         response = Response(
             _build_fallback_response_data(
-                detail=detail,
+                detail=GENERIC_ERROR_DETAIL,
                 field_errors=field_errors,
             ),
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,

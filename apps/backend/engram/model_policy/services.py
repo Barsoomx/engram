@@ -21,8 +21,10 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.db.models import Q
 
+from engram.core.environments import NON_PRODUCTION_ENVIRONMENTS
 from engram.core.models import AuditEvent, AuditResult, Project, Team
 from engram.core.redaction import redact_value
+from engram.model_policy.base_url_validation import BaseUrlValidationError, validate_base_url
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import (
     ModelPolicy,
@@ -37,7 +39,6 @@ from engram.model_policy.models import (
 logger = structlog.get_logger(__name__)
 
 SECRET_KEY_VERSION = 'v1'
-NON_PRODUCTION_ENVIRONMENTS = {'dev', 'development', 'local', 'test'}
 
 _MODEL_PREFIX_CONTEXT_WINDOWS = {
     'claude-': 200000,
@@ -257,7 +258,11 @@ class CreateProviderSecret:
                 target_id=str(secret.id),
                 capability='secrets:*',
                 request_id=data.request_id,
-                metadata={'provider': data.provider, 'scope': data.scope, 'raw_secret': data.raw_secret},
+                metadata={
+                    'provider': data.provider,
+                    'scope': data.scope,
+                    'fingerprint': secret_fingerprint(data.raw_secret),
+                },
             )
             logger.info(
                 'provider_secret_created',
@@ -307,7 +312,10 @@ class RotateProviderSecret:
                 target_id=str(secret.id),
                 capability='secrets:*',
                 request_id=data.request_id,
-                metadata={'provider': secret.provider, 'raw_secret': data.raw_secret},
+                metadata={
+                    'provider': secret.provider,
+                    'fingerprint': secret_fingerprint(data.raw_secret),
+                },
             )
             logger.info(
                 'provider_secret_rotated',
@@ -992,6 +1000,17 @@ def _resolve_base_url(policy: ModelPolicy) -> str:
     return base_url if base_url else default_base_url(policy.provider)
 
 
+def _recheck_custom_base_url(policy: ModelPolicy, base_url: str) -> None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    if not str(metadata.get('base_url') or '').strip():
+        return
+
+    try:
+        validate_base_url(base_url)
+    except BaseUrlValidationError as error:
+        raise ModelPolicyError('provider_base_url_invalid', str(error), retryable=False) from error
+
+
 def provider_http_timeout() -> int:
     return int(os.environ.get('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60'))
 
@@ -1467,8 +1486,9 @@ def get_provider_gateway(
     )
     if envelope is None:
         raise ProviderSecretError('provider secret has no active envelope')
-    api_key = decrypt_secret(envelope)
     base_url = _resolve_base_url(policy)
+    _recheck_custom_base_url(policy, base_url)
+    api_key = decrypt_secret(envelope)
     if policy.provider == Provider.ANTHROPIC:
         gateway: FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway = AnthropicMessagesGateway(
             base_url=base_url,

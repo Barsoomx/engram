@@ -2,6 +2,19 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from engram.model_policy.base_url_validation import BaseUrlValidationError, validate_base_url
+
+
+class BaseUrlValidationMixin:
+    def validate_base_url(self, value: str) -> str:
+        if value:
+            try:
+                validate_base_url(value)
+            except BaseUrlValidationError as error:
+                raise serializers.ValidationError(str(error)) from error
+
+        return value
+
 
 class ProviderSecretCreateSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
@@ -33,7 +46,7 @@ class ProviderSecretQuerySerializer(serializers.Serializer):
     offset = serializers.IntegerField(required=False, default=0, min_value=0)
 
 
-class ModelPolicyCreateSerializer(serializers.Serializer):
+class ModelPolicyCreateSerializer(BaseUrlValidationMixin, serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
     scope_team_id = serializers.UUIDField(required=False, allow_null=True)
@@ -71,7 +84,7 @@ class ModelPolicyQuerySerializer(serializers.Serializer):
     offset = serializers.IntegerField(required=False, default=0, min_value=0)
 
 
-class ModelPolicyUpdateSerializer(serializers.Serializer):
+class ModelPolicyUpdateSerializer(BaseUrlValidationMixin, serializers.Serializer):
     project_id = serializers.UUIDField()
     team_id = serializers.UUIDField(required=False, allow_null=True)
     name = serializers.CharField(max_length=255, required=False)
