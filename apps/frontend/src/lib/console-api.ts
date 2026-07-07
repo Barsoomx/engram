@@ -158,6 +158,7 @@ export async function downloadMemoryExport(
   const response = await apiClient().get('/v1/admin/memories/export', {
     params: query,
     responseType: 'blob',
+    timeout: 0,
   });
 
   const disposition = response.headers['content-disposition'] as
@@ -729,6 +730,7 @@ export async function validateModelPolicies(
   const response = await apiClient().post<{ results: PolicyValidationResult[] }>(
     '/v1/admin/model-policies/validate',
     body,
+    { timeout: 120000 },
   );
 
   return response.data.results;
