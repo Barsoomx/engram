@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from django.db.models import Count, IntegerField, OuterRef, Prefetch, Subquery
+from django.db.models import Count, IntegerField, OuterRef, Prefetch, Q, Subquery
 from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.serializers import BaseSerializer
@@ -62,7 +62,7 @@ class OrganizationViewSet(
                 output_field=IntegerField(),
             )
 
-            return (
+            queryset = (
                 Organization.objects.filter(
                     organization_memberships__identity_id__in=identity_ids,
                     organization_memberships__active=True,
@@ -80,6 +80,13 @@ class OrganizationViewSet(
                     )
                 )
             )
+
+            search = self.request.query_params.get('search')
+
+            if search:
+                queryset = queryset.filter(Q(name__icontains=search) | Q(slug__icontains=search))
+
+            return queryset
 
         return Organization.objects.filter(
             organization_memberships__identity=self.request.user_identity,

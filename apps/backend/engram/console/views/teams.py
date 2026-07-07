@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from django.db.models import Q
 from rest_framework import mixins, viewsets
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -40,10 +41,17 @@ class TeamViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        return Team.objects.filter(
+        queryset = Team.objects.filter(
             organization=self.request.active_organization,
             archived_at__isnull=True,
         )
+
+        search = self.request.query_params.get('search')
+
+        if search:
+            queryset = queryset.filter(Q(name__icontains=search) | Q(slug__icontains=search))
+
+        return queryset
 
     def get_serializer_context(self) -> dict:
         context = super().get_serializer_context()
