@@ -30,6 +30,13 @@ def test_require_secret_key_accepts_custom_value_in_production() -> None:
     assert require_secret_key(raw_secret_key=provided, environment='production') == provided
 
 
+def test_require_secret_key_rejects_shipped_placeholder_in_production() -> None:
+    placeholder = 'change-me-local-development-only'
+
+    with pytest.raises(ImproperlyConfigured):
+        require_secret_key(raw_secret_key=placeholder, environment='production')
+
+
 def test_resolve_allowed_hosts_requires_env_in_production() -> None:
     with pytest.raises(ImproperlyConfigured):
         resolve_allowed_hosts(raw_allowed_hosts='', environment='production')

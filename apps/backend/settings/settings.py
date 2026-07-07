@@ -17,6 +17,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 DEFAULT_DEV_SECRET_KEY = 'engram-development-secret'
 
+INSECURE_SECRET_KEY_PLACEHOLDERS = frozenset(
+    {
+        DEFAULT_DEV_SECRET_KEY,
+        'change-me-local-development-only',
+        'change-me',
+        'changeme',
+        'secret',
+        'django-insecure',
+    },
+)
+
 
 def to_bool(value: str | bool | None) -> bool:
     return str(value).casefold() in {'1', 'true', 'yes', 'on', 'enabled'}
@@ -57,7 +68,7 @@ def require_secret_key(*, raw_secret_key: str, environment: str) -> str:
     if is_non_production(environment):
         return raw_secret_key or DEFAULT_DEV_SECRET_KEY
 
-    if not raw_secret_key or raw_secret_key == DEFAULT_DEV_SECRET_KEY:
+    if not raw_secret_key or raw_secret_key in INSECURE_SECRET_KEY_PLACEHOLDERS:
         raise ImproperlyConfigured(
             'ENGRAM_SECRET_KEY must be set to a strong non-default value outside dev/test environments',
         )
