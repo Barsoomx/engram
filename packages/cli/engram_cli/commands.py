@@ -1209,6 +1209,82 @@ def send_hook_event(
 
 
 SESSION_START_EMPTY_MESSAGE = "Engram: no project memory yet."
+SESSION_START_BODY_TRUNCATE_LIMIT = 400
+SESSION_START_FOOTER = (
+    "Before non-trivial tasks, search deeper with the engram_search MCP tool. "
+    "If any memory above is wrong or outdated, mark it via engram_memory_feedback."
+)
+
+
+def _hook_response_items(body: dict[str, object]) -> list[dict[str, object]]:
+    items = body.get("items")
+    if not isinstance(items, list):
+        return []
+
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _truncate_session_start_body(body: str) -> str:
+    if len(body) <= SESSION_START_BODY_TRUNCATE_LIMIT:
+        return body
+
+    return f"{body[:SESSION_START_BODY_TRUNCATE_LIMIT]}…"
+
+
+def _render_session_start_annotation(kind: str, confidence: str) -> str:
+    parts = []
+    if kind:
+        parts.append(kind)
+    if confidence:
+        parts.append(f"confidence {confidence}")
+    if not parts:
+        return ""
+
+    return f" ({', '.join(parts)})"
+
+
+def _render_session_start_item(item: dict[str, object], index: int) -> str:
+    citation = as_string(item.get("citation")) or f"M{index}"
+    title = as_string(item.get("title"))
+    kind = as_string(item.get("kind"))
+    confidence = item.get("confidence")
+    confidence_str = confidence if isinstance(confidence, str) else ""
+    annotation = _render_session_start_annotation(kind, confidence_str)
+    body = _truncate_session_start_body(as_string(item.get("body")))
+
+    return f"- [{citation}] {title}{annotation}\n  {body}"
+
+
+def _render_session_start_model_context(items: list[dict[str, object]]) -> str:
+    lines = [f"# Engram context — {len(items)} memories for this project", ""]
+    lines.extend(
+        _render_session_start_item(item, index)
+        for index, item in enumerate(items, start=1)
+    )
+    lines.append("")
+    lines.append(SESSION_START_FOOTER)
+
+    return "\n".join(lines)
+
+
+def _session_start_kind_summary(items: list[dict[str, object]]) -> str:
+    counts: dict[str, int] = {}
+    for item in items:
+        kind = as_string(item.get("kind")) or "other"
+        counts[kind] = counts.get(kind, 0) + 1
+
+    ordered = sorted(counts.items(), key=lambda pair: -pair[1])
+
+    return ", ".join(f"{count} {kind}" for kind, count in ordered)
+
+
+def _render_session_start_human_summary(items: list[dict[str, object]]) -> str:
+    kind_summary = _session_start_kind_summary(items)
+
+    return (
+        f"Engram: {len(items)} memories injected ({kind_summary}) "
+        "— search deeper: engram_search"
+    )
 
 
 def format_hook_response(
@@ -1222,22 +1298,24 @@ def format_hook_response(
                 return {"systemMessage": SESSION_START_EMPTY_MESSAGE}
 
             return {"continue": True, "systemMessage": SESSION_START_EMPTY_MESSAGE}
-        rendered = as_string(body.get("rendered_context"))
+        items = _hook_response_items(body)
+        model_context = _render_session_start_model_context(items)
+        human_summary = _render_session_start_human_summary(items)
         if response_format == "claude-code":
             return {
-                "systemMessage": rendered,
+                "systemMessage": human_summary,
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "additionalContext": rendered,
+                    "additionalContext": model_context,
                 },
             }
 
         return {
             "continue": True,
-            "systemMessage": rendered,
+            "systemMessage": human_summary,
             "hookSpecificOutput": {
                 "hookEventName": "SessionStart",
-                "additionalContext": rendered,
+                "additionalContext": model_context,
             },
         }
     if hook_command == "user-prompt-submit":
@@ -1249,7 +1327,6 @@ def format_hook_response(
         rendered = as_string(body.get("rendered_context"))
         if response_format == "claude-code":
             return {
-                "systemMessage": rendered,
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": rendered,
@@ -1258,7 +1335,6 @@ def format_hook_response(
 
         return {
             "continue": True,
-            "systemMessage": rendered,
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": rendered,
