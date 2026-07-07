@@ -13,6 +13,7 @@ from engram.console.views.metrics import (
     MetricsOverviewView,
     MetricsSessionsView,
 )
+from engram.console.views.model_policy_validation import ValidateModelPoliciesView
 from engram.console.views.model_setup import ApplyPresetView, ModelPresetsView, ModelSetupStatusView
 from engram.console.views.ops import OpsOverviewView
 from engram.console.views.organizations import OrganizationViewSet
@@ -61,4 +62,5 @@ urlpatterns = router.urls + [
     path('model-setup/status', ModelSetupStatusView.as_view(), name='admin-model-setup-status'),
     path('model-setup/presets', ModelPresetsView.as_view(), name='admin-model-setup-presets'),
     path('model-setup/apply', ApplyPresetView.as_view(), name='admin-model-setup-apply'),
+    path('model-policies/validate', ValidateModelPoliciesView.as_view(), name='admin-model-policies-validate'),
 ]

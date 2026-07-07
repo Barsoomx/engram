@@ -13,6 +13,8 @@ import {
   Pagination,
   Select,
   SelectItem,
+  Spinner,
+  Tooltip,
 } from '@heroui/react';
 import {
   keepPreviousData,
@@ -21,7 +23,7 @@ import {
   useQueryClient,
 } from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, ArrowRight, Ban, Cpu, Eye, Plus, Sparkles } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Ban, Cpu, Eye, Plus, Sparkles, Zap } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -33,6 +35,7 @@ import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
 import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { StatusPill } from '@/components/ui/status-pill';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { useUrlFilters } from '@/hooks/use-url-filters';
 import { extractApiError } from '@/lib/api-error';
@@ -47,7 +50,9 @@ import {
   POLICY_TASK_TYPES,
   resolveModelPolicy,
   SECRET_PROVIDERS,
+  validateModelPolicies,
   type ModelPolicy,
+  type PolicyValidationResult,
   type ProviderSecret,
   type ModelPolicyCreateInput,
   type PolicyScope,
@@ -174,6 +179,46 @@ function HealthBadge({
   );
 }
 
+type TestState =
+  | { status: 'pending' }
+  | { status: 'done'; result: PolicyValidationResult };
+
+function ConnectionBadge({ state }: { state: TestState | undefined }) {
+  if (!state) {
+    return <span className='text-[11px] text-default-400'>Not tested</span>;
+  }
+
+  if (state.status === 'pending') {
+    return (
+      <span className='inline-flex items-center gap-1.5 text-[11px] text-default-500'>
+        <Spinner size='sm' color='current' />
+        Testing…
+      </span>
+    );
+  }
+
+  const { result } = state;
+
+  if (result.ok) {
+    return (
+      <StatusPill status='ok' tone='success' label={`OK · ${result.latency_ms} ms`} />
+    );
+  }
+
+  return (
+    <Tooltip
+      content={result.public_error ?? 'The connection test failed.'}
+      placement='top'
+      delay={150}
+      closeDelay={0}
+    >
+      <span className='inline-flex'>
+        <StatusPill status={result.error_code ?? 'failed'} tone='danger' />
+      </span>
+    </Tooltip>
+  );
+}
+
 const TASK_FILTER_OPTIONS: { key: string; label: string }[] = [
   { key: '', label: 'All tasks' },
   ...POLICY_TASK_TYPES.map((task) => ({ key: task, label: humanizeTask(task) })),
@@ -264,6 +309,9 @@ function PolicyTableHead() {
         <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
           Health
         </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Connection
+        </th>
         <th
           className='px-3 py-2.5 text-right font-semibold text-default-400'
           aria-label='Actions'
@@ -276,17 +324,21 @@ function PolicyTableHead() {
 function PoliciesTable({
   items,
   canManage,
+  testStates,
+  onTest,
   onDisable,
   onSelect,
 }: {
   items: ModelPolicy[];
   canManage: boolean;
+  testStates: Record<string, TestState>;
+  onTest: (policy: ModelPolicy) => void;
   onDisable: (policy: ModelPolicy) => void;
   onSelect: (policy: ModelPolicy) => void;
 }) {
   return (
     <div className='surface-card p-2'>
-      <ResponsiveTable minWidth={980}>
+      <ResponsiveTable minWidth={1120}>
         <PolicyTableHead />
         <tbody>
           {items.map((policy) => (
@@ -357,7 +409,21 @@ function PoliciesTable({
                 />
               </td>
               <td className='px-3 py-2.5'>
+                <ConnectionBadge state={testStates[policy.id]} />
+              </td>
+              <td className='px-3 py-2.5'>
                 <div className='flex items-center justify-end gap-2'>
+                  {canManage && (
+                    <Button
+                      size='sm'
+                      variant='flat'
+                      startContent={<Zap className='h-3.5 w-3.5' />}
+                      isLoading={testStates[policy.id]?.status === 'pending'}
+                      onPress={() => onTest(policy)}
+                    >
+                      Test
+                    </Button>
+                  )}
                   <Button
                     size='sm'
                     variant='flat'
@@ -390,9 +456,9 @@ function PoliciesTable({
 function PoliciesTableSkeleton() {
   return (
     <div className='surface-card p-2'>
-      <ResponsiveTable minWidth={980}>
+      <ResponsiveTable minWidth={1120}>
         <PolicyTableHead />
-        <TableRowSkeleton columns={8} rows={6} />
+        <TableRowSkeleton columns={9} rows={6} />
       </ResponsiveTable>
     </div>
   );
@@ -942,6 +1008,11 @@ export default function ModelPoliciesPage() {
 
   const [filters, setFilters, resetFilters] = useUrlFilters(MODEL_POLICY_FILTERS);
 
+  const [testStates, setTestStates] = React.useState<Record<string, TestState>>(
+    {},
+  );
+  const [testingAll, setTestingAll] = React.useState(false);
+
   const scopeKey = `${activeProjectId ?? ''}|${activeTeamId ?? ''}`;
   const prevScopeKey = React.useRef(scopeKey);
 
@@ -949,6 +1020,7 @@ export default function ModelPoliciesPage() {
     if (prevScopeKey.current !== scopeKey) {
       prevScopeKey.current = scopeKey;
       setFilters({ page: 1 });
+      setTestStates({});
     }
   }, [scopeKey, setFilters]);
 
@@ -1135,6 +1207,107 @@ export default function ModelPoliciesPage() {
     filters.task_type || filters.provider || filters.scope || filters.active,
   );
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const testableCount = items.filter((policy) => policy.active).length;
+
+  async function handleTestOne(policy: ModelPolicy) {
+    setTestStates((prev) => ({ ...prev, [policy.id]: { status: 'pending' } }));
+
+    try {
+      const [result] = await validateModelPolicies(policy.id);
+
+      setTestStates((prev) => {
+        const next = { ...prev };
+
+        if (result) {
+          next[policy.id] = { status: 'done', result };
+        } else {
+          delete next[policy.id];
+        }
+
+        return next;
+      });
+    } catch (error) {
+      setTestStates((prev) => {
+        const next = { ...prev };
+        delete next[policy.id];
+
+        return next;
+      });
+      addToast({
+        title: 'Test failed',
+        description: errorDetail(error, 'Could not run the connection test.'),
+        color: 'danger',
+      });
+    }
+  }
+
+  async function handleTestAll() {
+    const testable = items.filter((policy) => policy.active);
+
+    if (testable.length === 0) {
+
+      return;
+    }
+
+    setTestingAll(true);
+    setTestStates((prev) => {
+      const next = { ...prev };
+
+      for (const policy of testable) {
+        next[policy.id] = { status: 'pending' };
+      }
+
+      return next;
+    });
+
+    try {
+      const results = await validateModelPolicies();
+      const byId = new Map(results.map((result) => [result.policy_id, result]));
+
+      setTestStates((prev) => {
+        const next = { ...prev };
+
+        for (const policy of testable) {
+          const result = byId.get(policy.id);
+
+          if (result) {
+            next[policy.id] = { status: 'done', result };
+          } else {
+            delete next[policy.id];
+          }
+        }
+
+        return next;
+      });
+
+      const failed = results.filter((result) => !result.ok).length;
+      addToast({
+        title:
+          failed === 0
+            ? 'All connections passed'
+            : `${failed} connection${failed === 1 ? '' : 's'} failed`,
+        description: `Tested ${results.length} active polic${results.length === 1 ? 'y' : 'ies'}.`,
+        color: failed === 0 ? 'success' : 'danger',
+      });
+    } catch (error) {
+      setTestStates((prev) => {
+        const next = { ...prev };
+
+        for (const policy of testable) {
+          delete next[policy.id];
+        }
+
+        return next;
+      });
+      addToast({
+        title: 'Test all failed',
+        description: errorDetail(error, 'Could not run connection tests.'),
+        color: 'danger',
+      });
+    } finally {
+      setTestingAll(false);
+    }
+  }
 
   return (
     <CapabilityGate capabilities={capabilities} required='model_policy:read'>
@@ -1164,6 +1337,17 @@ export default function ModelPoliciesPage() {
                   Model setup
                   <ArrowRight size={14} strokeWidth={1.9} />
                 </Link>
+                {canManagePolicies && (
+                  <Button
+                    variant='flat'
+                    startContent={<Zap className='h-4 w-4' />}
+                    onPress={handleTestAll}
+                    isLoading={testingAll}
+                    isDisabled={!meLoaded || testableCount === 0}
+                  >
+                    Test all
+                  </Button>
+                )}
                 {canManagePolicies && (
                   <PrimaryButton
                     startContent={<Plus className='h-4 w-4' />}
@@ -1253,6 +1437,8 @@ export default function ModelPoliciesPage() {
             <PoliciesTable
               items={items}
               canManage={canManagePolicies}
+              testStates={testStates}
+              onTest={handleTestOne}
               onDisable={setDisablePolicyTarget}
               onSelect={setDetailPolicy}
             />

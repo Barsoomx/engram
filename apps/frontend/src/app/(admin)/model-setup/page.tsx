@@ -3,13 +3,14 @@
 import { addToast, Button, Input, Select, SelectItem } from '@heroui/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, ArrowRight, CheckCircle2, Cpu, XCircle } from 'lucide-react';
+import { AlertTriangle, ArrowRight, CheckCircle2, Cpu, XCircle, Zap } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { StatusPill } from '@/components/ui/status-pill';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   applyPreset,
@@ -18,10 +19,12 @@ import {
   getModelPresets,
   getModelSetupStatus,
   POLICY_TASK_TYPES,
+  validateModelPolicies,
   type ExistingPoliciesConflict,
   type ModelPreset,
   type ModelSetupStatus,
   type PolicyScope,
+  type PolicyValidationResult,
   type TaskTypeStatus,
 } from '@/lib/console-api';
 import { useOrgStore } from '@/lib/org-store';
@@ -378,6 +381,74 @@ function PresetCard({
   );
 }
 
+function ConnectionTestResults({
+  results,
+}: {
+  results: PolicyValidationResult[];
+}) {
+  if (results.length === 0) {
+
+    return (
+      <div className='surface-card px-5 py-4 text-[13px] text-default-500'>
+        No active model policies to test yet.
+      </div>
+    );
+  }
+
+  const failed = results.filter((result) => !result.ok).length;
+
+  return (
+    <div className='surface-card space-y-3 p-5'>
+      <div className='flex items-center gap-2'>
+        {failed === 0 ? (
+          <CheckCircle2 className='h-4 w-4 shrink-0 text-success' />
+        ) : (
+          <AlertTriangle className='h-4 w-4 shrink-0 text-warning' />
+        )}
+        <p className='text-[13px] font-medium text-foreground'>
+          {failed === 0
+            ? `All ${results.length} connection${results.length === 1 ? '' : 's'} passed`
+            : `${failed} of ${results.length} connection${results.length === 1 ? '' : 's'} failed`}
+        </p>
+      </div>
+      <div className='space-y-1.5'>
+        {results.map((result) => (
+          <div
+            key={result.policy_id}
+            className='flex items-center justify-between gap-3 rounded-[10px] border border-divider bg-content2/30 px-3.5 py-2.5'
+          >
+            <div className='min-w-0'>
+              <p className='text-[12.5px] font-medium text-foreground'>
+                {humanizeTask(result.task_type)}
+              </p>
+              <p className='truncate font-mono text-[11px] text-default-400'>
+                {result.provider} · {result.model}
+              </p>
+            </div>
+            {result.ok ? (
+              <StatusPill
+                status='ok'
+                tone='success'
+                label={`OK · ${result.latency_ms} ms`}
+              />
+            ) : (
+              <div className='flex min-w-0 items-center gap-2'>
+                <span className='hidden max-w-[240px] truncate text-[11px] text-danger sm:block'>
+                  {result.public_error}
+                </span>
+                <StatusPill
+                  status={result.error_code ?? 'failed'}
+                  tone='danger'
+                />
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function ModelSetupPage() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
@@ -416,6 +487,17 @@ export default function ModelSetupPage() {
     });
   }
 
+  const validateMutation = useMutation({
+    mutationFn: () => validateModelPolicies(),
+    onError: (error) => {
+      addToast({
+        title: 'Connection test failed',
+        description: extractDetail(error, 'Could not run connection tests.'),
+        color: 'danger',
+      });
+    },
+  });
+
   if (!activeProjectId) {
 
     return (
@@ -451,7 +533,21 @@ export default function ModelSetupPage() {
       <PageHeader
         title='Model Setup'
         subtitle='Configure which model serves each task type via presets.'
-        actions={<ModelPoliciesLink />}
+        actions={
+          <div className='flex items-center gap-2'>
+            {canManage && (
+              <Button
+                variant='flat'
+                startContent={<Zap className='h-4 w-4' />}
+                isLoading={validateMutation.isPending}
+                onPress={() => validateMutation.mutate()}
+              >
+                Test connections
+              </Button>
+            )}
+            <ModelPoliciesLink />
+          </div>
+        }
       />
 
       {statusQuery.isError && (
@@ -466,6 +562,19 @@ export default function ModelSetupPage() {
       )}
 
       {status && <ReadinessBanner status={status} />}
+
+      {(validateMutation.isPending || validateMutation.data) && (
+        <div>
+          <h2 className='mb-3 text-[12px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+            Connection tests
+          </h2>
+          {validateMutation.isPending ? (
+            <div className='surface-card h-16 animate-pulse bg-content2/50' />
+          ) : validateMutation.data ? (
+            <ConnectionTestResults results={validateMutation.data} />
+          ) : null}
+        </div>
+      )}
 
       {!statusQuery.isError && (
         <>

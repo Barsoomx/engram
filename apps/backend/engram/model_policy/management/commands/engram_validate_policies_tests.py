@@ -201,7 +201,7 @@ def test_validate_policies_filters_by_organization_option(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db
-def test_validate_policies_falls_back_to_error_message_when_error_code_is_unset(
+def test_validate_policies_reports_sanitized_code_for_provider_secret_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
@@ -218,7 +218,7 @@ def test_validate_policies_falls_back_to_error_message_when_error_code_is_unset(
 
     policy_line = next(line for line in stdout.getvalue().splitlines() if f'policy={policy.id}' in line)
     assert 'status=FAIL' in policy_line
-    assert 'error=provider secret is disabled' in policy_line
+    assert 'error=provider_secret_unavailable' in policy_line
 
 
 @pytest.mark.django_db

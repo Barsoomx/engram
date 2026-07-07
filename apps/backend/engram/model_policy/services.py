@@ -1592,6 +1592,7 @@ def get_provider_gateway(
     policy: ModelPolicy,
     *,
     opener: Any = None,
+    timeout: int | None = None,
 ) -> FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway:
     mode = os.environ.get('ENGRAM_PROVIDER_MODE', 'fake')
 
@@ -1613,9 +1614,10 @@ def get_provider_gateway(
         gateway: FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway = AnthropicMessagesGateway(
             base_url=base_url,
             api_key=api_key,
+            timeout=timeout,
         )
     else:
-        gateway = OpenAICompatibleGateway(base_url=base_url, api_key=api_key)
+        gateway = OpenAICompatibleGateway(base_url=base_url, api_key=api_key, timeout=timeout)
     if opener is not None:
         gateway._opener = opener
 
