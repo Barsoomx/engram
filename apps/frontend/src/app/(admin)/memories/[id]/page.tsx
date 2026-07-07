@@ -14,14 +14,27 @@ import {
 } from '@heroui/react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, Ban, Check, ChevronLeft, Clock, Link2, Plus } from 'lucide-react';
+import {
+  AlertTriangle,
+  Ban,
+  Check,
+  ChevronLeft,
+  Clock,
+  Copy,
+  History,
+  Link2,
+  Plus,
+} from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import * as React from 'react';
 
 import { ConfidenceTrack } from '@/components/ui/confidence-track';
-import { KindBadge, KindDot } from '@/components/ui/kind-badge';
-import { PrimaryButton } from '@/components/ui/primary-button';
+import { ErrorState } from '@/components/ui/error-state';
+import { KindBadge } from '@/components/ui/kind-badge';
+import { StatusPill } from '@/components/ui/status-pill';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useTeams } from '@/hooks/use-teams';
 import { apiClient, fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   addMemoryLink,
@@ -33,7 +46,8 @@ import {
   type MemoryLinkType,
   type ScopeParams,
 } from '@/lib/console-api';
-import { KIND_STYLES, formatRelativeTime, resolveKind } from '@/lib/design';
+import { resolveKind } from '@/lib/design';
+import { useOrgStore } from '@/lib/org-store';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
@@ -41,20 +55,13 @@ type MemoryVersion = {
   version: number;
   body: string | null;
   created_at: string | null;
-};
-
-type RetrievalDocument = {
-  id: string;
-  memory_id: string;
-  content_hash: string | null;
-  token_count: number | null;
-  created_at: string | null;
+  source_observation_id?: string | null;
 };
 
 type BackendRelated = {
   id: string;
   title: string;
-  link_type: string;
+  link_type: string | null;
 };
 
 type MemoryDetail = {
@@ -74,7 +81,6 @@ type MemoryDetail = {
   created_at: string | null;
   updated_at: string | null;
   versions: MemoryVersion[];
-  retrieval_documents: RetrievalDocument[];
   kind?: string | null;
   tags?: string[];
   file_paths?: string[];
@@ -86,10 +92,25 @@ type MemoryDetail = {
 };
 
 type RelatedItem = {
-  key: string;
+  id: string;
   title: string;
-  mono: boolean;
+  relation: string;
 };
+
+const RELATION_LABELS: Record<string, string> = {
+  superseded_by: 'Superseded by',
+  supersedes: 'Supersedes',
+  conflicts_with: 'Conflicts with',
+  narrowed_by: 'Narrowed by',
+};
+
+function relationLabel(linkType: string | null): string {
+  if (!linkType) {
+    return 'Related';
+  }
+
+  return RELATION_LABELS[linkType] ?? 'Related';
+}
 
 const LINK_TYPES: MemoryLinkType[] = ['file', 'symbol', 'commit', 'issue'];
 
@@ -140,27 +161,47 @@ function parseConfidence(value: string | null): number | null {
 }
 
 function buildRelated(data: MemoryDetail): RelatedItem[] {
-  if (data.related && data.related.length > 0) {
-    return data.related.map((item) => ({
-      key: item.id,
+  if (!data.related) {
+    return [];
+  }
+
+  return data.related
+    .filter((item) => Boolean(item.link_type))
+    .map((item) => ({
+      id: item.id,
       title: item.title,
-      mono: false,
+      relation: relationLabel(item.link_type),
     }));
+}
+
+function CopyableId({ value, className }: { value: string; className?: string }) {
+  const [copied, setCopied] = React.useState(false);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
   }
 
-  if (data.retrieval_documents.length > 0) {
-    return data.retrieval_documents.map((doc) => ({
-      key: doc.id,
-      title: doc.content_hash ? doc.content_hash.slice(0, 16) : doc.id.slice(0, 8),
-      mono: true,
-    }));
-  }
-
-  return data.versions.map((version) => ({
-    key: `v${version.version}`,
-    title: `Version ${version.version}`,
-    mono: false,
-  }));
+  return (
+    <button
+      type='button'
+      onClick={copy}
+      title={value}
+      className={`inline-flex min-w-0 items-center gap-1.5 font-mono text-[11.5px] text-default-500 transition-colors hover:text-foreground ${className ?? ''}`}
+    >
+      <span className='truncate'>{value}</span>
+      {copied ? (
+        <Check size={12} strokeWidth={2.5} className='shrink-0 text-success' />
+      ) : (
+        <Copy size={12} strokeWidth={1.8} className='shrink-0 text-default-400' />
+      )}
+    </button>
+  );
 }
 
 function BackLink() {
@@ -180,22 +221,28 @@ function ProvenanceRow({
   value,
   mono,
   accent,
+  children,
 }: {
   label: string;
-  value: string;
+  value?: string;
   mono?: boolean;
   accent?: boolean;
+  children?: React.ReactNode;
 }) {
   return (
     <div className='flex items-baseline justify-between gap-4'>
       <span className='shrink-0 text-[12px] text-default-500'>{label}</span>
-      <span
-        className={`min-w-0 truncate text-right text-[12.5px] font-semibold ${
-          accent ? 'text-primary-300' : 'text-foreground'
-        }${mono ? ' font-mono text-[11.5px]' : ''}`}
-      >
-        {value}
-      </span>
+      {children ? (
+        <span className='flex min-w-0 justify-end text-right'>{children}</span>
+      ) : (
+        <span
+          className={`min-w-0 truncate text-right text-[12.5px] font-semibold ${
+            accent ? 'text-primary-300' : 'text-foreground'
+          }${mono ? ' font-mono text-[11.5px]' : ''}`}
+        >
+          {value}
+        </span>
+      )}
     </div>
   );
 }
@@ -431,12 +478,15 @@ function LinksCard({
           ))}
         </div>
       ) : linksQuery.isError ? (
-        <div className='flex items-start gap-2.5 rounded-[12px] border border-danger/30 bg-danger/5 px-3.5 py-3'>
-          <AlertTriangle className='mt-0.5 h-4 w-4 shrink-0 text-danger' />
-          <p className='text-[13px] leading-relaxed text-danger'>
-            {linksQuery.error instanceof Error ? linksQuery.error.message : 'Failed to load links.'}
-          </p>
-        </div>
+        <ErrorState
+          title='Failed to load links'
+          message={
+            linksQuery.error instanceof Error
+              ? linksQuery.error.message
+              : 'Failed to load links.'
+          }
+          onRetry={() => linksQuery.refetch()}
+        />
       ) : links.length === 0 ? (
         <p className='text-[13px] text-default-500'>No links yet.</p>
       ) : (
@@ -643,6 +693,9 @@ function MemoryDetailContent({
   scope: ScopeParams;
   canReview: boolean;
 }) {
+  const activeOrgId = useOrgStore((s) => s.activeOrgId);
+  const teamsQuery = useTeams(activeOrgId, { pageSize: 200 });
+
   const meta = data.metadata;
   const kind = resolveKind(data.kind ?? metaString(meta, 'kind'));
   const source = data.file_paths?.[0] ?? metaString(meta, 'source') ?? '—';
@@ -655,7 +708,7 @@ function MemoryDetailContent({
   const projectName =
     data.project_name ?? data.project_slug ?? metaString(meta, 'project') ?? metaString(meta, 'project_slug') ?? data.project_id;
   const confidencePct = data.confidence_percent ?? parseConfidence(data.confidence);
-  const authorized = data.authorized_for_injection ?? (data.status === 'active' && !data.refuted && !data.stale);
+  const authorized = data.authorized_for_injection ?? (data.status === 'approved' && !data.refuted && !data.stale);
   const chip = authorized
     ? { text: 'Authorized for injection', color: 'text-success', bg: 'rgba(61,217,172,0.13)', icon: true }
     : data.refuted
@@ -663,22 +716,30 @@ function MemoryDetailContent({
       : data.stale
         ? { text: 'Stale', color: 'text-warning', bg: 'rgba(242,183,101,0.14)', icon: false }
         : { text: 'Not authorized', color: 'text-default-500', bg: 'rgba(255,255,255,0.05)', icon: false };
-  const versionBody =
-    data.versions.find((v) => v.version === data.current_version)?.body ??
-    data.versions[0]?.body ??
-    null;
-  const showVersionBody = Boolean(
-    versionBody && versionBody.trim() && versionBody.trim() !== data.body.trim(),
-  );
+  const teamName = data.team_id
+    ? teamsQuery.data?.results.find((team) => team.id === data.team_id)?.name ?? null
+    : null;
+  const versions = [...data.versions].sort((a, b) => b.version - a.version);
+  const showRefutedBadge = data.refuted && data.status !== 'refuted';
   const related = buildRelated(data);
 
   return (
     <div className='grid grid-cols-1 gap-6 lg:grid-cols-[1.7fr_1fr]'>
       <div className='space-y-5'>
         <div className='space-y-3'>
-          <div className='flex items-center gap-3'>
+          <div className='flex flex-wrap items-center gap-2.5'>
             <KindBadge kind={kind} />
-            <span className='min-w-0 truncate font-mono text-[12px] text-default-500'>{source}</span>
+            <StatusPill status={data.status} />
+            {data.stale && <StatusPill tone='warning' status='stale' label='Stale' />}
+            {showRefutedBadge && (
+              <StatusPill tone='danger' status='refuted' label='Refuted' />
+            )}
+            <span
+              title={source}
+              className='min-w-0 truncate font-mono text-[12px] text-default-500'
+            >
+              {source}
+            </span>
           </div>
           <h1 className='text-[26px] font-semibold leading-[1.25] tracking-[-0.02em] text-foreground'>
             {data.title || '(untitled)'}
@@ -691,9 +752,6 @@ function MemoryDetailContent({
           ) : (
             <p className='text-[15px] leading-[1.7] text-default-500'>No body recorded.</p>
           )}
-          {showVersionBody && versionBody && (
-            <p className='whitespace-pre-wrap text-[14px] leading-[1.7] text-default-500'>{versionBody}</p>
-          )}
         </div>
 
         {related.length > 0 && (
@@ -704,17 +762,64 @@ function MemoryDetailContent({
             </h2>
             <div className='space-y-2'>
               {related.map((item) => (
-                <div
-                  key={item.key}
+                <Link
+                  key={item.id}
+                  href={`/memories/${item.id}`}
                   className='surface-card flex items-center gap-3 px-4 py-3 transition-colors hover:bg-content2'
                 >
-                  <KindDot kind={kind} size={9} />
-                  <span
-                    className={`min-w-0 flex-1 truncate text-[13.5px] text-default-700${item.mono ? ' font-mono text-[12px]' : ''}`}
-                  >
-                    {item.title}
+                  <span className='shrink-0 rounded-[7px] bg-content3 px-2 py-0.5 text-[11px] font-medium text-default-500'>
+                    {item.relation}
                   </span>
-                  <span className='shrink-0 text-[11.5px] text-default-400'>{KIND_STYLES[kind].label}</span>
+                  <span
+                    title={item.title}
+                    className='min-w-0 flex-1 truncate text-[13.5px] text-default-700'
+                  >
+                    {item.title || '(untitled)'}
+                  </span>
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {versions.length > 0 && (
+          <div className='space-y-3'>
+            <h2 className='flex items-center gap-2 text-[14.5px] font-semibold text-foreground'>
+              <History size={15} strokeWidth={1.8} className='text-default-400' />
+              Version history
+              <span className='tnum text-[12px] font-normal text-default-400'>{versions.length}</span>
+            </h2>
+            <div className='space-y-2'>
+              {versions.map((version) => (
+                <div key={version.version} className='surface-card space-y-2 px-4 py-3'>
+                  <div className='flex items-center justify-between gap-3'>
+                    <span className='shrink-0 font-mono text-[12px] font-semibold text-foreground'>
+                      v{version.version}
+                      {version.version === data.current_version && (
+                        <span className='ml-2 rounded-[6px] bg-primary-soft px-1.5 py-0.5 text-[10px] font-medium text-primary-300'>
+                          current
+                        </span>
+                      )}
+                    </span>
+                    <TimeStamp
+                      value={version.created_at}
+                      className='shrink-0 text-[11.5px] text-default-400'
+                    />
+                  </div>
+                  {version.body && (
+                    <p
+                      title={version.body}
+                      className='line-clamp-3 whitespace-pre-wrap text-[12.5px] leading-relaxed text-default-500'
+                    >
+                      {version.body}
+                    </p>
+                  )}
+                  {version.source_observation_id && (
+                    <div className='flex items-center gap-2 text-[11px] text-default-400'>
+                      <span className='shrink-0'>Source observation</span>
+                      <CopyableId value={version.source_observation_id} />
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -735,8 +840,20 @@ function MemoryDetailContent({
             <ProvenanceRow label='Source' value={source} mono accent />
             <ProvenanceRow label='Scope' value={data.visibility_scope} />
             <ProvenanceRow label='Version' value={`v${data.current_version}`} mono />
-            {data.team_id && <ProvenanceRow label='Team' value={data.team_id} mono />}
-            <ProvenanceRow label='Updated' value={formatRelativeTime(data.updated_at)} />
+            {data.team_id &&
+              (teamName ? (
+                <ProvenanceRow label='Team' value={teamName} />
+              ) : (
+                <ProvenanceRow label='Team'>
+                  <CopyableId value={data.team_id} />
+                </ProvenanceRow>
+              ))}
+            <ProvenanceRow label='Updated'>
+              <TimeStamp
+                value={data.updated_at}
+                className='text-[12.5px] font-semibold text-foreground'
+              />
+            </ProvenanceRow>
           </div>
         </div>
 
@@ -767,8 +884,6 @@ function MemoryDetailContent({
             refuted={data.refuted}
           />
         )}
-
-        <PrimaryButton className='w-full'>Add to context bundle</PrimaryButton>
       </div>
     </div>
   );
@@ -836,9 +951,14 @@ export default function MemoryDetailPage() {
       {query.isLoading && <p className='text-[13.5px] text-default-500'>Loading memory…</p>}
 
       {query.isError && (
-        <div className='surface-card p-5 text-[13.5px] text-danger'>
-          {query.error instanceof Error ? query.error.message : 'Failed to load memory.'}
-        </div>
+        <ErrorState
+          message={
+            query.error instanceof Error
+              ? query.error.message
+              : 'Failed to load memory.'
+          }
+          onRetry={() => query.refetch()}
+        />
       )}
 
       {query.data && (
