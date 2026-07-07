@@ -39,6 +39,8 @@ class WorkflowRunFilterSet(django_filters.FilterSet):
     project_id = django_filters.UUIDFilter(field_name='project_id')
     team_id = django_filters.UUIDFilter(field_name='team_id')
     escalation = django_filters.BooleanFilter(field_name='escalation')
+    request_id = django_filters.CharFilter(field_name='request_id')
+    correlation_id = django_filters.CharFilter(field_name='correlation_id')
     created_at__gte = django_filters.IsoDateTimeFilter(field_name='created_at', lookup_expr='gte')
     created_at__lte = django_filters.IsoDateTimeFilter(field_name='created_at', lookup_expr='lte')
 
@@ -50,6 +52,8 @@ class WorkflowRunFilterSet(django_filters.FilterSet):
             'project_id',
             'team_id',
             'escalation',
+            'request_id',
+            'correlation_id',
             'created_at__gte',
             'created_at__lte',
         ]
