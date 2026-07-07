@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from django.contrib.auth.models import User
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
@@ -375,6 +378,97 @@ def test_issue_denied_without_issue_capability(
     )
 
     assert response.status_code == 403
+
+
+def _make_api_key(
+    organization: Organization,
+    owner_identity: Identity,
+    *,
+    name: str,
+    key_prefix: str,
+    suffix: str,
+    expires_at: object = None,
+    revoked_at: object = None,
+) -> ApiKey:
+    return ApiKey.objects.create(
+        organization=organization,
+        owner_identity=owner_identity,
+        name=name,
+        key_prefix=key_prefix,
+        key_hash=f'hash-{suffix}',
+        key_fingerprint=f'fingerprint-{suffix}',
+        expires_at=expires_at,
+        revoked_at=revoked_at,
+    )
+
+
+@pytest.mark.django_db
+def test_list_filter_by_status(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_identity: Identity,
+) -> None:
+    now = timezone.now()
+    active = _make_api_key(f_owned_org, f_owner_identity, name='Active', key_prefix='egk_act', suffix='active')
+    expired = _make_api_key(
+        f_owned_org,
+        f_owner_identity,
+        name='Expired',
+        key_prefix='egk_exp',
+        suffix='expired',
+        expires_at=now - timedelta(days=1),
+    )
+    revoked = _make_api_key(
+        f_owned_org,
+        f_owner_identity,
+        name='Revoked',
+        key_prefix='egk_rev',
+        suffix='revoked',
+        revoked_at=now,
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    active_resp = client.get('/v1/admin/api-keys/', {'status': 'active'})
+    expired_resp = client.get('/v1/admin/api-keys/', {'status': 'expired'})
+    revoked_resp = client.get('/v1/admin/api-keys/', {'status': 'revoked'})
+
+    assert {key['id'] for key in active_resp.data['results']} == {str(active.id)}
+
+    assert {key['id'] for key in expired_resp.data['results']} == {str(expired.id)}
+
+    assert {key['id'] for key in revoked_resp.data['results']} == {str(revoked.id)}
+
+
+@pytest.mark.django_db
+def test_list_search_matches_name_or_prefix(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_identity: Identity,
+) -> None:
+    target = _make_api_key(
+        f_owned_org,
+        f_owner_identity,
+        name='Deploy Bot',
+        key_prefix='egk_deploy',
+        suffix='target',
+    )
+    _make_api_key(
+        f_owned_org,
+        f_owner_identity,
+        name='Unrelated',
+        key_prefix='egk_other',
+        suffix='other',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    by_name = client.get('/v1/admin/api-keys/', {'search': 'deploy'})
+    by_prefix = client.get('/v1/admin/api-keys/', {'search': 'egk_deploy'})
+
+    assert {key['id'] for key in by_name.data['results']} == {str(target.id)}
+
+    assert {key['id'] for key in by_prefix.data['results']} == {str(target.id)}
 
 
 @pytest.mark.django_db
