@@ -28,6 +28,7 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    ContextBundleStatus,
     Memory,
     MemoryStatus,
     MemoryVersion,
@@ -1018,7 +1019,8 @@ class BuildContextBundle:
             persisted_matches = self._create_items(bundle, kept)
             bundle.rendered_text = self._render_context(persisted_matches, warnings)
             bundle.selected_count = len(persisted_matches)
-            bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
+            bundle.status = ContextBundleStatus.INJECTED if persisted_matches else ContextBundleStatus.SKIPPED
+            bundle.save(update_fields=['rendered_text', 'selected_count', 'status', 'updated_at'])
             self._audit_retrieval(
                 bundle,
                 persisted_matches,
