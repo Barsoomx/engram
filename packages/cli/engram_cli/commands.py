@@ -93,6 +93,13 @@ ERROR_REMEDIATION: dict[str, str] = {
     "claude_cli_not_found": "Install the Claude Code CLI and ensure 'claude' is on PATH.",
     "plugin_install_failed": "Check 'claude plugin' output and marketplace source.",
     "python_runtime_missing": "Install python3 >= 3.12 so bundled hooks can run.",
+    "missing_claude_mem_db": "Pass --data-dir pointing at a directory that holds claude-mem.db.",
+    "corrupt_claude_mem_db": "Verify claude-mem.db is a readable SQLite database.",
+    "unknown_upstream_project": "Pass --project-name with a project listed by the dry run.",
+    "import_conflict": "Wait for the in-progress import to finish or reuse its import id.",
+    "import_create_failed": "Check the server response and retry the import.",
+    "import_batch_failed": "Check the server response and retry the import.",
+    "import_finalize_failed": "Check the server response and retry the import.",
 }
 
 

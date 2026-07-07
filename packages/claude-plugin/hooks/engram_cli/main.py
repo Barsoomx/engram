@@ -19,6 +19,7 @@ from engram_cli.commands import (
     run_search,
 )
 from engram_cli.http import Transport
+from engram_cli.import_claude_mem import run_import_claude_mem
 from engram_cli.mcp_server import run_mcp_serve
 
 
@@ -58,6 +59,9 @@ def main(
         return run_search(args, output, errors, transport)
     if args.command == "observations":
         return run_observations(args, output, errors, transport)
+    if args.command == "import":
+        if args.import_command == "claude-mem":
+            return run_import_claude_mem(args, output, errors, transport)
     if args.command == "memory":
         if args.memory_command == "version":
             return run_memory_version(args, output, errors, transport)
@@ -197,5 +201,18 @@ def build_parser() -> argparse.ArgumentParser:
     observations.add_argument("--limit", type=int, default=20)
     observations.add_argument("--config-dir")
     observations.add_argument("--project", default="")
+
+    importer = subparsers.add_parser("import")
+    import_subparsers = importer.add_subparsers(dest="import_command")
+    claude_mem = import_subparsers.add_parser("claude-mem")
+    claude_mem.add_argument("--data-dir")
+    claude_mem.add_argument("--project", default="")
+    claude_mem.add_argument("--project-name", default="")
+    claude_mem.add_argument("--store-id", default="")
+    claude_mem.add_argument("--dry-run", action="store_true")
+    claude_mem.add_argument("--apply", action="store_true")
+    claude_mem.add_argument("--skip-observations", action="store_true")
+    claude_mem.add_argument("--batch-size", type=int, default=200)
+    claude_mem.add_argument("--config-dir")
 
     return parser
