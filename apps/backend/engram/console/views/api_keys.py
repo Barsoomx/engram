@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
+from django.db.models import Q
+from django.utils import timezone
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import BasePermission, IsAuthenticated
@@ -59,13 +61,43 @@ class ApiKeyViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        return (
+        queryset = (
             ApiKey.objects.filter(
                 organization=self.request.active_organization,
             )
             .select_related('owner_identity')
             .order_by('created_at')
         )
+
+        if self.action != 'list':
+            return queryset
+
+        queryset = self._filter_status(queryset)
+
+        search = self.request.query_params.get('search')
+
+        if search:
+            queryset = queryset.filter(Q(name__icontains=search) | Q(key_prefix__icontains=search))
+
+        return queryset
+
+    def _filter_status(self, queryset: Any) -> Any:
+        status_param = self.request.query_params.get('status')
+
+        if status_param == 'revoked':
+            return queryset.filter(revoked_at__isnull=False)
+
+        now = timezone.now()
+
+        if status_param == 'expired':
+            return queryset.filter(revoked_at__isnull=True, expires_at__isnull=False, expires_at__lte=now)
+
+        if status_param == 'active':
+            return queryset.filter(revoked_at__isnull=True).filter(
+                Q(expires_at__isnull=True) | Q(expires_at__gt=now),
+            )
+
+        return queryset
 
     def get_serializer_class(self) -> type:
         if self.action == 'create':

@@ -285,6 +285,26 @@ def test_list_includes_viewer_role(
 
 
 @pytest.mark.django_db
+def test_list_search_matches_name_or_slug(
+    f_owner_user_token: str,
+    f_owner_user: User,
+) -> None:
+    beta = Organization.objects.create(name='Beta Corp', slug='beta-corp')
+    _make_membership(f_owner_user, beta)
+
+    client = _auth_client(f_owner_user_token)
+
+    by_slug = client.get('/v1/admin/organizations/', {'search': 'beta'})
+    by_name = client.get('/v1/admin/organizations/', {'search': 'corp'})
+
+    assert by_slug.status_code == 200
+
+    assert {org['id'] for org in by_slug.data['results']} == {str(beta.id)}
+
+    assert {org['id'] for org in by_name.data['results']} == {str(beta.id)}
+
+
+@pytest.mark.django_db
 def test_suspended_organization_still_listed_with_status(f_owner_user_token: str) -> None:
     organization = Organization.objects.get(slug='acme')
     organization.status = OrganizationStatus.SUSPENDED

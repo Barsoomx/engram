@@ -10,6 +10,7 @@ from django.utils import timezone
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
+    AuditEvent,
     LinkType,
     Memory,
     MemoryLink,
@@ -712,3 +713,56 @@ def test_legacy_orphan_without_version_or_document_is_not_reused_or_reduplicated
     assert MemoryVersion.objects.filter(memory=result1.digest_memory).count() == 1
 
     assert RetrievalDocument.objects.filter(memory=result1.digest_memory).count() == 1
+
+
+@pytest.mark.django_db
+def test_weekly_digest_body_contains_bucketed_titles(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    mem = _make_memory(f_org, f_project, title='DistinctAddedTitle')
+
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
+    result = _run(f_org, f_project)
+
+    body = result.digest_memory.body
+
+    assert '## Added' in body
+
+    assert 'DistinctAddedTitle' in body
+
+    assert 'memory_changes' in result.digest_memory.metadata
+
+    assert result.digest_memory.metadata['counts']['added'] >= 1
+
+
+@pytest.mark.django_db
+def test_weekly_digest_retrieval_document_full_text_contains_titles(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    mem = _make_memory(f_org, f_project, title='SearchableAddedTitle')
+
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
+    result = _run(f_org, f_project)
+
+    document = RetrievalDocument.objects.get(memory=result.digest_memory)
+
+    assert 'SearchableAddedTitle' in document.full_text
+
+
+@pytest.mark.django_db
+def test_weekly_digest_emits_digest_generated_audit(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    result = _run(f_org, f_project)
+
+    audit = AuditEvent.objects.get(
+        event_type='DigestGenerated',
+        target_id=str(result.digest_memory.id),
+    )
+
+    assert audit.metadata['digest_kind'] == 'weekly_structured'

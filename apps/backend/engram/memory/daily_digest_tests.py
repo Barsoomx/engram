@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from unittest import mock
 
 import pytest
 from django.core.management import call_command
+from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
@@ -14,8 +16,16 @@ from engram.core.models import (
     Project,
     Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
 )
-from engram.memory.tasks import generate_daily_digest, run_scheduled_digests
+from engram.memory.tasks import (
+    _recent_approved_memory_ids,
+    daily_digest_window_start,
+    generate_daily_digest,
+    run_scheduled_digests,
+)
 
 
 def create_organization_project_team(slug: str = 'daily') -> tuple[Organization, Team, Project]:
@@ -157,6 +167,87 @@ def test_run_scheduled_digests_excludes_digest_kind_memories() -> None:
         [str(normal_memory.id)],
     )
     assert result == {'enqueued_projects': 1, 'enqueued_tasks': 1}
+
+
+def _make_succeeded_daily_run(
+    organization: Organization,
+    project: Project,
+    *,
+    finished_at: object,
+) -> WorkflowRun:
+    return WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.SUCCEEDED,
+        finished_at=finished_at,
+    )
+
+
+@pytest.mark.django_db
+def test_window_start_defaults_to_one_day_without_prior_success() -> None:
+    _organization, _team, project = create_organization_project_team(slug='win-default')
+    now = timezone.now()
+
+    start = daily_digest_window_start(project, now=now)
+
+    assert start == now - timedelta(days=1)
+
+
+@pytest.mark.django_db
+def test_window_start_uses_last_success_when_within_cap() -> None:
+    organization, _team, project = create_organization_project_team(slug='win-last')
+    now = timezone.now()
+    last_success = now - timedelta(days=3)
+    _make_succeeded_daily_run(organization, project, finished_at=last_success)
+
+    start = daily_digest_window_start(project, now=now)
+
+    assert start == last_success
+
+
+@pytest.mark.django_db
+def test_window_start_capped_at_max_when_last_success_is_old() -> None:
+    organization, _team, project = create_organization_project_team(slug='win-cap')
+    now = timezone.now()
+    _make_succeeded_daily_run(organization, project, finished_at=now - timedelta(days=15))
+
+    start = daily_digest_window_start(project, now=now)
+
+    assert start == now - timedelta(days=7)
+
+
+@pytest.mark.django_db
+def test_window_start_ignores_failed_runs() -> None:
+    organization, _team, project = create_organization_project_team(slug='win-failed')
+    now = timezone.now()
+    WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.FAILED,
+        finished_at=now - timedelta(days=2),
+    )
+
+    start = daily_digest_window_start(project, now=now)
+
+    assert start == now - timedelta(days=1)
+
+
+@pytest.mark.django_db
+def test_recent_ids_exclude_memories_before_last_success() -> None:
+    organization, team, project = create_organization_project_team(slug='win-ids')
+    now = timezone.now()
+    _make_succeeded_daily_run(organization, project, finished_at=now - timedelta(days=2))
+    after = create_approved_memory(organization, project, team, title='after-success')
+    before = create_approved_memory(organization, project, team, title='before-success')
+    Memory.objects.filter(id=after.id).update(updated_at=now - timedelta(days=1))
+    Memory.objects.filter(id=before.id).update(updated_at=now - timedelta(days=4))
+
+    ids = _recent_approved_memory_ids(project)
+
+    assert after.id in ids
+    assert before.id not in ids
 
 
 @pytest.mark.skip(reason='stale mock: GenerateDigest does not exist in tasks; update separately')

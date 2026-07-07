@@ -75,7 +75,10 @@ def bootstrap_golden_path(
         )
         OrganizationSettings.objects.update_or_create(
             organization=organization,
-            defaults={'distillation_auto_approve_threshold': Decimal('0.000')},
+            defaults={
+                'distillation_auto_approve_threshold': Decimal('0.000'),
+                'realtime_candidates_enabled': True,
+            },
         )
         team, _created = Team.objects.update_or_create(
             organization=organization,

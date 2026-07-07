@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from rest_framework.test import APIClient
 
@@ -13,7 +15,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import EffectiveScope, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import (
     OTHER_RAW_KEY,
     RAW_KEY,
@@ -22,6 +24,7 @@ from engram.context.context_api_tests import (
     create_project_scope,
     create_scoped_api_key,
 )
+from engram.context.services import authorized_retrieval_documents
 from engram.core.models import AuditEvent, MemoryVersion, Organization, Project, RetrievalDocument, VisibilityScope
 
 VERSION_BODY_MAX_LENGTH = 16000
@@ -606,3 +609,68 @@ def test_list_memory_versions_project_id_wins_over_repository_url() -> None:
 
     assert response.status_code == 200
     assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_update_memory_body_stales_previous_version_retrieval_document() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, first_version, first_document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    live_documents = RetrievalDocument.objects.filter(memory=memory, stale=False)
+    assert live_documents.count() == 1
+    live_document = live_documents.get()
+    assert live_document.memory_version_id != first_version.id
+    first_document.refresh_from_db()
+    assert first_document.stale is True
+
+
+@pytest.mark.django_db
+def test_update_memory_body_retrieval_returns_new_body_only() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _first_version, _first_document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        body='Original memory body before the correction.',
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(project, body='Corrected memory body after the review fix.'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    scope = EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(project.id,),
+        team_ids=(team.id,),
+        capabilities=(),
+        actor_type='user',
+        actor_id='reader',
+        project_bound=True,
+    )
+    documents = [
+        document
+        for document in authorized_retrieval_documents(organization, project, scope)
+        if document.memory_id == memory.id
+    ]
+
+    assert len(documents) == 1
+    assert 'Corrected memory body after the review fix.' in documents[0].full_text
+    assert 'Original memory body before the correction.' not in documents[0].full_text

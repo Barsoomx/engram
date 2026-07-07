@@ -144,6 +144,26 @@ def test_list_returns_active_teams_with_pagination(
 
 
 @pytest.mark.django_db
+def test_list_search_matches_name_or_slug(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owned_team: Team,
+) -> None:
+    billing = _make_team(f_owned_org, slug='billing', name='Billing Squad')
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    by_slug = client.get('/v1/admin/teams/', {'search': 'billing'})
+    by_name = client.get('/v1/admin/teams/', {'search': 'squad'})
+
+    assert by_slug.status_code == 200
+
+    assert {team['id'] for team in by_slug.data['results']} == {str(billing.id)}
+
+    assert {team['id'] for team in by_name.data['results']} == {str(billing.id)}
+
+
+@pytest.mark.django_db
 def test_list_denied_without_capability(
     f_developer_user_token: str,
     f_other_org: Organization,

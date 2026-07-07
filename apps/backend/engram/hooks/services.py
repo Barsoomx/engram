@@ -14,6 +14,7 @@ from engram.core.models import (
     Observation,
     ObservationSource,
     Organization,
+    OrganizationSettings,
     Project,
     RawEventEnvelope,
     SessionStatus,
@@ -145,7 +146,8 @@ class IngestHookEvent:
                     defaults={'citation': data.event_id, 'metadata': {'event_type': data.event_type}},
                 )
                 observation_id = str(observation.id)
-                transaction.on_commit(lambda: process_observation_recorded.delay(observation_id))
+                if self._realtime_candidates_enabled(organization):
+                    transaction.on_commit(lambda: process_observation_recorded.delay(observation_id))
                 if data.event_type == 'session_end' and session_was_active:
                     session_id = str(session.id)
                     transaction.on_commit(lambda: distill_session.delay(session_id))
@@ -173,6 +175,13 @@ class IngestHookEvent:
                 return self._existing_result(duplicate)
 
             raise
+
+    def _realtime_candidates_enabled(self, organization: Organization) -> bool:
+        return bool(
+            OrganizationSettings.objects.filter(organization=organization)
+            .values_list('realtime_candidates_enabled', flat=True)
+            .first(),
+        )
 
     def _resolve_team(
         self,
