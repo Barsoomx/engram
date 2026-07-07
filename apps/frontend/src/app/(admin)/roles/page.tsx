@@ -7,6 +7,7 @@ import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { useRoles } from '@/hooks/use-members';
@@ -22,7 +23,9 @@ function RolesTable({ items }: { items: Role[] }) {
           <tr className='border-b border-divider'>
             <th className='py-2 px-3 text-default-500 font-medium'>Code</th>
             <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Type</th>
+            <th className='py-2 px-3 text-default-500 font-medium'>
+              Description
+            </th>
             <th className='py-2 px-3 text-default-500 font-medium'>
               Capabilities
             </th>
@@ -35,15 +38,11 @@ function RolesTable({ items }: { items: Role[] }) {
                 {role.code}
               </td>
               <td className='py-2 px-3 text-foreground'>{role.name}</td>
-              <td className='py-2 px-3'>
-                {role.built_in ? (
-                  <Chip size='sm' variant='flat' color='primary'>
-                    Built-in
-                  </Chip>
+              <td className='py-2 px-3 max-w-[360px]'>
+                {role.description ? (
+                  <span className='text-default-600'>{role.description}</span>
                 ) : (
-                  <Chip size='sm' variant='flat' color='default'>
-                    Custom
-                  </Chip>
+                  <span className='text-default-400 text-xs'>—</span>
                 )}
               </td>
               <td className='py-2 px-3'>
@@ -115,6 +114,15 @@ export default function RolesPage() {
               </thead>
               <TableRowSkeleton columns={4} />
             </table>
+          ) : rolesQuery.isError ? (
+            <ErrorState
+              message={
+                rolesQuery.error instanceof Error
+                  ? rolesQuery.error.message
+                  : 'Failed to load roles.'
+              }
+              onRetry={() => rolesQuery.refetch()}
+            />
           ) : items.length === 0 ? (
             <EmptyState
               title='No roles'
@@ -126,21 +134,13 @@ export default function RolesPage() {
           )}
         </div>
 
-        {items.length > 0 && (
+        {!rolesQuery.isError && items.length > 0 && (
           <div className='flex items-center justify-between text-xs text-default-500'>
             <p>
               Showing {items.length} role{items.length === 1 ? '' : 's'}.
             </p>
             <p>Read-only.</p>
           </div>
-        )}
-
-        {rolesQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {rolesQuery.error instanceof Error
-              ? rolesQuery.error.message
-              : 'Failed to load roles.'}
-          </pre>
         )}
       </section>
     </CapabilityGate>
