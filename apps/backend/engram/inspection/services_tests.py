@@ -370,6 +370,36 @@ def test_list_inspection_memories_defaults_to_approved_only_matching_count() -> 
 
 
 @pytest.mark.django_db
+def test_list_inspection_memories_count_honors_search() -> None:
+    organization, team, project = create_inspection_scope_models()
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Findme distinct memory',
+        body='distinct body one',
+    )
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Other memory',
+        body='other body two',
+    )
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        search='Findme',
+    )
+
+    memories = list(ListInspectionMemories().execute(inspection_scope))
+    count = ListInspectionMemories().count(inspection_scope)
+
+    assert len(memories) == 1
+    assert count == len(memories)
+
+
+@pytest.mark.django_db
 def test_list_inspection_memories_honors_explicit_status_param() -> None:
     organization, team, project = create_inspection_scope_models()
     create_approved_memory_document(organization, team, project, title='Approved memory')
