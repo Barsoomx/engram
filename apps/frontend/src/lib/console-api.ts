@@ -447,13 +447,7 @@ export async function disableProviderSecret(
 /* ------------------------------- Model policies --------------------------- */
 
 export type PolicyScope = 'organization' | 'team' | 'project';
-export type PolicyTaskType =
-  | 'generation'
-  | 'embedding'
-  | 'curation'
-  | 'digest'
-  | 'rerank'
-  | 'admin_assistant';
+export type PolicyTaskType = 'generation' | 'embedding' | 'curation' | 'digest';
 
 export interface ModelPolicy {
   id: string;
@@ -500,12 +494,37 @@ export interface ModelPolicyResolveParams {
   task_type: PolicyTaskType;
 }
 
+export interface ModelPolicyListParams extends ScopeParams {
+  task_type?: PolicyTaskType;
+  provider?: SecretProvider;
+  scope?: PolicyScope;
+  active?: boolean;
+}
+
 export async function listModelPolicies(
-  scope: ScopeParams,
+  params: ModelPolicyListParams,
 ): Promise<{ count: number; items: ModelPolicy[] }> {
+  const query: Record<string, string> = scopeQuery(params);
+
+  if (params.task_type) {
+    query.task_type = params.task_type;
+  }
+
+  if (params.provider) {
+    query.provider = params.provider;
+  }
+
+  if (params.scope) {
+    query.scope = params.scope;
+  }
+
+  if (params.active !== undefined) {
+    query.active = String(params.active);
+  }
+
   try {
     const response = await apiClient().get('/v1/model-policy/policies', {
-      params: scopeQuery(scope),
+      params: query,
     });
 
     return listEnvelope<ModelPolicy>(response.data);
@@ -554,8 +573,6 @@ export const POLICY_TASK_TYPES: PolicyTaskType[] = [
   'embedding',
   'curation',
   'digest',
-  'rerank',
-  'admin_assistant',
 ];
 
 export const SECRET_PROVIDERS: SecretProvider[] = ['anthropic', 'openai', 'deepseek'];
@@ -756,7 +773,36 @@ export type ApplyPresetRequest = {
   preset_key: string;
   provider_keys: Record<string, string>;
   request_id: string;
+  replace_existing?: boolean;
 };
+
+export type ApplyPresetResponse = {
+  created_secret_ids: string[];
+  created_policy_ids: string[];
+  disabled_policy_ids: string[];
+  status: ModelSetupStatus;
+};
+
+export type ExistingPoliciesConflict = {
+  code: 'existing_policies';
+  policies_to_replace: string[];
+};
+
+export function existingPoliciesConflict(
+  error: unknown,
+): ExistingPoliciesConflict | null {
+  if (!axios.isAxiosError(error) || error.response?.status !== 409) {
+    return null;
+  }
+
+  const data = error.response.data as Partial<ExistingPoliciesConflict> | undefined;
+
+  if (data?.code === 'existing_policies' && Array.isArray(data.policies_to_replace)) {
+    return { code: 'existing_policies', policies_to_replace: data.policies_to_replace };
+  }
+
+  return null;
+}
 
 export async function getModelSetupStatus(
   projectId: string,
@@ -784,6 +830,13 @@ export async function getModelPresets(): Promise<{ presets: ModelPreset[] }> {
   return response.data;
 }
 
-export async function applyPreset(req: ApplyPresetRequest): Promise<void> {
-  await apiClient().post('/v1/admin/model-setup/apply', req);
+export async function applyPreset(
+  req: ApplyPresetRequest,
+): Promise<ApplyPresetResponse> {
+  const response = await apiClient().post<ApplyPresetResponse>(
+    '/v1/admin/model-setup/apply',
+    req,
+  );
+
+  return response.data;
 }
