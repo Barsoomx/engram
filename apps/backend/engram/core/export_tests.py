@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from django.core.management import call_command
+from structlog.testing import capture_logs
 
-from engram.core.export import iter_export_memories_json
+from engram.core.export import guard_export_stream, iter_export_memories_json
 from engram.core.models import (
     Memory,
     MemoryStatus,
@@ -355,6 +357,35 @@ def test_stream_export_redacts_token_shaped_values() -> None:
 
     assert LEAKED_TOKEN not in serialized
     assert '[REDACTED]' in serialized
+
+
+def test_guard_export_stream_passes_chunks_through_unchanged() -> None:
+    def source() -> Iterator[str]:
+        yield 'alpha'
+        yield 'beta'
+
+    assert list(guard_export_stream(source())) == ['alpha', 'beta']
+
+
+def test_guard_export_stream_logs_truncation_and_reraises_on_midstream_error() -> None:
+    def source() -> Iterator[str]:
+        yield 'first'
+        yield 'second'
+        raise RuntimeError('stream boom')
+
+    emitted: list[str] = []
+
+    with capture_logs() as logs:
+        with pytest.raises(RuntimeError):
+            for chunk in guard_export_stream(source()):
+                emitted.append(chunk)
+
+    assert emitted == ['first', 'second']
+
+    truncations = [entry for entry in logs if entry['event'] == 'memory_export_stream_truncated']
+    assert len(truncations) == 1
+    assert truncations[0]['items_emitted'] == 2
+    assert truncations[0]['log_level'] == 'error'
 
 
 @pytest.mark.django_db

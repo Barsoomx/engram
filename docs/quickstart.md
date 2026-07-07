@@ -57,7 +57,7 @@ Services that come up:
 
 | Service              | Port  | Role                                              |
 |----------------------|-------|---------------------------------------------------|
-| `api`                | 8000  | Django + DRF app (runs migrations, then gunicorn) |
+| `api`                | 8000  | Django + DRF app (runs migrations, then granian)  |
 | `frontend`           | 3000  | Next.js admin UI                                  |
 | `worker-realtime`    | -     | Celery worker, `engram-realtime` queue            |
 | `worker-near-realtime` | -   | Celery worker, `engram-near-realtime` queue       |

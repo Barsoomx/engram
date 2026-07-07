@@ -10,7 +10,7 @@ drf-spectacular = "^0.29.0"
 psycopg = {extras = ["binary"], version = "^3.2.6"}
 redis = {extras = ["hiredis"], version = "^8.0.1"}
 celery = "^5.5.3"
-gunicorn = "^23.0.0"
+granian = "~2.7.9"
 django-celery-outbox = "0.4.0"
 pydantic = {extras = ["email"], version = "^2.11.3"}
 sentry-sdk = "^2.27.0"
