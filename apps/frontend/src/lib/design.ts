@@ -215,3 +215,61 @@ export function auditResultChipColor(
 
   return 'default';
 }
+
+export type StatusTone = 'success' | 'danger' | 'warning' | 'info' | 'neutral';
+
+export interface ToneStyle {
+  text: string;
+  bg: string;
+  dot: string;
+}
+
+export const TONE_STYLES: Record<StatusTone, ToneStyle> = {
+  success: { text: '#3DD9AC', bg: 'rgba(47,212,167,0.13)', dot: '#3DD9AC' },
+  danger: { text: '#FB6E72', bg: 'rgba(251,110,114,0.13)', dot: '#FB6E72' },
+  warning: { text: '#F2B765', bg: 'rgba(242,183,101,0.14)', dot: '#F2B765' },
+  info: { text: '#6BA6FF', bg: 'rgba(91,157,255,0.14)', dot: '#6BA6FF' },
+  neutral: { text: '#8B8D93', bg: 'rgba(139,141,147,0.14)', dot: '#8B8D93' },
+};
+
+const STATUS_TONES: Record<string, StatusTone> = {
+  active: 'success',
+  succeeded: 'success',
+  success: 'success',
+  allowed: 'success',
+  ready: 'success',
+  injected: 'success',
+  approved: 'success',
+  enabled: 'success',
+  healthy: 'success',
+  ok: 'success',
+  failed: 'danger',
+  denied: 'danger',
+  revoked: 'danger',
+  refuted: 'danger',
+  error: 'danger',
+  errored: 'danger',
+  rejected: 'danger',
+  suspended: 'danger',
+  unhealthy: 'danger',
+  queued: 'warning',
+  running: 'warning',
+  pending: 'warning',
+  invited: 'warning',
+  proposed: 'warning',
+  conflict: 'warning',
+  stale: 'warning',
+  expired: 'warning',
+  degraded: 'warning',
+  recorded: 'info',
+  processing: 'info',
+  created: 'neutral',
+  skipped: 'neutral',
+  idle: 'neutral',
+  archived: 'neutral',
+  inactive: 'neutral',
+};
+
+export function statusTone(value: string | null | undefined): StatusTone {
+  return STATUS_TONES[(value ?? '').toLowerCase()] ?? 'neutral';
+}

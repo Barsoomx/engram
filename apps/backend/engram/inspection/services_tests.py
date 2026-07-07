@@ -145,3 +145,49 @@ def test_list_inspection_memories_count_honors_kind_param() -> None:
     count = ListInspectionMemories().count(inspection_scope)
 
     assert count == 1
+
+
+@pytest.mark.django_db
+def test_list_inspection_memories_defaults_to_approved_only_matching_count() -> None:
+    organization, team, project = create_inspection_scope_models()
+    create_approved_memory_document(organization, team, project, title='Approved memory')
+    archived, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Archived memory',
+    )
+    archived.status = MemoryStatus.ARCHIVED
+    archived.save(update_fields=['status', 'updated_at'])
+    inspection_scope = InspectionScope(project=project, scope=_effective_scope(organization, team))
+
+    memories = list(ListInspectionMemories().execute(inspection_scope))
+    count = ListInspectionMemories().count(inspection_scope)
+
+    assert {memory.status for memory in memories} == {MemoryStatus.APPROVED}
+    assert len(memories) == 1
+    assert len(memories) == count
+
+
+@pytest.mark.django_db
+def test_list_inspection_memories_honors_explicit_status_param() -> None:
+    organization, team, project = create_inspection_scope_models()
+    create_approved_memory_document(organization, team, project, title='Approved memory')
+    archived, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Archived memory',
+    )
+    archived.status = MemoryStatus.ARCHIVED
+    archived.save(update_fields=['status', 'updated_at'])
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        status=MemoryStatus.ARCHIVED,
+    )
+
+    memories = list(ListInspectionMemories().execute(inspection_scope))
+
+    assert {memory.status for memory in memories} == {MemoryStatus.ARCHIVED}
+    assert len(memories) == 1

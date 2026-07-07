@@ -27,6 +27,7 @@ from engram.context.services import (
     _pack_to_budget,
     _render_annotation,
     _semantic_retrieval_matches_python,
+    contains_match_query_terms,
     derive_retrieval_terms,
     estimate_tokens,
     fuse_retrieval_legs,
@@ -45,6 +46,7 @@ from engram.context.services import (
 from engram.core.models import (
     Agent,
     AgentSession,
+    ContextBundleStatus,
     Memory,
     MemoryStatus,
     MemoryVersion,
@@ -582,6 +584,69 @@ def test_index_memory_version_merges_extracted_symbols_and_exact_terms(
     )
     assert match is not None
     assert match.score == 80
+
+
+# score_retrieval_document — contains-tier term filtering (D7)
+
+
+@dataclass
+class _ScoreDocumentStub:
+    file_paths: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()
+    exact_terms: tuple[str, ...] = ()
+    full_text: str = ''
+
+
+def test_contains_match_query_terms_drops_short_tokens_keeps_whole_query() -> None:
+    terms = contains_match_query_terms('please fix the config')
+
+    assert terms == ('please fix the config', 'please', 'config')
+
+
+def test_score_retrieval_document_short_token_does_not_produce_contains_match() -> None:
+    document = _ScoreDocumentStub(exact_terms=('prefix',))
+
+    match = score_retrieval_document(
+        document,  # type: ignore[arg-type]
+        query='please fix the config',
+        file_paths=(),
+        symbols=(),
+        has_request_terms=True,
+    )
+
+    assert match is None
+
+
+def test_score_retrieval_document_distinctive_token_still_produces_contains_match() -> None:
+    document = _ScoreDocumentStub(exact_terms=('config',))
+
+    match = score_retrieval_document(
+        document,  # type: ignore[arg-type]
+        query='please fix the config',
+        file_paths=(),
+        symbols=(),
+        has_request_terms=True,
+    )
+
+    assert match is not None
+    assert match.score == 60
+    assert match.matched_terms == ('config',)
+
+
+def test_score_retrieval_document_whole_query_term_matches_contained_document_term() -> None:
+    document = _ScoreDocumentStub(exact_terms=('fix session cookie bug',))
+
+    match = score_retrieval_document(
+        document,  # type: ignore[arg-type]
+        query='please fix session cookie bug asap',
+        file_paths=(),
+        symbols=(),
+        has_request_terms=True,
+    )
+
+    assert match is not None
+    assert match.score == 60
+    assert match.matched_terms == ('fix session cookie bug',)
 
 
 # lexical fusion (RRF)
@@ -1209,3 +1274,93 @@ def test_build_context_bundle_includes_unprovenanced_memory_when_not_required() 
 
     titles = {match.document.memory.title for match in result.matches}
     assert titles == {'Provenanced memory', 'Unprovenanced memory'}
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_sets_injected_status_when_items_packed() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Injected memory',
+        body='This memory is packed into the bundle and injected.',
+        file_paths=['apps/backend/engram/context/services.py'],
+    )
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=('apps/backend/engram/context/services.py',),
+            request_id='request-status-injected-1',
+            session_id='session-status-injected-1',
+        ),
+    )
+
+    assert result.bundle.selected_count == 1
+    assert result.bundle.status == ContextBundleStatus.INJECTED
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_sets_skipped_status_when_no_items() -> None:
+    _organization, team, project, _api_key = _provenance_project_scope()
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=('apps/backend/engram/context/services.py',),
+            request_id='request-status-skipped-1',
+            session_id='session-status-skipped-1',
+        ),
+    )
+
+    assert result.bundle.selected_count == 0
+    assert result.bundle.status == ContextBundleStatus.SKIPPED
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_session_start_response_carries_injected_status() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    _create_memory_document(
+        organization,
+        team,
+        project,
+        title='Session-start memory',
+        body='Injected into the session-start hook response.',
+        file_paths=['apps/backend/engram/context/services.py'],
+    )
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=('apps/backend/engram/context/services.py',),
+            request_id='request-status-hook-1',
+            session_id='session-status-hook-1',
+        ),
+    )
+    response = result.to_response()
+
+    assert response['status'] == ContextBundleStatus.INJECTED
+    assert response['hook_specific_output']['hookEventName'] == 'SessionStart'
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_session_start_response_carries_skipped_status() -> None:
+    _organization, team, project, _api_key = _provenance_project_scope()
+
+    result = BuildContextBundle().execute(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=('apps/backend/engram/context/services.py',),
+            request_id='request-status-hook-skipped-1',
+            session_id='session-status-hook-skipped-1',
+        ),
+    )
+    response = result.to_response()
+
+    assert response['status'] == ContextBundleStatus.SKIPPED
+    assert response['hook_specific_output']['hookEventName'] == 'SessionStart'

@@ -6,6 +6,8 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -60,6 +62,10 @@ WIZARD_API_KEY_CAPABILITIES = (
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
 PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
+USER_PROMPT_SUBMIT_TOKEN_BUDGET = 1200
+SESSION_START_TOKEN_BUDGET = 2000
+CONTEXT_QUERY_MIN_PROMPT_LENGTH = 20
+HOOK_ERROR_COOLDOWN_SECONDS = 300
 
 
 ERROR_REMEDIATION: dict[str, str] = {
@@ -703,6 +709,38 @@ def run_disconnect(args: Namespace, stdout: TextIO, _stderr: TextIO) -> int:
     return 0
 
 
+def hook_error_marker_path(server_url: str) -> Path:
+    suffix = (
+        hashlib.sha256(server_url.encode()).hexdigest()[:12] if server_url else "default"
+    )
+
+    return Path(tempfile.gettempdir()) / f"engram-hook-error-{suffix}"
+
+
+def should_emit_hook_error(server_url: str) -> bool:
+    marker = hook_error_marker_path(server_url)
+    if not marker.exists():
+        return True
+
+    return time.time() - marker.stat().st_mtime >= HOOK_ERROR_COOLDOWN_SECONDS
+
+
+def touch_hook_error_marker(server_url: str) -> None:
+    marker = hook_error_marker_path(server_url)
+    marker.touch(exist_ok=True)
+    os.utime(marker, None)
+
+
+def should_skip_context_query(prompt: str) -> bool:
+    stripped = prompt.strip()
+    if len(stripped) < CONTEXT_QUERY_MIN_PROMPT_LENGTH:
+        return True
+    if stripped.startswith("/") or stripped.startswith("<command-"):
+        return True
+
+    return False
+
+
 def run_hook(
     args: Namespace,
     stdin: TextIO,
@@ -711,6 +749,7 @@ def run_hook(
     transport: Transport | None = None,
 ) -> int:
     api_key = ""
+    server_url = ""
     try:
         paths = local_paths(args.config_dir)
         config = load_required_json(
@@ -809,6 +848,13 @@ def run_hook(
             )
             if hook_status < 200 or hook_status >= 300:
                 raise error_from_body(hook_body, fallback="http_error")
+            effective_query = payload_string(input_payload, "query") or payload_string(
+                input_payload, "prompt"
+            )
+            if should_skip_context_query(effective_query):
+                stdout.write("{}\n")
+
+                return 0
             status, body = post_json(
                 transport=active_transport,
                 server_url=server_url,
@@ -835,9 +881,11 @@ def run_hook(
 
         return 0
     except CliError as error:
-        emit_error(stderr, error, api_key)
+        if should_emit_hook_error(server_url):
+            emit_error(stderr, error, api_key)
+        touch_hook_error_marker(server_url)
 
-        return 1
+        return 0
 
 
 def normalize_server_url(value: str | None) -> str:
@@ -1160,12 +1208,20 @@ def send_hook_event(
     )
 
 
+SESSION_START_EMPTY_MESSAGE = "Engram: no project memory yet."
+
+
 def format_hook_response(
     body: dict[str, object], response_format: str, hook_command: str
 ) -> dict[str, object]:
     if response_format == "server":
         return body
     if hook_command == "session-start":
+        if not body.get("items"):
+            if response_format == "claude-code":
+                return {"systemMessage": SESSION_START_EMPTY_MESSAGE}
+
+            return {"continue": True, "systemMessage": SESSION_START_EMPTY_MESSAGE}
         rendered = as_string(body.get("rendered_context"))
         if response_format == "claude-code":
             return {
@@ -1185,6 +1241,11 @@ def format_hook_response(
             },
         }
     if hook_command == "user-prompt-submit":
+        if not body.get("items"):
+            if response_format == "claude-code":
+                return {}
+
+            return {"continue": True}
         rendered = as_string(body.get("rendered_context"))
         if response_format == "claude-code":
             return {
@@ -1220,11 +1281,13 @@ def build_user_prompt_submit_payload(
             "session_id": required_payload_string(input_payload, "session_id"),
             "request_id": payload_string(input_payload, "request_id")
             or f"engram-cli-{uuid.uuid4()}",
-            "query": payload_string(input_payload, "query"),
+            "query": payload_string(input_payload, "query")
+            or payload_string(input_payload, "prompt"),
             "file_paths": list_value(input_payload.get("file_paths")),
             "symbols": list_value(input_payload.get("symbols")),
         },
     )
+    request_payload["token_budget"] = USER_PROMPT_SUBMIT_TOKEN_BUDGET
     for field in ("limit", "token_budget"):
         value = input_payload.get(field)
         if isinstance(value, int):
@@ -1262,6 +1325,7 @@ def build_session_start_payload(
             "symbols": list_value(input_payload.get("symbols")),
         },
     )
+    request_payload["token_budget"] = SESSION_START_TOKEN_BUDGET
     for field in ("limit", "token_budget"):
         value = input_payload.get(field)
         if isinstance(value, int):

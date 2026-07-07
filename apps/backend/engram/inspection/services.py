@@ -52,7 +52,10 @@ class InspectionScope:
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
         qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
-        filter_data = {'status': inspection_scope.status, 'kind': inspection_scope.kind}
+        filter_data = {
+            'status': inspection_scope.status or MemoryStatus.APPROVED,
+            'kind': inspection_scope.kind,
+        }
 
         return InspectionMemoryFilterSet(data=filter_data, queryset=qs).qs
 

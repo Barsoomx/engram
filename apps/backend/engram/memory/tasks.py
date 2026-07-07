@@ -17,6 +17,7 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
 )
+from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import run_session_distillation_with_tracking
 from engram.memory.distillation_reconciler import RetryFailedDistillations
@@ -90,17 +91,18 @@ def distill_session(self: object, session_id: object) -> str:
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed session id') from error
 
-    request_id = f'distill-session:{parsed_session_id}'
+    correlation_id = f'distill-session:{parsed_session_id}'
+    request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(
-        correlation_id=request_id,
+        correlation_id=correlation_id,
         request_id=request_id,
     )
     try:
         result = run_session_distillation_with_tracking(
             session_id=parsed_session_id,
             request_id=request_id,
-            correlation_id=request_id,
+            correlation_id=correlation_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:
@@ -316,6 +318,19 @@ def decay_memory_confidence() -> dict[str, int]:
         'projects': result.projects,
         'memories': result.memories,
     }
+
+
+@app.task(name='engram.memory.expire_stale_candidates')
+def expire_stale_candidates() -> dict[str, int]:
+    result = ExpireStaleCandidates().execute()
+
+    logger.info(
+        'expire_stale_candidates_completed',
+        scanned=result.scanned,
+        rejected=result.rejected,
+    )
+
+    return {'scanned': result.scanned, 'rejected': result.rejected}
 
 
 def _daily_digest_window_days() -> int:
