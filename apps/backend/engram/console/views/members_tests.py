@@ -773,6 +773,240 @@ def test_activate_denied_without_admin_capability(
     assert membership.status == 'invited'
 
 
+def _make_extra_member(
+    organization: Organization,
+    *,
+    external_id: str,
+    display_name: str,
+    email: str = '',
+    role_code: str = 'developer',
+    active: bool = True,
+) -> OrganizationMembership:
+    return OrganizationMembership.objects.create(
+        organization=organization,
+        identity=Identity.objects.create(
+            organization=organization,
+            identity_type=IdentityType.USER,
+            external_id=external_id,
+            display_name=display_name,
+            email=email,
+        ),
+        role=_make_role(role_code),
+        active=active,
+    )
+
+
+@pytest.mark.django_db
+def test_list_defaults_to_active_members_only(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    deactivated = _make_extra_member(
+        f_owned_org,
+        external_id='gone@acme.test',
+        display_name='Gone',
+        active=False,
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/members/')
+
+    assert response.status_code == 200
+
+    ids = {member['id'] for member in response.data['results']}
+
+    assert str(deactivated.id) not in ids
+
+    assert str(f_owner_membership.id) in ids
+
+
+@pytest.mark.django_db
+def test_list_active_false_returns_deactivated_members(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    deactivated = _make_extra_member(
+        f_owned_org,
+        external_id='gone@acme.test',
+        display_name='Gone',
+        active=False,
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/members/', {'active': 'false'})
+
+    assert response.status_code == 200
+
+    ids = {member['id'] for member in response.data['results']}
+
+    assert ids == {str(deactivated.id)}
+
+
+@pytest.mark.django_db
+def test_list_filter_by_role(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    auditor = _make_extra_member(
+        f_owned_org,
+        external_id='auditor@acme.test',
+        display_name='Auditor',
+        role_code='auditor',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.get('/v1/admin/members/', {'role': 'auditor'})
+
+    assert response.status_code == 200
+
+    ids = {member['id'] for member in response.data['results']}
+
+    assert ids == {str(auditor.id)}
+
+
+@pytest.mark.django_db
+def test_list_search_matches_name_email_or_external_id(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    target = _make_extra_member(
+        f_owned_org,
+        external_id='needle@acme.test',
+        display_name='Findme Person',
+        email='findme@acme.test',
+    )
+    _make_extra_member(
+        f_owned_org,
+        external_id='other@acme.test',
+        display_name='Someone Else',
+        email='else@acme.test',
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    by_name = client.get('/v1/admin/members/', {'search': 'findme'})
+    by_external = client.get('/v1/admin/members/', {'search': 'needle'})
+
+    assert by_name.status_code == 200
+
+    assert {member['id'] for member in by_name.data['results']} == {str(target.id)}
+
+    assert {member['id'] for member in by_external.data['results']} == {str(target.id)}
+
+
+@pytest.mark.django_db
+def test_reactivate_sets_active_true_and_writes_audit(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+) -> None:
+    deactivated = _make_extra_member(
+        f_owned_org,
+        external_id='return@acme.test',
+        display_name='Returner',
+        active=False,
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{deactivated.id}/reactivate/')
+
+    assert response.status_code == 200
+
+    assert response.data['active'] is True
+
+    deactivated.refresh_from_db()
+
+    assert deactivated.active is True
+
+    audit = AuditEvent.objects.filter(
+        organization=f_owned_org,
+        event_type='MemberReactivated',
+    )
+
+    assert audit.count() == 1
+
+    event = audit.get()
+
+    assert event.target_type == 'member'
+
+    assert event.target_id == str(deactivated.id)
+
+
+@pytest.mark.django_db
+def test_reactivate_is_idempotent_for_already_active_member(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_owner_membership: OrganizationMembership,
+) -> None:
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{f_owner_membership.id}/reactivate/')
+
+    assert response.status_code == 200
+
+    f_owner_membership.refresh_from_db()
+
+    assert f_owner_membership.active is True
+
+    audit = AuditEvent.objects.filter(
+        organization=f_owned_org,
+        event_type='MemberReactivated',
+    )
+
+    assert audit.count() == 0
+
+
+@pytest.mark.django_db
+def test_reactivate_denied_without_admin_capability(
+    f_developer_user_token: str,
+) -> None:
+    org = Organization.objects.create(name='Devreact', slug='devreact')
+    deactivated = _make_extra_member(
+        org,
+        external_id='down@devreact.test',
+        display_name='Down',
+        active=False,
+    )
+    _make_membership(User.objects.get(username='dev'), org, role_code='developer')
+
+    client = _auth_client(f_developer_user_token, org=org)
+
+    response = client.post(f'/v1/admin/members/{deactivated.id}/reactivate/')
+
+    assert response.status_code == 403
+
+    deactivated.refresh_from_db()
+
+    assert deactivated.active is False
+
+
+@pytest.mark.django_db
+def test_reactivate_returns_404_for_other_org_member(
+    f_owner_user_token: str,
+    f_owned_org: Organization,
+    f_other_org: Organization,
+) -> None:
+    other = _make_extra_member(
+        f_other_org,
+        external_id='foreign@globex.test',
+        display_name='Foreign',
+        active=False,
+    )
+
+    client = _auth_client(f_owner_user_token, org=f_owned_org)
+
+    response = client.post(f'/v1/admin/members/{other.id}/reactivate/')
+
+    assert response.status_code == 404
+
+
 @pytest.mark.django_db
 def test_existing_membership_defaults_status_active() -> None:
     org = Organization.objects.create(name='Status Org', slug='status-org')
