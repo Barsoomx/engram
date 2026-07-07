@@ -1664,25 +1664,7 @@ def render_weekly_digest_body(
 
 class BuildWeeklyStructuredDigest:
     def execute(self, data: WeeklyDigestInput) -> WeeklyDigestResult:
-        project = Project.objects.get(id=data.project_id, organization_id=data.organization_id)
-
-        today = timezone.now().date()
-
-        current_monday = today - datetime.timedelta(days=today.isoweekday() - 1)
-
-        anchor_monday = current_monday - datetime.timedelta(weeks=max(0, data.weeks_back))
-
-        tzinfo = timezone.get_current_timezone()
-
-        window_end = datetime.datetime.combine(anchor_monday, datetime.time.min, tzinfo=tzinfo)
-
-        window_start = datetime.datetime.combine(
-            anchor_monday - datetime.timedelta(days=7),
-            datetime.time.min,
-            tzinfo=tzinfo,
-        )
-
-        content_hash = weekly_digest_content_hash(project.id, window_start, window_end, data.team_id)
+        project, window_start, window_end, content_hash = self._resolve_window(data)
 
         existing = self._find_existing(project, content_hash)
 
@@ -1751,6 +1733,40 @@ class BuildWeeklyStructuredDigest:
             memory_changes=memory_changes,
             ready=False,
         )
+
+    def find_existing(
+        self,
+        data: WeeklyDigestInput,
+    ) -> tuple[WeeklyDigestResult | None, datetime.datetime, datetime.datetime]:
+        project, window_start, window_end, content_hash = self._resolve_window(data)
+
+        return self._find_existing(project, content_hash), window_start, window_end
+
+    def _resolve_window(
+        self,
+        data: WeeklyDigestInput,
+    ) -> tuple[Project, datetime.datetime, datetime.datetime, str]:
+        project = Project.objects.get(id=data.project_id, organization_id=data.organization_id)
+
+        today = timezone.now().date()
+
+        current_monday = today - datetime.timedelta(days=today.isoweekday() - 1)
+
+        anchor_monday = current_monday - datetime.timedelta(weeks=max(0, data.weeks_back))
+
+        tzinfo = timezone.get_current_timezone()
+
+        window_end = datetime.datetime.combine(anchor_monday, datetime.time.min, tzinfo=tzinfo)
+
+        window_start = datetime.datetime.combine(
+            anchor_monday - datetime.timedelta(days=7),
+            datetime.time.min,
+            tzinfo=tzinfo,
+        )
+
+        content_hash = weekly_digest_content_hash(project.id, window_start, window_end, data.team_id)
+
+        return project, window_start, window_end, content_hash
 
     def _find_existing(self, project: Project, content_hash: str) -> WeeklyDigestResult | None:
         existing = (

@@ -111,7 +111,7 @@ function DigestContent({ digest, onReviewed, canReview }: { digest: WeeklyDigest
   const { counts, changelog, window_start, window_end, window_days, ready } = digest;
 
   const reviewMutation = useMutation({
-    mutationFn: () => reviewDigest(digest.digest_memory_id),
+    mutationFn: () => reviewDigest(digest.digest_memory_id ?? ''),
     onSuccess: () => onReviewed(),
   });
 
@@ -242,6 +242,12 @@ export default function DigestsPage() {
             title='Failed to load digest'
             message={digestQuery.error instanceof Error ? digestQuery.error.message : 'The weekly digest could not be loaded.'}
             onRetry={() => digestQuery.refetch()}
+          />
+        ) : digestQuery.data && digestQuery.data.built === false ? (
+          <EmptyState
+            title='No digest for this week'
+            description='This earlier week has not been built yet. Digests are generated automatically for the current week; browsing history no longer creates them on demand.'
+            icon={<BookOpen className='h-6 w-6' />}
           />
         ) : digestQuery.data ? (
           <DigestContent

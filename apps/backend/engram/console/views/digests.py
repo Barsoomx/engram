@@ -79,16 +79,39 @@ class WeeklyDigestView(APIView):
                     status=HTTP_400_BAD_REQUEST,
                 )
 
+        digest_input = WeeklyDigestInput(
+            organization_id=organization.id,
+            project_id=project_id,
+            window_days=window_days,
+            team_id=team_id,
+            weeks_back=weeks_back,
+        )
+
+        builder = BuildWeeklyStructuredDigest()
+
         try:
-            result = BuildWeeklyStructuredDigest().execute(
-                WeeklyDigestInput(
-                    organization_id=organization.id,
-                    project_id=project_id,
-                    window_days=window_days,
-                    team_id=team_id,
-                    weeks_back=weeks_back,
-                ),
-            )
+            if weeks_back > 0:
+                existing, window_start, window_end = builder.find_existing(digest_input)
+
+                if existing is None:
+                    return Response(
+                        {
+                            'digest_memory_id': None,
+                            'built': False,
+                            'window_start': window_start.isoformat(),
+                            'window_end': window_end.isoformat(),
+                            'window_days': window_days,
+                            'counts': {},
+                            'memory_changes': {},
+                            'changelog': [],
+                            'ready': False,
+                        }
+                    )
+
+                result = existing
+
+            else:
+                result = builder.execute(digest_input)
         except Project.DoesNotExist:
             return Response({'detail': 'project not found'}, status=HTTP_404_NOT_FOUND)
 
@@ -99,6 +122,7 @@ class WeeklyDigestView(APIView):
         return Response(
             {
                 'digest_memory_id': str(result.digest_memory.id),
+                'built': True,
                 'window_start': metadata.get('window_start'),
                 'window_end': metadata.get('window_end'),
                 'window_days': metadata.get('window_days'),
