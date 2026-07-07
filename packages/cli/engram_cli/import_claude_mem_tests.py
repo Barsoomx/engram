@@ -15,10 +15,12 @@ from engram_cli.commands import remediation_for
 from engram_cli.import_claude_mem import (
     ClaudeMemImportError,
     ClaudeMemReader,
+    ImportConflictError,
     ImportPlan,
     _import_remediation,
     apply_v17_aliases,
     build_plan,
+    cancel_import,
     create_import,
     default_store_id,
     finalize_import,
@@ -378,6 +380,52 @@ class BatchTests(unittest.TestCase):
                 source_store_id='cli:abc',
                 manifest={'schema_version_head': 17, 'tables': {}},
             )
+
+    def test_create_import_conflict_carries_active_import_id(self) -> None:
+        transport = RecordingTransport(
+            [
+                (
+                    409,
+                    {
+                        'code': 'import_job_conflict',
+                        'detail': 'an active import already exists for this source store',
+                        'active_import_id': 'imp-old',
+                    },
+                ),
+            ],
+        )
+
+        with self.assertRaises(ImportConflictError) as ctx:
+            create_import(
+                transport=transport,
+                server_url='https://engram.example',
+                api_key=API_KEY,
+                project_id=PROJECT_ID,
+                source_store_id='cli:abc',
+                manifest={'schema_version_head': 17, 'tables': {}},
+            )
+
+        self.assertEqual('import_job_conflict', ctx.exception.code)
+        self.assertEqual('imp-old', ctx.exception.active_import_id)
+        self.assertIn('--replace', ctx.exception.remediation)
+
+    def test_cancel_import_targets_cancel_endpoint(self) -> None:
+        transport = RecordingTransport(
+            [(200, {'status': 'failed', 'failure_reason': 'canceled'})],
+        )
+
+        body = cancel_import(
+            transport=transport,
+            server_url='https://engram.example',
+            api_key=API_KEY,
+            import_id='imp-old',
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual('canceled', body['failure_reason'])
+        self.assertTrue(
+            transport.calls[0]['url'].endswith('/v1/imports/claude-mem/imp-old/cancel'),
+        )
 
     def test_create_import_retries_on_transient_then_succeeds(self) -> None:
         transport = RecordingTransport(
@@ -816,6 +864,213 @@ class RunImportCliTests(unittest.TestCase):
 
         self.assertEqual(1, code)
         self.assertIn('claude-mem', stderr)
+
+    def test_conflict_without_replace_prints_active_id_and_hint(self) -> None:
+        _write_head_db(
+            self.data_dir / 'claude-mem.db',
+            [{'content_session_id': 'c1', 'memory_session_id': 'm1', 'project': '/repo/one'}],
+        )
+        self._write_config()
+        transport = RecordingTransport(
+            [
+                (
+                    409,
+                    {
+                        'code': 'import_job_conflict',
+                        'detail': 'an active import already exists for this source store',
+                        'active_import_id': 'imp-old',
+                    },
+                ),
+            ],
+        )
+
+        code, _stdout, stderr = self._run(
+            [
+                'import',
+                'claude-mem',
+                '--data-dir',
+                str(self.data_dir),
+                '--config-dir',
+                str(self.config_dir),
+                '--apply',
+            ],
+            transport,
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn('import_job_conflict', stderr)
+        self.assertIn('imp-old', stderr)
+        self.assertIn('--replace', stderr)
+
+    def test_replace_flag_cancels_active_then_completes(self) -> None:
+        _write_head_db(
+            self.data_dir / 'claude-mem.db',
+            [{'content_session_id': 'c1', 'memory_session_id': 'm1', 'project': '/repo/one'}],
+        )
+        self._write_config()
+        transport = RecordingTransport(
+            [
+                (409, {'code': 'import_job_conflict', 'detail': 'exists', 'active_import_id': 'imp-old'}),
+                (200, {'status': 'failed', 'failure_reason': 'canceled'}),
+                (201, {'import_id': 'imp-new', 'status': 'created'}),
+                (200, {'accepted': True, 'seq': 0, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+                (200, {'accepted': True, 'seq': 1, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+                (200, {'accepted': True, 'seq': 2, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+                (200, {'accepted': True, 'seq': 3, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+                (200, {'status': 'succeeded', 'report': {}}),
+            ],
+        )
+
+        code, stdout, stderr = self._run(
+            [
+                'import',
+                'claude-mem',
+                '--data-dir',
+                str(self.data_dir),
+                '--config-dir',
+                str(self.config_dir),
+                '--apply',
+                '--replace',
+            ],
+            transport,
+        )
+
+        self.assertEqual(0, code, stderr)
+        cancel_calls = [
+            call for call in transport.calls if str(call['url']).endswith('/imp-old/cancel')
+        ]
+        self.assertEqual(1, len(cancel_calls))
+        self.assertIn('succeeded', stdout)
+
+    def test_replace_flag_reports_cancel_failure(self) -> None:
+        _write_head_db(
+            self.data_dir / 'claude-mem.db',
+            [{'content_session_id': 'c1', 'memory_session_id': 'm1', 'project': '/repo/one'}],
+        )
+        self._write_config()
+        transport = RecordingTransport(
+            [
+                (409, {'code': 'import_job_conflict', 'detail': 'exists', 'active_import_id': 'imp-old'}),
+                (409, {'code': 'import_job_state', 'detail': 'import job is already finalized'}),
+            ],
+        )
+
+        code, _stdout, stderr = self._run(
+            [
+                'import',
+                'claude-mem',
+                '--data-dir',
+                str(self.data_dir),
+                '--config-dir',
+                str(self.config_dir),
+                '--apply',
+                '--replace',
+            ],
+            transport,
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn('import_job_state', stderr)
+
+
+class ReplaceStreamTests(unittest.TestCase):
+    def _plan(self) -> ImportPlan:
+        return ImportPlan(
+            projects=['/repo/one'],
+            tables=OrderedDict(
+                (
+                    ('sdk_sessions', [{'id': 1}]),
+                    ('user_prompts', []),
+                    ('observations', []),
+                    ('session_summaries', []),
+                ),
+            ),
+            project_name='/repo/one',
+        )
+
+    def test_replace_cancels_active_then_retries_create(self) -> None:
+        transport = RecordingTransport(
+            [
+                (409, {'code': 'import_job_conflict', 'detail': 'exists', 'active_import_id': 'imp-old'}),
+                (200, {'status': 'failed', 'failure_reason': 'canceled'}),
+                (201, {'import_id': 'imp-new', 'status': 'created'}),
+                (200, {'accepted': True, 'seq': 0, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+                (200, {'status': 'succeeded', 'report': {}}),
+            ],
+        )
+        stdout = io.StringIO()
+
+        report = stream_plan(
+            transport=transport,
+            server_url='https://engram.example',
+            api_key=API_KEY,
+            plan=self._plan(),
+            project_id=PROJECT_ID,
+            source_store_id='cli:abc',
+            schema_version_head=17,
+            batch_size=200,
+            stdout=stdout,
+            replace=True,
+            sleep=lambda _seconds: None,
+        )
+
+        urls = [call['url'] for call in transport.calls]
+        self.assertTrue(urls[0].endswith('/v1/imports/claude-mem'))
+        self.assertTrue(urls[1].endswith('/v1/imports/claude-mem/imp-old/cancel'))
+        self.assertTrue(urls[2].endswith('/v1/imports/claude-mem'))
+        self.assertEqual('succeeded', report['status'])
+        self.assertIn('imp-old', stdout.getvalue())
+
+    def test_conflict_without_replace_propagates(self) -> None:
+        transport = RecordingTransport(
+            [(409, {'code': 'import_job_conflict', 'detail': 'exists', 'active_import_id': 'imp-old'})],
+        )
+        stdout = io.StringIO()
+
+        with self.assertRaises(ImportConflictError) as ctx:
+            stream_plan(
+                transport=transport,
+                server_url='https://engram.example',
+                api_key=API_KEY,
+                plan=self._plan(),
+                project_id=PROJECT_ID,
+                source_store_id='cli:abc',
+                schema_version_head=17,
+                batch_size=200,
+                stdout=stdout,
+                replace=False,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual('imp-old', ctx.exception.active_import_id)
+        self.assertEqual(1, len(transport.calls))
+
+    def test_replace_reports_cancel_failure_clearly(self) -> None:
+        transport = RecordingTransport(
+            [
+                (409, {'code': 'import_job_conflict', 'detail': 'exists', 'active_import_id': 'imp-old'}),
+                (409, {'code': 'import_job_state', 'detail': 'import job is already finalized'}),
+            ],
+        )
+        stdout = io.StringIO()
+
+        with self.assertRaises(ClaudeMemImportError) as ctx:
+            stream_plan(
+                transport=transport,
+                server_url='https://engram.example',
+                api_key=API_KEY,
+                plan=self._plan(),
+                project_id=PROJECT_ID,
+                source_store_id='cli:abc',
+                schema_version_head=17,
+                batch_size=200,
+                stdout=stdout,
+                replace=True,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual('import_job_state', ctx.exception.code)
+        self.assertEqual(2, len(transport.calls))
 
 
 class ImportRemediationTests(unittest.TestCase):

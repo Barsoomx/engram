@@ -1,11 +1,18 @@
 'use client';
 
-import { useQuery, type UseQueryOptions } from '@tanstack/react-query';
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type UseQueryOptions,
+} from '@tanstack/react-query';
 
 import {
+  cancelImport,
   importDetail,
   isTerminalImportStatus,
   listImports,
+  type CancelImportResult,
   type ImportJob,
   type Paginated,
 } from '@/lib/admin-api';
@@ -45,5 +52,19 @@ export function useImport(
       return DETAIL_POLL_INTERVAL_MS;
     },
     ...options,
+  });
+}
+
+export function useCancelImport(orgId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation<CancelImportResult, unknown, string>({
+    mutationFn: (id: string) => cancelImport(id),
+    onSuccess: (_result, id) => {
+      queryClient.invalidateQueries({ queryKey: ['admin', orgId, 'imports'] });
+      queryClient.invalidateQueries({
+        queryKey: adminQueryKeys.importJob(orgId, id),
+      });
+    },
   });
 }

@@ -4,6 +4,7 @@ from rest_framework.routers import DefaultRouter
 from engram.console.views.api_keys import ApiKeyViewSet
 from engram.console.views.audit_log import AuditEventViewSet
 from engram.console.views.digests import DigestReviewView, WeeklyDigestView
+from engram.console.views.import_cancel import AdminImportCancelView
 from engram.console.views.imports import ImportJobViewSet
 from engram.console.views.members import MemberViewSet
 from engram.console.views.memory_export import MemoryExportView
@@ -48,6 +49,11 @@ urlpatterns = router.urls + [
         'projects/<uuid:project_id>/digest/run',
         ProjectDigestRunView.as_view(),
         name='admin-project-digest-run',
+    ),
+    path(
+        'imports/<uuid:import_id>/cancel',
+        AdminImportCancelView.as_view(),
+        name='admin-import-cancel',
     ),
     path('memories/export', MemoryExportView.as_view(), name='admin-memory-export'),
     path('digests/weekly', WeeklyDigestView.as_view(), name='admin-digests-weekly'),

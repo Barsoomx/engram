@@ -522,6 +522,20 @@ export async function importDetail(id: string): Promise<ImportJob> {
   return response.data;
 }
 
+export type CancelImportResult = {
+  status: ImportJobStatus;
+  failure_reason: string;
+};
+
+export async function cancelImport(id: string): Promise<CancelImportResult> {
+  const client = apiClient();
+  const response = await client.post<CancelImportResult>(
+    `/v1/admin/imports/${id}/cancel`,
+  );
+
+  return response.data;
+}
+
 export type MemoryReviewItemType = 'candidate' | 'memory';
 
 export type MemoryReviewSourceSummary = {
