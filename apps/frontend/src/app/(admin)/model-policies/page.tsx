@@ -264,9 +264,10 @@ function PolicyTableHead() {
         <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
           Health
         </th>
-        <th className='px-3 py-2.5 text-right font-semibold text-default-400'>
-          <span className='sr-only'>Actions</span>
-        </th>
+        <th
+          className='px-3 py-2.5 text-right font-semibold text-default-400'
+          aria-label='Actions'
+        />
       </tr>
     </thead>
   );
