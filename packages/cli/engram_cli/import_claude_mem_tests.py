@@ -2,17 +2,21 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
 from collections import OrderedDict
 from pathlib import Path
+from unittest import mock
 
 from engram_cli import main
+from engram_cli.commands import remediation_for
 from engram_cli.import_claude_mem import (
     ClaudeMemImportError,
     ClaudeMemReader,
     ImportPlan,
+    _import_remediation,
     apply_v17_aliases,
     build_plan,
     create_import,
@@ -26,6 +30,8 @@ from engram_cli.import_claude_mem import (
 
 API_KEY = 'egk_test_import_0123456789abcdefghijklmnop'
 PROJECT_ID = '11111111-1111-1111-1111-111111111111'
+STORED_KEY = 'egk_stored_credential_key_abcdefghijklmnop'
+ENV_KEY = 'egk_env_override_key_0123456789abcdefghij'
 
 
 class RecordingTransport:
@@ -810,6 +816,163 @@ class RunImportCliTests(unittest.TestCase):
 
         self.assertEqual(1, code)
         self.assertIn('claude-mem', stderr)
+
+
+class ImportRemediationTests(unittest.TestCase):
+    def test_missing_capability_is_import_specific(self) -> None:
+        remediation = _import_remediation('missing_capability')
+
+        self.assertIn('memories:admin', remediation)
+        self.assertNotIn('hook dry-run', remediation)
+
+    def test_unknown_code_falls_back_to_shared_table(self) -> None:
+        self.assertEqual(
+            remediation_for('missing_project'),
+            _import_remediation('missing_project'),
+        )
+
+
+class HeaderRecordingTransport:
+    def __init__(self, responses: list[tuple[int, dict[str, object]]]) -> None:
+        self._responses = list(responses)
+        self.calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        self.calls.append(
+            {'method': method, 'url': url, 'headers': dict(headers), 'payload': payload},
+        )
+        if not self._responses:
+            raise AssertionError('unexpected transport call')
+
+        return self._responses.pop(0)
+
+
+def _apply_responses() -> list[tuple[int, dict[str, object]]]:
+    return [
+        (201, {'import_id': 'imp-1', 'status': 'created'}),
+        (200, {'accepted': True, 'seq': 0, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+        (200, {'accepted': True, 'seq': 1, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+        (200, {'accepted': True, 'seq': 2, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+        (200, {'accepted': True, 'seq': 3, 'created': 1, 'duplicates': 0, 'skipped': 0}),
+        (200, {'status': 'succeeded', 'report': {}}),
+    ]
+
+
+class ImportCredentialLadderTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        self.data_dir = self.root / 'data'
+        self.data_dir.mkdir()
+        self.config_dir = self.root / 'config'
+        self.config_dir.mkdir()
+        _write_head_db(
+            self.data_dir / 'claude-mem.db',
+            [{'content_session_id': 'c1', 'memory_session_id': 'm1', 'project': '/repo/one'}],
+        )
+
+    def _write_config(
+        self,
+        *,
+        server_url: str = 'https://engram.example',
+        with_credentials: bool = True,
+    ) -> None:
+        (self.config_dir / 'config.json').write_text(
+            json.dumps({'server_url': server_url, 'project_id': PROJECT_ID}),
+            encoding='utf-8',
+        )
+        if with_credentials:
+            (self.config_dir / 'credentials.json').write_text(
+                json.dumps({'api_key': STORED_KEY}),
+                encoding='utf-8',
+            )
+
+    def _run(self, transport: HeaderRecordingTransport) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        argv = [
+            'import',
+            'claude-mem',
+            '--data-dir',
+            str(self.data_dir),
+            '--config-dir',
+            str(self.config_dir),
+            '--apply',
+        ]
+        code = main.main(argv, stdout=stdout, stderr=stderr, transport=transport)
+
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_env_api_key_takes_precedence_over_stored_credential(self) -> None:
+        self._write_config()
+        transport = HeaderRecordingTransport(_apply_responses())
+
+        with mock.patch.dict(os.environ, {'ENGRAM_API_KEY': ENV_KEY}):
+            code, _stdout, stderr = self._run(transport)
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            f'Bearer {ENV_KEY}', transport.calls[0]['headers']['Authorization'],
+        )
+
+    def test_falls_back_to_stored_credential_when_env_absent(self) -> None:
+        self._write_config()
+        transport = HeaderRecordingTransport(_apply_responses())
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('ENGRAM_API_KEY', None)
+            code, _stdout, stderr = self._run(transport)
+
+        self.assertEqual(0, code, stderr)
+        self.assertEqual(
+            f'Bearer {STORED_KEY}', transport.calls[0]['headers']['Authorization'],
+        )
+
+    def test_env_server_url_takes_precedence_over_config(self) -> None:
+        self._write_config(server_url='https://config.example')
+        transport = HeaderRecordingTransport(_apply_responses())
+
+        with mock.patch.dict(os.environ, {'ENGRAM_SERVER_URL': 'https://env.example'}):
+            code, _stdout, stderr = self._run(transport)
+
+        self.assertEqual(0, code, stderr)
+        self.assertTrue(
+            str(transport.calls[0]['url']).startswith('https://env.example/'),
+            transport.calls[0]['url'],
+        )
+
+    def test_missing_key_everywhere_reports_missing_credential(self) -> None:
+        self._write_config(with_credentials=False)
+        transport = HeaderRecordingTransport([])
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('ENGRAM_API_KEY', None)
+            code, _stdout, stderr = self._run(transport)
+
+        self.assertEqual(1, code)
+        self.assertEqual([], transport.calls)
+        self.assertIn('missing_credential', stderr)
+
+    def test_missing_capability_surfaces_import_remediation(self) -> None:
+        self._write_config()
+        transport = HeaderRecordingTransport(
+            [(403, {'code': 'missing_capability', 'detail': 'memories:admin required'})],
+        )
+
+        with mock.patch.dict(os.environ, {'ENGRAM_API_KEY': ENV_KEY}):
+            code, _stdout, stderr = self._run(transport)
+
+        self.assertEqual(1, code)
+        self.assertIn('memories:admin', stderr)
+        self.assertNotIn('hook dry-run', stderr)
 
 
 if __name__ == '__main__':

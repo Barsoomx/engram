@@ -17,11 +17,10 @@ from engram_cli.commands import (
     CliError,
     _ladder_project_id,
     emit_error,
-    load_required_json,
     normalize_server_url,
     remediation_for,
 )
-from engram_cli.config import as_string, local_paths
+from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, post_json, urllib_transport
 
 
@@ -47,6 +46,32 @@ class ClaudeMemImportError(CliError):
 
 class ImportBatchTooLargeError(ClaudeMemImportError):
     pass
+
+
+_IMPORT_REMEDIATION: dict[str, str] = {
+    'missing_capability': (
+        'Use an API key with memories:admin for imports '
+        '(mint one on the console API Keys page).'
+    ),
+}
+
+
+def _import_remediation(code: str) -> str:
+    return _IMPORT_REMEDIATION.get(code, remediation_for(code))
+
+
+def _read_optional_json(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+
+    try:
+        return read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ClaudeMemImportError(
+            'invalid_response',
+            f'Could not read {path.name}: {error}',
+            _import_remediation('invalid_response'),
+        ) from error
 
 
 def default_store_id(db_path: str, hostname: str) -> str:
@@ -104,7 +129,7 @@ class ClaudeMemReader:
             raise ClaudeMemImportError(
                 'missing_claude_mem_db',
                 f'claude-mem.db was not found under {data_dir}',
-                remediation_for('missing_claude_mem_db'),
+                _import_remediation('missing_claude_mem_db'),
             )
 
         try:
@@ -115,7 +140,7 @@ class ClaudeMemReader:
             raise ClaudeMemImportError(
                 'corrupt_claude_mem_db',
                 'claude-mem.db could not be opened as a valid SQLite database',
-                remediation_for('corrupt_claude_mem_db'),
+                _import_remediation('corrupt_claude_mem_db'),
             ) from error
 
         return cls(connection, os.path.abspath(str(db_path)))
@@ -236,14 +261,14 @@ def _error_from_body(body: dict[str, object], fallback: str) -> ClaudeMemImportE
     code = as_string(body.get('code')) or fallback
     detail = as_string(body.get('detail')) or code
 
-    return ClaudeMemImportError(code, detail, remediation_for(code))
+    return ClaudeMemImportError(code, detail, _import_remediation(code))
 
 
 def _too_large_from_body(body: dict[str, object]) -> ImportBatchTooLargeError:
     code = as_string(body.get('code')) or 'import_payload_too_large'
     detail = as_string(body.get('detail')) or 'import batch exceeds the maximum request size'
 
-    return ImportBatchTooLargeError(code, detail, remediation_for(code))
+    return ImportBatchTooLargeError(code, detail, _import_remediation(code))
 
 
 def _oversized_row_error(table: str, row: dict[str, object]) -> ClaudeMemImportError:
@@ -256,7 +281,7 @@ def _oversized_row_error(table: str, row: dict[str, object]) -> ClaudeMemImportE
     return ClaudeMemImportError(
         'import_row_too_large',
         detail,
-        remediation_for('import_row_too_large'),
+        _import_remediation('import_row_too_large'),
     )
 
 
@@ -320,7 +345,7 @@ def create_import(
         raise ClaudeMemImportError(
             'import_create_failed',
             'Server did not return an import id',
-            remediation_for('import_create_failed'),
+            _import_remediation('import_create_failed'),
         )
 
     return import_id
@@ -524,7 +549,7 @@ def run_import_claude_mem(
                 raise ClaudeMemImportError(
                     'unknown_upstream_project',
                     f'project not found in claude-mem.db: {project_name}',
-                    remediation_for('unknown_upstream_project'),
+                    _import_remediation('unknown_upstream_project'),
                 )
 
             selected = project_name if project_name else (projects[0] if projects else None)
@@ -534,27 +559,27 @@ def run_import_claude_mem(
                 skip_observations=bool(getattr(args, 'skip_observations', False)),
             )
             paths = local_paths(args.config_dir)
-            config = load_required_json(
-                paths.config, 'missing_config', 'Engram config is missing',
-            )
-            credentials = load_required_json(
-                paths.credentials, 'missing_credential', 'Engram credential is missing',
-            )
-            api_key = as_string(credentials.get('api_key'))
+            config = _read_optional_json(paths.config)
+            credentials = _read_optional_json(paths.credentials)
+            api_key = (
+                os.environ.get('ENGRAM_API_KEY') or as_string(credentials.get('api_key'))
+            ).strip()
             if not api_key:
                 raise ClaudeMemImportError(
                     'missing_credential',
-                    'Engram credential is missing',
-                    remediation_for('missing_credential'),
+                    'Set ENGRAM_API_KEY or run `engram connect` to provide an import key',
+                    _import_remediation('missing_credential'),
                 )
 
-            server_url = normalize_server_url(as_string(config.get('server_url')))
+            server_url = normalize_server_url(
+                os.environ.get('ENGRAM_SERVER_URL') or as_string(config.get('server_url')),
+            )
             project_id = _ladder_project_id(args, config).strip()
             if not project_id:
                 raise ClaudeMemImportError(
                     'missing_project',
                     'Set --project or ENGRAM_PROJECT_ID for claude-mem import',
-                    remediation_for('missing_project'),
+                    _import_remediation('missing_project'),
                 )
 
             store_id = (as_string(getattr(args, 'store_id', '')) or '').strip() or default_store_id(
