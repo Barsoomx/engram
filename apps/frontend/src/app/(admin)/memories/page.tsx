@@ -1,8 +1,8 @@
 'use client';
 
-import { Input, Select, SelectItem } from '@heroui/react';
+import { addToast, Button, Checkbox, Input, Select, SelectItem } from '@heroui/react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { Database } from 'lucide-react';
+import { Database, Download } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
 
@@ -16,7 +16,9 @@ import { StatusPill } from '@/components/ui/status-pill';
 import { TimeStamp } from '@/components/ui/time-stamp';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useUrlFilters } from '@/hooks/use-url-filters';
+import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
+  downloadMemoryExport,
   listInspectionMemories,
   type InspectionMemory,
   type InspectionMemoryOrdering,
@@ -145,6 +147,62 @@ export default function MemoriesPage() {
   const activeProjectId = useProjectStore((s) => s.activeProjectId);
   const activeTeamId = useTeamStore((s) => s.activeTeamId);
 
+  const meQuery = useQuery<MeResponse>({
+    queryKey: ['auth', 'me'],
+    queryFn: fetchMe,
+  });
+  const canExportAllStatuses = hasCapability(
+    meQuery.data?.capabilities ?? [],
+    'memories:admin',
+  );
+
+  const [exportAllStatuses, setExportAllStatuses] = React.useState(false);
+  const [isExporting, setIsExporting] = React.useState(false);
+
+  const handleExport = React.useCallback(async () => {
+    if (!activeProjectId) {
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      await downloadMemoryExport({
+        projectId: activeProjectId,
+        teamId: activeTeamId,
+        allStatuses: canExportAllStatuses && exportAllStatuses,
+      });
+      addToast({ title: 'Export started', color: 'success' });
+    } catch {
+      addToast({ title: 'Export failed', color: 'danger' });
+    } finally {
+      setIsExporting(false);
+    }
+  }, [activeProjectId, activeTeamId, canExportAllStatuses, exportAllStatuses]);
+
+  const exportActions = (
+    <div className='flex items-center gap-3'>
+      {canExportAllStatuses && (
+        <Checkbox
+          size='sm'
+          isSelected={exportAllStatuses}
+          onValueChange={setExportAllStatuses}
+        >
+          All statuses
+        </Checkbox>
+      )}
+      <Button
+        size='sm'
+        variant='bordered'
+        startContent={<Download className='h-4 w-4' />}
+        isLoading={isExporting}
+        onPress={handleExport}
+      >
+        Export
+      </Button>
+    </div>
+  );
+
   const [filters, setFilters] = useUrlFilters(MEMORIES_FILTER_DEFAULTS);
   const [searchInput, setSearchInput] = React.useState(filters.search);
   const debouncedSearch = useDebouncedValue(searchInput, 300);
@@ -217,6 +275,7 @@ export default function MemoriesPage() {
       <PageHeader
         title='Memories'
         subtitle='Engineering knowledge captured by your agents, ready to inject.'
+        actions={exportActions}
       />
 
       <div className='surface-card p-4'>

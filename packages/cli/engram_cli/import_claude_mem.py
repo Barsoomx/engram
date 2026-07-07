@@ -1,0 +1,500 @@
+from __future__ import annotations
+
+import hashlib
+import os
+import socket
+import sqlite3
+import time
+from argparse import Namespace
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO
+
+from engram_cli.commands import (
+    CliError,
+    _ladder_project_id,
+    emit_error,
+    load_required_json,
+    normalize_server_url,
+    remediation_for,
+)
+from engram_cli.config import as_string, local_paths
+from engram_cli.http import Transport, post_json, urllib_transport
+
+
+_TABLE_ORDER = ('sdk_sessions', 'user_prompts', 'observations', 'session_summaries')
+_PROJECT_TABLES = ('sdk_sessions', 'observations', 'session_summaries')
+_V17_ALIASES = {
+    'claude_session_id': 'content_session_id',
+    'sdk_session_id': 'memory_session_id',
+}
+_MAX_BATCH_ROWS = 200
+_RETRYABLE_STATUS = (500, 502, 503, 504)
+_BATCH_MAX_ATTEMPTS = 5
+_BATCH_BACKOFF_SECONDS = 0.5
+
+
+class ClaudeMemImportError(CliError):
+    pass
+
+
+def default_store_id(db_path: str, hostname: str) -> str:
+    digest = hashlib.sha256(f'{hostname}{db_path}'.encode()).hexdigest()
+
+    return f'cli:{digest[:16]}'
+
+
+def apply_v17_aliases(row: dict[str, object]) -> dict[str, object]:
+    aliased: dict[str, object] = {}
+    for key, value in row.items():
+        if key in _V17_ALIASES and _V17_ALIASES[key] in row:
+            continue
+
+        aliased[_V17_ALIASES.get(key, key)] = value
+
+    return aliased
+
+
+def iter_batches(rows: list[dict[str, object]], size: int) -> Iterator[list[dict[str, object]]]:
+    step = max(1, size)
+    for start in range(0, len(rows), step):
+        yield rows[start:start + step]
+
+
+class ClaudeMemReader:
+    def __init__(self, connection: sqlite3.Connection, db_path: str) -> None:
+        self._connection = connection
+        self._db_path = db_path
+
+    @classmethod
+    def open(cls, data_dir: str | Path) -> 'ClaudeMemReader':
+        db_path = Path(data_dir).expanduser() / 'claude-mem.db'
+        if not db_path.exists():
+            raise ClaudeMemImportError(
+                'missing_claude_mem_db',
+                f'claude-mem.db was not found under {data_dir}',
+                remediation_for('missing_claude_mem_db'),
+            )
+
+        try:
+            connection = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+            connection.row_factory = sqlite3.Row
+            connection.execute('SELECT name FROM sqlite_master LIMIT 1')
+        except sqlite3.DatabaseError as error:
+            raise ClaudeMemImportError(
+                'corrupt_claude_mem_db',
+                'claude-mem.db could not be opened as a valid SQLite database',
+                remediation_for('corrupt_claude_mem_db'),
+            ) from error
+
+        return cls(connection, os.path.abspath(str(db_path)))
+
+    @property
+    def db_path(self) -> str:
+        return self._db_path
+
+    def close(self) -> None:
+        self._connection.close()
+
+    def __enter__(self) -> 'ClaudeMemReader':
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def table_exists(self, table: str) -> bool:
+        cursor = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
+            (table,),
+        )
+
+        return cursor.fetchone() is not None
+
+    def column_names(self, table: str) -> list[str]:
+        if table not in _TABLE_ORDER or not self.table_exists(table):
+            return []
+
+        cursor = self._connection.execute(f'PRAGMA table_info({table})')
+
+        return [str(row['name']) for row in cursor.fetchall()]
+
+    def read_table(self, table: str) -> list[dict[str, object]]:
+        if table not in _TABLE_ORDER or not self.table_exists(table):
+            return []
+
+        cursor = self._connection.execute(f'SELECT * FROM {table} ORDER BY rowid')
+
+        return [apply_v17_aliases(dict(row)) for row in cursor.fetchall()]
+
+    def distinct_projects(self) -> list[str]:
+        projects: list[str] = []
+        for table in _PROJECT_TABLES:
+            if 'project' not in self.column_names(table):
+                continue
+
+            cursor = self._connection.execute(
+                f'SELECT DISTINCT project FROM {table} WHERE project IS NOT NULL',
+            )
+            for row in cursor.fetchall():
+                value = str(row['project'])
+                if value not in projects:
+                    projects.append(value)
+
+        return sorted(projects)
+
+    def schema_version_head(self) -> int:
+        if not self.table_exists('schema_versions'):
+            return 0
+
+        cursor = self._connection.execute('SELECT MAX(version) FROM schema_versions')
+        head = cursor.fetchone()[0]
+
+        return int(head) if head is not None else 0
+
+
+@dataclass(frozen=True)
+class ImportPlan:
+    projects: list[str]
+    tables: 'OrderedDict[str, list[dict[str, object]]]'
+    project_name: str | None
+
+    @property
+    def counts(self) -> dict[str, int]:
+        return {table: len(rows) for table, rows in self.tables.items()}
+
+
+def build_plan(
+    reader: ClaudeMemReader,
+    *,
+    project_name: str | None,
+    skip_observations: bool,
+) -> ImportPlan:
+    projects = reader.distinct_projects()
+    sessions = reader.read_table('sdk_sessions')
+    prompts = reader.read_table('user_prompts')
+    observations = [] if skip_observations else reader.read_table('observations')
+    summaries = reader.read_table('session_summaries')
+    if project_name is not None:
+        sessions = [row for row in sessions if str(row.get('project') or '') == project_name]
+        content_ids = {
+            str(row.get('content_session_id') or '')
+            for row in sessions
+            if row.get('content_session_id')
+        }
+        prompts = [
+            row for row in prompts if str(row.get('content_session_id') or '') in content_ids
+        ]
+        observations = [
+            row for row in observations if str(row.get('project') or '') == project_name
+        ]
+        summaries = [row for row in summaries if str(row.get('project') or '') == project_name]
+
+    tables: OrderedDict[str, list[dict[str, object]]] = OrderedDict(
+        (
+            ('sdk_sessions', sessions),
+            ('user_prompts', prompts),
+            ('observations', observations),
+            ('session_summaries', summaries),
+        ),
+    )
+
+    return ImportPlan(projects=projects, tables=tables, project_name=project_name)
+
+
+def _error_from_body(body: dict[str, object], fallback: str) -> ClaudeMemImportError:
+    code = as_string(body.get('code')) or fallback
+    detail = as_string(body.get('detail')) or code
+
+    return ClaudeMemImportError(code, detail, remediation_for(code))
+
+
+def create_import(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    project_id: str,
+    source_store_id: str,
+    manifest: dict[str, object],
+) -> str:
+    payload: dict[str, object] = {
+        'project_id': project_id,
+        'source_store_id': source_store_id,
+        'manifest': manifest,
+    }
+    status, body = post_json(
+        transport=transport,
+        server_url=server_url,
+        path='/v1/imports/claude-mem',
+        api_key=api_key,
+        payload=payload,
+    )
+    if status < 200 or status >= 300:
+        raise _error_from_body(body, fallback='import_create_failed')
+
+    import_id = as_string(body.get('import_id'))
+    if not import_id:
+        raise ClaudeMemImportError(
+            'import_create_failed',
+            'Server did not return an import id',
+            remediation_for('import_create_failed'),
+        )
+
+    return import_id
+
+
+def send_batch(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    import_id: str,
+    seq: int,
+    table: str,
+    rows: list[dict[str, object]],
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    payload: dict[str, object] = {'seq': seq, 'table': table, 'rows': rows}
+    last_body: dict[str, object] = {}
+    for attempt in range(_BATCH_MAX_ATTEMPTS):
+        status, body = post_json(
+            transport=transport,
+            server_url=server_url,
+            path=f'/v1/imports/claude-mem/{import_id}/batches',
+            api_key=api_key,
+            payload=payload,
+        )
+        if 200 <= status < 300:
+            return body
+
+        last_body = body
+        if status not in _RETRYABLE_STATUS or attempt == _BATCH_MAX_ATTEMPTS - 1:
+            raise _error_from_body(body, fallback='import_batch_failed')
+
+        sleep(_BATCH_BACKOFF_SECONDS * (attempt + 1))
+
+    raise _error_from_body(last_body, fallback='import_batch_failed')
+
+
+def finalize_import(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    import_id: str,
+    client_row_counts: dict[str, int],
+) -> dict[str, object]:
+    status, body = post_json(
+        transport=transport,
+        server_url=server_url,
+        path=f'/v1/imports/claude-mem/{import_id}/finalize',
+        api_key=api_key,
+        payload={'client_row_counts': client_row_counts},
+    )
+    if status < 200 or status >= 300:
+        raise _error_from_body(body, fallback='import_finalize_failed')
+
+    return body
+
+
+def stream_plan(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    plan: ImportPlan,
+    project_id: str,
+    source_store_id: str,
+    schema_version_head: int,
+    batch_size: int,
+    stdout: TextIO,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    effective_size = min(max(1, batch_size), _MAX_BATCH_ROWS)
+    manifest: dict[str, object] = {
+        'schema_version_head': schema_version_head,
+        'tables': dict(plan.counts),
+    }
+    import_id = create_import(
+        transport=transport,
+        server_url=server_url,
+        api_key=api_key,
+        project_id=project_id,
+        source_store_id=source_store_id,
+        manifest=manifest,
+    )
+    stdout.write(f'import_id={import_id}\n')
+    seq = 0
+    for table, rows in plan.tables.items():
+        applied = 0
+        for chunk in iter_batches(rows, effective_size):
+            result = send_batch(
+                transport=transport,
+                server_url=server_url,
+                api_key=api_key,
+                import_id=import_id,
+                seq=seq,
+                table=table,
+                rows=chunk,
+                sleep=sleep,
+            )
+            applied += len(chunk)
+            stdout.write(
+                f'{table}: seq={seq} rows={len(chunk)} '
+                f'created={result.get("created")} duplicates={result.get("duplicates")}\n',
+            )
+            seq += 1
+
+        if rows:
+            stdout.write(f'{table}: streamed {applied}/{len(rows)} rows\n')
+
+    return finalize_import(
+        transport=transport,
+        server_url=server_url,
+        api_key=api_key,
+        import_id=import_id,
+        client_row_counts=dict(plan.counts),
+    )
+
+
+def resolve_data_dir(value: str | None) -> Path:
+    if value:
+        return Path(value).expanduser()
+
+    env_dir = os.environ.get('CLAUDE_MEM_DATA_DIR')
+    if env_dir:
+        return Path(env_dir).expanduser()
+
+    return Path.home() / '.claude-mem'
+
+
+def run_import_claude_mem(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ''
+    try:
+        reader = ClaudeMemReader.open(resolve_data_dir(args.data_dir))
+        with reader:
+            projects = reader.distinct_projects()
+            is_apply = bool(getattr(args, 'apply', False)) and not bool(
+                getattr(args, 'dry_run', False),
+            )
+            if not is_apply:
+                _print_dry_run(reader, projects, stdout)
+
+                return 0
+
+            project_name = (as_string(getattr(args, 'project_name', '')) or '').strip() or None
+            if len(projects) > 1 and not project_name:
+                _print_project_choices(projects, stderr)
+
+                return 1
+
+            if project_name and project_name not in projects:
+                raise ClaudeMemImportError(
+                    'unknown_upstream_project',
+                    f'project not found in claude-mem.db: {project_name}',
+                    remediation_for('unknown_upstream_project'),
+                )
+
+            selected = project_name if project_name else (projects[0] if projects else None)
+            plan = build_plan(
+                reader,
+                project_name=selected,
+                skip_observations=bool(getattr(args, 'skip_observations', False)),
+            )
+            paths = local_paths(args.config_dir)
+            config = load_required_json(
+                paths.config, 'missing_config', 'Engram config is missing',
+            )
+            credentials = load_required_json(
+                paths.credentials, 'missing_credential', 'Engram credential is missing',
+            )
+            api_key = as_string(credentials.get('api_key'))
+            if not api_key:
+                raise ClaudeMemImportError(
+                    'missing_credential',
+                    'Engram credential is missing',
+                    remediation_for('missing_credential'),
+                )
+
+            server_url = normalize_server_url(as_string(config.get('server_url')))
+            project_id = _ladder_project_id(args, config).strip()
+            if not project_id:
+                raise ClaudeMemImportError(
+                    'missing_project',
+                    'Set --project or ENGRAM_PROJECT_ID for claude-mem import',
+                    remediation_for('missing_project'),
+                )
+
+            store_id = (as_string(getattr(args, 'store_id', '')) or '').strip() or default_store_id(
+                reader.db_path, socket.gethostname(),
+            )
+            report = stream_plan(
+                transport=transport or urllib_transport,
+                server_url=server_url,
+                api_key=api_key,
+                plan=plan,
+                project_id=project_id,
+                source_store_id=store_id,
+                schema_version_head=reader.schema_version_head(),
+                batch_size=int(getattr(args, 'batch_size', _MAX_BATCH_ROWS)),
+                stdout=stdout,
+            )
+            _print_report(report, stdout)
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def _print_dry_run(reader: ClaudeMemReader, projects: list[str], stdout: TextIO) -> None:
+    if not projects:
+        stdout.write('No claude-mem projects found in this store.\n')
+
+        return
+
+    stdout.write(f'Detected {len(projects)} project(s) in claude-mem store:\n')
+    for project in projects:
+        plan = build_plan(reader, project_name=project, skip_observations=False)
+        counts = plan.counts
+        stdout.write(
+            f'  {project}: sdk_sessions={counts["sdk_sessions"]} '
+            f'user_prompts={counts["user_prompts"]} '
+            f'observations={counts["observations"]} '
+            f'session_summaries={counts["session_summaries"]}\n',
+        )
+
+    if len(projects) > 1:
+        stdout.write('Run with --apply --project-name <project> to import one project.\n')
+    else:
+        stdout.write('Run with --apply to import.\n')
+
+
+def _print_project_choices(projects: list[str], stderr: TextIO) -> None:
+    stderr.write('multiple_projects: claude-mem store spans more than one project.\n')
+    for project in projects:
+        stderr.write(f'  {project}\n')
+
+    stderr.write('remediation: choose one with --project-name <project>.\n')
+
+
+def _print_report(body: dict[str, object], stdout: TextIO) -> None:
+    status = body.get('status')
+    if status:
+        stdout.write(f'status={status}\n')
+
+    report = body.get('report')
+    if not isinstance(report, dict):
+        return
+
+    for field in ('counts', 'created', 'duplicates', 'unsupported', 'warnings', 'redactions', 'truncations'):
+        if field in report:
+            stdout.write(f'{field}={report[field]}\n')

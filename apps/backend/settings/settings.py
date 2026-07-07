@@ -125,6 +125,7 @@ CORS_ALLOW_HEADERS = (
     'x-engram-project',
     'x-engram-team',
 )
+CORS_EXPOSE_HEADERS = ('content-disposition',)
 
 INSTALLED_APPS = [
     'django.contrib.auth',
