@@ -74,9 +74,7 @@ class MemoryReviewViewSet(
         ]
 
     def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        items = list(self._reviewable_items(request))
-
-        page = self._paginate(request, items)
+        page = self._reviewable_page(request)
 
         results = [queue_item_payload(item) for item in page['items']]
 
@@ -198,16 +196,22 @@ class MemoryReviewViewSet(
 
         return Response(result.data, status=HTTP_200_OK)
 
-    def _reviewable_items(self, request: Request) -> Any:
+    def _reviewable_page(self, request: Request) -> dict[str, Any]:
         organization = request.active_organization
 
-        candidates_qs = self._filtered_candidates(request, organization)
+        candidates_qs = self._filtered_candidates(request, organization).order_by('-created_at')
 
-        memories_qs = self._filtered_memories(request, organization)
+        memories_qs = self._filtered_memories(request, organization).order_by('-created_at')
 
-        candidates = list(candidates_qs)
+        page_number = self._page_number(request)
 
-        memories = list(memories_qs.prefetch_related('links', 'versions__source_observation'))
+        start = (page_number - 1) * PAGE_SIZE
+
+        end = start + PAGE_SIZE
+
+        candidates = list(candidates_qs[:end])
+
+        memories = list(memories_qs.prefetch_related('links', 'versions__source_observation')[:end])
 
         combined = sorted(
             candidates + memories,
@@ -215,7 +219,16 @@ class MemoryReviewViewSet(
             reverse=True,
         )
 
-        return combined
+        page_items = combined[start:end]
+
+        total = candidates_qs.count() + memories_qs.count()
+
+        return {
+            'count': total,
+            'next': self._page_url(request, page_number + 1) if end < total else None,
+            'previous': self._page_url(request, page_number - 1) if page_number > 1 else None,
+            'items': page_items,
+        }
 
     def _filtered_candidates(self, request: Request, organization: Any) -> Any:
         queryset = MemoryCandidate.objects.filter(
@@ -276,45 +289,21 @@ class MemoryReviewViewSet(
 
         return queryset
 
-    def _paginate(self, request: Request, items: list) -> dict[str, Any]:
-        total = len(items)
-
+    def _page_number(self, request: Request) -> int:
         try:
-            page_number = max(int(request.query_params.get('page', '1')), 1)
+            return max(int(request.query_params.get('page', '1')), 1)
 
         except ValueError:
-            page_number = 1
+            return 1
 
-        start = (page_number - 1) * PAGE_SIZE
-
-        end = start + PAGE_SIZE
-
-        page_items = items[start:end]
-
+    def _page_url(self, request: Request, page_number: int) -> str:
         base_url = request.build_absolute_uri(request.path)
 
         query = request.query_params.copy()
 
-        next_url = None
+        query['page'] = str(page_number)
 
-        if end < total:
-            query['page'] = str(page_number + 1)
-
-            next_url = f'{base_url}?{query.urlencode()}'
-
-        previous_url = None
-
-        if page_number > 1:
-            query['page'] = str(page_number - 1)
-
-            previous_url = f'{base_url}?{query.urlencode()}'
-
-        return {
-            'count': total,
-            'next': next_url,
-            'previous': previous_url,
-            'items': page_items,
-        }
+        return f'{base_url}?{query.urlencode()}'
 
     def _version_or_404(self, memory: Memory, version_number: int) -> MemoryVersion:
         version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()

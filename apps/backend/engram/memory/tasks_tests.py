@@ -20,10 +20,12 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
 )
+from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
 from engram.memory.tasks import (
     decay_memory_confidence,
     distill_session,
+    expire_stale_candidates,
     generate_daily_digest,
     generate_weekly_digest,
     process_observation_recorded,
@@ -199,3 +201,26 @@ def test_decay_memory_confidence_invokes_the_service() -> None:
 
     m_execute.assert_called_once_with()
     assert result == {'organizations': 2, 'projects': 3, 'memories': 5}
+
+
+def test_task_routes_send_expire_stale_candidates_to_batch_queue() -> None:
+    assert celeryconfig.task_routes['engram.memory.expire_stale_candidates']['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_beat_schedule_registers_expire_stale_candidates() -> None:
+    assert 'expire-stale-candidates' in celeryconfig.beat_schedule
+
+    entry = celeryconfig.beat_schedule['expire-stale-candidates']
+
+    assert entry['task'] == 'engram.memory.expire_stale_candidates'
+    assert entry['schedule'] == timedelta(minutes=30)
+
+
+def test_expire_stale_candidates_invokes_the_service() -> None:
+    m_result = ExpireStaleCandidatesResult(scanned=7, rejected=4)
+
+    with mock.patch('engram.memory.tasks.ExpireStaleCandidates.execute', return_value=m_result) as m_execute:
+        result = expire_stale_candidates()
+
+    m_execute.assert_called_once_with()
+    assert result == {'scanned': 7, 'rejected': 4}
