@@ -82,7 +82,8 @@ def main() -> int:
 
             cli_env = pythonpath_env()
             config_dir = workdir / 'config'
-            _write_cli_config(config_dir, project_id, api_key)
+            progress('Connecting host CLI with import-admin key')
+            _connect_cli(config_dir, project_id, cli_env, api_key)
 
             head_dir = workdir / 'head'
             head_dir.mkdir()
@@ -153,16 +154,32 @@ def main() -> int:
         )
 
 
-def _write_cli_config(config_dir: Path, project_id: str, api_key: str) -> None:
-    config_dir.mkdir(parents=True, exist_ok=True)
-    (config_dir / 'config.json').write_text(
-        json.dumps({'server_url': SERVER_URL, 'project_id': project_id}),
-        encoding='utf-8',
+def _connect_cli(config_dir: Path, project_id: str, cli_env: dict[str, str], api_key: str) -> None:
+    result = run(
+        [
+            sys.executable,
+            '-m',
+            'engram_cli',
+            'connect',
+            '--server',
+            SERVER_URL,
+            '--api-key',
+            api_key,
+            '--project',
+            project_id,
+            '--agent',
+            'codex',
+            '--agent-version',
+            'import-e2e',
+            '--config-dir',
+            str(config_dir),
+        ],
+        cwd=ROOT,
+        env=cli_env,
+        secret=api_key,
     )
-    (config_dir / 'credentials.json').write_text(
-        json.dumps({'api_key': api_key}),
-        encoding='utf-8',
-    )
+    if 'connected Engram CLI' not in result.stdout:
+        raise E2EError(f'connect did not report success: {result.stdout[-400:]}')
 
 
 def _run_import_apply(

@@ -20,7 +20,7 @@ from engram.access.models import (
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import Organization, Project, ProjectTeam, Team
 
-IMPORT_E2E_CAPABILITIES = ('memories:admin', 'memories:read')
+IMPORT_E2E_CAPABILITIES = ('memories:admin', 'memories:read', 'observations:write')
 
 
 class Command(BaseCommand):
