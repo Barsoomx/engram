@@ -696,10 +696,8 @@ export async function reviewDigest(
 /* -------------------------------- Hook dry-run ---------------------------- */
 
 export interface HookDryRunInput {
-  project_id: string;
+  project_id: string | null;
   team_id?: string | null;
-  agent_runtime: string;
-  agent_version?: string;
   request_id?: string;
 }
 
