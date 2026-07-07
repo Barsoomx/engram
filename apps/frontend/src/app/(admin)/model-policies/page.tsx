@@ -10,20 +10,31 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Pagination,
   Select,
   SelectItem,
 } from '@heroui/react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 import axios from 'axios';
-import { AlertTriangle, Ban, Cpu, Eye, Plus, Sparkles } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Ban, Cpu, Eye, Plus, Sparkles } from 'lucide-react';
+import Link from 'next/link';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import { formatRelativeTime } from '@/lib/design';
@@ -46,6 +57,22 @@ import {
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
+const PAGE_SIZE = 50;
+
+const MODEL_POLICY_FILTERS: {
+  task_type: string;
+  provider: string;
+  scope: string;
+  active: string;
+  page: number;
+} = {
+  task_type: '',
+  provider: '',
+  scope: '',
+  active: '',
+  page: 1,
+};
+
 const SCOPE_OPTIONS: { key: PolicyScope; label: string }[] = [
   { key: 'organization', label: 'Organization' },
   { key: 'team', label: 'Team' },
@@ -57,9 +84,6 @@ const PROVIDER_LABELS: Record<SecretProvider, string> = {
   openai: 'OpenAI',
   deepseek: 'DeepSeek',
 };
-
-const GRID =
-  'minmax(0,1.3fr) minmax(0,0.9fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,1fr) minmax(0,1.1fr) auto';
 
 function humanizeTask(value: string): string {
   return value
@@ -150,21 +174,101 @@ function HealthBadge({
   );
 }
 
-function ColumnHeader() {
+const TASK_FILTER_OPTIONS: { key: string; label: string }[] = [
+  { key: '', label: 'All tasks' },
+  ...POLICY_TASK_TYPES.map((task) => ({ key: task, label: humanizeTask(task) })),
+];
+
+const PROVIDER_FILTER_OPTIONS: { key: string; label: string }[] = [
+  { key: '', label: 'All providers' },
+  ...SECRET_PROVIDERS.map((provider) => ({
+    key: provider,
+    label: PROVIDER_LABELS[provider],
+  })),
+];
+
+const SCOPE_FILTER_OPTIONS: { key: string; label: string }[] = [
+  { key: '', label: 'All scopes' },
+  ...SCOPE_OPTIONS.map((option) => ({ key: option.key, label: option.label })),
+];
+
+const STATUS_FILTER_OPTIONS: { key: string; label: string }[] = [
+  { key: '', label: 'All statuses' },
+  { key: 'true', label: 'Active' },
+  { key: 'false', label: 'Inactive' },
+];
+
+const ALL_FILTER_KEY = '__all__';
+
+function FilterSelect({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  options: { key: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  const selectedKey = value === '' ? ALL_FILTER_KEY : value;
+
   return (
-    <div
-      className='grid items-center gap-4 border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'
-      style={{ gridTemplateColumns: GRID }}
+    <Select
+      label={label}
+      labelPlacement='outside'
+      size='sm'
+      variant='bordered'
+      className='max-w-[200px]'
+      selectedKeys={new Set([selectedKey])}
+      disallowEmptySelection
+      onSelectionChange={(keys) => {
+        const next = Array.from(keys)[0];
+
+        if (typeof next === 'string') {
+          onChange(next === ALL_FILTER_KEY ? '' : next);
+        }
+      }}
     >
-      <span>Name</span>
-      <span>Task</span>
-      <span>Provider</span>
-      <span>Model</span>
-      <span>Scope</span>
-      <span>Status</span>
-      <span>Health</span>
-      <span className='sr-only'>Actions</span>
-    </div>
+      {options.map((option) => (
+        <SelectItem key={option.key === '' ? ALL_FILTER_KEY : option.key}>
+          {option.label}
+        </SelectItem>
+      ))}
+    </Select>
+  );
+}
+
+function PolicyTableHead() {
+  return (
+    <thead>
+      <tr className='border-b border-divider text-[10.5px] uppercase tracking-[0.1em]'>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Name
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Task
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Provider
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Model
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Scope
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Status
+        </th>
+        <th className='px-3 py-2.5 text-left font-semibold text-default-400'>
+          Health
+        </th>
+        <th className='px-3 py-2.5 text-right font-semibold text-default-400'>
+          <span className='sr-only'>Actions</span>
+        </th>
+      </tr>
+    </thead>
   );
 }
 
@@ -180,104 +284,115 @@ function PoliciesTable({
   onSelect: (policy: ModelPolicy) => void;
 }) {
   return (
-    <div className='surface-card overflow-hidden'>
-      <div className='overflow-x-auto'>
-        <div className='min-w-[960px]'>
-          <ColumnHeader />
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={980}>
+        <PolicyTableHead />
+        <tbody>
           {items.map((policy) => (
-            <div
+            <tr
               key={policy.id}
-              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
-              style={{ gridTemplateColumns: GRID }}
+              className='border-b border-divider/50 transition-colors last:border-b-0 hover:bg-content2/40'
             >
-              <div className='flex min-w-0 items-center gap-3'>
-                <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
-                  <Cpu className='h-[15px] w-[15px]' strokeWidth={1.8} />
-                </span>
-                <span className='truncate text-[13.5px] font-semibold text-foreground'>
-                  {policy.name}
-                </span>
-              </div>
-              <div className='min-w-0'>
+              <td className='px-3 py-2.5'>
+                <div className='flex items-center gap-3'>
+                  <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
+                    <Cpu className='h-[15px] w-[15px]' strokeWidth={1.8} />
+                  </span>
+                  <span
+                    className='block max-w-[220px] truncate text-[13.5px] font-semibold text-foreground'
+                    title={policy.name}
+                  >
+                    {policy.name}
+                  </span>
+                </div>
+              </td>
+              <td className='px-3 py-2.5'>
                 <TaskPill task={policy.task_type} />
-              </div>
-              <span className='truncate text-[12px] text-default-500'>
+              </td>
+              <td className='px-3 py-2.5 text-[12px] text-default-500'>
                 {PROVIDER_LABELS[policy.provider] ?? policy.provider}
-              </span>
-              <span className='truncate font-mono text-[12px] text-default-500'>
-                {policy.model}
-              </span>
-              <div className='min-w-0'>
+              </td>
+              <td className='px-3 py-2.5'>
+                <div className='flex flex-col gap-1'>
+                  <div className='flex items-center gap-2'>
+                    <span
+                      className='block max-w-[260px] truncate font-mono text-[12px] text-default-500'
+                      title={policy.model}
+                    >
+                      {policy.model}
+                    </span>
+                    {policy.json_mode && (
+                      <span
+                        className='shrink-0 rounded-[6px] bg-primary-soft px-1.5 py-0.5 text-[10px] font-semibold text-primary-300'
+                        title='Sends response_format: json_object'
+                      >
+                        JSON
+                      </span>
+                    )}
+                  </div>
+                  {policy.base_url && (
+                    <span
+                      className='block max-w-[260px] truncate font-mono text-[10.5px] text-default-400'
+                      title={policy.base_url}
+                    >
+                      {policy.base_url}
+                    </span>
+                  )}
+                </div>
+              </td>
+              <td className='px-3 py-2.5'>
                 <ScopePill scope={policy.scope} />
-              </div>
-              <StatusCell
-                active={policy.active}
-                fallbackEnabled={policy.fallback_enabled}
-              />
-              <div className='min-w-0'>
+              </td>
+              <td className='px-3 py-2.5'>
+                <StatusCell
+                  active={policy.active}
+                  fallbackEnabled={policy.fallback_enabled}
+                />
+              </td>
+              <td className='px-3 py-2.5'>
                 <HealthBadge
                   lastSuccessAt={policy.last_success_at}
                   recentErrorCount={policy.recent_error_count}
                 />
-              </div>
-              <div className='flex items-center justify-end gap-2'>
-                <Button
-                  size='sm'
-                  variant='flat'
-                  startContent={<Eye className='h-3.5 w-3.5' />}
-                  onPress={() => onSelect(policy)}
-                >
-                  View
-                </Button>
-                {canManage && policy.active && (
+              </td>
+              <td className='px-3 py-2.5'>
+                <div className='flex items-center justify-end gap-2'>
                   <Button
                     size='sm'
-                    color='danger'
                     variant='flat'
-                    startContent={<Ban className='h-3.5 w-3.5' />}
-                    onPress={() => onDisable(policy)}
+                    startContent={<Eye className='h-3.5 w-3.5' />}
+                    onPress={() => onSelect(policy)}
                   >
-                    Disable
+                    View
                   </Button>
-                )}
-              </div>
-            </div>
+                  {canManage && policy.active && (
+                    <Button
+                      size='sm'
+                      color='danger'
+                      variant='flat'
+                      startContent={<Ban className='h-3.5 w-3.5' />}
+                      onPress={() => onDisable(policy)}
+                    >
+                      Disable
+                    </Button>
+                  )}
+                </div>
+              </td>
+            </tr>
           ))}
-        </div>
-      </div>
+        </tbody>
+      </ResponsiveTable>
     </div>
   );
 }
 
 function PoliciesTableSkeleton() {
   return (
-    <div className='surface-card overflow-hidden'>
-      <div className='overflow-x-auto'>
-        <div className='min-w-[960px]'>
-          <ColumnHeader />
-          {Array.from({ length: 6 }).map((_, index) => (
-            <div
-              key={index}
-              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 last:border-b-0'
-              style={{ gridTemplateColumns: GRID }}
-            >
-              <div className='flex min-w-0 items-center gap-3'>
-                <span className='h-[30px] w-[30px] shrink-0 rounded-[9px] bg-content2' />
-                <span className='h-3.5 w-28 rounded-medium bg-content2' />
-              </div>
-              <span className='h-5 w-20 rounded-[7px] bg-content2' />
-              <span className='h-3 w-16 rounded-medium bg-content2' />
-              <span className='h-3 w-32 rounded-medium bg-content2' />
-              <span className='h-5 w-16 rounded-[7px] bg-content2' />
-              <span className='h-3 w-16 rounded-medium bg-content2' />
-              <span className='h-5 w-24 rounded-[7px] bg-content2' />
-              <div className='flex items-center justify-end gap-2'>
-                <span className='h-8 w-14 rounded-medium bg-content2' />
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={980}>
+        <PolicyTableHead />
+        <TableRowSkeleton columns={8} rows={6} />
+      </ResponsiveTable>
     </div>
   );
 }
@@ -774,6 +889,12 @@ function PolicyDetailModal({
                         ? `${policy.context_window_tokens} tokens`
                         : 'Auto-detected'}
                     </ResolveField>
+                    <ResolveField label='JSON mode'>
+                      {policy.json_mode ? 'Enabled' : 'Disabled'}
+                    </ResolveField>
+                    <ResolveField label='Base URL' mono>
+                      {policy.base_url || 'Provider default'}
+                    </ResolveField>
                     {policy.project_id && (
                       <ResolveField label='Project ID' mono>
                         {policy.project_id}
@@ -818,24 +939,56 @@ export default function ModelPoliciesPage() {
   );
   const canManagePolicies = hasCapability(capabilities, 'model_policy:*');
 
-  const [policyPage, setPolicyPage] = React.useState(0);
+  const [filters, setFilters, resetFilters] = useUrlFilters(MODEL_POLICY_FILTERS);
+
+  const scopeKey = `${activeProjectId ?? ''}|${activeTeamId ?? ''}`;
+  const prevScopeKey = React.useRef(scopeKey);
 
   React.useEffect(() => {
-    setPolicyPage(0);
-  }, [activeProjectId, activeTeamId]);
+    if (prevScopeKey.current !== scopeKey) {
+      prevScopeKey.current = scopeKey;
+      setFilters({ page: 1 });
+    }
+  }, [scopeKey, setFilters]);
+
+  const activeFilter =
+    filters.active === 'true'
+      ? true
+      : filters.active === 'false'
+        ? false
+        : undefined;
 
   const queryClient = useQueryClient();
 
   const policiesQuery = useQuery<{ count: number; items: ModelPolicy[] }>({
-    queryKey: ['model-policy', 'policies', activeProjectId, activeTeamId, policyPage],
+    queryKey: [
+      'model-policy',
+      'policies',
+      activeProjectId,
+      activeTeamId,
+      filters.task_type,
+      filters.provider,
+      filters.scope,
+      filters.active,
+      filters.page,
+    ],
     enabled: Boolean(activeProjectId),
+    placeholderData: keepPreviousData,
     queryFn: async () => {
       try {
         return await listModelPolicies({
           projectId: activeProjectId ?? '',
           teamId: activeTeamId,
-          limit: 50,
-          offset: policyPage * 50,
+          task_type: (filters.task_type || undefined) as
+            | PolicyTaskType
+            | undefined,
+          provider: (filters.provider || undefined) as
+            | SecretProvider
+            | undefined,
+          scope: (filters.scope || undefined) as PolicyScope | undefined,
+          active: activeFilter,
+          limit: PAGE_SIZE,
+          offset: (filters.page - 1) * PAGE_SIZE,
         });
       } catch (error) {
         if (isNotFound(error)) {
@@ -977,6 +1130,10 @@ export default function ModelPoliciesPage() {
   const isLoading = meQuery.isLoading || policiesQuery.isLoading;
   const items = policiesQuery.data?.items ?? [];
   const total = policiesQuery.data?.count ?? 0;
+  const hasActiveFilters = Boolean(
+    filters.task_type || filters.provider || filters.scope || filters.active,
+  );
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <CapabilityGate capabilities={capabilities} required='model_policy:read'>
@@ -998,45 +1155,99 @@ export default function ModelPoliciesPage() {
             title='Model Policies'
             subtitle='Which model serves each task type.'
             actions={
-              canManagePolicies ? (
-                <PrimaryButton
-                  startContent={<Plus className='h-4 w-4' />}
-                  onPress={openCreate}
-                  isDisabled={!meLoaded}
+              <div className='flex items-center gap-2'>
+                <Link
+                  href='/model-setup'
+                  className='inline-flex items-center gap-1.5 rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground'
                 >
-                  New policy
-                </PrimaryButton>
-              ) : undefined
+                  Model setup
+                  <ArrowRight size={14} strokeWidth={1.9} />
+                </Link>
+                {canManagePolicies && (
+                  <PrimaryButton
+                    startContent={<Plus className='h-4 w-4' />}
+                    onPress={openCreate}
+                    isDisabled={!meLoaded}
+                  >
+                    New policy
+                  </PrimaryButton>
+                )}
+              </div>
             }
           />
+
+          <div className='surface-card flex flex-wrap items-end gap-3 p-4'>
+            <FilterSelect
+              label='Task type'
+              value={filters.task_type}
+              options={TASK_FILTER_OPTIONS}
+              onChange={(value) => setFilters({ task_type: value, page: 1 })}
+            />
+            <FilterSelect
+              label='Provider'
+              value={filters.provider}
+              options={PROVIDER_FILTER_OPTIONS}
+              onChange={(value) => setFilters({ provider: value, page: 1 })}
+            />
+            <FilterSelect
+              label='Scope'
+              value={filters.scope}
+              options={SCOPE_FILTER_OPTIONS}
+              onChange={(value) => setFilters({ scope: value, page: 1 })}
+            />
+            <FilterSelect
+              label='Status'
+              value={filters.active}
+              options={STATUS_FILTER_OPTIONS}
+              onChange={(value) => setFilters({ active: value, page: 1 })}
+            />
+            {hasActiveFilters && (
+              <Button size='sm' variant='light' onPress={() => resetFilters()}>
+                Clear filters
+              </Button>
+            )}
+          </div>
 
           {isLoading ? (
             <PoliciesTableSkeleton />
           ) : policiesQuery.isError ? (
-            <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-              <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-              <p className='text-[13px] leading-relaxed text-danger'>
-                {policiesQuery.error instanceof Error
+            <ErrorState
+              message={
+                policiesQuery.error instanceof Error
                   ? policiesQuery.error.message
-                  : 'Failed to load model policies.'}
-              </p>
-            </div>
-          ) : items.length === 0 ? (
-            <EmptyState
-              title='No model policies yet'
-              description='Create a policy to route a task type to a specific provider and model.'
-              icon={<Cpu className='h-6 w-6' />}
-              action={
-                canManagePolicies ? (
-                  <PrimaryButton
-                    startContent={<Plus className='h-4 w-4' />}
-                    onPress={openCreate}
-                  >
-                    New policy
-                  </PrimaryButton>
-                ) : undefined
+                  : 'Failed to load model policies.'
               }
+              onRetry={() => policiesQuery.refetch()}
             />
+          ) : items.length === 0 ? (
+            hasActiveFilters ? (
+              <EmptyState
+                title='No matching policies'
+                description='No model policies match the current filters.'
+                icon={<Cpu className='h-6 w-6' />}
+                action={
+                  <Button size='sm' variant='flat' onPress={() => resetFilters()}>
+                    Clear filters
+                  </Button>
+                }
+              />
+            ) : (
+              <EmptyState
+                title='No model policies yet'
+                description='Create a policy to route a task type to a specific provider and model.'
+                icon={<Cpu className='h-6 w-6' />}
+                action={
+                  canManagePolicies ? (
+                    <PrimaryButton
+                      startContent={<Plus className='h-4 w-4' />}
+                      onPress={openCreate}
+                    >
+                      New policy
+                    </PrimaryButton>
+                  ) : undefined
+                }
+              />
+            )
           ) : (
             <PoliciesTable
               items={items}
@@ -1046,31 +1257,22 @@ export default function ModelPoliciesPage() {
             />
           )}
 
-          {items.length > 0 && (
-            <div className='flex items-center justify-between gap-3'>
-              <p className='text-[12px] text-default-400'>
-                {total > 0
-                  ? `Showing ${policyPage * 50 + 1}-${policyPage * 50 + items.length} of ${total}`
-                  : `Showing ${items.length} polic${items.length === 1 ? 'y' : 'ies'}`}
+          {total > 0 && (
+            <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+              <p className='text-xs text-default-500'>
+                Showing {(filters.page - 1) * PAGE_SIZE + 1}–
+                {Math.min(filters.page * PAGE_SIZE, total)} of {total} polic
+                {total === 1 ? 'y' : 'ies'}.
               </p>
-              <div className='flex items-center gap-2'>
-                <button
-                  type='button'
-                  onClick={() => setPolicyPage((p) => Math.max(0, p - 1))}
-                  disabled={policyPage === 0}
-                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-                >
-                  Previous
-                </button>
-                <button
-                  type='button'
-                  onClick={() => setPolicyPage((p) => p + 1)}
-                  disabled={(policyPage + 1) * 50 >= total}
-                  className='rounded-[9px] border border-divider bg-content1 px-3 py-1.5 text-[12.5px] font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-                >
-                  Next
-                </button>
-              </div>
+              {totalPages > 1 && (
+                <Pagination
+                  total={totalPages}
+                  page={filters.page}
+                  onChange={(page) => setFilters({ page })}
+                  size='sm'
+                  isDisabled={policiesQuery.isFetching}
+                />
+              )}
             </div>
           )}
 
