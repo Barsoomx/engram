@@ -67,6 +67,7 @@ class ContextIndexError(DomainError):
 @dataclass(frozen=True)
 class IndexMemoryVersionInput:
     memory_version_id: uuid.UUID
+    defer_embedding: bool = False
 
 
 @dataclass(frozen=True)
@@ -816,7 +817,8 @@ class IndexMemoryVersion:
             stale=True,
             updated_at=timezone.now(),
         )
-        self._embed_document(retrieval_document, memory, version)
+        if not data.defer_embedding:
+            self._embed_document(retrieval_document, memory, version)
 
         return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=created)
 

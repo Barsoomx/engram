@@ -154,6 +154,7 @@ class GeneratedMemoryCandidate:
 @dataclass(frozen=True)
 class PromoteMemoryCandidateInput:
     candidate_id: uuid.UUID
+    defer_embedding: bool = False
 
 
 @dataclass(frozen=True)
@@ -697,7 +698,12 @@ class PromoteMemoryCandidate:
                 memory, version = self._create_memory_and_version(candidate)
                 needs_index, duplicate = True, False
 
-        retrieval_document = self._resolve_retrieval_document(candidate, version, needs_index)
+        retrieval_document = self._resolve_retrieval_document(
+            candidate,
+            version,
+            needs_index,
+            data.defer_embedding,
+        )
 
         return PromoteMemoryCandidateResult(
             candidate=candidate,
@@ -753,9 +759,10 @@ class PromoteMemoryCandidate:
         candidate: MemoryCandidate,
         version: MemoryVersion,
         needs_index: bool,
+        defer_embedding: bool = False,
     ) -> RetrievalDocument:
         if needs_index:
-            return self._index_memory_version(candidate, version)
+            return self._index_memory_version(candidate, version, defer_embedding)
 
         return self._existing_retrieval_document(version)
 
@@ -768,8 +775,15 @@ class PromoteMemoryCandidate:
 
         return document
 
-    def _index_memory_version(self, candidate: MemoryCandidate, version: MemoryVersion) -> RetrievalDocument:
-        index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+    def _index_memory_version(
+        self,
+        candidate: MemoryCandidate,
+        version: MemoryVersion,
+        defer_embedding: bool = False,
+    ) -> RetrievalDocument:
+        index_result = IndexMemoryVersion().execute(
+            IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=defer_embedding),
+        )
         document = index_result.retrieval_document
         file_paths = self._candidate_file_paths(candidate)
         if document.file_paths == file_paths:
