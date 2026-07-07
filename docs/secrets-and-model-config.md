@@ -74,8 +74,36 @@ V1 provider support:
 
 The product must support multiple generation backends. Provider selection is an
 organization/team setting, and every generated memory records the provider,
-model, and policy version. Cost metadata is recorded as an estimated
-placeholder, not derived from actual token usage.
+model, and policy version.
+
+### Token Usage And Cost
+
+Every provider call records `token_usage` and `cost_metadata` on the
+`ProviderCallRecord`:
+
+- When the provider returns a usage object, `token_usage` carries the real
+  counts and `{'source': 'provider'}` (`input_tokens`, `output_tokens`,
+  `total_tokens`). OpenAI-compatible chat/embeddings expose
+  `usage.prompt_tokens`/`completion_tokens`/`total_tokens`; Anthropic exposes
+  `usage.input_tokens`/`output_tokens`.
+- When no usage object is present, `token_usage` keeps a word-count estimate
+  marked `{'source': 'estimated'}`.
+
+Cost is derived only from operator-configured pricing on the policy metadata;
+the server never fabricates prices. Set `metadata.pricing` on the model policy
+as USD per 1,000,000 tokens:
+
+```json
+{"pricing": {"input_per_mtok": "0.28", "output_per_mtok": "0.42"}}
+```
+
+Embedding policies use input-only pricing (`input_per_mtok`). With pricing
+configured and real usage present, `cost_metadata` is
+`{'estimated': False, 'cost_usd': <6-decimal Decimal>, 'pricing_source':
+'policy'}`. Otherwise `cost_metadata` stays an estimated placeholder with
+`pricing_source` set to `no_usage` (pricing configured but usage missing) or
+`unknown` (no pricing configured). Malformed pricing metadata is ignored with a
+structured warning and never fails the provider call.
 
 ## Safety Requirements
 

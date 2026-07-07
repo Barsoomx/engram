@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from unittest import mock
 
@@ -20,10 +21,12 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
 )
+from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
 from engram.memory.tasks import (
     decay_memory_confidence,
     distill_session,
+    expire_stale_candidates,
     generate_daily_digest,
     generate_weekly_digest,
     process_observation_recorded,
@@ -191,6 +194,34 @@ def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible(
     assert result == {'retried': 0}
 
 
+def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_attempt() -> None:
+    session_id = uuid.uuid4()
+
+    def _run(**kwargs: object) -> object:
+        result = mock.Mock()
+        result.session.id = session_id
+
+        return result
+
+    with mock.patch(
+        'engram.memory.tasks.run_session_distillation_with_tracking',
+        side_effect=_run,
+    ) as m_run:
+        distill_session(str(session_id))
+        distill_session(str(session_id))
+
+    first_kwargs = m_run.call_args_list[0].kwargs
+    second_kwargs = m_run.call_args_list[1].kwargs
+
+    correlation_id = f'distill-session:{session_id}'
+
+    assert first_kwargs['correlation_id'] == correlation_id
+    assert second_kwargs['correlation_id'] == correlation_id
+    assert first_kwargs['request_id'] != second_kwargs['request_id']
+    assert first_kwargs['request_id'].startswith(f'{correlation_id}:')
+    assert second_kwargs['request_id'].startswith(f'{correlation_id}:')
+
+
 def test_decay_memory_confidence_invokes_the_service() -> None:
     m_result = DecayMemoryConfidenceResult(organizations=2, projects=3, memories=5)
 
@@ -199,3 +230,26 @@ def test_decay_memory_confidence_invokes_the_service() -> None:
 
     m_execute.assert_called_once_with()
     assert result == {'organizations': 2, 'projects': 3, 'memories': 5}
+
+
+def test_task_routes_send_expire_stale_candidates_to_batch_queue() -> None:
+    assert celeryconfig.task_routes['engram.memory.expire_stale_candidates']['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_beat_schedule_registers_expire_stale_candidates() -> None:
+    assert 'expire-stale-candidates' in celeryconfig.beat_schedule
+
+    entry = celeryconfig.beat_schedule['expire-stale-candidates']
+
+    assert entry['task'] == 'engram.memory.expire_stale_candidates'
+    assert entry['schedule'] == timedelta(minutes=30)
+
+
+def test_expire_stale_candidates_invokes_the_service() -> None:
+    m_result = ExpireStaleCandidatesResult(scanned=7, rejected=4)
+
+    with mock.patch('engram.memory.tasks.ExpireStaleCandidates.execute', return_value=m_result) as m_execute:
+        result = expire_stale_candidates()
+
+    m_execute.assert_called_once_with()
+    assert result == {'scanned': 7, 'rejected': 4}

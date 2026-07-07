@@ -41,37 +41,74 @@ export type OpsOverview = {
   pending_embedding_count: number;
 };
 
-export async function getMetricsOverview(): Promise<MetricsOverview> {
+export type MetricsScopeParams = {
+  project_id?: string;
+  team_id?: string;
+};
+
+function metricsParams(
+  params?: MetricsScopeParams,
+): Record<string, string> | undefined {
+  if (!params) {
+    return undefined;
+  }
+
+  const query: Record<string, string> = {};
+
+  if (params.project_id) {
+    query.project_id = params.project_id;
+  }
+
+  if (params.team_id) {
+    query.team_id = params.team_id;
+  }
+
+  return Object.keys(query).length > 0 ? query : undefined;
+}
+
+export async function getMetricsOverview(
+  params?: MetricsScopeParams,
+): Promise<MetricsOverview> {
   const client = apiClient();
   const response = await client.get<MetricsOverview>(
     '/v1/admin/metrics/overview',
+    { params: metricsParams(params) },
   );
 
   return response.data;
 }
 
-export async function getMemoryIngest(): Promise<MemoryIngestPoint[]> {
+export async function getMemoryIngest(
+  params?: MetricsScopeParams,
+): Promise<MemoryIngestPoint[]> {
   const client = apiClient();
   const response = await client.get<MemoryIngestPoint[]>(
     '/v1/admin/metrics/memory-ingest',
+    { params: metricsParams(params) },
   );
 
   return response.data;
 }
 
-export async function getSessions(): Promise<MetricsSession[]> {
+export async function getSessions(
+  params?: MetricsScopeParams,
+): Promise<MetricsSession[]> {
   const client = apiClient();
   const response = await client.get<MetricsSession[]>(
     '/v1/admin/metrics/sessions',
+    { params: metricsParams(params) },
   );
 
   return response.data;
 }
 
-export async function getActivity(): Promise<ActivityEvent[]> {
+export async function getActivity(
+  params?: MetricsScopeParams,
+): Promise<ActivityEvent[]> {
   const client = apiClient();
   const response = await client.get<ActivityEvent[]>(
     '/v1/admin/metrics/activity',
+    { params: metricsParams(params) },
   );
 
   return response.data;

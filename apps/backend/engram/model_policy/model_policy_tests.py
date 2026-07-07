@@ -595,7 +595,7 @@ def test_fake_provider_gateway_records_redacted_provider_call_without_raw_secret
     assert record.policy_id == policy.id
     assert record.secret_id == secret.id
     assert record.redaction_state == 'redacted'
-    assert record.token_usage == {'input_tokens': 4, 'output_tokens': 0}
+    assert record.token_usage == {'input_tokens': 4, 'output_tokens': 0, 'source': 'estimated'}
     assert RAW_PROVIDER_SECRET not in str(record.__dict__)
 
 
