@@ -67,6 +67,7 @@ export type InspectionMemoryOrdering = 'created_at' | '-created_at';
 export interface InspectionMemoryListParams extends ScopeParams {
   search?: string;
   status?: string;
+  kind?: string;
   ordering?: InspectionMemoryOrdering;
 }
 
@@ -105,6 +106,10 @@ export async function listInspectionMemories(
 
   if (params.status) {
     query.status = params.status;
+  }
+
+  if (params.kind) {
+    query.kind = params.kind;
   }
 
   if (params.ordering) {
