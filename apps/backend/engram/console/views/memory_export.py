@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.services import audit_admin_action
-from engram.core.export import export_queryset, iter_export_memories_json
+from engram.core.export import export_queryset, guard_export_stream, iter_export_memories_json
 from engram.core.models import Organization, Project
 
 _TRUE_VALUES = frozenset({'true', '1', 'yes', 'on'})
@@ -85,11 +85,13 @@ class MemoryExportView(APIView):
             },
         )
 
-        stream = iter_export_memories_json(
-            organization_id=organization.id,
-            project_id=project.id,
-            team_id=team_id,
-            all_statuses=all_statuses,
+        stream = guard_export_stream(
+            iter_export_memories_json(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=team_id,
+                all_statuses=all_statuses,
+            ),
         )
 
         response = StreamingHttpResponse(stream, content_type='application/json')
