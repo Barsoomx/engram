@@ -61,7 +61,7 @@ class ListInspectionMemories:
         ordering = self._ordering(inspection_scope.ordering)
         qs = self._base_queryset(inspection_scope).order_by(ordering, 'id')
         filter_data = {
-            'status': inspection_scope.status,
+            'status': inspection_scope.status or MemoryStatus.APPROVED,
             'kind': inspection_scope.kind,
             'search': inspection_scope.search,
         }

@@ -52,6 +52,10 @@ from engram.core.models import (
 from engram.core.redaction import redact_value as core_redact_value
 from engram.core.repository import canonicalize_repository_url
 from engram.memory.conflict_links import clear_candidate_conflict_links
+from engram.memory.services import (
+    PromoteMemoryCandidate,
+    PromoteMemoryCandidateInput,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -475,14 +479,6 @@ def _redact_text(value: str) -> str:
     return str(core_redact_value(value).value)
 
 
-def _candidate_file_paths(candidate: MemoryCandidate) -> list[str]:
-    observation = candidate.source_observation
-    if observation is None:
-        return []
-
-    return [_redact_text(file_path) for file_path in [*observation.files_read, *observation.files_modified]]
-
-
 def _review_example_curator_context(item: MemoryCandidate | Memory) -> dict[str, object]:
     if not isinstance(item, MemoryCandidate):
         return {}
@@ -574,54 +570,7 @@ def approve_memory_candidate(
         reason=reason,
     )
 
-    metadata: dict[str, object] = {
-        'source': 'memory_candidate',
-        'memory_candidate_id': str(candidate.id),
-        'evidence': candidate.evidence,
-    }
-    if candidate.kind:
-        metadata['kind'] = candidate.kind
-
-    memory = Memory.objects.create(
-        organization=candidate.organization,
-        project=candidate.project,
-        team=candidate.team,
-        title=candidate.title,
-        body=candidate.body,
-        status=MemoryStatus.APPROVED,
-        visibility_scope=candidate.visibility_scope,
-        confidence=candidate.confidence,
-        metadata=metadata,
-    )
-
-    version = MemoryVersion.objects.create(
-        organization=memory.organization,
-        project=memory.project,
-        memory=memory,
-        version=1,
-        body=candidate.body,
-        content_hash=candidate.content_hash,
-        source_observation=candidate.source_observation,
-    )
-
-    index_result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
-
-    document = index_result.retrieval_document
-
-    file_paths = _candidate_file_paths(candidate)
-
-    if document.file_paths != file_paths:
-        document.file_paths = file_paths
-
-        document.save(update_fields=['file_paths', 'updated_at'])
-
-    candidate.status = CandidateStatus.PROMOTED
-
-    candidate.promoted_memory = memory
-
-    candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
-
-    clear_candidate_conflict_links(candidate)
+    memory = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id)).memory
 
     audit_admin_action(
         organization=organization,
@@ -688,6 +637,23 @@ def edit_memory_body(
     return version
 
 
+def _resolve_link_target_or_404(
+    organization: Organization,
+    memory: Memory,
+    target_id: uuid.UUID,
+) -> Memory:
+    target = Memory.objects.filter(
+        organization=organization,
+        project=memory.project,
+        id=target_id,
+    ).first()
+
+    if target is None:
+        raise MemoryReviewError('not_found', 'target memory not found', status=404)
+
+    return target
+
+
 @transaction.atomic
 def narrow_memory(
     organization: Organization,
@@ -697,6 +663,8 @@ def narrow_memory(
     reason: str,
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
+
+    _resolve_link_target_or_404(organization, memory, target_memory_id)
 
     _record_review_example(
         organization=organization,
@@ -726,6 +694,8 @@ def supersede_memory(
     reason: str,
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
+
+    _resolve_link_target_or_404(organization, memory, target_memory_id)
 
     _record_review_example(
         organization=organization,

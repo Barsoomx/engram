@@ -60,6 +60,64 @@ function listEnvelope<T>(data: unknown): { count: number; items: T[] } {
   return { count: 0, items: [] };
 }
 
+/* ---------------------------- Inspection memories ------------------------- */
+
+export type InspectionMemoryOrdering = 'created_at' | '-created_at';
+
+export interface InspectionMemoryListParams extends ScopeParams {
+  search?: string;
+  status?: string;
+  ordering?: InspectionMemoryOrdering;
+}
+
+export interface InspectionMemory {
+  id: string;
+  project_id: string;
+  team_id: string | null;
+  title: string;
+  body: string;
+  status: string;
+  visibility_scope: string;
+  current_version: number;
+  confidence: string | null;
+  confidence_percent?: number | null;
+  stale: boolean;
+  refuted: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  kind?: string | null;
+  metadata?: Record<string, unknown> | null;
+  tags?: string[];
+  file_paths?: string[];
+  project_name?: string;
+  project_slug?: string;
+  authorized_for_injection?: boolean;
+}
+
+export async function listInspectionMemories(
+  params: InspectionMemoryListParams,
+): Promise<{ count: number; items: InspectionMemory[] }> {
+  const query: Record<string, string> = scopeQuery(params);
+
+  if (params.search) {
+    query.search = params.search;
+  }
+
+  if (params.status) {
+    query.status = params.status;
+  }
+
+  if (params.ordering) {
+    query.ordering = params.ordering;
+  }
+
+  const response = await apiClient().get('/v1/inspection/memories', {
+    params: query,
+  });
+
+  return listEnvelope<InspectionMemory>(response.data);
+}
+
 /* ----------------------------- Search debugger ---------------------------- */
 
 export interface SearchDebugRequest {
@@ -171,11 +229,26 @@ export interface ContextBundleDetail extends ContextBundleListItem {
   items: ContextBundleEntry[];
 }
 
+export interface ContextBundleListParams extends ScopeParams {
+  session_id?: string;
+  status?: string;
+}
+
 export async function listContextBundles(
-  scope: ScopeParams,
+  scope: ContextBundleListParams,
 ): Promise<{ count: number; items: ContextBundleListItem[] }> {
+  const params: Record<string, string> = scopeQuery(scope);
+
+  if (scope.session_id) {
+    params.session_id = scope.session_id;
+  }
+
+  if (scope.status) {
+    params.status = scope.status;
+  }
+
   const response = await apiClient().get('/v1/inspection/context-bundles', {
-    params: scopeQuery(scope),
+    params,
   });
 
   return listEnvelope<ContextBundleListItem>(response.data);
@@ -397,6 +470,7 @@ export interface ModelPolicy {
   version: number;
   active: boolean;
   fallback_enabled: boolean;
+  base_url?: string | null;
   context_window_tokens?: number | null;
   json_mode?: boolean | null;
   last_success_at?: string | null;

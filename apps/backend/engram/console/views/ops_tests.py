@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
 from django.contrib.auth.models import User
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
@@ -15,7 +17,84 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.core.models import Organization, Project, WorkflowRun, WorkflowRunStatus, WorkflowRunType
+from engram.core.models import (
+    AuditResult,
+    CandidateStatus,
+    MemoryCandidate,
+    Organization,
+    Project,
+    Team,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+)
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
+
+
+def _make_project(org: Organization) -> Project:
+    return Project.objects.create(organization=org, name='Proj', slug=f'proj-{Project.objects.count()}')
+
+
+def _make_proposed_candidate(org: Organization, project: Project, *, created_at: object = None) -> MemoryCandidate:
+    counter = MemoryCandidate.objects.count()
+    candidate = MemoryCandidate.objects.create(
+        organization=org,
+        project=project,
+        title=f'Candidate {counter}',
+        body=f'Body {counter}',
+        status=CandidateStatus.PROPOSED,
+        content_hash=f'hash-c-{counter}',
+        confidence='0.300',
+    )
+    if created_at is not None:
+        MemoryCandidate.objects.filter(id=candidate.id).update(created_at=created_at)
+        candidate.refresh_from_db()
+
+    return candidate
+
+
+def _make_provider_error(org: Organization, project: Project, *, created_at: object = None) -> ProviderCallRecord:
+    counter = ProviderCallRecord.objects.count()
+    team = Team.objects.create(organization=org, name=f'Team {counter}', slug=f'team-{counter}')
+    secret = ProviderSecret.objects.create(
+        organization=org,
+        team=team,
+        name='OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=org,
+        team=team,
+        project=project,
+        name='Generation policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    record = ProviderCallRecord.objects.create(
+        organization=org,
+        project=project,
+        team=team,
+        policy=policy,
+        secret=secret,
+        provider='openai',
+        model='gpt-4.1-mini',
+        task_type='generation',
+        policy_version=1,
+        request_id=f'req-{counter}',
+        redaction_state='clean',
+        result=AuditResult.ERROR,
+    )
+    if created_at is not None:
+        ProviderCallRecord.objects.filter(id=record.id).update(created_at=created_at)
+        record.refresh_from_db()
+
+    return record
 
 
 def _make_user(username: str) -> User:
@@ -170,6 +249,56 @@ def test_ops_overview_does_not_count_other_organizations_failed_workflow_runs(f_
 
     assert response.status_code == 200
     assert response.json()['failed_workflow_runs'] == 1
+
+
+@pytest.mark.django_db
+def test_ops_overview_exposes_review_backlog_gauges(f_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='ops-org')
+    project = _make_project(org)
+    _make_proposed_candidate(org, project, created_at=timezone.now() - timedelta(hours=2))
+    _make_proposed_candidate(org, project)
+
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['review_backlog_count'] == 2
+    assert isinstance(body['oldest_proposed_age_seconds'], int)
+    assert body['oldest_proposed_age_seconds'] >= 7000
+    assert body['provider_errors_24h'] == 0
+
+
+@pytest.mark.django_db
+def test_ops_overview_review_gauges_are_empty_without_backlog(f_admin_client: APIClient) -> None:
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['review_backlog_count'] == 0
+    assert body['oldest_proposed_age_seconds'] is None
+    assert body['provider_errors_24h'] == 0
+
+
+@pytest.mark.django_db
+def test_ops_overview_review_gauges_scoped_to_active_organization(f_admin_client: APIClient) -> None:
+    org = Organization.objects.get(slug='ops-org')
+    project = _make_project(org)
+    other_org = Organization.objects.create(name='OtherOrg', slug='other-org')
+    other_project = _make_project(other_org)
+
+    _make_proposed_candidate(org, project)
+    _make_proposed_candidate(other_org, other_project)
+
+    _make_provider_error(org, project, created_at=timezone.now() - timedelta(hours=1))
+    _make_provider_error(org, project, created_at=timezone.now() - timedelta(hours=30))
+    _make_provider_error(other_org, other_project, created_at=timezone.now() - timedelta(hours=1))
+
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['review_backlog_count'] == 1
+    assert body['provider_errors_24h'] == 1
 
 
 @pytest.mark.django_db

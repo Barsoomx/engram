@@ -77,6 +77,16 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 class CliLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        hook_error_markers = tempfile.TemporaryDirectory()
+        self.addCleanup(hook_error_markers.cleanup)
+        patcher = mock.patch(
+            "engram_cli.commands.tempfile.gettempdir",
+            return_value=hook_error_markers.name,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def run_cli(
         self,
         argv: list[str],
@@ -889,7 +899,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
-    def test_hook_session_end_non_2xx_response_exits_with_1(self) -> None:
+    def test_hook_session_end_non_2xx_response_fails_open_with_0(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
             self.connect(config_dir)
@@ -923,7 +933,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=stdin,
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertIn("server_error", stderr)
 
     def test_hook_session_start_posts_event_then_requests_context_with_connected_scope(
@@ -1105,6 +1115,7 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "session_start",
                             "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
                         },
                     ),
                 ],
@@ -1169,6 +1180,7 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "session_start",
                             "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
                         },
                     ),
                 ],
@@ -1278,7 +1290,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=io.StringIO("{not-json"),
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertEqual("", stdout)
             self.assertIn("invalid_response", stderr)
             self.assertEqual([], transport.calls)
@@ -1291,7 +1303,7 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=io.StringIO("{}"),
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertEqual("", stdout)
             self.assertIn("missing_config", stderr)
 
@@ -1332,6 +1344,7 @@ class CliLifecycleTests(unittest.TestCase):
                         "session_id": "session-ups-1",
                         "event_id": "ups-event-1",
                         "request_id": "ups-context-request-1",
+                        "prompt": "how does authorization work?",
                         "query": "how does authorization work?",
                         "file_paths": ["apps/backend/engram/context/services.py"],
                         "symbols": ["BuildContextBundle"],
@@ -1402,6 +1415,7 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "user_prompt_submit",
                             "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
                         },
                     ),
                 ],
@@ -1412,6 +1426,7 @@ class CliLifecycleTests(unittest.TestCase):
                         "session_id": "session-ups-1",
                         "event_id": "ups-event-1",
                         "request_id": "ups-context-request-1",
+                        "prompt": "how does authorization work in this service?",
                     },
                 ),
             )
@@ -1466,6 +1481,7 @@ class CliLifecycleTests(unittest.TestCase):
                             "status": "created",
                             "purpose": "user_prompt_submit",
                             "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
                         },
                     ),
                 ],
@@ -1476,6 +1492,7 @@ class CliLifecycleTests(unittest.TestCase):
                         "session_id": "session-ups-1",
                         "event_id": "ups-event-1",
                         "request_id": "ups-context-request-1",
+                        "prompt": "how does authorization work in this service?",
                     },
                 ),
             )
@@ -1508,7 +1525,7 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
-    def test_hook_user_prompt_submit_non_2xx_hook_response_exits_with_1(
+    def test_hook_user_prompt_submit_non_2xx_hook_response_fails_open_with_0(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1544,8 +1561,268 @@ class CliLifecycleTests(unittest.TestCase):
                 stdin=stdin,
             )
 
-            self.assertEqual(1, exit_code)
+            self.assertEqual(0, exit_code)
             self.assertIn("server_error", stderr)
+
+    def test_hook_error_suppresses_repeated_stderr_within_cooldown_window(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            failing_response = (
+                500,
+                {"code": "server_error", "detail": "Internal Server Error"},
+            )
+            transport = FakeTransport([failing_response, failing_response])
+            stdin_payload = json.dumps(
+                {"session_id": "session-1", "event_id": "session-end-event-1"},
+            )
+
+            first_exit, _first_stdout, first_stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=io.StringIO(stdin_payload),
+            )
+            second_exit, _second_stdout, second_stderr = self.run_cli(
+                [
+                    "hook",
+                    "session-end",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+                stdin=io.StringIO(stdin_payload),
+            )
+
+            self.assertEqual(0, first_exit)
+            self.assertEqual(0, second_exit)
+            self.assertIn("server_error", first_stderr)
+            self.assertEqual("", second_stderr)
+
+    def test_hook_user_prompt_submit_skips_context_query_for_short_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-short-event-1",
+                        "prompt": "hi there",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual("", stderr)
+            self.assertEqual(1, len(transport.calls))
+            self.assertEqual(
+                "https://engram.example/v1/hooks/user-prompt-submit",
+                transport.calls[0]["url"],
+            )
+            self.assertEqual({}, json.loads(stdout))
+
+    def test_hook_user_prompt_submit_skips_context_query_for_slash_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-slash-event-1",
+                        "prompt": "/mem-search please look up something specific",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(1, len(transport.calls))
+            self.assertEqual({}, json.loads(stdout))
+
+    def test_hook_user_prompt_submit_skips_context_query_for_command_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-command-tag-event-1",
+                        "prompt": "<command-name>investigate this issue</command-name>",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(1, len(transport.calls))
+            self.assertEqual({}, json.loads(stdout))
+
+    def test_hook_user_prompt_submit_queries_context_when_prompt_meets_threshold(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                    (
+                        200,
+                        {
+                            "status": "created",
+                            "purpose": "user_prompt_submit",
+                            "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-threshold-event-1",
+                        "prompt": "12345678901234567890",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(2, len(transport.calls))
+            self.assertEqual(
+                "https://engram.example/v1/context/user-prompt-submit",
+                transport.calls[1]["url"],
+            )
+            body = json.loads(stdout)
+            self.assertEqual("created", body["status"])
+
+    def test_hook_user_prompt_submit_queries_context_for_top_level_query_without_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                    (
+                        200,
+                        {
+                            "status": "created",
+                            "purpose": "user_prompt_submit",
+                            "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-query-only-event-1",
+                        "query": "how does authorization work in this service?",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(2, len(transport.calls))
+            self.assertEqual(
+                "https://engram.example/v1/context/user-prompt-submit",
+                transport.calls[1]["url"],
+            )
+            body = json.loads(stdout)
+            self.assertEqual("created", body["status"])
 
     def test_disconnect_removes_only_engram_owned_state_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

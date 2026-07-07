@@ -14,6 +14,7 @@ import {
   updateProject,
   type Paginated,
   type Project,
+  type ProjectListParams,
   type ProjectWriteInput,
 } from '@/lib/admin-api';
 import { adminQueryKeys } from '@/lib/query-keys';
@@ -25,7 +26,7 @@ export function useProjects(
 ) {
   return useQuery<Paginated<Project>>({
     queryKey: adminQueryKeys.projects(orgId, params),
-    queryFn: () => listProjects(params),
+    queryFn: () => listProjects(params as ProjectListParams | undefined),
     enabled: Boolean(orgId),
     ...options,
   });
