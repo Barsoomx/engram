@@ -644,6 +644,34 @@ export async function disableModelPolicy(
   return response.data;
 }
 
+export interface PolicyValidationResult {
+  policy_id: string;
+  task_type: PolicyTaskType;
+  provider: SecretProvider;
+  model: string;
+  ok: boolean;
+  latency_ms: number;
+  error_code?: string;
+  public_error?: string;
+}
+
+export async function validateModelPolicies(
+  policyId?: string,
+): Promise<PolicyValidationResult[]> {
+  const body: { policy_id?: string } = {};
+
+  if (policyId) {
+    body.policy_id = policyId;
+  }
+
+  const response = await apiClient().post<{ results: PolicyValidationResult[] }>(
+    '/v1/admin/model-policies/validate',
+    body,
+  );
+
+  return response.data.results;
+}
+
 export async function enableProviderSecret(
   secretId: string,
   body: ProviderSecretDisableInput,
