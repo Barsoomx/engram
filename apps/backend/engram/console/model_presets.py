@@ -19,7 +19,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'curation',
                 'provider': 'anthropic',
-                'model': 'claude-haiku-4-5',
+                'model': 'claude-sonnet-5',
                 'base_url': '',
                 'key_slot': 'anthropic',
             },
@@ -55,7 +55,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'curation',
                 'provider': 'openai',
-                'model': 'gpt-5.4-mini',
+                'model': 'gpt-5.4',
                 'base_url': '',
                 'key_slot': 'openai',
             },
@@ -91,7 +91,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'curation',
                 'provider': 'deepseek',
-                'model': 'deepseek-v4-flash',
+                'model': 'deepseek-v4-pro',
                 'base_url': '',
                 'key_slot': 'deepseek',
             },
@@ -127,7 +127,7 @@ PRESETS: list[dict[str, Any]] = [
             {
                 'task_type': 'curation',
                 'provider': 'openai',
-                'model': 'glm-4.7-flash',
+                'model': 'glm-4.7',
                 'base_url': 'https://api.z.ai/api/paas/v4',
                 'key_slot': 'glm',
             },
