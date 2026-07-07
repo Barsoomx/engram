@@ -1569,6 +1569,65 @@ def test_model_policy_create_with_base_url_stores_in_metadata() -> None:
 
 
 @pytest.mark.django_db
+def test_model_policy_response_exposes_base_url_on_read() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Read URL', 'openai')
+
+    glm_url = 'https://open.bigmodel.cn/api/paas/v4'
+    create_response = client.post(
+        '/v1/model-policy/policies',
+        {
+            'project_id': str(project.id),
+            'team_id': str(team.id),
+            'name': 'GLM read policy',
+            'scope': 'team',
+            'task_type': 'generation',
+            'provider': 'openai',
+            'model': 'glm-4-flash',
+            'secret_id': secret_id,
+            'base_url': glm_url,
+            'request_id': 'request-policy-read-base-url-1',
+        },
+        format='json',
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert create_response.status_code == 201
+    assert create_response.json()['base_url'] == glm_url
+
+    detail_response = client.get(
+        f'/v1/model-policy/policies/{create_response.json()["id"]}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert detail_response.status_code == 200
+    assert detail_response.json()['base_url'] == glm_url
+
+
+@pytest.mark.django_db
+def test_model_policy_response_base_url_null_when_absent() -> None:
+    scope = create_project_scope()
+    _organization, team, project, _owner, _api_key = scope
+    create_policy_admin_key(scope)
+    client = APIClient()
+    secret_id = _create_secret(client, project, team, 'Team OpenAI Plain', 'openai')
+    policy_id = _create_policy(client, project, team, 'Plain policy', secret_id)
+
+    detail_response = client.get(
+        f'/v1/model-policy/policies/{policy_id}',
+        {'project_id': str(project.id), 'team_id': str(team.id)},
+        **auth_headers(POLICY_RAW_KEY),
+    )
+
+    assert detail_response.status_code == 200
+    assert detail_response.json()['base_url'] is None
+
+
+@pytest.mark.django_db
 def test_model_policy_create_without_base_url_has_empty_metadata() -> None:
     scope = create_project_scope()
     _organization, team, project, _owner, _api_key = scope
