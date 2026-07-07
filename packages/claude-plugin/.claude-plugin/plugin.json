@@ -1,7 +1,7 @@
 {
   "name": "engram",
   "displayName": "Engram",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Thin Engram hook adapter and MCP bridge for Claude Code.",
   "keywords": ["engineering-memory", "hooks", "claude-code"]
 }
