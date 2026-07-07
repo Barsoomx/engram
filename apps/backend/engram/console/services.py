@@ -8,6 +8,7 @@ from typing import Any
 
 import structlog
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import status
 
@@ -922,6 +923,22 @@ def restore_memory(
     return memory
 
 
+REVIEW_MEMORY_STATUSES = (
+    MemoryStatus.CONFLICT,
+    MemoryStatus.REFUTED,
+)
+
+REVIEW_MEMORY_CONFIDENCE_THRESHOLD = '0.300'
+
+
+def reviewable_memory_filter() -> Q:
+    return (
+        Q(status__in=REVIEW_MEMORY_STATUSES)
+        | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD)
+        | Q(status=MemoryStatus.APPROVED, refuted=True)
+    )
+
+
 @transaction.atomic
 def bulk_archive_memories(
     organization: Organization,
@@ -930,6 +947,8 @@ def bulk_archive_memories(
     *,
     ids: list[uuid.UUID] | None = None,
     confidence_lte: str | None = None,
+    project_id: uuid.UUID | None = None,
+    team_id: uuid.UUID | None = None,
 ) -> list[uuid.UUID]:
     archived_ids: list[uuid.UUID] = []
 
@@ -939,12 +958,18 @@ def bulk_archive_memories(
         )
 
     else:
-        memories = list(
-            Memory.objects.filter(
-                organization=organization,
-                confidence__lte=confidence_lte,
-            ).exclude(status=MemoryStatus.ARCHIVED),
-        )
+        queryset = Memory.objects.filter(
+            organization=organization,
+            confidence__lte=confidence_lte,
+        ).filter(reviewable_memory_filter())
+
+        if project_id is not None:
+            queryset = queryset.filter(project_id=project_id)
+
+        if team_id is not None:
+            queryset = queryset.filter(team_id=team_id)
+
+        memories = list(queryset)
 
     for memory in memories:
         archive_memory(organization, actor_identity, memory, reason)

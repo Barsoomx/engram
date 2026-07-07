@@ -987,6 +987,8 @@ export default function MemoryReviewPage() {
       const result = await bulkMutation.mutateAsync({
         confidence__lte: threshold.toFixed(3),
         reason: thresholdReason.trim(),
+        ...(filters.project_id ? { project_id: filters.project_id } : {}),
+        ...(filters.team_id ? { team_id: filters.team_id } : {}),
       });
 
       addToast({
@@ -1267,7 +1269,9 @@ export default function MemoryReviewPage() {
                 <ModalBody>
                   <div className='space-y-3'>
                     <p className='text-sm text-default-500'>
-                      Archives every reviewable memory whose confidence is at or below the threshold. Recorded in the audit log and permanent.
+                      Archives reviewable memories whose confidence is at or below the threshold
+                      {filters.project_id || filters.team_id ? ', scoped to the active project and team filters' : ''}. Recorded in the audit
+                      log and permanent.
                     </p>
                     <Input
                       label='Confidence ≤'
