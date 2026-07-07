@@ -391,12 +391,33 @@ export interface ProviderSecretDisableInput {
   request_id: string;
 }
 
+export interface ProviderSecretListFilters {
+  provider?: SecretProvider;
+  scope?: SecretScope;
+  active?: boolean;
+}
+
 export async function listProviderSecrets(
   scope: ScopeParams,
+  filters?: ProviderSecretListFilters,
 ): Promise<ProviderSecret[]> {
   try {
+    const params = scopeQuery(scope);
+
+    if (filters?.provider) {
+      params.provider = filters.provider;
+    }
+
+    if (filters?.scope) {
+      params.scope = filters.scope;
+    }
+
+    if (filters?.active !== undefined) {
+      params.active = String(filters.active);
+    }
+
     const response = await apiClient().get('/v1/model-policy/secrets', {
-      params: scopeQuery(scope),
+      params,
     });
 
     return listEnvelope<ProviderSecret>(response.data).items;
