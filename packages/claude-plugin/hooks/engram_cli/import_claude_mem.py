@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import socket
 import sqlite3
@@ -31,12 +32,20 @@ _V17_ALIASES = {
     'sdk_session_id': 'memory_session_id',
 }
 _MAX_BATCH_ROWS = 200
+_MAX_BATCH_BYTES = 1_500_000
+_SERVER_MAX_REQUEST_BYTES = 2 * 1024 * 1024
+_BATCH_ENVELOPE_BYTES = 256
+_PAYLOAD_TOO_LARGE_STATUS = 413
 _RETRYABLE_STATUS = (500, 502, 503, 504)
 _BATCH_MAX_ATTEMPTS = 5
 _BATCH_BACKOFF_SECONDS = 0.5
 
 
 class ClaudeMemImportError(CliError):
+    pass
+
+
+class ImportBatchTooLargeError(ClaudeMemImportError):
     pass
 
 
@@ -57,10 +66,30 @@ def apply_v17_aliases(row: dict[str, object]) -> dict[str, object]:
     return aliased
 
 
-def iter_batches(rows: list[dict[str, object]], size: int) -> Iterator[list[dict[str, object]]]:
+def _row_size_bytes(row: object) -> int:
+    return len(json.dumps(row)) + 1
+
+
+def iter_batches(
+    rows: list[dict[str, object]],
+    size: int,
+    max_bytes: int = _MAX_BATCH_BYTES,
+) -> Iterator[list[dict[str, object]]]:
     step = max(1, size)
-    for start in range(0, len(rows), step):
-        yield rows[start:start + step]
+    batch: list[dict[str, object]] = []
+    batch_bytes = _BATCH_ENVELOPE_BYTES
+    for row in rows:
+        row_bytes = _row_size_bytes(row)
+        if batch and (len(batch) >= step or batch_bytes + row_bytes > max_bytes):
+            yield batch
+            batch = []
+            batch_bytes = _BATCH_ENVELOPE_BYTES
+
+        batch.append(row)
+        batch_bytes += row_bytes
+
+    if batch:
+        yield batch
 
 
 class ClaudeMemReader:
@@ -210,6 +239,58 @@ def _error_from_body(body: dict[str, object], fallback: str) -> ClaudeMemImportE
     return ClaudeMemImportError(code, detail, remediation_for(code))
 
 
+def _too_large_from_body(body: dict[str, object]) -> ImportBatchTooLargeError:
+    code = as_string(body.get('code')) or 'import_payload_too_large'
+    detail = as_string(body.get('detail')) or 'import batch exceeds the maximum request size'
+
+    return ImportBatchTooLargeError(code, detail, remediation_for(code))
+
+
+def _oversized_row_error(table: str, row: dict[str, object]) -> ClaudeMemImportError:
+    row_id = row.get('id', '?') if isinstance(row, dict) else '?'
+    detail = (
+        f'claude-mem row id={row_id} in table {table} exceeds the server '
+        f'{_SERVER_MAX_REQUEST_BYTES}-byte import limit'
+    )
+
+    return ClaudeMemImportError(
+        'import_row_too_large',
+        detail,
+        remediation_for('import_row_too_large'),
+    )
+
+
+def _post_with_retry(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    path: str,
+    payload: dict[str, object],
+    fallback: str,
+    sleep: Callable[[float], None],
+) -> dict[str, object]:
+    last_body: dict[str, object] = {}
+    for attempt in range(_BATCH_MAX_ATTEMPTS):
+        status, body = post_json(
+            transport=transport,
+            server_url=server_url,
+            path=path,
+            api_key=api_key,
+            payload=payload,
+        )
+        if 200 <= status < 300:
+            return body
+
+        last_body = body
+        if status not in _RETRYABLE_STATUS or attempt == _BATCH_MAX_ATTEMPTS - 1:
+            raise _error_from_body(body, fallback=fallback)
+
+        sleep(_BATCH_BACKOFF_SECONDS * (attempt + 1))
+
+    raise _error_from_body(last_body, fallback=fallback)
+
+
 def create_import(
     *,
     transport: Transport,
@@ -218,22 +299,22 @@ def create_import(
     project_id: str,
     source_store_id: str,
     manifest: dict[str, object],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> str:
     payload: dict[str, object] = {
         'project_id': project_id,
         'source_store_id': source_store_id,
         'manifest': manifest,
     }
-    status, body = post_json(
+    body = _post_with_retry(
         transport=transport,
         server_url=server_url,
-        path='/v1/imports/claude-mem',
         api_key=api_key,
+        path='/v1/imports/claude-mem',
         payload=payload,
+        fallback='import_create_failed',
+        sleep=sleep,
     )
-    if status < 200 or status >= 300:
-        raise _error_from_body(body, fallback='import_create_failed')
-
     import_id = as_string(body.get('import_id'))
     if not import_id:
         raise ClaudeMemImportError(
@@ -270,12 +351,59 @@ def send_batch(
             return body
 
         last_body = body
+        if status == _PAYLOAD_TOO_LARGE_STATUS:
+            raise _too_large_from_body(body)
+
         if status not in _RETRYABLE_STATUS or attempt == _BATCH_MAX_ATTEMPTS - 1:
             raise _error_from_body(body, fallback='import_batch_failed')
 
         sleep(_BATCH_BACKOFF_SECONDS * (attempt + 1))
 
     raise _error_from_body(last_body, fallback='import_batch_failed')
+
+
+def _send_with_split(
+    *,
+    transport: Transport,
+    server_url: str,
+    api_key: str,
+    import_id: str,
+    seq: int,
+    table: str,
+    rows: list[dict[str, object]],
+    stdout: TextIO,
+    sleep: Callable[[float], None],
+) -> int:
+    pending: list[list[dict[str, object]]] = [rows]
+    while pending:
+        current = pending.pop(0)
+        try:
+            result = send_batch(
+                transport=transport,
+                server_url=server_url,
+                api_key=api_key,
+                import_id=import_id,
+                seq=seq,
+                table=table,
+                rows=current,
+                sleep=sleep,
+            )
+        except ImportBatchTooLargeError:
+            if len(current) <= 1:
+                raise _oversized_row_error(table, current[0]) from None
+
+            mid = len(current) // 2
+            pending.insert(0, current[mid:])
+            pending.insert(0, current[:mid])
+            continue
+
+        stdout.write(
+            f'{table}: seq={seq} rows={len(current)} '
+            f'created={result.get("created")} duplicates={result.get("duplicates")}\n',
+        )
+        seq += 1
+
+    return seq
 
 
 def finalize_import(
@@ -285,18 +413,17 @@ def finalize_import(
     api_key: str,
     import_id: str,
     client_row_counts: dict[str, int],
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
-    status, body = post_json(
+    return _post_with_retry(
         transport=transport,
         server_url=server_url,
-        path=f'/v1/imports/claude-mem/{import_id}/finalize',
         api_key=api_key,
+        path=f'/v1/imports/claude-mem/{import_id}/finalize',
         payload={'client_row_counts': client_row_counts},
+        fallback='import_finalize_failed',
+        sleep=sleep,
     )
-    if status < 200 or status >= 300:
-        raise _error_from_body(body, fallback='import_finalize_failed')
-
-    return body
 
 
 def stream_plan(
@@ -324,13 +451,14 @@ def stream_plan(
         project_id=project_id,
         source_store_id=source_store_id,
         manifest=manifest,
+        sleep=sleep,
     )
     stdout.write(f'import_id={import_id}\n')
     seq = 0
     for table, rows in plan.tables.items():
         applied = 0
         for chunk in iter_batches(rows, effective_size):
-            result = send_batch(
+            seq = _send_with_split(
                 transport=transport,
                 server_url=server_url,
                 api_key=api_key,
@@ -338,14 +466,10 @@ def stream_plan(
                 seq=seq,
                 table=table,
                 rows=chunk,
+                stdout=stdout,
                 sleep=sleep,
             )
             applied += len(chunk)
-            stdout.write(
-                f'{table}: seq={seq} rows={len(chunk)} '
-                f'created={result.get("created")} duplicates={result.get("duplicates")}\n',
-            )
-            seq += 1
 
         if rows:
             stdout.write(f'{table}: streamed {applied}/{len(rows)} rows\n')
@@ -356,6 +480,7 @@ def stream_plan(
         api_key=api_key,
         import_id=import_id,
         client_row_counts=dict(plan.counts),
+        sleep=sleep,
     )
 
 

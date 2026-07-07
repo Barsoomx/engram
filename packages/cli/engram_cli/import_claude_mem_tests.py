@@ -5,12 +5,14 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 
 from engram_cli import main
 from engram_cli.import_claude_mem import (
     ClaudeMemImportError,
     ClaudeMemReader,
+    ImportPlan,
     apply_v17_aliases,
     build_plan,
     create_import,
@@ -336,6 +338,28 @@ class BatchTests(unittest.TestCase):
     def test_iter_batches_empty(self) -> None:
         self.assertEqual([], list(iter_batches([], 2)))
 
+    def test_iter_batches_splits_by_byte_budget(self) -> None:
+        rows = [{'id': index, 'facts': 'x' * 600} for index in range(4)]
+
+        chunks = list(iter_batches(rows, 200, max_bytes=1600))
+
+        self.assertEqual([2, 2], [len(chunk) for chunk in chunks])
+        for chunk in chunks:
+            serialized = json.dumps({'seq': 0, 'table': 'observations', 'rows': chunk})
+            self.assertLessEqual(len(serialized), 1600)
+
+    def test_iter_batches_keeps_oversized_row_alone(self) -> None:
+        rows = [
+            {'id': 1, 'facts': 'x' * 50},
+            {'id': 2, 'facts': 'y' * 4000},
+            {'id': 3, 'facts': 'z' * 50},
+        ]
+
+        chunks = list(iter_batches(rows, 200, max_bytes=2000))
+
+        self.assertEqual([1, 1, 1], [len(chunk) for chunk in chunks])
+        self.assertEqual(2, chunks[1][0]['id'])
+
     def test_create_import_conflict_raises(self) -> None:
         transport = RecordingTransport([(409, {'code': 'import_conflict', 'detail': 'exists'})])
 
@@ -348,6 +372,49 @@ class BatchTests(unittest.TestCase):
                 source_store_id='cli:abc',
                 manifest={'schema_version_head': 17, 'tables': {}},
             )
+
+    def test_create_import_retries_on_transient_then_succeeds(self) -> None:
+        transport = RecordingTransport(
+            [
+                (503, {'code': 'server_unavailable'}),
+                (201, {'import_id': 'imp-2', 'status': 'created'}),
+            ],
+        )
+
+        import_id = create_import(
+            transport=transport,
+            server_url='https://engram.example',
+            api_key=API_KEY,
+            project_id=PROJECT_ID,
+            source_store_id='cli:abc',
+            manifest={'schema_version_head': 17, 'tables': {}},
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual('imp-2', import_id)
+        self.assertEqual(2, len(transport.calls))
+        self.assertTrue(transport.calls[0]['url'].endswith('/v1/imports/claude-mem'))
+        self.assertTrue(transport.calls[1]['url'].endswith('/v1/imports/claude-mem'))
+
+    def test_finalize_import_retries_on_transient_then_succeeds(self) -> None:
+        transport = RecordingTransport(
+            [
+                (503, {'code': 'server_unavailable'}),
+                (200, {'status': 'succeeded', 'report': {'ok': True}}),
+            ],
+        )
+
+        body = finalize_import(
+            transport=transport,
+            server_url='https://engram.example',
+            api_key=API_KEY,
+            import_id='imp-1',
+            client_row_counts={'sdk_sessions': 1},
+            sleep=lambda _seconds: None,
+        )
+
+        self.assertEqual('succeeded', body['status'])
+        self.assertEqual(2, len(transport.calls))
 
     def test_send_batch_retries_same_seq_on_transient(self) -> None:
         transport = RecordingTransport(
@@ -457,6 +524,129 @@ class StreamPlanTests(unittest.TestCase):
         self.assertEqual({'sdk_sessions': 1}, transport.calls[0]['payload']['client_row_counts'])
         self.assertEqual('succeeded', body['status'])
         self.assertEqual({'ok': True}, body['report'])
+
+
+class SplittingTransport:
+    def __init__(self, max_rows: int) -> None:
+        self._max_rows = max_rows
+        self.batch_calls: list[dict[str, object]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        if url.endswith('/v1/imports/claude-mem'):
+            return 201, {'import_id': 'imp-1', 'status': 'created'}
+
+        if url.endswith('/finalize'):
+            return 200, {'status': 'succeeded', 'report': {}}
+
+        rows = payload['rows'] if payload else []
+        self.batch_calls.append({'seq': payload['seq'], 'rows': len(rows)})
+        if len(rows) > self._max_rows:
+            return 413, {'code': 'import_payload_too_large', 'detail': 'batch too large'}
+
+        return 200, {
+            'accepted': True,
+            'seq': payload['seq'],
+            'created': len(rows),
+            'duplicates': 0,
+            'skipped': 0,
+        }
+
+
+class AlwaysTooLargeTransport:
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        if url.endswith('/v1/imports/claude-mem'):
+            return 201, {'import_id': 'imp-1', 'status': 'created'}
+
+        if url.endswith('/finalize'):
+            return 200, {'status': 'succeeded', 'report': {}}
+
+        return 413, {'code': 'import_payload_too_large', 'detail': 'batch too large'}
+
+
+class ByteAwareStreamTests(unittest.TestCase):
+    def _plan(self, tables: 'OrderedDict[str, list[dict[str, object]]]') -> ImportPlan:
+        return ImportPlan(projects=['/repo/one'], tables=tables, project_name='/repo/one')
+
+    def test_halves_batch_on_413_with_contiguous_seq(self) -> None:
+        plan = self._plan(
+            OrderedDict(
+                (
+                    ('sdk_sessions', [{'id': 1}]),
+                    ('user_prompts', [{'id': 1}]),
+                    ('observations', [{'id': 1}, {'id': 2}, {'id': 3}, {'id': 4}]),
+                    ('session_summaries', [{'id': 1}]),
+                ),
+            ),
+        )
+        transport = SplittingTransport(max_rows=2)
+        stdout = io.StringIO()
+
+        report = stream_plan(
+            transport=transport,
+            server_url='https://engram.example',
+            api_key=API_KEY,
+            plan=plan,
+            project_id=PROJECT_ID,
+            source_store_id='cli:abc',
+            schema_version_head=17,
+            batch_size=200,
+            stdout=stdout,
+            sleep=lambda _seconds: None,
+        )
+
+        seqs = [call['seq'] for call in transport.batch_calls]
+        rows = [call['rows'] for call in transport.batch_calls]
+        self.assertEqual([0, 1, 2, 2, 3, 4], seqs)
+        self.assertEqual([1, 1, 4, 2, 2, 1], rows)
+        accepted = [call['seq'] for call in transport.batch_calls if call['rows'] <= 2]
+        self.assertEqual([0, 1, 2, 3, 4], accepted)
+        self.assertEqual('succeeded', report['status'])
+
+    def test_single_oversized_row_raises_hard_error(self) -> None:
+        plan = self._plan(
+            OrderedDict(
+                (
+                    ('sdk_sessions', [{'id': 7, 'facts': 'x'}]),
+                    ('user_prompts', []),
+                    ('observations', []),
+                    ('session_summaries', []),
+                ),
+            ),
+        )
+        transport = AlwaysTooLargeTransport()
+        stdout = io.StringIO()
+
+        with self.assertRaises(ClaudeMemImportError) as ctx:
+            stream_plan(
+                transport=transport,
+                server_url='https://engram.example',
+                api_key=API_KEY,
+                plan=plan,
+                project_id=PROJECT_ID,
+                source_store_id='cli:abc',
+                schema_version_head=17,
+                batch_size=200,
+                stdout=stdout,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual('import_row_too_large', ctx.exception.code)
+        self.assertIn('sdk_sessions', ctx.exception.detail)
+        self.assertIn('7', ctx.exception.detail)
 
 
 class RunImportCliTests(unittest.TestCase):
