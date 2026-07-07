@@ -337,10 +337,16 @@ class ReplaySearchDebug:
         team_id: uuid.UUID | None,
     ) -> set[uuid.UUID]:
         allowed: set[uuid.UUID] = set(scope.team_ids)
-        if team_id is not None:
-            allowed.add(team_id)
+        if team_id is None:
+            return allowed
 
-        return allowed
+        if _is_full_org_admin(scope):
+            return {team_id}
+
+        if team_id not in allowed:
+            raise AccessDeniedError('team_scope_denied', 'Scope cannot access requested team')
+
+        return {team_id}
 
     def _resolve_team(
         self,
