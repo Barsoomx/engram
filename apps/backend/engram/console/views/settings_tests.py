@@ -285,6 +285,33 @@ def test_retrieval_settings_put_flips_confidence_decay_enabled(f_org_admin_clien
 
 
 @pytest.mark.django_db
+def test_retrieval_settings_get_includes_realtime_candidates_enabled_default_off(
+    f_org_admin_client: APIClient,
+) -> None:
+    response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert response.status_code == 200
+    assert response.json()['realtime_candidates_enabled'] is False
+
+
+@pytest.mark.django_db
+def test_retrieval_settings_put_flips_realtime_candidates_enabled(f_org_admin_client: APIClient) -> None:
+    response = f_org_admin_client.put(
+        '/v1/admin/settings/retrieval',
+        {'realtime_candidates_enabled': True},
+        format='json',
+    )
+
+    assert response.status_code == 200
+    assert response.json()['realtime_candidates_enabled'] is True
+
+    get_response = f_org_admin_client.get('/v1/admin/settings/retrieval')
+
+    assert get_response.status_code == 200
+    assert get_response.json()['realtime_candidates_enabled'] is True
+
+
+@pytest.mark.django_db
 def test_retrieval_settings_put_confidence_decay_enabled_writes_audit_event(f_org_admin_client: APIClient) -> None:
     organization = Organization.objects.get(slug='settings-org')
 

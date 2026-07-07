@@ -9,7 +9,7 @@ from engram.core.management.commands.engram_bootstrap_golden_path import (
     AGENT_KEY_CAPABILITIES,
     bootstrap_golden_path,
 )
-from engram.core.models import Project
+from engram.core.models import OrganizationSettings, Project
 from engram.model_policy.models import ModelPolicy
 
 RAW_KEY = 'egk_test_golden_path_key_0123456789abcdefghijklmnopqrstuv'
@@ -22,6 +22,14 @@ def test_bootstrap_without_agent_key_keeps_existing_contract() -> None:
 
     assert 'agent_api_key_id' not in result
     assert result['project_id']
+
+
+@pytest.mark.django_db
+def test_bootstrap_enables_realtime_candidates_for_e2e_org() -> None:
+    result = bootstrap_golden_path(RAW_KEY)
+
+    settings = OrganizationSettings.objects.get(organization_id=result['organization_id'])
+    assert settings.realtime_candidates_enabled is True
 
 
 @pytest.mark.django_db
