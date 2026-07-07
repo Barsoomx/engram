@@ -16,9 +16,12 @@ import { useRouter } from 'next/navigation';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { PageHeader } from '@/components/ui/page-header';
 import { PulseDot } from '@/components/ui/pulse-dot';
 import { useOrganizations } from '@/hooks/use-organizations';
+import { useProjects } from '@/hooks/use-projects';
+import { useTeams } from '@/hooks/use-teams';
 import {
   useEmbeddingSettings,
   usePurgeOrganizationMemory,
@@ -59,6 +62,17 @@ async function fetchHealth(): Promise<HealthStatus> {
       detail: `Unreachable: ${message}`,
     };
   }
+}
+
+const DISTILLATION_ADVISORY =
+  'Per-observation candidates will always be held; session distillation must be healthy for memory to be promoted.';
+
+function distillationAdvisory(threshold: number | null | undefined): string | null {
+  if (threshold !== null && threshold !== undefined && threshold > 0.6) {
+    return DISTILLATION_ADVISORY;
+  }
+
+  return null;
 }
 
 function Eyebrow({ children, tone = 'muted' }: { children: React.ReactNode; tone?: 'muted' | 'danger' }) {
@@ -277,6 +291,8 @@ export default function SettingsPage() {
   });
 
   const orgsQuery = useOrganizations(activeOrgId);
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
+  const teamsQuery = useTeams(activeOrgId, { pageSize: 100 });
   const embeddingQuery = useEmbeddingSettings(activeOrgId);
   const retrievalQuery = useRetrievalSettings(activeOrgId);
   const retrievalMutation = useUpdateRetrievalSettings(activeOrgId);
@@ -285,13 +301,18 @@ export default function SettingsPage() {
   const [loggingOut, setLoggingOut] = React.useState(false);
   const [purgeOpen, setPurgeOpen] = React.useState(false);
   const [purgeConfirm, setPurgeConfirm] = React.useState('');
+  const [confirmPurgeOpen, setConfirmPurgeOpen] = React.useState(false);
   const [purgeResult, setPurgeResult] = React.useState<PurgeResult['deleted'] | null>(null);
 
   const activeOrg = orgsQuery.data?.results.find((org) => org.id === activeOrgId);
   const orgSlug = activeOrg?.slug ?? '';
 
+  const projectName = projectsQuery.data?.results.find((p) => p.id === activeProjectId)?.name ?? null;
+  const teamName = teamsQuery.data?.results.find((t) => t.id === activeTeamId)?.name ?? null;
+
   const embedding = embeddingQuery.data;
   const retrieval = retrievalQuery.data;
+  const advisory = retrievalMutation.data?.advisory ?? distillationAdvisory(retrieval?.distillation_auto_approve_threshold);
 
   const handleRetrievalToggle = React.useCallback(
     (key: keyof RetrievalSettings, next: boolean) => {
@@ -388,7 +409,9 @@ export default function SettingsPage() {
                 <Mono>{profile.identity_id}</Mono>
               </InfoRow>
               <InfoRow label='Organization'>
-                <Mono>{profile.organization_id}</Mono>
+                <span className='text-[13px] text-default-700' title={profile.organization_id}>
+                  {activeOrg?.name ?? profile.organization_id}
+                </span>
               </InfoRow>
               <InfoRow label='Capabilities'>
                 {profile.capabilities.length > 0 ? (
@@ -437,14 +460,18 @@ export default function SettingsPage() {
             </InfoRow>
             <InfoRow label='Project'>
               {activeProjectId ? (
-                <Mono>{activeProjectId}</Mono>
+                <span className='text-[13px] text-default-700' title={activeProjectId}>
+                  {projectName ?? activeProjectId}
+                </span>
               ) : (
                 <span className='font-mono text-[12.5px] text-default-400'>not set</span>
               )}
             </InfoRow>
             <InfoRow label='Team'>
               {activeTeamId ? (
-                <Mono>{activeTeamId}</Mono>
+                <span className='text-[13px] text-default-700' title={activeTeamId}>
+                  {teamName ?? activeTeamId}
+                </span>
               ) : (
                 <span className='font-mono text-[12.5px] text-default-400'>not set</span>
               )}
@@ -493,10 +520,38 @@ export default function SettingsPage() {
               disabled={!retrieval || retrievalMutation.isPending}
             />
             <Toggle
+              label='Lexical recall'
+              description='Retrieve keyword (trigram) matches alongside vector similarity.'
+              checked={retrieval?.lexical_recall_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('lexical_recall_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
+            <Toggle
+              label='Lexical fusion'
+              description='Blend lexical and semantic scores when ranking candidates.'
+              checked={retrieval?.lexical_fusion_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('lexical_fusion_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
+            <Toggle
+              label='Curator LLM judge'
+              description='Use an LLM to adjudicate contradictions and near-duplicates during curation.'
+              checked={retrieval?.curator_llm_judge_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('curator_llm_judge_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
+            <Toggle
               label='Confidence decay'
               description='Aged memories gradually lose confidence and enter the review queue.'
               checked={retrieval?.confidence_decay_enabled ?? false}
               onChange={(next) => handleRetrievalToggle('confidence_decay_enabled', next)}
+              disabled={!retrieval || retrievalMutation.isPending}
+            />
+            <Toggle
+              label='Real-time candidate capture'
+              description='Create memory candidates from individual hook observations (usually off; distillation is the primary path).'
+              checked={retrieval?.realtime_candidates_enabled ?? false}
+              onChange={(next) => handleRetrievalToggle('realtime_candidates_enabled', next)}
               disabled={!retrieval || retrievalMutation.isPending}
             />
             <NumberField
@@ -506,7 +561,7 @@ export default function SettingsPage() {
               onCommit={handleAutoApproveChange}
               disabled={!retrieval || retrievalMutation.isPending}
               allowNull
-              notice={retrievalMutation.data?.advisory ?? null}
+              notice={advisory}
             />
             <NumberField
               label='Near-duplicate threshold'
@@ -525,6 +580,12 @@ export default function SettingsPage() {
                   ? 'Saving…'
                   : 'Changes are saved automatically.'}
           </p>
+          {retrievalMutation.isError && (
+            <div className='mt-2 rounded-[10px] border border-danger/30 bg-danger/5 px-3 py-2 text-[12px] text-danger'>
+              Failed to save:{' '}
+              {retrievalMutation.error instanceof Error ? retrievalMutation.error.message : 'the change was not applied.'}
+            </div>
+          )}
         </SettingsCard>
 
         <SettingsCard
@@ -602,7 +663,7 @@ export default function SettingsPage() {
             <div className='flex items-center gap-2'>
               <button
                 type='button'
-                onClick={handlePurge}
+                onClick={() => setConfirmPurgeOpen(true)}
                 disabled={purgeConfirm !== orgSlug || !orgSlug || purgeMutation.isPending}
                 className='inline-flex h-10 items-center justify-center rounded-[11px] bg-danger px-4 text-[13.5px] font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50'
               >
@@ -632,6 +693,20 @@ export default function SettingsPage() {
         )}
         </div>
       </CapabilityGate>
+
+      <ConfirmDialog
+        isOpen={confirmPurgeOpen}
+        onClose={() => setConfirmPurgeOpen(false)}
+        onConfirm={() => {
+          setConfirmPurgeOpen(false);
+          handlePurge();
+        }}
+        title='Purge organization memory?'
+        description={`This permanently deletes every memory, candidate, and retrieval document for ${orgSlug}. This cannot be undone.`}
+        confirmLabel='Purge permanently'
+        confirmColor='danger'
+        isLoading={purgeMutation.isPending}
+      />
     </section>
   );
 }
