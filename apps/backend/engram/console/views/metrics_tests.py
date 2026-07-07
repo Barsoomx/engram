@@ -404,6 +404,85 @@ def test_project_limited_admin_activity_excludes_other_project(
 
 
 @pytest.mark.django_db
+def test_overview_narrows_to_project_id(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    other = _make_project(f_org, slug='other-overview')
+    _make_memory(f_org, f_project, title='in-scope')
+    _make_memory(f_org, other, title='other-project')
+
+    response = f_admin_client.get('/v1/admin/metrics/overview', {'project_id': str(f_project.id)})
+
+    assert response.status_code == 200
+    assert response.data['memories_indexed'] == 1
+
+
+@pytest.mark.django_db
+def test_overview_project_id_outside_scope_returns_empty_not_forbidden(
+    f_limited_client: APIClient,
+    f_limited_org: Organization,
+    f_project_a: Project,
+    f_project_b: Project,
+) -> None:
+    _make_memory(f_limited_org, f_project_a, title='visible')
+    _make_memory(f_limited_org, f_project_b, title='hidden')
+
+    response = f_limited_client.get('/v1/admin/metrics/overview', {'project_id': str(f_project_b.id)})
+
+    assert response.status_code == 200
+    assert response.data['memories_indexed'] == 0
+
+
+@pytest.mark.django_db
+def test_activity_narrows_to_project_id(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    other = _make_project(f_org, slug='other-activity')
+    _make_audit_event(f_org, f_project, event_type='VisibleEvent')
+    _make_audit_event(f_org, other, event_type='HiddenEvent')
+
+    response = f_admin_client.get('/v1/admin/metrics/activity', {'project_id': str(f_project.id)})
+
+    assert response.status_code == 200
+    event_types = [item['event_type'] for item in response.data]
+    assert 'VisibleEvent' in event_types
+    assert 'HiddenEvent' not in event_types
+
+
+@pytest.mark.django_db
+def test_sessions_narrows_to_project_id(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    other = _make_project(f_org, slug='other-sessions')
+    _make_session(f_org, f_project, f_agent, external_id='sess-in-scope')
+    other_agent = _make_agent(f_org, external_id='agent-other-sessions')
+    _make_session(f_org, other, other_agent, external_id='sess-other')
+
+    response = f_admin_client.get('/v1/admin/metrics/sessions', {'project_id': str(f_project.id)})
+
+    assert response.status_code == 200
+    external_ids = {item['session_id'] for item in response.data}
+    assert len(external_ids) == 1
+
+
+@pytest.mark.django_db
+def test_overview_invalid_project_id_returns_400(
+    f_admin_client: APIClient,
+    f_org: Organization,
+) -> None:
+    response = f_admin_client.get('/v1/admin/metrics/overview', {'project_id': 'not-a-uuid'})
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
 def test_requires_authentication(f_org: Organization) -> None:
     client = APIClient()
 
