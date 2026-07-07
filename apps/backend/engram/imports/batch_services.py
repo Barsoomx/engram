@@ -121,12 +121,21 @@ class FinalizeImportJobInput:
     request_id: str = ''
 
 
+@dataclass(frozen=True)
+class CancelImportJobInput:
+    organization: Organization
+    import_id: uuid.UUID
+    actor_id: uuid.UUID | None
+    request_id: str = ''
+
+
 class CreateImportJob:
     def execute(self, data: CreateImportJobInput) -> ImportJob:
         try:
             with transaction.atomic():
-                if self._active_job_exists(data):
-                    raise ImportJobConflictError('an active import already exists for this source store')
+                active = self._active_job(data)
+                if active is not None:
+                    raise self._conflict(active)
 
                 job = ImportJob.objects.create(
                     organization=data.organization,
@@ -140,7 +149,7 @@ class CreateImportJob:
                     created_by_identity=data.identity_id,
                 )
         except IntegrityError:
-            raise ImportJobConflictError('an active import already exists for this source store') from None
+            raise self._conflict(self._active_job(data)) from None
 
         _emit_job_audit(
             job,
@@ -156,13 +165,20 @@ class CreateImportJob:
 
         return job
 
-    def _active_job_exists(self, data: CreateImportJobInput) -> bool:
+    def _active_job(self, data: CreateImportJobInput) -> ImportJob | None:
         return ImportJob.objects.filter(
             organization=data.organization,
             project=data.project,
             source_store_id=data.source_store_id,
             status__in=NON_TERMINAL_IMPORT_STATUSES,
-        ).exists()
+        ).first()
+
+    def _conflict(self, active: ImportJob | None) -> ImportJobConflictError:
+        error = ImportJobConflictError('an active import already exists for this source store')
+        if active is not None:
+            error.active_import_id = str(active.id)
+
+        return error
 
 
 class ApplyImportBatch:
@@ -380,6 +396,35 @@ class FinalizeImportJob:
                 discrepancies[table] = {'expected': expected, 'received': actual}
 
         return discrepancies
+
+    def _lock_job(self, organization: Organization, import_id: uuid.UUID) -> ImportJob:
+        try:
+            return ImportJob.objects.select_for_update().get(organization=organization, id=import_id)
+        except ImportJob.DoesNotExist:
+            raise ImportJobNotFoundError('import job was not found') from None
+
+
+class CancelImportJob:
+    def execute(self, data: CancelImportJobInput) -> ImportJob:
+        with transaction.atomic():
+            job = self._lock_job(data.organization, data.import_id)
+            if job.is_terminal:
+                raise ImportJobStateError('import job is already finalized')
+
+            job.status = ImportJobStatus.FAILED
+            job.failure_reason = 'canceled'
+            job.save(update_fields=['status', 'failure_reason', 'updated_at'])
+
+        _emit_job_audit(
+            job,
+            event_type='ImportFailed',
+            result=AuditResult.ERROR,
+            actor_id=data.actor_id,
+            metadata={'reason': 'canceled', 'source_store_id': job.source_store_id},
+            request_id=data.request_id,
+        )
+
+        return job
 
     def _lock_job(self, organization: Organization, import_id: uuid.UUID) -> ImportJob:
         try:

@@ -22,6 +22,7 @@ MANAGER_DOMAIN_EXTRA_FIELDS = {
     'limit_days': int,
     'scope': str,
     'current_access_version': int,
+    'active_import_id': str,
 }
 
 

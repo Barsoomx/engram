@@ -228,7 +228,7 @@ def test_create_import_job_returns_import_id_and_emits_audit(f_scope: ImportScop
 
 @pytest.mark.django_db
 def test_create_rejects_second_active_job_for_same_store(f_scope: ImportScope) -> None:
-    _create_job(f_scope, store='dup-store')
+    active_id = _create_job(f_scope, store='dup-store')
 
     response = APIClient().post(
         '/v1/imports/claude-mem',
@@ -238,6 +238,85 @@ def test_create_rejects_second_active_job_for_same_store(f_scope: ImportScope) -
     )
 
     assert response.status_code == 409
+    assert response.data['code'] == 'import_job_conflict'
+    assert response.data['active_import_id'] == active_id
+
+
+def _cancel(scope: ImportScope, import_id: str) -> Any:
+    return APIClient().post(
+        f'/v1/imports/claude-mem/{import_id}/cancel',
+        {},
+        format='json',
+        **auth_headers(scope.raw_key),
+    )
+
+
+@pytest.mark.django_db
+def test_cancel_marks_job_failed_and_emits_audit(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='cancel-store')
+
+    response = _cancel(f_scope, import_id)
+
+    assert response.status_code == 200
+    assert response.data['status'] == ImportJobStatus.FAILED
+    assert response.data['failure_reason'] == 'canceled'
+    job = ImportJob.objects.get(id=import_id)
+    assert job.status == ImportJobStatus.FAILED
+    assert AuditEvent.objects.filter(
+        organization=f_scope.organization,
+        event_type='ImportFailed',
+        target_id=str(job.id),
+        metadata__reason='canceled',
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_cancel_frees_store_for_new_import(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='wedged-store')
+    _apply_batch(f_scope, import_id, 0, 'sdk_sessions', [session_row()])
+
+    assert _cancel(f_scope, import_id).status_code == 200
+
+    replacement = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(f_scope.project.id), 'source_store_id': 'wedged-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(f_scope.raw_key),
+    )
+    assert replacement.status_code == 201
+
+
+@pytest.mark.django_db
+def test_cancel_already_terminal_returns_409_state(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='twice-store')
+    assert _cancel(f_scope, import_id).status_code == 200
+
+    response = _cancel(f_scope, import_id)
+
+    assert response.status_code == 409
+    assert response.data['code'] == 'import_job_state'
+
+
+@pytest.mark.django_db
+def test_cancel_missing_capability_is_denied(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='nocap-cancel')
+    reader = create_admin_scope('cancelreader', OTHER_RAW_KEY, capabilities=('memories:read',))
+
+    response = _cancel(reader, import_id)
+
+    assert response.status_code in (403, 404)
+    assert ImportJob.objects.get(id=import_id).status == ImportJobStatus.CREATED
+
+
+@pytest.mark.django_db
+def test_key_from_other_org_cannot_cancel_foreign_job(f_scope: ImportScope) -> None:
+    import_id = _create_job(f_scope, store='foreign-cancel')
+    other = create_admin_scope('cancelbeta', OTHER_RAW_KEY)
+
+    response = _cancel(other, import_id)
+
+    assert response.status_code in (403, 404)
+    assert ImportJob.objects.get(id=import_id).status == ImportJobStatus.CREATED
 
 
 @pytest.mark.django_db

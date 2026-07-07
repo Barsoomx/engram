@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -13,11 +14,15 @@ from engram.core.models import AuditEvent, Organization, Project
 from engram.imports.batch_services import (
     ApplyImportBatch,
     ApplyImportBatchInput,
+    CancelImportJob,
+    CancelImportJobInput,
     CreateImportJob,
     CreateImportJobInput,
     ExpireStaleImportJobs,
     FinalizeImportJob,
     FinalizeImportJobInput,
+    ImportJobConflictError,
+    ImportJobNotFoundError,
     ImportJobStateError,
 )
 from engram.imports.models import ImportJob, ImportJobStatus
@@ -216,6 +221,94 @@ def test_finalize_counts_duplicates_and_skips_as_received(f_batch_scope: BatchSc
     )
 
     assert finalized.status == ImportJobStatus.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_create_conflict_carries_active_import_id(f_batch_scope: BatchScope) -> None:
+    active = _create_job(f_batch_scope, store='store-conflict')
+
+    with pytest.raises(ImportJobConflictError) as exc_info:
+        _create_job(f_batch_scope, store='store-conflict')
+
+    assert exc_info.value.error_code == 'import_job_conflict'
+    assert exc_info.value.active_import_id == str(active.id)
+
+
+@pytest.mark.django_db
+def test_cancel_marks_created_job_failed_with_reason_canceled(f_batch_scope: BatchScope) -> None:
+    job = _create_job(f_batch_scope, store='store-cancel')
+
+    canceled = CancelImportJob().execute(
+        CancelImportJobInput(
+            organization=f_batch_scope.organization,
+            import_id=job.id,
+            actor_id=None,
+        ),
+    )
+
+    assert canceled.status == ImportJobStatus.FAILED
+    assert canceled.failure_reason == 'canceled'
+    assert AuditEvent.objects.filter(
+        organization=f_batch_scope.organization,
+        event_type='ImportFailed',
+        target_id=str(job.id),
+        metadata__reason='canceled',
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_cancel_receiving_job_frees_store_for_replacement(f_batch_scope: BatchScope) -> None:
+    job = _create_job(f_batch_scope, store='store-replace')
+    _apply_sessions(f_batch_scope, job, [_session_row(1)])
+    job.refresh_from_db()
+    assert job.status == ImportJobStatus.RECEIVING
+
+    CancelImportJob().execute(
+        CancelImportJobInput(
+            organization=f_batch_scope.organization,
+            import_id=job.id,
+            actor_id=None,
+        ),
+    )
+    replacement = _create_job(f_batch_scope, store='store-replace')
+
+    assert replacement.id != job.id
+    assert replacement.status == ImportJobStatus.CREATED
+
+
+@pytest.mark.django_db
+def test_cancel_already_terminal_job_raises_state_error(f_batch_scope: BatchScope) -> None:
+    job = _create_job(f_batch_scope, store='store-terminal')
+    CancelImportJob().execute(
+        CancelImportJobInput(
+            organization=f_batch_scope.organization,
+            import_id=job.id,
+            actor_id=None,
+        ),
+    )
+
+    with pytest.raises(ImportJobStateError) as exc_info:
+        CancelImportJob().execute(
+            CancelImportJobInput(
+                organization=f_batch_scope.organization,
+                import_id=job.id,
+                actor_id=None,
+            ),
+        )
+
+    assert exc_info.value.error_code == 'import_job_state'
+
+
+@pytest.mark.django_db
+def test_cancel_unknown_job_raises_not_found(f_batch_scope: BatchScope) -> None:
+    with pytest.raises(ImportJobNotFoundError):
+        CancelImportJob().execute(
+            CancelImportJobInput(
+                organization=f_batch_scope.organization,
+                import_id=uuid.uuid4(),
+                actor_id=None,
+            ),
+        )
 
 
 @pytest.mark.django_db

@@ -15,7 +15,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.core.models import Organization, Project
+from engram.core.models import AuditEvent, Organization, Project
 from engram.imports.models import ImportJob, ImportJobStatus
 
 
@@ -66,9 +66,23 @@ def _make_job(organization: Organization, project: Project, source_store_id: str
     )
 
 
+def _make_active_job(organization: Organization, project: Project, source_store_id: str) -> ImportJob:
+    return ImportJob.objects.create(
+        organization=organization,
+        project=project,
+        source_store_id=source_store_id,
+        status=ImportJobStatus.RECEIVING,
+    )
+
+
 @pytest.fixture
 def f_reader() -> ConsoleScope:
     return _console_scope('reader', ('memories:read',))
+
+
+@pytest.fixture
+def f_admin() -> ConsoleScope:
+    return _console_scope('admin', ('memories:read', 'memories:admin'))
 
 
 @pytest.mark.django_db
@@ -104,3 +118,54 @@ def test_requires_memories_read_capability() -> None:
     response = scope.client.get('/v1/admin/imports/')
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_cancel_marks_active_job_failed_and_audits(f_admin: ConsoleScope) -> None:
+    job = _make_active_job(f_admin.organization, f_admin.project, 'admin-cancel')
+
+    response = f_admin.client.post(f'/v1/admin/imports/{job.id}/cancel')
+
+    assert response.status_code == 200
+    assert response.data['status'] == ImportJobStatus.FAILED
+    job.refresh_from_db()
+    assert job.status == ImportJobStatus.FAILED
+    assert job.failure_reason == 'canceled'
+    assert AuditEvent.objects.filter(
+        organization=f_admin.organization,
+        event_type='ImportCanceled',
+        target_id=str(job.id),
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_cancel_requires_memories_admin_capability(f_reader: ConsoleScope) -> None:
+    job = _make_active_job(f_reader.organization, f_reader.project, 'reader-cancel')
+
+    response = f_reader.client.post(f'/v1/admin/imports/{job.id}/cancel')
+
+    assert response.status_code == 403
+    job.refresh_from_db()
+    assert job.status == ImportJobStatus.RECEIVING
+
+
+@pytest.mark.django_db
+def test_cancel_terminal_job_returns_409(f_admin: ConsoleScope) -> None:
+    job = _make_job(f_admin.organization, f_admin.project, 'admin-terminal')
+
+    response = f_admin.client.post(f'/v1/admin/imports/{job.id}/cancel')
+
+    assert response.status_code == 409
+    assert response.data['code'] == 'import_job_state'
+
+
+@pytest.mark.django_db
+def test_cancel_is_org_scoped(f_admin: ConsoleScope) -> None:
+    other = _console_scope('otheradmin', ('memories:read', 'memories:admin'))
+    job = _make_active_job(other.organization, other.project, 'foreign-active')
+
+    response = f_admin.client.post(f'/v1/admin/imports/{job.id}/cancel')
+
+    assert response.status_code == 404
+    job.refresh_from_db()
+    assert job.status == ImportJobStatus.RECEIVING
