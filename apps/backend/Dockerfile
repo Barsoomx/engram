@@ -18,4 +18,4 @@ RUN poetry config virtualenvs.create false \
 
 COPY apps/backend /srv/app
 
-CMD ["gunicorn", "settings.wsgi:application", "--bind", "0.0.0.0:8000"]
+CMD ["granian", "--interface", "wsgi", "settings.wsgi:application", "--host", "0.0.0.0", "--port", "8000"]

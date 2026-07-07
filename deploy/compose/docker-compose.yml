@@ -14,6 +14,11 @@ x-backend: &backend
     ENGRAM_CELERY_RESULT_BACKEND: redis://redis:6379/1
     ENGRAM_PROVIDER_MODE: ${ENGRAM_PROVIDER_MODE:-fake}
     ENGRAM_REALTIME_MIN_CONTENT_CHARS: ${ENGRAM_REALTIME_MIN_CONTENT_CHARS:-80}
+    GRANIAN_WORKERS: ${ENGRAM_WEB_WORKERS:-2}
+    GRANIAN_BLOCKING_THREADS: '4'
+    GRANIAN_RESPAWN_FAILED_WORKERS: 'true'
+    GRANIAN_WORKERS_KILL_TIMEOUT: '35'
+    GRANIAN_WORKERS_MAX_RSS: ${ENGRAM_WEB_MAX_RSS_MB:-512}
   extra_hosts:
     - "host.docker.internal:host-gateway"
   depends_on:
@@ -30,7 +35,7 @@ services:
     command: >
       sh -ec "python manage.py migrate --noinput &&
               python manage.py engram_bootstrap_admin &&
-              gunicorn settings.wsgi:application --bind 0.0.0.0:8000"
+              granian --interface wsgi settings.wsgi:application --host 0.0.0.0 --port 8000"
     ports:
       - "8000:8000"
     healthcheck:
