@@ -5,13 +5,32 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
+import structlog
 from django.db.models import Prefetch, QuerySet
 from django.utils import timezone
 
 from engram.core.models import Memory, MemoryStatus, MemoryVersion, RetrievalDocument
 from engram.core.redaction import redact_value
 
+logger = structlog.get_logger(__name__)
+
 EXPORT_STREAM_CHUNK_SIZE = 200
+
+
+def guard_export_stream(chunks: Iterator[str]) -> Iterator[str]:
+    emitted = 0
+
+    try:
+        for chunk in chunks:
+            emitted += 1
+            yield chunk
+    except Exception:
+        logger.error(
+            'memory_export_stream_truncated',
+            items_emitted=emitted,
+        )
+
+        raise
 
 
 def export_queryset(

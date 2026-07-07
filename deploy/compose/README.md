@@ -6,8 +6,11 @@ Redis result/cache backend, and the Next.js admin frontend.
 
 ## Services
 
-- `api`: Django + Gunicorn on port `8000`. Healthcheck probes
-  `http://localhost:8000/-/readyz/`.
+- `api`: Django + Granian (WSGI) on port `8000`. Healthcheck probes
+  `http://localhost:8000/-/readyz/`. Worker count is tunable via
+  `ENGRAM_WEB_WORKERS` (default `2`); each worker is bounded to `4` blocking
+  threads, respawns on unexpected exit, honors a `35s` graceful-kill timeout,
+  and respawns above `ENGRAM_WEB_MAX_RSS_MB` MiB (default `512`).
 - `frontend`: Next.js admin console (`apps/frontend`) on port `3000`.
   Builds from the `apps/frontend` directory (see `apps/frontend/Dockerfile`,
   `pnpm start`). Server-side fetches reach the backend over the internal
