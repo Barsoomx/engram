@@ -195,9 +195,9 @@ def test_validate_sanitizes_provider_error(
 
     assert response.status_code == 200
     results = response.json()['results']
-    leak_surface = json.dumps([
-        {key: value for key, value in result.items() if key != 'policy_id'} for result in results
-    ])
+    leak_surface = json.dumps(
+        [{key: value for key, value in result.items() if key != 'policy_id'} for result in results]
+    )
     assert '402' not in leak_surface
     assert 'raw-key-sk-leak' not in leak_surface
     assert 'returned' not in leak_surface
