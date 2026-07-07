@@ -14,6 +14,7 @@ import { PageHeader } from '@/components/ui/page-header';
 import { PaginationFooter } from '@/components/ui/pagination-footer';
 import { StatusPill } from '@/components/ui/status-pill';
 import { TimeStamp } from '@/components/ui/time-stamp';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useUrlFilters } from '@/hooks/use-url-filters';
 import {
   listInspectionMemories,
@@ -146,20 +147,17 @@ export default function MemoriesPage() {
 
   const [filters, setFilters] = useUrlFilters(MEMORIES_FILTER_DEFAULTS);
   const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
 
   React.useEffect(() => {
     setSearchInput(filters.search);
   }, [filters.search]);
 
   React.useEffect(() => {
-    const handle = setTimeout(() => {
-      if (searchInput !== filters.search) {
-        setFilters({ search: searchInput, page: 1 });
-      }
-    }, 300);
-
-    return () => clearTimeout(handle);
-  }, [searchInput, filters.search, setFilters]);
+    if (debouncedSearch !== filters.search) {
+      setFilters({ search: debouncedSearch, page: 1 });
+    }
+  }, [debouncedSearch, filters.search, setFilters]);
 
   const page = Math.max(1, filters.page);
 

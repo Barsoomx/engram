@@ -50,6 +50,7 @@ import {
   useMemoryReviewAction,
   useMemoryReviewDiff,
 } from '@/hooks/use-memory-review';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useProjects } from '@/hooks/use-projects';
 import { useTeams } from '@/hooks/use-teams';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
@@ -114,18 +115,6 @@ const ACTIONS_FOR_TYPE: Record<MemoryReviewItemType, MemoryReviewActionName[]> =
   candidate: ['approve', 'edit', 'narrow', 'supersede', 'reject'],
   memory: ['restore', 'archive', 'reject'],
 };
-
-function formatDateTime(value: string | null | undefined): string {
-  if (!value) {
-    return '—';
-  }
-
-  try {
-    return new Date(value).toLocaleString();
-  } catch {
-    return value;
-  }
-}
 
 function confidenceColor(value: string | null): 'default' | 'success' | 'warning' | 'danger' {
   if (value === null) {
@@ -738,7 +727,9 @@ function DiffVersionCard({ title, slice }: { title: string; slice: MemoryReviewD
       </div>
       {slice ? (
         <>
-          <p className='text-xs text-default-500'>{formatDateTime(slice.created_at)}</p>
+          <p className='text-xs text-default-500'>
+            <TimeStamp value={slice.created_at} relative={false} />
+          </p>
           <pre className='max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-medium bg-content2/60 p-3 font-mono text-xs'>
             {slice.body}
           </pre>
@@ -810,6 +801,7 @@ export default function MemoryReviewPage() {
 
   const [filters, setFilters, resetFilters] = useUrlFilters<FilterState>(DEFAULT_FILTERS);
   const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
 
   const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
   const teamsQuery = useTeams(activeOrgId, { pageSize: 100 });
@@ -842,14 +834,10 @@ export default function MemoryReviewPage() {
   const [diffVersionPrompt, setDiffVersionPrompt] = React.useState<MemoryReviewItem | null>(null);
 
   React.useEffect(() => {
-    const handle = window.setTimeout(() => {
-      if (searchInput !== filters.search) {
-        setFilters({ search: searchInput, page: 1 });
-      }
-    }, 300);
-
-    return () => window.clearTimeout(handle);
-  }, [searchInput, filters.search, setFilters]);
+    if (debouncedSearch !== filters.search) {
+      setFilters({ search: debouncedSearch, page: 1 });
+    }
+  }, [debouncedSearch, filters.search, setFilters]);
 
   const queryParams = React.useMemo(() => buildParams(filters), [filters]);
 

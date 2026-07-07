@@ -12,6 +12,7 @@ import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { StatusPill } from '@/components/ui/status-pill';
 import { TimeStamp } from '@/components/ui/time-stamp';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, type MeResponse } from '@/lib/auth';
 import { listContextBundles, type ContextBundleListItem } from '@/lib/console-api';
@@ -214,16 +215,13 @@ export default function ContextBundlesPage() {
 
   const [filters, setFilters, resetFilters] = useUrlFilters<BundleFilters>(DEFAULT_FILTERS);
   const [sessionInput, setSessionInput] = React.useState(filters.session_id);
+  const debouncedSession = useDebouncedValue(sessionInput, 300);
 
   React.useEffect(() => {
-    const handle = window.setTimeout(() => {
-      if (sessionInput !== filters.session_id) {
-        setFilters({ session_id: sessionInput, page: 0 });
-      }
-    }, 300);
-
-    return () => window.clearTimeout(handle);
-  }, [sessionInput, filters.session_id, setFilters]);
+    if (debouncedSession !== filters.session_id) {
+      setFilters({ session_id: debouncedSession, page: 0 });
+    }
+  }, [debouncedSession, filters.session_id, setFilters]);
 
   const query = useQuery({
     queryKey: [
