@@ -41,3 +41,8 @@ class EmbeddingFieldsRequiredError(DomainError):
 class EmbeddingSecretNotFoundError(DomainError):
     default_error_code = 'embedding_secret_not_found'
     default_status_code = 400
+
+
+class DailyDigestAlreadyRunningError(DomainError):
+    default_error_code = 'daily_digest_already_running'
+    default_status_code = 409

@@ -123,6 +123,68 @@ export async function listInspectionMemories(
   return listEnvelope<InspectionMemory>(response.data);
 }
 
+export interface MemoryExportParams {
+  projectId: string;
+  teamId?: string | null;
+  allStatuses?: boolean;
+}
+
+function filenameFromDisposition(
+  header: string | undefined,
+  fallback: string,
+): string {
+  if (!header) {
+    return fallback;
+  }
+
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(header);
+
+  return match ? decodeURIComponent(match[1]) : fallback;
+}
+
+export async function downloadMemoryExport(
+  params: MemoryExportParams,
+): Promise<void> {
+  const query: Record<string, string> = { project_id: params.projectId };
+
+  if (params.teamId) {
+    query.team_id = params.teamId;
+  }
+
+  if (params.allStatuses) {
+    query.all_statuses = 'true';
+  }
+
+  const response = await apiClient().get('/v1/admin/memories/export', {
+    params: query,
+    responseType: 'blob',
+  });
+
+  const disposition = response.headers['content-disposition'] as
+    | string
+    | undefined;
+  const filename = filenameFromDisposition(
+    disposition,
+    `engram-memories-${params.projectId}.json`,
+  );
+
+  const blob = new Blob([response.data as BlobPart], {
+    type: 'application/json',
+  });
+  const url = URL.createObjectURL(blob);
+
+  try {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 /* ----------------------------- Search debugger ---------------------------- */
 
 export interface SearchDebugRequest {
@@ -724,6 +786,29 @@ export async function reviewDigest(
 ): Promise<DigestReviewResult> {
   const response = await apiClient().post<DigestReviewResult>(
     `/v1/admin/digests/${memoryId}/review`,
+    {},
+  );
+
+  return response.data;
+}
+
+export interface DigestRunWorkflow {
+  run_type: string;
+  project_id: string;
+  request_id: string;
+}
+
+export interface DigestRunResult {
+  enqueued: boolean;
+  reason?: string;
+  workflow?: DigestRunWorkflow;
+}
+
+export async function runProjectDigest(
+  projectId: string,
+): Promise<DigestRunResult> {
+  const response = await apiClient().post<DigestRunResult>(
+    `/v1/admin/projects/${projectId}/digest/run`,
     {},
   );
 
