@@ -12,9 +12,11 @@ import {
   inviteMember,
   listMembers,
   listRoles,
+  reactivateMember,
   updateMemberRole,
   type Member,
   type MemberInviteInput,
+  type MemberListParams,
   type MemberRoleInput,
   type Paginated,
   type Role,
@@ -28,7 +30,7 @@ export function useMembers(
 ) {
   return useQuery<Paginated<Member>>({
     queryKey: adminQueryKeys.members(orgId, params),
-    queryFn: () => listMembers(params),
+    queryFn: () => listMembers(params as MemberListParams | undefined),
     enabled: Boolean(orgId),
     ...options,
   });
@@ -78,6 +80,19 @@ export function useDeactivateMember(orgId: string | null) {
 
   return useMutation<void, unknown, string>({
     mutationFn: (id: string) => deactivateMember(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: adminQueryKeys.members(orgId),
+      });
+    },
+  });
+}
+
+export function useReactivateMember(orgId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation<void, unknown, string>({
+    mutationFn: (id: string) => reactivateMember(id),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: adminQueryKeys.members(orgId),

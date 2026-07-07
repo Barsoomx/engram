@@ -57,6 +57,12 @@ class ClaudePluginContractTests(unittest.TestCase):
             self.assertIn("--response-format claude-code", command)
             self.assertNotIn("claude-mem", command)
 
+    def test_session_start_matcher_covers_clear_and_compact(self) -> None:
+        hook_manifest = json.loads(HOOK_MANIFEST_PATH.read_text(encoding="utf-8"))
+        matcher = hook_manifest["hooks"]["SessionStart"][0]["matcher"]
+
+        self.assertEqual("startup|resume|clear|compact", matcher)
+
     def test_claude_plugin_ships_mcp_server(self) -> None:
         self.assertTrue(MCP_MANIFEST_PATH.exists(), MCP_MANIFEST_PATH)
         manifest = json.loads(MCP_MANIFEST_PATH.read_text(encoding="utf-8"))

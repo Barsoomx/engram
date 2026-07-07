@@ -14,6 +14,7 @@ import {
   type ApiKey,
   type ApiKeyIssueInput,
   type ApiKeyIssueResult,
+  type ApiKeyListParams,
   type Paginated,
 } from '@/lib/admin-api';
 import { adminQueryKeys } from '@/lib/query-keys';
@@ -25,7 +26,7 @@ export function useApiKeys(
 ) {
   return useQuery<Paginated<ApiKey>>({
     queryKey: adminQueryKeys.apiKeys(orgId, params),
-    queryFn: () => listApiKeys(params),
+    queryFn: () => listApiKeys(params as ApiKeyListParams | undefined),
     enabled: Boolean(orgId),
     ...options,
   });
