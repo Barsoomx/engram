@@ -34,9 +34,11 @@ from engram.core.models import (
     ContextBundleStatus,
     Memory,
     MemoryLink,
+    Observation,
     Organization,
     Project,
     ProjectTeam,
+    RawEventEnvelope,
     Runtime,
     Team,
     VisibilityScope,
@@ -277,6 +279,100 @@ def test_memory_inspection_lists_authorized_memories_and_redacts_detail_metadata
     assert detail['versions'][0]['version'] == 1
     assert detail['retrieval_documents'][0]['memory_id'] == str(project_memory.id)
     assert RAW_KEY not in str(detail)
+
+
+@pytest.mark.django_db
+def test_memory_detail_exposes_source_session_and_correlation() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Provenanced memory',
+        body='Body with provenance.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id='provenance-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='provenance-session',
+        runtime=Runtime.CODEX,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        client_event_id='provenance-event',
+        idempotency_key='provenance-event-key',
+        content_hash='provenance-hash',
+        runtime=Runtime.CODEX,
+        correlation_id='corr-provenance-1',
+        payload={'tool_name': 'bash'},
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='source observation',
+        content_hash='obs-provenance-hash',
+    )
+    version.source_observation = observation
+    version.save(update_fields=['source_observation', 'updated_at'])
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail['source_session_id'] == str(session.id)
+    assert detail['source_correlation_id'] == 'corr-provenance-1'
+
+
+@pytest.mark.django_db
+def test_memory_detail_source_session_is_null_without_source_observation() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_memory_admin_key(scope)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest-like memory',
+        body='No source observation recorded.',
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/inspection/memories/{memory.id}',
+        {'project_id': str(project.id)},
+        **auth_headers(INSPECTION_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    detail = response.json()
+    assert detail['source_session_id'] is None
+    assert detail['source_correlation_id'] is None
 
 
 @pytest.mark.django_db
