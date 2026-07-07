@@ -1,29 +1,53 @@
 'use client';
 
-import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
-import { AlertTriangle, ChevronDown, ScrollText, X } from 'lucide-react';
+import { Button, Input, Select, SelectItem } from '@heroui/react';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { ScrollText, X } from 'lucide-react';
+import Link from 'next/link';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { CopyableId } from '@/components/ui/copyable-id';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useProjects } from '@/hooks/use-projects';
+import { useTeams } from '@/hooks/use-teams';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import {
   listAuditEvents,
   type AuditEvent,
   type AuditEventListParams,
 } from '@/lib/admin-api';
 import { fetchMe, type MeResponse } from '@/lib/auth';
-import { formatRelativeTime } from '@/lib/design';
+import { auditResultColor } from '@/lib/design';
+import { endOfDayExclusiveIso, startOfDayIso } from '@/lib/format-time';
 import { useOrgStore } from '@/lib/org-store';
 import { adminQueryKeys } from '@/lib/query-keys';
 
 const PAGE_SIZE = 50;
 
-type AppliedFilters = {
-  eventType: string;
-  result: string;
-  since: string;
-  until: string;
+const RESULT_OPTIONS: { key: string; label: string }[] = [
+  { key: 'allowed', label: 'Allowed' },
+  { key: 'denied', label: 'Denied' },
+  { key: 'recorded', label: 'Recorded' },
+  { key: 'error', label: 'Error' },
+];
+
+const AUDIT_FILTER_DEFAULTS = {
+  event_type: '',
+  result: '',
+  actor_id: '',
+  target_type: '',
+  project_id: '',
+  team_id: '',
+  since: '',
+  until: '',
+  page: 1,
+  event: '',
 };
 
 type AuditAction =
@@ -44,16 +68,6 @@ const ACTION_STYLES: Record<AuditAction, string> = {
   secret: 'text-warning bg-warning/10',
   neutral: 'text-default-500 bg-content3',
 };
-
-const RESULT_COLORS: Record<string, string> = {
-  success: '#3DD9AC',
-  allowed: '#3DD9AC',
-  recorded: '#6BA6FF',
-  denied: '#FB6E72',
-};
-
-const GRID =
-  'grid grid-cols-[minmax(150px,0.9fr)_minmax(0,1.4fr)_minmax(0,1fr)_auto] items-center gap-4';
 
 function resolveAction(eventType: string): AuditAction {
   const v = eventType.toLowerCase();
@@ -93,8 +107,23 @@ function shortenId(value: string): string {
   return `${value.slice(0, 8)}…`;
 }
 
-function resultColorFor(result: string): string {
-  return RESULT_COLORS[result] ?? '#666C77';
+function ResultBadge({ result }: { result: string }) {
+  const color = auditResultColor(result);
+
+  return (
+    <span className='inline-flex items-center gap-1.5'>
+      <span
+        className='inline-block h-1.5 w-1.5 rounded-full'
+        style={{ backgroundColor: color }}
+      />
+      <span
+        className='whitespace-nowrap text-[11.5px] font-medium capitalize'
+        style={{ color }}
+      >
+        {result}
+      </span>
+    </span>
+  );
 }
 
 function AuditRow({
@@ -105,78 +134,70 @@ function AuditRow({
   onSelect: (event: AuditEvent) => void;
 }) {
   const action = resolveAction(event.event_type);
-  const resultColor = resultColorFor(event.result);
 
   return (
-    <div
+    <tr
       role='button'
       tabIndex={0}
       onClick={() => onSelect(event)}
       onKeyDown={(e) => e.key === 'Enter' && onSelect(event)}
-      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60`}
+      className='cursor-pointer border-b border-divider/50 transition-colors hover:bg-content2/60'
     >
-      <div className='min-w-0'>
+      <td className='py-2.5 px-3'>
         <span
           className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2 py-0.5 font-mono text-[11px] font-medium ${ACTION_STYLES[action]}`}
+          title={event.event_type}
         >
           {event.event_type}
         </span>
-      </div>
-
-      <div className='min-w-0'>
+      </td>
+      <td className='py-2.5 px-3'>
         {event.target_display || event.target_type || event.target_id ? (
-          <div className='truncate text-[13px] text-default-700'>
-            {event.target_display ?? event.target_type ?? 'target'}
-            {!event.target_display && event.target_id && (
-              <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
-                {shortenId(event.target_id)}
-              </span>
+          <div className='min-w-0'>
+            <div className='truncate text-[13px] text-default-700' title={event.target_display ?? event.target_id ?? ''}>
+              {event.target_display ?? event.target_type ?? 'target'}
+              {!event.target_display && event.target_id && (
+                <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
+                  {shortenId(event.target_id)}
+                </span>
+              )}
+            </div>
+            {event.capability && (
+              <div className='truncate font-mono text-[11px] text-default-400'>
+                {event.capability}
+              </div>
             )}
           </div>
         ) : (
           <span className='text-[13px] text-default-400'>—</span>
         )}
-        {event.capability && (
-          <div className='truncate font-mono text-[11px] text-default-400'>
-            {event.capability}
-          </div>
-        )}
-      </div>
-
-      <div className='min-w-0 truncate text-[13px]'>
-        <span className='text-default-400'>by </span>
-        {event.actor_display ? (
-          <span className='text-default-600'>{event.actor_display}</span>
-        ) : (
-          <>
-            <span className='text-default-500'>{event.actor_type}</span>
-            {event.actor_id && (
-              <span className='ml-1 font-mono text-[11.5px] text-default-400'>
-                {shortenId(event.actor_id)}
-              </span>
-            )}
-          </>
-        )}
-      </div>
-
-      <div className='flex items-center justify-end gap-2.5'>
-        <span className='inline-flex items-center gap-1.5'>
-          <span
-            className='inline-block h-1.5 w-1.5 rounded-full'
-            style={{ backgroundColor: resultColor }}
-          />
-          <span
-            className='whitespace-nowrap text-[11.5px] font-medium capitalize'
-            style={{ color: resultColor }}
-          >
-            {event.result}
-          </span>
-        </span>
-        <span className='tnum whitespace-nowrap font-mono text-[11.5px] text-default-400'>
-          {formatRelativeTime(event.created_at)}
-        </span>
-      </div>
-    </div>
+      </td>
+      <td className='py-2.5 px-3'>
+        <div className='min-w-0 truncate text-[13px]' title={event.actor_display ?? event.actor_id}>
+          {event.actor_display ? (
+            <span className='text-default-600'>{event.actor_display}</span>
+          ) : (
+            <>
+              <span className='text-default-500'>{event.actor_type}</span>
+              {event.actor_id && (
+                <span className='ml-1 font-mono text-[11.5px] text-default-400'>
+                  {shortenId(event.actor_id)}
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </td>
+      <td className='py-2.5 px-3'>
+        <ResultBadge result={event.result} />
+      </td>
+      <td className='py-2.5 px-3 text-right'>
+        <TimeStamp
+          value={event.created_at}
+          className='tnum whitespace-nowrap font-mono text-[11.5px] text-default-400'
+        />
+      </td>
+    </tr>
   );
 }
 
@@ -188,44 +209,52 @@ function AuditTable({
   onSelect: (event: AuditEvent) => void;
 }) {
   return (
-    <div className='surface-card overflow-hidden'>
-      <div
-        className={`${GRID} border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400`}
-      >
-        <span>Event</span>
-        <span>Target</span>
-        <span>Actor</span>
-        <span className='text-right'>When</span>
-      </div>
-      {items.map((event) => (
-        <AuditRow key={event.id} event={event} onSelect={onSelect} />
-      ))}
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={760}>
+        <thead>
+          <tr className='border-b border-divider text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+            <th className='py-2 px-3 text-left font-medium'>Event</th>
+            <th className='py-2 px-3 text-left font-medium'>Target</th>
+            <th className='py-2 px-3 text-left font-medium'>Actor</th>
+            <th className='py-2 px-3 text-left font-medium'>Result</th>
+            <th className='py-2 px-3 text-right font-medium'>When</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((event) => (
+            <AuditRow key={event.id} event={event} onSelect={onSelect} />
+          ))}
+        </tbody>
+      </ResponsiveTable>
     </div>
   );
 }
 
 function AuditSkeleton() {
   return (
-    <div className='surface-card overflow-hidden'>
-      <div
-        className={`${GRID} border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400`}
-      >
-        <span>Event</span>
-        <span>Target</span>
-        <span>Actor</span>
-        <span className='text-right'>When</span>
-      </div>
-      {Array.from({ length: 6 }).map((_, index) => (
-        <div
-          key={index}
-          className={`${GRID} border-b border-divider px-5 py-3.5 last:border-b-0`}
-        >
-          <span className='h-5 w-24 rounded-[7px] bg-content2 animate-pulse' />
-          <span className='h-3.5 w-40 rounded-medium bg-content2 animate-pulse' />
-          <span className='h-3.5 w-28 rounded-medium bg-content2 animate-pulse' />
-          <span className='ml-auto h-3.5 w-16 rounded-medium bg-content2 animate-pulse' />
-        </div>
-      ))}
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={760}>
+        <thead>
+          <tr className='border-b border-divider text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+            {['Event', 'Target', 'Actor', 'Result', 'When'].map((label) => (
+              <th key={label} className='py-2 px-3 text-left font-medium'>
+                {label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {Array.from({ length: 8 }).map((_, index) => (
+            <tr key={index} className='border-b border-divider/50'>
+              {Array.from({ length: 5 }).map((__, cell) => (
+                <td key={cell} className='py-3 px-3'>
+                  <span className='block h-3.5 w-full animate-pulse rounded-medium bg-content2' />
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </ResponsiveTable>
     </div>
   );
 }
@@ -244,11 +273,13 @@ function DetailRow({ label, value }: { label: string; value: React.ReactNode }) 
 function AuditDetailModal({
   event,
   onClose,
+  onFilterActor,
 }: {
   event: AuditEvent;
   onClose: () => void;
+  onFilterActor: (actorId: string) => void;
 }) {
-  const resultColor = resultColorFor(event.result);
+  const isMemoryTarget = event.target_type === 'memory' && Boolean(event.target_id);
 
   return (
     <div
@@ -276,20 +307,7 @@ function AuditDetailModal({
             label='Event type'
             value={<span className='font-mono text-[12px]'>{event.event_type}</span>}
           />
-          <DetailRow
-            label='Result'
-            value={
-              <span className='inline-flex items-center gap-1.5'>
-                <span
-                  className='inline-block h-1.5 w-1.5 rounded-full'
-                  style={{ backgroundColor: resultColor }}
-                />
-                <span className='font-medium capitalize' style={{ color: resultColor }}>
-                  {event.result}
-                </span>
-              </span>
-            }
-          />
+          <DetailRow label='Result' value={<ResultBadge result={event.result} />} />
           {event.capability && (
             <DetailRow
               label='Capability'
@@ -299,48 +317,54 @@ function AuditDetailModal({
           <DetailRow
             label='Actor'
             value={
-              event.actor_display ? (
+              <div className='flex min-w-0 flex-wrap items-center gap-2'>
                 <span>
-                  {event.actor_display}
+                  {event.actor_display ?? event.actor_type}
                   <span className='ml-1.5 text-[11.5px] text-default-400'>
                     ({event.actor_type})
                   </span>
                 </span>
-              ) : (
-                <span>
-                  <span className='text-default-500'>{event.actor_type}</span>
-                  {event.actor_id && (
-                    <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
-                      {event.actor_id}
-                    </span>
-                  )}
-                </span>
-              )
+                {event.actor_id && (
+                  <>
+                    <CopyableId value={event.actor_id} display={shortenId(event.actor_id)} />
+                    <button
+                      type='button'
+                      onClick={() => onFilterActor(event.actor_id)}
+                      className='text-[11.5px] font-medium text-primary-300 hover:underline'
+                    >
+                      Filter by actor
+                    </button>
+                  </>
+                )}
+              </div>
             }
           />
           {(event.target_display || event.target_type || event.target_id) && (
             <DetailRow
               label='Target'
               value={
-                event.target_display ? (
+                <div className='flex min-w-0 flex-wrap items-center gap-2'>
                   <span>
-                    {event.target_display}
-                    {event.target_type && (
+                    {event.target_display ?? event.target_type}
+                    {event.target_type && event.target_display && (
                       <span className='ml-1.5 text-[11.5px] text-default-400'>
                         ({event.target_type})
                       </span>
                     )}
                   </span>
-                ) : (
-                  <span>
-                    <span className='text-default-500'>{event.target_type}</span>
-                    {event.target_id && (
-                      <span className='ml-1.5 font-mono text-[11.5px] text-default-400'>
-                        {event.target_id}
-                      </span>
-                    )}
-                  </span>
-                )
+                  {isMemoryTarget ? (
+                    <Link
+                      href={`/memories/${event.target_id}`}
+                      className='text-[11.5px] font-medium text-primary-300 hover:underline'
+                    >
+                      Open memory
+                    </Link>
+                  ) : (
+                    event.target_id && (
+                      <CopyableId value={event.target_id} display={shortenId(event.target_id)} />
+                    )
+                  )}
+                </div>
               }
             />
           )}
@@ -350,7 +374,7 @@ function AuditDetailModal({
               value={<span className='break-all font-mono text-[12px]'>{event.request_id}</span>}
             />
           )}
-          <DetailRow label='When' value={formatRelativeTime(event.created_at)} />
+          <DetailRow label='When' value={<TimeStamp value={event.created_at} relative={false} />} />
           {event.metadata && Object.keys(event.metadata).length > 0 && (
             <div className='py-2.5'>
               <span className='block pb-2 text-[11.5px] font-semibold uppercase tracking-[0.08em] text-default-400'>
@@ -369,86 +393,66 @@ function AuditDetailModal({
 
 function AuditLog() {
   const activeOrgId = useOrgStore((s) => s.activeOrgId);
+  const [filters, setFilters] = useUrlFilters(AUDIT_FILTER_DEFAULTS);
 
-  const [draftEventType, setDraftEventType] = React.useState('');
-  const [draftResult, setDraftResult] = React.useState('');
-  const [draftSince, setDraftSince] = React.useState('');
-  const [draftUntil, setDraftUntil] = React.useState('');
-  const [appliedFilters, setAppliedFilters] = React.useState<AppliedFilters>({
-    eventType: '',
-    result: '',
-    since: '',
-    until: '',
-  });
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
+  const teamsQuery = useTeams(activeOrgId, { pageSize: 200 });
+  const projects = projectsQuery.data?.results ?? [];
+  const teams = teamsQuery.data?.results ?? [];
 
-  const [selectedEvent, setSelectedEvent] = React.useState<AuditEvent | null>(null);
+  const page = Math.max(1, filters.page);
 
-  const buildParams = React.useCallback(
-    (page: number): AuditEventListParams => {
-      const params: AuditEventListParams = { page, pageSize: PAGE_SIZE };
+  const params = React.useMemo<AuditEventListParams>(() => {
+    const next: AuditEventListParams = { page, pageSize: PAGE_SIZE };
 
-      if (appliedFilters.eventType) params.event_type = appliedFilters.eventType;
-      if (appliedFilters.result) params.result = appliedFilters.result;
-      if (appliedFilters.since) params.created_at__gte = appliedFilters.since;
-      if (appliedFilters.until) params.created_at__lt = appliedFilters.until;
+    if (filters.event_type) next.event_type = filters.event_type;
+    if (filters.result) next.result = filters.result;
+    if (filters.actor_id) next.actor_id = filters.actor_id;
+    if (filters.target_type) next.target_type = filters.target_type;
+    if (filters.project_id) next.project_id = filters.project_id;
+    if (filters.team_id) next.team_id = filters.team_id;
 
-      return params;
-    },
-    [appliedFilters],
-  );
+    const since = startOfDayIso(filters.since);
+    const until = endOfDayExclusiveIso(filters.until);
 
-  const query = useInfiniteQuery({
-    queryKey: adminQueryKeys.auditEvents(activeOrgId, appliedFilters),
+    if (since) next.created_at__gte = since;
+    if (until) next.created_at__lt = until;
+
+    return next;
+  }, [
+    page,
+    filters.event_type,
+    filters.result,
+    filters.actor_id,
+    filters.target_type,
+    filters.project_id,
+    filters.team_id,
+    filters.since,
+    filters.until,
+  ]);
+
+  const query = useQuery({
+    queryKey: adminQueryKeys.auditEvents(activeOrgId, params),
     enabled: Boolean(activeOrgId),
-    initialPageParam: 1,
-    queryFn: ({ pageParam }) => listAuditEvents(buildParams(pageParam)),
-    getNextPageParam: (lastPage, allPages) => {
-      const loaded = allPages.reduce(
-        (sum, page) => sum + page.results.length,
-        0,
-      );
-
-      return loaded < lastPage.count ? allPages.length + 1 : undefined;
-    },
+    placeholderData: keepPreviousData,
+    queryFn: () => listAuditEvents(params),
   });
 
-  const allItems = React.useMemo(
-    () => query.data?.pages.flatMap((page) => page.results) ?? [],
-    [query.data],
-  );
-
-  const totalCount = query.data?.pages[0]?.count ?? 0;
-  const hasMore = Boolean(query.hasNextPage);
-  const isLoadingMore = query.isFetchingNextPage;
-  const loadMoreError =
-    query.isError && query.data
-      ? query.error instanceof Error
-        ? query.error.message
-        : 'Failed to load more events.'
-      : null;
+  const items = query.data?.results ?? [];
+  const total = query.data?.count ?? 0;
+  const selectedEvent = filters.event
+    ? items.find((event) => event.id === filters.event) ?? null
+    : null;
 
   const hasActiveFilters =
-    Boolean(appliedFilters.eventType) ||
-    Boolean(appliedFilters.result) ||
-    Boolean(appliedFilters.since) ||
-    Boolean(appliedFilters.until);
-
-  const applyFilters = () => {
-    setAppliedFilters({
-      eventType: draftEventType.trim(),
-      result: draftResult.trim(),
-      since: draftSince,
-      until: draftUntil,
-    });
-  };
-
-  const clearFilters = () => {
-    setDraftEventType('');
-    setDraftResult('');
-    setDraftSince('');
-    setDraftUntil('');
-    setAppliedFilters({ eventType: '', result: '', since: '', until: '' });
-  };
+    Boolean(filters.event_type) ||
+    Boolean(filters.result) ||
+    Boolean(filters.actor_id) ||
+    Boolean(filters.target_type) ||
+    Boolean(filters.project_id) ||
+    Boolean(filters.team_id) ||
+    Boolean(filters.since) ||
+    Boolean(filters.until);
 
   return (
     <section className='space-y-6'>
@@ -457,136 +461,160 @@ function AuditLog() {
         subtitle='Every privileged action across your organization, with actor and outcome.'
       />
 
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          applyFilters();
-        }}
-        className='surface-card px-5 py-4'
-      >
-        <div className='flex flex-wrap gap-3'>
-          <div className='flex min-w-[160px] flex-1 flex-col gap-1.5'>
-            <label className='text-[11px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-              Event type
-            </label>
-            <input
-              value={draftEventType}
-              onChange={(e) => setDraftEventType(e.target.value)}
-              placeholder='e.g. ProjectCreated'
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden placeholder:text-default-400 focus:border-primary'
-            />
-          </div>
-          <div className='flex min-w-[130px] flex-col gap-1.5'>
-            <label className='text-[11px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-              Result
-            </label>
-            <input
-              value={draftResult}
-              onChange={(e) => setDraftResult(e.target.value)}
-              placeholder='allowed / denied / recorded'
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden placeholder:text-default-400 focus:border-primary'
-            />
-          </div>
-          <div className='flex min-w-[130px] flex-col gap-1.5'>
-            <label className='text-[11px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-              Since
-            </label>
-            <input
-              type='date'
-              value={draftSince}
-              onChange={(e) => setDraftSince(e.target.value)}
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden focus:border-primary'
-            />
-          </div>
-          <div className='flex min-w-[130px] flex-col gap-1.5'>
-            <label className='text-[11px] font-semibold uppercase tracking-[0.08em] text-default-400'>
-              Until
-            </label>
-            <input
-              type='date'
-              value={draftUntil}
-              onChange={(e) => setDraftUntil(e.target.value)}
-              className='h-9 rounded-[9px] border border-divider-strong bg-content2 px-3 text-[13px] text-foreground outline-hidden focus:border-primary'
-            />
-          </div>
-          <div className='flex items-end gap-2'>
-            <button
-              type='submit'
-              className='h-9 rounded-[9px] bg-foreground px-4 text-[13px] font-medium text-background transition-colors hover:opacity-80'
-            >
-              Apply
-            </button>
-            {hasActiveFilters && (
-              <button
-                type='button'
-                onClick={clearFilters}
-                className='h-9 rounded-[9px] border border-divider-strong px-3 text-[13px] font-medium text-default-500 transition-colors hover:text-foreground'
-              >
-                Clear
-              </button>
-            )}
-          </div>
+      <div className='surface-card p-4'>
+        <div className='grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4'>
+          <Input
+            label='Event type'
+            labelPlacement='outside'
+            placeholder='e.g. ProjectCreated'
+            variant='bordered'
+            size='sm'
+            value={filters.event_type}
+            onValueChange={(v) => setFilters({ event_type: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ event_type: '', page: 1 })}
+          />
+          <Select
+            label='Result'
+            labelPlacement='outside'
+            placeholder='Any result'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.result ? new Set([filters.result]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ result: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {RESULT_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+          <Input
+            label='Actor ID'
+            labelPlacement='outside'
+            placeholder='actor uuid'
+            variant='bordered'
+            size='sm'
+            value={filters.actor_id}
+            onValueChange={(v) => setFilters({ actor_id: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ actor_id: '', page: 1 })}
+            classNames={{ input: 'font-mono text-xs' }}
+          />
+          <Input
+            label='Target type'
+            labelPlacement='outside'
+            placeholder='e.g. memory'
+            variant='bordered'
+            size='sm'
+            value={filters.target_type}
+            onValueChange={(v) => setFilters({ target_type: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ target_type: '', page: 1 })}
+          />
+          <Select
+            label='Project'
+            labelPlacement='outside'
+            placeholder='All projects'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.project_id ? new Set([filters.project_id]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ project_id: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {projects.map((project) => (
+              <SelectItem key={project.id}>{project.name}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            label='Team'
+            labelPlacement='outside'
+            placeholder='All teams'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.team_id ? new Set([filters.team_id]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ team_id: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {teams.map((team) => (
+              <SelectItem key={team.id}>{team.name}</SelectItem>
+            ))}
+          </Select>
+          <Input
+            label='Since'
+            labelPlacement='outside'
+            type='date'
+            variant='bordered'
+            size='sm'
+            value={filters.since}
+            onValueChange={(v) => setFilters({ since: v, page: 1 })}
+          />
+          <Input
+            label='Until'
+            labelPlacement='outside'
+            type='date'
+            variant='bordered'
+            size='sm'
+            value={filters.until}
+            onValueChange={(v) => setFilters({ until: v, page: 1 })}
+          />
         </div>
-      </form>
+        {hasActiveFilters && (
+          <div className='mt-3 flex justify-end'>
+            <Button size='sm' variant='light' onPress={() => setFilters(AUDIT_FILTER_DEFAULTS)}>
+              Clear filters
+            </Button>
+          </div>
+        )}
+      </div>
 
-      {query.isLoading && <AuditSkeleton />}
-
-      {query.isError && !query.data && (
-        <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-          <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-          <p className='text-[13px] leading-relaxed text-danger'>
-            {query.error instanceof Error ? query.error.message : 'Failed to load audit events.'}
-          </p>
+      {query.isLoading ? (
+        <AuditSkeleton />
+      ) : query.isError && !query.data ? (
+        <ErrorState
+          message={
+            query.error instanceof Error ? query.error.message : 'Failed to load audit events.'
+          }
+          onRetry={() => query.refetch()}
+        />
+      ) : items.length === 0 ? (
+        <EmptyState
+          title={hasActiveFilters ? 'No matching events' : 'No audit events yet'}
+          description={
+            hasActiveFilters
+              ? 'No audit events match the current filters.'
+              : 'Privileged actions across your organization will appear here as they happen.'
+          }
+          icon={<ScrollText className='h-6 w-6' />}
+        />
+      ) : (
+        <div className='space-y-3'>
+          <AuditTable items={items} onSelect={(event) => setFilters({ event: event.id })} />
+          <PaginationFooter
+            page={page}
+            pageSize={PAGE_SIZE}
+            total={total}
+            noun='event'
+            onPageChange={(next) => setFilters({ page: next })}
+            isDisabled={query.isFetching}
+          />
         </div>
       )}
 
-      {query.data &&
-        (allItems.length > 0 ? (
-          <div className='space-y-3'>
-            <AuditTable items={allItems} onSelect={setSelectedEvent} />
-
-            {loadMoreError && (
-              <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-                <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-                <p className='text-[13px] leading-relaxed text-danger'>{loadMoreError}</p>
-              </div>
-            )}
-
-            {hasMore ? (
-              <button
-                type='button'
-                onClick={() => void query.fetchNextPage()}
-                disabled={isLoadingMore}
-                className='flex w-full items-center justify-center gap-2 rounded-[12px] border border-divider-strong bg-content1 py-3 text-[13.5px] font-medium text-default-600 transition-colors hover:bg-content2 disabled:cursor-wait disabled:opacity-60'
-              >
-                {isLoadingMore ? (
-                  <span className='animate-pulse'>Loading…</span>
-                ) : (
-                  <>
-                    <ChevronDown size={16} strokeWidth={1.8} />
-                    Load more
-                    <span className='ml-1 text-default-400'>
-                      ({totalCount - allItems.length} remaining)
-                    </span>
-                  </>
-                )}
-              </button>
-            ) : (
-              <p className='tnum text-[12px] text-default-400'>
-                Total {totalCount} {totalCount === 1 ? 'event' : 'events'}
-              </p>
-            )}
-          </div>
-        ) : (
-          <EmptyState
-            title='No audit events yet'
-            description='Privileged actions across your organization will appear here as they happen.'
-            icon={<ScrollText className='h-6 w-6' />}
-          />
-        ))}
-
       {selectedEvent && (
-        <AuditDetailModal event={selectedEvent} onClose={() => setSelectedEvent(null)} />
+        <AuditDetailModal
+          event={selectedEvent}
+          onClose={() => setFilters({ event: '' })}
+          onFilterActor={(actorId) => setFilters({ actor_id: actorId, event: '', page: 1 })}
+        />
       )}
     </section>
   );
