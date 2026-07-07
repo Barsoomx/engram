@@ -156,8 +156,14 @@ export type ProjectWriteInput = {
   default_branch: string;
 };
 
+export type ProjectOrdering = '-created_at' | 'name';
+
+export type ProjectListParams = ListParams & {
+  ordering?: ProjectOrdering;
+};
+
 export async function listProjects(
-  params?: ListParams,
+  params?: ProjectListParams,
 ): Promise<Paginated<Project>> {
   const client = apiClient();
   const response = await client.get<Paginated<Project>>(
@@ -200,6 +206,7 @@ export type Role = {
   id: string;
   code: string;
   name: string;
+  description?: string;
   built_in: boolean;
   capabilities: string[];
 };
@@ -241,8 +248,13 @@ export type MemberRoleInput = {
   role: string;
 };
 
+export type MemberListParams = ListParams & {
+  role?: string;
+  active?: boolean;
+};
+
 export async function listMembers(
-  params?: ListParams,
+  params?: MemberListParams,
 ): Promise<Paginated<Member>> {
   const client = apiClient();
   const response = await client.get<Paginated<Member>>(
@@ -281,8 +293,20 @@ export async function deactivateMember(id: string): Promise<void> {
   await client.delete(`/v1/admin/members/${id}/`);
 }
 
+export async function reactivateMember(id: string): Promise<void> {
+  const client = apiClient();
+
+  await client.post(`/v1/admin/members/${id}/reactivate/`);
+}
+
+export type ApiKeyStatus = 'active' | 'expired' | 'revoked';
+
+export type ApiKeyListParams = ListParams & {
+  status?: ApiKeyStatus;
+};
+
 export async function listApiKeys(
-  params?: ListParams,
+  params?: ApiKeyListParams,
 ): Promise<Paginated<ApiKey>> {
   const client = apiClient();
   const response = await client.get<Paginated<ApiKey>>(
@@ -389,6 +413,8 @@ export type WorkflowRunListParams = ListParams & {
   project_id?: string;
   team_id?: string;
   escalation?: boolean;
+  request_id?: string;
+  correlation_id?: string;
   created_at__gte?: string;
   created_at__lte?: string;
 };
@@ -464,6 +490,12 @@ export type MemoryReviewItem = {
   created_at: string;
 };
 
+export type MemoryReviewOrdering =
+  | 'confidence'
+  | '-confidence'
+  | 'created_at'
+  | '-created_at';
+
 export type MemoryReviewListParams = ListParams & {
   team_id?: string;
   project_id?: string;
@@ -473,6 +505,7 @@ export type MemoryReviewListParams = ListParams & {
   status?: string;
   age_days__gte?: number;
   source_type?: string;
+  ordering?: MemoryReviewOrdering;
   page?: number;
 };
 
