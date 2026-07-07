@@ -100,6 +100,8 @@ ERROR_REMEDIATION: dict[str, str] = {
     "import_create_failed": "Check the server response and retry the import.",
     "import_batch_failed": "Check the server response and retry the import.",
     "import_finalize_failed": "Check the server response and retry the import.",
+    "import_payload_too_large": "A claude-mem batch exceeded the server request limit; the CLI retries with smaller batches.",
+    "import_row_too_large": "A single claude-mem row exceeds the server request limit; shrink or remove it in claude-mem.db, or re-run with --skip-observations.",
 }
 
 
