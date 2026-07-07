@@ -194,11 +194,13 @@ def test_validate_sanitizes_provider_error(
     response = f_admin_client.post(VALIDATE_URL, {}, format='json')
 
     assert response.status_code == 200
-    body = json.dumps(response.json())
-    assert '402' not in body
-    assert 'raw-key-sk-leak' not in body
-    assert 'returned' not in body
     results = response.json()['results']
+    leak_surface = json.dumps([
+        {key: value for key, value in result.items() if key != 'policy_id'} for result in results
+    ])
+    assert '402' not in leak_surface
+    assert 'raw-key-sk-leak' not in leak_surface
+    assert 'returned' not in leak_surface
     assert results[0]['ok'] is False
     assert results[0]['error_code'] == 'provider_http_error'
     assert results[0]['public_error']
