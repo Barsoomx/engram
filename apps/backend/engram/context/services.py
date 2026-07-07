@@ -1019,7 +1019,7 @@ class BuildContextBundle:
                 retrieval_latency_ms=retrieval_latency_ms,
             )
             persisted_matches = self._create_items(bundle, kept)
-            bundle.rendered_text = self._render_context(persisted_matches, warnings)
+            bundle.rendered_text = self._render_context(persisted_matches, warnings, data.purpose)
             bundle.selected_count = len(persisted_matches)
             bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
             self._audit_retrieval(
@@ -1289,9 +1289,17 @@ class BuildContextBundle:
 
         return tuple(persisted)
 
-    def _render_context(self, matches: tuple[RetrievalMatch, ...], warnings: list[RetrievalWarning]) -> str:
+    def _render_context(
+        self,
+        matches: tuple[RetrievalMatch, ...],
+        warnings: list[RetrievalWarning],
+        purpose: str,
+    ) -> str:
         if not matches:
-            base = '# Engram context\n\nNo approved memory matched this request.'
+            if purpose == 'user_prompt_submit':
+                base = ''
+            else:
+                base = '# Engram context\n\nNo approved memory matched this request.'
         else:
             lines = ['# Engram context', '']
             for index, match in enumerate(matches, start=1):
@@ -1301,10 +1309,13 @@ class BuildContextBundle:
         if not warnings:
             return base
 
-        warning_lines = ['', '> Warnings:']
+        warning_lines = ['> Warnings:']
         warning_lines.extend(f'> - {warning.message}' for warning in warnings)
+        warning_block = '\n'.join(warning_lines)
+        if not base:
+            return warning_block
 
-        return base + '\n' + '\n'.join(warning_lines)
+        return base + '\n\n' + warning_block
 
     def _authorization_scope(self, scope: EffectiveScope) -> dict[str, object]:
         return {
