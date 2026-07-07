@@ -211,6 +211,23 @@ def timestamp(value: object) -> str | None:
     return value.isoformat()
 
 
+def _memory_source_provenance(memory: Memory) -> tuple[str | None, str | None]:
+    for version in memory.versions.all():
+        observation = version.source_observation
+        if observation is None:
+            continue
+
+        session_id = str(observation.session_id) if observation.session_id else None
+        correlation_id = None
+        raw_event = observation.raw_event
+        if raw_event is not None and raw_event.correlation_id:
+            correlation_id = redacted_text(raw_event.correlation_id)
+
+        return session_id, correlation_id
+
+    return None, None
+
+
 def memory_response(
     memory: Memory,
     *,
@@ -250,6 +267,9 @@ def memory_response(
         'updated_at': timestamp(memory.updated_at),
     }
     if include_detail:
+        source_session_id, source_correlation_id = _memory_source_provenance(memory)
+        response['source_session_id'] = source_session_id
+        response['source_correlation_id'] = source_correlation_id
         response['versions'] = [memory_version_response(version) for version in memory.versions.all()]
         response['retrieval_documents'] = [
             retrieval_document_response(document) for document in memory.retrieval_documents.all()

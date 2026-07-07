@@ -167,7 +167,13 @@ class ListInspectionMemories:
             .filter(inspection_scope.team_filter)
             .select_related('project')
             .prefetch_related(
-                Prefetch('versions', queryset=MemoryVersion.objects.order_by('version')),
+                Prefetch(
+                    'versions',
+                    queryset=MemoryVersion.objects.select_related(
+                        'source_observation',
+                        'source_observation__raw_event',
+                    ).order_by('version'),
+                ),
                 Prefetch('retrieval_documents', queryset=RetrievalDocument.objects.order_by('created_at', 'id')),
             )
         )
