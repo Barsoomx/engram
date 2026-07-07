@@ -232,7 +232,8 @@ class MemoryReviewViewSet(
             Memory.objects.filter(organization=organization)
             .filter(
                 Q(status__in=REVIEW_MEMORY_STATUSES)
-                | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD),
+                | Q(status=MemoryStatus.APPROVED, confidence__lte=REVIEW_MEMORY_CONFIDENCE_THRESHOLD)
+                | Q(status=MemoryStatus.APPROVED, refuted=True),
             )
             .select_related('project', 'team')
         )
