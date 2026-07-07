@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 from django.contrib.auth.models import User
+from django.test import override_settings
 from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
@@ -186,3 +187,31 @@ def test_ops_overview_requires_authentication() -> None:
     response = client.get('/v1/admin/ops/overview')
 
     assert response.status_code == 401
+
+
+@pytest.mark.django_db
+@override_settings(ENGRAM_OPS_GLOBAL_COUNTERS=True)
+def test_ops_overview_includes_global_counters_when_enabled(f_admin_client: APIClient) -> None:
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert 'outbox_backlog_count' in body
+    assert 'outbox_oldest_age_seconds' in body
+    assert 'dead_letter_count' in body
+    assert 'failed_workflow_runs' in body
+    assert 'pending_embedding_count' in body
+
+
+@pytest.mark.django_db
+@override_settings(ENGRAM_OPS_GLOBAL_COUNTERS=False)
+def test_ops_overview_omits_global_counters_when_disabled(f_admin_client: APIClient) -> None:
+    response = f_admin_client.get('/v1/admin/ops/overview')
+
+    assert response.status_code == 200
+    body = response.json()
+    assert 'outbox_backlog_count' not in body
+    assert 'outbox_oldest_age_seconds' not in body
+    assert 'dead_letter_count' not in body
+    assert 'failed_workflow_runs' in body
+    assert 'pending_embedding_count' in body

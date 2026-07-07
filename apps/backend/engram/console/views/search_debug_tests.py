@@ -13,6 +13,7 @@ from engram.access.models import (
     Identity,
     IdentityType,
     OrganizationMembership,
+    ProjectGrant,
     Role,
     RoleCapability,
 )
@@ -62,11 +63,17 @@ def _make_role_with_capabilities(code: str, capability_codes: tuple[str, ...]) -
     return role
 
 
-def _make_admin_client(org: Organization, username: str = 'debug-admin') -> APIClient:
+def _make_admin_client(
+    org: Organization,
+    project: Project | None = None,
+    username: str = 'debug-admin',
+) -> APIClient:
     user = _make_user(username)
     identity = _make_identity(user, org)
     role = _make_role_with_capabilities(f'debug_reader_{username}', ('memories:read',))
     OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
+    if project is not None:
+        ProjectGrant.objects.create(organization=org, project=project, identity=identity, role=role)
     token = Token.objects.create(user=user).key
     client = APIClient()
     client.credentials(
@@ -146,9 +153,9 @@ def f_org_project() -> tuple[Organization, Project]:
 
 @pytest.fixture
 def f_admin_client(f_org_project: tuple[Organization, Project]) -> APIClient:
-    org, _project = f_org_project
+    org, project = f_org_project
 
-    return _make_admin_client(org)
+    return _make_admin_client(org, project)
 
 
 @pytest.mark.django_db
@@ -261,6 +268,24 @@ def test_cross_project_denied_returns_404(
     )
 
     assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_in_org_project_outside_scope_denied_403(
+    f_org_project: tuple[Organization, Project],
+) -> None:
+    org, granted_project = f_org_project
+    other_project = Project.objects.create(organization=org, name='Other', slug='other-in-org-debug')
+    client = _make_admin_client(org, granted_project, username='scoped-dev')
+
+    response = client.post(
+        '/v1/admin/search-debug/',
+        {'project_id': str(other_project.id), 'query': 'anything'},
+        format='json',
+    )
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'project_scope_denied'
 
 
 @pytest.mark.django_db
