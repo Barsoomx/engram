@@ -457,6 +457,71 @@ export async function rerunWorkflowRun(
   return response.data;
 }
 
+export type ImportJobStatus =
+  | 'created'
+  | 'receiving'
+  | 'succeeded'
+  | 'failed'
+  | 'expired';
+
+export type ImportJobReport = {
+  created?: Record<string, number>;
+  duplicates?: Record<string, number>;
+  counts?: Record<string, { client_rows?: number }>;
+  unsupported?: unknown[];
+  warnings?: unknown[];
+  redactions?: { redacted?: boolean };
+  truncations?: { truncated?: boolean };
+  source_store_id?: string;
+  [key: string]: unknown;
+};
+
+export type ImportJob = {
+  id: string;
+  source_store_id: string;
+  status: ImportJobStatus;
+  project: string | null;
+  project_name: string;
+  team: string | null;
+  manifest: Record<string, unknown>;
+  batches_applied: number;
+  rows_created: number;
+  rows_duplicate: number;
+  report: ImportJobReport;
+  failure_reason: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export const TERMINAL_IMPORT_STATUSES: ReadonlySet<ImportJobStatus> = new Set<ImportJobStatus>([
+  'succeeded',
+  'failed',
+  'expired',
+]);
+
+export function isTerminalImportStatus(status: ImportJobStatus): boolean {
+  return TERMINAL_IMPORT_STATUSES.has(status);
+}
+
+export async function listImports(
+  params?: ListParams,
+): Promise<Paginated<ImportJob>> {
+  const client = apiClient();
+  const response = await client.get<Paginated<ImportJob>>(
+    '/v1/admin/imports/',
+    { params },
+  );
+
+  return response.data;
+}
+
+export async function importDetail(id: string): Promise<ImportJob> {
+  const client = apiClient();
+  const response = await client.get<ImportJob>(`/v1/admin/imports/${id}/`);
+
+  return response.data;
+}
+
 export type MemoryReviewItemType = 'candidate' | 'memory';
 
 export type MemoryReviewSourceSummary = {

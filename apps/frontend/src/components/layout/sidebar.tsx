@@ -11,6 +11,7 @@ import {
   Cpu,
   Database,
   FolderTree,
+  Import,
   Key,
   KeyRound,
   LayoutDashboard,
@@ -157,6 +158,12 @@ const NAV_GROUPS: SidebarNavGroup[] = [
   {
     title: 'System',
     items: [
+      {
+        href: '/imports',
+        label: 'Migration',
+        icon: Import,
+        capability: 'memories:read',
+      },
       {
         href: '/audit',
         label: 'Audit log',

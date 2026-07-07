@@ -37,6 +37,12 @@ export const adminQueryKeys = {
   workflowRun: (orgId: string | null, id: string | null) =>
     ['admin', orgId, 'workflow-run', id] as const,
 
+  imports: (orgId: string | null, params?: ListParams) =>
+    ['admin', orgId, 'imports', params ?? {}] as const,
+
+  importJob: (orgId: string | null, id: string | null) =>
+    ['admin', orgId, 'import', id] as const,
+
   memoryReview: (orgId: string | null, params?: ListParams) =>
     ['admin', orgId, 'memory-review', params ?? {}] as const,
 
