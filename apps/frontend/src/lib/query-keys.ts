@@ -5,6 +5,11 @@ export type ListParams = {
   [key: string]: unknown;
 };
 
+export type MetricsScope = {
+  project_id?: string;
+  team_id?: string;
+};
+
 export const adminQueryKeys = {
   all: (orgId: string | null) => ['admin', orgId] as const,
 
@@ -51,17 +56,17 @@ export const adminQueryKeys = {
       toVersion,
     ] as const,
 
-  metricsOverview: (orgId: string | null) =>
-    ['admin', orgId, 'metrics', 'overview'] as const,
+  metricsOverview: (orgId: string | null, scope?: MetricsScope) =>
+    ['admin', orgId, 'metrics', 'overview', scope?.project_id ?? null, scope?.team_id ?? null] as const,
 
-  memoryIngest: (orgId: string | null) =>
-    ['admin', orgId, 'metrics', 'memory-ingest'] as const,
+  memoryIngest: (orgId: string | null, scope?: MetricsScope) =>
+    ['admin', orgId, 'metrics', 'memory-ingest', scope?.project_id ?? null, scope?.team_id ?? null] as const,
 
-  sessions: (orgId: string | null) =>
-    ['admin', orgId, 'metrics', 'sessions'] as const,
+  sessions: (orgId: string | null, scope?: MetricsScope) =>
+    ['admin', orgId, 'metrics', 'sessions', scope?.project_id ?? null, scope?.team_id ?? null] as const,
 
-  activity: (orgId: string | null) =>
-    ['admin', orgId, 'metrics', 'activity'] as const,
+  activity: (orgId: string | null, scope?: MetricsScope) =>
+    ['admin', orgId, 'metrics', 'activity', scope?.project_id ?? null, scope?.team_id ?? null] as const,
 
   opsOverview: (orgId: string | null) =>
     ['admin', orgId, 'ops', 'overview'] as const,
