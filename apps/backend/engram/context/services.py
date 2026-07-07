@@ -1191,11 +1191,14 @@ class BuildContextBundle:
         exact_matches.sort(
             key=lambda match: (
                 -match.score,
+                -float(match.document.memory.confidence or 0),
                 -match.document.updated_at.timestamp(),
                 match.document.memory.title.casefold(),
                 str(match.document.id),
             ),
         )
+        if not has_request_terms:
+            exact_matches = self._cap_filter_only_digests(exact_matches)
         if len(exact_matches) >= data.limit:
             return tuple(exact_matches[: data.limit]), False, None, False
 
@@ -1235,6 +1238,18 @@ class BuildContextBundle:
         query_vector: list[float],
     ) -> list[RetrievalMatch]:
         return semantic_retrieval_matches(documents, exact_matches, query_vector)
+
+    def _cap_filter_only_digests(self, matches: list[RetrievalMatch]) -> list[RetrievalMatch]:
+        capped: list[RetrievalMatch] = []
+        digest_kept = False
+        for match in matches:
+            if match.document.memory.kind == 'digest':
+                if digest_kept:
+                    continue
+                digest_kept = True
+            capped.append(match)
+
+        return capped
 
     def _resolve_query_embedding(
         self,

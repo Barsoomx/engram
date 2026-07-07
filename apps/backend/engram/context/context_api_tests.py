@@ -781,6 +781,120 @@ def test_session_start_filter_only_returns_authorized_project_memory() -> None:
 
 
 @pytest.mark.django_db
+def test_session_start_filter_only_keeps_single_most_recent_digest() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    digest_one, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest one',
+        body='Oldest digest memory.',
+        kind='digest',
+    )
+    digest_two, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest two',
+        body='Middle digest memory.',
+        kind='digest',
+    )
+    digest_three, _v3, _d3 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest three',
+        body='Most recent digest memory.',
+        kind='digest',
+    )
+    non_digest_one, _v4, _d4 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Non digest one',
+        body='First non-digest memory.',
+    )
+    non_digest_two, _v5, _d5 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Non digest two',
+        body='Second non-digest memory.',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-filter-only-digest-cap',
+            query='',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    memory_ids = {item['memory_id'] for item in body['items']}
+    assert memory_ids == {str(digest_three.id), str(non_digest_one.id), str(non_digest_two.id)}
+    assert str(digest_one.id) not in memory_ids
+    assert str(digest_two.id) not in memory_ids
+
+
+@pytest.mark.django_db
+def test_session_start_orders_same_tier_matches_by_confidence_before_recency() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    older_high_confidence, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Older high confidence',
+        body='Confidence tiebreak fixture body one.',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['confidence tiebreak fixture'],
+        confidence=Decimal('0.900'),
+    )
+    newer_low_confidence, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Newer low confidence',
+        body='Confidence tiebreak fixture body two.',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['confidence tiebreak fixture'],
+        confidence=Decimal('0.500'),
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-confidence-tiebreak',
+            query='confidence tiebreak fixture',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item['memory_id'] for item in body['items']] == [
+        str(older_high_confidence.id),
+        str(newer_low_confidence.id),
+    ]
+
+
+@pytest.mark.django_db
 def test_session_start_replay_returns_existing_bundle_without_duplicate_audit() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_approved_memory_document(organization, team, project)
