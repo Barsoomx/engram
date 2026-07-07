@@ -119,8 +119,22 @@ function InstructionsPanel() {
                 <span className='font-mono text-xs'>--project-name</span> to pick
                 one.
               </p>
+              <p className='text-sm text-default-500'>
+                By default the import lands in the project your CLI is connected
+                to. To route it into a specific Engram project, pass{' '}
+                <span className='font-mono text-xs'>--project &lt;id&gt;</span> —
+                copy the id from the{' '}
+                <Link href='/projects' className='text-primary hover:underline'>
+                  Projects
+                </Link>{' '}
+                page. You can also point at a different server or key for a single
+                run with{' '}
+                <span className='font-mono text-xs'>ENGRAM_SERVER_URL</span> and{' '}
+                <span className='font-mono text-xs'>ENGRAM_API_KEY</span>.
+              </p>
               <CommandBlock command='engram import claude-mem --apply' />
               <CommandBlock command='engram import claude-mem --apply --project-name "my-project"' />
+              <CommandBlock command='engram import claude-mem --apply --project <project id>' />
             </div>
           </div>
         </li>

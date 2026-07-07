@@ -26,6 +26,7 @@ import {
 import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { CopyableId } from '@/components/ui/copyable-id';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorState } from '@/components/ui/error-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
@@ -111,12 +112,15 @@ function ProjectsTable({
                 <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
                   <GitBranch className='h-[15px] w-[15px]' strokeWidth={1.8} />
                 </span>
-                <span
-                  className='truncate text-[13.5px] font-semibold text-foreground'
-                  title={project.name}
-                >
-                  {project.name}
-                </span>
+                <div className='flex min-w-0 flex-col gap-0.5'>
+                  <span
+                    className='truncate text-[13.5px] font-semibold text-foreground'
+                    title={project.name}
+                  >
+                    {project.name}
+                  </span>
+                  <CopyableId value={project.id} />
+                </div>
               </div>
               <span
                 className='truncate font-mono text-[12px] text-default-500'
