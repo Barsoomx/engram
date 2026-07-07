@@ -8,52 +8,75 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Select,
+  SelectItem,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { useRouter } from 'next/navigation';
 import { extractApiError } from '@/lib/api-error';
 import {
+  Activity,
   Archive,
   GitBranch,
+  Layers,
   Pencil,
   Plus,
-  ShieldCheck,
+  Search,
 } from 'lucide-react';
 import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
 import { PrimaryButton } from '@/components/ui/primary-button';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import {
   useArchiveProject,
   useCreateProject,
   useProjects,
   useUpdateProject,
 } from '@/hooks/use-projects';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
-import type { Project, ProjectWriteInput } from '@/lib/admin-api';
-import { formatRelativeTime } from '@/lib/design';
+import type {
+  Project,
+  ProjectOrdering,
+  ProjectWriteInput,
+} from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
+import { useProjectStore } from '@/lib/project-store';
 
-function gridColumns(canAdmin: boolean): string {
-  return canAdmin
-    ? 'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.8fr) minmax(0,0.8fr) auto'
-    : 'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.8fr) minmax(0,0.8fr)';
-}
+const PROJECT_FILTER_DEFAULTS = {
+  search: '',
+  page: 1,
+  ordering: '-created_at' as ProjectOrdering,
+};
+const PROJECT_PAGE_SIZE = 20;
 
-function ColumnHeader({ canAdmin }: { canAdmin: boolean }) {
+const ORDERING_OPTIONS: { key: ProjectOrdering; label: string }[] = [
+  { key: '-created_at', label: 'Newest first' },
+  { key: 'name', label: 'Name (A–Z)' },
+];
+
+const GRID_COLUMNS =
+  'minmax(0,1.4fr) minmax(0,1fr) minmax(0,1.7fr) minmax(0,0.7fr) minmax(0,0.8fr) auto';
+
+function ColumnHeader() {
   return (
     <div
       className='grid items-center gap-4 border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'
-      style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+      style={{ gridTemplateColumns: GRID_COLUMNS }}
     >
       <span>Project</span>
       <span>Slug</span>
       <span>Repository</span>
       <span>Memories</span>
       <span>Updated</span>
-      {canAdmin && <span className='sr-only'>Actions</span>}
+      <span className='sr-only'>Actions</span>
     </div>
   );
 }
@@ -63,65 +86,97 @@ function ProjectsTable({
   canAdmin,
   onEdit,
   onArchive,
+  onOpenMemories,
+  onOpenObservations,
 }: {
   items: Project[];
   canAdmin: boolean;
   onEdit: (project: Project) => void;
   onArchive: (project: Project) => void;
+  onOpenMemories: (project: Project) => void;
+  onOpenObservations: (project: Project) => void;
 }) {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[680px]'>
-          <ColumnHeader canAdmin={canAdmin} />
+        <div className='min-w-[780px]'>
+          <ColumnHeader />
           {items.map((project) => (
             <div
               key={project.id}
               className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
-              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+              style={{ gridTemplateColumns: GRID_COLUMNS }}
             >
               <div className='flex min-w-0 items-center gap-3'>
                 <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
                   <GitBranch className='h-[15px] w-[15px]' strokeWidth={1.8} />
                 </span>
-                <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                <span
+                  className='truncate text-[13.5px] font-semibold text-foreground'
+                  title={project.name}
+                >
                   {project.name}
                 </span>
               </div>
-              <span className='truncate font-mono text-[12px] text-default-500'>
+              <span
+                className='truncate font-mono text-[12px] text-default-500'
+                title={project.slug}
+              >
                 {project.slug}
               </span>
-              <span className='truncate font-mono text-[12px] text-default-500'>
+              <span
+                className='truncate font-mono text-[12px] text-default-500'
+                title={project.repository_url || undefined}
+              >
                 {project.repository_url || '—'}
               </span>
               <span className='tnum font-mono text-[12px] text-default-400'>
-                {project.memory_count != null ? project.memory_count.toLocaleString() : '—'}
+                {project.memory_count != null
+                  ? project.memory_count.toLocaleString()
+                  : '—'}
               </span>
               <span className='whitespace-nowrap text-[12px] text-default-400'>
-                {formatRelativeTime(project.updated_at)}
+                <TimeStamp value={project.updated_at} />
               </span>
-              {canAdmin && (
-                <div className='flex items-center justify-end gap-2'>
-                  <Button
-                    size='sm'
-                    variant='flat'
-                    startContent={<Pencil className='w-3.5 h-3.5' />}
-                    onPress={() => onEdit(project)}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    size='sm'
-                    color='danger'
-                    variant='flat'
-                    startContent={<Archive className='w-3.5 h-3.5' />}
-                    onPress={() => onArchive(project)}
-                    isDisabled={project.archived_at !== null}
-                  >
-                    Archive
-                  </Button>
-                </div>
-              )}
+              <div className='flex items-center justify-end gap-2'>
+                <Button
+                  size='sm'
+                  variant='light'
+                  startContent={<Layers className='w-3.5 h-3.5' />}
+                  onPress={() => onOpenMemories(project)}
+                >
+                  Memories
+                </Button>
+                <Button
+                  size='sm'
+                  variant='light'
+                  startContent={<Activity className='w-3.5 h-3.5' />}
+                  onPress={() => onOpenObservations(project)}
+                >
+                  Observations
+                </Button>
+                {canAdmin && (
+                  <>
+                    <Button
+                      size='sm'
+                      variant='flat'
+                      startContent={<Pencil className='w-3.5 h-3.5' />}
+                      onPress={() => onEdit(project)}
+                    >
+                      Edit
+                    </Button>
+                    <Button
+                      size='sm'
+                      color='danger'
+                      variant='flat'
+                      startContent={<Archive className='w-3.5 h-3.5' />}
+                      onPress={() => onArchive(project)}
+                    >
+                      Archive
+                    </Button>
+                  </>
+                )}
+              </div>
             </div>
           ))}
         </div>
@@ -130,17 +185,17 @@ function ProjectsTable({
   );
 }
 
-function ProjectsTableSkeleton({ canAdmin }: { canAdmin: boolean }) {
+function ProjectsTableSkeleton() {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[680px]'>
-          <ColumnHeader canAdmin={canAdmin} />
+        <div className='min-w-[780px]'>
+          <ColumnHeader />
           {Array.from({ length: 6 }).map((_, index) => (
             <div
               key={index}
               className='grid items-center gap-4 border-b border-divider px-5 py-3.5 last:border-b-0'
-              style={{ gridTemplateColumns: gridColumns(canAdmin) }}
+              style={{ gridTemplateColumns: GRID_COLUMNS }}
             >
               <div className='flex min-w-0 items-center gap-3'>
                 <span className='h-[30px] w-[30px] shrink-0 rounded-[9px] bg-content2' />
@@ -150,12 +205,10 @@ function ProjectsTableSkeleton({ canAdmin }: { canAdmin: boolean }) {
               <span className='h-3 w-40 rounded-medium bg-content2' />
               <span className='h-3 w-8 rounded-medium bg-content2' />
               <span className='h-3 w-12 rounded-medium bg-content2' />
-              {canAdmin && (
-                <div className='flex items-center justify-end gap-2'>
-                  <span className='h-8 w-14 rounded-medium bg-content2' />
-                  <span className='h-8 w-20 rounded-medium bg-content2' />
-                </div>
-              )}
+              <div className='flex items-center justify-end gap-2'>
+                <span className='h-8 w-24 rounded-medium bg-content2' />
+                <span className='h-8 w-28 rounded-medium bg-content2' />
+              </div>
             </div>
           ))}
         </div>
@@ -324,6 +377,8 @@ function ProjectModal({
 
 export default function ProjectsPage() {
   const activeOrgId = useOrgStore((state) => state.activeOrgId);
+  const router = useRouter();
+  const setActiveProject = useProjectStore((s) => s.setActiveProject);
   const meQuery = useQuery<MeResponse>({
     queryKey: ['auth', 'me'],
     queryFn: fetchMe,
@@ -334,8 +389,31 @@ export default function ProjectsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const params = React.useMemo(() => ({ page: 1, pageSize: 50 }), []);
-  const projectsQuery = useProjects(activeOrgId, params);
+  const [filters, setFilters] = useUrlFilters(PROJECT_FILTER_DEFAULTS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
+
+  React.useEffect(() => {
+    if (debouncedSearch === filters.search) {
+
+      return;
+    }
+
+    setFilters({ search: debouncedSearch, page: 1 });
+  }, [debouncedSearch, filters.search, setFilters]);
+
+  const params = React.useMemo(
+    () => ({
+      page: filters.page,
+      pageSize: PROJECT_PAGE_SIZE,
+      search: filters.search || undefined,
+      ordering: filters.ordering,
+    }),
+    [filters.page, filters.search, filters.ordering],
+  );
+  const projectsQuery = useProjects(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
 
   const createMutation = useCreateProject(activeOrgId);
   const updateMutation = useUpdateProject(activeOrgId);
@@ -361,6 +439,16 @@ export default function ProjectsPage() {
     setEditTarget(project);
     setModalError(null);
     setModalOpen(true);
+  }
+
+  function openMemories(project: Project) {
+    setActiveProject(project.id);
+    router.push('/memories');
+  }
+
+  function openObservations(project: Project) {
+    setActiveProject(project.id);
+    router.push('/observations');
   }
 
   async function handleSubmit(input: ProjectWriteInput): Promise<boolean> {
@@ -402,7 +490,9 @@ export default function ProjectsPage() {
 
   const isLoading = meQuery.isLoading || projectsQuery.isLoading;
   const items = projectsQuery.data?.results ?? [];
+  const total = projectsQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
+  const hasSearch = filters.search.length > 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='projects:read'>
@@ -423,15 +513,62 @@ export default function ProjectsPage() {
           }
         />
 
+        <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-end'>
+          <Input
+            aria-label='Search projects'
+            placeholder='Search by name or slug…'
+            value={searchInput}
+            onValueChange={setSearchInput}
+            variant='bordered'
+            size='sm'
+            isClearable
+            onClear={() => setSearchInput('')}
+            startContent={<Search className='w-4 h-4 text-default-400' />}
+            className='max-w-xs'
+          />
+          <Select
+            aria-label='Sort projects'
+            selectedKeys={new Set([filters.ordering])}
+            variant='bordered'
+            size='sm'
+            className='max-w-[200px]'
+            disallowEmptySelection
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              if (typeof next === 'string') {
+                setFilters({ ordering: next as ProjectOrdering, page: 1 });
+              }
+            }}
+          >
+            {ORDERING_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+        </div>
+
         {isLoading ? (
-          <ProjectsTableSkeleton canAdmin={canAdmin} />
+          <ProjectsTableSkeleton />
+        ) : projectsQuery.isError ? (
+          <ErrorState
+            message={
+              projectsQuery.error instanceof Error
+                ? projectsQuery.error.message
+                : 'Failed to load projects.'
+            }
+            onRetry={() => projectsQuery.refetch()}
+          />
         ) : items.length === 0 ? (
           <EmptyState
-            title='No projects yet'
-            description='Create a project to scope memory ingestion and retrieval within this organization.'
+            title={hasSearch ? 'No matching projects' : 'No projects yet'}
+            description={
+              hasSearch
+                ? 'No projects match your search.'
+                : 'Create a project to scope memory ingestion and retrieval within this organization.'
+            }
             icon={<GitBranch className='w-6 h-6' />}
             action={
-              canAdmin ? (
+              canAdmin && !hasSearch ? (
                 <PrimaryButton
                   startContent={<Plus className='w-4 h-4' />}
                   onPress={openCreate}
@@ -447,29 +584,20 @@ export default function ProjectsPage() {
             canAdmin={canAdmin}
             onEdit={openEdit}
             onArchive={setArchiveTarget}
+            onOpenMemories={openMemories}
+            onOpenObservations={openObservations}
           />
         )}
 
-        {items.length > 0 && (
-          <div className='flex items-center justify-between text-[12px] text-default-400'>
-            <p>
-              Showing {items.length} project{items.length === 1 ? '' : 's'}.
-            </p>
-            {canAdmin && (
-              <p className='flex items-center gap-1.5'>
-                <ShieldCheck className='w-3.5 h-3.5' />
-                Archiving is reversible by an administrator.
-              </p>
-            )}
-          </div>
-        )}
-
-        {projectsQuery.isError && (
-          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
-            {projectsQuery.error instanceof Error
-              ? projectsQuery.error.message
-              : 'Failed to load projects.'}
-          </pre>
+        {!projectsQuery.isError && total > 0 && (
+          <PaginationFooter
+            page={filters.page}
+            pageSize={PROJECT_PAGE_SIZE}
+            total={total}
+            noun='project'
+            onPageChange={(page) => setFilters({ page })}
+            isDisabled={projectsQuery.isFetching}
+          />
         )}
 
         <ProjectModal
@@ -487,7 +615,7 @@ export default function ProjectsPage() {
           title='Archive project'
           description={
             archiveTarget
-              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? Memory within this project will be retained but hidden from active views.`
+              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? Memory within this project is retained but the project is hidden from active views and cannot be restored from the console.`
               : undefined
           }
           confirmLabel='Archive'

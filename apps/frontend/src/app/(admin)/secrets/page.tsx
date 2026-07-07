@@ -20,9 +20,12 @@ import * as React from 'react';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
 import { PrimaryButton } from '@/components/ui/primary-button';
 import { PulseDot } from '@/components/ui/pulse-dot';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
   createProviderSecret,
@@ -45,8 +48,15 @@ const SECRET_SCOPES: { key: SecretScope; label: string }[] = [
   { key: 'team', label: 'Team' },
 ];
 
+const SECRET_FILTER_DEFAULTS = { provider: '', scope: '', active: '' };
+
+const ACTIVE_OPTIONS: { key: string; label: string }[] = [
+  { key: 'active', label: 'Active' },
+  { key: 'disabled', label: 'Disabled' },
+];
+
 const GRID_COLUMNS =
-  'minmax(0,1.2fr) minmax(0,0.8fr) minmax(0,0.8fr) minmax(0,1.2fr) minmax(0,0.55fr) minmax(0,1fr) auto';
+  'minmax(0,1.1fr) minmax(0,0.7fr) minmax(0,0.7fr) minmax(0,1.1fr) minmax(0,0.5fr) minmax(0,0.8fr) minmax(0,0.7fr) auto';
 
 function extractDetail(error: unknown, fallback: string): string {
   if (axios.isAxiosError(error)) {
@@ -67,6 +77,21 @@ function humanize(value: string): string {
     .filter(Boolean)
     .map((word) => word[0].toUpperCase() + word.slice(1))
     .join(' ');
+}
+
+function notableRotationState(state: string): string | null {
+  const value = (state || '').toLowerCase();
+
+  if (['', 'idle', 'none', 'active', 'stable', 'disabled'].includes(value)) {
+
+    return null;
+  }
+
+  return humanize(state);
+}
+
+function secretTeamId(secret: ProviderSecret): string | null {
+  return secret.scope === 'team' ? secret.team_id : null;
 }
 
 function providerLabel(provider: SecretProvider): string {
@@ -108,6 +133,7 @@ function ColumnHeader() {
       <span>Scope</span>
       <span>Fingerprint</span>
       <span>Version</span>
+      <span>Updated</span>
       <span>Status</span>
       <span className='sr-only'>Actions</span>
     </div>
@@ -136,93 +162,103 @@ function SecretsTable({
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[860px]'>
+        <div className='min-w-[960px]'>
           <ColumnHeader />
-          {items.map((secret) => (
-            <div
-              key={secret.id}
-              className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
-              style={{ gridTemplateColumns: GRID_COLUMNS }}
-            >
-              <div className='flex min-w-0 items-center gap-3'>
-                <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
-                  <KeyRound className='h-[15px] w-[15px]' strokeWidth={1.8} />
-                </span>
-                <span className='truncate text-[13.5px] font-semibold text-foreground'>
-                  {secret.name}
-                </span>
-              </div>
-              <div className='min-w-0'>
-                <span
-                  className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${providerPillClass(secret.provider)}`}
-                >
-                  {providerLabel(secret.provider)}
-                </span>
-              </div>
-              <span className='truncate text-[12px] text-default-500'>
-                {humanize(secret.scope)}
-              </span>
-              <span className='truncate font-mono text-[12px] text-default-400'>
-                {secret.secret_fingerprint || '—'}
-              </span>
-              <span className='tnum font-mono text-[12px] text-default-500'>
-                v{secret.current_version}
-              </span>
-              <div className='flex min-w-0 flex-col gap-0.5'>
-                <div className='flex items-center gap-2'>
-                  <PulseDot
-                    color={secret.active ? '#3DD9AC' : '#666C77'}
-                    pulse={secret.active}
-                  />
-                  <span className='text-[12px] text-default-500'>
-                    {secret.active ? 'Active' : 'Disabled'}
+          {items.map((secret) => {
+            const rotation = notableRotationState(secret.rotation_state);
+
+            return (
+              <div
+                key={secret.id}
+                className='grid items-center gap-4 border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60'
+                style={{ gridTemplateColumns: GRID_COLUMNS }}
+              >
+                <div className='flex min-w-0 items-center gap-3'>
+                  <span className='inline-flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-[9px] bg-content3 text-primary-300'>
+                    <KeyRound className='h-[15px] w-[15px]' strokeWidth={1.8} />
+                  </span>
+                  <span
+                    className='truncate text-[13.5px] font-semibold text-foreground'
+                    title={secret.name}
+                  >
+                    {secret.name}
                   </span>
                 </div>
-                {secret.rotation_state && (
-                  <span className='truncate font-mono text-[11px] text-default-400'>
-                    {humanize(secret.rotation_state)}
+                <div className='min-w-0'>
+                  <span
+                    className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${providerPillClass(secret.provider)}`}
+                  >
+                    {providerLabel(secret.provider)}
                   </span>
-                )}
-              </div>
-              <div className='flex items-center justify-end gap-2'>
-                {canManage &&
-                  (secret.active ? (
-                    <>
+                </div>
+                <span className='truncate text-[12px] text-default-500'>
+                  {humanize(secret.scope)}
+                </span>
+                <span className='truncate font-mono text-[12px] text-default-400'>
+                  {secret.secret_fingerprint || '—'}
+                </span>
+                <span className='tnum font-mono text-[12px] text-default-500'>
+                  v{secret.current_version}
+                </span>
+                <span className='whitespace-nowrap text-[12px] text-default-400'>
+                  <TimeStamp value={secret.updated_at} />
+                </span>
+                <div className='flex min-w-0 flex-col gap-0.5'>
+                  <div className='flex items-center gap-2'>
+                    <PulseDot
+                      color={secret.active ? '#3DD9AC' : '#666C77'}
+                      pulse={secret.active}
+                    />
+                    <span className='text-[12px] text-default-500'>
+                      {secret.active ? 'Active' : 'Disabled'}
+                    </span>
+                  </div>
+                  {rotation && (
+                    <span className='truncate font-mono text-[11px] text-default-400'>
+                      {rotation}
+                    </span>
+                  )}
+                </div>
+                <div className='flex items-center justify-end gap-2'>
+                  {canManage &&
+                    (secret.active ? (
+                      <>
+                        <Button
+                          size='sm'
+                          variant='flat'
+                          startContent={<RefreshCw className='h-3.5 w-3.5' />}
+                          onPress={() => onRotate(secret)}
+                          isDisabled={rotatePending}
+                        >
+                          Rotate
+                        </Button>
+                        <Button
+                          size='sm'
+                          color='danger'
+                          variant='flat'
+                          startContent={<Ban className='h-3.5 w-3.5' />}
+                          onPress={() => onDisable(secret)}
+                          isDisabled={disablePending}
+                        >
+                          Disable
+                        </Button>
+                      </>
+                    ) : (
                       <Button
                         size='sm'
+                        color='success'
                         variant='flat'
-                        startContent={<RefreshCw className='h-3.5 w-3.5' />}
-                        onPress={() => onRotate(secret)}
-                        isDisabled={rotatePending}
+                        startContent={<Power className='h-3.5 w-3.5' />}
+                        onPress={() => onEnable(secret)}
+                        isDisabled={enablePending}
                       >
-                        Rotate
+                        Enable
                       </Button>
-                      <Button
-                        size='sm'
-                        color='danger'
-                        variant='flat'
-                        startContent={<Ban className='h-3.5 w-3.5' />}
-                        onPress={() => onDisable(secret)}
-                        isDisabled={disablePending}
-                      >
-                        Disable
-                      </Button>
-                    </>
-                  ) : (
-                    <Button
-                      size='sm'
-                      color='success'
-                      variant='flat'
-                      startContent={<Power className='h-3.5 w-3.5' />}
-                      onPress={() => onEnable(secret)}
-                      isDisabled={enablePending}
-                    >
-                      Enable
-                    </Button>
-                  ))}
+                    ))}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>
@@ -233,7 +269,7 @@ function SecretsTableSkeleton() {
   return (
     <div className='surface-card overflow-hidden'>
       <div className='overflow-x-auto'>
-        <div className='min-w-[860px]'>
+        <div className='min-w-[960px]'>
           <ColumnHeader />
           {Array.from({ length: 5 }).map((_, index) => (
             <div
@@ -249,6 +285,7 @@ function SecretsTableSkeleton() {
               <span className='h-3 w-16 rounded-medium bg-content2' />
               <span className='h-3 w-28 rounded-medium bg-content2' />
               <span className='h-3 w-8 rounded-medium bg-content2' />
+              <span className='h-3 w-14 rounded-medium bg-content2' />
               <span className='h-3 w-14 rounded-medium bg-content2' />
               <div className='flex items-center justify-end gap-2'>
                 <span className='h-8 w-16 rounded-medium bg-content2' />
@@ -266,6 +303,7 @@ interface AddSecretModalProps {
   isOpen: boolean;
   isPending: boolean;
   error: string | null;
+  hasTeam: boolean;
   onClose: () => void;
   onSubmit: (input: {
     name: string;
@@ -279,6 +317,7 @@ function AddSecretModal({
   isOpen,
   isPending,
   error,
+  hasTeam,
   onClose,
   onSubmit,
 }: AddSecretModalProps) {
@@ -296,8 +335,12 @@ function AddSecretModal({
     }
   }, [isOpen]);
 
+  const teamScopeBlocked = scope === 'team' && !hasTeam;
   const canSubmit =
-    name.trim().length > 0 && rawSecret.trim().length > 0 && !isPending;
+    name.trim().length > 0 &&
+    rawSecret.trim().length > 0 &&
+    !teamScopeBlocked &&
+    !isPending;
 
   async function handleSubmit() {
     if (!canSubmit) {
@@ -366,7 +409,7 @@ function AddSecretModal({
                   placeholder='Select a scope'
                   selectedKeys={new Set([scope])}
                   isDisabled={isPending}
-                  description='Organization secrets apply org-wide; team secrets are limited to the active team.'
+                  description='Organization secrets apply org-wide; team secrets require an active team.'
                   onSelectionChange={(keys) => {
                     const next = Array.from(keys)[0];
 
@@ -379,6 +422,15 @@ function AddSecretModal({
                     <SelectItem key={option.key}>{option.label}</SelectItem>
                   ))}
                 </Select>
+                {teamScopeBlocked && (
+                  <div className='flex items-start gap-2.5 rounded-[12px] border border-warning/30 bg-warning/5 px-3.5 py-3'>
+                    <Info className='mt-0.5 h-4 w-4 shrink-0 text-warning' />
+                    <p className='text-[13px] leading-relaxed text-warning-600'>
+                      Select a team in the switcher above to add a team-scoped
+                      secret, or choose Organization scope.
+                    </p>
+                  </div>
+                )}
                 <Input
                   label='Secret'
                   labelPlacement='outside'
@@ -551,16 +603,42 @@ export default function SecretsPage() {
   );
   const canManageSecrets = hasCapability(capabilities, 'secrets:*');
 
+  const [filters, setFilters] = useUrlFilters(SECRET_FILTER_DEFAULTS);
+
+  const activeFilter =
+    filters.active === 'active'
+      ? true
+      : filters.active === 'disabled'
+        ? false
+        : undefined;
+
   const secretsQuery = useQuery<ProviderSecret[]>({
-    queryKey: ['model-policy', 'secrets', activeProjectId, activeTeamId],
+    queryKey: [
+      'model-policy',
+      'secrets',
+      activeProjectId,
+      activeTeamId,
+      filters.provider,
+      filters.scope,
+      filters.active,
+    ],
     enabled: Boolean(activeProjectId),
     queryFn: async () => {
       try {
 
-        return await listProviderSecrets({
-          projectId: activeProjectId ?? '',
-          teamId: activeTeamId,
-        });
+        return await listProviderSecrets(
+          {
+            projectId: activeProjectId ?? '',
+            teamId: activeTeamId,
+          },
+          {
+            provider: (filters.provider || undefined) as
+              | SecretProvider
+              | undefined,
+            scope: (filters.scope || undefined) as SecretScope | undefined,
+            active: activeFilter,
+          },
+        );
       } catch (error) {
         if (axios.isAxiosError(error) && error.response?.status === 404) {
 
@@ -586,32 +664,32 @@ export default function SecretsPage() {
   });
   const rotateMutation = useMutation({
     mutationFn: ({
-      secretId,
+      secret,
       rawSecret,
     }: {
-      secretId: string;
+      secret: ProviderSecret;
       rawSecret: string;
     }) =>
-      rotateProviderSecret(secretId, {
+      rotateProviderSecret(secret.id, {
         project_id: activeProjectId ?? '',
-        team_id: activeTeamId,
+        team_id: secretTeamId(secret),
         raw_secret: rawSecret,
         request_id: genRequestId(),
       }),
   });
   const disableMutation = useMutation({
-    mutationFn: (secretId: string) =>
-      disableProviderSecret(secretId, {
+    mutationFn: (secret: ProviderSecret) =>
+      disableProviderSecret(secret.id, {
         project_id: activeProjectId ?? '',
-        team_id: activeTeamId,
+        team_id: secretTeamId(secret),
         request_id: genRequestId(),
       }),
   });
   const enableMutation = useMutation({
-    mutationFn: (secretId: string) =>
-      enableProviderSecret(secretId, {
+    mutationFn: (secret: ProviderSecret) =>
+      enableProviderSecret(secret.id, {
         project_id: activeProjectId ?? '',
-        team_id: activeTeamId,
+        team_id: secretTeamId(secret),
         request_id: genRequestId(),
       }),
   });
@@ -630,7 +708,7 @@ export default function SecretsPage() {
 
     const body: ProviderSecretCreateInput = {
       project_id: activeProjectId ?? '',
-      team_id: activeTeamId,
+      team_id: input.scope === 'team' ? activeTeamId : null,
       name: input.name,
       provider: input.provider,
       scope: input.scope,
@@ -661,7 +739,7 @@ export default function SecretsPage() {
 
     try {
       await rotateMutation.mutateAsync({
-        secretId: rotateTarget.id,
+        secret: rotateTarget,
         rawSecret,
       });
       invalidateSecrets();
@@ -677,7 +755,7 @@ export default function SecretsPage() {
 
   async function handleEnable(secret: ProviderSecret) {
     try {
-      await enableMutation.mutateAsync(secret.id);
+      await enableMutation.mutateAsync(secret);
       invalidateSecrets();
       addToast({ title: 'Secret enabled', color: 'success' });
     } catch (error) {
@@ -696,7 +774,7 @@ export default function SecretsPage() {
     }
 
     try {
-      await disableMutation.mutateAsync(disableTarget.id);
+      await disableMutation.mutateAsync(disableTarget);
       invalidateSecrets();
       addToast({ title: 'Secret disabled', color: 'success' });
       setDisableTarget(null);
@@ -741,6 +819,10 @@ export default function SecretsPage() {
 
   const isLoading = meQuery.isLoading || secretsQuery.isLoading;
   const items = secretsQuery.data ?? [];
+  const hasFilters =
+    filters.provider.length > 0 ||
+    filters.scope.length > 0 ||
+    filters.active.length > 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='secrets:read'>
@@ -761,24 +843,84 @@ export default function SecretsPage() {
           }
         />
 
+        <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-end'>
+          <Select
+            aria-label='Filter by provider'
+            placeholder='All providers'
+            selectedKeys={
+              filters.provider ? new Set([filters.provider]) : new Set()
+            }
+            variant='bordered'
+            size='sm'
+            className='max-w-[180px]'
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ provider: typeof next === 'string' ? next : '' });
+            }}
+          >
+            {SECRET_PROVIDERS.map((value) => (
+              <SelectItem key={value}>{providerLabel(value)}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            aria-label='Filter by scope'
+            placeholder='All scopes'
+            selectedKeys={filters.scope ? new Set([filters.scope]) : new Set()}
+            variant='bordered'
+            size='sm'
+            className='max-w-[180px]'
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ scope: typeof next === 'string' ? next : '' });
+            }}
+          >
+            {SECRET_SCOPES.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            aria-label='Filter by status'
+            placeholder='All statuses'
+            selectedKeys={filters.active ? new Set([filters.active]) : new Set()}
+            variant='bordered'
+            size='sm'
+            className='max-w-[160px]'
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ active: typeof next === 'string' ? next : '' });
+            }}
+          >
+            {ACTIVE_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+        </div>
+
         {isLoading ? (
           <SecretsTableSkeleton />
         ) : secretsQuery.isError ? (
-          <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-            <Info className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-            <p className='text-[13px] leading-relaxed text-danger'>
-              {secretsQuery.error instanceof Error
+          <ErrorState
+            message={
+              secretsQuery.error instanceof Error
                 ? secretsQuery.error.message
-                : 'Failed to load secrets.'}
-            </p>
-          </div>
+                : 'Failed to load secrets.'
+            }
+            onRetry={() => secretsQuery.refetch()}
+          />
         ) : items.length === 0 ? (
           <EmptyState
-            title='No secrets yet'
-            description='Add a provider API key to enable model calls for this scope.'
+            title={hasFilters ? 'No matching secrets' : 'No secrets yet'}
+            description={
+              hasFilters
+                ? 'No secrets match the current filters.'
+                : 'Add a provider API key to enable model calls for this scope.'
+            }
             icon={<KeyRound className='h-6 w-6' />}
             action={
-              canManageSecrets ? (
+              canManageSecrets && !hasFilters ? (
                 <PrimaryButton
                   startContent={<Plus className='h-4 w-4' />}
                   onPress={openAdd}
@@ -801,16 +943,11 @@ export default function SecretsPage() {
           />
         )}
 
-        <p className='flex items-center gap-1.5 text-[12px] text-default-400'>
-          <Info className='h-3.5 w-3.5' />
-          If this list looks empty, the secrets service may be temporarily
-          unavailable — try refreshing.
-        </p>
-
         <AddSecretModal
           isOpen={addOpen}
           isPending={createMutation.isPending}
           error={addError}
+          hasTeam={Boolean(activeTeamId)}
           onClose={() => setAddOpen(false)}
           onSubmit={handleAdd}
         />

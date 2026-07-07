@@ -3,7 +3,6 @@
 import {
   addToast,
   Button,
-  Chip,
   Input,
   Modal,
   ModalBody,
@@ -13,10 +12,12 @@ import {
   Select,
   SelectItem,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import {
+  Search,
   ShieldCheck,
+  UserCheck,
   UserCog,
   UserMinus,
   UserPlus,
@@ -26,30 +27,47 @@ import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { InitialTile } from '@/components/ui/initial-tile';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
 import { PrimaryButton } from '@/components/ui/primary-button';
+import { StatusPill } from '@/components/ui/status-pill';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import {
   useDeactivateMember,
   useInviteMember,
   useMembers,
+  useReactivateMember,
   useRoles,
   useUpdateMemberRole,
 } from '@/hooks/use-members';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { extractApiError } from '@/lib/api-error';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type {
   Member,
   MemberInviteInput,
   MemberRoleInput,
-  MembershipStatus,
   Role,
 } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
 
-const LAST_OWNER_MESSAGE =
-  'Cannot remove the last organization owner.';
+const MEMBER_FILTER_DEFAULTS = {
+  search: '',
+  role: '',
+  status: 'active',
+  page: 1,
+};
+const MEMBER_PAGE_SIZE = 20;
+
+const STATUS_OPTIONS: { key: string; label: string }[] = [
+  { key: 'active', label: 'Active' },
+  { key: 'deactivated', label: 'Deactivated' },
+];
+
+const LAST_OWNER_MESSAGE = 'Cannot remove the last organization owner.';
 
 function isLastOwnerError(error: unknown): boolean {
   if (!axios.isAxiosError(error)) {
@@ -134,30 +152,18 @@ function rolePillClass(role: string): string {
   return 'bg-content3 text-default-500';
 }
 
-function statusChipColor(
-  status: MembershipStatus,
-): 'success' | 'warning' | 'danger' {
-  if (status === 'active') {
-    return 'success';
+function MemberStatusPill({ member }: { member: Member }) {
+  if (!member.active) {
+
+    return <StatusPill status='deactivated' label='Deactivated' tone='neutral' />;
   }
 
-  if (status === 'invited') {
-    return 'warning';
+  if (member.status === 'invited') {
+
+    return <StatusPill status='invited' />;
   }
 
-  return 'danger';
-}
-
-function statusLabel(status: MembershipStatus): string {
-  if (status === 'active') {
-    return 'Active';
-  }
-
-  if (status === 'invited') {
-    return 'Invited';
-  }
-
-  return 'Suspended';
+  return <StatusPill status='active' />;
 }
 
 function gridColumns(canAdmin: boolean): string {
@@ -186,12 +192,14 @@ function MembersTable({
   roleNames,
   onChangeRole,
   onDeactivate,
+  onReactivate,
 }: {
   items: Member[];
   canAdmin: boolean;
   roleNames: Map<string, string>;
   onChangeRole: (member: Member) => void;
   onDeactivate: (member: Member) => void;
+  onReactivate: (member: Member) => void;
 }) {
   return (
     <div className='surface-card overflow-hidden'>
@@ -211,10 +219,16 @@ function MembersTable({
                   size={34}
                 />
                 <div className='flex min-w-0 flex-col'>
-                  <span className='truncate text-[13.5px] font-semibold text-foreground'>
+                  <span
+                    className='truncate text-[13.5px] font-semibold text-foreground'
+                    title={getDisplayName(member)}
+                  >
                     {getDisplayName(member)}
                   </span>
-                  <span className='truncate font-mono text-[11.5px] text-default-400'>
+                  <span
+                    className='truncate font-mono text-[11.5px] text-default-400'
+                    title={getPrimaryIdentity(member)}
+                  >
                     {getPrimaryIdentity(member)}
                   </span>
                 </div>
@@ -223,23 +237,13 @@ function MembersTable({
                 <span
                   className={`inline-flex max-w-full items-center truncate rounded-[7px] px-2.5 py-1 text-[11.5px] font-medium ${rolePillClass(member.role)}`}
                 >
-                  {member.role_name ?? roleNames.get(member.role) ?? humanizeRole(member.role)}
+                  {member.role_name ??
+                    roleNames.get(member.role) ??
+                    humanizeRole(member.role)}
                 </span>
               </div>
               <div>
-                {member.status ? (
-                  <Chip
-                    size='sm'
-                    variant='flat'
-                    color={statusChipColor(member.status)}
-                  >
-                    {statusLabel(member.status)}
-                  </Chip>
-                ) : (
-                  <span className='text-[12px] text-default-500'>
-                    {member.active ? 'Active' : 'Inactive'}
-                  </span>
-                )}
+                <MemberStatusPill member={member} />
               </div>
               {canAdmin && (
                 <div className='flex items-center justify-end gap-2'>
@@ -251,16 +255,27 @@ function MembersTable({
                   >
                     Change role
                   </Button>
-                  <Button
-                    size='sm'
-                    color='danger'
-                    variant='flat'
-                    startContent={<UserMinus className='w-3.5 h-3.5' />}
-                    onPress={() => onDeactivate(member)}
-                    isDisabled={!member.active}
-                  >
-                    Deactivate
-                  </Button>
+                  {member.active ? (
+                    <Button
+                      size='sm'
+                      color='danger'
+                      variant='flat'
+                      startContent={<UserMinus className='w-3.5 h-3.5' />}
+                      onPress={() => onDeactivate(member)}
+                    >
+                      Deactivate
+                    </Button>
+                  ) : (
+                    <Button
+                      size='sm'
+                      color='success'
+                      variant='flat'
+                      startContent={<UserCheck className='w-3.5 h-3.5' />}
+                      onPress={() => onReactivate(member)}
+                    >
+                      Reactivate
+                    </Button>
+                  )}
                 </div>
               )}
             </div>
@@ -457,9 +472,7 @@ function MemberModal({
                   selectedKeys={role ? new Set([role]) : new Set()}
                   isDisabled={isPending || roleItems.length === 0}
                   description={
-                    roleItems.length === 0
-                      ? 'No roles available.'
-                      : undefined
+                    roleItems.length === 0 ? 'No roles available.' : undefined
                   }
                   onSelectionChange={(keys) => {
                     const next = Array.from(keys)[0];
@@ -470,9 +483,7 @@ function MemberModal({
                   }}
                 >
                   {(roleItem: Role) => (
-                    <SelectItem key={roleItem.code}>
-                      {roleItem.name}
-                    </SelectItem>
+                    <SelectItem key={roleItem.code}>{roleItem.name}</SelectItem>
                   )}
                 </Select>
                 {error && (
@@ -519,30 +530,49 @@ export default function MembersPage() {
     [meQuery.data?.capabilities],
   );
 
-  const [memberPage, setMemberPage] = React.useState(1);
+  const [filters, setFilters] = useUrlFilters(MEMBER_FILTER_DEFAULTS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
 
   React.useEffect(() => {
-    setMemberPage(1);
-  }, [activeOrgId]);
+    if (debouncedSearch === filters.search) {
+
+      return;
+    }
+
+    setFilters({ search: debouncedSearch, page: 1 });
+  }, [debouncedSearch, filters.search, setFilters]);
+
+  const showDeactivated = filters.status === 'deactivated';
 
   const params = React.useMemo(
-    () => ({ page: memberPage, pageSize: 50 }),
-    [memberPage],
+    () => ({
+      page: filters.page,
+      pageSize: MEMBER_PAGE_SIZE,
+      search: filters.search || undefined,
+      role: filters.role || undefined,
+      active: !showDeactivated,
+    }),
+    [filters.page, filters.search, filters.role, showDeactivated],
   );
   const roleParams = React.useMemo(() => ({ page: 1, pageSize: 100 }), []);
-  const membersQuery = useMembers(activeOrgId, params);
+  const membersQuery = useMembers(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
   const rolesQuery = useRoles(activeOrgId, roleParams);
 
   const inviteMutation = useInviteMember(activeOrgId);
   const roleMutation = useUpdateMemberRole(activeOrgId);
   const deactivateMutation = useDeactivateMember(activeOrgId);
+  const reactivateMutation = useReactivateMember(activeOrgId);
 
   const [modalMode, setModalMode] = React.useState<MemberModalMode>('invite');
   const [modalOpen, setModalOpen] = React.useState(false);
   const [memberTarget, setMemberTarget] = React.useState<Member | null>(null);
   const [modalError, setModalError] = React.useState<string | null>(null);
-  const [deactivateTarget, setDeactivateTarget] =
-    React.useState<Member | null>(null);
+  const [deactivateTarget, setDeactivateTarget] = React.useState<Member | null>(
+    null,
+  );
 
   const canAdmin = hasCapability(capabilities, 'members:admin');
 
@@ -575,9 +605,7 @@ export default function MembersPage() {
     setModalOpen(true);
   }
 
-  async function handleInvite(
-    input: MemberInviteInput,
-  ): Promise<boolean> {
+  async function handleInvite(input: MemberInviteInput): Promise<boolean> {
     setModalError(null);
 
     try {
@@ -593,9 +621,7 @@ export default function MembersPage() {
     }
   }
 
-  async function handleRoleChange(
-    input: MemberRoleInput,
-  ): Promise<boolean> {
+  async function handleRoleChange(input: MemberRoleInput): Promise<boolean> {
     setModalError(null);
 
     if (!memberTarget) {
@@ -648,23 +674,35 @@ export default function MembersPage() {
     }
   }
 
-  const mutationPending =
-    modalMode === 'invite'
-      ? inviteMutation.isPending
-      : roleMutation.isPending;
+  async function handleReactivate(member: Member) {
+    try {
+      await reactivateMutation.mutateAsync(member.id);
+      addToast({ title: 'Member reactivated', color: 'success' });
+    } catch (error) {
+      addToast({
+        title: 'Failed to reactivate member',
+        description: memberInitialError(error) ?? 'Unexpected error.',
+        color: 'danger',
+      });
+    }
+  }
 
-  const isLoading =
-    meQuery.isLoading || membersQuery.isLoading;
+  const mutationPending =
+    modalMode === 'invite' ? inviteMutation.isPending : roleMutation.isPending;
+
+  const isLoading = meQuery.isLoading || membersQuery.isLoading;
   const items = membersQuery.data?.results ?? [];
   const total = membersQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
+  const hasFilters =
+    filters.search.length > 0 || filters.role.length > 0 || showDeactivated;
 
   return (
     <CapabilityGate capabilities={capabilities} required='members:read'>
       <section className='space-y-6'>
         <PageHeader
           title='Members'
-          subtitle='Invite members, assign roles, and deactivate access within this organization.'
+          subtitle='Invite members, assign roles, and manage access within this organization.'
           actions={
             canAdmin ? (
               <PrimaryButton
@@ -678,21 +716,81 @@ export default function MembersPage() {
           }
         />
 
+        <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-end'>
+          <Input
+            aria-label='Search members'
+            placeholder='Name, email, or external ID…'
+            value={searchInput}
+            onValueChange={setSearchInput}
+            variant='bordered'
+            size='sm'
+            isClearable
+            onClear={() => setSearchInput('')}
+            startContent={<Search className='w-4 h-4 text-default-400' />}
+            className='max-w-xs'
+          />
+          <Select
+            aria-label='Filter by role'
+            placeholder='All roles'
+            selectedKeys={filters.role ? new Set([filters.role]) : new Set()}
+            variant='bordered'
+            size='sm'
+            className='max-w-[200px]'
+            items={roles}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({
+                role: typeof next === 'string' ? next : '',
+                page: 1,
+              });
+            }}
+          >
+            {(role: Role) => <SelectItem key={role.code}>{role.name}</SelectItem>}
+          </Select>
+          <Select
+            aria-label='Filter by status'
+            selectedKeys={new Set([filters.status])}
+            variant='bordered'
+            size='sm'
+            className='max-w-[180px]'
+            disallowEmptySelection
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              if (typeof next === 'string') {
+                setFilters({ status: next, page: 1 });
+              }
+            }}
+          >
+            {STATUS_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+        </div>
+
         {isLoading ? (
           <MembersTableSkeleton canAdmin={canAdmin} />
         ) : membersQuery.isError ? (
-          <pre className='rounded-[10px] border border-danger-500/30 bg-danger-500/10 p-3 text-sm text-danger-500'>
-            {membersQuery.error instanceof Error
-              ? membersQuery.error.message
-              : 'Failed to load members.'}
-          </pre>
+          <ErrorState
+            message={
+              membersQuery.error instanceof Error
+                ? membersQuery.error.message
+                : 'Failed to load members.'
+            }
+            onRetry={() => membersQuery.refetch()}
+          />
         ) : items.length === 0 ? (
           <EmptyState
-            title='No members yet'
-            description='Invite the first member to grant them access to this organization.'
+            title={hasFilters ? 'No matching members' : 'No members yet'}
+            description={
+              hasFilters
+                ? 'No members match the current filters.'
+                : 'Invite the first member to grant them access to this organization.'
+            }
             icon={<Users className='w-6 h-6' />}
             action={
-              canAdmin ? (
+              canAdmin && !hasFilters ? (
                 <PrimaryButton
                   startContent={<UserPlus className='w-4 h-4' />}
                   onPress={openInvite}
@@ -709,38 +807,24 @@ export default function MembersPage() {
             roleNames={roleNames}
             onChangeRole={openChangeRole}
             onDeactivate={setDeactivateTarget}
+            onReactivate={handleReactivate}
           />
         )}
 
-        {items.length > 0 && (
-          <div className='flex items-center justify-between text-[12px] text-default-400'>
-            <div className='flex items-center gap-3'>
-              <p>
-                {total > 0
-                  ? `Showing ${(memberPage - 1) * 50 + 1}-${(memberPage - 1) * 50 + items.length} of ${total}`
-                  : `Showing ${items.length} member${items.length === 1 ? '' : 's'}`}
-              </p>
-              <button
-                type='button'
-                onClick={() => setMemberPage((p) => Math.max(1, p - 1))}
-                disabled={memberPage === 1}
-                className='rounded-[8px] border border-divider bg-content1 px-2.5 py-1 font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-              >
-                Previous
-              </button>
-              <button
-                type='button'
-                onClick={() => setMemberPage((p) => p + 1)}
-                disabled={memberPage * 50 >= total}
-                className='rounded-[8px] border border-divider bg-content1 px-2.5 py-1 font-medium text-default-600 transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50'
-              >
-                Next
-              </button>
-            </div>
+        {!membersQuery.isError && total > 0 && (
+          <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
+            <PaginationFooter
+              page={filters.page}
+              pageSize={MEMBER_PAGE_SIZE}
+              total={total}
+              noun='member'
+              onPageChange={(page) => setFilters({ page })}
+              isDisabled={membersQuery.isFetching}
+            />
             {canAdmin && (
-              <p className='flex items-center gap-1.5'>
+              <p className='flex items-center gap-1.5 text-[12px] text-default-400'>
                 <ShieldCheck className='w-3.5 h-3.5' />
-                Deactivating is restricted to administrators.
+                Managing access is restricted to administrators.
               </p>
             )}
           </div>
@@ -763,7 +847,7 @@ export default function MembersPage() {
           title='Deactivate member'
           description={
             deactivateTarget
-              ? `Deactivate "${getDisplayName(deactivateTarget)}"? They will lose access to this organization immediately.`
+              ? `Deactivate "${getDisplayName(deactivateTarget)}"? They will lose access to this organization immediately. You can reactivate them later from the Deactivated view.`
               : undefined
           }
           confirmLabel='Deactivate'

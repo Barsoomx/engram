@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  addToast,
   Button,
   Input,
   Modal,
@@ -9,22 +10,21 @@ import {
   ModalFooter,
   ModalHeader,
 } from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { extractApiError } from '@/lib/api-error';
-import {
-  Archive,
-  Pencil,
-  Plus,
-  ShieldCheck,
-  Users,
-} from 'lucide-react';
+import { Archive, Pencil, Plus, Search, Users } from 'lucide-react';
 import * as React from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import {
   useArchiveTeam,
   useCreateTeam,
@@ -34,21 +34,10 @@ import {
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type { Team, TeamWriteInput } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 
-function formatDateTime(value: string | null): string {
-  if (!value) {
-
-    return '—';
-  }
-
-  try {
-
-    return new Date(value).toLocaleString();
-  } catch {
-
-    return value;
-  }
-}
+const TEAM_FILTER_DEFAULTS = { search: '', page: 1 };
+const TEAM_PAGE_SIZE = 20;
 
 function TeamsTable({
   items,
@@ -62,59 +51,61 @@ function TeamsTable({
   onArchive: (team: Team) => void;
 }) {
   return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
-        <thead>
-          <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
+    <ResponsiveTable minWidth={640}>
+      <thead>
+        <tr className='border-b border-divider'>
+          <th className='py-2 px-3 text-default-500 font-medium'>Name</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Slug</th>
+          <th className='py-2 px-3 text-default-500 font-medium'>Created</th>
+          {canAdmin && (
+            <th className='py-2 px-3 text-default-500 font-medium text-right'>
+              Actions
+            </th>
+          )}
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((team) => (
+          <tr key={team.id} className='border-b border-divider/50'>
+            <td
+              className='py-2 px-3 text-foreground max-w-[280px] truncate'
+              title={team.name}
+            >
+              {team.name}
+            </td>
+            <td className='py-2 px-3 font-mono text-xs text-default-700'>
+              {team.slug}
+            </td>
+            <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+              <TimeStamp value={team.created_at} />
+            </td>
             {canAdmin && (
-              <th className='py-2 px-3 text-default-500 font-medium text-right'>
-                Actions
-              </th>
+              <td className='py-2 px-3'>
+                <div className='flex items-center justify-end gap-2'>
+                  <Button
+                    size='sm'
+                    variant='flat'
+                    startContent={<Pencil className='w-3.5 h-3.5' />}
+                    onPress={() => onEdit(team)}
+                  >
+                    Edit
+                  </Button>
+                  <Button
+                    size='sm'
+                    color='danger'
+                    variant='flat'
+                    startContent={<Archive className='w-3.5 h-3.5' />}
+                    onPress={() => onArchive(team)}
+                  >
+                    Archive
+                  </Button>
+                </div>
+              </td>
             )}
           </tr>
-        </thead>
-        <tbody>
-          {items.map((team) => (
-            <tr key={team.id} className='border-b border-divider/50'>
-              <td className='py-2 px-3 text-foreground'>{team.name}</td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {team.slug}
-              </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {formatDateTime(team.created_at)}
-              </td>
-              {canAdmin && (
-                <td className='py-2 px-3'>
-                  <div className='flex items-center justify-end gap-2'>
-                    <Button
-                      size='sm'
-                      variant='flat'
-                      startContent={<Pencil className='w-3.5 h-3.5' />}
-                      onPress={() => onEdit(team)}
-                    >
-                      Edit
-                    </Button>
-                    <Button
-                      size='sm'
-                      color='danger'
-                      variant='flat'
-                      startContent={<Archive className='w-3.5 h-3.5' />}
-                      onPress={() => onArchive(team)}
-                      isDisabled={team.archived_at !== null}
-                    >
-                      Archive
-                    </Button>
-                  </div>
-                </td>
-              )}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+        ))}
+      </tbody>
+    </ResponsiveTable>
   );
 }
 
@@ -256,8 +247,30 @@ export default function TeamsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const params = React.useMemo(() => ({ page: 1, pageSize: 50 }), []);
-  const teamsQuery = useTeams(activeOrgId, params);
+  const [filters, setFilters] = useUrlFilters(TEAM_FILTER_DEFAULTS);
+  const [searchInput, setSearchInput] = React.useState(filters.search);
+  const debouncedSearch = useDebouncedValue(searchInput, 300);
+
+  React.useEffect(() => {
+    if (debouncedSearch === filters.search) {
+
+      return;
+    }
+
+    setFilters({ search: debouncedSearch, page: 1 });
+  }, [debouncedSearch, filters.search, setFilters]);
+
+  const params = React.useMemo(
+    () => ({
+      page: filters.page,
+      pageSize: TEAM_PAGE_SIZE,
+      search: filters.search || undefined,
+    }),
+    [filters.page, filters.search],
+  );
+  const teamsQuery = useTeams(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
 
   const createMutation = useCreateTeam(activeOrgId);
   const updateMutation = useUpdateTeam(activeOrgId);
@@ -311,8 +324,14 @@ export default function TeamsPage() {
 
     try {
       await archiveMutation.mutateAsync(archiveTarget.id);
+      addToast({ title: 'Team archived', color: 'success' });
       setArchiveTarget(null);
-    } catch {
+    } catch (error) {
+      addToast({
+        title: 'Failed to archive team',
+        description: extractApiError(error, 'Unexpected error.'),
+        color: 'danger',
+      });
       setArchiveTarget(null);
     }
   }
@@ -324,7 +343,9 @@ export default function TeamsPage() {
 
   const isLoading = meQuery.isLoading || teamsQuery.isLoading;
   const items = teamsQuery.data?.results ?? [];
+  const total = teamsQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
+  const hasSearch = filters.search.length > 0;
 
   return (
     <CapabilityGate capabilities={capabilities} required='teams:read'>
@@ -346,6 +367,21 @@ export default function TeamsPage() {
           }
         />
 
+        <div className='surface-card p-4'>
+          <Input
+            aria-label='Search teams'
+            placeholder='Search by name or slug…'
+            value={searchInput}
+            onValueChange={setSearchInput}
+            variant='bordered'
+            size='sm'
+            isClearable
+            onClear={() => setSearchInput('')}
+            startContent={<Search className='w-4 h-4 text-default-400' />}
+            className='max-w-xs'
+          />
+        </div>
+
         <div className='surface-card p-2'>
           {isLoading ? (
             <table className='w-full border-collapse text-left text-sm'>
@@ -363,13 +399,26 @@ export default function TeamsPage() {
               </thead>
               <TableRowSkeleton columns={canAdmin ? 4 : 3} />
             </table>
+          ) : teamsQuery.isError ? (
+            <ErrorState
+              message={
+                teamsQuery.error instanceof Error
+                  ? teamsQuery.error.message
+                  : 'Failed to load teams.'
+              }
+              onRetry={() => teamsQuery.refetch()}
+            />
           ) : items.length === 0 ? (
             <EmptyState
-              title='No teams yet'
-              description='Create a team to group members and projects within this organization.'
+              title={hasSearch ? 'No matching teams' : 'No teams yet'}
+              description={
+                hasSearch
+                  ? 'No teams match your search.'
+                  : 'Create a team to group members and projects within this organization.'
+              }
               icon={<Users className='w-6 h-6' />}
               action={
-                canAdmin ? (
+                canAdmin && !hasSearch ? (
                   <Button
                     color='primary'
                     startContent={<Plus className='w-4 h-4' />}
@@ -390,26 +439,15 @@ export default function TeamsPage() {
           )}
         </div>
 
-        {items.length > 0 && (
-          <div className='flex items-center justify-between text-xs text-default-500'>
-            <p>
-              Showing {items.length} team{items.length === 1 ? '' : 's'}.
-            </p>
-            {canAdmin && (
-              <p className='flex items-center gap-1'>
-                <ShieldCheck className='w-3.5 h-3.5' />
-                Archiving is reversible by an administrator.
-              </p>
-            )}
-          </div>
-        )}
-
-        {teamsQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {teamsQuery.error instanceof Error
-              ? teamsQuery.error.message
-              : 'Failed to load teams.'}
-          </pre>
+        {!teamsQuery.isError && total > 0 && (
+          <PaginationFooter
+            page={filters.page}
+            pageSize={TEAM_PAGE_SIZE}
+            total={total}
+            noun='team'
+            onPageChange={(page) => setFilters({ page })}
+            isDisabled={teamsQuery.isFetching}
+          />
         )}
 
         <TeamModal
@@ -427,7 +465,7 @@ export default function TeamsPage() {
           title='Archive team'
           description={
             archiveTarget
-              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? Members and projects in this team will be retained but hidden from active views.`
+              ? `Archive "${archiveTarget.name}" (${archiveTarget.slug})? It will be hidden from active views. Archived teams are not shown in this list and cannot be restored from the console.`
               : undefined
           }
           confirmLabel='Archive'
