@@ -1123,7 +1123,7 @@ def _recheck_custom_base_url(policy: ModelPolicy, base_url: str) -> None:
     try:
         validate_base_url(base_url)
     except BaseUrlValidationError as error:
-        raise ModelPolicyError('provider_base_url_invalid', str(error), retryable=False) from error
+        raise ModelPolicyError('provider_base_url_invalid', error.public_message, retryable=False) from error
 
 
 def provider_http_timeout() -> int:

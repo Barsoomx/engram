@@ -11,7 +11,7 @@ class BaseUrlValidationMixin:
             try:
                 validate_base_url(value)
             except BaseUrlValidationError as error:
-                raise serializers.ValidationError(str(error)) from error
+                raise serializers.ValidationError(error.public_message) from error
 
         return value
 

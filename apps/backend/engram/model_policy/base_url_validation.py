@@ -18,7 +18,10 @@ Resolver = Callable[[str], tuple[str, ...]]
 
 
 class BaseUrlValidationError(ValueError):
-    pass
+    def __init__(self, public_message: str) -> None:
+        self.public_message = public_message
+
+        super().__init__(public_message)
 
 
 def _default_resolver(host: str) -> tuple[str, ...]:
