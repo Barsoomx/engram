@@ -21,6 +21,7 @@ import {
   ChevronLeft,
   Clock,
   Copy,
+  ExternalLink,
   History,
   Link2,
   Plus,
@@ -89,6 +90,8 @@ type MemoryDetail = {
   project_slug?: string;
   authorized_for_injection?: boolean;
   related?: BackendRelated[];
+  source_session_id?: string | null;
+  source_correlation_id?: string | null;
 };
 
 type RelatedItem = {
@@ -854,6 +857,28 @@ function MemoryDetailContent({
                 className='text-[12.5px] font-semibold text-foreground'
               />
             </ProvenanceRow>
+            {data.source_session_id && (
+              <ProvenanceRow label='Source session'>
+                <Link
+                  href={`/observations?session_id=${encodeURIComponent(data.source_session_id)}`}
+                  className='inline-flex items-center gap-1 text-[12px] font-medium text-primary-300 transition-colors hover:underline'
+                >
+                  <ExternalLink size={12} strokeWidth={1.8} />
+                  View in observations
+                </Link>
+              </ProvenanceRow>
+            )}
+            {data.source_correlation_id && (
+              <ProvenanceRow label='Correlation'>
+                <Link
+                  href={`/observations?correlation_id=${encodeURIComponent(data.source_correlation_id)}`}
+                  className='inline-flex items-center gap-1 text-[12px] font-medium text-primary-300 transition-colors hover:underline'
+                >
+                  <ExternalLink size={12} strokeWidth={1.8} />
+                  View by correlation
+                </Link>
+              </ProvenanceRow>
+            )}
           </div>
         </div>
 
