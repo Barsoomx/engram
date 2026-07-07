@@ -21,6 +21,7 @@ class Command(BaseCommand):
         parser.add_argument('--project-id', required=True)
         parser.add_argument('--output', required=True)
         parser.add_argument('--team-id', required=False)
+        parser.add_argument('--all-statuses', action='store_true')
 
     def handle(self, *args: Any, **options: Any) -> None:
         organization_id = uuid.UUID(str(options['organization_id']))
@@ -32,6 +33,7 @@ class Command(BaseCommand):
             organization_id=organization_id,
             project_id=project_id,
             team_id=team_id,
+            all_statuses=bool(options['all_statuses']),
         )
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,12 +48,12 @@ def export_memories(
     organization_id: uuid.UUID,
     project_id: uuid.UUID,
     team_id: uuid.UUID | None,
+    all_statuses: bool = False,
 ) -> dict[str, Any]:
     memories = (
         Memory.objects.filter(
             organization_id=organization_id,
             project_id=project_id,
-            status=MemoryStatus.APPROVED,
         )
         .prefetch_related(
             Prefetch(
@@ -59,9 +61,13 @@ def export_memories(
                 queryset=RetrievalDocument.objects.select_related('memory_version'),
             ),
             'versions',
+            'links',
         )
         .order_by('title')
     )
+
+    if not all_statuses:
+        memories = memories.filter(status=MemoryStatus.APPROVED)
 
     if team_id is not None:
         memories = memories.filter(team_id=team_id)
@@ -91,15 +97,31 @@ def _serialize_memory(memory: Memory) -> dict[str, Any]:
 
     retrieval_document = _serialize_retrieval_document(memory)
 
+    links = [
+        {
+            'link_type': link.link_type,
+            'target': redact_value(link.target).value,
+            'created_at': link.created_at.isoformat(),
+        }
+        for link in memory.links.all()
+    ]
+
     return {
         'id': str(memory.id),
         'title': redact_value(memory.title).value,
         'body': redact_value(memory.body).value,
+        'status': memory.status,
+        'confidence': str(memory.confidence) if memory.confidence is not None else None,
+        'stale': memory.stale,
+        'refuted': memory.refuted,
+        'kind': memory.kind,
+        'team_id': str(memory.team_id) if memory.team_id else None,
         'visibility_scope': memory.visibility_scope,
         'current_version': memory.current_version,
         'metadata': redact_value(memory.metadata).value,
         'created_at': memory.created_at.isoformat(),
         'versions': versions,
+        'links': links,
         'retrieval_document': retrieval_document,
     }
 

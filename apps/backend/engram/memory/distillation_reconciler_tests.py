@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 from django.utils import timezone
+from structlog.testing import capture_logs
 
 from engram.core.models import (
     Agent,
@@ -82,6 +83,7 @@ def create_workflow_run(
     status: str = WorkflowRunStatus.FAILED,
     created_at: object = None,
     finished_at: object = None,
+    failure_reason: str = '',
 ) -> WorkflowRun:
     run = WorkflowRun.objects.create(
         organization=session.organization,
@@ -90,6 +92,7 @@ def create_workflow_run(
         run_type=WorkflowRunType.SESSION_DISTILLATION,
         status=status,
         input_snapshot={'session_id': str(session.id)},
+        failure_reason=failure_reason,
     )
 
     update_fields: dict[str, object] = {}
@@ -153,11 +156,13 @@ def test_session_at_max_attempts_cap_is_not_retriable(
         session,
         created_at=timezone.now() - timedelta(hours=2),
         finished_at=timezone.now() - timedelta(hours=2),
+        failure_reason='provider returned 400',
     )
     create_workflow_run(
         session,
         created_at=timezone.now() - timedelta(hours=1),
         finished_at=timezone.now() - timedelta(minutes=40),
+        failure_reason='provider returned 400',
     )
 
     result = RetryFailedDistillations().execute()
@@ -267,6 +272,131 @@ def test_env_override_lowers_max_attempts_and_makes_session_not_retriable(
     session = create_session(f_org, f_team, f_project, f_agent)
     create_observation(session)
     create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=40))
+
+    result = RetryFailedDistillations().execute()
+
+    assert result.retriable_session_ids == ()
+
+
+@pytest.mark.django_db
+def test_two_transient_failures_past_cooldown_are_retriable(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    create_observation(session)
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=2),
+        finished_at=timezone.now() - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=1),
+        finished_at=timezone.now() - timedelta(minutes=40),
+        failure_reason='provider returned 402',
+    )
+
+    result = RetryFailedDistillations().execute()
+
+    assert result.retriable_session_ids == (session.id,)
+
+
+@pytest.mark.django_db
+def test_transient_failures_beyond_non_transient_cap_are_still_retriable(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    create_observation(session)
+    for index in range(5):
+        create_workflow_run(
+            session,
+            created_at=timezone.now() - timedelta(hours=5 - index),
+            finished_at=timezone.now() - timedelta(minutes=40 + index),
+            failure_reason='provider timed out',
+        )
+
+    result = RetryFailedDistillations().execute()
+
+    assert result.retriable_session_ids == (session.id,)
+
+
+@pytest.mark.django_db
+def test_transient_failures_exceeding_transient_cap_are_abandoned_and_logged(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_TRANSIENT_MAX_ATTEMPTS', '2')
+    session = create_session(f_org, f_team, f_project, f_agent)
+    create_observation(session)
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=2),
+        finished_at=timezone.now() - timedelta(hours=2),
+        failure_reason='provider returned 429',
+    )
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=1),
+        finished_at=timezone.now() - timedelta(minutes=40),
+        failure_reason='provider returned 503',
+    )
+
+    with capture_logs() as logs:
+        result = RetryFailedDistillations().execute()
+
+    assert result.retriable_session_ids == ()
+
+    abandoned = [entry for entry in logs if entry['event'] == 'distillation_reconciler_abandoned']
+
+    assert len(abandoned) == 1
+    assert abandoned[0]['session_id'] == str(session.id)
+    assert abandoned[0]['failed_count'] == 2
+    assert abandoned[0]['transient_count'] == 2
+
+
+@pytest.mark.django_db
+def test_failures_before_a_succeeded_run_are_excluded_by_the_succeeded_gate(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    create_observation(session)
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=4),
+        finished_at=timezone.now() - timedelta(hours=4),
+        failure_reason='provider returned 400',
+    )
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=3),
+        finished_at=timezone.now() - timedelta(hours=3),
+        failure_reason='provider returned 400',
+    )
+    create_workflow_run(
+        session,
+        status=WorkflowRunStatus.SUCCEEDED,
+        created_at=timezone.now() - timedelta(hours=2),
+        finished_at=timezone.now() - timedelta(hours=2),
+    )
+    create_workflow_run(
+        session,
+        created_at=timezone.now() - timedelta(hours=1),
+        finished_at=timezone.now() - timedelta(minutes=40),
+        failure_reason='provider returned 400',
+    )
 
     result = RetryFailedDistillations().execute()
 
