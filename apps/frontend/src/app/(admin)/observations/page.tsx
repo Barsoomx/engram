@@ -1,33 +1,34 @@
 'use client';
 
-import {
-  Button,
-  Input,
-  Modal,
-  ModalBody,
-  ModalContent,
-  ModalHeader,
-} from '@heroui/react';
-import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
-import { AlertTriangle, Eye, Filter } from 'lucide-react';
+import { Button, Input, Modal, ModalBody, ModalContent, ModalHeader, Select, SelectItem } from '@heroui/react';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { Eye } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
+import { TimeStamp } from '@/components/ui/time-stamp';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { apiClient, fetchMe, type MeResponse } from '@/lib/auth';
-import { formatRelativeTime } from '@/lib/design';
+import { endOfDayExclusiveIso, startOfDayIso } from '@/lib/format-time';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
-const LIMIT = 20;
+const PAGE_SIZE = 20;
 
 type ObservationItem = {
   observation_id: string;
   session_id: string | null;
   observation_type: string;
   title: string;
+  subtitle?: string | null;
   body: string;
+  facts?: unknown;
+  narrative?: string | null;
+  concepts?: unknown;
   files_read: string[] | null;
   files_modified: string[] | null;
   observed_at: string | null;
@@ -39,26 +40,25 @@ type ObservationsListResponse = {
   request_id: string;
 };
 
-type ObservationDetailResponse = ObservationItem & {
-  request_id: string;
-};
-
-type Filters = {
-  observation_type: string;
-  session_id: string;
-  since: string;
-  until: string;
-};
-
-const EMPTY_FILTERS: Filters = {
+const OBSERVATIONS_FILTER_DEFAULTS = {
   observation_type: '',
   session_id: '',
+  correlation_id: '',
   since: '',
   until: '',
+  page: 1,
+  selected: '',
 };
 
-const GRID =
-  'grid grid-cols-[minmax(0,0.7fr)_minmax(0,1.2fr)_minmax(0,2fr)_auto] items-center gap-4';
+function asStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.filter(
+    (entry): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+  );
+}
 
 function TypePill({ type }: { type: string }) {
   return (
@@ -68,226 +68,204 @@ function TypePill({ type }: { type: string }) {
   );
 }
 
-function ObservationRow({
-  observation,
-  onClick,
-}: {
-  observation: ObservationItem;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      role='button'
-      tabIndex={0}
-      className={`${GRID} cursor-pointer border-b border-divider px-5 py-3.5 transition-colors last:border-b-0 hover:bg-content2/60 focus:bg-content2/60 focus:outline-hidden`}
-      onClick={onClick}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          onClick();
-        }
-      }}
-    >
-      <div className='min-w-0'>
-        <TypePill type={observation.observation_type} />
-      </div>
-      <div className='min-w-0'>
-        <div className='truncate text-[13px] text-foreground'>
-          {observation.title || '(untitled)'}
-        </div>
-        {observation.session_id && (
-          <div className='mt-0.5 truncate font-mono text-[10.5px] text-default-400'>
-            {observation.session_id}
-          </div>
-        )}
-      </div>
-      <div className='min-w-0 truncate text-[12.5px] text-default-500'>
-        {observation.body || '—'}
-      </div>
-      <div className='flex items-center justify-end'>
-        <span className='tnum whitespace-nowrap font-mono text-[11.5px] text-default-400'>
-          {formatRelativeTime(observation.observed_at)}
-        </span>
-      </div>
-    </div>
-  );
-}
-
 function ObservationsTable({
   items,
   onRowClick,
+  onSessionClick,
 }: {
   items: ObservationItem[];
   onRowClick: (id: string) => void;
+  onSessionClick: (sessionId: string) => void;
 }) {
   return (
-    <div className='surface-card overflow-hidden'>
-      <div
-        className={`${GRID} border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400`}
-      >
-        <span>Type</span>
-        <span>Title / Session</span>
-        <span>Body</span>
-        <span className='text-right'>Observed</span>
-      </div>
-      {items.map((obs) => (
-        <ObservationRow
-          key={obs.observation_id}
-          observation={obs}
-          onClick={() => onRowClick(obs.observation_id)}
-        />
-      ))}
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={720}>
+        <thead>
+          <tr className='border-b border-divider text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+            <th className='py-3 px-3 text-left font-medium'>Type</th>
+            <th className='py-3 px-3 text-left font-medium'>Title / Session</th>
+            <th className='py-3 px-3 text-left font-medium'>Body</th>
+            <th className='py-3 px-3 text-right font-medium'>Observed</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.map((obs) => (
+            <tr
+              key={obs.observation_id}
+              role='button'
+              tabIndex={0}
+              className='cursor-pointer border-b border-divider/60 transition-colors last:border-b-0 hover:bg-content2/60 focus:bg-content2/60 focus:outline-hidden'
+              onClick={() => onRowClick(obs.observation_id)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  onRowClick(obs.observation_id);
+                }
+              }}
+            >
+              <td className='py-2.5 px-3'>
+                <TypePill type={obs.observation_type} />
+              </td>
+              <td className='py-2.5 px-3'>
+                <div className='min-w-0'>
+                  <div className='truncate text-[13px] text-foreground' title={obs.title || undefined}>
+                    {obs.title || '(untitled)'}
+                  </div>
+                  {obs.session_id && (
+                    <button
+                      type='button'
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onSessionClick(obs.session_id as string);
+                      }}
+                      className='mt-0.5 block max-w-full truncate font-mono text-[10.5px] text-default-400 hover:text-primary-300'
+                      title={`Filter by session ${obs.session_id}`}
+                    >
+                      {obs.session_id}
+                    </button>
+                  )}
+                </div>
+              </td>
+              <td className='py-2.5 px-3'>
+                <span
+                  className='block min-w-0 truncate text-[12.5px] text-default-500'
+                  title={obs.body || undefined}
+                >
+                  {obs.body || '—'}
+                </span>
+              </td>
+              <td className='py-2.5 px-3 text-right'>
+                <TimeStamp
+                  value={obs.observed_at}
+                  className='tnum whitespace-nowrap font-mono text-[11.5px] text-default-400'
+                />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </ResponsiveTable>
     </div>
   );
 }
 
-function TableSkeleton() {
-  return (
-    <div className='surface-card overflow-hidden'>
-      <div
-        className={`${GRID} border-b border-divider px-5 py-3 text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400`}
-      >
-        <span>Type</span>
-        <span>Title / Session</span>
-        <span>Body</span>
-        <span className='text-right'>Observed</span>
-      </div>
-      {Array.from({ length: 5 }).map((_, index) => (
-        <div
-          key={index}
-          className={`${GRID} border-b border-divider px-5 py-3.5 last:border-b-0`}
-        >
-          <span className='h-5 w-20 animate-pulse rounded-[7px] bg-content2' />
-          <span className='h-3.5 w-32 animate-pulse rounded-medium bg-content2' />
-          <span className='h-3.5 w-48 animate-pulse rounded-medium bg-content2' />
-          <span className='ml-auto h-3.5 w-14 animate-pulse rounded-medium bg-content2' />
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function DetailField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function DetailField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className='min-w-0 space-y-1.5'>
-      <p className='text-[10px] font-semibold uppercase tracking-[0.12em] text-default-400'>
-        {label}
-      </p>
+      <p className='text-[10px] font-semibold uppercase tracking-[0.12em] text-default-400'>{label}</p>
       {children}
     </div>
   );
 }
 
 function DetailModal({
-  observationId,
-  projectId,
-  teamId,
+  observation,
   onClose,
+  onSessionClick,
 }: {
-  observationId: string | null;
-  projectId: string;
-  teamId: string | null;
+  observation: ObservationItem | null;
   onClose: () => void;
+  onSessionClick: (sessionId: string) => void;
 }) {
-  const detailQuery = useQuery<ObservationDetailResponse>({
-    queryKey: ['observations', 'detail', observationId, projectId, teamId],
-    enabled: Boolean(observationId),
-    queryFn: async () => {
-      const client = apiClient();
-      const params: Record<string, string> = { project_id: projectId };
-
-      if (teamId) {
-        params.team_id = teamId;
-      }
-
-      const response = await client.get<ObservationDetailResponse>(
-        `/v1/observations/${observationId}`,
-        { params },
-      );
-
-      return response.data;
-    },
-  });
-
-  const obs = detailQuery.data;
+  const facts = asStringList(observation?.facts);
+  const concepts = asStringList(observation?.concepts);
+  const filesRead = observation?.files_read ?? [];
+  const filesModified = observation?.files_modified ?? [];
 
   return (
-    <Modal
-      isOpen={Boolean(observationId)}
-      onClose={onClose}
-      placement='center'
-      size='2xl'
-    >
+    <Modal isOpen={Boolean(observation)} onClose={onClose} placement='center' size='2xl'>
       <ModalContent>
         {() => (
           <>
             <ModalHeader className='text-foreground'>Observation detail</ModalHeader>
             <ModalBody className='pb-6'>
-              {detailQuery.isLoading && (
-                <div className='space-y-3'>
-                  {Array.from({ length: 4 }).map((_, i) => (
-                    <span
-                      key={i}
-                      className='block h-3.5 w-full animate-pulse rounded-medium bg-content2'
-                    />
-                  ))}
-                </div>
-              )}
-              {detailQuery.isError && (
-                <div className='flex items-start gap-3 rounded-[14px] border border-danger/30 bg-danger/5 px-4 py-3.5'>
-                  <AlertTriangle className='mt-0.5 h-4 w-4 shrink-0 text-danger' />
-                  <p className='text-[13px] text-danger'>
-                    {detailQuery.error instanceof Error
-                      ? detailQuery.error.message
-                      : 'Failed to load observation.'}
-                  </p>
-                </div>
-              )}
-              {obs && (
+              {observation && (
                 <div className='space-y-5'>
                   <div className='grid grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-3'>
                     <DetailField label='Type'>
-                      <TypePill type={obs.observation_type} />
+                      <TypePill type={observation.observation_type} />
                     </DetailField>
                     <DetailField label='Observed'>
-                      <span className='font-mono text-[12.5px] text-default-700'>
-                        {formatRelativeTime(obs.observed_at)}
-                      </span>
+                      <TimeStamp
+                        value={observation.observed_at}
+                        relative={false}
+                        className='font-mono text-[12.5px] text-default-700'
+                      />
                     </DetailField>
-                    {obs.session_id && (
-                      <DetailField label='Session ID'>
-                        <span className='break-all font-mono text-[11.5px] text-default-500'>
-                          {obs.session_id}
-                        </span>
+                    {observation.session_id && (
+                      <DetailField label='Session'>
+                        <button
+                          type='button'
+                          onClick={() => onSessionClick(observation.session_id as string)}
+                          className='break-all text-left font-mono text-[11.5px] text-primary-300 hover:underline'
+                        >
+                          {observation.session_id}
+                        </button>
                       </DetailField>
                     )}
                   </div>
 
-                  {obs.title && (
+                  {observation.title && (
                     <DetailField label='Title'>
-                      <p className='text-[13.5px] font-semibold text-foreground'>
-                        {obs.title}
+                      <p className='text-[13.5px] font-semibold text-foreground'>{observation.title}</p>
+                    </DetailField>
+                  )}
+
+                  {observation.subtitle && (
+                    <DetailField label='Subtitle'>
+                      <p className='text-[13px] text-default-600'>{observation.subtitle}</p>
+                    </DetailField>
+                  )}
+
+                  {observation.narrative && (
+                    <DetailField label='Narrative'>
+                      <p className='whitespace-pre-wrap text-[13px] leading-relaxed text-default-600'>
+                        {observation.narrative}
                       </p>
+                    </DetailField>
+                  )}
+
+                  {facts.length > 0 && (
+                    <DetailField label={`Facts (${facts.length})`}>
+                      <ul className='list-disc space-y-1 pl-4'>
+                        {facts.map((fact, index) => (
+                          <li key={index} className='text-[12.5px] text-default-600'>
+                            {fact}
+                          </li>
+                        ))}
+                      </ul>
+                    </DetailField>
+                  )}
+
+                  {concepts.length > 0 && (
+                    <DetailField label={`Concepts (${concepts.length})`}>
+                      <div className='flex flex-wrap gap-1.5'>
+                        {concepts.map((concept, index) => (
+                          <span
+                            key={index}
+                            className='rounded-[7px] bg-content3 px-2 py-0.5 text-[11px] text-default-600'
+                          >
+                            {concept}
+                          </span>
+                        ))}
+                      </div>
                     </DetailField>
                   )}
 
                   <DetailField label='Body'>
                     <pre className='max-h-48 overflow-y-auto whitespace-pre-wrap rounded-[12px] bg-content2 px-4 py-3.5 font-mono text-[11.5px] leading-relaxed text-default-700'>
-                      {obs.body || '(empty)'}
+                      {observation.body || '(empty)'}
                     </pre>
                   </DetailField>
 
-                  {obs.files_read && obs.files_read.length > 0 && (
-                    <DetailField label={`Files read (${obs.files_read.length})`}>
+                  {filesRead.length > 0 && (
+                    <DetailField label={`Files read (${filesRead.length})`}>
                       <ul className='space-y-1'>
-                        {obs.files_read.map((f) => (
-                          <li key={f} className='truncate font-mono text-[11.5px] text-default-500'>
+                        {filesRead.map((f) => (
+                          <li
+                            key={f}
+                            className='truncate font-mono text-[11.5px] text-default-500'
+                            title={f}
+                          >
                             {f}
                           </li>
                         ))}
@@ -295,11 +273,15 @@ function DetailModal({
                     </DetailField>
                   )}
 
-                  {obs.files_modified && obs.files_modified.length > 0 && (
-                    <DetailField label={`Files modified (${obs.files_modified.length})`}>
+                  {filesModified.length > 0 && (
+                    <DetailField label={`Files modified (${filesModified.length})`}>
                       <ul className='space-y-1'>
-                        {obs.files_modified.map((f) => (
-                          <li key={f} className='truncate font-mono text-[11.5px] text-warning'>
+                        {filesModified.map((f) => (
+                          <li
+                            key={f}
+                            className='truncate font-mono text-[11.5px] text-warning'
+                            title={f}
+                          >
                             {f}
                           </li>
                         ))}
@@ -330,63 +312,93 @@ export default function ObservationsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const [draft, setDraft] = React.useState<Filters>(EMPTY_FILTERS);
-  const [applied, setApplied] = React.useState<Filters>(EMPTY_FILTERS);
-  const [selectedId, setSelectedId] = React.useState<string | null>(null);
+  const [filters, setFilters] = useUrlFilters(OBSERVATIONS_FILTER_DEFAULTS);
+  const page = Math.max(1, filters.page);
+  const [knownTypes, setKnownTypes] = React.useState<string[]>([]);
 
-  const query = useInfiniteQuery({
-    queryKey: ['observations', activeProjectId, activeTeamId, applied],
+  const query = useQuery({
+    queryKey: [
+      'observations',
+      activeProjectId,
+      activeTeamId,
+      filters.observation_type,
+      filters.session_id,
+      filters.correlation_id,
+      filters.since,
+      filters.until,
+      page,
+    ],
     enabled: Boolean(activeProjectId),
-    initialPageParam: 0,
-    queryFn: async ({ pageParam }) => {
+    placeholderData: keepPreviousData,
+    queryFn: async () => {
       const params: Record<string, string> = {
         project_id: activeProjectId ?? '',
-        limit: String(LIMIT),
-        offset: String(pageParam),
+        limit: String(PAGE_SIZE),
+        offset: String((page - 1) * PAGE_SIZE),
       };
 
       if (activeTeamId) params.team_id = activeTeamId;
-      if (applied.observation_type) {
-        params.observation_type = applied.observation_type;
-      }
-      if (applied.session_id) params.session_id = applied.session_id;
-      if (applied.since) params.since = applied.since;
-      if (applied.until) params.until = applied.until;
+      if (filters.observation_type) params.observation_type = filters.observation_type;
+      if (filters.session_id) params.session_id = filters.session_id;
+      if (filters.correlation_id) params.correlation_id = filters.correlation_id;
 
-      const response = await apiClient().get<ObservationsListResponse>(
-        '/v1/observations/',
-        { params },
-      );
+      const since = startOfDayIso(filters.since);
+      const until = endOfDayExclusiveIso(filters.until);
+
+      if (since) params.since = since;
+      if (until) params.until = until;
+
+      const response = await apiClient().get<ObservationsListResponse>('/v1/observations/', {
+        params,
+      });
 
       return response.data;
     },
-    getNextPageParam: (lastPage, allPages) => {
-      const loaded = allPages.reduce(
-        (sum, page) => sum + page.items.length,
-        0,
-      );
-
-      return lastPage.items.length === LIMIT ? loaded : undefined;
-    },
   });
 
-  const items = React.useMemo(
-    () => query.data?.pages.flatMap((page) => page.items) ?? [],
-    [query.data],
-  );
-  const isLoading = query.isLoading;
-  const isLoadingMore = query.isFetchingNextPage;
-  const hasMore = Boolean(query.hasNextPage);
-  const fetchError = query.isError
-    ? query.error instanceof Error
-      ? query.error.message
-      : 'Failed to load observations.'
+  const items = React.useMemo(() => query.data?.items ?? [], [query.data]);
+
+  React.useEffect(() => {
+    if (items.length === 0) {
+      return;
+    }
+
+    setKnownTypes((prev) => {
+      const set = new Set(prev);
+
+      for (const item of items) {
+        if (item.observation_type) {
+          set.add(item.observation_type);
+        }
+      }
+
+      const merged = Array.from(set).sort();
+
+      return merged.length === prev.length ? prev : merged;
+    });
+  }, [items]);
+
+  const typeOptions = React.useMemo(() => {
+    const set = new Set(knownTypes);
+
+    if (filters.observation_type) {
+      set.add(filters.observation_type);
+    }
+
+    return Array.from(set).sort();
+  }, [knownTypes, filters.observation_type]);
+
+  const selectedObservation = filters.selected
+    ? items.find((obs) => obs.observation_id === filters.selected) ?? null
     : null;
 
-  function handleFilterSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    setApplied({ ...draft });
-  }
+  const hasMore = items.length === PAGE_SIZE;
+  const hasActiveFilters =
+    Boolean(filters.observation_type) ||
+    Boolean(filters.session_id) ||
+    Boolean(filters.correlation_id) ||
+    Boolean(filters.since) ||
+    Boolean(filters.until);
 
   if (!activeProjectId) {
     return (
@@ -412,102 +424,154 @@ export default function ObservationsPage() {
           subtitle='Raw agent observations captured for the active project.'
         />
 
-        <form
-          onSubmit={handleFilterSubmit}
-          className='surface-card flex flex-wrap items-end gap-3 p-4'
-        >
-          <div className='flex items-center gap-2 self-start pt-[26px] text-[11px] font-semibold uppercase tracking-[0.1em] text-default-400'>
-            <Filter className='h-3.5 w-3.5' />
-            Filters
-          </div>
-          <Input
+        <div className='surface-card grid grid-cols-1 gap-3 p-4 sm:grid-cols-2 lg:grid-cols-4'>
+          <Select
             label='Type'
             labelPlacement='outside'
-            placeholder='e.g. file_read'
+            placeholder='All types'
+            variant='bordered'
             size='sm'
-            className='max-w-[180px]'
-            value={draft.observation_type}
-            onValueChange={(v) => setDraft((p) => ({ ...p, observation_type: v }))}
-            classNames={{ input: 'font-mono text-xs' }}
-          />
+            selectedKeys={
+              filters.observation_type ? new Set([filters.observation_type]) : new Set<string>()
+            }
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ observation_type: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {typeOptions.map((type) => (
+              <SelectItem key={type}>{type}</SelectItem>
+            ))}
+          </Select>
           <Input
             label='Session ID'
             labelPlacement='outside'
             placeholder='session uuid'
+            variant='bordered'
             size='sm'
-            className='max-w-[220px]'
-            value={draft.session_id}
-            onValueChange={(v) => setDraft((p) => ({ ...p, session_id: v }))}
+            value={filters.session_id}
+            onValueChange={(v) => setFilters({ session_id: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ session_id: '', page: 1 })}
             classNames={{ input: 'font-mono text-xs' }}
           />
           <Input
-            label='Since'
+            label='Correlation ID'
             labelPlacement='outside'
-            placeholder='2024-01-01T00:00:00Z'
+            placeholder='correlation id'
+            variant='bordered'
             size='sm'
-            className='max-w-[210px]'
-            value={draft.since}
-            onValueChange={(v) => setDraft((p) => ({ ...p, since: v }))}
+            value={filters.correlation_id}
+            onValueChange={(v) => setFilters({ correlation_id: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ correlation_id: '', page: 1 })}
             classNames={{ input: 'font-mono text-xs' }}
           />
-          <Input
-            label='Until'
-            labelPlacement='outside'
-            placeholder='2024-12-31T23:59:59Z'
-            size='sm'
-            className='max-w-[210px]'
-            value={draft.until}
-            onValueChange={(v) => setDraft((p) => ({ ...p, until: v }))}
-            classNames={{ input: 'font-mono text-xs' }}
-          />
-          <Button type='submit' color='primary' size='sm' className='mb-0.5'>
-            Apply
-          </Button>
-        </form>
-
-        {isLoading && <TableSkeleton />}
-
-        {fetchError && !isLoading && (
-          <div className='flex items-start gap-3 rounded-[16px] border border-danger/30 bg-danger/5 px-5 py-4'>
-            <AlertTriangle className='mt-0.5 h-5 w-5 shrink-0 text-danger' />
-            <p className='text-[13px] leading-relaxed text-danger'>{fetchError}</p>
+          <div className='grid grid-cols-2 gap-2'>
+            <Input
+              label='Since'
+              labelPlacement='outside'
+              type='date'
+              variant='bordered'
+              size='sm'
+              value={filters.since}
+              onValueChange={(v) => setFilters({ since: v, page: 1 })}
+            />
+            <Input
+              label='Until'
+              labelPlacement='outside'
+              type='date'
+              variant='bordered'
+              size='sm'
+              value={filters.until}
+              onValueChange={(v) => setFilters({ until: v, page: 1 })}
+            />
           </div>
-        )}
+        </div>
 
-        {!isLoading && !fetchError && items.length === 0 && (
+        {query.isLoading ? (
+          <div className='surface-card p-2'>
+            <ResponsiveTable minWidth={720}>
+              <thead>
+                <tr className='border-b border-divider text-[10.5px] font-semibold uppercase tracking-[0.1em] text-default-400'>
+                  {['Type', 'Title / Session', 'Body', 'Observed'].map((label) => (
+                    <th key={label} className='py-3 px-3 text-left font-medium'>
+                      {label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {Array.from({ length: 6 }).map((_, index) => (
+                  <tr key={index} className='border-b border-divider/60'>
+                    {Array.from({ length: 4 }).map((__, cell) => (
+                      <td key={cell} className='py-3 px-3'>
+                        <span className='block h-3.5 w-full animate-pulse rounded-medium bg-content2' />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </ResponsiveTable>
+          </div>
+        ) : query.isError && !query.data ? (
+          <ErrorState
+            message={
+              query.error instanceof Error ? query.error.message : 'Failed to load observations.'
+            }
+            onRetry={() => query.refetch()}
+          />
+        ) : items.length === 0 ? (
           <EmptyState
-            title='No observations'
-            description='No observations have been recorded for this project yet.'
+            title={hasActiveFilters ? 'No matching observations' : 'No observations'}
+            description={
+              hasActiveFilters
+                ? 'No observations match the current filters.'
+                : 'No observations have been recorded for this project yet.'
+            }
             icon={<Eye className='h-6 w-6' />}
           />
-        )}
-
-        {!isLoading && items.length > 0 && (
+        ) : (
           <div className='space-y-3'>
-            <ObservationsTable items={items} onRowClick={setSelectedId} />
+            <ObservationsTable
+              items={items}
+              onRowClick={(id) => setFilters({ selected: id })}
+              onSessionClick={(sessionId) => setFilters({ session_id: sessionId, page: 1 })}
+            />
             <div className='flex items-center justify-between'>
               <p className='tnum text-[12px] text-default-400'>
-                Showing {items.length} observation{items.length === 1 ? '' : 's'}.
+                Showing {(page - 1) * PAGE_SIZE + 1}–{(page - 1) * PAGE_SIZE + items.length} on page{' '}
+                {page}.
               </p>
-              {hasMore && (
+              <div className='flex items-center gap-2'>
                 <Button
                   size='sm'
                   variant='flat'
-                  onPress={() => void query.fetchNextPage()}
-                  isLoading={isLoadingMore}
+                  isDisabled={page <= 1 || query.isFetching}
+                  onPress={() => setFilters({ page: page - 1 })}
                 >
-                  Load more
+                  Previous
                 </Button>
-              )}
+                <Button
+                  size='sm'
+                  variant='flat'
+                  isDisabled={!hasMore || query.isFetching}
+                  onPress={() => setFilters({ page: page + 1 })}
+                >
+                  Next
+                </Button>
+              </div>
             </div>
           </div>
         )}
 
         <DetailModal
-          observationId={selectedId}
-          projectId={activeProjectId}
-          teamId={activeTeamId}
-          onClose={() => setSelectedId(null)}
+          observation={selectedObservation}
+          onClose={() => setFilters({ selected: '' })}
+          onSessionClick={(sessionId) =>
+            setFilters({ session_id: sessionId, selected: '', page: 1 })
+          }
         />
       </section>
     </CapabilityGate>

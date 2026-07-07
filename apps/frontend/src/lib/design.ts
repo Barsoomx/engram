@@ -194,6 +194,7 @@ export const AUDIT_RESULT_COLORS: Record<string, string> = {
   allowed: '#3DD9AC',
   recorded: '#6BA6FF',
   denied: '#FB6E72',
+  error: '#FB6E72',
 };
 
 export function auditResultColor(value: string | null | undefined): string {
@@ -209,7 +210,7 @@ export function auditResultChipColor(
     return 'success';
   }
 
-  if (v === 'denied' || v === 'failed' || v === 'errored') {
+  if (v === 'denied' || v === 'failed' || v === 'errored' || v === 'error') {
     return 'danger';
   }
 

@@ -1,39 +1,45 @@
 'use client';
 
-import {
-  Button,
-  Chip,
-  Input,
-  Pagination,
-  Select,
-  SelectItem,
-} from '@heroui/react';
-import { useQuery } from '@tanstack/react-query';
+import { Chip, Input, Select, SelectItem } from '@heroui/react';
+import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
-import { Clock, GitBranch, RefreshCw, Workflow } from 'lucide-react';
+import { Workflow } from 'lucide-react';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
 import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
+import { PaginationFooter } from '@/components/ui/pagination-footer';
+import { ResponsiveTable } from '@/components/ui/responsive-table';
 import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
+import { TimeStamp } from '@/components/ui/time-stamp';
 import { useProjects } from '@/hooks/use-projects';
+import { useUrlFilters } from '@/hooks/use-url-filters';
 import { useWorkflowRuns } from '@/hooks/use-workflow-runs';
-import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
+import { fetchMe, type MeResponse } from '@/lib/auth';
+import { endOfDayInclusiveIso, startOfDayIso } from '@/lib/format-time';
 import { useOrgStore } from '@/lib/org-store';
 import type {
-  Project,
   WorkflowRunListItem,
   WorkflowRunListParams,
   WorkflowRunStatus,
   WorkflowRunType,
 } from '@/lib/admin-api';
 
-const RUN_TYPE_OPTIONS: { key: WorkflowRunType; label: string }[] = [
-  { key: 'daily_digest', label: 'Daily Digest' },
-  { key: 'session_distillation', label: 'Session Distillation' },
-  { key: 'weekly_digest', label: 'Weekly Digest' },
-];
+const PAGE_SIZE = 20;
+
+const RUN_TYPE_LABELS: Record<WorkflowRunType, string> = {
+  daily_digest: 'Daily digest',
+  observation_processing: 'Observation processing',
+  session_distillation: 'Session distillation',
+  weekly_digest: 'Weekly digest',
+};
+
+const RUN_TYPE_OPTIONS = Object.entries(RUN_TYPE_LABELS).map(([key, label]) => ({
+  key,
+  label,
+}));
 
 const STATUS_OPTIONS: { key: WorkflowRunStatus; label: string }[] = [
   { key: 'queued', label: 'Queued' },
@@ -52,21 +58,22 @@ const STATUS_CHIP_COLOR: Record<
   failed: 'danger',
 };
 
-const PAGE_SIZE = 20;
+const ACTIVE_STATUSES: ReadonlySet<string> = new Set(['queued', 'running']);
 
-function formatDateTime(value: string | null): string {
-  if (!value) {
+const WORKFLOW_FILTER_DEFAULTS = {
+  run_type: '',
+  status: '',
+  project_id: '',
+  escalation: '',
+  request_id: '',
+  correlation_id: '',
+  since: '',
+  until: '',
+  page: 1,
+};
 
-    return '—';
-  }
-
-  try {
-
-    return new Date(value).toLocaleString();
-  } catch {
-
-    return value;
-  }
+function runTypeLabel(runType: WorkflowRunType): string {
+  return RUN_TYPE_LABELS[runType] ?? runType;
 }
 
 function formatDuration(
@@ -74,7 +81,6 @@ function formatDuration(
   finishedAt: string | null,
 ): string {
   if (!startedAt || !finishedAt) {
-
     return '—';
   }
 
@@ -82,15 +88,12 @@ function formatDuration(
   const end = new Date(finishedAt).getTime();
 
   if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
-
     return '—';
   }
 
-  const diffMs = end - start;
-  const seconds = Math.floor(diffMs / 1000);
+  const seconds = Math.floor((end - start) / 1000);
 
   if (seconds < 60) {
-
     return `${seconds}s`;
   }
 
@@ -98,184 +101,32 @@ function formatDuration(
   const remSeconds = seconds % 60;
 
   if (minutes < 60) {
-
     return `${minutes}m ${remSeconds}s`;
   }
 
   const hours = Math.floor(minutes / 60);
-  const remMinutes = minutes % 60;
 
-  return `${hours}h ${remMinutes}m`;
+  return `${hours}h ${minutes % 60}m`;
 }
 
-function shortId(value: string | null): string {
-  if (!value) {
-
-    return '—';
-  }
-
-  return value.length > 8 ? `${value.slice(0, 8)}…` : value;
-}
-
-type WorkflowRunFilters = {
-  run_type?: WorkflowRunType;
-  status?: WorkflowRunStatus;
-  project_id?: string;
-  team_id?: string;
-  escalation?: boolean;
-  created_at__gte?: string;
-  created_at__lte?: string;
-};
-
-function FiltersBar({
-  filters,
-  projects,
-  onChange,
-  onReset,
+function WorkflowRunsTable({
+  items,
+  projectName,
 }: {
-  filters: WorkflowRunFilters;
-  projects: Project[];
-  onChange: (next: Partial<WorkflowRunFilters>) => void;
-  onReset: () => void;
+  items: WorkflowRunListItem[];
+  projectName: (id: string) => string;
 }) {
-  const runTypeKeys = React.useMemo(
-    () => new Set<string>(filters.run_type ? [filters.run_type] : []),
-    [filters.run_type],
-  );
-  const statusKeys = React.useMemo(
-    () => new Set<string>(filters.status ? [filters.status] : []),
-    [filters.status],
-  );
-  const escalationKeys = React.useMemo(
-    () =>
-      new Set<string>(
-        filters.escalation === undefined
-          ? []
-          : [filters.escalation ? 'true' : 'false'],
-      ),
-    [filters.escalation],
-  );
-  const projectKeys = React.useMemo(
-    () => new Set<string>(filters.project_id ? [filters.project_id] : []),
-    [filters.project_id],
-  );
-
   return (
-    <div className='surface-card p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3'>
-      <Select
-        label='Run type'
-        labelPlacement='outside'
-        placeholder='All types'
-        selectedKeys={runTypeKeys}
-        onSelectionChange={(keys) => {
-          const next = Array.from(keys)[0];
-
-          onChange({ run_type: typeof next === 'string' ? (next as WorkflowRunType) : undefined });
-        }}
-      >
-        {RUN_TYPE_OPTIONS.map((option) => (
-          <SelectItem key={option.key}>{option.label}</SelectItem>
-        ))}
-      </Select>
-
-      <Select
-        label='Status'
-        labelPlacement='outside'
-        placeholder='All statuses'
-        selectedKeys={statusKeys}
-        onSelectionChange={(keys) => {
-          const next = Array.from(keys)[0];
-
-          onChange({ status: typeof next === 'string' ? (next as WorkflowRunStatus) : undefined });
-        }}
-      >
-        {STATUS_OPTIONS.map((option) => (
-          <SelectItem key={option.key}>{option.label}</SelectItem>
-        ))}
-      </Select>
-
-      <Select
-        label='Project'
-        labelPlacement='outside'
-        placeholder='All projects'
-        selectedKeys={projectKeys}
-        onSelectionChange={(keys) => {
-          const next = Array.from(keys)[0];
-
-          onChange({ project_id: typeof next === 'string' ? next : undefined });
-        }}
-      >
-        {projects.map((project) => (
-          <SelectItem key={project.id}>{project.name}</SelectItem>
-        ))}
-      </Select>
-
-      <Select
-        label='Escalation'
-        labelPlacement='outside'
-        placeholder='Any'
-        selectedKeys={escalationKeys}
-        onSelectionChange={(keys) => {
-          const next = Array.from(keys)[0];
-
-          if (typeof next !== 'string') {
-            onChange({ escalation: undefined });
-
-            return;
-          }
-
-          onChange({ escalation: next === 'true' });
-        }}
-      >
-        <SelectItem key='true'>Escalated</SelectItem>
-        <SelectItem key='false'>Not escalated</SelectItem>
-      </Select>
-
-      <Input
-        label='Created from'
-        labelPlacement='outside'
-        placeholder='YYYY-MM-DD'
-        type='date'
-        value={filters.created_at__gte ?? ''}
-        onValueChange={(value) => onChange({ created_at__gte: value || undefined })}
-      />
-
-      <Input
-        label='Created to'
-        labelPlacement='outside'
-        placeholder='YYYY-MM-DD'
-        type='date'
-        value={filters.created_at__lte ?? ''}
-        onValueChange={(value) => onChange({ created_at__lte: value || undefined })}
-      />
-
-      <div className='md:col-span-2 lg:col-span-3 flex justify-end'>
-        <Button
-          size='sm'
-          variant='flat'
-          color='default'
-          startContent={<RefreshCw className='w-3.5 h-3.5' />}
-          onPress={onReset}
-        >
-          Reset filters
-        </Button>
-      </div>
-    </div>
-  );
-}
-
-function WorkflowRunsTable({ items }: { items: WorkflowRunListItem[] }) {
-  return (
-    <div className='overflow-x-auto'>
-      <table className='w-full border-collapse text-left text-sm'>
+    <div className='surface-card p-2'>
+      <ResponsiveTable minWidth={820}>
         <thead>
           <tr className='border-b border-divider'>
-            <th className='py-2 px-3 text-default-500 font-medium'>Run type</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Status</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Project</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Escalation</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Started at</th>
-            <th className='py-2 px-3 text-default-500 font-medium'>Duration</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Run type</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Status</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Project</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Escalation</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Started</th>
+            <th className='py-2 px-3 font-medium text-default-500'>Duration</th>
           </tr>
         </thead>
         <tbody>
@@ -284,9 +135,9 @@ function WorkflowRunsTable({ items }: { items: WorkflowRunListItem[] }) {
               <td className='py-2 px-3'>
                 <Link
                   href={`/workflow-runs/${run.id}`}
-                  className='text-foreground hover:underline'
+                  className='font-medium text-foreground hover:underline'
                 >
-                  {run.run_type}
+                  {runTypeLabel(run.run_type)}
                 </Link>
               </td>
               <td className='py-2 px-3'>
@@ -299,8 +150,10 @@ function WorkflowRunsTable({ items }: { items: WorkflowRunListItem[] }) {
                   {run.status}
                 </Chip>
               </td>
-              <td className='py-2 px-3 font-mono text-xs text-default-700'>
-                {shortId(run.project_id)}
+              <td className='py-2 px-3 text-default-700'>
+                <span className='block max-w-[220px] truncate' title={projectName(run.project_id)}>
+                  {projectName(run.project_id)}
+                </span>
               </td>
               <td className='py-2 px-3'>
                 {run.escalation ? (
@@ -311,16 +164,16 @@ function WorkflowRunsTable({ items }: { items: WorkflowRunListItem[] }) {
                   <span className='text-default-500'>—</span>
                 )}
               </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
-                {formatDateTime(run.started_at)}
+              <td className='py-2 px-3 whitespace-nowrap text-default-700'>
+                <TimeStamp value={run.started_at} />
               </td>
-              <td className='py-2 px-3 text-default-700 whitespace-nowrap'>
+              <td className='py-2 px-3 whitespace-nowrap text-default-700'>
                 {formatDuration(run.started_at, run.finished_at)}
               </td>
             </tr>
           ))}
         </tbody>
-      </table>
+      </ResponsiveTable>
     </div>
   );
 }
@@ -337,115 +190,243 @@ export default function WorkflowRunsPage() {
     [meQuery.data?.capabilities],
   );
 
-  const [rawFilters, setRawFilters] = React.useState<WorkflowRunFilters>({});
-  const [page, setPage] = React.useState(1);
+  const [filters, setFilters] = useUrlFilters(WORKFLOW_FILTER_DEFAULTS);
+  const page = Math.max(1, filters.page);
 
-  const projectsParams = React.useMemo(() => ({ pageSize: 100 }), []);
-  const projectsQuery = useProjects(activeOrgId, projectsParams);
-
+  const projectsQuery = useProjects(activeOrgId, { pageSize: 100 });
   const projects = React.useMemo(
     () => projectsQuery.data?.results ?? [],
     [projectsQuery.data?.results],
   );
-
-  const params = React.useMemo<WorkflowRunListParams>(
-    () => ({ ...rawFilters, page, pageSize: PAGE_SIZE }),
-    [rawFilters, page],
+  const projectName = React.useCallback(
+    (id: string) => projects.find((project) => project.id === id)?.name ?? id,
+    [projects],
   );
 
-  const runsQuery = useWorkflowRuns(activeOrgId, params);
+  const params = React.useMemo<WorkflowRunListParams>(() => {
+    const next: WorkflowRunListParams = { page, pageSize: PAGE_SIZE };
 
-  const total = runsQuery.data?.count ?? 0;
-  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    if (filters.run_type) next.run_type = filters.run_type as WorkflowRunType;
+    if (filters.status) next.status = filters.status as WorkflowRunStatus;
+    if (filters.project_id) next.project_id = filters.project_id;
+    if (filters.escalation) next.escalation = filters.escalation === 'true';
+    if (filters.request_id) next.request_id = filters.request_id;
+    if (filters.correlation_id) next.correlation_id = filters.correlation_id;
 
-  function handleFilterChange(next: Partial<WorkflowRunFilters>) {
-    setRawFilters((prev) => ({ ...prev, ...next }));
-    setPage(1);
-  }
+    const since = startOfDayIso(filters.since);
+    const until = endOfDayInclusiveIso(filters.until);
 
-  function handleReset() {
-    setRawFilters({});
-    setPage(1);
-  }
+    if (since) next.created_at__gte = since;
+    if (until) next.created_at__lte = until;
 
-  const isLoading = meQuery.isLoading || runsQuery.isLoading;
+    return next;
+  }, [
+    page,
+    filters.run_type,
+    filters.status,
+    filters.project_id,
+    filters.escalation,
+    filters.request_id,
+    filters.correlation_id,
+    filters.since,
+    filters.until,
+  ]);
+
+  const runsQuery = useWorkflowRuns(activeOrgId, params, {
+    placeholderData: keepPreviousData,
+  });
+
   const items = runsQuery.data?.results ?? [];
-  const meLoaded = meQuery.data !== undefined;
+  const total = runsQuery.data?.count ?? 0;
+  const hasActiveRun = items.some((run) => ACTIVE_STATUSES.has(run.status));
+
+  React.useEffect(() => {
+    if (!hasActiveRun) {
+      return;
+    }
+
+    const handle = setInterval(() => void runsQuery.refetch(), 5000);
+
+    return () => clearInterval(handle);
+  }, [hasActiveRun, runsQuery]);
+
+  const hasActiveFilters =
+    Boolean(filters.run_type) ||
+    Boolean(filters.status) ||
+    Boolean(filters.project_id) ||
+    Boolean(filters.escalation) ||
+    Boolean(filters.request_id) ||
+    Boolean(filters.correlation_id) ||
+    Boolean(filters.since) ||
+    Boolean(filters.until);
 
   return (
     <CapabilityGate capabilities={capabilities} required='memories:read'>
       <section className='space-y-6'>
         <PageHeader
-          title='Workflow Runs'
-          subtitle='Track AI workflow executions: daily digests, curator actions, escalations, and reruns.'
+          title='Workflow runs'
+          subtitle='Track AI workflow executions: digests, observation processing, distillations, escalations, and reruns.'
         />
 
-        <FiltersBar
-          filters={rawFilters}
-          projects={projects}
-          onChange={handleFilterChange}
-          onReset={handleReset}
-        />
+        <div className='surface-card grid grid-cols-1 gap-3 p-4 sm:grid-cols-2 lg:grid-cols-4'>
+          <Select
+            label='Run type'
+            labelPlacement='outside'
+            placeholder='All types'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.run_type ? new Set([filters.run_type]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
 
-        <div className='surface-card p-2'>
-          {isLoading ? (
+              setFilters({ run_type: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {RUN_TYPE_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            label='Status'
+            labelPlacement='outside'
+            placeholder='All statuses'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.status ? new Set([filters.status]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ status: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {STATUS_OPTIONS.map((option) => (
+              <SelectItem key={option.key}>{option.label}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            label='Project'
+            labelPlacement='outside'
+            placeholder='All projects'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.project_id ? new Set([filters.project_id]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ project_id: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            {projects.map((project) => (
+              <SelectItem key={project.id}>{project.name}</SelectItem>
+            ))}
+          </Select>
+          <Select
+            label='Escalation'
+            labelPlacement='outside'
+            placeholder='Any'
+            variant='bordered'
+            size='sm'
+            selectedKeys={filters.escalation ? new Set([filters.escalation]) : new Set<string>()}
+            onSelectionChange={(keys) => {
+              const next = Array.from(keys)[0];
+
+              setFilters({ escalation: typeof next === 'string' ? next : '', page: 1 });
+            }}
+          >
+            <SelectItem key='true'>Escalated</SelectItem>
+            <SelectItem key='false'>Not escalated</SelectItem>
+          </Select>
+          <Input
+            label='Request ID'
+            labelPlacement='outside'
+            placeholder='request id'
+            variant='bordered'
+            size='sm'
+            value={filters.request_id}
+            onValueChange={(v) => setFilters({ request_id: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ request_id: '', page: 1 })}
+            classNames={{ input: 'font-mono text-xs' }}
+          />
+          <Input
+            label='Correlation ID'
+            labelPlacement='outside'
+            placeholder='correlation id'
+            variant='bordered'
+            size='sm'
+            value={filters.correlation_id}
+            onValueChange={(v) => setFilters({ correlation_id: v, page: 1 })}
+            isClearable
+            onClear={() => setFilters({ correlation_id: '', page: 1 })}
+            classNames={{ input: 'font-mono text-xs' }}
+          />
+          <Input
+            label='Created from'
+            labelPlacement='outside'
+            type='date'
+            variant='bordered'
+            size='sm'
+            value={filters.since}
+            onValueChange={(v) => setFilters({ since: v, page: 1 })}
+          />
+          <Input
+            label='Created to'
+            labelPlacement='outside'
+            type='date'
+            variant='bordered'
+            size='sm'
+            value={filters.until}
+            onValueChange={(v) => setFilters({ until: v, page: 1 })}
+          />
+        </div>
+
+        {runsQuery.isLoading ? (
+          <div className='surface-card p-2'>
             <table className='w-full border-collapse text-left text-sm'>
               <thead>
                 <tr className='border-b border-divider'>
                   {Array.from({ length: 6 }).map((_, index) => (
-                    <th
-                      key={index}
-                      className='py-2 px-3 text-default-500 font-medium'
-                    >
-                      <span className='inline-block w-16 h-3 rounded-medium bg-content2/60' />
+                    <th key={index} className='py-2 px-3 font-medium text-default-500'>
+                      <span className='inline-block h-3 w-16 rounded-medium bg-content2/60' />
                     </th>
                   ))}
                 </tr>
               </thead>
               <TableRowSkeleton columns={6} />
             </table>
-          ) : items.length === 0 ? (
-            <EmptyState
-              title='No workflow runs'
-              description='No runs match the current filters, or no workflows have executed yet.'
-              icon={<Workflow className='w-6 h-6' />}
-            />
-          ) : (
-            <WorkflowRunsTable items={items} />
-          )}
-        </div>
-
-        {total > 0 && (
-          <div className='flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between'>
-            <p className='text-xs text-default-500'>
-              Showing {(page - 1) * PAGE_SIZE + 1}–
-              {Math.min(page * PAGE_SIZE, total)} of {total} run
-              {total === 1 ? '' : 's'}.
-            </p>
-            <Pagination
-              total={totalPages}
+          </div>
+        ) : runsQuery.isError && !runsQuery.data ? (
+          <ErrorState
+            message={
+              runsQuery.error instanceof Error
+                ? runsQuery.error.message
+                : 'Failed to load workflow runs.'
+            }
+            onRetry={() => runsQuery.refetch()}
+          />
+        ) : items.length === 0 ? (
+          <EmptyState
+            title={hasActiveFilters ? 'No matching runs' : 'No workflow runs'}
+            description={
+              hasActiveFilters
+                ? 'No runs match the current filters.'
+                : 'No workflows have executed yet.'
+            }
+            icon={<Workflow className='h-6 w-6' />}
+          />
+        ) : (
+          <div className='space-y-3'>
+            <WorkflowRunsTable items={items} projectName={projectName} />
+            <PaginationFooter
               page={page}
-              onChange={setPage}
-              size='sm'
-              isDisabled={!meLoaded}
+              pageSize={PAGE_SIZE}
+              total={total}
+              noun='run'
+              onPageChange={(next) => setFilters({ page: next })}
+              isDisabled={runsQuery.isFetching}
             />
           </div>
         )}
-
-        {runsQuery.isError && (
-          <pre className='text-sm text-danger-500 bg-danger-50 dark:bg-danger-500/10 rounded-medium p-3'>
-            {runsQuery.error instanceof Error
-              ? runsQuery.error.message
-              : 'Failed to load workflow runs.'}
-          </pre>
-        )}
-
-        <div className='flex items-center gap-2 text-xs text-default-500'>
-          <Clock className='w-3.5 h-3.5' />
-          <span>Duration = finished_at − started_at.</span>
-          <GitBranch className='w-3.5 h-3.5 ml-2' />
-          <span>Reruns are available on the run detail page.</span>
-        </div>
       </section>
     </CapabilityGate>
   );
