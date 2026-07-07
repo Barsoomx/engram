@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from unittest import mock
 
@@ -191,6 +192,34 @@ def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible(
 
     m_delay.assert_not_called()
     assert result == {'retried': 0}
+
+
+def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_attempt() -> None:
+    session_id = uuid.uuid4()
+
+    def _run(**kwargs: object) -> object:
+        result = mock.Mock()
+        result.session.id = session_id
+
+        return result
+
+    with mock.patch(
+        'engram.memory.tasks.run_session_distillation_with_tracking',
+        side_effect=_run,
+    ) as m_run:
+        distill_session(str(session_id))
+        distill_session(str(session_id))
+
+    first_kwargs = m_run.call_args_list[0].kwargs
+    second_kwargs = m_run.call_args_list[1].kwargs
+
+    correlation_id = f'distill-session:{session_id}'
+
+    assert first_kwargs['correlation_id'] == correlation_id
+    assert second_kwargs['correlation_id'] == correlation_id
+    assert first_kwargs['request_id'] != second_kwargs['request_id']
+    assert first_kwargs['request_id'].startswith(f'{correlation_id}:')
+    assert second_kwargs['request_id'].startswith(f'{correlation_id}:')
 
 
 def test_decay_memory_confidence_invokes_the_service() -> None:
