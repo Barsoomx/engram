@@ -4,10 +4,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
+from django.db.models import Q
+
 from engram.access.services import EffectiveScope
 from engram.core.models import Observation, Organization, Project
 from engram.core.redaction import redact_value
 from engram.observations.filters import ObservationFilterSet
+
+
+def team_visibility_filter(scope: EffectiveScope) -> Q:
+    return Q(team__isnull=True) | Q(team_id__in=scope.team_ids)
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,9 @@ class ListObservations:
     def execute(self, data: ObservationListInput) -> ObservationListResult:
         organization = Organization.objects.get(id=data.scope.organization_id)
         project = Project.objects.get(organization=organization, id=data.project_id)
-        queryset = Observation.objects.filter(organization=organization, project=project)
+        queryset = Observation.objects.filter(organization=organization, project=project).filter(
+            team_visibility_filter(data.scope),
+        )
         filter_data = {
             'team_id': data.team_id,
             'observation_type': data.observation_type,
@@ -95,7 +103,11 @@ class GetObservation:
     def execute(self, data: ObservationDetailInput) -> Observation:
         organization = Organization.objects.get(id=data.scope.organization_id)
         project = Project.objects.get(organization=organization, id=data.project_id)
-        queryset = Observation.objects.filter(organization=organization, project=project, id=data.observation_id)
+        queryset = Observation.objects.filter(
+            organization=organization,
+            project=project,
+            id=data.observation_id,
+        ).filter(team_visibility_filter(data.scope))
         if data.team_id is not None:
             queryset = queryset.filter(team_id=data.team_id)
 

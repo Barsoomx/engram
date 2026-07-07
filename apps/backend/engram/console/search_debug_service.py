@@ -3,7 +3,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from engram.access.services import EffectiveScope
+from engram.access.auth_services import PROJECT_ADMIN_CAPABILITIES
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.context.services import (
     SEMANTIC_MIN_SIMILARITY,
     cosine_similarity,
@@ -23,6 +24,10 @@ from engram.core.models import (
 )
 
 DEFAULT_PACK_LIMIT = 20
+
+
+def _is_full_org_admin(scope: EffectiveScope) -> bool:
+    return bool(PROJECT_ADMIN_CAPABILITIES & set(scope.capabilities))
 
 
 def _confidence_str(memory: Memory) -> str | None:
@@ -90,6 +95,7 @@ class ReplaySearchDebug:
         file_paths: tuple[str, ...],
         symbols: tuple[str, ...],
     ) -> SearchDebugResult:
+        self._authorize_project(scope, project)
         allowed_team_ids = self._allowed_team_ids(scope, team_id)
         team = self._resolve_team(organization, team_id)
 
@@ -315,6 +321,15 @@ class ReplaySearchDebug:
                 )
 
         return packed, excluded
+
+    def _authorize_project(self, scope: EffectiveScope, project: Project) -> None:
+        if _is_full_org_admin(scope):
+            return
+
+        if project.id in scope.project_ids:
+            return
+
+        raise AccessDeniedError('project_scope_denied', 'Scope cannot access requested project')
 
     def _allowed_team_ids(
         self,

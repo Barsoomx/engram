@@ -22,7 +22,7 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import RAW_KEY, auth_headers, create_project_scope
-from engram.core.models import Agent, AgentSession, Observation, Organization, Project, RawEventEnvelope, Runtime
+from engram.core.models import Agent, AgentSession, Observation, Organization, Project, RawEventEnvelope, Runtime, Team
 
 AGENT_RAW_KEY = 'egk_test_observations_agent_0123456789abcdefghijklmnopqrstuv'
 AGENT_CAPS = ('observations:read', 'projects:agent')
@@ -203,8 +203,6 @@ def test_list_observations_filters_by_team() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     grant_observations_read(RAW_KEY)
     create_observation(organization, team, project, title='In team', content_hash='h-in')
-    from engram.core.models import Team
-
     other_team = Team.objects.create(organization=organization, name='Other', slug='other-obs-team')
     create_observation(organization, other_team, project, title='Other team', content_hash='h-out')
     client = APIClient()
@@ -600,7 +598,7 @@ def test_list_observations_routes_by_repository_url_with_org_agent_key() -> None
     project.repository_url = 'git@github.com:acme/observations-demo.git'
     project.save(update_fields=['repository_url'])
     create_org_agent_key(organization)
-    observation = create_observation(organization, team, project, content_hash='h-repo-url-list')
+    observation = create_observation(organization, None, project, content_hash='h-repo-url-list')
     client = APIClient()
 
     response = client.get(
@@ -727,7 +725,7 @@ def test_observation_detail_routes_by_repository_url_with_org_agent_key() -> Non
     project.repository_url = 'git@github.com:acme/observations-detail-demo.git'
     project.save(update_fields=['repository_url'])
     create_org_agent_key(organization)
-    obs = create_observation(organization, team, project, content_hash='h-repo-url-detail')
+    obs = create_observation(organization, None, project, content_hash='h-repo-url-detail')
     client = APIClient()
 
     response = client.get(
@@ -872,3 +870,77 @@ def test_observation_detail_repository_url_resolving_elsewhere_never_leaks_objec
     assert response.status_code == 404
     assert response.json()['code'] == 'observation_not_found'
     assert 'Project A secret observation' not in str(response.json())
+
+
+@pytest.mark.django_db
+def test_list_observations_team_bound_key_hides_other_team_and_shows_teamless() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    own_team_obs = create_observation(organization, team, project, title='Own team obs', content_hash='h-scope-own')
+    teamless_obs = create_observation(
+        organization,
+        None,
+        project,
+        title='Teamless obs',
+        content_hash='h-scope-teamless',
+    )
+    other_team = Team.objects.create(organization=organization, name='Other Scope', slug='other-scope-team')
+    other_team_obs = create_observation(
+        organization,
+        other_team,
+        project,
+        title='Other team secret',
+        content_hash='h-scope-other',
+    )
+    client = APIClient()
+
+    response = client.get('/v1/observations/', {'project_id': str(project.id), 'limit': 10}, **auth_headers())
+
+    assert response.status_code == 200
+    ids = {item['observation_id'] for item in response.json()['items']}
+    assert str(own_team_obs.id) in ids
+    assert str(teamless_obs.id) in ids
+    assert str(other_team_obs.id) not in ids
+    assert 'Other team secret' not in str(response.json())
+
+
+@pytest.mark.django_db
+def test_observation_detail_team_bound_key_denies_other_team() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_observations_read(RAW_KEY)
+    other_team = Team.objects.create(organization=organization, name='Other Scope Detail', slug='other-scope-detail')
+    other_team_obs = create_observation(
+        organization,
+        other_team,
+        project,
+        title='Other team detail secret',
+        content_hash='h-scope-detail-other',
+    )
+    client = APIClient()
+
+    response = client.get(f'/v1/observations/{other_team_obs.id}', {'project_id': str(project.id)}, **auth_headers())
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'observation_not_found'
+    assert 'Other team detail secret' not in str(response.json())
+
+
+@pytest.mark.django_db
+def test_list_observations_session_admin_sees_all_teams_and_teamless() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    token = _make_session_admin(organization)
+    own_team_obs = create_observation(organization, team, project, title='Team A obs', content_hash='h-all-a')
+    teamless_obs = create_observation(organization, None, project, title='Teamless all', content_hash='h-all-teamless')
+    other_team = Team.objects.create(organization=organization, name='Team B All', slug='team-b-all')
+    other_team_obs = create_observation(organization, other_team, project, title='Team B obs', content_hash='h-all-b')
+    client = APIClient()
+
+    response = client.get(
+        '/v1/observations/',
+        {'project_id': str(project.id), 'limit': 10},
+        **_session_headers(token, organization),
+    )
+
+    assert response.status_code == 200
+    ids = {item['observation_id'] for item in response.json()['items']}
+    assert {str(own_team_obs.id), str(teamless_obs.id), str(other_team_obs.id)} <= ids
