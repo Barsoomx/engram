@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import urllib.error
+from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.real_provider_tests import _opener_raising, make_real_policy
+from engram.model_policy.models import ProviderCallRecord
+from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
     AnthropicMessagesGateway,
@@ -27,6 +30,249 @@ from engram.model_policy.services import (
 )
 
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
+
+
+def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
+    response: dict[str, Any] = {'choices': [{'message': {'content': content}}]}
+    if usage is not None:
+        response['usage'] = usage
+
+    return json.dumps(response).encode()
+
+
+def _anthropic_message_body(content: str, usage: dict[str, int] | None = None) -> bytes:
+    response: dict[str, Any] = {'content': [{'type': 'text', 'text': content}]}
+    if usage is not None:
+        response['usage'] = usage
+
+    return json.dumps(response).encode()
+
+
+def _openai_embedding_body(embedding: list[float], usage: dict[str, int] | None = None) -> bytes:
+    response: dict[str, Any] = {'data': [{'embedding': embedding}]}
+    if usage is not None:
+        response['usage'] = usage
+
+    return json.dumps(response).encode()
+
+
+def _openai_call(policy: Any, prompt: str, body: bytes) -> ProviderCallRecord:
+    gateway = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1',
+        api_key='key',
+        opener=_opener_returning(body),
+    )
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=policy.organization_id,
+            project_id=policy.project_id,
+            team_id=None,
+            policy=policy,
+            request_id='cost-call-1',
+            trace_id='cost-call-1',
+            prompt=prompt,
+        ),
+    )
+
+    return ProviderCallRecord.objects.get(id=result.call_record_id)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_records_provider_token_usage_when_usage_present() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    body = _openai_chat_body(
+        'Title: Memory\nBody: line one',
+        usage={'prompt_tokens': 120, 'completion_tokens': 45, 'total_tokens': 165},
+    )
+
+    record = _openai_call(policy, 'a prompt', body)
+
+    assert record.token_usage == {
+        'input_tokens': 120,
+        'output_tokens': 45,
+        'total_tokens': 165,
+        'source': 'provider',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_falls_back_to_estimated_token_usage_without_usage() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    content = 'Title: Memory\nBody: one two'
+    body = _openai_chat_body(content)
+
+    record = _openai_call(policy, 'alpha beta gamma', body)
+
+    assert record.token_usage == {
+        'input_tokens': 3,
+        'output_tokens': len(content.split()),
+        'source': 'estimated',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_computes_policy_cost_when_pricing_and_usage_present() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        metadata={'pricing': {'input_per_mtok': '0.28', 'output_per_mtok': '0.42'}},
+    )
+    body = _openai_chat_body(
+        'Title: Memory\nBody: line one',
+        usage={'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000, 'total_tokens': 2_000_000},
+    )
+
+    record = _openai_call(policy, 'a prompt', body)
+
+    assert record.cost_metadata == {
+        'estimated': False,
+        'cost_usd': '0.700000',
+        'pricing_source': 'policy',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_marks_no_usage_cost_when_pricing_but_no_usage() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        metadata={'pricing': {'input_per_mtok': '0.28', 'output_per_mtok': '0.42'}},
+    )
+    body = _openai_chat_body('Title: Memory\nBody: line one')
+
+    record = _openai_call(policy, 'a prompt', body)
+
+    assert record.cost_metadata == {
+        'estimated': True,
+        'cost_usd': '0.0000',
+        'pricing_source': 'no_usage',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_marks_unknown_cost_without_pricing() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    body = _openai_chat_body(
+        'Title: Memory\nBody: line one',
+        usage={'prompt_tokens': 100, 'completion_tokens': 50, 'total_tokens': 150},
+    )
+
+    record = _openai_call(policy, 'a prompt', body)
+
+    assert record.cost_metadata == {
+        'estimated': True,
+        'cost_usd': '0.0000',
+        'pricing_source': 'unknown',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_ignores_malformed_pricing_and_still_records() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        metadata={'pricing': {'input_per_mtok': 'not-a-number', 'output_per_mtok': '0.42'}},
+    )
+    body = _openai_chat_body(
+        'Title: Memory\nBody: line one',
+        usage={'prompt_tokens': 100, 'completion_tokens': 50, 'total_tokens': 150},
+    )
+
+    with capture_logs() as logs:
+        record = _openai_call(policy, 'a prompt', body)
+
+    assert record.cost_metadata == {
+        'estimated': True,
+        'cost_usd': '0.0000',
+        'pricing_source': 'unknown',
+    }
+    assert any(entry.get('event') == 'provider_pricing_malformed' for entry in logs)
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_records_provider_token_usage() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic')
+    body = _anthropic_message_body(
+        'Title: Memory\nBody: line one',
+        usage={'input_tokens': 30, 'output_tokens': 12},
+    )
+    gateway = AnthropicMessagesGateway(
+        base_url='https://api.anthropic.com',
+        api_key='key',
+        opener=_opener_returning(body),
+    )
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='cost-call-anthropic-1',
+            trace_id='cost-call-anthropic-1',
+            prompt='a prompt',
+        ),
+    )
+    record = ProviderCallRecord.objects.get(id=result.call_record_id)
+
+    assert record.token_usage == {
+        'input_tokens': 30,
+        'output_tokens': 12,
+        'total_tokens': 42,
+        'source': 'provider',
+    }
+
+
+@pytest.mark.django_db
+def test_openai_gateway_embed_records_usage_and_input_only_cost() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='embedding',
+        metadata={'pricing': {'input_per_mtok': '0.02'}},
+    )
+    body = _openai_embedding_body(
+        [0.1, 0.2, 0.3],
+        usage={'prompt_tokens': 1_000_000, 'total_tokens': 1_000_000},
+    )
+    gateway = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1',
+        api_key='key',
+        opener=_opener_returning(body),
+    )
+
+    result = gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='cost-embed-1',
+            trace_id='cost-embed-1',
+            text='text to embed',
+        ),
+    )
+    record = ProviderCallRecord.objects.get(id=result.call_record_id)
+
+    assert record.token_usage == {
+        'input_tokens': 1_000_000,
+        'output_tokens': 0,
+        'total_tokens': 1_000_000,
+        'source': 'provider',
+    }
+    assert record.cost_metadata == {
+        'estimated': False,
+        'cost_usd': '0.020000',
+        'pricing_source': 'policy',
+    }
 
 
 def test_split_completion_strips_title_and_body_labels_same_line() -> None:

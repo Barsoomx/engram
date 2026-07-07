@@ -19,7 +19,16 @@ def list_tools() -> list[dict[str, object]]:
     return [
         {
             "name": "engram_search",
-            "description": "Search approved Engram memory for the connected project.",
+            "description": (
+                "Step 1 - ALWAYS search project memory BEFORE starting any "
+                "non-trivial task (bug fix, feature, refactor, debugging). "
+                "Returns prior decisions, gotchas, incidents and architecture "
+                "notes ranked by relevance. Call it when the user references "
+                "past work ('did we', 'last time', 'as before'), names a "
+                "subsystem, or reports an error you have not seen this "
+                "session. Prefer short 2-4 word queries (symptom, component, "
+                "error text)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -34,7 +43,12 @@ def list_tools() -> list[dict[str, object]]:
         },
         {
             "name": "engram_context",
-            "description": "Request a session-start context bundle from Engram memory.",
+            "description": (
+                "Re-request the memory context bundle that is injected at "
+                "session start (recent and relevant approved memories for "
+                "this project). Use after /clear or context compaction, or "
+                "when the injected Engram context looks stale."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -50,7 +64,11 @@ def list_tools() -> list[dict[str, object]]:
         },
         {
             "name": "engram_memory_link",
-            "description": "Attach a file/symbol/commit/issue link to an approved memory.",
+            "description": (
+                "Attach a file/symbol/commit/issue link to an approved "
+                "memory so future retrieval can find it by exact file path "
+                "or symbol match."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -68,7 +86,12 @@ def list_tools() -> list[dict[str, object]]:
         },
         {
             "name": "engram_observations",
-            "description": "List recent Engram observations for the connected project.",
+            "description": (
+                "Step 2 - list recent raw observations (prompts, tool "
+                "activity, hook events) captured for the connected project. "
+                "Use to corroborate a memory found via engram_search with "
+                "ground-truth detail, or to audit what Engram captured."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -80,7 +103,11 @@ def list_tools() -> list[dict[str, object]]:
         },
         {
             "name": "engram_memory_version",
-            "description": "Update an approved memory body, creating a new reviewed version.",
+            "description": (
+                "Update an approved memory body, creating a new reviewed "
+                "version. Use when you verified materially better "
+                "information than what the memory states."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -94,7 +121,12 @@ def list_tools() -> list[dict[str, object]]:
         },
         {
             "name": "engram_memory_feedback",
-            "description": "Mark an injected memory stale or refuted with a reason.",
+            "description": (
+                "Step 3 - close the loop: the moment you discover an "
+                "injected or retrieved memory is outdated or wrong, mark it "
+                "stale or refuted with a reason. Clean memory improves every "
+                "future session; do not silently ignore bad memory."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {

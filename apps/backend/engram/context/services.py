@@ -28,6 +28,7 @@ from engram.core.models import (
     AuditResult,
     ContextBundle,
     ContextBundleItem,
+    ContextBundleStatus,
     Memory,
     MemoryStatus,
     MemoryVersion,
@@ -336,6 +337,9 @@ def request_has_terms(query: str, file_paths: tuple[str, ...], symbols: tuple[st
     return bool(query.strip() or file_paths or symbols)
 
 
+CONTAINS_MATCH_MIN_TOKEN_LENGTH = 4
+
+
 def score_retrieval_document(
     document: RetrievalDocument,
     query: str,
@@ -363,8 +367,8 @@ def score_retrieval_document(
             inclusion_reason=f'exact match: {symbol_match}',
         )
 
-    query_terms = request_query_terms(query)
-    exact_match = first_contains_match(query_terms, tuple(str(value) for value in document.exact_terms))
+    contains_terms = contains_match_query_terms(query)
+    exact_match = first_contains_match(contains_terms, tuple(str(value) for value in document.exact_terms))
     if exact_match:
         return RetrievalMatch(
             document=document,
@@ -373,7 +377,7 @@ def score_retrieval_document(
             inclusion_reason=f'exact match: {exact_match}',
         )
 
-    full_text_match = first_full_text_match(query_terms, document.full_text)
+    full_text_match = first_full_text_match(contains_terms, document.full_text)
     if full_text_match:
         return RetrievalMatch(
             document=document,
@@ -1016,9 +1020,10 @@ class BuildContextBundle:
                 retrieval_latency_ms=retrieval_latency_ms,
             )
             persisted_matches = self._create_items(bundle, kept)
-            bundle.rendered_text = self._render_context(persisted_matches, warnings)
+            bundle.rendered_text = self._render_context(persisted_matches, warnings, data.purpose)
             bundle.selected_count = len(persisted_matches)
-            bundle.save(update_fields=['rendered_text', 'selected_count', 'updated_at'])
+            bundle.status = ContextBundleStatus.INJECTED if persisted_matches else ContextBundleStatus.SKIPPED
+            bundle.save(update_fields=['rendered_text', 'selected_count', 'status', 'updated_at'])
             self._audit_retrieval(
                 bundle,
                 persisted_matches,
@@ -1188,11 +1193,14 @@ class BuildContextBundle:
         exact_matches.sort(
             key=lambda match: (
                 -match.score,
+                -float(match.document.memory.confidence or 0),
                 -match.document.updated_at.timestamp(),
                 match.document.memory.title.casefold(),
                 str(match.document.id),
             ),
         )
+        if not has_request_terms:
+            exact_matches = self._cap_filter_only_digests(exact_matches)
         if len(exact_matches) >= data.limit:
             return tuple(exact_matches[: data.limit]), False, None, False
 
@@ -1232,6 +1240,18 @@ class BuildContextBundle:
         query_vector: list[float],
     ) -> list[RetrievalMatch]:
         return semantic_retrieval_matches(documents, exact_matches, query_vector)
+
+    def _cap_filter_only_digests(self, matches: list[RetrievalMatch]) -> list[RetrievalMatch]:
+        capped: list[RetrievalMatch] = []
+        digest_kept = False
+        for match in matches:
+            if match.document.memory.kind == 'digest':
+                if digest_kept:
+                    continue
+                digest_kept = True
+            capped.append(match)
+
+        return capped
 
     def _resolve_query_embedding(
         self,
@@ -1286,9 +1306,17 @@ class BuildContextBundle:
 
         return tuple(persisted)
 
-    def _render_context(self, matches: tuple[RetrievalMatch, ...], warnings: list[RetrievalWarning]) -> str:
+    def _render_context(
+        self,
+        matches: tuple[RetrievalMatch, ...],
+        warnings: list[RetrievalWarning],
+        purpose: str,
+    ) -> str:
         if not matches:
-            base = '# Engram context\n\nNo approved memory matched this request.'
+            if purpose == 'user_prompt_submit':
+                base = ''
+            else:
+                base = '# Engram context\n\nNo approved memory matched this request.'
         else:
             lines = ['# Engram context', '']
             for index, match in enumerate(matches, start=1):
@@ -1298,10 +1326,13 @@ class BuildContextBundle:
         if not warnings:
             return base
 
-        warning_lines = ['', '> Warnings:']
+        warning_lines = ['> Warnings:']
         warning_lines.extend(f'> - {warning.message}' for warning in warnings)
+        warning_block = '\n'.join(warning_lines)
+        if not base:
+            return warning_block
 
-        return base + '\n' + '\n'.join(warning_lines)
+        return base + '\n\n' + warning_block
 
     def _authorization_scope(self, scope: EffectiveScope) -> dict[str, object]:
         return {
@@ -1361,6 +1392,20 @@ def request_query_terms(query: str) -> tuple[str, ...]:
         return ()
     terms = [query_value]
     terms.extend(token for token in query_value.replace('/', ' ').split() if len(token.strip()) >= 2)
+
+    return normalize_lookup_values(terms)
+
+
+def contains_match_query_terms(query: str) -> tuple[str, ...]:
+    query_value = query.strip()
+    if not query_value:
+        return ()
+    terms = [query_value]
+    terms.extend(
+        token
+        for token in query_value.replace('/', ' ').split()
+        if len(token.strip()) >= CONTAINS_MATCH_MIN_TOKEN_LENGTH
+    )
 
     return normalize_lookup_values(terms)
 

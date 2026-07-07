@@ -246,7 +246,7 @@ def test_session_start_returns_cited_exact_context_and_persists_bundle() -> None
 
     assert response.status_code == 200
     body = response.json()
-    assert body['status'] == 'created'
+    assert body['status'] == 'injected'
     assert body['request_id'] == 'request-context-1'
     assert body['purpose'] == 'session_start'
     assert body['context_bundle_id']
@@ -778,6 +778,120 @@ def test_session_start_filter_only_returns_authorized_project_memory() -> None:
     body = response.json()
     assert [item['memory_id'] for item in body['items']] == [str(memory.id)]
     assert body['items'][0]['inclusion_reason'] == 'filter-only authorized memory'
+
+
+@pytest.mark.django_db
+def test_session_start_filter_only_keeps_single_most_recent_digest() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    digest_one, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest one',
+        body='Oldest digest memory.',
+        kind='digest',
+    )
+    digest_two, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest two',
+        body='Middle digest memory.',
+        kind='digest',
+    )
+    digest_three, _v3, _d3 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Digest three',
+        body='Most recent digest memory.',
+        kind='digest',
+    )
+    non_digest_one, _v4, _d4 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Non digest one',
+        body='First non-digest memory.',
+    )
+    non_digest_two, _v5, _d5 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Non digest two',
+        body='Second non-digest memory.',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-filter-only-digest-cap',
+            query='',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    memory_ids = {item['memory_id'] for item in body['items']}
+    assert memory_ids == {str(digest_three.id), str(non_digest_one.id), str(non_digest_two.id)}
+    assert str(digest_one.id) not in memory_ids
+    assert str(digest_two.id) not in memory_ids
+
+
+@pytest.mark.django_db
+def test_session_start_orders_same_tier_matches_by_confidence_before_recency() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    older_high_confidence, _v1, _d1 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Older high confidence',
+        body='Confidence tiebreak fixture body one.',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['confidence tiebreak fixture'],
+        confidence=Decimal('0.900'),
+    )
+    newer_low_confidence, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Newer low confidence',
+        body='Confidence tiebreak fixture body two.',
+        file_paths=[],
+        symbols=[],
+        exact_terms=['confidence tiebreak fixture'],
+        confidence=Decimal('0.500'),
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-confidence-tiebreak',
+            query='confidence tiebreak fixture',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [item['memory_id'] for item in body['items']] == [
+        str(older_high_confidence.id),
+        str(newer_low_confidence.id),
+    ]
 
 
 @pytest.mark.django_db
@@ -1600,7 +1714,7 @@ def test_user_prompt_submit_returns_cited_exact_context_and_persists_bundle() ->
 
     assert response.status_code == 200
     body = response.json()
-    assert body['status'] == 'created'
+    assert body['status'] == 'injected'
     assert body['request_id'] == 'request-ups-1'
     assert body['purpose'] == 'user_prompt_submit'
     assert body['context_bundle_id']
@@ -1612,6 +1726,129 @@ def test_user_prompt_submit_returns_cited_exact_context_and_persists_bundle() ->
     assert memory.title in body['rendered_context']
     bundle = ContextBundle.objects.get(request_id='request-ups-1')
     assert bundle.purpose == 'user_prompt_submit'
+
+
+@pytest.mark.django_db
+def test_user_prompt_submit_empty_bundle_renders_empty_string() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    OrganizationSettings.objects.create(organization=organization, hybrid_retrieval_enabled=False)
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Unrelated memory',
+        body='Nothing here relates to the prompt below.',
+        file_paths=['src/unrelated.py'],
+        symbols=['UnrelatedThing'],
+        exact_terms=['unrelated exact term'],
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/user-prompt-submit',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-ups-empty',
+            query='completely different topic altogether',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == []
+    assert body['rendered_context'] == ''
+    assert body['hook_specific_output'] == {'hookEventName': 'UserPromptSubmit', 'additionalContext': ''}
+    bundle = ContextBundle.objects.get(request_id='request-ups-empty')
+    assert bundle.rendered_text == ''
+
+
+@pytest.mark.django_db
+def test_session_start_empty_bundle_still_renders_stub_text() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    OrganizationSettings.objects.create(organization=organization, hybrid_retrieval_enabled=False)
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Unrelated memory',
+        body='Nothing here relates to the prompt below.',
+        file_paths=['src/unrelated.py'],
+        symbols=['UnrelatedThing'],
+        exact_terms=['unrelated exact term'],
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/session-start',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-ss-empty',
+            query='completely different topic altogether',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == []
+    assert body['rendered_context'] == '# Engram context\n\nNo approved memory matched this request.'
+    bundle = ContextBundle.objects.get(request_id='request-ss-empty')
+    assert bundle.rendered_text == '# Engram context\n\nNo approved memory matched this request.'
+
+
+@pytest.mark.django_db
+def test_user_prompt_submit_empty_bundle_with_warnings_renders_warnings_block_alone() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Unrelated memory',
+        body='Nothing here relates to the prompt below.',
+        file_paths=['src/unrelated.py'],
+        symbols=['UnrelatedThing'],
+        exact_terms=['unrelated exact term'],
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context/user-prompt-submit',
+        valid_context_payload(
+            project,
+            team,
+            request_id='request-ups-empty-warnings',
+            query='completely different topic altogether',
+            file_paths=[],
+            symbols=[],
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['items'] == []
+    assert body['warnings'] == [
+        {
+            'code': 'semantic_unavailable',
+            'message': 'semantic retrieval unavailable: embedding could not be resolved',
+            'memory_id': None,
+        },
+    ]
+    expected_rendered_context = '> Warnings:\n> - semantic retrieval unavailable: embedding could not be resolved'
+    assert body['rendered_context'] == expected_rendered_context
+    assert not body['rendered_context'].startswith('\n')
 
 
 @pytest.mark.django_db

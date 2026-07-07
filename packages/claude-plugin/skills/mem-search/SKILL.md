@@ -1,6 +1,6 @@
 ---
 name: mem-search
-description: Search Engram's shared engineering memory for prior work, decisions, and gotchas before acting. Use when the user asks "did we solve this before?", "how did we do X last time?", or when starting a task that may already have relevant memory.
+description: Search Engram's shared engineering memory for prior work, decisions, and gotchas. Use BEFORE starting any non-trivial task (bug fix, feature, refactor) to check whether the team already solved something similar, and when the user asks "did we solve this before?" or "how did we do X last time?".
 ---
 
 # Search Engram memory
@@ -10,7 +10,9 @@ memory for this project, so you build on prior work instead of repeating it.
 
 ## How to search
 
-Use the `engram` CLI (configured by `engram install` / `engram connect`):
+Prefer the `engram_search` MCP tool — call it directly with a short query. Fall
+back to the `engram` CLI (configured by `engram install` / `engram connect`)
+only when the MCP tool is unavailable:
 
 ```bash
 engram search --query "<what you're looking for>" --limit 5

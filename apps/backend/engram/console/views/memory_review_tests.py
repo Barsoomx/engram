@@ -16,6 +16,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
+from engram.console.views.memory_review import PAGE_SIZE
 from engram.core.models import (
     AuditEvent,
     CandidateStatus,
@@ -279,6 +280,119 @@ def test_queue_returns_proposed_candidates_and_reviewable_memories(
     assert 'candidate' in types
 
     assert 'memory' in types
+
+
+@pytest.mark.django_db
+def test_queue_orders_mixed_items_by_created_at_desc(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    now = timezone.now()
+
+    oldest = _make_candidate(
+        f_admin_org,
+        f_project,
+        status=CandidateStatus.PROPOSED,
+        created_at=now - timedelta(days=3),
+    )
+
+    middle = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.CONFLICT,
+        created_at=now - timedelta(days=2),
+    )
+
+    newest = _make_candidate(
+        f_admin_org,
+        f_project,
+        status=CandidateStatus.PROPOSED,
+        created_at=now - timedelta(days=1),
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    ordered_ids = [item['id'] for item in response.data['results']]
+
+    assert ordered_ids == [str(newest.id), str(middle.id), str(oldest.id)]
+
+    assert response.data['count'] == 3
+
+
+@pytest.mark.django_db
+def test_queue_paginates_across_pages_by_created_at(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    now = timezone.now()
+
+    candidates = [
+        _make_candidate(
+            f_admin_org,
+            f_project,
+            status=CandidateStatus.PROPOSED,
+            created_at=now - timedelta(minutes=index),
+        )
+        for index in range(PAGE_SIZE + 5)
+    ]
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    first = client.get('/v1/admin/memory-review/')
+
+    assert first.status_code == 200
+    assert len(first.data['results']) == PAGE_SIZE
+    assert first.data['count'] == PAGE_SIZE + 5
+    assert first.data['next'] is not None
+    assert first.data['previous'] is None
+    assert [item['id'] for item in first.data['results']] == [str(c.id) for c in candidates[:PAGE_SIZE]]
+
+    second = client.get('/v1/admin/memory-review/?page=2')
+
+    assert second.status_code == 200
+    assert len(second.data['results']) == 5
+    assert second.data['next'] is None
+    assert second.data['previous'] is not None
+    assert [item['id'] for item in second.data['results']] == [str(c.id) for c in candidates[PAGE_SIZE:]]
+
+
+@pytest.mark.django_db
+def test_queue_issues_bounded_queries_for_large_backlog(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    from django.db import connection
+    from django.test.utils import CaptureQueriesContext
+
+    for _ in range(PAGE_SIZE * 2 + 10):
+        _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    with CaptureQueriesContext(connection) as ctx:
+        response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+    assert len(response.data['results']) == PAGE_SIZE
+    assert response.data['count'] == PAGE_SIZE * 2 + 10
+
+    candidate_selects = [
+        query['sql']
+        for query in ctx.captured_queries
+        if 'memorycandidate' in query['sql'].lower()
+        and query['sql'].lstrip().lower().startswith('select')
+        and 'count(' not in query['sql'].lower()
+    ]
+
+    assert candidate_selects
+    assert all(f'LIMIT {PAGE_SIZE}' in sql for sql in candidate_selects)
 
 
 @pytest.mark.django_db
@@ -1204,3 +1318,81 @@ def test_retrieve_denied_without_review_capability() -> None:
     response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
 
     assert response.status_code == 403
+
+
+@pytest.mark.django_db
+def test_queue_includes_agent_refuted_approved_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    memory.refuted = True
+
+    memory.save(update_fields=['refuted', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    items = {item['id']: item for item in response.data['results']}
+
+    assert str(memory.id) in items
+
+    assert items[str(memory.id)]['refuted'] is True
+
+
+@pytest.mark.django_db
+def test_queue_excludes_stale_superseded_approved_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    memory.stale = True
+
+    memory.save(update_fields=['stale', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+
+    ids = {item['id'] for item in response.data['results']}
+
+    assert str(memory.id) not in ids
+
+
+@pytest.mark.django_db
+def test_action_restore_reactivates_agent_refuted_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+
+    _make_version(memory, 1, 'body')
+
+    memory.refuted = True
+
+    memory.save(update_fields=['refuted', 'updated_at'])
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        f'/v1/admin/memory-review/{memory.id}/action/',
+        {'action': 'restore', 'reason': 'undo feedback refute'},
+    )
+
+    assert response.status_code == 200
+
+    memory.refresh_from_db()
+
+    assert memory.refuted is False
+
+    assert memory.status == MemoryStatus.APPROVED
