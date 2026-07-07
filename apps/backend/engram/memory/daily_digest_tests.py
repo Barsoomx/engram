@@ -21,9 +21,9 @@ from engram.core.models import (
     WorkflowRunType,
 )
 from engram.memory.tasks import (
-    _recent_approved_memory_ids,
     daily_digest_window_start,
     generate_daily_digest,
+    recent_approved_memory_ids,
     run_scheduled_digests,
 )
 
@@ -244,7 +244,7 @@ def test_recent_ids_exclude_memories_before_last_success() -> None:
     Memory.objects.filter(id=after.id).update(updated_at=now - timedelta(days=1))
     Memory.objects.filter(id=before.id).update(updated_at=now - timedelta(days=4))
 
-    ids = _recent_approved_memory_ids(project)
+    ids = recent_approved_memory_ids(project)
 
     assert after.id in ids
     assert before.id not in ids
