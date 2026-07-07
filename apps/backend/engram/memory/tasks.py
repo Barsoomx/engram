@@ -84,17 +84,18 @@ def distill_session(self: object, session_id: object) -> str:
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed session id') from error
 
-    request_id = f'distill-session:{parsed_session_id}'
+    correlation_id = f'distill-session:{parsed_session_id}'
+    request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(
-        correlation_id=request_id,
+        correlation_id=correlation_id,
         request_id=request_id,
     )
     try:
         result = run_session_distillation_with_tracking(
             session_id=parsed_session_id,
             request_id=request_id,
-            correlation_id=request_id,
+            correlation_id=correlation_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:
