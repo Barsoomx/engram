@@ -848,7 +848,10 @@ def run_hook(
             )
             if hook_status < 200 or hook_status >= 300:
                 raise error_from_body(hook_body, fallback="http_error")
-            if should_skip_context_query(payload_string(input_payload, "prompt")):
+            effective_query = payload_string(input_payload, "query") or payload_string(
+                input_payload, "prompt"
+            )
+            if should_skip_context_query(effective_query):
                 stdout.write("{}\n")
 
                 return 0

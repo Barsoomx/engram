@@ -1772,6 +1772,58 @@ class CliLifecycleTests(unittest.TestCase):
             body = json.loads(stdout)
             self.assertEqual("created", body["status"])
 
+    def test_hook_user_prompt_submit_queries_context_for_top_level_query_without_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (
+                        202,
+                        {
+                            "status": "accepted",
+                            "duplicate": False,
+                            "request_id": "ups-event-request-1",
+                        },
+                    ),
+                    (
+                        200,
+                        {
+                            "status": "created",
+                            "purpose": "user_prompt_submit",
+                            "rendered_context": "Relevant Engram context",
+                            "items": [{"citation": "M1"}],
+                        },
+                    ),
+                ],
+            )
+            stdin = io.StringIO(
+                json.dumps(
+                    {
+                        "session_id": "session-ups-1",
+                        "event_id": "ups-query-only-event-1",
+                        "query": "how does authorization work in this service?",
+                    },
+                ),
+            )
+
+            exit_code, stdout, stderr = self.run_cli(
+                ["hook", "user-prompt-submit", "--config-dir", str(config_dir)],
+                transport,
+                stdin=stdin,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(2, len(transport.calls))
+            self.assertEqual(
+                "https://engram.example/v1/context/user-prompt-submit",
+                transport.calls[1]["url"],
+            )
+            body = json.loads(stdout)
+            self.assertEqual("created", body["status"])
+
     def test_disconnect_removes_only_engram_owned_state_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
