@@ -94,6 +94,7 @@ def _memory_payload(memory: Memory) -> dict[str, Any]:
         'title': memory.title,
         'body': memory.body,
         'status': memory.status,
+        'current_version': memory.current_version,
         'refuted': memory.refuted,
         'stale': memory.stale,
         'confidence': str(memory.confidence) if memory.confidence is not None else None,

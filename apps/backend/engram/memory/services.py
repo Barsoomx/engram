@@ -1614,6 +1614,7 @@ class WeeklyDigestInput:
     project_id: uuid.UUID
     window_days: int = WEEKLY_DIGEST_WINDOW_DAYS
     team_id: uuid.UUID | None = None
+    weeks_back: int = 0
     request_id: str = ''
     correlation_id: str = ''
 
@@ -1669,12 +1670,14 @@ class BuildWeeklyStructuredDigest:
 
         current_monday = today - datetime.timedelta(days=today.isoweekday() - 1)
 
+        anchor_monday = current_monday - datetime.timedelta(weeks=max(0, data.weeks_back))
+
         tzinfo = timezone.get_current_timezone()
 
-        window_end = datetime.datetime.combine(current_monday, datetime.time.min, tzinfo=tzinfo)
+        window_end = datetime.datetime.combine(anchor_monday, datetime.time.min, tzinfo=tzinfo)
 
         window_start = datetime.datetime.combine(
-            current_monday - datetime.timedelta(days=7),
+            anchor_monday - datetime.timedelta(days=7),
             datetime.time.min,
             tzinfo=tzinfo,
         )

@@ -693,11 +693,16 @@ export interface WeeklyDigest {
 export async function getWeeklyDigest(
   scope: ScopeParams,
   windowDays?: number,
+  weeksBack?: number,
 ): Promise<WeeklyDigest> {
   const params: Record<string, string> = scopeQuery(scope);
 
   if (windowDays && windowDays > 0) {
     params.window_days = String(windowDays);
+  }
+
+  if (weeksBack && weeksBack > 0) {
+    params.weeks_back = String(weeksBack);
   }
 
   const response = await apiClient().get<WeeklyDigest>(

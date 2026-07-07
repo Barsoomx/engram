@@ -479,6 +479,7 @@ export type MemoryReviewItem = {
   title: string;
   body: string;
   status: string;
+  current_version: number;
   confidence: string | null;
   visibility_scope: string;
   team_id: string | null;

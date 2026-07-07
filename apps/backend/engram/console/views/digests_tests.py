@@ -233,6 +233,27 @@ def test_get_weekly_digest_returns_expected_structure(
 
 
 @pytest.mark.django_db
+def test_weekly_digest_forwards_weeks_back(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
+        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
+
+        response = f_read_client.get(
+            '/v1/admin/digests/weekly',
+            {'project_id': str(f_project.id), 'weeks_back': '2'},
+        )
+
+    assert response.status_code == 200
+
+    passed_input = m_service_cls.return_value.execute.call_args.args[0]
+
+    assert passed_input.weeks_back == 2
+
+
+@pytest.mark.django_db
 def test_get_weekly_digest_returns_digest_memory_id(
     f_read_client: APIClient,
     f_org: Organization,

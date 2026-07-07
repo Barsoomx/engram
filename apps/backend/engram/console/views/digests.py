@@ -61,6 +61,11 @@ class WeeklyDigestView(APIView):
         except (TypeError, ValueError):
             window_days = WEEKLY_DIGEST_WINDOW_DAYS
 
+        try:
+            weeks_back = max(0, int(request.query_params.get('weeks_back', '0')))
+        except (TypeError, ValueError):
+            weeks_back = 0
+
         team_id_raw = request.query_params.get('team_id')
 
         team_id: uuid.UUID | None = None
@@ -81,6 +86,7 @@ class WeeklyDigestView(APIView):
                     project_id=project_id,
                     window_days=window_days,
                     team_id=team_id,
+                    weeks_back=weeks_back,
                 ),
             )
         except Project.DoesNotExist:

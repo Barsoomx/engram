@@ -476,6 +476,30 @@ def test_window_covers_monday_to_monday_boundary_of_completed_week(
 
 
 @pytest.mark.django_db
+def test_weeks_back_shifts_window_to_earlier_week(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    current = _run(f_org, f_project)
+
+    previous = BuildWeeklyStructuredDigest().execute(
+        WeeklyDigestInput(
+            organization_id=f_org.id,
+            project_id=f_project.id,
+            weeks_back=1,
+        ),
+    )
+
+    current_end = datetime.datetime.fromisoformat(current.digest_memory.metadata['window_end'])
+
+    previous_end = datetime.datetime.fromisoformat(previous.digest_memory.metadata['window_end'])
+
+    assert (current_end.date() - previous_end.date()).days == 7
+
+    assert previous.digest_memory.id != current.digest_memory.id
+
+
+@pytest.mark.django_db
 def test_counts_match_bucket_lengths(
     f_org: Organization,
     f_project: Project,
