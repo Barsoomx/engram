@@ -419,8 +419,8 @@ export type WorkflowRunListParams = ListParams & {
 };
 
 export type WorkflowRunRerunResult = {
-  run_id: string | null;
-  result_memory_id: string;
+  run_id: string;
+  status: WorkflowRunStatus;
 };
 
 export async function listWorkflowRuns(

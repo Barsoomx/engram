@@ -227,6 +227,60 @@ def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_
     assert second_kwargs['request_id'].startswith(f'{correlation_id}:')
 
 
+def test_distill_session_passes_existing_run_id_when_workflow_run_id_given() -> None:
+    session_id = uuid.uuid4()
+    workflow_run_id = uuid.uuid4()
+
+    def _run(**kwargs: object) -> object:
+        result = mock.Mock()
+        result.session.id = session_id
+
+        return result
+
+    with mock.patch(
+        'engram.memory.tasks.run_session_distillation_with_tracking',
+        side_effect=_run,
+    ) as m_run:
+        distill_session(str(session_id), workflow_run_id=str(workflow_run_id))
+
+    assert m_run.call_args.kwargs['existing_run_id'] == workflow_run_id
+
+
+def test_distill_session_passes_none_existing_run_id_when_no_workflow_run_id_given() -> None:
+    session_id = uuid.uuid4()
+
+    def _run(**kwargs: object) -> object:
+        result = mock.Mock()
+        result.session.id = session_id
+
+        return result
+
+    with mock.patch(
+        'engram.memory.tasks.run_session_distillation_with_tracking',
+        side_effect=_run,
+    ) as m_run:
+        distill_session(str(session_id))
+
+    assert m_run.call_args.kwargs['existing_run_id'] is None
+
+
+@pytest.mark.django_db
+def test_generate_weekly_digest_passes_existing_run_id_when_workflow_run_id_given(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    workflow_run_id = uuid.uuid4()
+    m_result = mock.Mock()
+
+    with mock.patch(
+        'engram.memory.tasks.run_weekly_digest_with_tracking',
+        return_value=m_result,
+    ) as m_run:
+        generate_weekly_digest(str(f_org.id), str(f_project.id), workflow_run_id=str(workflow_run_id))
+
+    assert m_run.call_args.kwargs['existing_run_id'] == workflow_run_id
+
+
 def test_decay_memory_confidence_invokes_the_service() -> None:
     m_result = DecayMemoryConfidenceResult(organizations=2, projects=3, memories=5)
 
