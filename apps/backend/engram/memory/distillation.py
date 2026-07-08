@@ -744,19 +744,31 @@ def run_session_distillation_with_tracking(
     request_id: str = '',
     correlation_id: str = '',
     auto_approve_threshold: Decimal | None = None,
+    existing_run_id: uuid.UUID | None = None,
 ) -> DistillSessionResult:
     session = AgentSession.objects.select_related('organization', 'project', 'team').get(id=session_id)
 
-    run = WorkflowRun.objects.create(
-        organization=session.organization,
-        project=session.project,
-        team=session.team,
-        run_type=WorkflowRunType.SESSION_DISTILLATION,
-        status=WorkflowRunStatus.QUEUED,
-        input_snapshot={'session_id': str(session_id)},
-        request_id=request_id,
-        correlation_id=correlation_id,
-    )
+    run = None
+    if existing_run_id is not None:
+        run = WorkflowRun.objects.filter(
+            id=existing_run_id,
+            organization=session.organization,
+            project=session.project,
+            run_type=WorkflowRunType.SESSION_DISTILLATION,
+            status=WorkflowRunStatus.QUEUED,
+        ).first()
+
+    if run is None:
+        run = WorkflowRun.objects.create(
+            organization=session.organization,
+            project=session.project,
+            team=session.team,
+            run_type=WorkflowRunType.SESSION_DISTILLATION,
+            status=WorkflowRunStatus.QUEUED,
+            input_snapshot={'session_id': str(session_id)},
+            request_id=request_id,
+            correlation_id=correlation_id,
+        )
 
     run.status = WorkflowRunStatus.RUNNING
 

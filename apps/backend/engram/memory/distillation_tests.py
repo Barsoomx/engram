@@ -709,6 +709,43 @@ def test_run_session_distillation_with_tracking_marks_failed_run_and_reraises() 
 
 
 @pytest.mark.django_db
+def test_run_session_distillation_with_tracking_adopts_existing_queued_run() -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+
+    queued = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        request_id='distill-adopt-1',
+        input_snapshot={'session_id': str(session.id)},
+    )
+
+    result = run_session_distillation_with_tracking(
+        session_id=session.id,
+        request_id='distill-adopt-1',
+        existing_run_id=queued.id,
+    )
+
+    queued.refresh_from_db()
+
+    assert queued.status == WorkflowRunStatus.SUCCEEDED
+
+    assert queued.result_memory_id == result.auto_promoted[0].id
+
+    assert (
+        WorkflowRun.objects.filter(
+            organization=organization,
+            run_type=WorkflowRunType.SESSION_DISTILLATION,
+        ).count()
+        == 1
+    )
+
+
+@pytest.mark.django_db
 def test_distill_session_rerun_with_real_gateway_does_not_replay_stale_provider_call(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:

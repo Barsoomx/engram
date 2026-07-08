@@ -17,12 +17,15 @@ from rest_framework.status import (
     HTTP_404_NOT_FOUND,
 )
 
+from engram.access.models import Identity
 from engram.console.filters import MemoryReviewCandidateFilterSet, MemoryReviewMemoryFilterSet
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.memory_review import (
     BulkArchiveResultSerializer,
     BulkArchiveSerializer,
+    BulkReviewActionResultSerializer,
+    BulkReviewActionSerializer,
     MemoryReviewActionSerializer,
     queue_item_payload,
     version_slice,
@@ -58,7 +61,7 @@ class MemoryReviewViewSet(
     pagination_class: Any = None
 
     def get_permissions(self) -> list[BasePermission]:
-        if self.action in {'review_action', 'bulk_archive'}:
+        if self.action in {'review_action', 'bulk_archive', 'bulk_action'}:
             return [
                 IsAuthenticated(),
                 ActiveOrganizationPermission(),
@@ -195,6 +198,69 @@ class MemoryReviewViewSet(
         result = BulkArchiveResultSerializer(payload)
 
         return Response(result.data, status=HTTP_200_OK)
+
+    @action(detail=False, methods=['post'], url_path='bulk-action')
+    def bulk_action(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        organization = request.active_organization
+
+        actor_identity = request.user_identity
+
+        serializer = BulkReviewActionSerializer(data=request.data)
+
+        serializer.is_valid(raise_exception=True)
+
+        data = serializer.validated_data
+
+        results = [
+            self._apply_bulk_review_action(
+                request,
+                organization,
+                actor_identity,
+                item_id,
+                data['action'],
+                data['reason'],
+            )
+            for item_id in data['ids']
+        ]
+
+        done_count = sum(1 for result in results if result['outcome'] == 'done')
+
+        payload = {
+            'results': results,
+            'done_count': done_count,
+            'skipped_count': len(results) - done_count,
+        }
+
+        result = BulkReviewActionResultSerializer(payload)
+
+        return Response(result.data, status=HTTP_200_OK)
+
+    def _apply_bulk_review_action(
+        self,
+        request: Request,
+        organization: Any,
+        actor_identity: Identity,
+        item_id: uuid.UUID,
+        action_name: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        try:
+            ReviewActionUseCase(user=request.user, transaction=transaction.atomic()).execute(
+                ReviewActionInput(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    item_id=item_id,
+                    action_name=action_name,
+                    reason=reason,
+                ),
+            )
+
+        except MemoryReviewError as error:
+            outcome = 'not_found' if error.code == 'not_found' else 'invalid_state'
+
+            return {'id': item_id, 'outcome': outcome}
+
+        return {'id': item_id, 'outcome': 'done'}
 
     def _reviewable_page(self, request: Request) -> dict[str, Any]:
         organization = request.active_organization

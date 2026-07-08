@@ -419,8 +419,8 @@ export type WorkflowRunListParams = ListParams & {
 };
 
 export type WorkflowRunRerunResult = {
-  run_id: string | null;
-  result_memory_id: string;
+  run_id: string;
+  status: WorkflowRunStatus;
 };
 
 export async function listWorkflowRuns(
@@ -636,6 +636,27 @@ export type BulkArchiveMemoryReviewResult = {
   archived_ids: string[];
 };
 
+export type BulkReviewActionName = 'approve' | 'reject';
+
+export type BulkReviewActionOutcome = 'done' | 'invalid_state' | 'not_found';
+
+export type BulkReviewActionItemResult = {
+  id: string;
+  outcome: BulkReviewActionOutcome;
+};
+
+export type BulkReviewActionPayload = {
+  ids: string[];
+  action: BulkReviewActionName;
+  reason: string;
+};
+
+export type BulkReviewActionResult = {
+  results: BulkReviewActionItemResult[];
+  done_count: number;
+  skipped_count: number;
+};
+
 export async function listMemoryReview(
   params?: MemoryReviewListParams,
 ): Promise<Paginated<MemoryReviewItem>> {
@@ -681,6 +702,18 @@ export async function bulkArchiveMemoryReview(
   const client = apiClient();
   const response = await client.post<BulkArchiveMemoryReviewResult>(
     '/v1/admin/memory-review/bulk-archive/',
+    payload,
+  );
+
+  return response.data;
+}
+
+export async function bulkReviewAction(
+  payload: BulkReviewActionPayload,
+): Promise<BulkReviewActionResult> {
+  const client = apiClient();
+  const response = await client.post<BulkReviewActionResult>(
+    '/v1/admin/memory-review/bulk-action/',
     payload,
   );
 

@@ -44,10 +44,13 @@ import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type { ApiKey, ApiKeyStatus } from '@/lib/admin-api';
 import { useOrgStore } from '@/lib/org-store';
 
-const KEY_FILTER_DEFAULTS = { search: '', status: '', page: 1 };
+const ALL_STATUSES = 'all';
+
+const KEY_FILTER_DEFAULTS = { search: '', status: 'active', page: 1 };
 const KEY_PAGE_SIZE = 20;
 
-const STATUS_OPTIONS: { key: ApiKeyStatus; label: string }[] = [
+const STATUS_OPTIONS: { key: string; label: string }[] = [
+  { key: ALL_STATUSES, label: 'All statuses' },
   { key: 'active', label: 'Active' },
   { key: 'expired', label: 'Expired' },
   { key: 'revoked', label: 'Revoked' },
@@ -90,6 +93,66 @@ function expandGrantableCapabilities(capabilities: string[]): string[] {
   }
 
   return Array.from(grantable).sort();
+}
+
+interface CapabilityGroup {
+  group: string;
+  members: string[];
+}
+
+function groupCapabilities(capabilities: string[]): CapabilityGroup[] {
+  const map = new Map<string, string[]>();
+
+  for (const capability of capabilities) {
+    const [group] = capability.split(':');
+    const members = map.get(group);
+
+    if (members) {
+      members.push(capability);
+    } else {
+      map.set(group, [capability]);
+    }
+  }
+
+  return Array.from(map.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([group, members]) => ({ group, members }));
+}
+
+function formatGroupLabel(group: string): string {
+  return group
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
+type SelectionState = 'all' | 'some' | 'none';
+
+function groupSelectionState(
+  members: string[],
+  selected: string[],
+): SelectionState {
+  if (members.length === 0) {
+
+    return 'none';
+  }
+
+  const selectedSet = new Set(selected);
+  const selectedCount = members.filter((member) =>
+    selectedSet.has(member),
+  ).length;
+
+  if (selectedCount === 0) {
+
+    return 'none';
+  }
+
+  if (selectedCount === members.length) {
+
+    return 'all';
+  }
+
+  return 'some';
 }
 
 type KeyStatus = ApiKeyStatus;
@@ -307,6 +370,29 @@ function IssueModal({
   } | null>(null);
   const [copied, setCopied] = React.useState(false);
 
+  const capabilityGroups = React.useMemo(
+    () => groupCapabilities(grantableCapabilities),
+    [grantableCapabilities],
+  );
+
+  function commitGroupSelection(members: string[], nextValues: string[]) {
+    setSelectedCapabilities((prev) => {
+      const keep = new Set(
+        prev.filter((capability) => !members.includes(capability)),
+      );
+
+      for (const value of nextValues) {
+        keep.add(value);
+      }
+
+      return grantableCapabilities.filter((capability) => keep.has(capability));
+    });
+  }
+
+  function handleSelectAllToggle(checked: boolean) {
+    setSelectedCapabilities(checked ? grantableCapabilities : []);
+  }
+
   React.useEffect(() => {
     if (!isOpen) {
       setName('');
@@ -364,6 +450,11 @@ function IssueModal({
     setCopied(false);
     onClose();
   }
+
+  const allSelectionState = groupSelectionState(
+    grantableCapabilities,
+    selectedCapabilities,
+  );
 
   return (
     <Modal
@@ -452,21 +543,71 @@ function IssueModal({
                         You have no grantable capabilities.
                       </p>
                     ) : (
-                      <CheckboxGroup
-                        value={selectedCapabilities}
-                        onValueChange={setSelectedCapabilities}
-                        isDisabled={isIssuing}
-                      >
-                        <div className='grid grid-cols-1 sm:grid-cols-2 gap-2'>
-                          {grantableCapabilities.map((capability) => (
-                            <Checkbox key={capability} value={capability}>
-                              <span className='font-mono text-xs'>
-                                {capability}
-                              </span>
-                            </Checkbox>
-                          ))}
+                      <div className='space-y-4'>
+                        <div className='flex items-center justify-between border-b border-divider pb-2'>
+                          <Checkbox
+                            isSelected={allSelectionState === 'all'}
+                            isIndeterminate={allSelectionState === 'some'}
+                            onValueChange={handleSelectAllToggle}
+                            isDisabled={isIssuing}
+                          >
+                            <span className='text-sm font-medium text-foreground'>
+                              Select all
+                            </span>
+                          </Checkbox>
+                          <span className='text-xs text-default-400'>
+                            {selectedCapabilities.length} /{' '}
+                            {grantableCapabilities.length} selected
+                          </span>
                         </div>
-                      </CheckboxGroup>
+                        {capabilityGroups.map(({ group, members }) => {
+                          const groupState = groupSelectionState(
+                            members,
+                            selectedCapabilities,
+                          );
+                          const groupValue = members.filter((member) =>
+                            selectedCapabilities.includes(member),
+                          );
+
+                          return (
+                            <div key={group} className='space-y-2'>
+                              <Checkbox
+                                isSelected={groupState === 'all'}
+                                isIndeterminate={groupState === 'some'}
+                                onValueChange={(checked) =>
+                                  commitGroupSelection(
+                                    members,
+                                    checked ? members : [],
+                                  )
+                                }
+                                isDisabled={isIssuing}
+                              >
+                                <span className='text-xs font-semibold uppercase tracking-[0.06em] text-default-500'>
+                                  {formatGroupLabel(group)}
+                                </span>
+                              </Checkbox>
+                              <CheckboxGroup
+                                value={groupValue}
+                                onValueChange={(values) =>
+                                  commitGroupSelection(members, values)
+                                }
+                                isDisabled={isIssuing}
+                                className='pl-6'
+                              >
+                                <div className='grid grid-cols-1 sm:grid-cols-2 gap-2'>
+                                  {members.map((capability) => (
+                                    <Checkbox key={capability} value={capability}>
+                                      <span className='font-mono text-xs'>
+                                        {capability}
+                                      </span>
+                                    </Checkbox>
+                                  ))}
+                                </div>
+                              </CheckboxGroup>
+                            </div>
+                          );
+                        })}
+                      </div>
                     )}
                   </div>
                   {issueError && (
@@ -544,7 +685,10 @@ export default function ApiKeysPage() {
       page: filters.page,
       pageSize: KEY_PAGE_SIZE,
       search: filters.search || undefined,
-      status: (filters.status || undefined) as ApiKeyStatus | undefined,
+      status:
+        filters.status && filters.status !== ALL_STATUSES
+          ? (filters.status as ApiKeyStatus)
+          : undefined,
     }),
     [filters.page, filters.search, filters.status],
   );
@@ -618,7 +762,8 @@ export default function ApiKeysPage() {
   const items = keysQuery.data?.results ?? [];
   const total = keysQuery.data?.count ?? 0;
   const meLoaded = meQuery.data !== undefined;
-  const hasFilters = filters.search.length > 0 || filters.status.length > 0;
+  const hasFilters =
+    filters.search.length > 0 || filters.status !== KEY_FILTER_DEFAULTS.status;
 
   return (
     <CapabilityGate capabilities={capabilities} required='api_keys:read'>
@@ -654,16 +799,16 @@ export default function ApiKeysPage() {
           />
           <Select
             aria-label='Filter by status'
-            placeholder='All statuses'
-            selectedKeys={filters.status ? new Set([filters.status]) : new Set()}
+            selectedKeys={new Set([filters.status])}
             variant='bordered'
             size='sm'
             className='max-w-[180px]'
+            disallowEmptySelection
             onSelectionChange={(keys) => {
               const next = Array.from(keys)[0];
 
               setFilters({
-                status: typeof next === 'string' ? next : '',
+                status: typeof next === 'string' ? next : KEY_FILTER_DEFAULTS.status,
                 page: 1,
               });
             }}

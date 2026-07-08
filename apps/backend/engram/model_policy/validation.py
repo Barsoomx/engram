@@ -9,7 +9,7 @@ from typing import Any
 from engram.core.models import Project, ProjectTeam
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, TaskType
-from engram.model_policy.services import ProviderCallInput, get_provider_gateway
+from engram.model_policy.services import EmbeddingCallInput, ProviderCallInput, get_provider_gateway
 
 VALIDATION_PROMPT = 'engram_validate_policies health check: respond with a minimal completion.'
 NO_PROJECT_AVAILABLE_ERROR_CODE = 'no_project_available'
@@ -75,22 +75,36 @@ def validate_policy(
     if project is None:
         return _failure(policy, NO_PROJECT_AVAILABLE_ERROR_CODE, latency_ms=0)
 
-    response_kind = 'candidates' if policy.task_type == TaskType.CURATION else 'single'
     request_id = f'{VALIDATION_REQUEST_ID_PREFIX}{policy.id}:{uuid.uuid4()}'
     started_at = time.monotonic()
     try:
-        factory(policy, timeout=timeout).call(
-            ProviderCallInput(
-                organization_id=policy.organization_id,
-                project_id=project.id,
-                team_id=policy.team_id,
-                policy=policy,
-                request_id=request_id,
-                trace_id=request_id,
-                prompt=VALIDATION_PROMPT,
-                response_kind=response_kind,
-            ),
-        )
+        gateway = factory(policy, timeout=timeout)
+        if policy.task_type == TaskType.EMBEDDING:
+            gateway.embed(
+                EmbeddingCallInput(
+                    organization_id=policy.organization_id,
+                    project_id=project.id,
+                    team_id=policy.team_id,
+                    policy=policy,
+                    request_id=request_id,
+                    trace_id=request_id,
+                    text=VALIDATION_PROMPT,
+                ),
+            )
+        else:
+            response_kind = 'candidates' if policy.task_type == TaskType.CURATION else 'single'
+            gateway.call(
+                ProviderCallInput(
+                    organization_id=policy.organization_id,
+                    project_id=project.id,
+                    team_id=policy.team_id,
+                    policy=policy,
+                    request_id=request_id,
+                    trace_id=request_id,
+                    prompt=VALIDATION_PROMPT,
+                    response_kind=response_kind,
+                ),
+            )
     except ModelPolicyError as error:
         raw_code = error.error_code or _FALLBACK_ERROR_CODE
 

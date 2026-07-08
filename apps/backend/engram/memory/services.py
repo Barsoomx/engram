@@ -1969,18 +1969,30 @@ def run_weekly_digest_with_tracking(
     window_days: int = WEEKLY_DIGEST_WINDOW_DAYS,
     request_id: str = '',
     correlation_id: str = '',
+    existing_run_id: uuid.UUID | None = None,
 ) -> WeeklyDigestResult:
     project = Project.objects.get(id=project_id, organization_id=organization_id)
 
-    run = WorkflowRun.objects.create(
-        organization=project.organization,
-        project=project,
-        run_type=WorkflowRunType.WEEKLY_DIGEST,
-        status=WorkflowRunStatus.QUEUED,
-        input_snapshot={'window_days': window_days},
-        request_id=request_id,
-        correlation_id=correlation_id,
-    )
+    run = None
+    if existing_run_id is not None:
+        run = WorkflowRun.objects.filter(
+            id=existing_run_id,
+            organization=project.organization,
+            project=project,
+            run_type=WorkflowRunType.WEEKLY_DIGEST,
+            status=WorkflowRunStatus.QUEUED,
+        ).first()
+
+    if run is None:
+        run = WorkflowRun.objects.create(
+            organization=project.organization,
+            project=project,
+            run_type=WorkflowRunType.WEEKLY_DIGEST,
+            status=WorkflowRunStatus.QUEUED,
+            input_snapshot={'window_days': window_days},
+            request_id=request_id,
+            correlation_id=correlation_id,
+        )
 
     run.status = WorkflowRunStatus.RUNNING
 
