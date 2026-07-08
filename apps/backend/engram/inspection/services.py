@@ -55,6 +55,9 @@ class InspectionScope:
 MEMORY_ORDERING_FIELDS = ('created_at', '-created_at')
 DEFAULT_MEMORY_ORDERING = '-created_at'
 
+CONTEXT_BUNDLE_ORDERING_FIELDS = ('created_at', '-created_at')
+DEFAULT_CONTEXT_BUNDLE_ORDERING = '-created_at'
+
 
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
@@ -183,7 +186,8 @@ class ListInspectionMemories:
 
 class ListInspectionContextBundles:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[ContextBundle]:
-        qs = self._base_queryset(inspection_scope).order_by('created_at', 'id')
+        ordering = self._ordering(inspection_scope.ordering)
+        qs = self._base_queryset(inspection_scope).order_by(ordering, 'id')
         filter_data = {
             'since': inspection_scope.since,
             'until': inspection_scope.until,
@@ -192,6 +196,12 @@ class ListInspectionContextBundles:
         }
 
         return InspectionContextBundleFilterSet(data=filter_data, queryset=qs).qs
+
+    def _ordering(self, ordering: str | None) -> str:
+        if ordering in CONTEXT_BUNDLE_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_CONTEXT_BUNDLE_ORDERING
 
     def detail(self, inspection_scope: InspectionScope, bundle_id: uuid.UUID) -> ContextBundle:
         bundle = self._base_queryset(inspection_scope).filter(id=bundle_id).first()
