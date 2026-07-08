@@ -8,10 +8,12 @@ import pytest
 from engram.core.models import Organization, Project, Team
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
-from engram.model_policy.services import ProviderCallInput, ProviderCallResult
+from engram.model_policy.services import EmbeddingCallInput, EmbeddingCallResult, ProviderCallInput, ProviderCallResult
 from engram.model_policy.validation import (
     NO_PROJECT_AVAILABLE_ERROR_CODE,
     VALIDATION_HTTP_TIMEOUT_SECONDS,
+    VALIDATION_PROMPT,
+    VALIDATION_REQUEST_ID_PREFIX,
     PolicyValidationResult,
     validate_policy,
 )
@@ -71,6 +73,27 @@ class _RecordingGateway:
             redaction_state='clean',
             generated_title='ok',
             generated_body='ok',
+        )
+
+
+class _EmbedHttpErrorGateway:
+    def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
+        raise ModelPolicyError('provider_http_error', 'provider returned 403', http_status=403)
+
+
+class _RecordingEmbedGateway:
+    def __init__(self, sink: list[EmbeddingCallInput]) -> None:
+        self._sink = sink
+
+    def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
+        self._sink.append(data)
+
+        return EmbeddingCallResult(
+            provider=data.policy.provider,
+            model=data.policy.model,
+            call_record_id=uuid.uuid4(),
+            redaction_state='clean',
+            embedding=(0.0,),
         )
 
 
@@ -151,6 +174,17 @@ def f_policy(
     secret = _make_secret(f_organization, f_team)
 
     return _make_policy(f_organization, f_team, f_project, secret, task_type='generation')
+
+
+@pytest.fixture
+def f_embedding_policy(
+    f_organization: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> ModelPolicy:
+    secret = _make_secret(f_organization, f_team)
+
+    return _make_policy(f_organization, f_team, f_project, secret, task_type='embedding')
 
 
 @pytest.mark.django_db
@@ -289,3 +323,38 @@ def test_validate_policy_bounds_gateway_timeout(f_policy: ModelPolicy) -> None:
     validate_policy(f_policy, gateway_factory=factory)
 
     assert seen_timeouts == [VALIDATION_HTTP_TIMEOUT_SECONDS]
+
+
+@pytest.mark.django_db
+def test_validate_policy_embedding_calls_embed_not_chat(f_embedding_policy: ModelPolicy) -> None:
+    captured: list[EmbeddingCallInput] = []
+
+    result = validate_policy(
+        f_embedding_policy,
+        gateway_factory=_gateway_factory(_RecordingEmbedGateway(captured)),
+    )
+
+    assert result.ok is True
+    assert result.error_code is None
+    assert len(captured) == 1
+    assert captured[0].organization_id == f_embedding_policy.organization_id
+    assert captured[0].project_id == f_embedding_policy.project.id
+    assert captured[0].team_id == f_embedding_policy.team_id
+    assert captured[0].policy == f_embedding_policy
+    assert captured[0].text == VALIDATION_PROMPT
+    assert captured[0].request_id.startswith(VALIDATION_REQUEST_ID_PREFIX)
+    assert captured[0].trace_id == captured[0].request_id
+
+
+@pytest.mark.django_db
+def test_validate_policy_embedding_failure_returns_sanitized_code(f_embedding_policy: ModelPolicy) -> None:
+    result = validate_policy(
+        f_embedding_policy,
+        gateway_factory=_gateway_factory(_EmbedHttpErrorGateway()),
+    )
+
+    assert result.ok is False
+    assert result.task_type == 'embedding'
+    assert result.error_code == 'provider_http_error'
+    assert result.public_error
+    assert '403' not in result.public_error
