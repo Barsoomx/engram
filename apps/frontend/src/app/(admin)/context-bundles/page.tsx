@@ -7,6 +7,7 @@ import Link from 'next/link';
 import * as React from 'react';
 
 import { CapabilityGate } from '@/components/ui/capability-gate';
+import { DateTimeInput } from '@/components/ui/datetime-input';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorState } from '@/components/ui/error-state';
 import { PageHeader } from '@/components/ui/page-header';
@@ -15,7 +16,11 @@ import { TimeStamp } from '@/components/ui/time-stamp';
 import { useDebouncedValue } from '@/hooks/use-debounced-value';
 import { useUrlFilters } from '@/hooks/use-url-filters';
 import { fetchMe, type MeResponse } from '@/lib/auth';
-import { listContextBundles, type ContextBundleListItem } from '@/lib/console-api';
+import {
+  listContextBundles,
+  type ContextBundleListItem,
+  type ContextBundleOrdering,
+} from '@/lib/console-api';
 import { useProjectStore } from '@/lib/project-store';
 import { useTeamStore } from '@/lib/team-store';
 
@@ -24,6 +29,11 @@ const GRID_COLUMNS =
 
 const STATUS_OPTIONS = ['created', 'injected', 'skipped'] as const;
 
+const ORDERING_OPTIONS: { key: ContextBundleOrdering; label: string }[] = [
+  { key: '-created_at', label: 'Newest first' },
+  { key: 'created_at', label: 'Oldest first' },
+];
+
 const PAGE_SIZE = 50;
 
 type BundleFilters = {
@@ -31,6 +41,7 @@ type BundleFilters = {
   session_id: string;
   since: string;
   until: string;
+  ordering: ContextBundleOrdering;
   page: number;
 };
 
@@ -39,6 +50,7 @@ const DEFAULT_FILTERS: BundleFilters = {
   session_id: '',
   since: '',
   until: '',
+  ordering: '-created_at',
   page: 0,
 };
 
@@ -145,7 +157,7 @@ function BundleFilterBar({
   onReset: () => void;
 }) {
   return (
-    <div className='surface-card grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-5'>
+    <div className='surface-card grid grid-cols-1 gap-4 p-4 sm:grid-cols-2 lg:grid-cols-6'>
       <Select
         label='Status'
         labelPlacement='outside'
@@ -169,20 +181,33 @@ function BundleFilterBar({
         isClearable
         onClear={() => onSessionInput('')}
       />
-      <Input
+      <DateTimeInput
         label='Since'
-        labelPlacement='outside'
-        type='datetime-local'
         value={filters.since}
         onValueChange={(value) => onChange({ since: value, page: 0 })}
       />
-      <Input
+      <DateTimeInput
         label='Until'
-        labelPlacement='outside'
-        type='datetime-local'
         value={filters.until}
         onValueChange={(value) => onChange({ until: value, page: 0 })}
       />
+      <Select
+        label='Sort'
+        labelPlacement='outside'
+        disallowEmptySelection
+        selectedKeys={new Set([filters.ordering])}
+        onSelectionChange={(keys) => {
+          const next = Array.from(keys)[0];
+
+          if (typeof next === 'string') {
+            onChange({ ordering: next as ContextBundleOrdering, page: 0 });
+          }
+        }}
+      >
+        {ORDERING_OPTIONS.map((option) => (
+          <SelectItem key={option.key}>{option.label}</SelectItem>
+        ))}
+      </Select>
       <div className='flex items-end'>
         <button
           type='button'
@@ -233,6 +258,7 @@ export default function ContextBundlesPage() {
       filters.session_id,
       filters.since,
       filters.until,
+      filters.ordering,
       filters.page,
     ],
     enabled: Boolean(activeProjectId),
@@ -247,6 +273,7 @@ export default function ContextBundlesPage() {
         session_id: filters.session_id || undefined,
         since: toIso(filters.since),
         until: toIso(filters.until),
+        ordering: filters.ordering,
       }),
   });
 
