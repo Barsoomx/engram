@@ -46,6 +46,7 @@ import { TableRowSkeleton } from '@/components/ui/table-row-skeleton';
 import { TimeStamp } from '@/components/ui/time-stamp';
 import {
   useBulkArchiveMemoryReview,
+  useBulkReviewAction,
   useMemoryReview,
   useMemoryReviewAction,
   useMemoryReviewDiff,
@@ -55,6 +56,7 @@ import { useProjects } from '@/hooks/use-projects';
 import { useTeams } from '@/hooks/use-teams';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import type {
+  BulkReviewActionName,
   MemoryReviewActionName,
   MemoryReviewActionPayload,
   MemoryReviewDiffSlice,
@@ -447,7 +449,7 @@ interface ReviewTableProps {
 }
 
 function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, onRowAction }: ReviewTableProps) {
-  const allIds = items.filter((item) => item.type === 'memory').map((item) => item.id);
+  const allIds = items.map((item) => item.id);
   const allSelected = allIds.length > 0 && allIds.every((id) => selectedIds.has(id));
   const someSelected = allIds.some((id) => selectedIds.has(id));
 
@@ -483,13 +485,11 @@ function ReviewTable({ items, selectedIds, canAdmin, onToggleRow, onToggleAll, o
             <tr key={`${item.type}-${item.id}`} className='border-b border-divider/50'>
               {canAdmin && (
                 <td className='px-3 py-2'>
-                  {item.type === 'memory' ? (
-                    <Checkbox
-                      isSelected={isSelected}
-                      onValueChange={() => onToggleRow(item.id)}
-                      aria-label={`Select ${item.title}`}
-                    />
-                  ) : null}
+                  <Checkbox
+                    isSelected={isSelected}
+                    onValueChange={() => onToggleRow(item.id)}
+                    aria-label={`Select ${item.title}`}
+                  />
                 </td>
               )}
               <td className='px-3 py-2'>
@@ -828,6 +828,10 @@ export default function MemoryReviewPage() {
   const [thresholdReason, setThresholdReason] = React.useState('');
   const [thresholdValue, setThresholdValue] = React.useState('0.3');
 
+  const [bulkReviewActionName, setBulkReviewActionName] = React.useState<BulkReviewActionName | null>(null);
+  const [bulkReviewActionReason, setBulkReviewActionReason] = React.useState('');
+  const [bulkReviewActionOpen, setBulkReviewActionOpen] = React.useState(false);
+
   const [actionItem, setActionItem] = React.useState<MemoryReviewItem | null>(null);
   const [actionName, setActionName] = React.useState<MemoryReviewActionName | null>(null);
   const [actionOpen, setActionOpen] = React.useState(false);
@@ -850,6 +854,7 @@ export default function MemoryReviewPage() {
   const reviewQuery = useMemoryReview(activeOrgId, queryParams, { placeholderData: keepPreviousData });
   const actionMutation = useMemoryReviewAction(activeOrgId);
   const bulkMutation = useBulkArchiveMemoryReview(activeOrgId);
+  const bulkReviewActionMutation = useBulkReviewAction(activeOrgId);
 
   const canAdmin = hasCapability(capabilities, 'memories:admin');
 
@@ -1006,6 +1011,43 @@ export default function MemoryReviewPage() {
     }
   }
 
+  function openBulkReviewAction(action: BulkReviewActionName) {
+    setBulkReviewActionName(action);
+    setBulkReviewActionReason('');
+    setBulkReviewActionOpen(true);
+  }
+
+  async function handleBulkReviewAction() {
+    if (selectedIds.size === 0 || !bulkReviewActionName || bulkReviewActionReason.trim().length === 0) {
+      return;
+    }
+
+    try {
+      const result = await bulkReviewActionMutation.mutateAsync({
+        ids: Array.from(selectedIds),
+        action: bulkReviewActionName,
+        reason: bulkReviewActionReason.trim(),
+      });
+
+      addToast({
+        title: `${ACTION_META[bulkReviewActionName].label} applied`,
+        description: `${result.done_count} done, ${result.skipped_count} skipped.`,
+        color: result.skipped_count > 0 ? 'warning' : 'success',
+      });
+
+      setSelectedIds(new Set());
+      setBulkReviewActionOpen(false);
+    } catch (error) {
+      addToast({
+        title: `Bulk ${bulkReviewActionName} failed`,
+        description: extractErrorDetail(error),
+        color: 'danger',
+      });
+    }
+  }
+
+  const BulkActionIcon = bulkReviewActionName ? ACTION_META[bulkReviewActionName].icon : null;
+
   return (
     <CapabilityGate capabilities={capabilities} required='memories:review'>
       <section className='space-y-6'>
@@ -1038,11 +1080,34 @@ export default function MemoryReviewPage() {
           <div className='surface-card flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between'>
             <div className='flex items-center gap-2 text-sm text-default-700'>
               <ShieldCheck className='h-4 w-4' />
-              <span>{selectedIds.size} selected for bulk archive.</span>
+              <span>{selectedIds.size} selected.</span>
             </div>
-            <div className='flex items-center gap-2'>
-              <Button color='default' variant='light' onPress={() => setSelectedIds(new Set())} isDisabled={bulkMutation.isPending}>
+            <div className='flex flex-wrap items-center gap-2'>
+              <Button
+                color='default'
+                variant='light'
+                onPress={() => setSelectedIds(new Set())}
+                isDisabled={bulkMutation.isPending || bulkReviewActionMutation.isPending}
+              >
                 Clear
+              </Button>
+              <Button
+                color='success'
+                variant='flat'
+                startContent={<ThumbsUp className='h-4 w-4' />}
+                onPress={() => openBulkReviewAction('approve')}
+                isDisabled={bulkMutation.isPending || bulkReviewActionMutation.isPending}
+              >
+                Approve selected
+              </Button>
+              <Button
+                color='danger'
+                variant='flat'
+                startContent={<ThumbsDown className='h-4 w-4' />}
+                onPress={() => openBulkReviewAction('reject')}
+                isDisabled={bulkMutation.isPending || bulkReviewActionMutation.isPending}
+              >
+                Reject selected
               </Button>
               <Button
                 color='danger'
@@ -1052,7 +1117,7 @@ export default function MemoryReviewPage() {
                   setBulkReason('');
                   setBulkOpen(true);
                 }}
-                isDisabled={bulkMutation.isPending}
+                isDisabled={bulkMutation.isPending || bulkReviewActionMutation.isPending}
               >
                 Archive selected
               </Button>
@@ -1250,6 +1315,64 @@ export default function MemoryReviewPage() {
                     isLoading={bulkMutation.isPending}
                   >
                     Confirm archive
+                  </Button>
+                </ModalFooter>
+              </>
+            )}
+          </ModalContent>
+        </Modal>
+
+        <Modal
+          isOpen={bulkReviewActionOpen}
+          onClose={() => setBulkReviewActionOpen(false)}
+          placement='center'
+          isDismissable={!bulkReviewActionMutation.isPending}
+          hideCloseButton={bulkReviewActionMutation.isPending}
+        >
+          <ModalContent>
+            {() => (
+              <>
+                <ModalHeader className='flex flex-col gap-1 text-foreground'>
+                  {bulkReviewActionName ? ACTION_META[bulkReviewActionName].label : 'Action'} {selectedIds.size} item
+                  {selectedIds.size === 1 ? '' : 's'}
+                </ModalHeader>
+                <ModalBody>
+                  <div className='space-y-3'>
+                    <p className='text-sm text-default-500'>
+                      Provide a reason. This is recorded in the audit log for each item. Items that are not in a
+                      valid state for this action are skipped and reported individually.
+                    </p>
+                    <Textarea
+                      label='Reason'
+                      labelPlacement='outside'
+                      placeholder='Explain why this action is being taken…'
+                      value={bulkReviewActionReason}
+                      onValueChange={setBulkReviewActionReason}
+                      minRows={2}
+                      maxRows={6}
+                      maxLength={1024}
+                      isDisabled={bulkReviewActionMutation.isPending}
+                      isRequired
+                    />
+                  </div>
+                </ModalBody>
+                <ModalFooter>
+                  <Button
+                    color='default'
+                    variant='light'
+                    onPress={() => setBulkReviewActionOpen(false)}
+                    isDisabled={bulkReviewActionMutation.isPending}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    color={bulkReviewActionName ? ACTION_META[bulkReviewActionName].color : 'primary'}
+                    startContent={BulkActionIcon ? <BulkActionIcon className='h-4 w-4' /> : undefined}
+                    onPress={handleBulkReviewAction}
+                    isDisabled={bulkReviewActionReason.trim().length === 0 || bulkReviewActionMutation.isPending}
+                    isLoading={bulkReviewActionMutation.isPending}
+                  >
+                    {bulkReviewActionName ? `Confirm ${ACTION_META[bulkReviewActionName].label.toLowerCase()}` : 'Confirm'}
                   </Button>
                 </ModalFooter>
               </>

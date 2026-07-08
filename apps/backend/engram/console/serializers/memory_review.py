@@ -62,6 +62,35 @@ class BulkArchiveResultSerializer(serializers.Serializer):
     archived_ids = serializers.ListField(child=serializers.UUIDField(), read_only=True)
 
 
+class BulkReviewActionSerializer(serializers.Serializer):
+    ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        allow_empty=False,
+        max_length=200,
+    )
+
+    action = serializers.ChoiceField(choices=('approve', 'reject'))
+
+    reason = serializers.CharField(min_length=1, max_length=1024)
+
+
+class BulkReviewActionItemResultSerializer(serializers.Serializer):
+    id = serializers.UUIDField(read_only=True)
+
+    outcome = serializers.ChoiceField(
+        choices=('done', 'invalid_state', 'not_found'),
+        read_only=True,
+    )
+
+
+class BulkReviewActionResultSerializer(serializers.Serializer):
+    results = BulkReviewActionItemResultSerializer(many=True, read_only=True)
+
+    done_count = serializers.IntegerField(read_only=True)
+
+    skipped_count = serializers.IntegerField(read_only=True)
+
+
 def queue_item_payload(item: MemoryCandidate | Memory) -> dict[str, Any]:
     if isinstance(item, MemoryCandidate):
         return _candidate_payload(item)

@@ -9,11 +9,14 @@ import {
 
 import {
   bulkArchiveMemoryReview,
+  bulkReviewAction,
   listMemoryReview,
   memoryReviewAction,
   memoryReviewDiff,
   type BulkArchiveMemoryReviewPayload,
   type BulkArchiveMemoryReviewResult,
+  type BulkReviewActionPayload,
+  type BulkReviewActionResult,
   type MemoryReviewActionPayload,
   type MemoryReviewActionResult,
   type MemoryReviewDiff,
@@ -95,6 +98,23 @@ export function useBulkArchiveMemoryReview(orgId: string | null) {
     BulkArchiveMemoryReviewPayload
   >({
     mutationFn: (payload) => bulkArchiveMemoryReview(payload),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: adminQueryKeys.memoryReview(orgId),
+      });
+    },
+  });
+}
+
+export function useBulkReviewAction(orgId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation<
+    BulkReviewActionResult,
+    unknown,
+    BulkReviewActionPayload
+  >({
+    mutationFn: (payload) => bulkReviewAction(payload),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: adminQueryKeys.memoryReview(orgId),
