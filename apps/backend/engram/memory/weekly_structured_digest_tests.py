@@ -543,6 +543,44 @@ def test_run_weekly_digest_with_tracking_creates_succeeded_workflow_run(
 
 
 @pytest.mark.django_db
+def test_run_weekly_digest_with_tracking_adopts_existing_queued_run(
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    queued = WorkflowRun.objects.create(
+        organization=f_org,
+        project=f_project,
+        run_type=WorkflowRunType.WEEKLY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        request_id='weekly-adopt-1',
+        input_snapshot={'window_days': 7},
+    )
+
+    result = run_weekly_digest_with_tracking(
+        organization_id=f_org.id,
+        project_id=f_project.id,
+        window_days=7,
+        request_id='weekly-adopt-1',
+        existing_run_id=queued.id,
+    )
+
+    queued.refresh_from_db()
+
+    assert queued.status == WorkflowRunStatus.SUCCEEDED
+
+    assert queued.result_memory_id == result.digest_memory.id
+
+    assert (
+        WorkflowRun.objects.filter(
+            organization=f_org,
+            project=f_project,
+            run_type=WorkflowRunType.WEEKLY_DIGEST,
+        ).count()
+        == 1
+    )
+
+
+@pytest.mark.django_db
 def test_different_projects_isolated(
     f_org: Organization,
     f_project: Project,

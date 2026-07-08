@@ -89,9 +89,10 @@ def process_observation_recorded(self: object, observation_id: object) -> str:
     soft_time_limit=_DISTILL_SOFT_TIME_LIMIT,
     time_limit=_DISTILL_TIME_LIMIT,
 )
-def distill_session(self: object, session_id: object) -> str:
+def distill_session(self: object, session_id: object, workflow_run_id: object = None) -> str:
     try:
         parsed_session_id = uuid.UUID(str(session_id))
+        parsed_workflow_run_id = uuid.UUID(str(workflow_run_id)) if workflow_run_id is not None else None
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed session id') from error
 
@@ -107,6 +108,7 @@ def distill_session(self: object, session_id: object) -> str:
             session_id=parsed_session_id,
             request_id=request_id,
             correlation_id=correlation_id,
+            existing_run_id=parsed_workflow_run_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:
@@ -178,10 +180,12 @@ def generate_weekly_digest(
     self: object,
     organization_id: object,
     project_id: object,
+    workflow_run_id: object = None,
 ) -> str:
     try:
         parsed_organization_id = uuid.UUID(str(organization_id))
         parsed_project_id = uuid.UUID(str(project_id))
+        parsed_workflow_run_id = uuid.UUID(str(workflow_run_id)) if workflow_run_id is not None else None
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed weekly digest input') from error
 
@@ -197,6 +201,7 @@ def generate_weekly_digest(
             project_id=parsed_project_id,
             request_id=request_id,
             correlation_id=request_id,
+            existing_run_id=parsed_workflow_run_id,
         )
     except MemoryWorkerError as exc:
         if exc.retryable:
