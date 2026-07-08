@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
 
 import pytest
@@ -1526,3 +1527,253 @@ def test_action_restore_reactivates_agent_refuted_memory(
     assert memory.refuted is False
 
     assert memory.status == MemoryStatus.APPROVED
+
+
+@pytest.mark.django_db
+def test_bulk_action_approve_promotes_candidates(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(c1.id), str(c2.id)], 'action': 'approve', 'reason': 'batch approve'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['done_count'] == 2
+
+    assert response.data['skipped_count'] == 0
+
+    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
+
+    assert outcomes[str(c1.id)] == 'done'
+
+    assert outcomes[str(c2.id)] == 'done'
+
+    c1.refresh_from_db()
+
+    c2.refresh_from_db()
+
+    assert c1.status == CandidateStatus.PROMOTED
+
+    assert c2.status == CandidateStatus.PROMOTED
+
+    assert c1.promoted_memory_id is not None
+
+    assert (
+        AuditEvent.objects.filter(
+            organization=f_admin_org,
+            event_type='MemoryReviewed',
+            metadata__action='approve',
+        ).count()
+        == 2
+    )
+
+
+@pytest.mark.django_db
+def test_bulk_action_reject_handles_candidate_and_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(candidate.id), str(memory.id)], 'action': 'reject', 'reason': 'batch reject'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['done_count'] == 2
+
+    candidate.refresh_from_db()
+
+    memory.refresh_from_db()
+
+    assert candidate.status == CandidateStatus.REJECTED
+
+    assert memory.status == MemoryStatus.REFUTED
+
+
+@pytest.mark.django_db
+def test_bulk_action_partial_failure_reports_per_item_outcome(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    already_promoted = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROMOTED)
+
+    missing_id = uuid.uuid4()
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {
+            'ids': [str(approvable.id), str(already_promoted.id), str(missing_id)],
+            'action': 'approve',
+            'reason': 'batch approve',
+        },
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['done_count'] == 1
+
+    assert response.data['skipped_count'] == 2
+
+    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
+
+    assert outcomes[str(approvable.id)] == 'done'
+
+    assert outcomes[str(already_promoted.id)] == 'invalid_state'
+
+    assert outcomes[str(missing_id)] == 'not_found'
+
+    approvable.refresh_from_db()
+
+    assert approvable.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
+def test_bulk_action_denied_without_admin_capability(
+    f_reviewer_token: str,
+    f_reviewer_org: Organization,
+) -> None:
+    project = Project.objects.create(organization=f_reviewer_org, name='P', slug='p')
+
+    candidate = _make_candidate(f_reviewer_org, project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_reviewer_token, f_reviewer_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(candidate.id)], 'action': 'approve', 'reason': 'try'},
+    )
+
+    assert response.status_code == 403
+
+    candidate.refresh_from_db()
+
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_bulk_action_requires_reason(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(candidate.id)], 'action': 'approve'},
+    )
+
+    assert response.status_code == 400
+
+    candidate.refresh_from_db()
+
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_bulk_action_rejects_more_than_200_ids(
+    f_admin_token: str,
+    f_admin_org: Organization,
+) -> None:
+    ids = [str(uuid.uuid4()) for _ in range(201)]
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': ids, 'action': 'approve', 'reason': 'too many'},
+    )
+
+    assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_bulk_action_is_tenant_scoped(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_foreign_org: Organization,
+) -> None:
+    foreign_project = Project.objects.create(
+        organization=f_foreign_org,
+        name='FP3',
+        slug='fp3',
+    )
+
+    candidate = _make_candidate(f_foreign_org, foreign_project, status=CandidateStatus.PROPOSED)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(candidate.id)], 'action': 'approve', 'reason': 'cross'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['results'][0]['outcome'] == 'not_found'
+
+    candidate.refresh_from_db()
+
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_bulk_action_rejects_invalid_action_choice(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(memory.id)], 'action': 'archive', 'reason': 'not allowed'},
+    )
+
+    assert response.status_code == 400
+
+    memory.refresh_from_db()
+
+    assert memory.status == MemoryStatus.APPROVED
+
+
+@pytest.mark.django_db
+def test_bulk_action_rejects_empty_ids(
+    f_admin_token: str,
+    f_admin_org: Organization,
+) -> None:
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [], 'action': 'approve', 'reason': 'empty'},
+    )
+
+    assert response.status_code == 400

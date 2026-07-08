@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -361,66 +362,128 @@ def test_retrieve_returns_404_for_other_org_run(
 
 
 @pytest.mark.django_db
-def test_rerun_creates_chained_run_triggers_digest_and_audits(
+def test_rerun_daily_digest_creates_queued_run_and_dispatches_task(
     f_admin_client: APIClient,
     f_admin_org: Organization,
 ) -> None:
-    from engram.context.context_api_tests import create_project_scope
-    from engram.memory.memory_digest_tests import create_digest_policy, create_source_memory
+    project = _make_project(f_admin_org)
 
-    org, team, project, _owner, _api_key = create_project_scope()
-
-    user = _make_user('rerun-admin')
-
-    identity = _make_identity(user, org)
-
-    role = _make_role_with_capabilities(
-        'rerun_admin',
-        ('memories:read', 'memories:admin'),
-    )
-
-    OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
-
-    from rest_framework.authtoken.models import Token
-
-    token = Token.objects.create(user=user).key
-
-    client = _client(token, org)
-
-    create_digest_policy(org, team, project)
-
-    source = create_source_memory(org, team, project, title='Rerun source')
+    source_id = uuid.uuid4()
 
     run = _make_run(
-        org,
+        f_admin_org,
         project,
-        memory_ids=[str(source.id)],
+        memory_ids=[str(source_id)],
         request_id='original-run',
     )
 
-    response = client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+    with patch('engram.console.views.workflow_runs.generate_daily_digest') as m_task:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
 
-    assert response.status_code == 200
+    assert response.status_code == 202
 
     new_run_id = response.data['run_id']
 
     assert new_run_id is not None
 
+    assert response.data['status'] == WorkflowRunStatus.QUEUED
+
     new_run = WorkflowRun.objects.get(id=new_run_id)
 
-    assert new_run.status == WorkflowRunStatus.SUCCEEDED
+    assert new_run.status == WorkflowRunStatus.QUEUED
 
     assert new_run.rerun_of_id == run.id
 
-    assert new_run.result_memory_id is not None
+    assert new_run.run_type == WorkflowRunType.DAILY_DIGEST
 
-    audit = AuditEvent.objects.filter(
-        organization=org,
+    assert new_run.input_snapshot['memory_ids'] == [str(source_id)]
+
+    m_task.delay.assert_called_once()
+
+    args = m_task.delay.call_args[0]
+
+    kwargs = m_task.delay.call_args[1]
+
+    assert args[0] == str(f_admin_org.id)
+
+    assert args[1] == str(project.id)
+
+    assert args[2] == [str(source_id)]
+
+    assert kwargs['workflow_run_id'] == str(new_run.id)
+
+
+@pytest.mark.django_db
+def test_rerun_daily_digest_never_executes_pipeline_inline(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(f_admin_org, project, memory_ids=[], request_id='inline-guard-run')
+
+    with (
+        patch('engram.console.views.workflow_runs.generate_daily_digest') as m_task,
+        patch('engram.memory.services.GenerateDigest.execute') as m_pipeline,
+    ):
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 202
+
+    m_task.delay.assert_called_once()
+
+    m_pipeline.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_rerun_daily_digest_writes_audit_event_without_result_memory_id(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(f_admin_org, project, memory_ids=[], request_id='audit-run')
+
+    with patch('engram.console.views.workflow_runs.generate_daily_digest'):
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    new_run_id = response.data['run_id']
+
+    audit = AuditEvent.objects.get(
+        organization=f_admin_org,
         event_type='WorkflowRunReran',
         target_id=str(run.id),
     )
 
-    assert audit.count() == 1
+    assert audit.metadata == {'new_run_id': new_run_id}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('running_status', [WorkflowRunStatus.QUEUED, WorkflowRunStatus.RUNNING])
+def test_rerun_daily_digest_conflicts_with_active_run_for_project(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+    running_status: str,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    run = _make_run(f_admin_org, project, memory_ids=[], request_id='conflict-original')
+
+    WorkflowRun.objects.create(
+        organization=f_admin_org,
+        project=project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=running_status,
+    )
+
+    with patch('engram.console.views.workflow_runs.generate_daily_digest') as m_task:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 409
+
+    assert response.data['code'] == 'daily_digest_already_running'
+
+    m_task.delay.assert_not_called()
 
 
 @pytest.mark.django_db
@@ -438,16 +501,82 @@ def test_rerun_dispatches_weekly_digest_for_weekly_run_type(
     )
 
     with (
-        patch('engram.console.views.workflow_runs.run_weekly_digest_with_tracking') as m_weekly,
-        patch('engram.console.views.workflow_runs.run_daily_digest_with_tracking') as m_daily,
+        patch('engram.console.views.workflow_runs.generate_weekly_digest') as m_weekly,
+        patch('engram.console.views.workflow_runs.generate_daily_digest') as m_daily,
     ):
         response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
 
-    assert response.status_code == 200
+    assert response.status_code == 202
 
-    m_weekly.assert_called_once()
+    new_run_id = response.data['run_id']
 
-    m_daily.assert_not_called()
+    new_run = WorkflowRun.objects.get(id=new_run_id)
+
+    assert new_run.run_type == WorkflowRunType.WEEKLY_DIGEST
+
+    assert new_run.status == WorkflowRunStatus.QUEUED
+
+    assert new_run.rerun_of_id == run.id
+
+    m_weekly.delay.assert_called_once()
+
+    args = m_weekly.delay.call_args[0]
+
+    kwargs = m_weekly.delay.call_args[1]
+
+    assert args[0] == str(f_admin_org.id)
+
+    assert args[1] == str(project.id)
+
+    assert kwargs['workflow_run_id'] == str(new_run.id)
+
+    m_daily.delay.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_rerun_dispatches_session_distillation_for_session_run_type(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+
+    session_id = uuid.uuid4()
+
+    run = WorkflowRun.objects.create(
+        organization=f_admin_org,
+        project=project,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.SUCCEEDED,
+        input_snapshot={'session_id': str(session_id)},
+        request_id='distill-original',
+    )
+
+    with patch('engram.console.views.workflow_runs.distill_session') as m_distill:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 202
+
+    new_run_id = response.data['run_id']
+
+    new_run = WorkflowRun.objects.get(id=new_run_id)
+
+    assert new_run.run_type == WorkflowRunType.SESSION_DISTILLATION
+
+    assert new_run.status == WorkflowRunStatus.QUEUED
+
+    assert new_run.rerun_of_id == run.id
+
+    assert new_run.input_snapshot == {'session_id': str(session_id)}
+
+    m_distill.delay.assert_called_once()
+
+    args = m_distill.delay.call_args[0]
+
+    kwargs = m_distill.delay.call_args[1]
+
+    assert args[0] == str(session_id)
+
+    assert kwargs['workflow_run_id'] == str(new_run.id)
 
 
 @pytest.mark.django_db
@@ -499,7 +628,8 @@ def test_rerun_daily_digest_invalid_memory_ids_returns_invalid_rerun_snapshot(
         request_id='invalid-memory-ids',
     )
 
-    response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+    with patch('engram.console.views.workflow_runs.generate_daily_digest') as m_task:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
 
     assert response.status_code == 400
 
@@ -508,6 +638,10 @@ def test_rerun_daily_digest_invalid_memory_ids_returns_invalid_rerun_snapshot(
     assert response.data['error_code'] == 'invalid_rerun_snapshot'
 
     assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+    m_task.delay.assert_not_called()
+
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.DAILY_DIGEST).count() == 1
 
 
 @pytest.mark.django_db
@@ -526,7 +660,8 @@ def test_rerun_session_distillation_invalid_session_id_returns_invalid_rerun_sna
         request_id='invalid-session-id',
     )
 
-    response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+    with patch('engram.console.views.workflow_runs.distill_session') as m_distill:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
 
     assert response.status_code == 400
 
@@ -535,6 +670,10 @@ def test_rerun_session_distillation_invalid_session_id_returns_invalid_rerun_sna
     assert response.data['error_code'] == 'invalid_rerun_snapshot'
 
     assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+    m_distill.delay.assert_not_called()
+
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.SESSION_DISTILLATION).count() == 1
 
 
 @pytest.mark.django_db

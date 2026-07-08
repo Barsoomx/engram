@@ -273,6 +273,62 @@ def test_list_inspection_context_bundles_filters_by_session_id() -> None:
 
 
 @pytest.mark.django_db
+def test_list_inspection_context_bundles_defaults_to_newest_first() -> None:
+    organization, team, project = create_inspection_scope_models()
+    older = _make_context_bundle(
+        organization,
+        team,
+        project,
+        request_id='bundle-older',
+        session_external_id='sess-older',
+    )
+    newer = _make_context_bundle(
+        organization,
+        team,
+        project,
+        request_id='bundle-newer',
+        session_external_id='sess-newer',
+    )
+    ContextBundle.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
+    ContextBundle.objects.filter(id=newer.id).update(created_at=timezone.now())
+    inspection_scope = InspectionScope(project=project, scope=_effective_scope(organization, team))
+
+    results = list(ListInspectionContextBundles().execute(inspection_scope))
+
+    assert [bundle.id for bundle in results] == [newer.id, older.id]
+
+
+@pytest.mark.django_db
+def test_list_inspection_context_bundles_ordering_created_at_ascending() -> None:
+    organization, team, project = create_inspection_scope_models()
+    older = _make_context_bundle(
+        organization,
+        team,
+        project,
+        request_id='bundle-older',
+        session_external_id='sess-older',
+    )
+    newer = _make_context_bundle(
+        organization,
+        team,
+        project,
+        request_id='bundle-newer',
+        session_external_id='sess-newer',
+    )
+    ContextBundle.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
+    ContextBundle.objects.filter(id=newer.id).update(created_at=timezone.now())
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        ordering='created_at',
+    )
+
+    results = list(ListInspectionContextBundles().execute(inspection_scope))
+
+    assert [bundle.id for bundle in results] == [older.id, newer.id]
+
+
+@pytest.mark.django_db
 def test_list_inspection_memories_count_defaults_to_approved_only() -> None:
     organization, team, project = create_inspection_scope_models()
     create_approved_memory_document(organization, team, project, title='Approved memory')

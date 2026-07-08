@@ -298,11 +298,14 @@ export interface ContextBundleDetail extends ContextBundleListItem {
   items: ContextBundleEntry[];
 }
 
+export type ContextBundleOrdering = 'created_at' | '-created_at';
+
 export interface ContextBundleListParams extends ScopeParams {
   session_id?: string;
   status?: string;
   since?: string;
   until?: string;
+  ordering?: ContextBundleOrdering;
 }
 
 export async function listContextBundles(
@@ -324,6 +327,10 @@ export async function listContextBundles(
 
   if (scope.until) {
     params.until = scope.until;
+  }
+
+  if (scope.ordering) {
+    params.ordering = scope.ordering;
   }
 
   const response = await apiClient().get('/v1/inspection/context-bundles', {

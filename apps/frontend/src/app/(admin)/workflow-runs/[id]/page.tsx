@@ -344,10 +344,8 @@ export default function WorkflowRunDetailPage() {
       const result = await rerunMutation.mutateAsync(id);
 
       addToast({
-        title: 'Workflow rerun started',
-        description: result.run_id
-          ? `New run ${result.run_id.slice(0, 8)}… queued.`
-          : 'New run queued.',
+        title: 'Workflow rerun queued',
+        description: `New run ${result.run_id.slice(0, 8)}… queued for processing.`,
         color: 'success',
       });
       setRerunOpen(false);
