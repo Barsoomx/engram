@@ -53,7 +53,9 @@ class BundleSyncTests(unittest.TestCase):
             self.assertNotIn('claude-mem', text.lower())
 
         self.assertIn('main()', hook_shim.read_text(encoding='utf-8'))
-        self.assertIn('main(["mcp", "serve"])', mcp_shim.read_text(encoding='utf-8'))
+        mcp_shim_text = mcp_shim.read_text(encoding='utf-8')
+        self.assertIn('main(["mcp", "serve"])', mcp_shim_text)
+        self.assertIn('os.environ["ENGRAM_MCP_CODEX_SCOPE"] = "1"', mcp_shim_text)
 
     def test_hook_commands_reference_bundled_entrypoint(self) -> None:
         self.assertTrue(HOOK_MANIFEST_PATH.is_file(), HOOK_MANIFEST_PATH)

@@ -1,16 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from argparse import Namespace
 from importlib import metadata
+from pathlib import Path
 from typing import Any, TextIO
 
+from engram_cli.commands import git_remote_url
 from engram_cli.http import Transport
-from engram_cli.mcp_tools import ToolFn, build_tools
+from engram_cli.mcp_tools import (
+    INTERNAL_REPOSITORY_URL_ARGUMENT,
+    ToolFn,
+    build_tools,
+)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "engram"
+CODEX_TURN_METADATA_KEY = "x-codex-turn-metadata"
+CODEX_TURN_METADATA_MAX_LENGTH = 65536
+CODEX_MCP_SCOPE_ENV = "ENGRAM_MCP_CODEX_SCOPE"
 
 
 def _server_version() -> str:
@@ -23,6 +33,47 @@ def _server_version() -> str:
 SERVER_VERSION = _server_version()
 
 ToolMap = dict[str, ToolFn]
+
+
+def _codex_turn_metadata(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or len(value) > CODEX_TURN_METADATA_MAX_LENGTH:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _codex_repository_url(params: dict[str, Any]) -> str:
+    request_meta = params.get("_meta")
+    if not isinstance(request_meta, dict):
+        return ""
+    thread_id = request_meta.get("threadId")
+    if not isinstance(thread_id, str) or not thread_id.strip():
+        return ""
+    turn_metadata = _codex_turn_metadata(request_meta.get(CODEX_TURN_METADATA_KEY))
+    metadata_ids = (
+        turn_metadata.get("session_id"),
+        turn_metadata.get("thread_id"),
+    )
+    if any(value != thread_id for value in metadata_ids):
+        return ""
+    workspaces = turn_metadata.get("workspaces")
+    if not isinstance(workspaces, dict) or len(workspaces) != 1:
+        return ""
+    workspace, workspace_metadata = next(iter(workspaces.items()))
+    if (
+        not isinstance(workspace, str)
+        or not Path(workspace).is_absolute()
+        or not isinstance(workspace_metadata, dict)
+    ):
+        return ""
+
+    return git_remote_url(workspace)
 
 
 def list_tools() -> list[dict[str, object]]:
@@ -177,7 +228,12 @@ def handle_request(request: dict[str, Any], tools: ToolMap) -> dict[str, Any] | 
 
     if method == "tools/call":
         name = params.get("name")
-        arguments = params.get("arguments") or {}
+        raw_arguments = params.get("arguments")
+        arguments = dict(raw_arguments) if isinstance(raw_arguments, dict) else {}
+        arguments.pop(INTERNAL_REPOSITORY_URL_ARGUMENT, None)
+        repository_url = _codex_repository_url(params)
+        if repository_url or os.environ.get(CODEX_MCP_SCOPE_ENV) == "1":
+            arguments[INTERNAL_REPOSITORY_URL_ARGUMENT] = repository_url
         tool_fn = tools.get(name) if isinstance(name, str) else None
         if tool_fn is None:
             return {

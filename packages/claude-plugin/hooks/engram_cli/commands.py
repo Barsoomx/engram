@@ -92,7 +92,8 @@ ERROR_REMEDIATION: dict[str, str] = {
     "missing_mcp_target": "Pass --claude-code-config or --claude-desktop-config.",
     "invalid_agent_target": "Use claude_code, claude_desktop, or both.",
     "claude_cli_not_found": "Install the Claude Code CLI and ensure 'claude' is on PATH.",
-    "plugin_install_failed": "Check 'claude plugin' output and marketplace source.",
+    "codex_cli_not_found": "Install the Codex CLI and ensure 'codex' is on PATH.",
+    "plugin_install_failed": "Check the agent plugin output and marketplace source.",
     "python_runtime_missing": "Install python3 >= 3.12 so bundled hooks can run.",
     "missing_claude_mem_db": "Pass --data-dir pointing at a directory that holds claude-mem.db.",
     "corrupt_claude_mem_db": "Verify claude-mem.db is a readable SQLite database.",
@@ -644,29 +645,60 @@ def run_install(
         return connect_code
 
     try:
+        runtimes = normalize_runtimes(args.agent)
+        claude_bin = ""
+        codex_bin = ""
         if not args.skip_plugin_install:
-            claude_bin = shutil.which(args.claude_bin or "claude")
-            if not claude_bin:
-                raise CliError(
-                    "claude_cli_not_found",
-                    "Could not find the Claude Code CLI on PATH",
-                    remediation_for("claude_cli_not_found"),
+            if "claude_code" in runtimes:
+                claude_bin = shutil.which(args.claude_bin or "claude") or ""
+                if not claude_bin:
+                    raise CliError(
+                        "claude_cli_not_found",
+                        "Could not find the Claude Code CLI on PATH",
+                        remediation_for("claude_cli_not_found"),
+                    )
+            if "codex" in runtimes:
+                codex_bin = shutil.which(args.codex_bin or "codex") or ""
+                if not codex_bin:
+                    raise CliError(
+                        "codex_cli_not_found",
+                        "Could not find the Codex CLI on PATH",
+                        remediation_for("codex_cli_not_found"),
+                    )
+            if codex_bin:
+                install_codex_plugin(
+                    runner or subprocess_runner,
+                    codex_bin=codex_bin,
+                    marketplace_source=args.marketplace_source,
+                    marketplace_name=args.marketplace_name,
+                    plugin_name=args.plugin_name,
+                    api_key=args.api_key or "",
                 )
-            install_claude_plugin(
-                runner or subprocess_runner,
-                claude_bin=claude_bin,
-                marketplace_source=args.marketplace_source,
-                marketplace_name=args.marketplace_name,
-                plugin_name=args.plugin_name,
-                api_key=args.api_key or "",
-            )
+            if claude_bin:
+                install_claude_plugin(
+                    runner or subprocess_runner,
+                    claude_bin=claude_bin,
+                    marketplace_source=args.marketplace_source,
+                    marketplace_name=args.marketplace_name,
+                    plugin_name=args.plugin_name,
+                    api_key=args.api_key or "",
+                )
     except CliError as error:
         emit_error(stderr, error, args.api_key or "")
 
         return 1
 
     doctor_code = run_doctor(args, stdout, stderr, active_transport)
-    stdout.write("MCP tools ship with the Claude Code plugin (no extra setup).\n")
+    if not args.skip_plugin_install and "claude_code" in runtimes:
+        stdout.write("MCP tools ship with the Claude Code plugin (no extra setup).\n")
+    if not args.skip_plugin_install and "codex" in runtimes:
+        stdout.write("Codex plugin installed; verify with: codex plugin list --json\n")
+        stdout.write("Review and trust the Engram hooks with /hooks.\n")
+        stdout.write("Start a new thread after trusting the hooks.\n")
+        stdout.write(
+            "Remove the plugin with: "
+            f"codex plugin remove {args.plugin_name}@{args.marketplace_name} --json\n"
+        )
 
     return doctor_code
 
@@ -684,6 +716,55 @@ def install_claude_plugin(
         [claude_bin, "plugin", "marketplace", "add", marketplace_source],
         [claude_bin, "plugin", "install", f"{plugin_name}@{marketplace_name}"],
     )
+    _run_plugin_commands(
+        runner,
+        plugin_commands=plugin_commands,
+        api_key=api_key,
+        failure_message="claude plugin install failed",
+    )
+
+
+def install_codex_plugin(
+    runner: Runner,
+    *,
+    codex_bin: str,
+    marketplace_source: str,
+    marketplace_name: str,
+    plugin_name: str,
+    api_key: str,
+) -> None:
+    plugin_commands = (
+        [
+            codex_bin,
+            "plugin",
+            "marketplace",
+            "add",
+            marketplace_source,
+            "--json",
+        ],
+        [
+            codex_bin,
+            "plugin",
+            "add",
+            f"{plugin_name}@{marketplace_name}",
+            "--json",
+        ],
+    )
+    _run_plugin_commands(
+        runner,
+        plugin_commands=plugin_commands,
+        api_key=api_key,
+        failure_message="codex plugin install failed",
+    )
+
+
+def _run_plugin_commands(
+    runner: Runner,
+    *,
+    plugin_commands: tuple[list[str], ...],
+    api_key: str,
+    failure_message: str,
+) -> None:
     for command in plugin_commands:
         returncode, command_stdout, command_stderr = runner(command)
         if returncode != 0:
@@ -694,7 +775,7 @@ def install_claude_plugin(
             )
             raise CliError(
                 "plugin_install_failed",
-                redact_secret(combined or "claude plugin install failed", api_key),
+                redact_secret(combined or failure_message, api_key),
                 remediation_for("plugin_install_failed"),
             )
 
@@ -1034,6 +1115,9 @@ def synthesize_observation(
         value = payload_string(input_payload, field)
         if value:
             parts.append(f"{field}: {value}")
+    last_assistant_message = payload_string(input_payload, "last_assistant_message")
+    if last_assistant_message:
+        parts.append(f"last_assistant_message: {last_assistant_message}")
     tool_name = payload_string(input_payload, "tool_name")
     if tool_name:
         parts.append(f"tool: {tool_name}")
@@ -1070,9 +1154,21 @@ def build_generic_hook_payload(
     payload = dict_value(input_payload.get("payload"))
     if not payload:
         payload = {"trigger": event_type}
-        for field in ("prompt", "query", "tool_name", "message", "reason"):
+        for field in (
+            "prompt",
+            "query",
+            "tool_name",
+            "message",
+            "reason",
+            "hook_event_name",
+            "turn_id",
+            "tool_use_id",
+            "last_assistant_message",
+        ):
             value = payload_string(input_payload, field)
             if value:
+                if field == "last_assistant_message":
+                    value = value[:OBSERVATION_BODY_MAX_LENGTH]
                 payload[field] = value
         tool_input = input_payload.get("tool_input")
         if isinstance(tool_input, dict) and tool_input:
@@ -1105,6 +1201,9 @@ def build_generic_hook_payload(
         "team_id": as_string(config.get("team_id")),
         "agent_runtime": runtime,
         "agent_external_id": payload_string(input_payload, "agent_external_id"),
+        "hook_event_name": payload_string(input_payload, "hook_event_name"),
+        "turn_id": payload_string(input_payload, "turn_id"),
+        "tool_use_id": payload_string(input_payload, "tool_use_id"),
         "repository_url": payload_string(input_payload, "repository_url"),
         "repository_root": payload_string(input_payload, "repository_root"),
         "branch": payload_string(input_payload, "branch"),
@@ -1630,32 +1729,7 @@ def write_local_state(
             "project_id": project_id,
             "team_id": team_id or None,
             "credential_fingerprint": fingerprint,
-            "commands": {
-                "SessionStart": (
-                    f"engram hook session-start --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-                "PostToolUse": (
-                    f"engram hook post-tool-use --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-                "Error": (
-                    f"engram hook error --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-                "Decision": (
-                    f"engram hook decision --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-                "SessionEnd": (
-                    f"engram hook session-end --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-                "UserPromptSubmit": (
-                    f"engram hook user-prompt-submit --agent {runtime} "
-                    f"--response-format {response_format_for_runtime(runtime)}"
-                ),
-            },
+            "commands": _hook_commands_for_runtime(runtime),
         }
         for runtime in runtimes
     }
@@ -1663,6 +1737,36 @@ def write_local_state(
     write_secret_json(paths.credentials, credential_payload)
     for runtime, hook_payload in hook_payloads.items():
         write_json(paths.hook_manifest(runtime), hook_payload)
+
+
+def _hook_commands_for_runtime(runtime: str) -> dict[str, str]:
+    response_format = response_format_for_runtime(runtime)
+    commands = {
+        "SessionStart": (
+            f"engram hook session-start --agent {runtime} "
+            f"--response-format {response_format}"
+        ),
+        "PostToolUse": (
+            f"engram hook post-tool-use --agent {runtime} "
+            f"--response-format {response_format}"
+        ),
+        "UserPromptSubmit": (
+            f"engram hook user-prompt-submit --agent {runtime} "
+            f"--response-format {response_format}"
+        ),
+    }
+    if runtime == "codex":
+        commands["Stop"] = (
+            f"engram hook session-end --agent {runtime} "
+            f"--response-format {response_format}"
+        )
+    else:
+        commands["SessionEnd"] = (
+            f"engram hook session-end --agent {runtime} "
+            f"--response-format {response_format}"
+        )
+
+    return commands
 
 
 def emit_error(stderr: TextIO, error: CliError, secret: str = "") -> None:

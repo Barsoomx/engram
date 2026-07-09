@@ -1,176 +1,93 @@
-# Engram Plugin Repository
+# Engram Plugin Distribution
 
-This directory is the distribution index for the Engram agent plugins. It
-documents how the `packages/claude-plugin` and `packages/codex-plugin` packages
-are published, versioned, and installed. It owns no runtime code.
+Engram ships separate native packages and marketplace manifests for Claude Code
+and Codex. This directory documents distribution only; runtime code stays in
+`packages/`.
 
-The canonical Claude Code marketplace manifest now lives at the repository root:
-`.claude-plugin/marketplace.json`. That is the path `claude plugin marketplace
-add <owner/repo>` resolves, so a consumer installs Engram with:
+| Runtime | Plugin package | Marketplace manifest |
+| --- | --- | --- |
+| Claude Code | `packages/claude-plugin` | `.claude-plugin/marketplace.json` |
+| Codex | `packages/codex-plugin` | `.agents/plugins/marketplace.json` |
+
+Both plugins bundle the same thin Python connector and MCP bridge. They require
+`python3 >= 3.12` on `PATH`, but do not require a separate `engram` executable
+for the hook or MCP hot path. They read the connection created under
+`~/.engram`; neither package contains credentials, a memory database, provider
+secrets, a local worker, or a vector index.
+
+## Golden install flow
+
+The supported one-step command connects Engram and installs the selected native
+plugin:
 
 ```bash
+uvx engram-connect install --agent both \
+  --server URL --api-key KEY --project PROJECT
+```
+
+`--agent` accepts `claude-code`, `codex`, or `both`. Direct native installation
+is also supported:
+
+```bash
+# Claude Code
 claude plugin marketplace add Barsoomx/engram
 claude plugin install engram@engram-marketplace
+
+# Codex
+codex plugin marketplace add Barsoomx/engram --json
+codex plugin add engram@engram-marketplace --json
 ```
 
-The Claude Code plugin bundles its hook runtime, so it requires `python3 >= 3.12`
-on `PATH` (it does not require the `engram` CLI on `PATH` for the hook hot path).
-The examples below in this document describe the manifest format; the committed
-source of truth is the repo-root file.
+After a Codex install, open `/hooks`, review the Engram commands, approve them
+if they match the installed package, and start a new thread. The installer does
+not bypass Codex hook trust.
 
-## Role in distribution
+## Package contracts
 
-Engram ships two thin agent adapters that wire AI coding agents into Engram
-memory by registering hook events:
+The Claude Code package uses its `.claude-plugin/plugin.json`, `.mcp.json`, and
+`hooks/hooks.json` contracts. Its hooks invoke:
 
-- `packages/claude-plugin` - Claude Code plugin (`.claude-plugin/plugin.json`).
-- `packages/codex-plugin` - Codex plugin (`.codex-plugin/plugin.json`).
-
-The repo-root `.claude-plugin/marketplace.json` is the install source that agent
-marketplaces point at. A user runs `engram connect` (or `engram install`) to
-materialize local credentials under `~/.engram`, then installs the plugin so the
-agent's hook events call the bundled hook runtime. For the Claude Code plugin the
-hook command is `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook <event>
---agent claude_code --response-format claude-code`, which reuses the same
-`engram_cli` runtime bundled under `packages/claude-plugin/hooks/engram_cli/`.
-
-## Marketplace manifest format
-
-Claude Code plugin marketplaces are described by a
-`.claude-plugin/marketplace.json` manifest. For this repository that manifest is
-the repo-root `.claude-plugin/marketplace.json`; the `source` of each plugin is
-therefore a path relative to the repo root (for example `./packages/claude-plugin`).
-The manifest is a JSON object with two top-level fields:
-
-- `name` - marketplace identifier (string).
-- `owner` - human-readable owner name (object or string).
-- `plugins` - array of plugin entries that this marketplace distributes.
-
-Each entry in the `plugins` array has this shape:
-
-```json
-{
-  "name": "<plugin-name>",
-  "source": "./<path-to-plugin-package>",
-  "description": "<short description>",
-  "version": "<semver>",
-  "category": "<category>",
-  "metadata": {
-    "author": "<author>",
-    "repository": "<repo-url>",
-    "license": "<license-id>"
-  }
-}
+```text
+python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook <event> \
+  --agent claude_code --response-format claude-code
 ```
 
-A concrete example covering both Engram plugins:
+The Codex package uses `.codex-plugin/plugin.json`, `.mcp.json`, and Codex's
+default `hooks/hooks.json` discovery path. Its hooks invoke:
 
-```json
-{
-  "name": "engram-marketplace",
-  "owner": {
-    "name": "Engram"
-  },
-  "plugins": [
-    {
-      "name": "engram",
-      "source": "./packages/claude-plugin",
-      "description": "Thin Engram hook adapter for Claude Code.",
-      "version": "0.1.0",
-      "category": "Productivity",
-      "metadata": {
-        "author": "Engram",
-        "repository": "<repo-url>",
-        "license": "MIT"
-      }
-    },
-    {
-      "name": "engram-codex",
-      "source": "./packages/codex-plugin",
-      "description": "Thin Engram hook adapter for Codex.",
-      "version": "0.1.0",
-      "category": "Productivity",
-      "metadata": {
-        "author": "Engram",
-        "repository": "<repo-url>",
-        "license": "MIT"
-      }
-    }
-  ]
-}
+```text
+python3 "$PLUGIN_ROOT/hooks/hook.py" hook <event> \
+  --agent codex --response-format codex
 ```
 
-Field reference:
+Codex maps `SessionStart`, `UserPromptSubmit`, `PostToolUse`, and `Stop`; `Stop`
+calls the existing Engram `session-end` adapter as a turn checkpoint. Codex has
+no native `Error`, `Decision`, or `SessionEnd` hook.
 
-| Field                  | Type   | Notes                                                              |
-| ---------------------- | ------ | ------------------------------------------------------------------ |
-| `name`                 | string | Marketplace identifier.                                            |
-| `owner`                | object | `{"name": "..."}`.                                                 |
-| `plugins[].name`       | string | Plugin install name (`claude plugin install <name>`).              |
-| `plugins[].source`     | string | Relative path or URL to the plugin package directory.              |
-| `plugins[].description`| string | One-line description shown in marketplace listings.               |
-| `plugins[].version`    | string | Semver version; must match the plugin's own `plugin.json`.         |
-| `plugins[].category`   | string | Marketplace category, e.g. `Productivity`.                         |
-| `plugins[].metadata`   | object | Optional `author`, `repository`, `license`.                        |
+The bundled `hooks/engram_cli/` directories are generated from
+`packages/cli/engram_cli/` by `scripts/sync_plugin_bundle.py`. Contract tests
+reject missing files, extra files, or byte drift.
 
-## Adding and versioning plugins
+## Publishing and versioning
 
-To add a new plugin to the marketplace:
+For Claude Code, keep the package version and its entry in
+`.claude-plugin/marketplace.json` in lockstep. For Codex, bump
+`packages/codex-plugin/.codex-plugin/plugin.json`; the Codex marketplace points
+at the local package and reads package metadata from that manifest.
 
-1. Author the plugin package with its own `<agent>-plugin/plugin.json` and
-   hook manifest (see `packages/claude-plugin` and `packages/codex-plugin` for
-   reference).
-2. Add an entry to the `plugins` array in
-   `.claude-plugin/marketplace.json`. Set `source` to the relative path of the
-   package directory.
-3. Keep the entry's `version` field in lockstep with the plugin's own
-   `plugin.json` `version` field.
+Before publishing:
 
-To publish a new version of an existing plugin:
+1. sync both generated connector bundles;
+2. validate both plugin manifests and marketplace files;
+3. run CLI, package-contract, MCP, and real-agent E2E tests in containers;
+4. run the focused plugin/install security review;
+5. tag the reviewed commit so installations can pin a known revision.
 
-1. Bump `version` in the plugin's own `plugin.json`
-   (`packages/<plugin>/.<agent>-plugin/plugin.json`).
-2. Bump the matching `version` in
-   `.claude-plugin/marketplace.json`.
-3. Tag the release in git so installs can pin to a specific revision.
+Codex removal is owned by Codex:
 
-Both fields must match. Mismatches cause the marketplace to advertise a
-different version than the plugin actually ships, which breaks pinning and
-updates.
+```bash
+codex plugin remove engram@engram-marketplace --json
+```
 
-## Install flow
-
-End-to-end, installing an Engram plugin is:
-
-1. `engram connect` (or `engram install`) - writes `~/.engram/config.json`,
-   `~/.engram/credentials.json`, and `~/.engram/hooks.<runtime>.json` for each
-   selected runtime. Required before any hook can fire.
-2. `engram mcp install --runtime <runtime>` - (optional) registers the Engram
-   MCP server with the agent for inline memory queries.
-3. Add this marketplace and install the plugin:
-
-   ```bash
-   # Claude Code
-   claude plugin marketplace add Barsoomx/engram
-   claude plugin install engram@engram-marketplace
-   # Codex
-   codex plugin install engram-codex@engram-marketplace
-   ```
-
-Once installed, the agent's `SessionStart`, `PostToolUse`, `Error`, `Decision`,
-`SessionEnd`, and `UserPromptSubmit` hook events call the plugin's bundled hook
-runtime. For Claude Code that command is
-`python3 "${CLAUDE_PLUGIN_ROOT}/hooks/hook.py" hook <event> --agent claude_code
---response-format claude-code`, which requires `python3 >= 3.12` on `PATH` (not
-the `engram` CLI) and forwards each event to the Engram server. See each plugin's
-README for the exact hook table:
-
-- `packages/claude-plugin/README.md`
-- `packages/codex-plugin/README.md`
-
-## Scope and non-goals
-
-This repository is a docs-and-manifest distribution index only. It must not
-ship installer automation, signing material, generated packages, or release
-artifacts beyond the marketplace manifest documented above. CI/release
-automation is out of scope for the current checkpoint.
+See `packages/claude-plugin/README.md` and `packages/codex-plugin/README.md` for
+the runtime-specific contracts.

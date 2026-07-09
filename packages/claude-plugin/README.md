@@ -11,8 +11,8 @@ provider secret storage of its own.
 Engram is shared engineering memory for AI coding agents. This plugin wires
 Claude Code into that memory:
 
-- Captures coding-session activity (tool calls, decisions, errors, session
-  lifecycle) by emitting hook events.
+- Captures prompts, tool results, and session lifecycle activity by emitting
+  hook events.
 - Forwards each event to the Engram server via the bundled hook runtime
   (`hooks/hook.py`, which vendors the thin `engram_cli` client).
 - Registers the bundled Engram MCP server (`hooks/mcp.py`) so Claude Code can
@@ -53,8 +53,8 @@ one command. Or, from a local checkout of this repository:
 claude plugin install /path/to/engram/packages/claude-plugin
 ```
 
-The plugin manifest lives at `.claude-plugin/plugin.json` and points its
-`hooks` field at `./hooks/hooks.json`.
+The plugin manifest lives at `.claude-plugin/plugin.json`; Claude Code discovers
+the hook manifest from the package's default `hooks/hooks.json` path.
 
 ## Configuration
 
@@ -76,18 +76,18 @@ bundled runtime via
 
 | Event              | Matcher           | Hook argument        | Timeout (s) |
 | ------------------ | ----------------- | -------------------- | ----------- |
-| `SessionStart`     | `startup\|resume` | `session-start`      | 60          |
+| `SessionStart`     | `startup\|resume\|clear\|compact` | `session-start` | 60 |
 | `PostToolUse`      | `*`               | `post-tool-use`      | 120         |
-| `Error`            | `*`               | `error`              | 60          |
-| `Decision`         | `*`               | `decision`           | 60          |
 | `SessionEnd`       | `*`               | `session-end`        | 60          |
 | `UserPromptSubmit` | `*`               | `user-prompt-submit` | 60          |
 
-Hook lifecycle ordering: `SessionStart → UserPromptSubmit* → PostToolUse* → Decision/Error → SessionEnd`.
+Hook lifecycle ordering: `SessionStart → UserPromptSubmit* → PostToolUse* → SessionEnd`.
 
 `UserPromptSubmit` fires on every user prompt: it records the prompt as an observation and injects a fresh per-turn context bundle (`additionalContext`) into the agent.
 
-Existing installs need a plugin re-install or version bump before `SessionEnd` and `UserPromptSubmit` fire.
+Claude Code has no registered Engram `Error` or `Decision` hooks. Tool failures
+are captured in `PostToolUse`; decisions are learned from prompts and tool/session
+observations instead of an invented native event.
 
 ### How hooks call the bundled runtime
 

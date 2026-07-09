@@ -220,6 +220,28 @@ class OccurredAtTests(unittest.TestCase):
 
 
 class CodexOccurrenceIdentityTests(unittest.TestCase):
+    def test_replayed_native_payload_remains_idempotent(self) -> None:
+        hook_input: dict[str, object] = {
+            "session_id": "s1",
+            "repository_url": REPO,
+            "turn_id": "turn-1",
+            "tool_use_id": "tool-1",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "pytest"},
+            "tool_response": {"exit_code": 0, "output": "ok"},
+        }
+
+        first = build_generic_hook_payload(
+            CONFIG, "codex", hook_input, "post_tool_use"
+        )
+        second = build_generic_hook_payload(
+            CONFIG, "codex", hook_input, "post_tool_use"
+        )
+
+        self.assertEqual(first["event_id"], second["event_id"])
+        self.assertEqual(first["content_hash"], second["content_hash"])
+
     def test_turn_id_distinguishes_repeated_prompt_events(self) -> None:
         first = build_generic_hook_payload(
             CONFIG,
@@ -291,6 +313,22 @@ class CodexOccurrenceIdentityTests(unittest.TestCase):
 
         self.assertIn("deploy remains pending", built["observation"]["body"])
         self.assertEqual("turn-1", built["payload"]["turn_id"])
+
+    def test_stop_bounds_last_assistant_message_in_raw_payload(self) -> None:
+        built = build_generic_hook_payload(
+            CONFIG,
+            "codex",
+            {
+                "session_id": "s1",
+                "repository_url": REPO,
+                "turn_id": "turn-1",
+                "hook_event_name": "Stop",
+                "last_assistant_message": "x" * 20000,
+            },
+            "session_end",
+        )
+
+        self.assertEqual(16000, len(built["payload"]["last_assistant_message"]))
 
 
 class PayloadSizeBoundTests(unittest.TestCase):

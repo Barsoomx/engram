@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--marketplace-name", default="engram-marketplace")
     install.add_argument("--plugin-name", default="engram")
     install.add_argument("--claude-bin", default="claude")
+    install.add_argument("--codex-bin", default="codex")
     install.add_argument("--skip-plugin-install", action="store_true")
 
     doctor = subparsers.add_parser("doctor")

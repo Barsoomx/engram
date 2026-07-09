@@ -13,6 +13,7 @@ from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
 ToolFn = Callable[[dict[str, Any]], str]
 HandlerFn = Callable[[dict[str, Any], str | None, Transport], str]
+INTERNAL_REPOSITORY_URL_ARGUMENT = "__engram_repository_url"
 
 NOT_CONFIGURED_MESSAGE = (
     "Engram MCP bridge is not configured. Run `engram connect` first, or set "
@@ -35,7 +36,10 @@ class McpRuntime:
 
 
 def resolve_runtime(
-    config_dir: str | None = None, *, project_override: str = ""
+    config_dir: str | None = None,
+    *,
+    project_override: str = "",
+    repository_override: str | None = None,
 ) -> McpRuntime | None:
     paths = local_paths(config_dir)
     config = _read_optional_json(paths.config)
@@ -51,7 +55,12 @@ def resolve_runtime(
     )
     team_id = os.environ.get("ENGRAM_TEAM_ID") or as_string(config.get("team_id"))
     agent_runtime = os.environ.get("ENGRAM_AGENT_RUNTIME") or "codex"
-    repository_url = "" if project_id else workspace_repository_url()
+    if project_id:
+        repository_url = ""
+    elif repository_override is None:
+        repository_url = workspace_repository_url()
+    else:
+        repository_url = repository_override
     if not server_url or not api_key:
         return None
 
@@ -69,13 +78,37 @@ def resolve_runtime(
 
 
 def _require_runtime(
-    config_dir: str | None, *, project_override: str = ""
+    config_dir: str | None,
+    *,
+    project_override: str = "",
+    repository_override: str | None = None,
 ) -> tuple[McpRuntime | None, str]:
-    runtime = resolve_runtime(config_dir, project_override=project_override)
+    runtime = resolve_runtime(
+        config_dir,
+        project_override=project_override,
+        repository_override=repository_override,
+    )
     if runtime is None:
         return None, NOT_CONFIGURED_MESSAGE
 
     return runtime, ""
+
+
+def _require_runtime_for_arguments(
+    config_dir: str | None,
+    arguments: dict[str, Any],
+) -> tuple[McpRuntime | None, str]:
+    repository_override = None
+    if INTERNAL_REPOSITORY_URL_ARGUMENT in arguments:
+        repository_override = as_string(
+            arguments.get(INTERNAL_REPOSITORY_URL_ARGUMENT)
+        )
+
+    return _require_runtime(
+        config_dir,
+        project_override=as_string(arguments.get("project_id")),
+        repository_override=repository_override,
+    )
 
 
 def build_tools(
@@ -102,9 +135,7 @@ def build_tools(
 def search_memory(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 
@@ -151,9 +182,7 @@ def fetch_context(
     if not session_id:
         return "engram_context requires session_id."
 
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 
@@ -195,9 +224,7 @@ def create_memory_link(
     if not memory_id or not link_type or not target:
         return "engram_memory_link requires memory_id, link_type, and target."
 
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 
@@ -229,9 +256,7 @@ def create_memory_link(
 def list_observations(
     arguments: dict[str, Any], config_dir: str | None, transport: Transport
 ) -> str:
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 
@@ -276,9 +301,7 @@ def update_memory_version(
     if not memory_id or not body_text:
         return "engram_memory_version requires memory_id and body."
 
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 
@@ -319,9 +342,7 @@ def submit_memory_feedback(
             "(stale or refuted), and reason."
         )
 
-    runtime, error = _require_runtime(
-        config_dir, project_override=as_string(arguments.get("project_id"))
-    )
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
     if runtime is None:
         return error
 

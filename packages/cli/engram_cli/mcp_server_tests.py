@@ -1,10 +1,13 @@
 import io
 import json
+import os
 import tempfile
 import unittest
 from argparse import Namespace
+from unittest import mock
 
 from engram_cli.mcp_server import (
+    CODEX_MCP_SCOPE_ENV,
     PROTOCOL_VERSION,
     handle_request,
     run_mcp_serve,
@@ -184,6 +187,131 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual("text", response["result"]["content"][0]["type"])
         self.assertIn("searched: auth", response["result"]["content"][0]["text"])
+
+    def test_tools_call_scopes_codex_mcp_from_per_turn_workspace(self) -> None:
+        captured: list[dict] = []
+
+        def capture(arguments: dict) -> str:
+            captured.append(arguments)
+
+            return "ok"
+
+        tools = build_tools()
+        tools["engram_search"] = capture
+        request = {
+            "jsonrpc": "2.0",
+            "id": 31,
+            "method": "tools/call",
+            "params": {
+                "name": "engram_search",
+                "arguments": {"query": "auth"},
+                "_meta": {
+                    "threadId": "thread-1",
+                    "x-codex-turn-metadata": {
+                        "session_id": "thread-1",
+                        "thread_id": "thread-1",
+                        "turn_id": "turn-1",
+                        "workspaces": {
+                            "/workspace/project": {
+                                "associated_remote_urls": {
+                                    "origin": "https://example.test/acme/project.git"
+                                }
+                            }
+                        },
+                    },
+                },
+            },
+        }
+
+        with mock.patch(
+            "engram_cli.mcp_server.git_remote_url",
+            return_value="https://example.test/acme/project.git",
+        ) as m_remote:
+            response = handle_request(request, tools)
+
+        self.assertEqual("ok", response["result"]["content"][0]["text"])
+        self.assertEqual(
+            "https://example.test/acme/project.git",
+            captured[0]["__engram_repository_url"],
+        )
+        m_remote.assert_called_once_with("/workspace/project")
+
+    def test_tools_call_accepts_json_string_codex_turn_metadata(self) -> None:
+        captured: list[dict] = []
+        tools = build_tools()
+        tools["engram_search"] = lambda arguments: captured.append(arguments) or "ok"
+        turn_metadata = json.dumps(
+            {
+                "session_id": "thread-1",
+                "thread_id": "thread-1",
+                "workspaces": {"/workspace/project": {}},
+            }
+        )
+
+        with mock.patch(
+            "engram_cli.mcp_server.git_remote_url",
+            return_value="git@example.test:acme/project.git",
+        ):
+            handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 32,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "engram_search",
+                        "arguments": {"query": "auth"},
+                        "_meta": {
+                            "threadId": "thread-1",
+                            "x-codex-turn-metadata": turn_metadata,
+                        },
+                    },
+                },
+                tools,
+            )
+
+        self.assertEqual(
+            "git@example.test:acme/project.git",
+            captured[0]["__engram_repository_url"],
+        )
+
+    def test_tools_call_fails_closed_for_ambiguous_or_mismatched_codex_scope(
+        self,
+    ) -> None:
+        captured: list[dict] = []
+        tools = build_tools()
+        tools["engram_search"] = lambda arguments: captured.append(arguments) or "ok"
+        metadata = {
+            "session_id": "different-thread",
+            "thread_id": "different-thread",
+            "workspaces": {"/workspace/a": {}, "/workspace/b": {}},
+        }
+
+        with (
+            mock.patch("engram_cli.mcp_server.git_remote_url") as m_remote,
+            mock.patch.dict(os.environ, {CODEX_MCP_SCOPE_ENV: "1"}),
+        ):
+            handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 33,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "engram_search",
+                        "arguments": {
+                            "query": "auth",
+                            "__engram_repository_url": "https://attacker.invalid/repo",
+                        },
+                        "_meta": {
+                            "threadId": "thread-1",
+                            "x-codex-turn-metadata": metadata,
+                        },
+                    },
+                },
+                tools,
+            )
+
+        self.assertEqual("", captured[0]["__engram_repository_url"])
+        m_remote.assert_not_called()
 
     def test_tools_call_context_returns_text_content(self) -> None:
         response = handle_request(
