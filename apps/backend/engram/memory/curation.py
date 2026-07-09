@@ -816,4 +816,9 @@ class CurateMemoryCandidate:
             project_bound=False,
         )
 
-        return authorized_retrieval_documents(candidate.organization, candidate.project, scope)
+        return authorized_retrieval_documents(
+            candidate.organization,
+            candidate.project,
+            scope,
+            include_embeddings=True,
+        )

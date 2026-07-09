@@ -314,6 +314,7 @@ def authorized_retrieval_documents(
     project: Project,
     scope: EffectiveScope,
     kinds: tuple[str, ...] = (),
+    include_embeddings: bool = False,
 ) -> tuple[RetrievalDocument, ...]:
     documents = RetrievalDocument.objects.select_related(
         'memory',
@@ -330,6 +331,11 @@ def authorized_retrieval_documents(
     )
     if kinds:
         documents = documents.filter(memory__kind__in=kinds)
+    if not include_embeddings:
+        deferred_fields = ['embedding_vector']
+        if VectorField is not None:
+            deferred_fields.append('embedding_pgvector')
+        documents = documents.defer(*deferred_fields)
 
     return filter_documents_by_team_visibility(documents, scope)
 
@@ -401,17 +407,39 @@ def score_retrieval_document(
 PGVECTOR_FLOOR_DISTANCE_EPSILON = 1e-6
 
 
+def _document_embedding_vectors(
+    documents: tuple[RetrievalDocument, ...],
+) -> dict[uuid.UUID, list[float]]:
+    deferred_ids = [document.id for document in documents if 'embedding_vector' in document.get_deferred_fields()]
+    loaded: dict[uuid.UUID, list[float]] = {}
+    if deferred_ids:
+        loaded = dict(
+            RetrievalDocument.objects.filter(id__in=deferred_ids).values_list('id', 'embedding_vector'),
+        )
+    vectors: dict[uuid.UUID, list[float]] = {}
+    for document in documents:
+        if document.id in loaded:
+            vectors[document.id] = loaded[document.id]
+        else:
+            vectors[document.id] = document.embedding_vector
+
+    return vectors
+
+
 def _semantic_retrieval_matches_python(
     documents: tuple[RetrievalDocument, ...],
     exact_matches: list[RetrievalMatch],
     query_vector: list[float],
 ) -> list[RetrievalMatch]:
     already_matched = {match.document.id for match in exact_matches}
+    candidates = tuple(document for document in documents if document.id not in already_matched)
+    vectors = _document_embedding_vectors(candidates)
     scored: list[tuple[float, RetrievalMatch]] = []
-    for document in documents:
-        if document.id in already_matched or not document.embedding_vector:
+    for document in candidates:
+        vector = vectors.get(document.id)
+        if not vector:
             continue
-        similarity = cosine_similarity(query_vector, list(document.embedding_vector))
+        similarity = cosine_similarity(query_vector, list(vector))
         if similarity < SEMANTIC_MIN_SIMILARITY:
             continue
         scored.append(
@@ -436,23 +464,28 @@ def semantic_retrieval_matches_pgvector(
     query_vector: list[float],
 ) -> list[RetrievalMatch]:
     already_matched = {match.document.id for match in exact_matches}
-    pgvector_ids = [
-        document.id
-        for document in documents
-        if document.id not in already_matched and document.embedding_vector and document.embedding_pgvector is not None
-    ]
+    remaining = tuple(document for document in documents if document.id not in already_matched)
+    if not remaining:
+        return []
+
+    remaining_ids = [document.id for document in remaining]
+    pgvector_ids = set(
+        RetrievalDocument.objects.filter(id__in=remaining_ids)
+        .exclude(embedding_pgvector__isnull=True)
+        .values_list('id', flat=True),
+    )
     passing_ids: set[uuid.UUID] = set()
     if pgvector_ids and CosineDistance is not None and any(query_vector):
         max_distance = (1 - SEMANTIC_MIN_SIMILARITY) + PGVECTOR_FLOOR_DISTANCE_EPSILON
         passing_ids = set(
-            RetrievalDocument.objects.filter(id__in=pgvector_ids)
+            RetrievalDocument.objects.filter(id__in=list(pgvector_ids))
             .annotate(distance=CosineDistance('embedding_pgvector', query_vector))
             .filter(distance__lte=max_distance)
             .values_list('id', flat=True),
         )
 
     candidates = tuple(
-        document for document in documents if document.embedding_pgvector is None or document.id in passing_ids
+        document for document in remaining if document.id not in pgvector_ids or document.id in passing_ids
     )
 
     return _semantic_retrieval_matches_python(candidates, exact_matches, query_vector)
@@ -463,18 +496,10 @@ def semantic_retrieval_matches(
     exact_matches: list[RetrievalMatch],
     query_vector: list[float],
 ) -> list[RetrievalMatch]:
-    already_matched = {match.document.id for match in exact_matches}
-    use_pgvector = (
-        VectorField is not None
-        and CosineDistance is not None
-        and any(
-            document.id not in already_matched and document.embedding_pgvector is not None for document in documents
-        )
-    )
-    if use_pgvector:
-        return semantic_retrieval_matches_pgvector(documents, exact_matches, query_vector)
+    if VectorField is None or CosineDistance is None:
+        return _semantic_retrieval_matches_python(documents, exact_matches, query_vector)
 
-    return _semantic_retrieval_matches_python(documents, exact_matches, query_vector)
+    return semantic_retrieval_matches_pgvector(documents, exact_matches, query_vector)
 
 
 RECIPROCAL_RANK_FUSION_K = 60
