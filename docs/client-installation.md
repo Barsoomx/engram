@@ -26,8 +26,13 @@ Target command shape:
 The V1 golden path is non-interactive and scriptable:
 
 ```bash
-engram connect --server URL --api-key KEY --project PROJECT
+uvx engram-connect install --agent both \
+  --server URL --api-key KEY --project PROJECT
 ```
+
+Use `--agent claude-code`, `--agent codex`, or `--agent both`. `connect` remains
+the credential-and-hook-config primitive; `install` runs it, installs the
+selected native marketplace plugin, and runs `doctor`.
 
 The interactive wizard wraps a subset of the same fields:
 
@@ -35,13 +40,17 @@ The interactive wizard wraps a subset of the same fields:
 2. Log in with a username and password against the server's token endpoint.
 3. Choose organization and project from the fetched lists.
 4. Provide an API key name; the wizard issues a scoped API key.
-5. Install thin hook config for the agent runtime(s) passed via `--agent`
-   (default: both).
+5. Install thin hook config for the agent runtime(s) passed via `--agent`.
 6. Print a connection summary; it does not run a live dry-run identity/scope
    check the way the non-interactive flags path does.
 
 The command must not install Bun, local vector databases, local SQLite stores,
 provider SDK workers, or background services.
+
+The dashboard's **Connect agent** modal generates the same command. It exposes
+Claude Code, Codex, and Both as explicit choices, defaults to Claude Code for
+backward compatibility, and shows the matching native trust/completion steps.
+It does not retain the displayed key or implement a second installer.
 
 ## Local Credential
 
@@ -114,6 +123,10 @@ Agent-specific compatibility matters. For example, Codex hook responses must not
 emit unsupported fields. The adapter should have contract tests for each event
 type and agent family.
 
+Codex's native lifecycle maps `Stop` to the existing `session-end` adapter as a
+turn checkpoint. Codex does not expose native `Error`, `Decision`, or
+`SessionEnd` hooks; tool failures are carried by `PostToolUse`.
+
 ## Server Deploy Is Separate
 
 Server setup should live in deployment docs and automation:
@@ -130,6 +143,8 @@ attempt to deploy the server implicitly.
 Build the smallest useful client package:
 
 - `connect`: write thin hooks and verify server scope;
+- `install`: connect, install the selected Claude Code/Codex marketplace
+  plugin, and verify the resulting Engram connection;
 - `doctor`: validate installed hooks and server reachability;
 - `mcp install` / `mcp serve`: register or run the local MCP bridge without
   creating a local memory store. The Claude Code plugin bundles `mcp serve`

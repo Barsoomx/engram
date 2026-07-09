@@ -20,7 +20,7 @@ After connecting Engram, a developer can install the native plugin either with
 the combined command:
 
 ```bash
-engram install --agent codex --server URL --api-key KEY --project PROJECT
+uvx engram-connect install --agent codex --server URL --api-key KEY --project PROJECT
 ```
 
 or with the native Codex marketplace flow:
@@ -101,7 +101,12 @@ manifest-level `hooks` key.
 The manifest points only to components that exist, uses plugin-root-relative
 `./` paths, and contains publisher and install-surface metadata required by the
 validator. The MCP manifest launches the bundled Python bridge from the plugin
-root. The canonical connector modules remain under `packages/cli/engram_cli`;
+root. Because that process cwd is the plugin cache, each Codex `tools/call`
+derives repository scope from the request's per-turn workspace metadata after
+matching its outer and inner thread/session ids. Explicit project scope wins;
+missing, mismatched, or ambiguous metadata fails closed and is never cached
+across threads. The canonical connector modules remain under
+`packages/cli/engram_cli`;
 the plugin copy is byte-for-byte generated and checked for drift.
 
 The Codex marketplace is separate from the Claude Code marketplace and points
@@ -129,6 +134,24 @@ wrapper and standalone `doctor` inspection of Codex's plugin cache are deferred;
 native `codex plugin list` and the isolated E2E are the authority in this
 checkpoint.
 
+## Dashboard installer
+
+The existing **Connect agent** modal remains a thin command generator. It adds
+an explicit selector for `Claude Code`, `Codex`, or `Both` and emits one
+shell-safe command using the corresponding `--agent` value. Claude Code remains
+the default so the current flow does not change for existing users.
+
+The modal also shows runtime-specific completion guidance:
+
+- Claude Code uses its existing marketplace/install commands;
+- Codex uses `plugin marketplace add`, `plugin add`, `/hooks` review, and a new
+  thread;
+- Both shows both sets without asking the user to reconnect or expose the key a
+  second time.
+
+The UI does not install a local worker, retain the displayed API key, bypass
+agent hook trust, or invent a second installer protocol.
+
 ## Verification
 
 TDD contract coverage must prove:
@@ -141,22 +164,33 @@ TDD contract coverage must prove:
 - `engram install --agent codex` never invokes Claude, and `--agent both`
   resolves both binaries before plugin mutation;
 - secrets do not appear in manifests, commands, command errors, or MCP config;
+- Codex MCP calls route by the caller repository rather than the plugin cache,
+  while ambiguous or spoofed scope metadata fails closed;
 - the generated Codex bundle byte-matches the canonical connector modules.
 
 One isolated real-Codex E2E uses temporary `HOME` and `CODEX_HOME`, a local
-stub Engram HTTP server, and the pinned supported Codex CLI to:
+stub Engram HTTP server, a local deterministic OpenAI-compatible model server,
+and the pinned supported Codex CLI to:
 
 1. add the repository marketplace;
 2. list and install Engram;
-3. execute the installed four hook fixtures;
-4. initialize the bundled MCP server and list all six tools;
-5. remove the plugin with Codex;
-6. prove no files under the developer's real Codex profile changed.
+3. start a real Codex thread and submit a prompt whose deterministic model
+   response makes Codex run a harmless tool;
+4. prove Codex itself emitted `SessionStart`, `UserPromptSubmit`, `PostToolUse`,
+   and `Stop` to the stub Engram server, with no direct hook invocation used as
+   the ground-truth assertion;
+5. initialize the bundled MCP server and list all six tools;
+6. remove the plugin with Codex;
+7. prove no files under the developer's real Codex profile changed.
 
 CI runs the same E2E with a pinned Codex version, plus CLI/package contract and
-bundle-drift tests. A focused security review records hook trust, credential
-handling, payload persistence, marketplace isolation, MCP authorization, exact
-commands, and exit codes.
+bundle-drift tests. The Codex E2E is a required PR check, matching the Claude
+Code baseline rather than an optional smoke job.
+
+The classifier-backed security review is operator-deferred as of 2026-07-09.
+This checkpoint retains functional negative tests for credential redaction,
+hook trust, marketplace isolation, and fail-closed MCP routing, but does not
+claim that the formal security-review gate completed.
 
 ## Deferred
 
@@ -164,7 +198,8 @@ commands, and exit codes.
   Engram behavior requires them for the core loop.
 - a standalone `engram doctor` plugin-cache/trust parser;
 - an Engram-owned plugin uninstall wrapper;
-- provider, backend, retrieval, worker, frontend, and memory-quality changes;
+- provider, backend, retrieval, worker, and memory-quality changes beyond the
+  deterministic local E2E stub;
 - the unrelated pgvector, trigram, curation near-duplicate, and search-debug
   performance backlog.
 

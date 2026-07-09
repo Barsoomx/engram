@@ -20,8 +20,8 @@ MCP, and hooks.
 - **LLM-agnostic memory** shared across Claude Code, Codex, and future agents.
 - **Context, not search** — the primary output is a ready-to-inject context
   bundle with provenance and authorization evidence, not a list of hits.
-- **Deterministic capture** via lifecycle hooks (`SessionStart`, `PostToolUse`,
-  `Error`, `Decision`); no local worker or vector store on developer hosts.
+- **Deterministic capture** via native session, prompt, tool-use, and completion
+  hooks; no local worker or vector store on developer hosts.
 - **Hybrid retrieval** — exact/lexical recall plus semantic search over pgvector.
 - **Scheduled AI workflow loop** distills sessions into memory and generates
   daily/weekly digests.

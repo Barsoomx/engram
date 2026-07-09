@@ -1,7 +1,7 @@
 # MCP Guide
 
-Engram provides an MCP (Model Context Protocol) bridge so Claude Code, Claude
-Desktop, and other MCP-aware clients can call memory operations as tools. The
+Engram provides an MCP (Model Context Protocol) bridge so Claude Code, Codex,
+Claude Desktop, and other MCP-aware clients can call memory operations as tools. The
 bridge is a thin authenticated client of the server, not a local memory store:
 every tool call goes to the server and is authorized by the same RBAC checks as
 the HTTP API.
@@ -23,7 +23,7 @@ The MCP server:
 |------------------------|-----------------------------------------------------------|
 | Claude Code            | Automatic, via the Claude Code plugin                    |
 | Claude Desktop         | `engram mcp install --agent claude_desktop`               |
-| Codex                  | Manual `config.toml` snippet (below); native support is deferred |
+| Codex                  | Automatic, via the Codex plugin                         |
 | Any other MCP client   | Point it at `engram mcp serve`                            |
 
 ### Claude Code
@@ -34,6 +34,15 @@ installs the plugin and writes `~/.engram` credentials in one command, so
 running it is the only step needed - there is no separate `mcp install` call
 for Claude Code. See
 [../../packages/claude-plugin/README.md](../../packages/claude-plugin/README.md).
+
+### Codex
+
+The native Codex plugin declares `./.mcp.json` in its plugin manifest. Codex
+starts the bundled `hooks/mcp.py` bridge from the plugin root, so
+`engram install --agent codex` is the only registration step. The MCP manifest
+contains no API key or provider secret; the bridge resolves the existing
+`~/.engram` connection at call time. See
+[../../packages/codex-plugin/README.md](../../packages/codex-plugin/README.md).
 
 ### Claude Desktop and other manual setups
 
@@ -72,17 +81,6 @@ engram mcp serve
 ```
 
 It speaks MCP over stdio and exits cleanly on stdin close.
-
-### Codex
-
-Codex does not support installer-driven MCP registration yet. Add this to
-`~/.codex/config.toml` by hand:
-
-```toml
-[mcp_servers.engram]
-command = "engram"
-args = ["mcp", "serve"]
-```
 
 ## Configuration
 
@@ -131,15 +129,21 @@ restating it.
 
 When no project id resolves, the bridge derives `repository_url` from:
 
-1. `CLAUDE_PROJECT_DIR`, if set - the workspace directory Claude Code passes
-   to spawned stdio MCP servers (v2.1.139+). This is checked first because the
-   MCP server process's own working directory is not guaranteed to be the
-   workspace: for a user-scope plugin install it can be the plugin cache - a
-   different git checkout whose `origin` would otherwise silently mis-route
-   memory to the marketplace repository's project;
-2. otherwise the server process's current working directory (correct for
-   `engram mcp serve` launched manually, and for any other MCP runtime with no
-   `CLAUDE_PROJECT_DIR` equivalent).
+1. for a Codex plugin tool call, the single workspace in Codex's per-call
+   `x-codex-turn-metadata`, after its session/thread identifiers match the
+   outer request metadata; Engram resolves that local workspace's sanitized
+   `origin` URL for this call only;
+2. `CLAUDE_PROJECT_DIR`, if set - the workspace directory Claude Code passes
+   to spawned stdio MCP servers (v2.1.139+);
+3. otherwise the server process's current working directory, which is correct
+   for `engram mcp serve` launched manually and other MCP runtimes with no
+   agent-specific workspace signal.
+
+Codex starts a bundled MCP process from the plugin cache, not the user's
+repository. Engram therefore never uses that process cwd when valid per-call
+Codex metadata is present. Missing, mismatched, or multi-workspace metadata
+fails closed unless the tool call or local connection supplies an explicit
+`project_id`; it is not cached globally across concurrent Codex threads.
 
 ### Errors from repository-URL resolution
 

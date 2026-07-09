@@ -96,6 +96,40 @@ capabilities: memories:read, observations:write
 The dry-run must return `status: ok` or connect fails with a remediation hint.
 Capabilities and organization are echoed from the server's resolved scope.
 
+## `engram install`
+
+Runs `connect`, installs the selected native plugin, then runs `doctor`. With
+`uvx`, no persistent CLI installation is required:
+
+```bash
+uvx engram-connect install --agent both \
+  --server http://localhost:8000 \
+  --api-key egk_... \
+  --project <project_id>
+```
+
+`--agent` accepts `claude-code`, `codex`, or `both` and defaults to
+`claude-code`. Claude Code uses `claude plugin marketplace add` followed by
+`claude plugin install`. Codex uses:
+
+```bash
+codex plugin marketplace add Barsoomx/engram --json
+codex plugin add engram@engram-marketplace --json
+```
+
+For `both`, the command resolves both native binaries before changing either
+plugin installation. Plugin failures redact the API key. After a Codex install,
+review the installed commands with `/hooks` and start a new thread; Engram does
+not auto-approve hook trust.
+
+Useful installer-only flags are `--marketplace-source`, `--marketplace-name`,
+`--plugin-name`, `--claude-bin`, `--codex-bin`, and
+`--skip-plugin-install`. Codex owns plugin removal:
+
+```bash
+codex plugin remove engram@engram-marketplace --json
+```
+
 ## `engram doctor`
 
 Verifies that local state is consistent and the server is reachable, then
