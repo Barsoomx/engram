@@ -1007,6 +1007,8 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(
                 ["apps/backend/engram/hooks/services.py"], context_payload["file_paths"]
             )
+            self.assertEqual(10.0, hook_call["timeout"])
+            self.assertEqual(10.0, context_call["timeout"])
             body = json.loads(stdout)
             self.assertEqual("created", body["status"])
             self.assertNotIn(RAW_KEY, stdout)

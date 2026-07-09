@@ -39,6 +39,7 @@ from engram.core.models import (
     Team,
     VectorField,
     VisibilityScope,
+    retrieval_embedding_deferred_fields,
 )
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
@@ -332,10 +333,7 @@ def authorized_retrieval_documents(
     if kinds:
         documents = documents.filter(memory__kind__in=kinds)
     if not include_embeddings:
-        deferred_fields = ['embedding_vector']
-        if VectorField is not None:
-            deferred_fields.append('embedding_pgvector')
-        documents = documents.defer(*deferred_fields)
+        documents = documents.defer(*retrieval_embedding_deferred_fields())
 
     return filter_documents_by_team_visibility(documents, scope)
 
@@ -410,7 +408,7 @@ PGVECTOR_FLOOR_DISTANCE_EPSILON = 1e-6
 def _document_embedding_vectors(
     documents: tuple[RetrievalDocument, ...],
 ) -> dict[uuid.UUID, list[float]]:
-    deferred_ids = [document.id for document in documents if 'embedding_vector' in document.get_deferred_fields()]
+    deferred_ids = {document.id for document in documents if 'embedding_vector' in document.get_deferred_fields()}
     loaded: dict[uuid.UUID, list[float]] = {}
     if deferred_ids:
         loaded = dict(
@@ -418,8 +416,8 @@ def _document_embedding_vectors(
         )
     vectors: dict[uuid.UUID, list[float]] = {}
     for document in documents:
-        if document.id in loaded:
-            vectors[document.id] = loaded[document.id]
+        if document.id in deferred_ids:
+            vectors[document.id] = loaded.get(document.id) or []
         else:
             vectors[document.id] = document.embedding_vector
 
@@ -469,20 +467,19 @@ def semantic_retrieval_matches_pgvector(
         return []
 
     remaining_ids = [document.id for document in remaining]
-    pgvector_ids = set(
-        RetrievalDocument.objects.filter(id__in=remaining_ids)
-        .exclude(embedding_pgvector__isnull=True)
-        .values_list('id', flat=True),
-    )
+    pgvector_ids: set[uuid.UUID] = set()
     passing_ids: set[uuid.UUID] = set()
-    if pgvector_ids and CosineDistance is not None and any(query_vector):
+    pgvector_rows = RetrievalDocument.objects.filter(id__in=remaining_ids).exclude(embedding_pgvector__isnull=True)
+    if CosineDistance is not None and any(query_vector):
         max_distance = (1 - SEMANTIC_MIN_SIMILARITY) + PGVECTOR_FLOOR_DISTANCE_EPSILON
-        passing_ids = set(
-            RetrievalDocument.objects.filter(id__in=list(pgvector_ids))
-            .annotate(distance=CosineDistance('embedding_pgvector', query_vector))
-            .filter(distance__lte=max_distance)
-            .values_list('id', flat=True),
-        )
+        for document_id, distance in pgvector_rows.annotate(
+            distance=CosineDistance('embedding_pgvector', query_vector),
+        ).values_list('id', 'distance'):
+            pgvector_ids.add(document_id)
+            if distance is not None and distance <= max_distance:
+                passing_ids.add(document_id)
+    else:
+        pgvector_ids = set(pgvector_rows.values_list('id', flat=True))
 
     candidates = tuple(
         document for document in remaining if document.id not in pgvector_ids or document.id in passing_ids

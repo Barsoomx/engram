@@ -16,7 +16,7 @@ from engram.core.models import (
     Organization,
     Project,
     RetrievalDocument,
-    VectorField,
+    retrieval_embedding_deferred_fields,
 )
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
 
@@ -83,10 +83,7 @@ def stale_and_refuted_warnings(
     )
     if kinds:
         documents = documents.filter(memory__kind__in=kinds)
-    deferred_fields = ['embedding_vector']
-    if VectorField is not None:
-        deferred_fields.append('embedding_pgvector')
-    documents = documents.select_related('memory').defer(*deferred_fields)[:200]
+    documents = documents.select_related('memory').defer(*retrieval_embedding_deferred_fields())[:200]
     authorized_documents = filter_documents_by_team_visibility(documents, scope)
 
     warnings: list[RetrievalWarning] = []

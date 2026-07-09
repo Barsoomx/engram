@@ -62,6 +62,7 @@ WIZARD_API_KEY_CAPABILITIES = (
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
 PLUGIN_COMMAND_TIMEOUT_SECONDS = 120
+HOOK_HTTP_TIMEOUT_SECONDS = 10.0
 USER_PROMPT_SUBMIT_TOKEN_BUDGET = 1200
 SESSION_START_TOKEN_BUDGET = 2000
 CONTEXT_QUERY_MIN_PROMPT_LENGTH = 20
@@ -810,6 +811,7 @@ def run_hook(
                 path="/v1/context/session-start",
                 api_key=api_key,
                 payload=build_session_start_payload(config, runtime, input_payload),
+                timeout=HOOK_HTTP_TIMEOUT_SECONDS,
             )
         elif args.hook_command == "error":
             status, body = send_hook_event(
@@ -870,6 +872,7 @@ def run_hook(
                 path="/v1/context/user-prompt-submit",
                 api_key=api_key,
                 payload=build_user_prompt_submit_payload(config, runtime, input_payload),
+                timeout=HOOK_HTTP_TIMEOUT_SECONDS,
             )
         else:
             raise CliError(
@@ -1214,6 +1217,7 @@ def send_hook_event(
         path=path,
         api_key=api_key,
         payload=payload,
+        timeout=HOOK_HTTP_TIMEOUT_SECONDS,
     )
 
 
