@@ -641,6 +641,13 @@ class MemoryVersion(TimestampedModel):
         return f'{self.memory_id}:v{self.version}'
 
 
+def retrieval_embedding_deferred_fields() -> tuple[str, ...]:
+    if VectorField is None:
+        return ('embedding_vector',)
+
+    return ('embedding_vector', 'embedding_pgvector')
+
+
 class RetrievalDocument(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='retrieval_documents')
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='retrieval_documents')

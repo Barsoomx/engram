@@ -3,6 +3,8 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APIClient
 
 from engram.access.models import ApiKeyCapability, Capability
@@ -55,6 +57,31 @@ def grant_search_capability(raw_key: str) -> None:
         api_key=api_key,
         capability=Capability.objects.get(code='search:query'),
     )
+
+
+@pytest.mark.django_db
+def test_search_does_not_bulk_load_embedding_columns() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    with CaptureQueriesContext(connection) as captured:
+        response = client.post(
+            '/v1/search/',
+            search_payload(project),
+            format='json',
+            **auth_headers(),
+        )
+
+    assert response.status_code == 200
+    document_load_queries = [
+        query['sql']
+        for query in captured.captured_queries
+        if 'core_retrievaldocument' in query['sql'] and 'JOIN "core_memory"' in query['sql']
+    ]
+    assert document_load_queries
+    assert all('embedding_vector' not in sql for sql in document_load_queries)
 
 
 @pytest.mark.django_db

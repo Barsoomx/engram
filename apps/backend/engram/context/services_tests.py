@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 
 from engram.access.models import (
     ApiKey,
@@ -17,7 +19,7 @@ from engram.access.models import (
     ProjectGrant,
     Role,
 )
-from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import EffectiveScope, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.services import (
     BuildContextBundle,
     ContextBundleInput,
@@ -27,6 +29,7 @@ from engram.context.services import (
     _pack_to_budget,
     _render_annotation,
     _semantic_retrieval_matches_python,
+    authorized_retrieval_documents,
     contains_match_query_terms,
     derive_retrieval_terms,
     estimate_tokens,
@@ -523,6 +526,87 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
     matches = semantic_retrieval_matches((document,), [], query_vector)
 
     assert [match.document.id for match in matches] == [document.id]
+    assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
+
+
+# authorized_retrieval_documents — deferred embedding columns
+
+
+def _effective_scope(organization: Organization) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=(),
+        capabilities=('search:query',),
+        actor_type='api_key',
+        actor_id='key',
+        project_bound=False,
+    )
+
+
+@pytest.mark.django_db
+def test_authorized_documents_defer_embedding_columns(f_scope: tuple[Organization, Project]) -> None:
+    organization, project = f_scope
+    _seed_document(organization, project, title='doc', body='doc', embedding=_basis_vector(0), sequence=1)
+
+    documents = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+
+    deferred = documents[0].get_deferred_fields()
+    assert 'embedding_vector' in deferred
+    if VectorField is not None:
+        assert 'embedding_pgvector' in deferred
+
+
+@pytest.mark.django_db
+def test_authorized_documents_include_embeddings_loads_columns(f_scope: tuple[Organization, Project]) -> None:
+    organization, project = f_scope
+    _seed_document(organization, project, title='doc', body='doc', embedding=_basis_vector(0), sequence=1)
+
+    documents = authorized_retrieval_documents(
+        organization,
+        project,
+        _effective_scope(organization),
+        include_embeddings=True,
+    )
+
+    assert documents[0].get_deferred_fields() == set()
+
+
+@pytest.mark.django_db
+def test_python_semantic_bulk_loads_deferred_vectors(f_scope: tuple[Organization, Project]) -> None:
+    organization, project = f_scope
+    for index in range(3):
+        _seed_document(
+            organization,
+            project,
+            title=f'doc-{index}',
+            body='doc',
+            embedding=_basis_vector(0),
+            sequence=index,
+            with_pgvector=False,
+        )
+    documents = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+
+    with CaptureQueriesContext(connection) as captured:
+        matches = _semantic_retrieval_matches_python(documents, [], _basis_vector(0))
+
+    assert len(matches) == 3
+    assert len(captured.captured_queries) == 1
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_semantic_matches_work_on_deferred_documents(f_scope: tuple[Organization, Project]) -> None:
+    organization, project = f_scope
+    near = _seed_document(organization, project, title='near', body='near', embedding=_basis_vector(0), sequence=1)
+    _seed_document(organization, project, title='far', body='far', embedding=_basis_vector(1), sequence=2)
+    documents = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+
+    matches = semantic_retrieval_matches(documents, [], _basis_vector(0))
+
+    assert [match.document.id for match in matches] == [near.id]
     assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
 
 

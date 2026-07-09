@@ -5,7 +5,7 @@ import unittest
 import urllib.error
 from unittest.mock import patch
 
-from engram_cli.http import admin_post, post_json, urllib_transport
+from engram_cli.http import admin_post, get_json, post_json, urllib_transport
 
 
 class FakeResponse(io.BytesIO):
@@ -98,6 +98,43 @@ class UrllibTransportRetryTests(unittest.TestCase):
         self.assertEqual(
             {'code': 'server_unavailable', 'detail': 'Server is unavailable'}, body
         )
+
+    def test_post_json_default_timeout_is_thirty_seconds(self) -> None:
+        captured: list[float] = []
+
+        def m_urlopen(request: object, timeout: float) -> object:
+            captured.append(timeout)
+
+            return FakeResponse(200, b'{}')
+
+        with patch('engram_cli.http.urllib.request.urlopen', side_effect=m_urlopen):
+            post_json(
+                transport=urllib_transport,
+                server_url='https://example.test',
+                path='/v1/search/',
+                api_key='key',
+                payload={},
+            )
+
+        self.assertEqual([30.0], captured)
+
+    def test_get_json_default_timeout_is_thirty_seconds(self) -> None:
+        captured: list[float] = []
+
+        def m_urlopen(request: object, timeout: float) -> object:
+            captured.append(timeout)
+
+            return FakeResponse(200, b'{}')
+
+        with patch('engram_cli.http.urllib.request.urlopen', side_effect=m_urlopen):
+            get_json(
+                transport=urllib_transport,
+                server_url='https://example.test',
+                path='/v1/observations/',
+                api_key='key',
+            )
+
+        self.assertEqual([30.0], captured)
 
     def test_admin_post_persistent_503_makes_exactly_one_attempt(self) -> None:
         def m_urlopen(request: object, timeout: float) -> object:
