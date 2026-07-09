@@ -8,6 +8,8 @@ import {
   ModalContent,
   ModalFooter,
   ModalHeader,
+  Select,
+  SelectItem,
 } from '@heroui/react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
@@ -25,9 +27,12 @@ import * as React from 'react';
 import { useIssueApiKey } from '@/hooks/use-api-keys';
 import { fetchMe, hasCapability, type MeResponse } from '@/lib/auth';
 import {
+  AGENT_TARGET_OPTIONS,
+  type AgentTarget,
   buildConnectCommand,
   buildConnectFallbackCommand,
-  PLUGIN_INSTALL_COMMAND,
+  buildManualInstallCommands,
+  validateConnectServerUrl,
 } from '@/lib/build-connect-command';
 import { useOrgStore } from '@/lib/org-store';
 
@@ -40,6 +45,8 @@ const CONNECT_CAPABILITIES = [
   'projects:agent',
 ];
 
+const DEFAULT_AGENT_TARGET: AgentTarget = 'claude-code';
+
 function defaultServerUrl(): string {
   return (
     process.env.NEXT_PUBLIC_ENGRAM_API_URL ||
@@ -48,6 +55,7 @@ function defaultServerUrl(): string {
 }
 
 interface IssuedCommand {
+  agent: AgentTarget;
   command: string;
   fallbackCommand: string;
   keyPrefix: string;
@@ -68,7 +76,9 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   });
 
   const issueMutation = useIssueApiKey(activeOrgId);
+  const resetIssueMutation = issueMutation.reset;
 
+  const [agent, setAgent] = React.useState<AgentTarget>(DEFAULT_AGENT_TARGET);
   const [serverUrl, setServerUrl] = React.useState<string>(defaultServerUrl);
   const [issued, setIssued] = React.useState<IssuedCommand | null>(null);
   const [issueError, setIssueError] = React.useState<string | null>(null);
@@ -77,13 +87,15 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
 
   React.useEffect(() => {
     if (!isOpen) {
+      resetIssueMutation();
+      setAgent(DEFAULT_AGENT_TARGET);
       setServerUrl(defaultServerUrl());
       setIssued(null);
       setIssueError(null);
       setFallbackOpen(false);
       setCopied(null);
     }
-  }, [isOpen]);
+  }, [isOpen, resetIssueMutation]);
 
   const capabilities = React.useMemo(
     () => meQuery.data?.capabilities ?? [],
@@ -91,6 +103,12 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   );
   const canIssue = hasCapability(capabilities, 'api_keys:issue');
   const meLoaded = meQuery.data !== undefined;
+  const agentOption = AGENT_TARGET_OPTIONS.find(
+    (option) => option.value === agent,
+  );
+  const serverUrlError = serverUrl.trim()
+    ? validateConnectServerUrl(serverUrl)
+    : null;
 
   async function copyText(id: string, text: string) {
     try {
@@ -106,13 +124,22 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
 
     try {
       const result = await issueMutation.mutateAsync({
-        name: 'claude-code agent',
+        name:
+          agent === 'both'
+            ? 'Claude Code + Codex agent'
+            : `${agentOption?.label ?? agent} agent`,
         capabilities: CONNECT_CAPABILITIES,
       });
 
       setIssued({
-        command: buildConnectCommand({ serverUrl, apiKey: result.plaintext }),
+        agent,
+        command: buildConnectCommand({
+          agent,
+          serverUrl,
+          apiKey: result.plaintext,
+        }),
         fallbackCommand: buildConnectFallbackCommand({
+          agent,
           serverUrl,
           apiKey: result.plaintext,
         }),
@@ -133,7 +160,11 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
   }
 
   const isIssuing = issueMutation.isPending;
-  const canGenerate = canIssue && serverUrl.trim().length > 0 && !isIssuing;
+  const canGenerate =
+    canIssue &&
+    serverUrl.trim().length > 0 &&
+    serverUrlError === null &&
+    !isIssuing;
 
   return (
     <Modal
@@ -150,7 +181,7 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
         {() => (
           <>
             <ModalHeader className='flex flex-col gap-1 text-foreground'>
-              {issued ? 'Connect agent' : 'Connect a Claude Code agent'}
+              Connect an agent
             </ModalHeader>
             <ModalBody>
               {meQuery.isError ? (
@@ -215,6 +246,26 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
                   >
                     {copied === 'command' ? 'Copied' : 'Copy command'}
                   </Button>
+                  <div className='rounded-medium border border-divider bg-content2 px-3 py-2.5 text-xs text-default-500'>
+                    {issued.agent === 'claude-code' ? (
+                      <p>
+                        Start a new Claude Code session after the command
+                        completes.
+                      </p>
+                    ) : issued.agent === 'codex' ? (
+                      <p>
+                        In Codex, open <code className='font-mono'>/hooks</code>,
+                        review and approve the Engram commands, then start a new
+                        thread.
+                      </p>
+                    ) : (
+                      <p>
+                        Start a new Claude Code session. In Codex, open{' '}
+                        <code className='font-mono'>/hooks</code>, review and
+                        approve the Engram commands, then start a new thread.
+                      </p>
+                    )}
+                  </div>
                   <div>
                     <button
                       type='button'
@@ -231,22 +282,33 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
                     {fallbackOpen && (
                       <div className='mt-2 space-y-2'>
                         {[
-                          { id: 'plugin', text: PLUGIN_INSTALL_COMMAND },
-                          { id: 'connect', text: issued.fallbackCommand },
+                          ...buildManualInstallCommands(issued.agent),
+                          {
+                            id: 'connect',
+                            label: 'Configure Engram credentials only',
+                            command: issued.fallbackCommand,
+                          },
                         ].map((entry) => (
                           <div
                             key={entry.id}
                             className='flex items-center gap-2 rounded-medium border border-divider bg-content2 px-3 py-2'
                           >
-                            <code className='min-w-0 flex-1 truncate font-mono text-[11.5px] text-default-500'>
-                              {entry.text}
-                            </code>
+                            <div className='min-w-0 flex-1'>
+                              <p className='text-[11px] font-medium text-default-600'>
+                                {entry.label}
+                              </p>
+                              <code className='block truncate font-mono text-[11.5px] text-default-500'>
+                                {entry.command}
+                              </code>
+                            </div>
                             <Button
                               isIconOnly
                               size='sm'
                               variant='light'
-                              aria-label='Copy command'
-                              onPress={() => copyText(entry.id, entry.text)}
+                              aria-label={`Copy ${entry.label}`}
+                              onPress={() =>
+                                copyText(entry.id, entry.command)
+                              }
                             >
                               {copied === entry.id ? (
                                 <Check className='w-3.5 h-3.5' />
@@ -264,10 +326,35 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
                 <div className='space-y-4'>
                   <p className='text-sm text-default-500'>
                     Issue an org-wide agent key and get a one-line command to
-                    install the Engram plugin into a Claude Code harness. One key
-                    covers every repository; memory is routed per project by git
-                    remote.
+                    install the Engram plugin into Claude Code, Codex, or both.
+                    One key covers every repository; memory is routed per
+                    project by git remote.
                   </p>
+                  <div className='space-y-1.5'>
+                    <Select
+                      label='Agent runtime'
+                      labelPlacement='outside'
+                      selectedKeys={new Set([agent])}
+                      disallowEmptySelection
+                      isDisabled={isIssuing}
+                      onSelectionChange={(selection) => {
+                        const next = Array.from(selection)[0];
+
+                        if (typeof next === 'string') {
+                          setAgent(next as AgentTarget);
+                        }
+                      }}
+                    >
+                      {AGENT_TARGET_OPTIONS.map((option) => (
+                        <SelectItem key={option.value}>
+                          {option.label}
+                        </SelectItem>
+                      ))}
+                    </Select>
+                    <p className='text-xs text-default-500'>
+                      {agentOption?.description}
+                    </p>
+                  </div>
                   <Input
                     label='Server URL'
                     labelPlacement='outside'
@@ -275,6 +362,8 @@ export function ConnectAgentModal({ isOpen, onClose }: ConnectAgentModalProps) {
                     value={serverUrl}
                     onValueChange={setServerUrl}
                     description='Where the agent should reach this Engram backend.'
+                    isInvalid={serverUrlError !== null}
+                    errorMessage={serverUrlError ?? undefined}
                     isDisabled={isIssuing}
                     classNames={{
                       input: 'font-mono text-xs',
