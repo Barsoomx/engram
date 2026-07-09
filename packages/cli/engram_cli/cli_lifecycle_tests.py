@@ -222,52 +222,46 @@ class CliLifecycleTests(unittest.TestCase):
             claude_hook = read_json(config_dir / "hooks" / "claude_code.json")
 
             self.assertEqual(
-                "engram hook session-start --agent codex --response-format codex",
-                codex_hook["commands"]["SessionStart"],
+                {
+                    "SessionStart": (
+                        "engram hook session-start --agent codex "
+                        "--response-format codex"
+                    ),
+                    "PostToolUse": (
+                        "engram hook post-tool-use --agent codex "
+                        "--response-format codex"
+                    ),
+                    "Stop": (
+                        "engram hook session-end --agent codex "
+                        "--response-format codex"
+                    ),
+                    "UserPromptSubmit": (
+                        "engram hook user-prompt-submit --agent codex "
+                        "--response-format codex"
+                    ),
+                },
+                codex_hook["commands"],
             )
             self.assertEqual(
-                "engram hook post-tool-use --agent codex --response-format codex",
-                codex_hook["commands"]["PostToolUse"],
-            )
-            self.assertEqual(
-                "engram hook error --agent codex --response-format codex",
-                codex_hook["commands"]["Error"],
-            )
-            self.assertEqual(
-                "engram hook decision --agent codex --response-format codex",
-                codex_hook["commands"]["Decision"],
-            )
-            self.assertEqual(
-                "engram hook session-end --agent codex --response-format codex",
-                codex_hook["commands"]["SessionEnd"],
-            )
-            self.assertEqual(
-                "engram hook user-prompt-submit --agent codex --response-format codex",
-                codex_hook["commands"]["UserPromptSubmit"],
-            )
-            self.assertEqual(
-                "engram hook session-start --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["SessionStart"],
-            )
-            self.assertEqual(
-                "engram hook post-tool-use --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["PostToolUse"],
-            )
-            self.assertEqual(
-                "engram hook error --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["Error"],
-            )
-            self.assertEqual(
-                "engram hook decision --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["Decision"],
-            )
-            self.assertEqual(
-                "engram hook session-end --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["SessionEnd"],
-            )
-            self.assertEqual(
-                "engram hook user-prompt-submit --agent claude_code --response-format claude-code",
-                claude_hook["commands"]["UserPromptSubmit"],
+                {
+                    "SessionStart": (
+                        "engram hook session-start --agent claude_code "
+                        "--response-format claude-code"
+                    ),
+                    "PostToolUse": (
+                        "engram hook post-tool-use --agent claude_code "
+                        "--response-format claude-code"
+                    ),
+                    "SessionEnd": (
+                        "engram hook session-end --agent claude_code "
+                        "--response-format claude-code"
+                    ),
+                    "UserPromptSubmit": (
+                        "engram hook user-prompt-submit --agent claude_code "
+                        "--response-format claude-code"
+                    ),
+                },
+                claude_hook["commands"],
             )
 
     def test_connect_fingerprint_uses_only_derived_material_for_short_keys(
