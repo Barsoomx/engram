@@ -1,0 +1,29 @@
+name: Codex plugin E2E
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+env:
+  CODEX_VERSION: 0.142.5
+  PNPM_VERSION: 11.9.0
+
+jobs:
+  codex-plugin-e2e:
+    name: Codex plugin E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Show Docker version
+        run: docker version
+
+      - name: Run isolated real-Codex E2E
+        run: python3 scripts/e2e_codex_plugin.py
