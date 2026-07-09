@@ -120,7 +120,7 @@ def post_json(
     path: str,
     api_key: str,
     payload: dict[str, object],
-    timeout: float = 8.0,
+    timeout: float = 30.0,
     max_attempts: int = 2,
 ) -> tuple[int, dict[str, object]]:
     return _with_max_attempts(transport, max_attempts)(
@@ -217,7 +217,7 @@ def get_json(
     path: str,
     api_key: str,
     params: dict[str, str] | None = None,
-    timeout: float = 8.0,
+    timeout: float = 30.0,
     max_attempts: int = 2,
 ) -> tuple[int, dict[str, object]]:
     query = ""
