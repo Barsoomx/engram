@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from argparse import Namespace
+from importlib import metadata
 from typing import Any, TextIO
 
 from engram_cli.http import Transport
@@ -10,7 +11,16 @@ from engram_cli.mcp_tools import ToolFn, build_tools
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "engram"
-SERVER_VERSION = "0.4.3"
+
+
+def _server_version() -> str:
+    try:
+        return metadata.version("engram-connect")
+    except metadata.PackageNotFoundError:
+        return "bundled"
+
+
+SERVER_VERSION = _server_version()
 
 ToolMap = dict[str, ToolFn]
 
