@@ -39,6 +39,15 @@ class SessionStatus(models.TextChoices):
     ERRORED = 'errored', 'Errored'
 
 
+class RawEventNormalizationDisposition(models.TextChoices):
+    OBSERVATION = 'observation', 'Observation'
+    NO_OP = 'no_op', 'No-op'
+
+
+class RawEventNormalizationReason(models.TextChoices):
+    EVIDENCE_ONLY = 'evidence_only', 'Evidence only'
+
+
 class VisibilityScope(models.TextChoices):
     SESSION = 'session', 'Session'
     PROJECT = 'project', 'Project'
@@ -268,6 +277,8 @@ class AgentSession(TimestampedModel):
     cwd = models.TextField(blank=True)
     status = models.CharField(max_length=40, choices=SessionStatus.choices, default=SessionStatus.ACTIVE)
     prompt_counter = models.PositiveIntegerField(default=0)
+    observation_sequence_cursor = models.PositiveBigIntegerField(null=True, blank=True)
+    end_work_contract_version = models.PositiveSmallIntegerField(default=0)
     metadata = models.JSONField(default=dict, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
@@ -283,12 +294,20 @@ class AgentSession(TimestampedModel):
                 condition=~models.Q(content_session_id=''),
                 name='core_session_unique_content_id_per_project',
             ),
+            models.CheckConstraint(
+                condition=models.Q(end_work_contract_version__in=(0, 1)),
+                name='core_session_end_contract_ck',
+            ),
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'status']),
             models.Index(
                 fields=['organization', 'project', 'updated_at'],
                 name='core_session_updated_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'status', 'end_work_contract_version'],
+                name='core_session_end_work_idx',
             ),
         ]
         ordering = ['organization_id', 'project_id', 'external_session_id']
@@ -320,6 +339,19 @@ class RawEventEnvelope(TimestampedModel):
     content_hash = models.CharField(max_length=128)
     runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
     payload_schema_version = models.CharField(max_length=40, default='v1')
+    normalization_contract_version = models.PositiveSmallIntegerField(null=True, blank=True)
+    normalization_disposition = models.CharField(
+        max_length=20,
+        choices=RawEventNormalizationDisposition.choices,
+        null=True,
+        blank=True,
+    )
+    normalization_reason = models.CharField(
+        max_length=40,
+        choices=RawEventNormalizationReason.choices,
+        null=True,
+        blank=True,
+    )
     sequence_number = models.BigIntegerField(null=True, blank=True)
     occurred_at = models.DateTimeField(null=True, blank=True)
     received_at = models.DateTimeField(auto_now_add=True)
@@ -342,10 +374,44 @@ class RawEventEnvelope(TimestampedModel):
                 fields=['organization', 'project', 'idempotency_key'],
                 name='core_raw_event_unique_idempotency_key_per_project',
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        normalization_contract_version__isnull=True,
+                        normalization_disposition__isnull=True,
+                        normalization_reason__isnull=True,
+                    )
+                    | models.Q(
+                        normalization_contract_version__isnull=False,
+                        normalization_contract_version=1,
+                        normalization_disposition__isnull=False,
+                        normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+                        normalization_reason__isnull=True,
+                    )
+                    | models.Q(
+                        normalization_contract_version__isnull=False,
+                        normalization_contract_version=1,
+                        normalization_disposition__isnull=False,
+                        normalization_disposition=RawEventNormalizationDisposition.NO_OP,
+                        normalization_reason__isnull=False,
+                        normalization_reason=RawEventNormalizationReason.EVIDENCE_ONLY,
+                    )
+                ),
+                name='core_raw_norm_expand_valid',
+            ),
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'event_type']),
             models.Index(fields=['organization', 'project', 'content_hash']),
+            models.Index(
+                fields=[
+                    'organization',
+                    'project',
+                    'normalization_contract_version',
+                    'normalization_disposition',
+                ],
+                name='core_raw_norm_disposition_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'received_at']
 
@@ -388,6 +454,7 @@ class Observation(TimestampedModel):
     files_read = models.JSONField(default=list, blank=True)
     files_modified = models.JSONField(default=list, blank=True)
     prompt_number = models.PositiveIntegerField(null=True, blank=True)
+    session_sequence = models.PositiveBigIntegerField(null=True, blank=True)
     content_hash = models.CharField(max_length=128)
     generation_key = models.CharField(max_length=255, blank=True)
     generated_model = models.CharField(max_length=120, blank=True)
@@ -401,6 +468,15 @@ class Observation(TimestampedModel):
                 fields=['organization', 'project', 'session', 'content_hash'],
                 name='core_observation_unique_content_hash_per_session',
             ),
+            models.UniqueConstraint(
+                fields=['session', 'session_sequence'],
+                condition=models.Q(session_sequence__isnull=False),
+                name='core_obs_session_seq_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(session_sequence__isnull=True) | models.Q(session_sequence__gt=0),
+                name='core_obs_session_seq_pos',
+            ),
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'observation_type']),
@@ -408,6 +484,10 @@ class Observation(TimestampedModel):
             models.Index(
                 fields=['organization', 'project', 'observed_at', 'created_at'],
                 name='core_observation_created_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'session', 'session_sequence'],
+                name='core_obs_scope_session_seq_idx',
             ),
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
@@ -941,6 +1021,221 @@ class MemoryReviewExample(TimestampedModel):
         return f'{self.item_type}:{self.item_id}:{self.action}'
 
 
+class WorkflowWorkType(models.TextChoices):
+    OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
+    SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
+    DAILY_DIGEST = 'daily_digest', 'Daily Digest'
+    WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
+
+
+class WorkflowSubjectType(models.TextChoices):
+    OBSERVATION = 'observation', 'Observation'
+    AGENT_SESSION = 'agent_session', 'Agent Session'
+    PROJECT = 'project', 'Project'
+    TEAM = 'team', 'Team'
+
+
+class WorkflowWorkDisposition(models.TextChoices):
+    REQUIRED = 'required', 'Required'
+    COMPLETE = 'complete', 'Complete'
+    NO_OP = 'no_op', 'No-op'
+
+
+class WorkflowWorkResolutionReason(models.TextChoices):
+    SUCCEEDED = 'succeeded', 'Succeeded'
+    NO_SIGNAL = 'no_signal', 'No signal'
+    NO_INPUT = 'no_input', 'No input'
+
+
+class WorkflowWork(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='workflow_works')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='workflow_works')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='workflow_works',
+        null=True,
+        blank=True,
+    )
+    work_type = models.CharField(max_length=40, choices=WorkflowWorkType.choices)
+    subject_type = models.CharField(max_length=40, choices=WorkflowSubjectType.choices)
+    subject_id = models.UUIDField()
+    contract_version = models.PositiveSmallIntegerField(default=1)
+    occurrence_key = models.CharField(max_length=255, blank=True)
+    input_fingerprint = models.CharField(max_length=64)
+    input_snapshot = models.JSONField()
+    disposition = models.CharField(
+        max_length=20,
+        choices=WorkflowWorkDisposition.choices,
+        default=WorkflowWorkDisposition.REQUIRED,
+    )
+    resolution_reason = models.CharField(
+        max_length=40,
+        choices=WorkflowWorkResolutionReason.choices,
+        blank=True,
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('work_type', 'work_type'),
+        ('subject_type', 'subject_type'),
+        ('subject_id', 'subject_id'),
+        ('contract_version', 'contract_version'),
+        ('occurrence_key', 'occurrence_key'),
+        ('input_fingerprint', 'input_fingerprint'),
+        ('input_snapshot', 'input_snapshot'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=[
+                    'organization',
+                    'project',
+                    'work_type',
+                    'subject_type',
+                    'subject_id',
+                    'contract_version',
+                    'input_fingerprint',
+                ],
+                name='core_work_identity_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=[
+                    'organization',
+                    'project',
+                    'work_type',
+                    'subject_type',
+                    'subject_id',
+                    'contract_version',
+                    'occurrence_key',
+                ],
+                condition=~models.Q(occurrence_key=''),
+                name='core_work_occurrence_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(contract_version__gt=0),
+                name='core_work_contract_ver_pos',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(input_fingerprint__regex=r'^[0-9a-f]{64}$'),
+                name='core_work_fingerprint_hex',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+                        subject_type=WorkflowSubjectType.OBSERVATION,
+                        occurrence_key='',
+                    )
+                    | models.Q(
+                        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                        subject_type=WorkflowSubjectType.AGENT_SESSION,
+                        occurrence_key='',
+                    )
+                    | (
+                        models.Q(
+                            work_type=WorkflowWorkType.DAILY_DIGEST,
+                            subject_type=WorkflowSubjectType.PROJECT,
+                            subject_id=models.F('project_id'),
+                            team__isnull=True,
+                        )
+                        & ~models.Q(occurrence_key='')
+                    )
+                    | (
+                        models.Q(
+                            work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                            subject_type=WorkflowSubjectType.PROJECT,
+                            subject_id=models.F('project_id'),
+                            team__isnull=True,
+                        )
+                        & ~models.Q(occurrence_key='')
+                    )
+                    | (
+                        models.Q(
+                            work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                            subject_type=WorkflowSubjectType.TEAM,
+                            subject_id=models.F('team_id'),
+                            team__isnull=False,
+                        )
+                        & ~models.Q(occurrence_key='')
+                    )
+                ),
+                name='core_work_subject_scope_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        disposition=WorkflowWorkDisposition.REQUIRED,
+                        resolution_reason='',
+                        resolved_at__isnull=True,
+                    )
+                    | models.Q(
+                        disposition=WorkflowWorkDisposition.COMPLETE,
+                        resolution_reason__in=(
+                            WorkflowWorkResolutionReason.SUCCEEDED,
+                            WorkflowWorkResolutionReason.NO_SIGNAL,
+                        ),
+                        resolved_at__isnull=False,
+                    )
+                    | models.Q(
+                        disposition=WorkflowWorkDisposition.NO_OP,
+                        resolution_reason=WorkflowWorkResolutionReason.NO_INPUT,
+                        resolved_at__isnull=False,
+                    )
+                ),
+                name='core_work_terminal_state_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'disposition'],
+                name='core_work_scope_disp_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'work_type', 'disposition'],
+                name='core_work_type_disp_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'subject_type', 'subject_id'],
+                name='core_work_subject_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'work_type', 'occurrence_key'],
+                name='core_work_occurrence_idx',
+            ),
+        ]
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+
+        if not self._state.adding:
+            value_fields = tuple(field for field, _error_field in self._IMMUTABLE_FIELDS)
+            persisted = type(self).objects.filter(pk=self.pk).values(*value_fields, 'disposition').first()
+            if persisted is not None:
+                for field, error_field in self._IMMUTABLE_FIELDS:
+                    if getattr(self, field) != persisted[field]:
+                        add_scope_error(errors, error_field, f'{error_field} is immutable')
+
+                if (
+                    persisted['disposition'] != WorkflowWorkDisposition.REQUIRED
+                    and self.disposition == WorkflowWorkDisposition.REQUIRED
+                ):
+                    add_scope_error(errors, 'disposition', 'terminal work cannot return to required')
+
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'{self.work_type}:{self.subject_type}:{self.subject_id}'
+
+
 class WorkflowRunType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
@@ -964,6 +1259,13 @@ class WorkflowRun(TimestampedModel):
         max_length=40,
         choices=WorkflowRunStatus.choices,
         default=WorkflowRunStatus.QUEUED,
+    )
+    work = models.ForeignKey(
+        WorkflowWork,
+        on_delete=models.PROTECT,
+        related_name='attempts',
+        null=True,
+        blank=True,
     )
     input_snapshot = models.JSONField(default=dict, blank=True)
     provider_call_ids = models.JSONField(default=list, blank=True)
@@ -1011,6 +1313,12 @@ class WorkflowRun(TimestampedModel):
             check_project_organization(errors, 'project', self.project, self.organization_id)
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.work_id:
+            check_project_scope(errors, 'work', self.work, self.organization_id, self.project_id)
+            if self.work.team_id != self.team_id:
+                add_scope_error(errors, 'work', 'work team must match workflow run team')
+            if self.work.work_type != self.run_type:
+                add_scope_error(errors, 'work', 'work type must match workflow run type')
         if self.result_memory_id:
             check_project_scope(
                 errors,

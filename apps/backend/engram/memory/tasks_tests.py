@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import timedelta
 from unittest import mock
 
 import pytest
+from django.db import transaction
 from django.utils import timezone
 
 from engram import celeryconfig
@@ -20,9 +22,14 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkType,
 )
+from engram.memory import tasks as tasks_module
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
+from engram.memory.services import MemoryWorkerError
 from engram.memory.tasks import (
     decay_memory_confidence,
     distill_session,
@@ -31,6 +38,59 @@ from engram.memory.tasks import (
     generate_weekly_digest,
     process_observation_recorded,
     retry_failed_distillations,
+)
+from engram.memory.workflow_work import (
+    CreateWorkflowWorkInput,
+    canonical_json_bytes,
+    create_work,
+    observation_content_digest,
+    resolve_work_succeeded,
+)
+
+_VERSIONED_WORK_TASKS = (
+    (
+        'process_observation_work_v1',
+        'engram.memory.process_observation_work_v1',
+        celeryconfig.QUEUE_NEAR_REALTIME,
+    ),
+    (
+        'distill_session_work_v1',
+        'engram.memory.distill_session_work_v1',
+        celeryconfig.QUEUE_BATCH,
+    ),
+    (
+        'generate_daily_digest_work_v1',
+        'engram.memory.generate_daily_digest_work_v1',
+        celeryconfig.QUEUE_BATCH,
+    ),
+    (
+        'generate_weekly_digest_work_v1',
+        'engram.memory.generate_weekly_digest_work_v1',
+        celeryconfig.QUEUE_BATCH,
+    ),
+)
+
+_VERSIONED_WORK_CASES = (
+    (
+        'process_observation_work_v1',
+        WorkflowWorkType.OBSERVATION_PROCESSING,
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+    ),
+    (
+        'distill_session_work_v1',
+        WorkflowWorkType.SESSION_DISTILLATION,
+        'engram.memory.tasks.run_session_distillation_with_tracking',
+    ),
+    (
+        'generate_daily_digest_work_v1',
+        WorkflowWorkType.DAILY_DIGEST,
+        'engram.memory.tasks.run_daily_digest_with_tracking',
+    ),
+    (
+        'generate_weekly_digest_work_v1',
+        WorkflowWorkType.WEEKLY_DIGEST,
+        'engram.memory.tasks.run_weekly_digest_with_tracking',
+    ),
 )
 
 
@@ -44,6 +104,17 @@ def test_task_routes_send_distill_and_digest_tasks_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.distill_session']['queue'] == celeryconfig.QUEUE_BATCH
     assert celeryconfig.task_routes['engram.memory.generate_daily_digest']['queue'] == celeryconfig.QUEUE_BATCH
     assert celeryconfig.task_routes['engram.memory.generate_weekly_digest']['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_versioned_work_tasks_are_registered_with_id_only_names_and_queues() -> None:
+    for attribute, task_name, queue in _VERSIONED_WORK_TASKS:
+        task = getattr(tasks_module, attribute)
+
+        assert task.name == task_name
+        assert task.max_retries == 3
+        assert task.acks_late is True
+        assert task.reject_on_worker_lost is True
+        assert celeryconfig.task_routes[task_name]['queue'] == queue
 
 
 def test_celeryconfig_sets_global_time_limits() -> None:
@@ -134,7 +205,12 @@ def create_session(
     )
 
 
-def create_observation(session: AgentSession, *, suffix: str = '1') -> Observation:
+def create_observation(
+    session: AgentSession,
+    *,
+    suffix: str = '1',
+    session_sequence: int | None = None,
+) -> Observation:
     return Observation.objects.create(
         organization=session.organization,
         project=session.project,
@@ -145,8 +221,145 @@ def create_observation(session: AgentSession, *, suffix: str = '1') -> Observati
         title=f'observation {suffix}',
         body=f'body {suffix}',
         content_hash=f'hash-obs-{session.external_session_id}-{suffix}',
+        source_metadata={'event_type': 'post_tool_use'},
+        session_sequence=session_sequence,
         observed_at=timezone.now(),
     )
+
+
+def frozen_input_digest(value: object) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def create_required_work(
+    session: AgentSession,
+    *,
+    work_type: str,
+) -> WorkflowWork:
+    if work_type == WorkflowWorkType.OBSERVATION_PROCESSING:
+        observation = create_observation(session, suffix=f'work-{uuid.uuid4()}')
+        data = CreateWorkflowWorkInput(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            work_type=work_type,
+            subject_type=WorkflowSubjectType.OBSERVATION,
+            subject_id=observation.id,
+            input_snapshot={
+                'schema': 'observation_processing_input/v1',
+                'observation_id': str(observation.id),
+                'observation_digest': observation_content_digest(observation),
+                'policy': {
+                    'schema': 'hook_work_policy/v1',
+                    'realtime_candidates_enabled': True,
+                    'legacy_policy_fallback': False,
+                },
+            },
+        )
+    elif work_type == WorkflowWorkType.SESSION_DISTILLATION:
+        create_observation(
+            session,
+            suffix=f'session-work-{uuid.uuid4()}',
+            session_sequence=1,
+        )
+        AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=1)
+        data = CreateWorkflowWorkInput(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            work_type=work_type,
+            subject_type=WorkflowSubjectType.AGENT_SESSION,
+            subject_id=session.id,
+            input_snapshot={
+                'schema': 'session_distillation_input/v1',
+                'session_id': str(session.id),
+                'lower_sequence_exclusive': 0,
+                'upper_sequence_inclusive': 1,
+            },
+        )
+    elif work_type == WorkflowWorkType.DAILY_DIGEST:
+        schedule_key = 'daily:2026-07-10'
+        memory_id = uuid.uuid4()
+        memory_version_id = uuid.uuid4()
+        source = {
+            'render_position': 0,
+            'memory_id': str(memory_id),
+            'memory_version_id': str(memory_version_id),
+            'version': 1,
+            'content_hash': 'legacy-source-hash',
+            'server_body_digest': frozen_input_digest([str(memory_version_id), 1, 'Frozen daily body']),
+            'visibility_scope': 'project',
+            'team_id': None,
+            'source_title': 'Frozen daily title',
+        }
+        data = CreateWorkflowWorkInput(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            work_type=work_type,
+            subject_type=WorkflowSubjectType.PROJECT,
+            subject_id=session.project_id,
+            occurrence_key=schedule_key,
+            input_snapshot={
+                'schema': 'daily_digest_input/v1',
+                'project_id': str(session.project_id),
+                'schedule_key': schedule_key,
+                'window_start': '2026-07-10T00:00:00Z',
+                'window_end': '2026-07-11T00:00:00Z',
+                'visibility_policy': 'digest_visibility/v1',
+                'allowed_team_ids': [],
+                'output_visibility_scope': 'project',
+                'output_team_id': None,
+                'eligible_source_count': 1,
+                'max_sources': 200,
+                'sources_truncated': False,
+                'sources': [source],
+                'input_digest': frozen_input_digest([source]),
+            },
+        )
+    else:
+        schedule_key = 'weekly:2026-W28'
+        memory_id = uuid.uuid4()
+        memory_version_id = uuid.uuid4()
+        change = {
+            'bucket': 'added',
+            'memory_id': str(memory_id),
+            'memory_version_id': str(memory_version_id),
+            'version': 1,
+            'content_hash': 'legacy-change-hash',
+            'server_body_digest': frozen_input_digest([str(memory_version_id), 1, 'Frozen weekly body']),
+            'visibility_scope': 'project',
+            'team_id': None,
+            'source_title': 'Frozen weekly title',
+            'transition_ref': f'transition:{memory_id}',
+            'occurred_at': '2026-07-09T12:00:00Z',
+        }
+        data = CreateWorkflowWorkInput(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            work_type=work_type,
+            subject_type=WorkflowSubjectType.PROJECT,
+            subject_id=session.project_id,
+            occurrence_key=schedule_key,
+            input_snapshot={
+                'schema': 'weekly_digest_input/v1',
+                'project_id': str(session.project_id),
+                'team_id': None,
+                'schedule_key': schedule_key,
+                'window_start': '2026-07-06T00:00:00Z',
+                'window_end': '2026-07-13T00:00:00Z',
+                'visibility_policy': 'digest_visibility/v1',
+                'allowed_team_ids': [],
+                'output_visibility_scope': 'project',
+                'output_team_id': None,
+                'changes': [change],
+                'input_digest': frozen_input_digest([change]),
+            },
+        )
+
+    with transaction.atomic():
+        work, created = create_work(data)
+
+    assert created is True
+
+    return work
 
 
 def create_failed_workflow_run(session: AgentSession) -> WorkflowRun:
@@ -312,3 +525,272 @@ def test_expire_stale_candidates_invokes_the_service() -> None:
 
     m_execute.assert_called_once_with()
     assert result == {'scanned': 7, 'rejected': 4}
+
+
+@pytest.mark.parametrize(
+    'workflow_run_id',
+    [None, uuid.UUID('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb')],
+)
+def test_dispatch_work_task_uses_deterministic_automatic_and_explicit_task_ids(
+    workflow_run_id: uuid.UUID | None,
+) -> None:
+    work_id = uuid.UUID('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+    task = mock.Mock()
+    expected_args = (str(work_id), str(workflow_run_id)) if workflow_run_id is not None else (str(work_id),)
+    expected_task_id = (
+        f'workflow-work:{work_id}:run:{workflow_run_id}' if workflow_run_id is not None else f'workflow-work:{work_id}'
+    )
+
+    tasks_module.dispatch_work_task(
+        task,
+        work_id,
+        workflow_run_id=workflow_run_id,
+    )
+
+    task.apply_async.assert_called_once_with(
+        args=expected_args,
+        task_id=expected_task_id,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('task_attribute', 'work_type', 'domain_target'),
+    _VERSIONED_WORK_CASES,
+)
+def test_versioned_work_tasks_reject_malformed_ids_before_domain_access(
+    task_attribute: str,
+    work_type: str,
+    domain_target: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch(domain_target) as m_execute:
+        with pytest.raises(MemoryWorkerError, match='malformed work id'):
+            task('not-a-uuid')
+        with pytest.raises(MemoryWorkerError, match='malformed workflow run id'):
+            task(str(work.id), workflow_run_id='not-a-uuid')
+
+    m_execute.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('task_attribute', 'wrong_work_type', 'domain_target'),
+    [
+        (
+            'process_observation_work_v1',
+            WorkflowWorkType.SESSION_DISTILLATION,
+            'engram.memory.tasks.ProcessObservationRecorded.execute',
+        ),
+        (
+            'distill_session_work_v1',
+            WorkflowWorkType.OBSERVATION_PROCESSING,
+            'engram.memory.tasks.run_session_distillation_with_tracking',
+        ),
+        (
+            'generate_daily_digest_work_v1',
+            WorkflowWorkType.WEEKLY_DIGEST,
+            'engram.memory.tasks.run_daily_digest_with_tracking',
+        ),
+        (
+            'generate_weekly_digest_work_v1',
+            WorkflowWorkType.DAILY_DIGEST,
+            'engram.memory.tasks.run_weekly_digest_with_tracking',
+        ),
+    ],
+)
+def test_versioned_work_tasks_reject_mismatched_work_type_before_domain_access(
+    task_attribute: str,
+    wrong_work_type: str,
+    domain_target: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=wrong_work_type)
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch(domain_target) as m_domain:
+        with pytest.raises(MemoryWorkerError, match='work type'):
+            task(str(work.id))
+
+    m_domain.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_observation_work_task_rejects_subject_outside_persisted_work_scope_before_domain_access(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.OBSERVATION_PROCESSING)
+    foreign_org = Organization.objects.create(name='Foreign Tasks Org', slug='foreign-tasks-org')
+    foreign_project = Project.objects.create(
+        organization=foreign_org,
+        name='Foreign Backend',
+        slug='foreign-backend',
+    )
+    WorkflowWork.objects.filter(id=work.id).update(project_id=foreign_project.id)
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        with pytest.raises(MemoryWorkerError, match='scope'):
+            task(str(work.id))
+
+    m_execute.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('task_attribute', 'work_type', 'domain_target'),
+    _VERSIONED_WORK_CASES,
+)
+def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_access(
+    task_attribute: str,
+    work_type: str,
+    domain_target: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    other_work = create_required_work(session, work_type=WorkflowWorkType.OBSERVATION_PROCESSING)
+    foreign_org = Organization.objects.create(name='Foreign Run Org', slug='foreign-run-org')
+    foreign_team = Team.objects.create(organization=foreign_org, name='Foreign Run Team', slug='foreign-run-team')
+    foreign_project = Project.objects.create(
+        organization=foreign_org,
+        name='Foreign Run Project',
+        slug='foreign-run-project',
+    )
+    wrong_run_type = (
+        WorkflowRunType.OBSERVATION_PROCESSING
+        if work_type != WorkflowWorkType.OBSERVATION_PROCESSING
+        else WorkflowRunType.SESSION_DISTILLATION
+    )
+    invalid_updates = (
+        {'work_id': other_work.id},
+        {'status': WorkflowRunStatus.SUCCEEDED},
+        {'run_type': wrong_run_type},
+        {
+            'organization_id': foreign_org.id,
+            'project_id': foreign_project.id,
+            'team_id': foreign_team.id,
+        },
+    )
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch(domain_target) as m_execute:
+        for invalid_update in invalid_updates:
+            invalid_run = WorkflowRun.objects.create(
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                work=work,
+                run_type=work_type,
+                status=WorkflowRunStatus.QUEUED,
+            )
+            WorkflowRun.objects.filter(id=invalid_run.id).update(**invalid_update)
+            with pytest.raises(MemoryWorkerError, match='workflow run'):
+                task(str(work.id), workflow_run_id=str(invalid_run.id))
+            invalid_run.delete()
+
+    m_execute.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('task_attribute', 'work_type', 'domain_target'),
+    [
+        (
+            'distill_session_work_v1',
+            WorkflowWorkType.SESSION_DISTILLATION,
+            'engram.memory.tasks.run_session_distillation_with_tracking',
+        ),
+        (
+            'generate_daily_digest_work_v1',
+            WorkflowWorkType.DAILY_DIGEST,
+            'engram.memory.tasks.run_daily_digest_with_tracking',
+        ),
+        (
+            'generate_weekly_digest_work_v1',
+            WorkflowWorkType.WEEKLY_DIGEST,
+            'engram.memory.tasks.run_weekly_digest_with_tracking',
+        ),
+    ],
+)
+def test_unfinished_versioned_work_adapters_fail_closed_without_legacy_domain_execution(
+    task_attribute: str,
+    work_type: str,
+    domain_target: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch(domain_target) as m_domain:
+        with pytest.raises(MemoryWorkerError, match='not implemented'):
+            task(str(work.id))
+
+    m_domain.assert_not_called()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('task_attribute', 'work_type', 'domain_target'),
+    [
+        (
+            'distill_session_work_v1',
+            WorkflowWorkType.SESSION_DISTILLATION,
+            'engram.memory.tasks.run_session_distillation_with_tracking',
+        ),
+        (
+            'generate_daily_digest_work_v1',
+            WorkflowWorkType.DAILY_DIGEST,
+            'engram.memory.tasks.run_daily_digest_with_tracking',
+        ),
+        (
+            'generate_weekly_digest_work_v1',
+            WorkflowWorkType.WEEKLY_DIGEST,
+            'engram.memory.tasks.run_weekly_digest_with_tracking',
+        ),
+    ],
+)
+def test_terminal_automatic_delivery_returns_before_unfinished_adapter(
+    task_attribute: str,
+    work_type: str,
+    domain_target: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch(domain_target) as m_domain:
+        task(str(work.id))
+
+    m_domain.assert_not_called()
