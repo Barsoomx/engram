@@ -147,11 +147,38 @@ def _claim_workflow_run(work: WorkflowWork, workflow_run: WorkflowRun) -> Workfl
             failure_reason='',
         )
     if claimed != 1:
-        raise MemoryWorkerError('workflow run is no longer queued')
+        try:
+            return WorkflowRun.objects.get(
+                id=workflow_run.id,
+                work_id=work.id,
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                run_type=work.work_type,
+                status=WorkflowRunStatus.SUCCEEDED,
+            )
+        except WorkflowRun.DoesNotExist as error:
+            raise MemoryWorkerError('workflow run is no longer queued') from error
 
     workflow_run.refresh_from_db()
 
     return workflow_run
+
+
+def _succeeded_workflow_run_result(work: WorkflowWork, workflow_run: WorkflowRun) -> str:
+    disposition = (
+        WorkflowWork.objects.filter(
+            id=work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+        .values_list('disposition', flat=True)
+        .get()
+    )
+    if disposition != WorkflowWorkDisposition.COMPLETE:
+        raise MemoryWorkerError('succeeded workflow run has non-complete work')
+
+    return str(workflow_run.id)
 
 
 def _requeue_workflow_run(workflow_run: WorkflowRun) -> None:
@@ -374,10 +401,11 @@ def process_observation_work_v1(
     )
     if automatic_terminal:
         return str(work.id)
-    if workflow_run is not None and workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-        return str(workflow_run.id)
     if workflow_run is not None:
-        workflow_run = _claim_workflow_run(work, workflow_run)
+        if workflow_run.status == WorkflowRunStatus.QUEUED:
+            workflow_run = _claim_workflow_run(work, workflow_run)
+        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+            return _succeeded_workflow_run_result(work, workflow_run)
 
     structlog.contextvars.clear_contextvars()
     try:

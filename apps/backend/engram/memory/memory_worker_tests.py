@@ -1318,7 +1318,6 @@ def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> 
             str(work.id),
             workflow_run_id=str(queued_run.id),
         )
-        queued_run.refresh_from_db()
         duplicate_result = tasks_module.process_observation_work_v1(
             str(work.id),
             workflow_run_id=str(queued_run.id),
@@ -1326,6 +1325,7 @@ def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> 
 
     m_execute.assert_called_once()
     work.refresh_from_db()
+    queued_run.refresh_from_db()
     assert duplicate_result == str(queued_run.id)
     assert WorkflowWork.objects.count() == work_count
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
@@ -1333,6 +1333,94 @@ def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> 
     assert queued_run.status == WorkflowRunStatus.SUCCEEDED
     assert queued_run.started_at is not None
     assert queued_run.finished_at is not None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'work_disposition',
+    (WorkflowWorkDisposition.REQUIRED, WorkflowWorkDisposition.NO_OP),
+)
+def test_succeeded_explicit_run_with_non_complete_work_fails_closed_before_domain_access(
+    work_disposition: str,
+) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    if work_disposition == WorkflowWorkDisposition.NO_OP:
+        WorkflowWork.objects.filter(id=work.id).update(
+            disposition=WorkflowWorkDisposition.NO_OP,
+            resolution_reason=WorkflowWorkResolutionReason.NO_INPUT,
+            resolved_at=timezone.now(),
+        )
+    succeeded_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    now = timezone.now()
+    WorkflowRun.objects.filter(id=succeeded_run.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        started_at=now,
+        finished_at=now,
+    )
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        with pytest.raises(MemoryWorkerError, match='non-complete'):
+            tasks_module.process_observation_work_v1(
+                str(work.id),
+                workflow_run_id=str(succeeded_run.id),
+            )
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.disposition == work_disposition
+
+
+@pytest.mark.django_db
+def test_explicit_run_claim_loser_accepts_winner_terminal_success() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    original_load = tasks_module._load_workflow_run
+
+    def load_before_winner_finishes(*args: object, **kwargs: object) -> WorkflowRun:
+        loaded_run = original_load(*args, **kwargs)
+        resolve_work_succeeded(
+            work.id,
+            organization_id=organization.id,
+            project_id=project.id,
+        )
+        now = timezone.now()
+        WorkflowRun.objects.filter(id=queued_run.id).update(
+            status=WorkflowRunStatus.SUCCEEDED,
+            started_at=now,
+            finished_at=now,
+        )
+
+        return loaded_run
+
+    with (
+        mock.patch('engram.memory.tasks._load_workflow_run', side_effect=load_before_winner_finishes),
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute,
+    ):
+        result = tasks_module.process_observation_work_v1(
+            str(work.id),
+            workflow_run_id=str(queued_run.id),
+        )
+
+    m_execute.assert_not_called()
+    queued_run.refresh_from_db()
+    assert result == str(queued_run.id)
+    assert queued_run.status == WorkflowRunStatus.SUCCEEDED
 
 
 @pytest.mark.django_db
