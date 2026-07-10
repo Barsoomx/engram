@@ -100,7 +100,10 @@ contract never deploy together.
 1. **C1.1 — identity and expand schema**
    Add logical-work persistence, the nullable run link, the session sequence
    expand fields, canonical identity services, versioned id-only tasks, model
-   tests, and migration tests. No producer switches yet.
+   tests, and migration tests. Preserve old session writers with a persistent
+   database default and a state-neutral repair migration for installations that
+   already recorded the originally published expand migration. No producer
+   switches yet.
 2. **C1.2 — hook/API atomic creation and all observation writers**
    Make hook evidence, observation work, and its package signal atomic. Move
    hook and import observation creation onto the server sequence allocator.
@@ -328,7 +331,7 @@ AgentSession.observation_sequence_cursor
   PositiveBigIntegerField(null=True) during expand
 
 AgentSession.end_work_contract_version
-  PositiveSmallIntegerField(default=0)
+  PositiveSmallIntegerField(default=0, db_default=0)
 
 Observation.session_sequence
   PositiveBigIntegerField(null=True, blank=True) during expand
@@ -348,6 +351,13 @@ explicitly writes cursor zero. The final contract makes the cursor non-null
 with default zero and makes `Observation.session_sequence` non-null. Client
 sequence numbers, occurrence time, prompt number, creation time alone, and UUID
 lexical order are never authoritative live ordering inputs.
+
+The persistent database default on `end_work_contract_version` is a rolling-
+compatibility contract, not a substitute for explicit new-writer behavior.
+An old application writer that omits the unknown column must still insert the
+conservative legacy value 0. Explicit null remains invalid, and the default
+must remain present until every writer that can omit the column is demonstrably
+retired. Value 0 never fabricates a version 1 end transition.
 
 `end_work_contract_version=1` means the session's current `ENDED` state was
 committed by the CP1 active-to-ended primitive together with its work/no-op.
@@ -988,9 +998,43 @@ work for source-materialized ended history.
   nullable `WorkflowRun.work`, nullable session cursor/observation sequence,
   typed nullable raw-event normalization fields, and their
   uniqueness/check/index contracts;
+- amend the already-published `0032_workflowwork_sequence_expand` field state so
+  `AgentSession.end_work_contract_version` has both Python `default=0` and
+  persistent `db_default=0`; fresh installations must never commit an
+  incompatible no-default schema;
+- add `0032b_agentsession_end_work_db_default.py`, with dependency tuple
+  `('core', '0032_workflowwork_sequence_expand')`, as a state-neutral
+  unconditional database repair:
+
+  ```sql
+  ALTER TABLE "core_agentsession"
+  ALTER COLUMN "end_work_contract_version" SET DEFAULT 0;
+  ```
+
+  It repairs installations that already recorded the originally published
+  `0032_workflowwork_sequence_expand`; it has no state operation and its
+  reverse is intentionally a no-op because amended
+  `0032_workflowwork_sequence_expand` owns the persistent default state;
 - add canonical identity/subject validation tests and migration tests;
+- prove both physical histories: an `0031` historical model can insert a new
+  session after fresh amended `0032_workflowwork_sequence_expand`, and a
+  simulated already-recorded old `0032_workflowwork_sequence_expand` with its
+  physical default removed is repaired by
+  `0032b_agentsession_end_work_db_default`; reverse to
+  `0032_workflowwork_sequence_expand` and reapply
+  `0032b_agentsession_end_work_db_default` must preserve the historical insert
+  contract;
+- assert the model exposes Python default 0 and database default 0, while an
+  explicit null remains rejected;
 - add versioned tasks but switch no producers;
-- deploy without backfilling work or requiring non-null sequence.
+- allow only an image containing the corrected
+  `0032_workflowwork_sequence_expand` plus
+  `0032b_agentsession_end_work_db_default` to execute migrations; an image
+  containing the originally published broken
+  `0032_workflowwork_sequence_expand` may never own migration execution;
+- deploy without backfilling work or requiring non-null sequence. The rollout
+  gate records the physical column default and exact old-writer insertion
+  evidence before C1.2 begins.
 
 ### C1.2 Writer Cutover
 
@@ -1011,7 +1055,9 @@ session-generation identity consumes them yet.
 
 ### C1.3a Deterministic Backfill
 
-Deploy `0033_backfill_observation_sequence.py` without the contract migration.
+`0033_backfill_observation_sequence.py` depends on
+`0032b_agentsession_end_work_db_default.py`. Deploy it without the contract
+migration.
 It is non-atomic and uses idempotent per-session transactions, iterating session
 ids in sorted order. The migration hard-codes a reviewed maximum of 10,000
 observations per session, update batches of 500, a 5-second per-session lock
@@ -1185,10 +1231,14 @@ teams and prove denial before selection, provider access, and output.
 ### C1.1 schema/identity owner
 
 - `apps/backend/engram/core/models.py`;
-- next `engram/core/migrations/` expand migration;
+- `apps/backend/engram/core/migrations/0032_workflowwork_sequence_expand.py`;
+- `apps/backend/engram/core/migrations/0032b_agentsession_end_work_db_default.py`;
+- `apps/backend/engram/core/migrations_tests.py` and the focused model metadata
+  test;
 - `apps/backend/engram/memory/workflow_work.py` and adjacent tests;
 - versioned task definitions and focused task tests;
-- migration tests.
+- no hook, import, context, producer, task-routing, or public API change belongs
+  to the rolling-default repair.
 
 ### C1.2 hook/API owner
 
@@ -1248,9 +1298,22 @@ Each slice must record:
 - Claude adversarial review against the committed slice range;
 - draft PR CI names, URLs, conclusions, rollback, and residual risks.
 
+The C1.1 rolling-default repair additionally records PostgreSQL physical-schema
+proof that `core_agentsession.end_work_contract_version` is `NOT NULL` with
+database default 0, plus the fresh-`0032_workflowwork_sequence_expand`,
+simulated-published-`0032_workflowwork_sequence_expand`, exact reverse, and
+`0032b_agentsession_end_work_db_default` reapply historical-writer tests.
+Migration freshness alone is not proof of the physical default.
+
 ## Rollback
 
 - Before producer cutover, revert additive code/migrations normally.
+- Reversing `0032b_agentsession_end_work_db_default` to amended
+  `0032_workflowwork_sequence_expand` intentionally retains the database
+  default; this matches amended `0032_workflowwork_sequence_expand` state and
+  keeps old writers compatible. Reversing through
+  `0032_workflowwork_sequence_expand` drops the entire expand schema. Do not
+  drop only the database default while any old writer can omit the column.
 - During nullable sequence rollout, old rows remain valid; revert writers while
   leaving additive columns/model present if required for safe rollback.
 - After non-null contract, do not roll back to a writer that can insert null.
@@ -1266,6 +1329,13 @@ Checkpoint 1 closes only when:
 
 - C1.1, C1.2, C1.3a, C1.3b, C1.3c, and C1.3d have merged serially with their
   deploy gates recorded;
+- fresh amended `0032_workflowwork_sequence_expand`, simulated already-applied
+  published `0032_workflowwork_sequence_expand`, reverse to
+  `0032_workflowwork_sequence_expand`, and
+  `0032b_agentsession_end_work_db_default` reapply all preserve insertion by
+  the historical `0031_workflowrun_active_daily_digest_unique` session model
+  with stored `end_work_contract_version=0`; the deployed physical column
+  default is exactly 0;
 - all post-cutover accepted events have exact normalization disposition;
 - every post-cutover required transition has one stable scoped work identity;
 - evidence/lifecycle work and its one initial package signal commit or roll
@@ -1306,6 +1376,9 @@ Stop before implementation or the next serial slice if:
 - a producer cannot create work and package intent in its source transaction;
 - a design needs package-row presence/absence to decide product completion;
 - a rolling deployment can insert null/duplicate sequence after contract;
+- an old session writer can observe the new non-null end-work marker without a
+  physical database default, or an image containing the uncorrected published
+  `0032_workflowwork_sequence_expand` can execute migrations;
 - sequence backfill cannot be deterministic, idempotent, bounded, and resumed;
 - manual rerun would fabricate a historical input generation;
 - a digest snapshot would load mutable current state instead of exact versioned
