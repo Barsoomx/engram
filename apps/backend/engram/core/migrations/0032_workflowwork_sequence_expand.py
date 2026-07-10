@@ -69,7 +69,7 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='agentsession',
             name='end_work_contract_version',
-            field=models.PositiveSmallIntegerField(default=0),
+            field=models.PositiveSmallIntegerField(default=0, db_default=0),
         ),
         migrations.AddField(
             model_name='agentsession',

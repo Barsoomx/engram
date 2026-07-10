@@ -1104,6 +1104,19 @@ def test_sequence_expand_fields_are_nullable_but_checked_when_present() -> None:
 
 
 @pytest.mark.django_db
+def test_end_work_contract_version_has_both_defaults_and_rejects_null() -> None:
+    _organization, _team, _project, _agent, session = create_scope()
+    field = AgentSession._meta.get_field('end_work_contract_version')
+
+    assert field.default == 0
+    assert field.db_default == 0
+    assert field.null is False
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        AgentSession.objects.filter(id=session.id).update(end_work_contract_version=None)
+
+
+@pytest.mark.django_db
 def test_workflow_work_full_identity_and_digest_occurrence_are_unique() -> None:
     scope = create_scope()
     _organization, _team, project, _agent, _session = scope

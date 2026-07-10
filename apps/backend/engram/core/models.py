@@ -278,7 +278,10 @@ class AgentSession(TimestampedModel):
     status = models.CharField(max_length=40, choices=SessionStatus.choices, default=SessionStatus.ACTIVE)
     prompt_counter = models.PositiveIntegerField(default=0)
     observation_sequence_cursor = models.PositiveBigIntegerField(null=True, blank=True)
-    end_work_contract_version = models.PositiveSmallIntegerField(default=0)
+    end_work_contract_version = models.PositiveSmallIntegerField(
+        default=0,
+        db_default=0,
+    )
     metadata = models.JSONField(default=dict, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
