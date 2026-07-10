@@ -149,6 +149,162 @@ class InstallTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_install_codex_uses_native_marketplace_and_plugin_add(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = StubTransport(
+                [
+                    (200, dry_run_ok()),
+                    (200, health_ok()),
+                    (200, dry_run_ok()),
+                ],
+            )
+            runner = StubRunner()
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which",
+                side_effect=lambda name: "/usr/bin/codex" if name == "codex" else None,
+            ):
+                exit_code, stdout, stderr = self.run_install_command(
+                    self.install_args(config_dir, ["--agent", "codex"]),
+                    transport,
+                    runner,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(
+                [
+                    [
+                        "/usr/bin/codex",
+                        "plugin",
+                        "marketplace",
+                        "add",
+                        "Barsoomx/engram",
+                        "--json",
+                    ],
+                    [
+                        "/usr/bin/codex",
+                        "plugin",
+                        "add",
+                        "engram@engram-marketplace",
+                        "--json",
+                    ],
+                ],
+                runner.calls,
+            )
+            self.assertIn("codex plugin list --json", stdout)
+            self.assertIn("/hooks", stdout)
+            self.assertIn("new thread", stdout)
+            self.assertNotIn("claude", " ".join(" ".join(call) for call in runner.calls))
+
+    def test_install_both_resolves_binaries_before_plugin_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = StubTransport(
+                [
+                    (200, dry_run_ok()),
+                    (200, dry_run_ok()),
+                    (200, health_ok()),
+                    (200, dry_run_ok()),
+                    (200, dry_run_ok()),
+                ],
+            )
+            runner = StubRunner()
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which",
+                side_effect=lambda name: "/usr/bin/claude" if name == "claude" else None,
+            ):
+                exit_code, _stdout, stderr = self.run_install_command(
+                    self.install_args(config_dir, ["--agent", "both"]),
+                    transport,
+                    runner,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("codex_cli_not_found", stderr)
+            self.assertEqual([], runner.calls)
+
+    def test_install_both_runs_each_native_installer_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = StubTransport(
+                [
+                    (200, dry_run_ok()),
+                    (200, dry_run_ok()),
+                    (200, health_ok()),
+                    (200, dry_run_ok()),
+                    (200, dry_run_ok()),
+                ],
+            )
+            runner = StubRunner()
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which",
+                side_effect=lambda name: f"/usr/bin/{name}",
+            ):
+                exit_code, stdout, stderr = self.run_install_command(
+                    self.install_args(config_dir, ["--agent", "both"]),
+                    transport,
+                    runner,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(
+                [
+                    [
+                        "/usr/bin/codex",
+                        "plugin",
+                        "marketplace",
+                        "add",
+                        "Barsoomx/engram",
+                        "--json",
+                    ],
+                    [
+                        "/usr/bin/codex",
+                        "plugin",
+                        "add",
+                        "engram@engram-marketplace",
+                        "--json",
+                    ],
+                    [
+                        "/usr/bin/claude",
+                        "plugin",
+                        "marketplace",
+                        "add",
+                        "Barsoomx/engram",
+                    ],
+                    [
+                        "/usr/bin/claude",
+                        "plugin",
+                        "install",
+                        "engram@engram-marketplace",
+                    ],
+                ],
+                runner.calls,
+            )
+            self.assertIn("MCP tools ship with the Claude Code plugin", stdout)
+            self.assertIn("Review and trust the Engram hooks with /hooks", stdout)
+
+    def test_install_reports_codex_cli_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = StubTransport([(200, dry_run_ok())])
+            runner = StubRunner()
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which", return_value=None
+            ):
+                exit_code, _stdout, stderr = self.run_install_command(
+                    self.install_args(config_dir, ["--agent", "codex"]),
+                    transport,
+                    runner,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("codex_cli_not_found", stderr)
+            self.assertEqual([], runner.calls)
+
     def test_install_reports_claude_cli_not_found(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -184,6 +340,26 @@ class InstallTests(unittest.TestCase):
             self.assertIn("plugin_install_failed", stderr)
             self.assertIn("marketplace source unreachable", stderr)
             self.assertEqual(1, len(runner.calls))
+            self.assertNotIn(RAW_KEY, stderr)
+
+    def test_install_redacts_codex_plugin_failure_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            transport = StubTransport([(200, dry_run_ok())])
+            runner = StubRunner([(1, "", f"native error included {RAW_KEY}")])
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which", return_value="/usr/bin/codex"
+            ):
+                exit_code, _stdout, stderr = self.run_install_command(
+                    self.install_args(config_dir, ["--agent", "codex"]),
+                    transport,
+                    runner,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("plugin_install_failed", stderr)
+            self.assertIn("native error included [REDACTED]", stderr)
             self.assertNotIn(RAW_KEY, stderr)
 
     def test_install_bad_key_fails_at_connect_without_running_plugin(self) -> None:

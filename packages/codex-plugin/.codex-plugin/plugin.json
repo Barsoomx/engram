@@ -1,14 +1,27 @@
 {
   "name": "engram",
-  "version": "0.1.0",
-  "description": "Thin Engram hook adapter for Codex.",
-  "hooks": "../plugin/hooks/codex-hooks.json",
+  "version": "0.2.0",
+  "description": "Shared engineering memory for Codex.",
+  "author": {
+    "name": "Engram",
+    "url": "https://github.com/Barsoomx/engram"
+  },
+  "homepage": "https://github.com/Barsoomx/engram",
+  "repository": "https://github.com/Barsoomx/engram",
+  "license": "Apache-2.0",
+  "keywords": ["engineering-memory", "hooks", "codex"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Engram",
     "shortDescription": "Shared engineering memory for AI coding agents.",
     "longDescription": "Engram captures coding-session activity and injects relevant server-backed context into future agent sessions.",
     "developerName": "Engram",
     "category": "Productivity",
-    "capabilities": ["Read", "Write"]
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/Barsoomx/engram",
+    "defaultPrompt": [
+      "Search Engram for relevant project memory before starting this task."
+    ]
   }
 }

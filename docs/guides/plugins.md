@@ -7,11 +7,18 @@ SDK.
 
 ## Prerequisites
 
-Before installing either plugin:
+Before installing either plugin, make sure the Engram server is running (see
+[../quickstart.md](../quickstart.md)). Then use the one-step installer:
 
-1. The Engram server is running (see [../quickstart.md](../quickstart.md)).
-2. You ran `engram connect` so `~/.engram/credentials.json` and
-   `~/.engram/hooks/<runtime>.json` exist (see [cli.md](cli.md)).
+```bash
+uvx engram-connect install --agent codex \
+  --server URL --api-key KEY --project PROJECT
+```
+
+`--agent` accepts `claude-code`, `codex`, or `both`. The command writes
+`~/.engram/credentials.json` and `~/.engram/hooks/<runtime>.json`, verifies the
+connection, and installs the selected native plugin. `engram connect` remains
+available when plugin installation is managed separately.
 
 The plugins read no secrets of their own; they delegate to the `engram hook`
 adapter, which authenticates using the credential written by `engram connect`.
@@ -20,14 +27,16 @@ adapter, which authenticates using the credential written by `engram connect`.
 
 Event coverage differs between the two plugins:
 
-| Event             | CLI adapter                       | Server endpoint            | Claude Code | Codex |
-|-------------------|------------------------------------|----------------------------|-------------|-------|
-| `SessionStart`    | `engram hook session-start`       | `POST /v1/hooks/session-start` + `POST /v1/context/session-start` | yes | yes |
-| `PostToolUse`     | `engram hook post-tool-use`       | `POST /v1/hooks/post-tool-use` | yes | yes |
-| `SessionEnd`      | `engram hook session-end`         | `POST /v1/hooks/session-end` | yes | yes |
-| `UserPromptSubmit`| `engram hook user-prompt-submit`  | `POST /v1/hooks/user-prompt-submit` | yes | yes |
-| `Error`           | `engram hook error`               | `POST /v1/hooks/error`     | no | yes |
-| `Decision`        | `engram hook decision`            | `POST /v1/hooks/decision`  | no | yes |
+| Adapter event | Server endpoint | Claude Code hook | Codex hook |
+| --- | --- | --- | --- |
+| `session-start` | `POST /v1/hooks/session-start` + `POST /v1/context/session-start` | `SessionStart` | `SessionStart` |
+| `user-prompt-submit` | `POST /v1/hooks/user-prompt-submit` + `POST /v1/context/user-prompt-submit` | `UserPromptSubmit` | `UserPromptSubmit` |
+| `post-tool-use` | `POST /v1/hooks/post-tool-use` | `PostToolUse` | `PostToolUse` |
+| `session-end` | `POST /v1/hooks/session-end` | `SessionEnd` | `Stop` |
+
+Codex has no native `Error`, `Decision`, or `SessionEnd` hook. Tool failures
+are captured through `PostToolUse.tool_response`, and `Stop` is a turn-scoped
+checkpoint rather than proof that the whole Codex session is over.
 
 Each adapter call:
 
@@ -50,7 +59,7 @@ plus a `hookSpecificOutput.additionalContext` block; for `PostToolUse` and
 
 ### Install
 
-Run `engram install` (after `engram connect`). It adds the Engram marketplace
+Run `engram install`. It connects Engram, adds the Engram marketplace
 (`claude plugin marketplace add <source>`) and installs the plugin
 (`claude plugin install engram@engram-marketplace`). The plugin bundles its own
 copy of the CLI under `hooks/`, so each hook command runs
@@ -61,18 +70,25 @@ See `packages/claude-plugin/README.md` for the package contract.
 
 ## Codex plugin
 
-Package: `packages/codex-plugin/`. The fixture lives at
+Package: `packages/codex-plugin/`. The native manifest lives at
 `packages/codex-plugin/.codex-plugin/plugin.json`.
 
 The hooks call the same thin Python CLI with `--agent codex` (or
 `--response-format codex`). Codex hook responses use the `{"continue": true, ...}`
 shape and must not emit fields Codex does not support.
 
-> **Status:** the manifest wires all six hook events (`SessionStart`,
-> `PostToolUse`, `Error`, `Decision`, `SessionEnd`, `UserPromptSubmit`), but the
-> Codex harness is not yet exercised end to end — Claude Code is the validated
-> path today. The package is not published to a marketplace and does not install
-> itself into a user profile; see the README for manual install commands.
+The package uses Codex's native `hooks/hooks.json`, bundles the same connector
+and six MCP tools as the Claude Code package, and ships the three shared memory
+skills. Install it with the one-step command above or directly:
+
+```bash
+codex plugin marketplace add Barsoomx/engram --json
+codex plugin add engram@engram-marketplace --json
+```
+
+Open `/hooks`, review the Engram commands, approve them if they match the
+installed package, and start a new thread. Installation never bypasses Codex's
+hook trust decision.
 
 See `packages/codex-plugin/README.md` for the package contract.
 

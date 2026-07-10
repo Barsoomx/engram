@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "engram": {
+      "command": "python3",
+      "args": ["./hooks/mcp.py"],
+      "cwd": "."
+    }
+  }
+}

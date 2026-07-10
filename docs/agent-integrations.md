@@ -30,11 +30,13 @@ The target installer is a client connector, not a worker bootstrapper. The V1
 golden path is explicit:
 
 ```bash
-engram connect --server URL --api-key KEY --project PROJECT
+uvx engram-connect install --agent both \
+  --server URL --api-key KEY --project PROJECT
 ```
 
-It writes hook configuration for Claude Code and/or Codex, then calls the dry-run
-endpoint.
+It writes hook configuration, installs the selected Claude Code and/or Codex
+native plugin, then verifies the connection. `engram connect` performs only the
+configuration and dry-run portion for managed installs.
 
 Server deployment is handled separately by Compose, Helm, or SaaS provisioning.
 The installer must not install local databases, vector stores, provider workers,
@@ -54,6 +56,22 @@ Every request includes agent family, agent version, event id, session id,
 repository metadata, cwd, idempotency key, timestamp, and auth credential.
 Responses are adapter-specific and must not emit fields unsupported by the
 target agent.
+
+The table describes handler budgets. The connector's HTTP call timeout remains
+10 seconds for hook ingest/context calls, including the two-call retrieval
+hooks; the general CLI HTTP timeout is 30 seconds.
+
+Native lifecycle names differ at the adapter boundary:
+
+| Adapter behavior | Claude Code | Codex |
+| --- | --- | --- |
+| session start | `SessionStart` | `SessionStart` |
+| prompt context | `UserPromptSubmit` | `UserPromptSubmit` |
+| tool capture | `PostToolUse` | `PostToolUse` |
+| completion checkpoint | `SessionEnd` | `Stop` |
+
+Codex has no native `Error`, `Decision`, or `SessionEnd` event. A failed tool is
+captured in `PostToolUse.tool_response`, and `Stop` is turn-scoped.
 
 ## Hook Responsibilities
 
@@ -106,3 +124,7 @@ Enterprise deployments should support managed hooks so platform admins can
 install and trust the same integration across developer machines. Trust is still
 not authorization. The server must verify API keys, scopes, request signatures,
 tenant/project binding, and replay protection for every call.
+
+For non-managed Codex installs, the user reviews the Engram commands in
+`/hooks` and starts a new thread. The installer must not bypass that trust
+boundary.

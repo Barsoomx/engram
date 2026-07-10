@@ -8,7 +8,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = ROOT / 'packages/cli/engram_cli'
-BUNDLE_DIR = ROOT / 'packages/claude-plugin/hooks/engram_cli'
+BUNDLE_DIRS = (
+    ROOT / 'packages/claude-plugin/hooks/engram_cli',
+    ROOT / 'packages/codex-plugin/hooks/engram_cli',
+)
 
 
 def runtime_module_names() -> tuple[str, ...]:
@@ -35,12 +38,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def sync_bundle() -> None:
-    if BUNDLE_DIR.exists():
-        shutil.rmtree(BUNDLE_DIR)
+    for bundle_dir in BUNDLE_DIRS:
+        if bundle_dir.exists():
+            shutil.rmtree(bundle_dir)
 
-    BUNDLE_DIR.mkdir(parents=True)
-    for name in runtime_module_names():
-        shutil.copyfile(SOURCE_DIR / name, BUNDLE_DIR / name)
+        bundle_dir.mkdir(parents=True)
+        for name in runtime_module_names():
+            shutil.copyfile(SOURCE_DIR / name, bundle_dir / name)
 
 
 def check_bundle() -> int:
@@ -58,21 +62,23 @@ def check_bundle() -> int:
 
 def bundle_drift() -> list[str]:
     expected = set(runtime_module_names())
-    bundled = (
-        {path.name for path in BUNDLE_DIR.iterdir() if path.is_file()}
-        if BUNDLE_DIR.exists()
-        else set()
-    )
     problems: list[str] = []
-    for name in sorted(expected - bundled):
-        problems.append(f'missing bundled file {name}')
+    for bundle_dir in BUNDLE_DIRS:
+        bundled = (
+            {path.name for path in bundle_dir.iterdir() if path.is_file()}
+            if bundle_dir.exists()
+            else set()
+        )
+        bundle_name = bundle_dir.relative_to(ROOT)
+        for name in sorted(expected - bundled):
+            problems.append(f'{bundle_name}: missing bundled file {name}')
 
-    for name in sorted(bundled - expected):
-        problems.append(f'unexpected bundled file {name}')
+        for name in sorted(bundled - expected):
+            problems.append(f'{bundle_name}: unexpected bundled file {name}')
 
-    for name in sorted(expected & bundled):
-        if (SOURCE_DIR / name).read_bytes() != (BUNDLE_DIR / name).read_bytes():
-            problems.append(f'out-of-date bundled file {name}')
+        for name in sorted(expected & bundled):
+            if (SOURCE_DIR / name).read_bytes() != (bundle_dir / name).read_bytes():
+                problems.append(f'{bundle_name}: out-of-date bundled file {name}')
 
     return problems
 

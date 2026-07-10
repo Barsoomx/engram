@@ -5,14 +5,17 @@ ARG HTTPS_PROXY
 ARG NO_PROXY=localhost,127.0.0.1,::1
 
 ENV PNPM_HOME=/pnpm
-ENV PATH=$PNPM_HOME:$PATH
-RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
+ENV PATH=$PNPM_HOME/bin:$PNPM_HOME:$PATH
+RUN corepack enable \
+    && corepack prepare pnpm@11.9.0 --activate \
+    && pnpm config set --global minimumReleaseAge 10080 \
+    && pnpm config set --global minimumReleaseAgeStrict true
 
 WORKDIR /app
 
 FROM base AS deps
 COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml* ./
-RUN pnpm install --frozen-lockfile || pnpm install
+RUN pnpm install --frozen-lockfile
 
 FROM base AS builder
 # Bake a placeholder, not a real URL: entrypoint.sh replaces APP_NEXT_PUBLIC_* with the

@@ -1,0 +1,34 @@
+FROM node:22.21.1-bookworm-slim AS node-runtime
+
+FROM python:3.12-slim-bookworm
+
+# Published 2026-07-01; this was the newest stable plugin/hooks release older
+# than the enforced seven-day package-age gate when the harness was added.
+ARG CODEX_VERSION=0.142.5
+ARG PNPM_VERSION=11.9.0
+
+ENV CODEX_E2E_EXPECTED_VERSION=${CODEX_VERSION} \
+    PATH=/opt/pnpm/bin:/opt/pnpm:${PATH} \
+    PNPM_HOME=/opt/pnpm \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules/corepack /usr/local/lib/node_modules/corepack
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+    && corepack enable \
+    && corepack prepare "pnpm@${PNPM_VERSION}" --activate \
+    && pnpm config set --global minimumReleaseAge 10080 \
+    && pnpm config set --global minimumReleaseAgeStrict true \
+    && test "$(pnpm config get minimumReleaseAge)" = "10080" \
+    && test "$(pnpm config get minimumReleaseAgeStrict)" = "true" \
+    && pnpm add --global "@openai/codex@${CODEX_VERSION}" \
+    && test "$(codex --version)" = "codex-cli ${CODEX_VERSION}"
+
+WORKDIR /workspace
+
+ENTRYPOINT ["python3", "/workspace/scripts/e2e_codex_plugin.py", "--inside-container"]

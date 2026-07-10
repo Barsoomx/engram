@@ -105,6 +105,67 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("", runtime.project_id)
         self.assertEqual("https://github.com/a/b", runtime.repository_url)
 
+    def test_codex_per_call_repository_wins_over_plugin_process_cwd(self) -> None:
+        self.write_local_config(project_id="")
+        transport = StubTransport(body={"items": []})
+
+        with mock.patch.object(
+            mcp_tools,
+            "workspace_repository_url",
+            return_value="https://github.com/engram/plugin-cache",
+        ):
+            mcp_tools.search_memory(
+                {
+                    "query": "auth",
+                    "__engram_repository_url": "https://github.com/acme/project",
+                },
+                self.config_dir,
+                transport,
+            )
+
+        payload = transport.calls[0][3]
+        self.assertEqual("https://github.com/acme/project", payload["repository_url"])
+
+    def test_empty_codex_per_call_repository_does_not_fallback_to_process_cwd(
+        self,
+    ) -> None:
+        self.write_local_config(project_id="")
+        transport = StubTransport(body={"items": []})
+
+        with mock.patch.object(
+            mcp_tools,
+            "workspace_repository_url",
+            return_value="https://github.com/engram/plugin-cache",
+        ):
+            result = mcp_tools.search_memory(
+                {
+                    "query": "auth",
+                    "__engram_repository_url": "",
+                },
+                self.config_dir,
+                transport,
+            )
+
+        self.assertEqual(mcp_tools.NOT_CONFIGURED_MESSAGE, result)
+        self.assertEqual([], transport.calls)
+
+    def test_configured_project_wins_over_codex_per_call_repository(self) -> None:
+        self.write_local_config(project_id="configured-project")
+        transport = StubTransport(body={"items": []})
+
+        mcp_tools.search_memory(
+            {
+                "query": "auth",
+                "__engram_repository_url": "https://github.com/acme/project",
+            },
+            self.config_dir,
+            transport,
+        )
+
+        payload = transport.calls[0][3]
+        self.assertEqual("configured-project", payload["project_id"])
+        self.assertNotIn("repository_url", payload)
+
     def test_project_id_argument_wins_over_env_config_and_repo(self) -> None:
         self.write_local_config(project_id="")
         os.environ["ENGRAM_PROJECT_ID"] = "env-project"
