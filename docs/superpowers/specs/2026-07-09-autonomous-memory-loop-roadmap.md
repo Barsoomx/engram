@@ -483,8 +483,8 @@ implementation slice from then-current `master`.
 
 After the base SHA is fixed:
 
-- **C0-A — invariant catalog:** turn P1-P15 into bounded read-only queries and
-  expected healthy results;
+- **C0-A — invariant catalog:** turn P1-P15 into bounded read-only queries with
+  an expected current result/state plus the eventual healthy target;
 - **C0-B — fault matrix:** enumerate crash boundaries from API transaction
   through outbox, worker, provider, semantic commit, and context replay;
 - **C0-C — baseline fixture:** create sanitized fixtures representing no-run
@@ -572,7 +572,9 @@ schema owner owns models and migrations. No other agent edits those files.
 
 ### Gate
 
-- P1, P2, and P14 pass.
+- Typed post-cutover P1/P2 cohorts pass. Focused P14 source-to-sink negative
+  tests pass; global P14 remains explicitly missing until its later
+  observability owner lands.
 - A test that previously expected zero outbox rows inside the ingest
   transaction is replaced by the correct atomicity contract.
 - Killing the request process after database commit still leaves recoverable
@@ -584,9 +586,10 @@ schema owner owns models and migrations. No other agent edits those files.
 
 ### Rollout
 
-Deploy with invariant metrics enabled. Do not repair historical no-run sessions
-yet. Observe only newly accepted traffic through at least one full scheduler
-cycle.
+Run the scoped internal evaluator and record a post-cutover cohort report; CP1
+does not expose or schedule invariant metrics, which belong to CP2 operations.
+Do not repair historical no-run sessions yet. Observe only newly accepted
+traffic through at least one full scheduler cycle.
 
 ## Checkpoint 2 — Leases, Recovery, And Invariant Reconciliation
 
@@ -798,7 +801,8 @@ files must not have multiple writers.
 
 ### Gate
 
-- P7, P8, P9, and P13 pass.
+- P7, P8, and P9 pass. The CP4 consistency/projection-repair subset of P13
+  passes; global P13 remains open until the historical repair work in CP10.
 - It is impossible to observe a promoted candidate without a coherent memory
   and current version.
 - Exact retrieval is available when the authoritative transition commits.

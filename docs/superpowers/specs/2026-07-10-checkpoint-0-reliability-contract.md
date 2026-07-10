@@ -45,10 +45,11 @@ This checkpoint does not:
 
 ## Controller-Verified Start State
 
-These facts were verified by the integration owner and remain pending tracked
-transcription into
-`docs/reliability/checkpoints/2026-07-10-cp0-preflight.md`. They are not yet a
-committed CP0 evidence artifact.
+These facts were verified by the integration owner and are transcribed into the
+committed, sanitized
+`docs/reliability/checkpoints/2026-07-10-cp0-preflight.md` evidence artifact.
+The aggregate snapshot is intentionally frozen rather than re-queried during
+later documentation reviews.
 
 - Local `master` and `origin/master` are
   `e4f68eeac2e571e7b1d8442bf61c54f06221070c`.
@@ -176,9 +177,11 @@ The focused Checkpoint 1 spec must preserve these decisions:
   Preserve that lifecycle: the late observation joins the reactivated session,
   and its next explicit or idle end creates a newer input generation. A
   historical success cannot satisfy that later generation.
-- Duplicate ingest reuses existing evidence and ensures any originally
-  required logical work and delivery signal exist. It does not return early
-  while work is missing.
+- Duplicate ingest reuses existing evidence. When historical evidence is
+  missing originally required logical work, it atomically creates that work
+  and its initial delivery signal rather than returning early. Existing work
+  is never re-signaled from package absence in CP1; post-relay recovery belongs
+  to CP2.
 - Idle-session sweep, explicit session end, console rerun, and scheduled digest
   producers eventually use the same logical-work creation primitive, in the
   serial order C1.1, C1.2, then C1.3. Console rerun creates a new explicit
