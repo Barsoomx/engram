@@ -361,7 +361,16 @@ async session transition; historical convergence remains CP10.
 
 Canonical JSON is UTF-8 JSON with sorted keys, no insignificant whitespace,
 Unicode preserved, UUIDs rendered lowercase with hyphens, and aware timestamps
-rendered as UTC `Z`. Unsupported/non-canonical values fail before a write.
+normalized to UTC and rendered as `YYYY-MM-DDTHH:MM:SS[.ffffff]Z`. Fractional
+seconds use exactly six digits when microseconds are non-zero and are omitted
+when they are zero; naive timestamps and unsupported/non-canonical values fail
+before a write.
+
+The accepted value domain is JSON null, booleans, signed 64-bit integers,
+Unicode strings, UUIDs, aware timestamps, lists, and dictionaries with string
+keys. Floats, `Decimal`, bytes, sets, tuples, non-string dictionary keys, and
+integers outside the signed 64-bit range fail before a write. Producers build
+JSON-shaped lists explicitly rather than relying on Python-only coercions.
 
 `input_fingerprint` is SHA-256 of canonical JSON over the type-specific
 identity projection, not provenance-only snapshot fields:
@@ -413,8 +422,9 @@ files_modified
 source_metadata
 ```
 
-Each field is canonicalized, encoded, prefixed by an unsigned eight-byte
-length, and streamed into SHA-256. `session_sequence` is deliberately absent:
+Each field is canonicalized, encoded, prefixed by its unsigned 64-bit
+big-endian byte length, and streamed into SHA-256. `session_sequence` is
+deliberately absent:
 C1.3 renumbers provisional C1.2 sequences and must not invalidate already
 created observation work. Accepted observation input fields are append-only
 through normal domain services.

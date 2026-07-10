@@ -1,6 +1,10 @@
+import uuid
+
 import pytest
+from django.apps import apps as django_apps
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError, models, transaction
+from django.utils import timezone
 
 from engram.core.models import (
     MEMORY_KINDS,
@@ -21,6 +25,7 @@ from engram.core.models import (
     RawEventEnvelope,
     RetrievalDocument,
     Team,
+    WorkflowRun,
     clamp_memory_kind,
 )
 
@@ -896,3 +901,539 @@ def test_retrieval_document_defaults_to_empty_embedding_vector() -> None:
     )
 
     assert document.embedding_vector == []
+
+
+C11Scope = tuple[Organization, Team, Project, Agent, AgentSession]
+
+
+def get_workflow_work_model() -> type[models.Model]:
+    return django_apps.get_model('core', 'WorkflowWork')
+
+
+def create_c11_raw_event(
+    scope: C11Scope,
+    *,
+    suffix: str,
+    contract_version: int | None,
+    disposition: str | None,
+    reason: str | None,
+) -> RawEventEnvelope:
+    organization, team, project, agent, session = scope
+
+    return RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        client_event_id=f'c11-event-{suffix}',
+        idempotency_key=f'c11-key-{suffix}',
+        content_hash=f'c11-hash-{suffix}',
+        runtime='codex',
+        payload={'tool_name': 'bash'},
+        normalization_contract_version=contract_version,
+        normalization_disposition=disposition,
+        normalization_reason=reason,
+    )
+
+
+def create_c11_observation(scope: C11Scope, *, suffix: str) -> Observation:
+    organization, team, project, agent, session = scope
+
+    return Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        observation_type='decision',
+        title=f'C1.1 observation {suffix}',
+        content_hash=f'c11-observation-{suffix}',
+    )
+
+
+def create_c11_work(
+    scope: C11Scope,
+    *,
+    subject_id: uuid.UUID,
+    input_fingerprint: str = 'a' * 64,
+    **overrides: object,
+) -> models.Model:
+    organization, team, project, _agent, _session = scope
+    fields: dict[str, object] = {
+        'organization': organization,
+        'project': project,
+        'team': team,
+        'work_type': 'observation_processing',
+        'subject_type': 'observation',
+        'subject_id': subject_id,
+        'contract_version': 1,
+        'occurrence_key': '',
+        'input_fingerprint': input_fingerprint,
+        'input_snapshot': {'schema': 'test_input/v1'},
+        'disposition': 'required',
+        'resolution_reason': '',
+        'resolved_at': None,
+    }
+    fields.update(overrides)
+
+    return get_workflow_work_model().objects.create(**fields)
+
+
+def assert_c11_save_rejected(work: models.Model, **changes: object) -> None:
+    for field, value in changes.items():
+        setattr(work, field, value)
+
+    with pytest.raises(ValidationError):
+        work.save()
+
+    work.refresh_from_db()
+
+
+@pytest.mark.parametrize(
+    ('contract_version', 'disposition', 'reason'),
+    [
+        (None, None, None),
+        (1, 'observation', None),
+        (1, 'no_op', 'evidence_only'),
+    ],
+    ids=['legacy', 'v1-observation', 'v1-no-op'],
+)
+@pytest.mark.django_db
+def test_raw_event_normalization_expand_accepts_declared_combinations(
+    contract_version: int | None,
+    disposition: str | None,
+    reason: str | None,
+) -> None:
+    raw_event = create_c11_raw_event(
+        create_scope(),
+        suffix='valid',
+        contract_version=contract_version,
+        disposition=disposition,
+        reason=reason,
+    )
+
+    assert (
+        raw_event.normalization_contract_version,
+        raw_event.normalization_disposition,
+        raw_event.normalization_reason,
+    ) == (contract_version, disposition, reason)
+
+
+@pytest.mark.parametrize(
+    ('contract_version', 'disposition', 'reason'),
+    [
+        (None, 'observation', None),
+        (None, None, 'evidence_only'),
+        (1, None, None),
+        (1, 'observation', 'evidence_only'),
+        (1, 'no_op', None),
+        (1, 'no_op', 'unknown'),
+        (1, 'unknown', None),
+        (0, 'observation', None),
+        (2, 'observation', None),
+    ],
+)
+@pytest.mark.django_db
+def test_raw_event_normalization_expand_rejects_partial_or_unknown_combinations(
+    contract_version: int | None,
+    disposition: str | None,
+    reason: str | None,
+) -> None:
+    raw_event = create_c11_raw_event(
+        create_scope(),
+        suffix='invalid',
+        contract_version=None,
+        disposition=None,
+        reason=None,
+    )
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        RawEventEnvelope.objects.filter(id=raw_event.id).update(
+            normalization_contract_version=contract_version,
+            normalization_disposition=disposition,
+            normalization_reason=reason,
+        )
+
+    raw_event.refresh_from_db()
+    assert (
+        raw_event.normalization_contract_version,
+        raw_event.normalization_disposition,
+        raw_event.normalization_reason,
+    ) == (None, None, None)
+
+
+@pytest.mark.django_db
+def test_sequence_expand_fields_are_nullable_but_checked_when_present() -> None:
+    scope = create_scope()
+    _organization, _team, _project, _agent, session = scope
+    first = create_c11_observation(scope, suffix='sequence-1')
+    second = create_c11_observation(scope, suffix='sequence-2')
+
+    Observation.objects.filter(id=first.id).update(session_sequence=1)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        Observation.objects.filter(id=second.id).update(session_sequence=1)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        Observation.objects.filter(id=first.id).update(session_sequence=0)
+
+    AgentSession.objects.filter(id=session.id).update(end_work_contract_version=1)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        AgentSession.objects.filter(id=session.id).update(end_work_contract_version=2)
+
+    cursor_field = AgentSession._meta.get_field('observation_sequence_cursor')
+    end_contract_field = AgentSession._meta.get_field('end_work_contract_version')
+    sequence_field = Observation._meta.get_field('session_sequence')
+
+    assert cursor_field.null is True
+    assert cursor_field.default is models.NOT_PROVIDED
+    assert end_contract_field.default == 0
+    assert sequence_field.null is True
+    assert sequence_field.blank is True
+    assert (
+        'organization',
+        'project',
+        'normalization_contract_version',
+        'normalization_disposition',
+    ) in index_field_sets(RawEventEnvelope)
+    assert ('organization', 'project', 'status', 'end_work_contract_version') in index_field_sets(AgentSession)
+    assert ('organization', 'project', 'session', 'session_sequence') in index_field_sets(Observation)
+
+
+@pytest.mark.django_db
+def test_workflow_work_full_identity_and_digest_occurrence_are_unique() -> None:
+    scope = create_scope()
+    _organization, _team, project, _agent, _session = scope
+    observation = create_c11_observation(scope, suffix='identity')
+    create_c11_work(scope, subject_id=observation.id)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        create_c11_work(scope, subject_id=observation.id)
+
+    create_c11_work(scope, subject_id=observation.id, input_fingerprint='b' * 64)
+    create_c11_work(scope, subject_id=observation.id, contract_version=2)
+
+    create_c11_work(
+        scope,
+        subject_id=project.id,
+        team=None,
+        work_type='daily_digest',
+        subject_type='project',
+        occurrence_key='daily:2026-07-10',
+        input_fingerprint='c' * 64,
+    )
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        create_c11_work(
+            scope,
+            subject_id=project.id,
+            team=None,
+            work_type='daily_digest',
+            subject_type='project',
+            occurrence_key='daily:2026-07-10',
+            input_fingerprint='d' * 64,
+        )
+
+    work_model = get_workflow_work_model()
+    identity_constraint = next(
+        constraint
+        for constraint in work_model._meta.constraints
+        if isinstance(constraint, models.UniqueConstraint)
+        and constraint.condition is None
+        and 'input_fingerprint' in constraint.fields
+    )
+
+    assert tuple(identity_constraint.fields) == (
+        'organization',
+        'project',
+        'work_type',
+        'subject_type',
+        'subject_id',
+        'contract_version',
+        'input_fingerprint',
+    )
+    assert 'team' not in identity_constraint.fields
+    assert {
+        ('organization', 'project', 'disposition'),
+        ('organization', 'project', 'work_type', 'disposition'),
+        ('organization', 'project', 'subject_type', 'subject_id'),
+        ('organization', 'project', 'work_type', 'occurrence_key'),
+    } <= index_field_sets(work_model)
+
+
+@pytest.mark.parametrize(
+    'mutation',
+    [
+        {'contract_version': 0},
+        {'input_fingerprint': 'A' * 64},
+        {'input_fingerprint': 'g' * 64},
+        {'input_fingerprint': 'a' * 63},
+        {'subject_type': 'project'},
+        {'occurrence_key': 'unexpected'},
+    ],
+)
+@pytest.mark.django_db
+def test_workflow_work_rejects_invalid_identity_values(mutation: dict[str, object]) -> None:
+    scope = create_scope()
+    observation = create_c11_observation(scope, suffix='invalid-identity')
+    work = create_c11_work(scope, subject_id=observation.id)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        get_workflow_work_model().objects.filter(id=work.id).update(**mutation)
+
+
+@pytest.mark.django_db
+def test_workflow_work_database_checks_each_work_subject_branch() -> None:
+    scope = create_scope()
+    organization, team, project, _agent, session = scope
+    observation = create_c11_observation(scope, suffix='subject-pairs')
+    observation_work = create_c11_work(scope, subject_id=observation.id)
+    session_work = create_c11_work(
+        scope,
+        subject_id=session.id,
+        work_type='session_distillation',
+        subject_type='agent_session',
+        input_fingerprint='b' * 64,
+    )
+    daily_work = create_c11_work(
+        scope,
+        subject_id=project.id,
+        team=None,
+        work_type='daily_digest',
+        subject_type='project',
+        occurrence_key='daily:2026-07-10',
+        input_fingerprint='c' * 64,
+    )
+    weekly_project_work = create_c11_work(
+        scope,
+        subject_id=project.id,
+        team=None,
+        work_type='weekly_digest',
+        subject_type='project',
+        occurrence_key='weekly:2026-W28',
+        input_fingerprint='d' * 64,
+    )
+    selected_team = Team.objects.create(organization=organization, name='Selected', slug='selected')
+    weekly_team_work = create_c11_work(
+        scope,
+        subject_id=selected_team.id,
+        team=selected_team,
+        work_type='weekly_digest',
+        subject_type='team',
+        occurrence_key='weekly:2026-W28:selected',
+        input_fingerprint='e' * 64,
+    )
+    work_model = get_workflow_work_model()
+    _foreign_organization, _foreign_team, foreign_project, _foreign_agent, _foreign_session = create_second_scope()
+
+    for work, mutation in (
+        (observation_work, {'subject_type': 'agent_session'}),
+        (observation_work, {'occurrence_key': 'unexpected'}),
+        (session_work, {'subject_type': 'observation'}),
+        (session_work, {'occurrence_key': 'unexpected'}),
+        (daily_work, {'subject_id': foreign_project.id}),
+        (daily_work, {'team_id': team.id}),
+        (daily_work, {'occurrence_key': ''}),
+        (weekly_project_work, {'subject_id': foreign_project.id}),
+        (weekly_project_work, {'team_id': team.id}),
+        (weekly_project_work, {'occurrence_key': ''}),
+        (weekly_team_work, {'subject_id': team.id}),
+        (weekly_team_work, {'occurrence_key': ''}),
+    ):
+        with pytest.raises(IntegrityError), transaction.atomic():
+            work_model.objects.filter(id=work.id).update(**mutation)
+
+
+@pytest.mark.django_db
+def test_workflow_work_clean_rejects_cross_organization_project_or_team() -> None:
+    scope = create_scope()
+    _organization, _team, _project, _agent, _session = scope
+    observation = create_c11_observation(scope, suffix='scope-clean')
+    _foreign_organization, foreign_team, foreign_project, _foreign_agent, _foreign_session = create_second_scope()
+
+    with pytest.raises(ValidationError):
+        create_c11_work(
+            scope,
+            subject_id=foreign_project.id,
+            project=foreign_project,
+            team=None,
+            work_type='daily_digest',
+            subject_type='project',
+            occurrence_key='daily:2026-07-10',
+        )
+
+    with pytest.raises(ValidationError):
+        create_c11_work(scope, subject_id=observation.id, team=foreign_team)
+
+
+@pytest.mark.parametrize(
+    ('disposition', 'reason', 'resolved'),
+    [
+        ('required', '', False),
+        ('complete', 'succeeded', True),
+        ('complete', 'no_signal', True),
+        ('no_op', 'no_input', True),
+    ],
+)
+@pytest.mark.django_db
+def test_workflow_work_accepts_valid_terminal_combinations(
+    disposition: str,
+    reason: str,
+    resolved: bool,
+) -> None:
+    scope = create_scope()
+    observation = create_c11_observation(scope, suffix='valid-terminal')
+    work = create_c11_work(
+        scope,
+        subject_id=observation.id,
+        disposition=disposition,
+        resolution_reason=reason,
+        resolved_at=timezone.now() if resolved else None,
+    )
+
+    assert work.disposition == disposition
+
+
+@pytest.mark.parametrize(
+    ('disposition', 'reason', 'resolved'),
+    [
+        ('required', 'succeeded', False),
+        ('required', '', True),
+        ('complete', '', False),
+        ('complete', 'succeeded', False),
+        ('complete', 'no_input', True),
+        ('no_op', 'no_input', False),
+        ('no_op', 'succeeded', True),
+    ],
+)
+@pytest.mark.django_db
+def test_workflow_work_rejects_invalid_terminal_combinations(
+    disposition: str,
+    reason: str,
+    resolved: bool,
+) -> None:
+    scope = create_scope()
+    observation = create_c11_observation(scope, suffix='invalid-terminal')
+    work = create_c11_work(scope, subject_id=observation.id)
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        get_workflow_work_model().objects.filter(id=work.id).update(
+            disposition=disposition,
+            resolution_reason=reason,
+            resolved_at=timezone.now() if resolved else None,
+        )
+
+
+@pytest.mark.django_db
+def test_workflow_work_identity_snapshot_team_and_terminal_state_are_one_way() -> None:
+    scope = create_scope()
+    organization, team, project, _agent, _session = scope
+    first_observation = create_c11_observation(scope, suffix='immutable-first')
+    second_observation = create_c11_observation(scope, suffix='immutable-second')
+    work = create_c11_work(scope, subject_id=first_observation.id)
+
+    for changes in (
+        {'subject_id': second_observation.id},
+        {'contract_version': 2},
+        {'input_fingerprint': 'b' * 64},
+        {'input_snapshot': {'schema': 'changed/v1'}},
+    ):
+        assert_c11_save_rejected(work, **changes)
+
+    digest = create_c11_work(
+        scope,
+        subject_id=project.id,
+        team=None,
+        work_type='weekly_digest',
+        subject_type='project',
+        occurrence_key='weekly:2026-W28',
+        input_fingerprint='c' * 64,
+    )
+    assert_c11_save_rejected(digest, work_type='daily_digest')
+    assert_c11_save_rejected(digest, occurrence_key='weekly:2026-W29')
+    other_project = Project.objects.create(organization=organization, name='Other project', slug='immutable-project')
+    assert_c11_save_rejected(digest, project=other_project, subject_id=other_project.id)
+    assert_c11_save_rejected(digest, subject_type='team', subject_id=team.id, team=team)
+
+    team_work = create_c11_work(
+        scope,
+        subject_id=team.id,
+        team=team,
+        work_type='weekly_digest',
+        subject_type='team',
+        occurrence_key='weekly:2026-W28:team',
+        input_fingerprint='d' * 64,
+    )
+    foreign_organization, foreign_team, foreign_project, _foreign_agent, _foreign_session = create_second_scope()
+    assert_c11_save_rejected(
+        team_work,
+        organization=foreign_organization,
+        project=foreign_project,
+        team=foreign_team,
+        subject_id=foreign_team.id,
+    )
+
+    work.disposition = 'complete'
+    work.resolution_reason = 'succeeded'
+    work.resolved_at = timezone.now()
+    work.save()
+    work.refresh_from_db()
+
+    assert work.disposition == 'complete'
+
+    assert_c11_save_rejected(work, disposition='required', resolution_reason='', resolved_at=None)
+
+
+@pytest.mark.django_db
+def test_workflow_run_link_requires_matching_scope_team_and_type() -> None:
+    scope = create_scope()
+    organization, team, project, _agent, _session = scope
+    observation = create_c11_observation(scope, suffix='linked-run')
+    work = create_c11_work(scope, subject_id=observation.id)
+    linked = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type='observation_processing',
+        status='queued',
+    )
+    legacy = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        run_type='session_distillation',
+        status='succeeded',
+    )
+    other_team = Team.objects.create(organization=organization, name='Run team', slug='run-team')
+    other_project = Project.objects.create(organization=organization, name='Run project', slug='run-project')
+    foreign_organization, foreign_team, foreign_project, _foreign_agent, _foreign_session = create_second_scope()
+
+    mismatches = (
+        {'organization': organization, 'project': project, 'team': team, 'run_type': 'session_distillation'},
+        {'organization': organization, 'project': project, 'team': other_team, 'run_type': 'observation_processing'},
+        {'organization': organization, 'project': other_project, 'team': team, 'run_type': 'observation_processing'},
+        {
+            'organization': foreign_organization,
+            'project': foreign_project,
+            'team': foreign_team,
+            'run_type': 'observation_processing',
+        },
+    )
+    for mismatch in mismatches:
+        with pytest.raises(ValidationError):
+            WorkflowRun.objects.create(work=work, status='queued', **mismatch)
+
+    work_field = WorkflowRun._meta.get_field('work')
+
+    assert linked.work_id == work.id
+    assert work.attempts.get() == linked
+    assert legacy.work_id is None
+    assert work_field.null is True
+    assert work_field.blank is True
+    assert work_field.default is models.NOT_PROVIDED
+    assert work_field.remote_field.on_delete is models.PROTECT
+    assert work_field.remote_field.related_name == 'attempts'
