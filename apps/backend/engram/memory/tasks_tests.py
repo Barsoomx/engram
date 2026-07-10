@@ -680,16 +680,19 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
         if work_type != WorkflowWorkType.OBSERVATION_PROCESSING
         else WorkflowRunType.SESSION_DISTILLATION
     )
-    invalid_updates = (
+    invalid_updates = [
         {'work_id': other_work.id},
-        {'status': WorkflowRunStatus.SUCCEEDED},
+        {'status': WorkflowRunStatus.RUNNING},
+        {'status': WorkflowRunStatus.FAILED},
         {'run_type': wrong_run_type},
         {
             'organization_id': foreign_org.id,
             'project_id': foreign_project.id,
             'team_id': foreign_team.id,
         },
-    )
+    ]
+    if task_attribute != 'process_observation_work_v1':
+        invalid_updates.append({'status': WorkflowRunStatus.SUCCEEDED})
     task = getattr(tasks_module, task_attribute)
 
     with mock.patch(domain_target) as m_execute:

@@ -110,10 +110,10 @@ def _load_workflow_run(
     work: WorkflowWork,
     workflow_run_id: uuid.UUID,
     *,
-    allow_redelivered: bool,
+    allow_succeeded: bool,
 ) -> WorkflowRun:
     allowed_statuses = [WorkflowRunStatus.QUEUED]
-    if allow_redelivered:
+    if allow_succeeded:
         allowed_statuses.append(WorkflowRunStatus.SUCCEEDED)
 
     try:
@@ -147,11 +147,50 @@ def _claim_workflow_run(work: WorkflowWork, workflow_run: WorkflowRun) -> Workfl
             failure_reason='',
         )
     if claimed != 1:
-        raise MemoryWorkerError('workflow run is no longer queued')
+        try:
+            return WorkflowRun.objects.get(
+                id=workflow_run.id,
+                work_id=work.id,
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                run_type=work.work_type,
+                status=WorkflowRunStatus.SUCCEEDED,
+            )
+        except WorkflowRun.DoesNotExist as error:
+            raise MemoryWorkerError('workflow run is no longer queued') from error
 
     workflow_run.refresh_from_db()
 
     return workflow_run
+
+
+def _succeeded_workflow_run_result(
+    work: WorkflowWork,
+    workflow_run: WorkflowRun,
+    *,
+    via: str,
+) -> str:
+    disposition = (
+        WorkflowWork.objects.filter(
+            id=work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+        .values_list('disposition', flat=True)
+        .get()
+    )
+    if disposition != WorkflowWorkDisposition.COMPLETE:
+        raise MemoryWorkerError('succeeded workflow run has non-complete work')
+
+    logger.info(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(workflow_run.id),
+        via=via,
+    )
+
+    return str(workflow_run.id)
 
 
 def _requeue_workflow_run(workflow_run: WorkflowRun) -> None:
@@ -242,7 +281,7 @@ def _prepare_versioned_work(
     work_id: object,
     workflow_run_id: object,
     expected_work_type: str,
-    allow_redelivered_run: bool = False,
+    allow_succeeded_run: bool = False,
 ) -> tuple[WorkflowWork, WorkflowRun | None, bool]:
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, expected_work_type)
@@ -250,7 +289,7 @@ def _prepare_versioned_work(
         _load_workflow_run(
             work,
             parsed_run_id,
-            allow_redelivered=allow_redelivered_run,
+            allow_succeeded=allow_succeeded_run,
         )
         if parsed_run_id is not None
         else None
@@ -366,19 +405,27 @@ def process_observation_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    delivery_info = self.request.delivery_info or {}
     work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
-        allow_redelivered_run=delivery_info.get('redelivered') is True,
+        allow_succeeded_run=True,
     )
     if automatic_terminal:
         return str(work.id)
-    if workflow_run is not None and workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-        return str(workflow_run.id)
     if workflow_run is not None:
-        workflow_run = _claim_workflow_run(work, workflow_run)
+        duplicate_via = 'load'
+        if workflow_run.status == WorkflowRunStatus.QUEUED:
+            workflow_run = _claim_workflow_run(work, workflow_run)
+            duplicate_via = 'claim_cas_loss'
+        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+            return _succeeded_workflow_run_result(
+                work,
+                workflow_run,
+                via=duplicate_via,
+            )
+        if workflow_run.status != WorkflowRunStatus.RUNNING:
+            raise MemoryWorkerError('workflow run claim returned invalid status')
 
     structlog.contextvars.clear_contextvars()
     try:
