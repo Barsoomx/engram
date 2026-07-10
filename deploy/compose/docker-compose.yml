@@ -5,8 +5,10 @@ x-backend: &backend
   build:
     context: ../..
     dockerfile: apps/backend/Dockerfile
+  restart: unless-stopped
+  stop_signal: SIGTERM
   env_file:
-    - .env
+    - ${ENGRAM_ENV_FILE:-.env}
   environment:
     ENGRAM_DATABASE_URL: postgresql://engram:engram@postgres:5432/engram
     ENGRAM_REDIS_URL: redis://redis:6379/0
@@ -29,13 +31,21 @@ x-backend: &backend
     rabbitmq:
       condition: service_healthy
 
+x-worker: &worker
+  <<: *backend
+  stop_grace_period: 12m
+
 services:
   api:
     <<: *backend
-    command: >
-      sh -ec "python manage.py migrate --noinput &&
-              python manage.py engram_bootstrap_admin &&
-              granian --interface wsgi settings.wsgi:application --host 0.0.0.0 --port 8000"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        python manage.py migrate --noinput &&
+        python manage.py engram_bootstrap_admin &&
+        exec granian --interface wsgi settings.wsgi:application --host 0.0.0.0 --port 8000
+    stop_grace_period: 45s
     ports:
       - "8000:8000"
     healthcheck:
@@ -46,7 +56,7 @@ services:
       start_period: 20s
 
   worker-realtime:
-    <<: *backend
+    <<: *worker
     depends_on:
       api:
         condition: service_healthy
@@ -54,11 +64,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-realtime"
+    command: ["celery", "-A", "engram.celery_app", "worker", "--loglevel=info", "-Q", "engram-realtime"]
 
   worker-near-realtime:
-    <<: *backend
+    <<: *worker
     depends_on:
       api:
         condition: service_healthy
@@ -66,11 +75,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-near-realtime"
+    command: ["celery", "-A", "engram.celery_app", "worker", "--loglevel=info", "-Q", "engram-near-realtime"]
 
   worker-batch:
-    <<: *backend
+    <<: *worker
     depends_on:
       api:
         condition: service_healthy
@@ -78,11 +86,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-batch --prefetch-multiplier=1"
+    command: ["celery", "-A", "engram.celery_app", "worker", "--loglevel=info", "-Q", "engram-batch", "--prefetch-multiplier=1"]
 
   worker-highmemory:
-    <<: *backend
+    <<: *worker
     depends_on:
       api:
         condition: service_healthy
@@ -90,11 +97,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-highmemory"
+    command: ["celery", "-A", "engram.celery_app", "worker", "--loglevel=info", "-Q", "engram-highmemory"]
 
   worker-domain-events:
-    <<: *backend
+    <<: *worker
     depends_on:
       api:
         condition: service_healthy
@@ -102,8 +108,7 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app worker --loglevel=info -Q engram-domain-events"
+    command: ["celery", "-A", "engram.celery_app", "worker", "--loglevel=info", "-Q", "engram-domain-events"]
 
   beat:
     <<: *backend
@@ -114,8 +119,10 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "celery -A engram.celery_app beat --loglevel=info"
+    command: ["celery", "-A", "engram.celery_app", "beat", "--loglevel=info", "--schedule=/var/lib/engram-beat/celerybeat-schedule"]
+    stop_grace_period: 30s
+    volumes:
+      - beat_data:/var/lib/engram-beat
 
   relay:
     <<: *backend
@@ -126,8 +133,8 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-    command: >
-      sh -ec "python manage.py celery_outbox_relay"
+    command: ["python", "manage.py", "celery_outbox_relay", "--send-timeout", "10", "--shutdown-timeout", "45"]
+    stop_grace_period: 60s
 
   frontend:
     image: engram-frontend:local
@@ -153,6 +160,7 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+    restart: unless-stopped
 
   postgres:
     image: pgvector/pgvector:pg18
@@ -168,6 +176,7 @@ services:
     volumes:
       # PG18+ official image stores data in a major-version subdir; mount the parent.
       - postgres_data:/var/lib/postgresql
+    restart: unless-stopped
 
   redis:
     image: redis/redis-stack-server:7.4.0-v8
@@ -176,20 +185,27 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   rabbitmq:
     image: rabbitmq:4.3.2-management-alpine
+    hostname: ${ENGRAM_RABBITMQ_HOSTNAME:-rabbitmq}
     environment:
       RABBITMQ_DEFAULT_USER: engram
       RABBITMQ_DEFAULT_PASS: engram
       RABBITMQ_DEFAULT_VHOST: engram
+      RABBITMQ_NODENAME: ${ENGRAM_RABBITMQ_NODENAME:-rabbit@rabbitmq}
     volumes:
       - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-engram.conf:ro
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping && rabbitmqctl -q -p engram list_queues name >/dev/null"]
       interval: 5s
       timeout: 5s
       retries: 20
+    restart: unless-stopped
 
 volumes:
+  beat_data:
   postgres_data:
+  rabbitmq_data:
