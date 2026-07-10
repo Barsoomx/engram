@@ -1305,6 +1305,11 @@ simulated-published-`0032_workflowwork_sequence_expand`, exact reverse, and
 `0032b_agentsession_end_work_db_default` reapply historical-writer tests.
 Migration freshness alone is not proof of the physical default.
 
+The merged code is not the C1.1 deployment gate. Before C1.2 begins, direct
+PID-1 signaling, rollout-specific async quiescence, gated API cutover,
+exact-image rehearsal, rollback, and continuous hook-ledger requirements in
+`docs/superpowers/specs/2026-07-10-cp1-1-loss-aware-rollout.md` must also close.
+
 ## Rollback
 
 - Before producer cutover, revert additive code/migrations normally.
