@@ -1,0 +1,1201 @@
+from __future__ import annotations
+
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from typing import Any
+
+import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
+
+from engram.core.models import (
+    Agent,
+    AgentSession,
+    CandidateStatus,
+    LinkType,
+    Memory,
+    MemoryCandidate,
+    MemoryLink,
+    MemoryStatus,
+    MemoryVersion,
+    Observation,
+    ObservationSource,
+    Organization,
+    Project,
+    RawEventEnvelope,
+    RetrievalDocument,
+    Runtime,
+    SessionStatus,
+    Team,
+    VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+)
+from engram.memory.conflict_links import conflict_candidate_target
+from engram.memory.invariant_queries import (
+    InvariantId,
+    InvariantResult,
+    InvariantState,
+    evaluate_invariants,
+)
+
+FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
+EXPECTED_CASES = {
+    'no_run_session',
+    'stale_running_work',
+    'latest_failure_after_prior_success',
+    'duplicate_delivery',
+    'orphan_candidate',
+    'partial_promotion',
+    'conflict',
+    'oversized_session',
+}
+VALID_INVARIANTS = {f'P{number}' for number in range(1, 16)}
+VALID_STATES = {'healthy', 'violated', 'missing_observability'}
+EXPECTED_ENTRY_KEYS = {
+    'invariant_id',
+    'state',
+    'reason',
+    'violation_count',
+    'proxy_count',
+    'sample_refs',
+    'missing_evidence',
+    'target_checkpoint',
+}
+FORBIDDEN_KEYS = {
+    'title',
+    'body',
+    'payload',
+    'repository_url',
+    'provider',
+    'model',
+    'failure_reason',
+    'task_args',
+    'dsn',
+    'secret',
+}
+FIXED_AS_OF = datetime(2026, 7, 10, 12, tzinfo=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class ScopeFixture:
+    organization: Organization
+    project: Project
+    team: Team
+    agent: Agent
+
+
+def _load_manifest() -> dict[str, Any]:
+    return json.loads(FIXTURE_PATH.read_text())
+
+
+def _nested_keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        return set(value) | {key for item in value.values() for key in _nested_keys(item)}
+
+    if isinstance(value, list):
+        return {key for item in value for key in _nested_keys(item)}
+
+    return set()
+
+
+def _synthetic_id(ref: str) -> uuid.UUID:
+    return uuid.uuid5(uuid.NAMESPACE_URL, f'engram-cp0:{ref}')
+
+
+def _expected_sample_ids(sample_refs: list[str]) -> tuple[str, ...]:
+    qualified = []
+
+    for ref in sample_refs:
+        prefix, _separator, _name = ref.partition(':')
+        qualified.append((prefix, _synthetic_id(ref)))
+
+    return tuple(
+        f'{prefix}:{entity_id}'
+        for prefix, entity_id in sorted(
+            qualified,
+            key=lambda item: (item[1].int, item[0]),
+        )
+    )
+
+
+def test_baseline_manifest_declares_all_synthetic_scenarios() -> None:
+    manifest = _load_manifest()
+
+    assert manifest['schema_version'] == 1
+    assert set(manifest['scopes']) == {'target', 'foreign'}
+    assert manifest['scopes']['target'] != manifest['scopes']['foreign']
+    assert all(value.startswith('synthetic-') for scope in manifest['scopes'].values() for value in scope.values())
+
+    scenarios = manifest['scenarios']
+
+    assert {scenario['id'] for scenario in scenarios} == EXPECTED_CASES
+
+    for scenario in scenarios:
+        assert set(scenario) == {
+            'id',
+            'invariant_ids',
+            'expected_characterization',
+            'target',
+            'foreign_tenant_control',
+        }
+        assert set(scenario['invariant_ids']) <= VALID_INVARIANTS
+        assert [entry['invariant_id'] for entry in scenario['expected_characterization']] == scenario['invariant_ids']
+        assert scenario['target']['scope_ref'] == 'target'
+        assert scenario['foreign_tenant_control']['scope_ref'] == 'foreign'
+        assert set(scenario['target']) == {'scope_ref', 'entity_refs'}
+        assert set(scenario['foreign_tenant_control']) == {'scope_ref', 'entity_refs'}
+        assert set(scenario['target']['entity_refs']).isdisjoint(
+            scenario['foreign_tenant_control']['entity_refs'],
+        )
+        assert scenario['expected_characterization']
+
+        for expected in scenario['expected_characterization']:
+            assert set(expected) == EXPECTED_ENTRY_KEYS
+            assert expected['invariant_id'] in scenario['invariant_ids']
+            assert expected['state'] in VALID_STATES
+            assert isinstance(expected['sample_refs'], list)
+
+
+def test_baseline_manifest_excludes_sensitive_content_keys() -> None:
+    assert not (_nested_keys(_load_manifest()) & FORBIDDEN_KEYS)
+
+
+def _create_scope(prefix: str) -> ScopeFixture:
+    organization = Organization.objects.create(
+        id=_synthetic_id(f'organization:{prefix}'),
+        name=f'Synthetic {prefix}',
+        slug=f'synthetic-{prefix}',
+    )
+    project = Project.objects.create(
+        id=_synthetic_id(f'project:{prefix}'),
+        organization=organization,
+        name=f'Synthetic project {prefix}',
+        slug=f'project-{prefix}',
+    )
+    team = Team.objects.create(
+        id=_synthetic_id(f'team:{prefix}'),
+        organization=organization,
+        name=f'Synthetic team {prefix}',
+        slug=f'team-{prefix}',
+    )
+    agent = Agent.objects.create(
+        id=_synthetic_id(f'agent:{prefix}'),
+        organization=organization,
+        runtime=Runtime.CODEX,
+        external_id=f'agent-{prefix}',
+    )
+
+    return ScopeFixture(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+    )
+
+
+@pytest.fixture
+def f_scope() -> ScopeFixture:
+    return _create_scope('target')
+
+
+@pytest.fixture
+def f_foreign_scope() -> ScopeFixture:
+    return _create_scope('foreign')
+
+
+def _make_session(
+    scope: ScopeFixture,
+    suffix: str,
+    *,
+    status: str = SessionStatus.ENDED,
+    entity_id: uuid.UUID | None = None,
+) -> AgentSession:
+    return AgentSession.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        agent=scope.agent,
+        external_session_id=f'session-{suffix}',
+        runtime=Runtime.CODEX,
+        status=status,
+        ended_at=FIXED_AS_OF if status == SessionStatus.ENDED else None,
+    )
+
+
+def _make_raw_event(
+    scope: ScopeFixture,
+    session: AgentSession,
+    suffix: str,
+    *,
+    entity_id: uuid.UUID | None = None,
+) -> RawEventEnvelope:
+    return RawEventEnvelope.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        agent=scope.agent,
+        session=session,
+        event_type='post_tool_use',
+        client_event_id=f'event-{suffix}',
+        idempotency_key=f'idempotency-{suffix}',
+        content_hash=f'raw-hash-{suffix}',
+        runtime=Runtime.CODEX,
+        payload={'synthetic': True},
+    )
+
+
+def _make_observation(
+    scope: ScopeFixture,
+    session: AgentSession,
+    suffix: str,
+    *,
+    observation_type: str = 'tool_use',
+    entity_id: uuid.UUID | None = None,
+) -> Observation:
+    return Observation.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        agent=scope.agent,
+        session=session,
+        observation_type=observation_type,
+        title=f'Synthetic observation {suffix}',
+        body=f'Synthetic detail {suffix}',
+        content_hash=f'observation-hash-{suffix}',
+        observed_at=FIXED_AS_OF,
+    )
+
+
+def _make_source(
+    scope: ScopeFixture,
+    observation: Observation,
+    raw_event: RawEventEnvelope,
+    suffix: str,
+    *,
+    entity_id: uuid.UUID | None = None,
+) -> ObservationSource:
+    return ObservationSource.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        observation=observation,
+        raw_event=raw_event,
+        source_type='raw_event',
+        source_id=f'source-{suffix}',
+    )
+
+
+def _make_candidate(
+    scope: ScopeFixture,
+    suffix: str,
+    *,
+    status: str = CandidateStatus.PROPOSED,
+    entity_id: uuid.UUID | None = None,
+) -> MemoryCandidate:
+    return MemoryCandidate.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        title=f'Synthetic candidate {suffix}',
+        body=f'Synthetic candidate detail {suffix}',
+        status=status,
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=f'candidate-hash-{suffix}',
+        confidence=Decimal('0.900'),
+    )
+
+
+def _make_memory(
+    scope: ScopeFixture,
+    suffix: str,
+    *,
+    entity_id: uuid.UUID | None = None,
+    body: str | None = None,
+    status: str = MemoryStatus.APPROVED,
+    confidence: Decimal = Decimal('0.900'),
+    stale: bool = False,
+    refuted: bool = False,
+    current_version: int = 1,
+) -> Memory:
+    return Memory.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        title=f'Synthetic memory {suffix}',
+        body=body or f'Synthetic memory detail {suffix}',
+        status=status,
+        visibility_scope=VisibilityScope.PROJECT,
+        confidence=confidence,
+        stale=stale,
+        refuted=refuted,
+        current_version=current_version,
+    )
+
+
+def _make_version(
+    memory: Memory,
+    suffix: str,
+    *,
+    body: str | None = None,
+    entity_id: uuid.UUID | None = None,
+) -> MemoryVersion:
+    return MemoryVersion.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=memory.organization,
+        project=memory.project,
+        memory=memory,
+        version=memory.current_version,
+        body=body if body is not None else memory.body,
+        content_hash=f'version-hash-{suffix}',
+    )
+
+
+def _make_document(
+    memory: Memory,
+    version: MemoryVersion,
+    *,
+    stale: bool | None = None,
+    refuted: bool | None = None,
+    entity_id: uuid.UUID | None = None,
+) -> RetrievalDocument:
+    return RetrievalDocument.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=memory.organization,
+        project=memory.project,
+        team=memory.team,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=memory.visibility_scope,
+        full_text='Synthetic retrieval text',
+        stale=memory.stale if stale is None else stale,
+        refuted=memory.refuted if refuted is None else refuted,
+    )
+
+
+def _make_complete_memory(
+    scope: ScopeFixture,
+    suffix: str,
+    *,
+    entity_id: uuid.UUID | None = None,
+    status: str = MemoryStatus.APPROVED,
+    confidence: Decimal = Decimal('0.900'),
+) -> tuple[Memory, MemoryVersion, RetrievalDocument]:
+    memory = _make_memory(
+        scope,
+        suffix,
+        entity_id=entity_id,
+        status=status,
+        confidence=confidence,
+    )
+    version = _make_version(
+        memory,
+        suffix,
+        entity_id=_synthetic_id(f'{suffix}:version') if entity_id is not None else None,
+    )
+    document = _make_document(
+        memory,
+        version,
+        entity_id=_synthetic_id(f'{suffix}:document') if entity_id is not None else None,
+    )
+
+    return memory, version, document
+
+
+def _make_workflow_run(
+    scope: ScopeFixture,
+    *,
+    status: str,
+    session: AgentSession | None = None,
+    started_at: datetime | None = None,
+    entity_id: uuid.UUID | None = None,
+    run_type: str = WorkflowRunType.SESSION_DISTILLATION,
+) -> WorkflowRun:
+    return WorkflowRun.objects.create(
+        id=entity_id or uuid.uuid4(),
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        run_type=run_type,
+        status=status,
+        input_snapshot={'session_id': str(session.id)} if session is not None else {},
+        started_at=started_at,
+    )
+
+
+def _result_by_id(
+    scope: ScopeFixture,
+    *,
+    as_of: datetime = FIXED_AS_OF,
+) -> dict[str, InvariantResult]:
+    return {
+        str(result.invariant_id): result
+        for result in evaluate_invariants(
+            organization_id=scope.organization.id,
+            project_id=scope.project.id,
+            as_of=as_of,
+        )
+    }
+
+
+def _assert_characterization(result: InvariantResult, expected: dict[str, Any]) -> None:
+    assert str(result.invariant_id) == expected['invariant_id']
+    assert result.state == expected['state']
+    assert result.reason == expected['reason']
+    assert result.violation_count == expected['violation_count']
+    assert result.proxy_count == expected['proxy_count']
+    assert result.sample_ids == _expected_sample_ids(expected['sample_refs'])
+    assert result.missing_evidence == expected['missing_evidence']
+    assert result.target_checkpoint == expected['target_checkpoint']
+
+
+@pytest.mark.django_db
+def test_evaluation_fails_closed_for_mismatched_organization_and_project(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    with pytest.raises(Project.DoesNotExist):
+        evaluate_invariants(
+            organization_id=f_scope.organization.id,
+            project_id=f_foreign_scope.project.id,
+            as_of=FIXED_AS_OF,
+        )
+
+
+@pytest.mark.django_db
+def test_evaluation_rejects_naive_as_of(f_scope: ScopeFixture) -> None:
+    with pytest.raises(ValueError, match='timezone-aware'):
+        evaluate_invariants(
+            organization_id=f_scope.organization.id,
+            project_id=f_scope.project.id,
+            as_of=datetime(2026, 7, 10, 12),  # noqa: DTZ001 - intentionally naive contract input
+        )
+
+
+@pytest.mark.django_db
+def test_evaluation_returns_p1_through_p15_in_order(f_scope: ScopeFixture) -> None:
+    results = evaluate_invariants(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+        as_of=FIXED_AS_OF,
+    )
+
+    assert tuple(result.invariant_id for result in results) == tuple(InvariantId)
+
+
+@pytest.mark.django_db
+def test_p1_is_healthy_without_raw_events_and_detects_missing_source(
+    f_scope: ScopeFixture,
+) -> None:
+    healthy = _result_by_id(f_scope)['P1']
+
+    assert healthy.state == InvariantState.HEALTHY
+    assert healthy.reason == 'scoped_raw_events_normalized'
+    assert healthy.violation_count == 0
+    assert healthy.proxy_count is None
+    assert healthy.sample_ids == ()
+    assert healthy.target_checkpoint == 'CP1'
+
+    session = _make_session(f_scope, 'p1-missing')
+    raw_event = _make_raw_event(
+        f_scope,
+        session,
+        'p1-missing',
+        entity_id=uuid.UUID('00000000-0000-0000-0000-000000000011'),
+    )
+
+    violated = _result_by_id(f_scope)['P1']
+
+    assert violated.state == InvariantState.VIOLATED
+    assert violated.reason == 'raw_event_normalization_cardinality_invalid'
+    assert violated.violation_count == 1
+    assert violated.proxy_count is None
+    assert violated.sample_ids == (f'raw_event:{raw_event.id}',)
+    assert violated.missing_evidence is None
+    assert violated.target_checkpoint == 'CP1'
+
+
+@pytest.mark.django_db
+def test_p1_requires_exactly_one_total_and_same_scope_source(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    target_session = _make_session(f_scope, 'p1-cardinality')
+    duplicate_raw = _make_raw_event(
+        f_scope,
+        target_session,
+        'p1-duplicate',
+        entity_id=uuid.UUID('00000000-0000-0000-0000-000000000021'),
+    )
+    first = _make_observation(f_scope, target_session, 'p1-first')
+    second = _make_observation(f_scope, target_session, 'p1-second')
+    _make_source(f_scope, first, duplicate_raw, 'p1-first')
+    _make_source(f_scope, second, duplicate_raw, 'p1-second')
+
+    corrupt_raw = _make_raw_event(
+        f_scope,
+        target_session,
+        'p1-corrupt',
+        entity_id=uuid.UUID('00000000-0000-0000-0000-000000000022'),
+    )
+    target_observation = _make_observation(f_scope, target_session, 'p1-corrupt-target')
+    source = _make_source(f_scope, target_observation, corrupt_raw, 'p1-corrupt')
+    foreign_session = _make_session(f_foreign_scope, 'p1-corrupt-foreign')
+    foreign_observation = _make_observation(
+        f_foreign_scope,
+        foreign_session,
+        'p1-corrupt-foreign',
+    )
+    ObservationSource.objects.filter(id=source.id).update(observation_id=foreign_observation.id)
+
+    result = _result_by_id(f_scope)['P1']
+
+    assert result.violation_count == 2
+    assert result.sample_ids == (
+        f'raw_event:{duplicate_raw.id}',
+        f'raw_event:{corrupt_raw.id}',
+    )
+
+
+@pytest.mark.django_db
+def test_p1_foreign_project_anomaly_is_neither_counted_nor_sampled(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    target_session = _make_session(f_scope, 'p1-target')
+    target_raw = _make_raw_event(
+        f_scope,
+        target_session,
+        'p1-target',
+        entity_id=uuid.UUID('00000000-0000-0000-0000-000000000031'),
+    )
+    foreign_session = _make_session(f_foreign_scope, 'p1-foreign')
+    foreign_raw = _make_raw_event(
+        f_foreign_scope,
+        foreign_session,
+        'p1-foreign',
+        entity_id=uuid.UUID('00000000-0000-0000-0000-000000000001'),
+    )
+
+    result = _result_by_id(f_scope)['P1']
+
+    assert result.violation_count == 1
+    assert result.sample_ids == (f'raw_event:{target_raw.id}',)
+    assert f'raw_event:{foreign_raw.id}' not in result.sample_ids
+
+
+@pytest.mark.django_db
+def test_p3_requires_non_lifecycle_input_and_correlates_json_session_id(
+    f_scope: ScopeFixture,
+) -> None:
+    lifecycle_session = _make_session(f_scope, 'p3-lifecycle')
+    _make_observation(
+        f_scope,
+        lifecycle_session,
+        'p3-lifecycle',
+        observation_type='session_start',
+    )
+    uncovered_session = _make_session(f_scope, 'p3-uncovered')
+    _make_observation(f_scope, uncovered_session, 'p3-uncovered')
+    covered_session = _make_session(f_scope, 'p3-covered')
+    _make_observation(f_scope, covered_session, 'p3-covered')
+    _make_workflow_run(
+        f_scope,
+        status=WorkflowRunStatus.SUCCEEDED,
+        session=covered_session,
+    )
+
+    result = _result_by_id(f_scope)['P3']
+
+    assert result.proxy_count == 1
+    assert result.sample_ids == (f'session:{uncovered_session.id}',)
+
+    _make_workflow_run(
+        f_scope,
+        status=WorkflowRunStatus.SUCCEEDED,
+        session=uncovered_session,
+    )
+
+    result = _result_by_id(f_scope)['P3']
+
+    assert result.proxy_count == 0
+    assert result.sample_ids == ()
+
+
+@pytest.mark.django_db
+def test_p4_coalesces_started_at_over_created_at(f_scope: ScopeFixture) -> None:
+    fallback_run = _make_workflow_run(f_scope, status=WorkflowRunStatus.RUNNING)
+    recent_started_run = _make_workflow_run(
+        f_scope,
+        status=WorkflowRunStatus.RUNNING,
+        started_at=FIXED_AS_OF - timedelta(minutes=1),
+    )
+    WorkflowRun.objects.filter(id__in=(fallback_run.id, recent_started_run.id)).update(
+        created_at=FIXED_AS_OF - timedelta(minutes=31),
+    )
+
+    result = _result_by_id(f_scope)['P4']
+
+    assert result.proxy_count == 1
+    assert result.sample_ids == (f'workflow_run:{fallback_run.id}',)
+
+
+@pytest.mark.django_db
+def test_p7_sums_guarded_promotion_version_body_and_document_anomalies(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    orphan_candidate = _make_candidate(
+        f_scope,
+        'p7-orphan',
+        status=CandidateStatus.PROMOTED,
+        entity_id=uuid.UUID(int=101),
+    )
+    missing_version = _make_memory(
+        f_scope,
+        'p7-missing-version',
+        entity_id=uuid.UUID(int=102),
+    )
+    mismatched_body = _make_memory(
+        f_scope,
+        'p7-body-mismatch',
+        entity_id=uuid.UUID(int=103),
+    )
+    _make_version(mismatched_body, 'p7-body-mismatch', body='Different synthetic detail')
+
+    wrong_scope_document_memory, _version, wrong_scope_document = _make_complete_memory(
+        f_scope,
+        'p7-wrong-document-scope',
+        entity_id=uuid.UUID(int=104),
+    )
+    RetrievalDocument.objects.filter(id=wrong_scope_document.id).update(
+        organization_id=f_foreign_scope.organization.id,
+        project_id=f_foreign_scope.project.id,
+    )
+
+    stale_refuted_memory = _make_memory(
+        f_scope,
+        'p7-stale-refuted',
+        entity_id=uuid.UUID(int=105),
+        stale=True,
+        refuted=False,
+    )
+    stale_refuted_version = _make_version(stale_refuted_memory, 'p7-stale-refuted')
+    _make_document(
+        stale_refuted_memory,
+        stale_refuted_version,
+        stale=False,
+        refuted=True,
+    )
+    _make_complete_memory(
+        f_scope,
+        'p7-coherent',
+        entity_id=uuid.UUID(int=106),
+    )
+
+    result = _result_by_id(f_scope)['P7']
+
+    assert result.state == InvariantState.VIOLATED
+    assert result.reason == 'promotion_chain_inconsistent'
+    assert result.violation_count == 6
+    assert result.proxy_count is None
+    assert result.sample_ids == (
+        f'candidate:{orphan_candidate.id}',
+        f'memory:{missing_version.id}',
+        f'memory:{mismatched_body.id}',
+        f'memory:{wrong_scope_document_memory.id}',
+        f'memory:{stale_refuted_memory.id}',
+    )
+    assert result.missing_evidence == 'relational promotion provenance and transition audit identity'
+    assert result.target_checkpoint == 'CP4'
+
+
+@pytest.mark.django_db
+def test_p7_ignores_foreign_scope_anomalies(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    _make_candidate(
+        f_foreign_scope,
+        'p7-foreign-orphan',
+        status=CandidateStatus.PROMOTED,
+    )
+    _make_memory(f_foreign_scope, 'p7-foreign-missing-version')
+
+    result = _result_by_id(f_scope)['P7']
+
+    assert result.state == InvariantState.MISSING_OBSERVABILITY
+    assert result.reason == 'promotion_provenance_audit_relation_missing'
+    assert result.violation_count == 0
+    assert result.proxy_count is None
+    assert result.sample_ids == ()
+    assert result.missing_evidence == 'relational promotion provenance and transition audit identity'
+    assert result.target_checkpoint == 'CP4'
+
+
+@pytest.mark.django_db
+def test_p12_mirrors_review_population_but_excludes_genuine_conflicts(
+    f_scope: ScopeFixture,
+) -> None:
+    ordinary_candidate = _make_candidate(
+        f_scope,
+        'p12-ordinary',
+        entity_id=uuid.UUID(int=201),
+    )
+    conflict_candidate = _make_candidate(
+        f_scope,
+        'p12-conflict-candidate',
+        entity_id=uuid.UUID(int=202),
+    )
+    conflict_source, _version, _document = _make_complete_memory(
+        f_scope,
+        'p12-conflict-source',
+        entity_id=uuid.UUID(int=203),
+    )
+    MemoryLink.objects.create(
+        organization=f_scope.organization,
+        project=f_scope.project,
+        memory=conflict_source,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=conflict_candidate_target(conflict_candidate.id),
+    )
+    low_confidence = _make_memory(
+        f_scope,
+        'p12-low-confidence',
+        entity_id=uuid.UUID(int=204),
+        confidence=Decimal('0.300'),
+    )
+    refuted_flag = _make_memory(
+        f_scope,
+        'p12-refuted-flag',
+        entity_id=uuid.UUID(int=205),
+        refuted=True,
+    )
+    refuted_status = _make_memory(
+        f_scope,
+        'p12-refuted-status',
+        entity_id=uuid.UUID(int=206),
+        status=MemoryStatus.REFUTED,
+    )
+    _make_memory(
+        f_scope,
+        'p12-conflict-memory',
+        entity_id=uuid.UUID(int=207),
+        status=MemoryStatus.CONFLICT,
+        confidence=Decimal('0.100'),
+        refuted=True,
+    )
+
+    result = _result_by_id(f_scope)['P12']
+
+    assert result.state == InvariantState.VIOLATED
+    assert result.reason == 'non_conflict_item_in_human_inbox'
+    assert result.violation_count == 4
+    assert result.proxy_count is None
+    assert result.sample_ids == (
+        f'candidate:{ordinary_candidate.id}',
+        f'memory:{low_confidence.id}',
+        f'memory:{refuted_flag.id}',
+        f'memory:{refuted_status.id}',
+    )
+    assert f'candidate:{conflict_candidate.id}' not in result.sample_ids
+    assert result.missing_evidence is None
+    assert result.target_checkpoint == 'CP5'
+
+
+@pytest.mark.django_db
+def test_p12_requires_scoped_link_and_same_scope_origin_memory(
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    target_candidate = _make_candidate(
+        f_scope,
+        'p12-target',
+        entity_id=uuid.UUID(int=211),
+    )
+    foreign_origin, _version, _document = _make_complete_memory(
+        f_foreign_scope,
+        'p12-foreign-origin',
+        entity_id=uuid.UUID(int=212),
+    )
+    corrupt_link = MemoryLink.objects.create(
+        organization=f_foreign_scope.organization,
+        project=f_foreign_scope.project,
+        memory=foreign_origin,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=conflict_candidate_target(target_candidate.id),
+    )
+    MemoryLink.objects.filter(id=corrupt_link.id).update(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+    _make_candidate(f_foreign_scope, 'p12-foreign-candidate', entity_id=uuid.UUID(int=1))
+    _make_memory(
+        f_foreign_scope,
+        'p12-foreign-low-memory',
+        entity_id=uuid.UUID(int=2),
+        confidence=Decimal('0.100'),
+    )
+
+    result = _result_by_id(f_scope)['P12']
+
+    assert result.violation_count == 1
+    assert result.sample_ids == (f'candidate:{target_candidate.id}',)
+
+
+@pytest.mark.django_db
+def test_p12_samples_are_bounded_and_ordered_by_uuid_then_prefix(
+    f_scope: ScopeFixture,
+) -> None:
+    expected_samples: list[str] = []
+
+    for number in range(300, 311):
+        entity_id = uuid.UUID(int=number)
+        candidate = _make_candidate(f_scope, f'p12-sample-candidate-{number}', entity_id=entity_id)
+        memory = _make_memory(
+            f_scope,
+            f'p12-sample-memory-{number}',
+            entity_id=entity_id,
+            confidence=Decimal('0.100'),
+        )
+        expected_samples.extend((f'candidate:{candidate.id}', f'memory:{memory.id}'))
+
+    result = _result_by_id(f_scope)['P12']
+
+    assert result.violation_count == 22
+    assert result.sample_ids == tuple(expected_samples[:20])
+
+
+@pytest.mark.django_db
+def test_p6_samples_are_bounded_and_ordered(f_scope: ScopeFixture) -> None:
+    candidates = [
+        _make_candidate(
+            f_scope,
+            f'p6-sample-{number}',
+            entity_id=uuid.UUID(int=number),
+        )
+        for number in reversed(range(400, 425))
+    ]
+    expected = tuple(
+        f'candidate:{candidate.id}' for candidate in sorted(candidates, key=lambda candidate: candidate.id.int)[:20]
+    )
+
+    result = _result_by_id(f_scope)['P6']
+
+    assert result.proxy_count == 25
+    assert result.sample_ids == expected
+
+
+@pytest.mark.django_db
+def test_missing_observability_catalog_is_exact(f_scope: ScopeFixture) -> None:
+    expected = {
+        'P2': (
+            'logical_work_intent_relation_missing',
+            'durable logical-work-intent relation tied to the source transition',
+            'CP1',
+        ),
+        'P5': (
+            'observation_coverage_relation_missing',
+            'observation-to-window disposition coverage relation',
+            'CP3',
+        ),
+        'P8': (
+            'memory_transition_history_relation_missing',
+            'immutable transition history and authoritative current pointer',
+            'CP4',
+        ),
+        'P9': (
+            'durable_conflict_evidence_relation_missing',
+            'conflict evidence surviving cleanup and restart',
+            'CP4/CP5',
+        ),
+        'P10': (
+            'replay_evidence_fields_missing',
+            'replay fingerprint, byte hash, authorization, and budget evidence',
+            'CP6',
+        ),
+        'P11': (
+            'temporal_eligibility_evidence_missing',
+            'retrieval-time temporal eligibility evidence',
+            'CP8',
+        ),
+        'P13': (
+            'repair_run_relation_missing',
+            'repair identity, progress, idempotency, and dry-run explanation',
+            'CP2/CP10',
+        ),
+        'P14': (
+            'operation_scope_resolution_evidence_missing',
+            'operation-to-resolved organization/project/team evidence',
+            'CP1+',
+        ),
+        'P15': (
+            'repository_impact_coverage_relation_missing',
+            'memory revision and impact-coverage revision relation',
+            'CP8',
+        ),
+    }
+    results = _result_by_id(f_scope)
+
+    for invariant_id, (reason, missing_evidence, target_checkpoint) in expected.items():
+        result = results[invariant_id]
+
+        assert result.state == InvariantState.MISSING_OBSERVABILITY
+        assert result.reason == reason
+        assert result.violation_count is None
+        assert result.proxy_count is None
+        assert result.sample_ids == ()
+        assert result.missing_evidence == missing_evidence
+        assert result.target_checkpoint == target_checkpoint
+
+
+@pytest.mark.django_db
+def test_zero_proxies_remain_missing_observability(f_scope: ScopeFixture) -> None:
+    results = _result_by_id(f_scope)
+
+    for invariant_id in ('P3', 'P4', 'P6'):
+        result = results[invariant_id]
+
+        assert result.state == InvariantState.MISSING_OBSERVABILITY
+        assert result.proxy_count == 0
+
+
+@pytest.mark.django_db
+def test_evaluation_uses_selects_only_and_preserves_all_read_model_counts(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'read-only')
+    _make_raw_event(f_scope, session, 'read-only')
+    _make_observation(f_scope, session, 'read-only')
+    _make_candidate(f_scope, 'read-only')
+    _make_memory(f_scope, 'read-only')
+    read_models = (
+        Project,
+        RawEventEnvelope,
+        ObservationSource,
+        Observation,
+        AgentSession,
+        WorkflowRun,
+        MemoryCandidate,
+        Memory,
+        MemoryVersion,
+        RetrievalDocument,
+        MemoryLink,
+    )
+    before = {model: model.objects.count() for model in read_models}
+
+    with CaptureQueriesContext(connection) as captured:
+        evaluate_invariants(
+            organization_id=f_scope.organization.id,
+            project_id=f_scope.project.id,
+            as_of=FIXED_AS_OF,
+        )
+
+    after = {model: model.objects.count() for model in read_models}
+
+    assert captured.captured_queries
+    assert all(query['sql'].lstrip().upper().startswith('SELECT') for query in captured.captured_queries)
+    assert after == before
+
+
+def _materialize_scenario(
+    scenario_id: str,
+    scope: ScopeFixture,
+    entity_refs: list[str],
+    *,
+    as_of: datetime,
+) -> None:
+    if scenario_id == 'no_run_session':
+        [session_ref] = entity_refs
+        session = _make_session(scope, session_ref, entity_id=_synthetic_id(session_ref))
+        observation_ref = f'{session_ref}:observation'
+        _make_observation(
+            scope,
+            session,
+            observation_ref,
+            entity_id=_synthetic_id(observation_ref),
+        )
+
+        return
+
+    if scenario_id == 'stale_running_work':
+        [run_ref] = entity_refs
+        _make_workflow_run(
+            scope,
+            status=WorkflowRunStatus.RUNNING,
+            started_at=as_of - timedelta(minutes=31),
+            entity_id=_synthetic_id(run_ref),
+            run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        )
+
+        return
+
+    if scenario_id == 'latest_failure_after_prior_success':
+        [session_ref] = entity_refs
+        session = _make_session(scope, session_ref, entity_id=_synthetic_id(session_ref))
+        observation_ref = f'{session_ref}:observation'
+        _make_observation(
+            scope,
+            session,
+            observation_ref,
+            entity_id=_synthetic_id(observation_ref),
+        )
+        _make_workflow_run(
+            scope,
+            status=WorkflowRunStatus.SUCCEEDED,
+            session=session,
+            entity_id=_synthetic_id(f'{session_ref}:success'),
+        )
+        _make_workflow_run(
+            scope,
+            status=WorkflowRunStatus.FAILED,
+            session=session,
+            entity_id=_synthetic_id(f'{session_ref}:failure'),
+        )
+
+        return
+
+    if scenario_id == 'duplicate_delivery':
+        [raw_ref] = entity_refs
+        session_ref = f'{raw_ref}:session'
+        session = _make_session(
+            scope,
+            session_ref,
+            status=SessionStatus.ACTIVE,
+            entity_id=_synthetic_id(session_ref),
+        )
+        raw_event = _make_raw_event(
+            scope,
+            session,
+            raw_ref,
+            entity_id=_synthetic_id(raw_ref),
+        )
+        observation_ref = f'{raw_ref}:observation'
+        observation = _make_observation(
+            scope,
+            session,
+            observation_ref,
+            entity_id=_synthetic_id(observation_ref),
+        )
+        source_ref = f'{raw_ref}:source'
+        _make_source(
+            scope,
+            observation,
+            raw_event,
+            source_ref,
+            entity_id=_synthetic_id(source_ref),
+        )
+
+        return
+
+    if scenario_id == 'orphan_candidate':
+        [candidate_ref] = entity_refs
+        _make_candidate(scope, candidate_ref, entity_id=_synthetic_id(candidate_ref))
+
+        return
+
+    if scenario_id == 'partial_promotion':
+        [candidate_ref] = entity_refs
+        _make_candidate(
+            scope,
+            candidate_ref,
+            status=CandidateStatus.PROMOTED,
+            entity_id=_synthetic_id(candidate_ref),
+        )
+
+        return
+
+    if scenario_id == 'conflict':
+        candidate_ref, memory_ref = entity_refs
+        candidate = _make_candidate(
+            scope,
+            candidate_ref,
+            entity_id=_synthetic_id(candidate_ref),
+        )
+        memory, _version, _document = _make_complete_memory(
+            scope,
+            memory_ref,
+            entity_id=_synthetic_id(memory_ref),
+        )
+        MemoryLink.objects.create(
+            id=_synthetic_id(f'{candidate_ref}:link'),
+            organization=scope.organization,
+            project=scope.project,
+            memory=memory,
+            link_type=LinkType.CONFLICTS_WITH,
+            target=conflict_candidate_target(candidate.id),
+        )
+
+        return
+
+    if scenario_id == 'oversized_session':
+        [session_ref] = entity_refs
+        session = _make_session(scope, session_ref, entity_id=_synthetic_id(session_ref))
+
+        for index in range(101):
+            observation_ref = f'{session_ref}:observation:{index:03d}'
+            _make_observation(
+                scope,
+                session,
+                observation_ref,
+                entity_id=_synthetic_id(observation_ref),
+            )
+
+        return
+
+    raise AssertionError(f'unknown synthetic scenario: {scenario_id}')
+
+
+SCENARIOS = _load_manifest()['scenarios']
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('scenario', SCENARIOS, ids=[scenario['id'] for scenario in SCENARIOS])
+def test_manifest_scenarios_materialize_and_foreign_controls_are_isolated(
+    scenario: dict[str, Any],
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    _materialize_scenario(
+        scenario['id'],
+        f_scope,
+        scenario['target']['entity_refs'],
+        as_of=FIXED_AS_OF,
+    )
+    before_foreign = evaluate_invariants(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+        as_of=FIXED_AS_OF,
+    )
+    before_by_id = {str(result.invariant_id): result for result in before_foreign}
+
+    for expected in scenario['expected_characterization']:
+        _assert_characterization(before_by_id[expected['invariant_id']], expected)
+
+    _materialize_scenario(
+        scenario['id'],
+        f_foreign_scope,
+        scenario['foreign_tenant_control']['entity_refs'],
+        as_of=FIXED_AS_OF,
+    )
+    after_foreign = evaluate_invariants(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+        as_of=FIXED_AS_OF,
+    )
+    after_by_id = {str(result.invariant_id): result for result in after_foreign}
+
+    assert after_foreign == before_foreign
+
+    for expected in scenario['expected_characterization']:
+        _assert_characterization(after_by_id[expected['invariant_id']], expected)

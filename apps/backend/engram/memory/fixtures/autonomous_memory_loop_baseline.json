@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "scopes": {
+    "target": {
+      "organization_ref": "synthetic-org-target",
+      "project_ref": "synthetic-project-target"
+    },
+    "foreign": {
+      "organization_ref": "synthetic-org-foreign",
+      "project_ref": "synthetic-project-foreign"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "no_run_session",
+      "invariant_ids": ["P3"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P3",
+          "state": "missing_observability",
+          "reason": "latest_input_watermark_missing",
+          "violation_count": null,
+          "proxy_count": 1,
+          "sample_refs": ["session:no-run"],
+          "missing_evidence": "exact latest and completed input watermarks",
+          "target_checkpoint": "CP2/CP3"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["session:no-run"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["session:no-run-control"]
+      }
+    },
+    {
+      "id": "stale_running_work",
+      "invariant_ids": ["P4"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P4",
+          "state": "missing_observability",
+          "reason": "work_lease_and_reclaim_evidence_missing",
+          "violation_count": null,
+          "proxy_count": 1,
+          "sample_refs": ["workflow_run:stale-running"],
+          "missing_evidence": "lease expiry, owner, heartbeat, and reclaim evidence",
+          "target_checkpoint": "CP2"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["workflow_run:stale-running"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["workflow_run:stale-running-control"]
+      }
+    },
+    {
+      "id": "latest_failure_after_prior_success",
+      "invariant_ids": ["P3"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P3",
+          "state": "missing_observability",
+          "reason": "latest_input_watermark_missing",
+          "violation_count": null,
+          "proxy_count": 0,
+          "sample_refs": [],
+          "missing_evidence": "exact latest and completed input watermarks",
+          "target_checkpoint": "CP2/CP3"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["session:latest-failure"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["session:latest-failure-control"]
+      }
+    },
+    {
+      "id": "duplicate_delivery",
+      "invariant_ids": ["P2"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P2",
+          "state": "missing_observability",
+          "reason": "logical_work_intent_relation_missing",
+          "violation_count": null,
+          "proxy_count": null,
+          "sample_refs": [],
+          "missing_evidence": "durable logical-work-intent relation tied to the source transition",
+          "target_checkpoint": "CP1"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["raw_event:duplicate"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["raw_event:duplicate-control"]
+      }
+    },
+    {
+      "id": "orphan_candidate",
+      "invariant_ids": ["P6", "P12"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P6",
+          "state": "missing_observability",
+          "reason": "candidate_decision_work_relation_missing",
+          "violation_count": null,
+          "proxy_count": 1,
+          "sample_refs": ["candidate:orphan"],
+          "missing_evidence": "candidate-to-active-decision-work and canonical conflict relation",
+          "target_checkpoint": "CP2/CP3/CP5"
+        },
+        {
+          "invariant_id": "P12",
+          "state": "violated",
+          "reason": "non_conflict_item_in_human_inbox",
+          "violation_count": 1,
+          "proxy_count": null,
+          "sample_refs": ["candidate:orphan"],
+          "missing_evidence": null,
+          "target_checkpoint": "CP5"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["candidate:orphan"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["candidate:orphan-control"]
+      }
+    },
+    {
+      "id": "partial_promotion",
+      "invariant_ids": ["P7"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P7",
+          "state": "violated",
+          "reason": "promotion_chain_inconsistent",
+          "violation_count": 1,
+          "proxy_count": null,
+          "sample_refs": ["candidate:partial-promotion"],
+          "missing_evidence": "relational promotion provenance and transition audit identity",
+          "target_checkpoint": "CP4"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["candidate:partial-promotion"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["candidate:partial-promotion-control"]
+      }
+    },
+    {
+      "id": "conflict",
+      "invariant_ids": ["P9", "P12"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P9",
+          "state": "missing_observability",
+          "reason": "durable_conflict_evidence_relation_missing",
+          "violation_count": null,
+          "proxy_count": null,
+          "sample_refs": [],
+          "missing_evidence": "conflict evidence surviving cleanup and restart",
+          "target_checkpoint": "CP4/CP5"
+        },
+        {
+          "invariant_id": "P12",
+          "state": "healthy",
+          "reason": "human_inbox_conflicts_only",
+          "violation_count": 0,
+          "proxy_count": null,
+          "sample_refs": [],
+          "missing_evidence": null,
+          "target_checkpoint": "CP5"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["candidate:conflict", "memory:conflict-anchor"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["candidate:conflict-control", "memory:conflict-anchor-control"]
+      }
+    },
+    {
+      "id": "oversized_session",
+      "invariant_ids": ["P3", "P5"],
+      "expected_characterization": [
+        {
+          "invariant_id": "P3",
+          "state": "missing_observability",
+          "reason": "latest_input_watermark_missing",
+          "violation_count": null,
+          "proxy_count": 1,
+          "sample_refs": ["session:oversized"],
+          "missing_evidence": "exact latest and completed input watermarks",
+          "target_checkpoint": "CP2/CP3"
+        },
+        {
+          "invariant_id": "P5",
+          "state": "missing_observability",
+          "reason": "observation_coverage_relation_missing",
+          "violation_count": null,
+          "proxy_count": null,
+          "sample_refs": [],
+          "missing_evidence": "observation-to-window disposition coverage relation",
+          "target_checkpoint": "CP3"
+        }
+      ],
+      "target": {
+        "scope_ref": "target",
+        "entity_refs": ["session:oversized"]
+      },
+      "foreign_tenant_control": {
+        "scope_ref": "foreign",
+        "entity_refs": ["session:oversized-control"]
+      }
+    }
+  ]
+}
