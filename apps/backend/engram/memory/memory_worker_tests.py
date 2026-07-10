@@ -1310,10 +1310,13 @@ def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> 
     )
     work_count = WorkflowWork.objects.count()
 
-    with mock.patch(
-        'engram.memory.tasks.ProcessObservationRecorded.execute',
-        return_value=worker_result,
-    ) as m_execute:
+    with (
+        mock.patch(
+            'engram.memory.tasks.ProcessObservationRecorded.execute',
+            return_value=worker_result,
+        ) as m_execute,
+        mock.patch('engram.memory.tasks.logger.info') as m_log,
+    ):
         tasks_module.process_observation_work_v1(
             str(work.id),
             workflow_run_id=str(queued_run.id),
@@ -1333,6 +1336,12 @@ def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> 
     assert queued_run.status == WorkflowRunStatus.SUCCEEDED
     assert queued_run.started_at is not None
     assert queued_run.finished_at is not None
+    m_log.assert_called_once_with(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(queued_run.id),
+        via='load',
+    )
 
 
 @pytest.mark.django_db
@@ -1411,6 +1420,7 @@ def test_explicit_run_claim_loser_accepts_winner_terminal_success() -> None:
     with (
         mock.patch('engram.memory.tasks._load_workflow_run', side_effect=load_before_winner_finishes),
         mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute,
+        mock.patch('engram.memory.tasks.logger.info') as m_log,
     ):
         result = tasks_module.process_observation_work_v1(
             str(work.id),
@@ -1421,6 +1431,89 @@ def test_explicit_run_claim_loser_accepts_winner_terminal_success() -> None:
     queued_run.refresh_from_db()
     assert result == str(queued_run.id)
     assert queued_run.status == WorkflowRunStatus.SUCCEEDED
+    m_log.assert_called_once_with(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(queued_run.id),
+        via='claim_cas_loss',
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('winner_status', (WorkflowRunStatus.RUNNING, WorkflowRunStatus.FAILED))
+def test_explicit_run_claim_loser_rejects_non_succeeded_winner_before_domain_access(
+    winner_status: str,
+) -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    original_load = tasks_module._load_workflow_run
+
+    def load_before_winner_changes_status(*args: object, **kwargs: object) -> WorkflowRun:
+        loaded_run = original_load(*args, **kwargs)
+        now = timezone.now()
+        update = {
+            'status': winner_status,
+            'started_at': now,
+        }
+        if winner_status == WorkflowRunStatus.FAILED:
+            update.update(
+                finished_at=now,
+                failure_reason='winner failed',
+            )
+        WorkflowRun.objects.filter(id=queued_run.id).update(**update)
+
+        return loaded_run
+
+    with (
+        mock.patch('engram.memory.tasks._load_workflow_run', side_effect=load_before_winner_changes_status),
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute,
+    ):
+        with pytest.raises(MemoryWorkerError, match='no longer queued'):
+            tasks_module.process_observation_work_v1(
+                str(work.id),
+                workflow_run_id=str(queued_run.id),
+            )
+
+    m_execute.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_explicit_run_rejects_unexpected_claim_status_before_domain_access() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    def invalid_claim(_work: WorkflowWork, workflow_run: WorkflowRun) -> WorkflowRun:
+        workflow_run.status = WorkflowRunStatus.FAILED
+
+        return workflow_run
+
+    with (
+        mock.patch('engram.memory.tasks._claim_workflow_run', side_effect=invalid_claim),
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute,
+    ):
+        with pytest.raises(MemoryWorkerError, match='claim returned invalid status'):
+            tasks_module.process_observation_work_v1(
+                str(work.id),
+                workflow_run_id=str(queued_run.id),
+            )
+
+    m_execute.assert_not_called()
 
 
 @pytest.mark.django_db

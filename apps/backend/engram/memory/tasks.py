@@ -165,7 +165,12 @@ def _claim_workflow_run(work: WorkflowWork, workflow_run: WorkflowRun) -> Workfl
     return workflow_run
 
 
-def _succeeded_workflow_run_result(work: WorkflowWork, workflow_run: WorkflowRun) -> str:
+def _succeeded_workflow_run_result(
+    work: WorkflowWork,
+    workflow_run: WorkflowRun,
+    *,
+    via: str,
+) -> str:
     disposition = (
         WorkflowWork.objects.filter(
             id=work.id,
@@ -177,6 +182,13 @@ def _succeeded_workflow_run_result(work: WorkflowWork, workflow_run: WorkflowRun
     )
     if disposition != WorkflowWorkDisposition.COMPLETE:
         raise MemoryWorkerError('succeeded workflow run has non-complete work')
+
+    logger.info(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(workflow_run.id),
+        via=via,
+    )
 
     return str(workflow_run.id)
 
@@ -402,10 +414,18 @@ def process_observation_work_v1(
     if automatic_terminal:
         return str(work.id)
     if workflow_run is not None:
+        duplicate_via = 'load'
         if workflow_run.status == WorkflowRunStatus.QUEUED:
             workflow_run = _claim_workflow_run(work, workflow_run)
+            duplicate_via = 'claim_cas_loss'
         if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-            return _succeeded_workflow_run_result(work, workflow_run)
+            return _succeeded_workflow_run_result(
+                work,
+                workflow_run,
+                via=duplicate_via,
+            )
+        if workflow_run.status != WorkflowRunStatus.RUNNING:
+            raise MemoryWorkerError('workflow run claim returned invalid status')
 
     structlog.contextvars.clear_contextvars()
     try:
