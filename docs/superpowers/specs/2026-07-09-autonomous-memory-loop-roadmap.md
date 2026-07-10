@@ -549,6 +549,15 @@ allocated within that active slice.
 - Task payloads remain stable ids only.
 - A response is not considered accepted until evidence and required work are
   both committed.
+- Digest work freezes an output-bounded source-visibility policy before
+  selection or provider access: project output admits only project-visible
+  input; team output admits project-visible input plus exactly its authorized,
+  project-linked team. Null team is not all-team privilege.
+- Request-driven digest/workflow reads and review mutations narrow by effective
+  project/team scope,
+  and unproven legacy digest output is quarantined from new digest sources,
+  context/search/replay, and ordinary content reads without mutating historical
+  rows; flattened product capabilities cannot bypass the quarantine.
 
 The checkpoint spec decides whether the current workflow model can carry this
 contract or needs a small additive companion concept. It must not recreate the
@@ -565,7 +574,8 @@ After the schema owner establishes the logical identity contract:
 - **C1-D — transaction fault tests:** rollback, process death immediately
   after commit, broker unavailable, and relay restart;
 - **C1-E — focused scope review:** prove tenant/project scope is resolved
-  before the work intent and task are created.
+  before the work intent and task are created, and prove digest source
+  visibility is authorized before selection, provider access, and output.
 
 C1-A owns hook service files. C1-B owns session lifecycle/sweep files. One
 schema owner owns models and migrations. No other agent edits those files.
@@ -583,6 +593,13 @@ schema owner owns models and migrations. No other agent edits those files.
   row.
 - Duplicate delivery creates no duplicate logical work.
 - Existing transport relay behavior remains package-owned.
+- Same-organization/project unauthorized-team digest sources never reach the
+  frozen snapshot, provider, or a broader output; project/team scheduler and
+  request-path negative tests pass.
+- Same-organization unauthorized project/team request paths fail before product
+  reads/writes, and legacy digest output without exact visibility/work linkage
+  is absent from new digest inputs, fresh/replayed retrieval, weekly history,
+  and ordinary content reads.
 
 ### Rollout
 

@@ -187,6 +187,18 @@ The focused Checkpoint 1 spec must preserve these decisions:
   serial order C1.1, C1.2, then C1.3. Console rerun creates a new explicit
   `WorkflowRun` attempt linked to the same completed `WorkflowWork`; it never
   fabricates a new input generation merely to bypass completion.
+- Digest work freezes an output-bounded visibility policy before source
+  selection or provider access. Project-visible output admits only
+  project-visible input; team-visible output admits project-visible input plus
+  exactly its authorized, project-linked team. Null team is never implicit
+  all-team privilege.
+- Manual digest, weekly current/history/review, and workflow read/rerun paths
+  narrow by the request's effective project/team scope before product reads or
+  writes.
+  Legacy digest output without exact work/input/output visibility proof is
+  quarantined from new digest inputs, context/search/replay, weekly history, and
+  ordinary content reads without rewriting it; no flattened product capability,
+  including admin from a narrower grant, bypasses quarantine.
 
 The policy inputs that affect whether work was required must be snapshotted
 with the accepted evidence or logical work. A later settings change must not

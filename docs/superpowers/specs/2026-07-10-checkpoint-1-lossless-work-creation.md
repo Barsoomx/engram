@@ -39,7 +39,11 @@ For post-cutover traffic:
 - duplicate delivery converges on the same evidence and logical work;
 - task payloads contain stable work/run ids only;
 - organization, project, and derived team are resolved before evidence, work,
-  package creation, subject loading, or provider execution.
+  package creation, subject loading, or provider execution;
+- digest source visibility is authorized for the eventual output before source
+  selection, freezing, provider execution, or publication;
+- legacy digest output without exact authorization linkage is quarantined from
+  autonomous inputs and ordinary content reads without historical mutation.
 
 Historical rows remain visible and may remain unlinked. Checkpoint 1 records
 their gaps but does not bulk-create historical work or claim global historical
@@ -58,6 +62,7 @@ Checkpoint 1 does not add:
 - a public `WorkflowWork` API, console screen, management command, or scheduler
   for the invariant evaluator;
 - historical missing-work repair;
+- mutation, deletion, or semantic reinterpretation of legacy digest rows;
 - digest late-arrival/carry-forward coverage for transactions invisible when a
   closed occurrence first freezes (CP4);
 - long-lived task payloads containing evidence, memory text, prompts, provider
@@ -74,6 +79,11 @@ target contract:
 - idle sweep commits the ended state before its caller dispatches;
 - manual digest/rerun rows commit separately from task creation and audit;
 - scheduled digest tasks carry mutable ids and reselect current state;
+- project-wide legacy digests can select team-visible sources and publish the
+  derived result as project-visible without freezing an authorization policy;
+- retrieval documents and stored context replay trust that legacy project
+  visibility, and current console digest/rerun paths narrow only to active
+  organization plus capability rather than `request.effective_scope`;
 - the legacy distillation reconciler treats any historical session success as
   final rather than an exact generation;
 - context session resolution may change derived team without the session lock.
@@ -124,7 +134,9 @@ Engram neither mirrors nor polls those states.
 An empty package queue is never completion evidence. Logical identity and the
 initial signal are created once; package delivery and Celery task execution
 remain at-least-once. Checkpoint 1 does not claim exactly-once semantic output:
-later checkpoints add durable stage coverage and atomic promotion.
+provider execution may repeat, and later checkpoints add durable stage coverage
+and general atomic promotion. The digest-only publication/linkage exception
+defined below does not broaden that claim.
 
 ## Additive Data Contract
 
@@ -479,6 +491,10 @@ ordered exact memory versions:
   "schedule_key": "daily:YYYY-MM-DD",
   "window_start": "<UTC Z>",
   "window_end": "<UTC Z>",
+  "visibility_policy": "digest_visibility/v1",
+  "allowed_team_ids": [],
+  "output_visibility_scope": "project",
+  "output_team_id": null,
   "eligible_source_count": 240,
   "max_sources": 200,
   "sources_truncated": true,
@@ -487,19 +503,28 @@ ordered exact memory versions:
      "memory_version_id": "<uuid>", "version": 1,
      "content_hash": "<legacy/source hash>",
      "server_body_digest": "<sha256>",
+     "visibility_scope": "project", "team_id": null,
      "source_title": "<redacted frozen title>"}
   ],
   "input_digest": "<sha256>"
 }
 ```
 
-Selection, cap, and truncation happen before work creation and preserve current
-behavior: choose at most `max_sources` by `(-updated_at, id)`, freeze the
-redacted title/exact current version, then assign `render_position` by
-`(source_title, memory_id)`. The worker renders that frozen order using exact
-`MemoryVersion.body`, never mutable current `Memory.title`/`Memory.body`, and
-never reselects, resorts, or retruncates. Empty sources create terminal
-`no_op/no_input` work and no package signal.
+Authorization filtering, selection, cap, and truncation happen before work
+creation. Daily work uses the project-output policy below, then preserves the
+current ordering behavior over that authorized set: choose at most
+`max_sources` by `(-updated_at, id)`, freeze the redacted title/exact current
+version plus source visibility/team, then assign `render_position` by
+`(source_title, memory_id)`. `eligible_source_count` counts only authorized
+sources. The worker renders that frozen order using exact `MemoryVersion.body`,
+never mutable current `Memory.title`/`Memory.body`, and never reselects, resorts,
+or retruncates. Empty authorized sources create terminal `no_op/no_input` work
+and no package signal.
+
+Daily and weekly planners exclude every `kind=digest` memory before eligibility,
+counting, classification, cap, or freeze. CP1 never nests derived digest output
+inside another digest, so legacy content cannot be laundered into a proven v1
+output. A future recursive digest needs a separately reviewed provenance rule.
 
 ### Weekly Digest
 
@@ -515,11 +540,16 @@ already-classified change references needed to render the digest:
   "schedule_key": "weekly:YYYY-Www",
   "window_start": "<UTC Z>",
   "window_end": "<UTC Z>",
+  "visibility_policy": "digest_visibility/v1",
+  "allowed_team_ids": [],
+  "output_visibility_scope": "project",
+  "output_team_id": null,
   "changes": [
     {"bucket": "added|refuted|retired|superseded|merged",
      "memory_id": "<uuid>", "memory_version_id": "<uuid>",
      "version": 1, "content_hash": "<legacy/source hash>",
      "server_body_digest": "<sha256>",
+     "visibility_scope": "project", "team_id": null,
      "source_title": "<redacted frozen title>",
      "transition_ref": "<stable id>", "occurred_at": "<UTC Z>"}
   ],
@@ -527,33 +557,134 @@ already-classified change references needed to render the digest:
 }
 ```
 
-Changes are ordered by bucket, occurrence time, memory UUID, and transition
+Authorization filtering happens before weekly classification. Authorized
+changes are ordered by bucket, occurrence time, memory UUID, and transition
 reference. A transition reference is the persisted `MemoryLink`/`AuditEvent`
 id when one exists; otherwise it is a deterministic hash of the frozen bucket,
 memory/version id, and occurrence time. Workers render the frozen title and
-load exact same-scope `MemoryVersion` rows rather than reclassifying mutable
-current memories. Empty changes create terminal `no_op/no_input` work and no
-signal.
+load exact authorized `MemoryVersion` rows rather than reclassifying mutable
+current memories. Empty authorized changes create terminal `no_op/no_input`
+work and no signal.
+
+### Digest Visibility Authority
+
+A reusable digest is a publishable derived memory, not an implicit privileged
+report. Source authorization is therefore derived from the output visibility,
+not from the incidental breadth of the requesting user or scheduler process.
+The frozen `digest_visibility/v1` policy has exactly two forms:
+
+- project work freezes `allowed_team_ids=[]`, admits only
+  `visibility_scope=project` sources in the resolved organization/project, and
+  creates a project-visible output with null team;
+- team work requires the selected team in the request's effective scope and a
+  same-organization `ProjectTeam` link, freezes that one id in
+  `allowed_team_ids`, admits project-visible sources plus team-visible sources
+  for exactly that team, and creates a team-visible output bound to that team.
+
+Session- and organization-visible sources are outside both policies. A
+project-wide occurrence never means all-team privilege. If a future all-team
+digest is required, it needs a separate explicit capability/principal and an
+output visibility contract that cannot expose team-private input; CP1 does not
+invent that surface.
+
+Every frozen source/change records its current `visibility_scope` and `team_id`.
+Immediately before provider access, one short pre-call transaction locks the
+selected source `Memory` and exact `MemoryVersion` rows in deterministic UUID
+order plus the selected `ProjectTeam` row for team work, revalidates the frozen
+policy, and commits. Completion of that final locked revalidation is the
+provider-authorization linearization point: a mutation committed before it
+prevents the call; a mutation ordered after it is in-flight and may not make the
+eventual output publishable.
+
+After the provider returns, one short output transaction takes the same locks,
+revalidates the same policy, and creates/reuses the exact output before releasing
+them. No database lock is held across the provider call. A mutation committed
+after the pre-call point but before the output lock discards the provider result
+without publication; a concurrent mutation after output-lock acquisition
+serializes after the valid output commit. Provider calls use null team for
+project work and the selected team for team work.
+
+### Legacy Digest Read Containment
+
+A `kind=digest` memory is injectable or reusable only when its server-authored
+metadata contains `digest_visibility/v1`, `workflow_work_id`, `input_digest`,
+`output_identity`, allowed teams, and output visibility/team that match:
+
+- a same-organization/project completed daily/weekly `WorkflowWork`;
+- that work's immutable input digest and visibility snapshot;
+- the recomputed output identity; and
+- the `Memory` and `RetrievalDocument` visibility/team fields.
+
+Missing, malformed, legacy, or inconsistent linkage is quarantined as
+`digest_visibility_unproven`. One shared read predicate excludes such content
+before digest source selection, search, ranking, packing, provider input,
+context-bundle creation, or curation. Stored-bundle replay rechecks every persisted item; if
+any digest is unproven, it rejects the whole replay with stable code
+`context_bundle_digest_visibility_unproven` and returns no rendered context or
+items. It never returns the persisted `rendered_text` and never tries to filter
+and dynamically repack an immutable bundle. Search debug reports the exclusion
+reason with title/content withheld and never places the document in any
+candidate or packed set.
+
+`ReembedMissingEmbeddings` applies the same proof predicate before provider
+access. A proven v1 digest is eligible after publication commits; an unproven
+digest is skipped with zero provider call and zero row mutation. The scheduler
+does not turn a quarantined legacy document into a trusted projection.
+
+`WeeklyDigestView`, including `weeks_back>0`, returns the existing built-false
+empty shape with null digest id for an unproven legacy digest and never returns
+its changes or changelog. CP1 does not delete, rewrite, backfill, re-index, or
+mark those rows healthy. Ordinary `memories:read`, `memories:review`,
+`context:read`, and `audit:read` surfaces must not expose their title, body,
+versions, retrieval text, metadata-derived changes, or contaminated bundle
+rendering. This includes inspection list/count/detail/related results, memory
+version/diff, approved-only export, review queue, audit title resolution, and
+workflow result-memory titles. Those surfaces filter the item, return not-found,
+or use a content-withheld placeholder without changing their existing
+authorization-safe shape.
+
+No product capability, including `memories:admin`, bypasses body-bearing
+quarantine in CP1: effective capabilities flatten organization/project/team
+grant provenance and cannot prove access to every team that may have contributed
+to a legacy project digest. Product APIs may expose only a content-withheld
+quarantine marker/id where their existing shape requires it. Same-organization
+team/project/admin negative tests prove no capability-union bypass. The durable
+rows remain available for explicitly authorized offline operations and future
+CP10 remediation. Read suppression is authorization, not historical repair.
 
 ### Digest Input And Output Identity
 
 Do not trust the existing free-form `MemoryVersion.content_hash` as the body
 binding. For every frozen version compute `server_body_digest` as SHA-256 over
-canonical `(memory_version_id, version, body)` bytes. Daily `input_digest` is
-SHA-256 over its schema/project/window/cap/truncation fields and the ordered
-source tuples `(render_position, memory_id, version_id, version,
-server_body_digest, source_title)`. Weekly uses the corresponding window/team and ordered change
-tuples `(bucket, memory_id, version_id, version, server_body_digest,
-source_title, transition_ref, occurred_at)`.
+canonical `(memory_version_id, version, body)` bytes. Both digest forms include
+`visibility_policy`, sorted `allowed_team_ids`, output visibility/team, and each
+source visibility/team in canonical digest material. Daily `input_digest` also
+includes its schema/project/window/cap/truncation fields and the ordered source
+tuples `(render_position, memory_id, version_id, version, server_body_digest,
+visibility_scope, team_id, source_title)`. Weekly uses the corresponding
+window/team and ordered change tuples `(bucket, memory_id, version_id, version,
+server_body_digest, visibility_scope, team_id, source_title, transition_ref,
+occurred_at)`.
 
-Workers reload exact same-scope versions, recompute every server body digest,
-and fail closed before rendering/provider access on mismatch. Digest output
-identity is SHA-256 over `digest-output/v1`, work type, project/team, and the
-`WorkflowWork.input_snapshot['input_digest']`; it is not the legacy memory-id-only or
-window-only hash. A previously generated digest is reusable only when its
-metadata records the same work id, input digest, and output identity. Legacy
-output or a same-memory newer-version snapshot without that exact match creates
-new output; it is never accepted as completion for the work.
+Workers reload exact authorized versions, revalidate their source/output policy,
+recompute every server body digest, and fail closed before rendering/provider
+access on mismatch. Digest output identity is SHA-256 over `digest-output/v1`,
+work type, project/team, and the
+`WorkflowWork.input_snapshot['input_digest']`; it is not the legacy
+memory-id-only or window-only hash. A previously generated digest is reusable
+only when its metadata records the same work id, input digest, output identity,
+visibility policy, allowed teams, visibility scope, and team, and the same
+output transaction makes that work `complete/succeeded`. Legacy output or a
+same-memory newer-version snapshot without that exact match creates new output;
+it is never accepted as completion for the work or authorized for retrieval.
+
+Inside the locked publication transaction, create the exact
+`RetrievalDocument` with `IndexMemoryVersionInput(..., defer_embedding=True)` or
+an equivalent deterministic row-only path. No embedding/model provider may run
+under source, team, work, or output locks. The existing scheduled
+`ReembedMissingEmbeddings` projection fills missing embeddings for proven
+digests after commit; its delay or failure does not weaken exact/lexical
+authorization or roll back the published digest.
 
 ## Server Sequence And Transaction Order
 
@@ -699,10 +830,15 @@ explicit attempt signal:  workflow-work:<work UUID>:run:<run UUID>
 The outbox package does not enforce task-id uniqueness. Correctness comes from
 serializing create-once work/run transitions, not from package constraints.
 
-CP1 does not make semantic output and the terminal work update one atomic
-stage. A crash between those writes leaves work `required` and may replay the
-existing idempotent workflow. Durable stage coverage and atomic promotion are
-CP3/CP4 acceptance gates, not claims of this checkpoint.
+CP1 does not generally make semantic output and the terminal work update one
+atomic stage. Observation/session crashes between those writes leave work
+`required` and may replay the existing idempotent workflow. Digest publication
+is the narrow exception: its output/version/retrieval representation, exact
+authorization linkage, and `complete/succeeded` transition commit in the one
+post-provider transaction because an unlinked output cannot be read safely.
+This is digest authorization/publication atomicity, not observation/session
+stage coverage, candidate promotion, lineage transition, or a general CP3/CP4
+atomic-semantic claim.
 
 Checkpoint 1 retains existing bounded Celery attempt retries. It does not add
 logical retry scheduling, leases, or reconciliation.
@@ -733,10 +869,13 @@ logical retry scheduling, leases, or reconciliation.
 ## Manual Attempt Transactions
 
 `ProjectDigestRunView` delegates to one domain transaction. It locks and
-re-resolves the organization-scoped project, preserves the existing one-active-
-daily-run guard, freezes the manual snapshot, creates the work, creates a linked
-queued run for required or complete non-no-op work, creates the composite-id
-package, writes the audit event, and then commits before returning. Empty input records
+re-resolves the project through `request.effective_scope.project_ids` inside the
+active organization before any source/output/work read, preserves the existing
+one-active-daily-run guard, freezes the manual project-output visibility policy
+and authorized snapshot, creates the work, creates a linked queued run for
+required or complete non-no-op work, creates the composite-id package, writes
+the audit event, and then commits before returning. The caller's broader team
+membership never widens a shareable project digest. Empty authorized input records
 `no_op/no_input`, emits no package, and preserves the current non-enqueued
 response. An active-run conflict creates no work, run, package, or audit.
 Request UUID/request id belongs to `WorkflowRun` and audit only; it is never
@@ -744,24 +883,38 @@ part of `WorkflowWork` fingerprint. Identical immutable digest input therefore
 reuses one logical work while each accepted manual request remains a distinct
 explicit attempt.
 
-Workflow rerun also uses one transaction. It reloads and locks the source run
-inside the active organization, requires a terminal run with non-null `work`,
-locks and validates that scoped work, creates one linked queued run with
-`rerun_of` and the immutable work snapshot, creates its composite-id package,
-writes `WorkflowRunReran`, and commits. Any unlinked historical run returns
+Workflow read/rerun also uses `request.effective_scope` in its first query:
+project must be allowed, and a non-null run/work team must be in allowed team
+ids. Rerun then locks that source row, requires a terminal run with non-null
+`work`, locks and validates the same scoped work, creates one linked queued run
+with `rerun_of` and the immutable work snapshot, creates its composite-id
+package, writes `WorkflowRunReran`, and commits. An organization-local but
+unauthorized source is indistinguishable from not found and produces no further
+read or mutation. Any authorized unlinked historical run returns
 `409 legacy_work_unlinked` with no mutation, signal, or success audit.
+Workflow detail serializes an unproven digest result id/status only and replaces
+its title with the stable content-withheld placeholder; effective-scope access
+to the run never bypasses digest quarantine.
 
 `WeeklyDigestView` becomes enqueue/read-through and no longer calls the mutable
-legacy builder synchronously. For the current window it validates project/team
-scope (including `ProjectTeam`) and freezes/creates occurrence work plus its
-initial package transactionally. It returns `built=true` only for exact output
-already linked by matching work/input/output metadata; new or pending work uses
-the existing `built=false` response shape and a later poll observes completion.
-This is an explicit timing change within the existing response schema and must
-be recorded in the C1.3c PR/release notes. Empty input is no-op/built false.
-Historical `weeks_back>0` remains read-only and never fabricates work. Legacy
-digest rows may be displayed as history but are not accepted as exact work
-output without matching metadata.
+legacy builder synchronously. Before current or historical lookup it requires
+the project in `request.effective_scope.project_ids`; a selected team must also
+be in `request.effective_scope.team_ids` and have a same-organization
+`ProjectTeam` link. For the current window it freezes/creates occurrence work
+plus its initial package transactionally. A null team selects the project-output
+policy, never all-team data; a selected team uses the team-output policy. It
+returns `built=true` only for exact output already linked by matching
+work/input/output/visibility metadata; new or pending work uses the existing
+`built=false` response shape and a later poll observes completion. This timing
+and visibility correction must be recorded in the C1.3c PR/release notes. Empty
+authorized input is no-op/built false. Historical `weeks_back>0` remains
+read-only, never fabricates work, and applies the same scope and legacy digest
+read-containment gates.
+
+`DigestReviewView` resolves its project/team through `request.effective_scope`
+and requires exact proven digest linkage in its first memory query. An
+organization-local unauthorized or unproven digest is not found and cannot be
+marked ready/reviewed; it creates no mutation or audit event.
 
 ## Session End Primitive
 
@@ -795,9 +948,11 @@ different explicit window/override gets a different key. The first transaction
 to insert the occurrence freezes the source snapshot used by all later
 automatic or explicit attempts for that occurrence.
 
-The scheduler first freezes same-scope stable version/change references, then
-creates work and its package row in a per-project transaction. It does not pass
-the source list through Celery. Cross-project references fail before work.
+The scheduler first applies the project-output visibility policy and freezes
+authorized stable version/change references, then creates work and its package
+row in a per-project transaction. It does not pass the source list through
+Celery. Project-policy selection excludes team-private rows; cross-project or
+injected unauthorized references fail before work/provider access.
 Weekly classification always uses a closed window; mutable changes after
 `window_end` belong to a later bucket and never rewrite an existing snapshot.
 The scheduled-weekly eligibility check derives from the frozen change set, not
@@ -975,19 +1130,45 @@ old evidence merely to make a dashboard green.
 10. unlinked historical rerun returns 409 without writes;
 11. duplicate daily/weekly bucket execution converges on one work;
 12. empty schedule buckets are terminal no-op with no package;
-13. every digest source/version is same-scope, mutable titles/body changes do
-    not change frozen input, and task payload is work id only;
-14. same memory with a newer exact version creates a different input/output
+13. every digest source/version is same-scope and authorized by the frozen
+    visibility policy; mutable titles/body changes do not change frozen input,
+    and task payload is work id only;
+14. same-organization/project unauthorized-team sources never enter project
+    daily, project weekly, or another team's weekly snapshot/provider/output;
+    scheduler, management-command, and view paths each have a negative control;
+15. project output is derived only from project-visible sources, team output is
+    bound to exactly its selected team; barriers prove mutation committed before
+    the pre-call linearization point prevents provider access, mutation ordered
+    after that point prevents publication, and output locks serialize commit;
+16. all `kind=digest` rows are excluded before daily/weekly eligibility and
+    classification, so legacy output cannot be nested and laundered into v1;
+17. legacy/malformed digest linkage is excluded from fresh search/context,
+    stored-bundle replay, curation, search debug, weekly current/history, and
+    ordinary body-bearing read surfaces including workflow result titles; one
+    unproven persisted item rejects replay with no rendered text/items;
+18. read/review/context/audit and `memories:admin` product paths all withhold
+    quarantined content; a same-project Team-A admin cannot expose possible
+    Team-B source data through flat capability union;
+19. same-organization unauthorized project/team requests cannot read/create
+    manual digest, weekly current/history/review, or workflow list/rerun state;
+    unproven review cannot mutate ready status or create an audit event;
+20. same memory with a newer exact version creates a different input/output
     identity and never reuses legacy digest output;
-15. new manual digest, weekly read-through, management command, workflow rerun,
+21. new manual digest, weekly read-through, management command, workflow rerun,
     and bounded linked distillation retry all emit versioned id-only tasks
     atomically;
-16. repository callsite census finds no production producer of legacy task
+22. repository callsite census finds no production producer of legacy task
     signatures after C1.3d.
+
+Digest publication tests also assert `defer_embedding=True` (or the equivalent
+row-only path) and zero embedding-provider calls while publication locks are
+held; the existing scheduled reembed path remains outside the transaction.
 
 F1–F6 in `docs/reliability/memory-loop-fault-matrix.md` are mandatory CP1
 fault contracts. Each distinct source-to-sink boundary has one foreign-scope
-negative control; worker-kill variants do not repeat it mechanically.
+negative control; worker-kill variants do not repeat it mechanically. Focused
+P14 digest controls additionally use same-organization/project unauthorized
+teams and prove denial before selection, provider access, and output.
 
 ## Files And Ownership
 
@@ -1023,6 +1204,10 @@ negative control; worker-kill variants do not repeat it mechanically.
 ### C1.3c digest/explicit-attempt owner
 
 - immutable digest services/task tests;
+- central digest-visibility quarantine helper and tests;
+- context/search/replay/curation digest authorization and tests;
+- search-debug, inspection, memory-version/diff, approved export, memory-review,
+  and audit-title quarantine consumers/tests;
 - `apps/backend/engram/console/views/project_digest.py` and tests;
 - `apps/backend/engram/console/views/digests.py` and tests;
 - `apps/backend/engram/console/views/workflow_runs.py` and rerun tests.
@@ -1081,6 +1266,20 @@ Checkpoint 1 closes only when:
 - late useful input creates a newer generation and lifecycle-only input does not;
 - every producer carries stable work/run ids only, the legacy-producer census
   is empty, and legacy packages have drained;
+- every digest freezes `digest_visibility/v1`; project output has only
+  project-visible input, team output has only project plus its selected team,
+  and no unauthorized source reaches provider or publication;
+- all digest output is excluded from new digest input, and unproven legacy
+  output is quarantined from weekly history, fresh retrieval/search/curation,
+  debug, bundle replay, and ordinary body-bearing read surfaces without
+  mutating the historical row; no flat capability/admin bypass exposes content;
+- digest output/version/retrieval linkage and work completion commit atomically
+  under the narrow publication exception; broader stage/promotion atomicity
+  remains deferred;
+- publication defers embedding under locks and relies on the existing scheduled
+  reembed projection after commit;
+- manual digest, weekly current/history/review, and workflow list/rerun queries
+  narrow through `request.effective_scope` before reading/mutating scoped rows;
 - P1/P2 post-cutover cohort and focused P14 tests pass;
 - broker/package ownership remains entirely in `django-celery-outbox`;
 - no CP2 leases, general required-work reconciliation, new retry policy, or
@@ -1101,6 +1300,8 @@ Stop before implementation or the next serial slice if:
 - manual rerun would fabricate a historical input generation;
 - a digest snapshot would load mutable current state instead of exact versioned
   references;
+- digest input authorization cannot be expressed as a stable output-bounded
+  visibility policy or revalidated before provider/publication;
 - the first schema change is not additive;
 - required fixes expand into CP2 lease/retry/repair, public API, secrets,
   deployment mutation, or historical data repair without a new reviewed spec.
