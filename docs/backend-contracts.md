@@ -57,6 +57,29 @@ Rules:
 A future Engram-owned domain-event stream requires a separate decision record
 and must not be introduced as a weaker replacement for the package transport.
 
+### Product-Domain Progress
+
+The transport prohibition does not prohibit durable product-domain progress.
+Engram may own one scoped logical-work record describing which immutable input
+still requires processing and its explicit product disposition.
+
+`WorkflowWork` is the stable logical requirement. `WorkflowRun` remains
+append-only attempt/history and provider/result provenance.
+`django-celery-outbox` remains the sole transport authority and the only owner
+of publication, transport retries, dead letters, and relay behavior.
+
+Logical work never mirrors broker status or polls transport as its source of
+truth. Reconciliation starts from organization/project-scoped domain
+invariants and emits stable-id tasks through the package-backed Celery
+boundary. Operational work state, candidate state, and memory temporal
+validity are separate.
+
+Current hook ingest violates the existing atomic enqueue contract: it registers
+`.delay()` through `transaction.on_commit()`, leaving a process-death window
+after evidence commit and before package-row creation. CP1 replaces that
+characterization with one transaction containing evidence, logical work, and
+the package row.
+
 ## RBAC Source Of Truth
 
 Roles, capabilities, grants, API keys, and scope bindings are database-backed.
