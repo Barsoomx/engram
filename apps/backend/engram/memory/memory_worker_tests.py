@@ -5,10 +5,11 @@ import threading
 import uuid
 from decimal import Decimal
 from typing import Any
+from unittest import mock
 
 import pytest
 import structlog
-from django.db import connection
+from django.db import connection, transaction
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -34,9 +35,19 @@ from engram.core.models import (
     Runtime,
     Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
+from engram.memory import tasks as tasks_module
 from engram.memory.services import (
     MemoryCandidateWorkerInput,
+    MemoryCandidateWorkerResult,
     MemoryWorkerError,
     ProcessObservationRecorded,
     PromoteMemoryCandidate,
@@ -48,6 +59,12 @@ from engram.memory.services import (
     provider_prompt,
 )
 from engram.memory.tasks import process_observation_recorded
+from engram.memory.workflow_work import (
+    CreateWorkflowWorkInput,
+    create_work,
+    observation_content_digest,
+    resolve_work_succeeded,
+)
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import EMBEDDING_DIMENSION
 
@@ -156,6 +173,32 @@ def create_observation_recorded_scope(
     )
 
     return organization, team, project, session, raw_event, observation
+
+
+def create_required_observation_work(observation: Observation) -> WorkflowWork:
+    data = CreateWorkflowWorkInput(
+        organization_id=observation.organization_id,
+        project_id=observation.project_id,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        subject_type=WorkflowSubjectType.OBSERVATION,
+        subject_id=observation.id,
+        input_snapshot={
+            'schema': 'observation_processing_input/v1',
+            'observation_id': str(observation.id),
+            'observation_digest': observation_content_digest(observation),
+            'policy': {
+                'schema': 'hook_work_policy/v1',
+                'realtime_candidates_enabled': True,
+                'legacy_policy_fallback': False,
+            },
+        },
+    )
+    with transaction.atomic():
+        work, created = create_work(data)
+
+    assert created is True
+
+    return work
 
 
 def execute_worker(observation: Observation) -> Any:
@@ -1156,3 +1199,285 @@ def test_observation_recorded_worker_concurrent_duplicate_delivery_with_embeddin
     assert MemoryVersion.objects.count() == 1
     assert RetrievalDocument.objects.count() == 1
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
+
+
+@pytest.mark.django_db
+def test_observation_work_task_executes_existing_worker_and_resolves_succeeded() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    worker_result = MemoryCandidateWorkerResult(
+        candidate=mock.Mock(),
+        duplicate=False,
+    )
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=worker_result,
+    ) as m_execute:
+        task(str(work.id))
+
+    worker_input = m_execute.call_args.args[0]
+    assert worker_input.observation_id == observation.id
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert work.resolved_at is not None
+
+
+@pytest.mark.django_db
+def test_observation_work_task_resolves_no_signal_when_worker_intentionally_skips() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    worker_result = MemoryCandidateWorkerResult(
+        candidate=None,
+        duplicate=False,
+        skipped=True,
+    )
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=worker_result,
+    ):
+        task(str(work.id))
+
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+    assert work.resolved_at is not None
+
+
+@pytest.mark.django_db
+def test_observation_work_task_failure_leaves_required_work_replayable() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        side_effect=MemoryWorkerError('provider failed'),
+    ):
+        with pytest.raises(MemoryWorkerError, match='provider failed'):
+            task(str(work.id))
+
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.resolution_reason == ''
+    assert work.resolved_at is None
+
+
+@pytest.mark.django_db
+def test_automatic_observation_work_delivery_is_idempotent_after_terminal_resolution() -> None:
+    organization, _team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=organization.id,
+        project_id=project.id,
+    )
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        task(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_explicit_queued_run_executes_against_terminal_observation_work() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=organization.id,
+        project_id=project.id,
+    )
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    worker_result = MemoryCandidateWorkerResult(
+        candidate=mock.Mock(),
+        duplicate=True,
+    )
+    work_count = WorkflowWork.objects.count()
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=worker_result,
+    ) as m_execute:
+        tasks_module.process_observation_work_v1(
+            str(work.id),
+            workflow_run_id=str(queued_run.id),
+        )
+        queued_run.refresh_from_db()
+        task = tasks_module.process_observation_work_v1
+        task.push_request(retries=0, delivery_info={'redelivered': True})
+        try:
+            redelivered_result = task.run(
+                str(work.id),
+                workflow_run_id=str(queued_run.id),
+            )
+        finally:
+            task.pop_request()
+
+    m_execute.assert_called_once()
+    work.refresh_from_db()
+    assert redelivered_result == str(queued_run.id)
+    assert WorkflowWork.objects.count() == work_count
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert queued_run.status == WorkflowRunStatus.SUCCEEDED
+    assert queued_run.started_at is not None
+    assert queued_run.finished_at is not None
+
+
+@pytest.mark.django_db
+def test_explicit_observation_run_failure_is_terminal_and_not_redelivered() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        side_effect=MemoryWorkerError('explicit provider failed'),
+    ) as m_execute:
+        with pytest.raises(MemoryWorkerError, match='explicit provider failed'):
+            tasks_module.process_observation_work_v1(
+                str(work.id),
+                workflow_run_id=str(queued_run.id),
+            )
+        with pytest.raises(MemoryWorkerError, match='workflow run'):
+            tasks_module.process_observation_work_v1(
+                str(work.id),
+                workflow_run_id=str(queued_run.id),
+            )
+
+    assert m_execute.call_count == 1
+    queued_run.refresh_from_db()
+    work.refresh_from_db()
+    assert queued_run.status == WorkflowRunStatus.FAILED
+    assert queued_run.started_at is not None
+    assert queued_run.finished_at is not None
+    assert queued_run.failure_reason == 'explicit provider failed'
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db
+def test_redelivered_running_observation_run_recovers_after_worker_loss() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    running_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    WorkflowRun.objects.filter(id=running_run.id).update(
+        status=WorkflowRunStatus.RUNNING,
+        started_at=timezone.now(),
+    )
+    worker_result = MemoryCandidateWorkerResult(
+        candidate=mock.Mock(),
+        duplicate=True,
+    )
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=worker_result,
+    ) as m_execute:
+        with pytest.raises(MemoryWorkerError, match='workflow run'):
+            task(str(work.id), workflow_run_id=str(running_run.id))
+
+        task.push_request(retries=0, delivery_info={'redelivered': True})
+        try:
+            task.run(str(work.id), workflow_run_id=str(running_run.id))
+        finally:
+            task.pop_request()
+
+    m_execute.assert_called_once()
+    running_run.refresh_from_db()
+    assert running_run.status == WorkflowRunStatus.SUCCEEDED
+    assert running_run.finished_at is not None
+
+
+@pytest.mark.django_db
+def test_exhausted_retryable_explicit_run_finishes_failed_not_queued() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    queued_run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    task = tasks_module.process_observation_work_v1
+    retryable_error = MemoryWorkerError('retry budget exhausted', retryable=True)
+
+    task.push_request(retries=task.max_retries, delivery_info={})
+    try:
+        with mock.patch(
+            'engram.memory.tasks.ProcessObservationRecorded.execute',
+            side_effect=retryable_error,
+        ):
+            with pytest.raises(MemoryWorkerError, match='retry budget exhausted'):
+                task.run(str(work.id), workflow_run_id=str(queued_run.id))
+    finally:
+        task.pop_request()
+
+    queued_run.refresh_from_db()
+    assert queued_run.status == WorkflowRunStatus.FAILED
+    assert queued_run.finished_at is not None
+    assert queued_run.failure_reason == 'retry budget exhausted'
+
+
+@pytest.mark.django_db
+def test_observation_work_task_rejects_changed_subject_content_before_domain_access() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    Observation.objects.filter(id=observation.id).update(title='changed after work capture')
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        with pytest.raises(MemoryWorkerError, match='digest'):
+            task(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db
+def test_observation_work_task_rejects_changed_fingerprint_before_domain_access() -> None:
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    WorkflowWork.objects.filter(id=work.id).update(input_fingerprint='f' * 64)
+    task = tasks_module.process_observation_work_v1
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        with pytest.raises(MemoryWorkerError, match='fingerprint'):
+            task(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
