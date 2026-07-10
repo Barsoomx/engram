@@ -52,8 +52,10 @@ def test_celeryconfig_uses_confirm_publish_and_quorum_delivery() -> None:
     assert celeryconfig.broker_transport_options == {'confirm_publish': True}
     assert celeryconfig.broker_native_delayed_delivery_queue_type == 'quorum'
     assert celeryconfig.worker_detect_quorum_queues is True
-    assert celeryconfig.broker_connection_retry_on_startup is False
-    assert celeryconfig.broker_connection_retry is False
+    assert celeryconfig.broker_connection_retry_on_startup is True
+    assert celeryconfig.broker_connection_retry is True
+    assert celeryconfig.broker_connection_max_retries is None
+    assert celeryconfig.worker_enable_soft_shutdown_on_idle is True
     assert celeryconfig.worker_soft_shutdown_timeout == 60
 
 
@@ -115,6 +117,18 @@ def test_celery_app_uses_outbox_transport_and_foundation_config() -> None:
     assert celery_app.conf.broker_transport_options == {'confirm_publish': True}
     assert celery_app.conf.task_default_queue == celeryconfig.QUEUE_NEAR_REALTIME
     assert celery_app.conf.task_default_queue_type == 'quorum'
+    effective_reconnect_config = {
+        'broker_connection_retry_on_startup': celery_app.conf.broker_connection_retry_on_startup,
+        'broker_connection_retry': celery_app.conf.broker_connection_retry,
+        'broker_connection_max_retries': celery_app.conf.broker_connection_max_retries,
+        'worker_enable_soft_shutdown_on_idle': celery_app.conf.worker_enable_soft_shutdown_on_idle,
+    }
+    assert effective_reconnect_config == {
+        'broker_connection_retry_on_startup': True,
+        'broker_connection_retry': True,
+        'broker_connection_max_retries': None,
+        'worker_enable_soft_shutdown_on_idle': True,
+    }
     assert LivenessProbe in celery_app.steps['worker']
 
 
