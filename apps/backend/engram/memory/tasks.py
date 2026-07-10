@@ -110,10 +110,10 @@ def _load_workflow_run(
     work: WorkflowWork,
     workflow_run_id: uuid.UUID,
     *,
-    allow_redelivered: bool,
+    allow_succeeded: bool,
 ) -> WorkflowRun:
     allowed_statuses = [WorkflowRunStatus.QUEUED]
-    if allow_redelivered:
+    if allow_succeeded:
         allowed_statuses.append(WorkflowRunStatus.SUCCEEDED)
 
     try:
@@ -242,7 +242,7 @@ def _prepare_versioned_work(
     work_id: object,
     workflow_run_id: object,
     expected_work_type: str,
-    allow_redelivered_run: bool = False,
+    allow_succeeded_run: bool = False,
 ) -> tuple[WorkflowWork, WorkflowRun | None, bool]:
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, expected_work_type)
@@ -250,7 +250,7 @@ def _prepare_versioned_work(
         _load_workflow_run(
             work,
             parsed_run_id,
-            allow_redelivered=allow_redelivered_run,
+            allow_succeeded=allow_succeeded_run,
         )
         if parsed_run_id is not None
         else None
@@ -366,12 +366,11 @@ def process_observation_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    delivery_info = self.request.delivery_info or {}
     work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
-        allow_redelivered_run=delivery_info.get('redelivered') is True,
+        allow_succeeded_run=True,
     )
     if automatic_terminal:
         return str(work.id)

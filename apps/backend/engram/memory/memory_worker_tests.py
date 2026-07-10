@@ -1288,7 +1288,7 @@ def test_automatic_observation_work_delivery_is_idempotent_after_terminal_resolu
 
 
 @pytest.mark.django_db
-def test_explicit_queued_run_executes_against_terminal_observation_work() -> None:
+def test_succeeded_explicit_run_is_idempotent_for_fresh_duplicate_delivery() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     work = create_required_observation_work(observation)
     resolve_work_succeeded(
@@ -1319,19 +1319,14 @@ def test_explicit_queued_run_executes_against_terminal_observation_work() -> Non
             workflow_run_id=str(queued_run.id),
         )
         queued_run.refresh_from_db()
-        task = tasks_module.process_observation_work_v1
-        task.push_request(retries=0, delivery_info={'redelivered': True})
-        try:
-            redelivered_result = task.run(
-                str(work.id),
-                workflow_run_id=str(queued_run.id),
-            )
-        finally:
-            task.pop_request()
+        duplicate_result = tasks_module.process_observation_work_v1(
+            str(work.id),
+            workflow_run_id=str(queued_run.id),
+        )
 
     m_execute.assert_called_once()
     work.refresh_from_db()
-    assert redelivered_result == str(queued_run.id)
+    assert duplicate_result == str(queued_run.id)
     assert WorkflowWork.objects.count() == work_count
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
