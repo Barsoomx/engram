@@ -114,7 +114,7 @@ def _load_workflow_run(
 ) -> WorkflowRun:
     allowed_statuses = [WorkflowRunStatus.QUEUED]
     if allow_redelivered:
-        allowed_statuses.extend((WorkflowRunStatus.RUNNING, WorkflowRunStatus.SUCCEEDED))
+        allowed_statuses.append(WorkflowRunStatus.SUCCEEDED)
 
     try:
         return WorkflowRun.objects.get(
@@ -131,9 +131,6 @@ def _load_workflow_run(
 
 
 def _claim_workflow_run(work: WorkflowWork, workflow_run: WorkflowRun) -> WorkflowRun:
-    if workflow_run.status == WorkflowRunStatus.RUNNING:
-        return workflow_run
-
     with transaction.atomic():
         claimed = WorkflowRun.objects.filter(
             id=workflow_run.id,

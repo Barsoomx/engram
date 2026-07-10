@@ -1379,7 +1379,7 @@ def test_explicit_observation_run_failure_is_terminal_and_not_redelivered() -> N
 
 
 @pytest.mark.django_db
-def test_redelivered_running_observation_run_recovers_after_worker_loss() -> None:
+def test_redelivered_running_observation_run_fails_closed_before_domain_access() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     work = create_required_observation_work(observation)
     running_run = WorkflowRun.objects.create(
@@ -1409,14 +1409,17 @@ def test_redelivered_running_observation_run_recovers_after_worker_loss() -> Non
 
         task.push_request(retries=0, delivery_info={'redelivered': True})
         try:
-            task.run(str(work.id), workflow_run_id=str(running_run.id))
+            with pytest.raises(MemoryWorkerError, match='workflow run'):
+                task.run(str(work.id), workflow_run_id=str(running_run.id))
         finally:
             task.pop_request()
 
-    m_execute.assert_called_once()
+    m_execute.assert_not_called()
     running_run.refresh_from_db()
-    assert running_run.status == WorkflowRunStatus.SUCCEEDED
-    assert running_run.finished_at is not None
+    work.refresh_from_db()
+    assert running_run.status == WorkflowRunStatus.RUNNING
+    assert running_run.finished_at is None
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
