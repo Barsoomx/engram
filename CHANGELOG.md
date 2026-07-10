@@ -14,6 +14,9 @@ integration, client surfaces, and operations.
 
 ### Added
 
+- Native Codex harness support: repository-backed marketplace packaging,
+  lifecycle hooks, MCP workspace routing, Claude Code/Codex/Both installer UI,
+  and a real containerized Codex E2E baseline.
 - Semantic retrieval foundation: deterministic character 3-gram embeddings
   provider adapter, `embedding_vector` on `RetrievalDocument` (migration
   `0004`), and cosine semantic fallback inside context packing that fires only
