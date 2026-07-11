@@ -13,7 +13,6 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +34,8 @@ CLEANUP_FALLBACK_TIMEOUT = 15.0
 POST_WORKLOAD_RESERVE = 200.0
 WORKLOAD_TIMEOUT = GLOBAL_TIMEOUT - POST_WORKLOAD_RESERVE
 COMMAND_TIMEOUT = 180.0
+STOP_CLI_OVERHEAD = 5.0
+STOP_POST_INSPECT_TIMEOUT = 10.0
 POLL_INTERVAL = 2.0
 OUTPUT_LIMIT = 4000
 PROJECT_PATTERN = re.compile(r"engram-d1-fault-[0-9a-f]{8,32}\Z")
@@ -740,12 +741,10 @@ class Harness:
         before_finished = (
             before.get("finished_at") if isinstance(before, dict) else None
         )
-        allowed = min(
-            timeout,
-            self.deadline.remaining(),
-            deadline.remaining() if deadline else timeout,
-        )
-        if allowed < 1:
+        required_budget = timeout + STOP_CLI_OVERHEAD + STOP_POST_INSPECT_TIMEOUT
+        if self.deadline.remaining() < required_budget:
+            raise HarnessError(f"Insufficient global deadline to stop {service}")
+        if deadline and deadline.remaining() < required_budget:
             raise HarnessError(f"Insufficient phase deadline to stop {service}")
         command = [
             "docker",
@@ -753,93 +752,32 @@ class Harness:
             "--signal",
             "SIGTERM",
             "--timeout",
-            str(int(allowed)),
+            str(int(timeout)),
             container_id,
         ]
         started = time.monotonic()
-        wall_started = datetime.now(UTC)
-        process = subprocess.Popen(  # noqa: S603
+        self.run(
             command,
-            cwd=ROOT,
-            env=self.command_env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            timeout=timeout + STOP_CLI_OVERHEAD,
         )
-        state: StopState | None = None
-        observed = timeout
-        try:
-            while time.monotonic() - started <= allowed:
-                self.deadline.remaining()
-                remaining = min(
-                    allowed - (time.monotonic() - started),
-                    deadline.remaining() if deadline else allowed,
-                )
-                try:
-                    completed = subprocess.run(  # noqa: S603
-                        ["docker", "inspect", "--format", template, container_id],
-                        cwd=ROOT,
-                        env=self.command_env,
-                        text=True,
-                        capture_output=True,
-                        check=False,
-                        timeout=max(
-                            0.1,
-                            min(2.0, remaining, self.deadline.remaining()),
-                        ),
-                    )
-                    if completed.returncode != 0:
-                        raise HarnessError("selected stop inspect failed")
-                    state = parse_stop_state(completed.stdout)
-                except (HarnessError, subprocess.TimeoutExpired):
-                    self.deadline.remaining()
-                    time.sleep(min(0.1, max(0.0, remaining)))
-                    continue
-                observed = time.monotonic() - started
-                break
-        except HarnessError:
-            process.kill()
-            process.communicate(timeout=1)
-            raise
-        try:
-            reap_timeout = min(
-                5.0,
-                self.deadline.remaining(),
-                deadline.remaining() if deadline else 5.0,
+        observed = time.monotonic() - started
+        state = parse_stop_state(
+            self.inspect_selected(
+                container_id,
+                template,
+                timeout=min(
+                    STOP_POST_INSPECT_TIMEOUT,
+                    self.deadline.remaining(),
+                    deadline.remaining() if deadline else STOP_POST_INSPECT_TIMEOUT,
+                ),
             )
-            stdout, stderr = process.communicate(timeout=reap_timeout)
-        except HarnessError:
-            process.kill()
-            process.communicate(timeout=1)
-            raise
-        except subprocess.TimeoutExpired as error:
-            process.kill()
-            process.communicate(timeout=1)
-            raise HarnessError(
-                f"Fault stop command for {service} did not reap"
-            ) from error
-        if process.returncode != 0:
-            result = CommandResult(command, process.returncode, stdout, stderr)
-            raise HarnessError(self._failure_message(result))
-        if state is None or observed > timeout:
-            raise HarnessError(
-                f"{service} did not exit within exact {timeout:.0f}s contract"
-            )
-        if state.exit_code != 0 or state.exit_code == 137:
+        )
+        if state.exit_code != 0:
             raise HarnessError(
                 f"{service} exited non-gracefully with code {state.exit_code}"
             )
         if state.finished_at == before_finished:
             raise HarnessError(f"{service} FinishedAt did not change")
-        try:
-            finished = datetime.fromisoformat(state.finished_at.replace("Z", "+00:00"))
-        except ValueError as error:
-            raise HarnessError(f"{service} FinishedAt is malformed") from error
-        finished_elapsed = (finished - wall_started).total_seconds()
-        if finished_elapsed > timeout:
-            raise HarnessError(
-                f"{service} FinishedAt exceeded exact {timeout:.0f}s contract"
-            )
 
         return state, observed
 

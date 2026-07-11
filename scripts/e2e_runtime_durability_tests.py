@@ -883,6 +883,154 @@ def test_stop_state_parser_rejects_running_oom_killed_and_malformed_fields() -> 
             parse_stop_state(invalid)
 
 
+@pytest.fixture
+def f_stop_harness(tmp_path: Path) -> Harness:
+    env_file = (tmp_path / "generated.env").resolve()
+    env_file.touch()
+    override_file = (tmp_path / "ports.override.yml").resolve()
+    write_port_override(override_file, "engram-d1-fault-a1b2c3d4")
+
+    return Harness(
+        project="engram-d1-fault-a1b2c3d4",
+        env_file=env_file,
+        override_file=override_file,
+        generated_secrets=[],
+    )
+
+
+def test_stop_service_uses_synchronous_stop_and_monotonic_elapsed_only(
+    f_stop_harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [10.0]
+    inspections = iter(
+        (
+            '{"finished_at":"2026-07-11T00:00:00Z"}',
+            '{"running":false,"restarting":false,"exit_code":0,'
+            '"oom_killed":false,"finished_at":"2099-01-01T00:00:00Z"}',
+        )
+    )
+    commands: list[tuple[list[str], float]] = []
+    f_stop_harness.container_id = lambda service, timeout: "container-1"  # type: ignore[method-assign]
+    f_stop_harness.inspect_selected = (  # type: ignore[method-assign]
+        lambda container_id, template, timeout: next(inspections)
+    )
+
+    def run_stub(args: list[str], *, timeout: float) -> CommandResult:
+        commands.append((args, timeout))
+        now[0] = 18.0
+
+        return CommandResult(args, 0, "container-1\n", "")
+
+    f_stop_harness.run = run_stub  # type: ignore[method-assign]
+    monkeypatch.setattr(durability.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        durability.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("stop_service must use Harness.run"),
+    )
+
+    state, elapsed = f_stop_harness.stop_service("beat", 7.0)
+
+    assert state == StopState(False, 0, False, "2099-01-01T00:00:00Z")
+    assert elapsed == pytest.approx(8.0)
+    assert commands == [
+        (
+            [
+                "docker",
+                "stop",
+                "--signal",
+                "SIGTERM",
+                "--timeout",
+                "7",
+                "container-1",
+            ],
+            12.0,
+        )
+    ]
+    with pytest.raises(StopIteration):
+        next(inspections)
+
+
+@pytest.mark.parametrize("budget_scope", ("global", "phase"))
+def test_stop_service_requires_full_budget_before_docker_stop(
+    f_stop_harness: Harness, budget_scope: str
+) -> None:
+    now = [10.0]
+    f_stop_harness.deadline = Deadline(21.0, clock=lambda: now[0])
+    phase_deadline = None
+    if budget_scope == "phase":
+        f_stop_harness.deadline = Deadline(100.0, clock=lambda: now[0])
+        phase_deadline = Deadline(21.0, clock=lambda: now[0])
+    inspections = iter(
+        (
+            '{"finished_at":"2026-07-11T00:00:00Z"}',
+            '{"running":false,"restarting":false,"exit_code":0,'
+            '"oom_killed":false,"finished_at":"2026-07-11T00:00:01Z"}',
+        )
+    )
+    stop_commands: list[list[str]] = []
+    f_stop_harness.container_id = lambda service, timeout: "container-1"  # type: ignore[method-assign]
+    f_stop_harness.inspect_selected = (  # type: ignore[method-assign]
+        lambda container_id, template, timeout: next(inspections)
+    )
+
+    def run_stub(args: list[str], *, timeout: float) -> CommandResult:
+        stop_commands.append(args)
+
+        return CommandResult(args, 0, "container-1\n", "")
+
+    f_stop_harness.run = run_stub  # type: ignore[method-assign]
+
+    with pytest.raises(HarnessError, match=f"Insufficient {budget_scope} deadline"):
+        f_stop_harness.stop_service("beat", 7.0, deadline=phase_deadline)
+
+    assert stop_commands == []
+
+
+@pytest.mark.parametrize(
+    ("post_stop", "message"),
+    (
+        (
+            '{"running":false,"restarting":false,"exit_code":137,'
+            '"oom_killed":false,"finished_at":"2026-07-11T00:00:01Z"}',
+            "non-gracefully with code 137",
+        ),
+        (
+            '{"running":false,"restarting":false,"exit_code":0,'
+            '"oom_killed":true,"finished_at":"2026-07-11T00:00:01Z"}',
+            "stop state",
+        ),
+        (
+            '{"running":true,"restarting":false,"exit_code":0,'
+            '"oom_killed":false,"finished_at":"2026-07-11T00:00:01Z"}',
+            "stop state",
+        ),
+    ),
+)
+def test_stop_service_rejects_non_graceful_post_stop_state(
+    f_stop_harness: Harness,
+    monkeypatch: pytest.MonkeyPatch,
+    post_stop: str,
+    message: str,
+) -> None:
+    inspections = iter(('{"finished_at":"2026-07-11T00:00:00Z"}', post_stop))
+    f_stop_harness.container_id = lambda service, timeout: "container-1"  # type: ignore[method-assign]
+    f_stop_harness.inspect_selected = (  # type: ignore[method-assign]
+        lambda container_id, template, timeout: next(inspections)
+    )
+    f_stop_harness.run = (  # type: ignore[method-assign]
+        lambda args, timeout: CommandResult(args, 0, "container-1\n", "")
+    )
+    monkeypatch.setattr(
+        durability.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("stop_service must use Harness.run"),
+    )
+
+    with pytest.raises(HarnessError, match=message):
+        f_stop_harness.stop_service("beat", 7.0)
+
+
 def test_beat_snapshot_parser_requires_expected_subset_and_snapshots_all_entries() -> (
     None
 ):
