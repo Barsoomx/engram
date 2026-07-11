@@ -26,6 +26,7 @@ from engram.core.models import (
     Project,
     RawEventEnvelope,
     RetrievalDocument,
+    Runtime,
     SessionStatus,
     WorkflowRun,
     WorkflowRunStatus,
@@ -233,6 +234,8 @@ def _evaluate_post_cutover_p1(project: Project) -> InvariantResult:
                 observation_sources__observation__organization_id=project.organization_id,
                 observation_sources__observation__project_id=project.id,
                 observation_sources__observation__session_id=F('session_id'),
+                session__organization_id=project.organization_id,
+                session__project_id=project.id,
             )
             & (
                 Q(observation_sources__observation__team_id=F('team_id'))
@@ -254,6 +257,8 @@ def _evaluate_post_cutover_p1(project: Project) -> InvariantResult:
         normalization_disposition='no_op',
         normalization_reason='evidence_only',
         total_source_count=0,
+        session__organization_id=project.organization_id,
+        session__project_id=project.id,
     ) & (Q(session__team_id=F('team_id')) | Q(session__team_id__isnull=True, team_id__isnull=True))
     invalid_raw_events = typed_raw_events.exclude(valid_observation | valid_no_op)
     violation_count = invalid_raw_events.count()
@@ -312,6 +317,8 @@ def _canonical_hook_observation(
         or observation.project_id != project.id
         or observation.session_id != raw_event.session_id
         or observation.team_id != raw_event.team_id
+        or raw_event.session.organization_id != project.organization_id
+        or raw_event.session.project_id != project.id
         or raw_event.session.team_id != raw_event.team_id
     ):
         return None
@@ -405,9 +412,7 @@ def _stored_observation_work_matches(
         return False
 
     stored_policy = snapshot.get('policy')
-    if not isinstance(stored_policy, dict):
-        return False
-    if stored_policy.get('realtime_candidates_enabled') != policy['realtime_candidates_enabled']:
+    if stored_policy != policy:
         return False
 
     expected_snapshot = {
@@ -437,6 +442,7 @@ def _evaluate_post_cutover_p2(project: Project) -> InvariantResult:
             organization_id=project.organization_id,
             project_id=project.id,
             normalization_contract_version=1,
+            source_adapter__in=(Runtime.CODEX, Runtime.CLAUDE_CODE, Runtime.UNKNOWN),
         )
         .select_related('session')
         .prefetch_related(
@@ -454,10 +460,7 @@ def _evaluate_post_cutover_p2(project: Project) -> InvariantResult:
         work_inputs: list[tuple[RawEventEnvelope, Observation, dict[str, object]]] = []
         for raw_event in batch:
             metadata = raw_event.metadata
-            if not isinstance(metadata, dict) or 'work_policy_v1' not in metadata:
-                continue
-
-            policy = metadata['work_policy_v1']
+            policy = metadata.get('work_policy_v1') if isinstance(metadata, dict) else None
             if not _valid_hook_work_policy(policy):
                 violation_count += 1
                 _record_bounded_sample(sample_ids, f'raw_event:{raw_event.id}')

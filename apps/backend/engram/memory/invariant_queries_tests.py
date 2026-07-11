@@ -324,6 +324,7 @@ def _make_typed_raw_event(
     raw_event.normalization_contract_version = 1
     raw_event.normalization_disposition = disposition
     raw_event.normalization_reason = reason
+    raw_event.source_adapter = Runtime.CODEX
     if policy is not None:
         raw_event.metadata = {'work_policy_v1': policy}
     raw_event.save(
@@ -331,6 +332,7 @@ def _make_typed_raw_event(
             'normalization_contract_version',
             'normalization_disposition',
             'normalization_reason',
+            'source_adapter',
             'metadata',
             'updated_at',
         ],
@@ -855,6 +857,123 @@ def test_post_cutover_p1_evidence_only_noop_team_equality_is_null_safe(
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize('scope_mismatch', ('organization', 'project'))
+def test_post_cutover_p1_and_p2_reject_cross_scope_session_linkage(
+    scope_mismatch: str,
+    f_scope: ScopeFixture,
+    f_foreign_scope: ScopeFixture,
+) -> None:
+    policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    hook_session = _make_session(f_scope, f'typed-cross-{scope_mismatch}-hook')
+    hook_raw = _make_typed_raw_event(
+        f_scope,
+        hook_session,
+        f'typed-cross-{scope_mismatch}-hook',
+        policy=policy,
+    )
+    hook_observation = _make_observation(f_scope, hook_session, f'typed-cross-{scope_mismatch}-hook')
+    _make_source(
+        f_scope,
+        hook_observation,
+        hook_raw,
+        f'typed-cross-{scope_mismatch}-hook',
+        source_type='hook_event',
+        source_id=hook_raw.client_event_id,
+        metadata={'event_type': hook_raw.event_type},
+    )
+    _make_observation_work(f_scope, hook_observation, policy)
+
+    if scope_mismatch == 'organization':
+        AgentSession.objects.filter(id=hook_session.id).update(
+            organization_id=f_foreign_scope.organization.id,
+        )
+    else:
+        other_project = Project.objects.create(
+            organization=f_scope.organization,
+            name='Other target-organization project',
+            slug='other-target-organization-project',
+        )
+        AgentSession.objects.filter(id=hook_session.id).update(project_id=other_project.id)
+
+    typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.VIOLATED
+    assert typed_p1.violation_count == 1
+    assert typed_p1.sample_ids == (f'raw_event:{hook_raw.id}',)
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{hook_raw.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_requires_policy_for_every_typed_hook_raw(
+    f_scope: ScopeFixture,
+) -> None:
+    regular_session = _make_session(f_scope, 'typed-missing-policy')
+    regular_raw = _make_typed_raw_event(f_scope, regular_session, 'typed-missing-policy')
+    lifecycle_session = _make_session(f_scope, 'typed-lifecycle-missing-policy')
+    lifecycle_raw = _make_typed_raw_event(
+        f_scope,
+        lifecycle_session,
+        'typed-lifecycle-missing-policy',
+        event_type='session_start',
+    )
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 2
+    assert set(typed_p2.sample_ids) == {
+        f'raw_event:{regular_raw.id}',
+        f'raw_event:{lifecycle_raw.id}',
+    }
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_excludes_typed_claude_mem_imports_without_hook_policy(
+    f_scope: ScopeFixture,
+) -> None:
+    observation_session = _make_session(f_scope, 'typed-import-observation')
+    observation_raw = _make_typed_raw_event(
+        f_scope,
+        observation_session,
+        'typed-import-observation',
+    )
+    observation = _make_observation(f_scope, observation_session, 'typed-import-observation')
+    _make_source(f_scope, observation, observation_raw, 'typed-import-observation')
+    RawEventEnvelope.objects.filter(id=observation_raw.id).update(source_adapter='claude_mem')
+
+    no_op_session = _make_session(f_scope, 'typed-import-no-op')
+    no_op_raw = _make_typed_raw_event(
+        f_scope,
+        no_op_session,
+        'typed-import-no-op',
+        disposition='no_op',
+        reason='evidence_only',
+    )
+    RawEventEnvelope.objects.filter(id=no_op_raw.id).update(source_adapter='claude_mem')
+
+    typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.HEALTHY
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+
+@pytest.mark.django_db
 def test_post_cutover_p2_requires_matching_observation_work_and_rejects_malformed_policy(
     f_scope: ScopeFixture,
 ) -> None:
@@ -965,7 +1084,7 @@ def test_post_cutover_p2_rejects_noncanonical_hook_source_before_work_check(
 
 
 @pytest.mark.django_db
-def test_post_cutover_p2_reuses_work_when_only_policy_provenance_differs(
+def test_post_cutover_p2_requires_exact_stored_policy_match(
     f_scope: ScopeFixture,
 ) -> None:
     current_policy = {
@@ -995,6 +1114,16 @@ def test_post_cutover_p2_reuses_work_when_only_policy_provenance_differs(
         project_id=f_scope.project.id,
     )
 
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
+
+    WorkflowWork.objects.all().delete()
+    _make_observation_work(f_scope, observation, current_policy)
+    typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )[1]
     assert typed_p2.state == InvariantState.HEALTHY
     assert typed_p2.violation_count == 0
 
