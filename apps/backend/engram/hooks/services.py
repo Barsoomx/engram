@@ -263,6 +263,7 @@ class IngestHookEvent:
         requested_team_id = requested_team.id if requested_team is not None else None
         if raw_event.team_id != session.team_id or raw_event.team_id != requested_team_id:
             raise AccessDeniedError('team_scope_denied', 'Hook duplicate is outside effective team scope')
+        self._validate_duplicate_producer(raw_event)
         self._repair_duplicate(
             raw_event,
             organization=organization,
@@ -337,6 +338,9 @@ class IngestHookEvent:
         if not isinstance(metadata, dict):
             raise ValueError('malformed hook duplicate metadata')
         if 'work_policy_v1' not in metadata:
+            if raw_event.normalization_contract_version is not None:
+                raise ValueError('missing work_policy_v1')
+
             return self._work_policy(organization, legacy_policy_fallback=True), True
 
         policy = metadata['work_policy_v1']
@@ -482,6 +486,13 @@ class IngestHookEvent:
             session=session,
             client_event_id=data.event_id,
         ).first()
+
+    def _validate_duplicate_producer(self, raw_event: RawEventEnvelope) -> None:
+        if (
+            raw_event.source_adapter == 'claude_mem'
+            or raw_event.observation_sources.exclude(source_type='hook_event').exists()
+        ):
+            raise ValueError('hook duplicate is owned by another producer')
 
     def _existing_result(self, raw_event: RawEventEnvelope) -> HookIngestResult:
         observation = raw_event.observations.order_by('created_at').first()
@@ -680,6 +691,8 @@ class IngestHookEvent:
             (persisted_event_type in lifecycle_types) != (event_type in lifecycle_types)
         ):
             raise ValueError('content hash collision across trusted lifecycle class')
+        if persisted_event_type != event_type:
+            raise ValueError('content hash collision across trusted event type')
 
     def _fallback_title(self, data: HookEventInput, payload: dict[str, object] | None = None) -> str:
         tool_name = (payload or data.payload).get('tool_name')

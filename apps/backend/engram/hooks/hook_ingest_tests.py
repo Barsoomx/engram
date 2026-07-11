@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier, local
 from typing import Any
 
 import pytest
-from django.db import transaction
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from pytest_django.fixtures import DjangoCaptureOnCommitCallbacks
@@ -484,21 +486,101 @@ def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
     assert response.status_code == 202
     raw_event = RawEventEnvelope.objects.get()
     raw_event.metadata = {}
-    raw_event.save(update_fields=['metadata', 'updated_at'])
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
     enable_realtime_candidates(organization)
 
-    duplicate = APIClient().post(
+    first_duplicate = APIClient().post(
         '/v1/hooks/post-tool-use',
         valid_hook_payload(project, team),
         format='json',
         **auth_headers(),
     )
 
-    assert duplicate.status_code == 202
+    assert first_duplicate.status_code == 202
     raw_event.refresh_from_db()
     assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is True
+    assert raw_event.normalization_contract_version is None
+    assert raw_event.normalization_disposition is None
+    assert raw_event.normalization_reason is None
     assert WorkflowWork.objects.count() == 1
     assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    session = AgentSession.objects.get()
+    source = ObservationSource.objects.get()
+    state_after_repair = {
+        'raw_updated_at': raw_event.updated_at,
+        'source_updated_at': source.updated_at,
+        'session_updated_at': session.updated_at,
+        'session_cursor': session.observation_sequence_cursor,
+        'raw_count': RawEventEnvelope.objects.count(),
+        'source_count': ObservationSource.objects.count(),
+        'work_count': WorkflowWork.objects.count(),
+        'outbox_count': CeleryOutbox.objects.count(),
+    }
+
+    second_duplicate = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert second_duplicate.status_code == 202
+    raw_event.refresh_from_db()
+    source.refresh_from_db()
+    session.refresh_from_db()
+    assert raw_event.updated_at == state_after_repair['raw_updated_at']
+    assert source.updated_at == state_after_repair['source_updated_at']
+    assert session.updated_at == state_after_repair['session_updated_at']
+    assert session.observation_sequence_cursor == state_after_repair['session_cursor']
+    assert RawEventEnvelope.objects.count() == state_after_repair['raw_count']
+    assert ObservationSource.objects.count() == state_after_repair['source_count']
+    assert WorkflowWork.objects.count() == state_after_repair['work_count']
+    assert CeleryOutbox.objects.count() == state_after_repair['outbox_count']
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_rejects_typed_v1_missing_work_policy_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    raw_event.metadata = {}
+    raw_event.save(update_fields=['metadata', 'updated_at'])
+    ObservationSource.objects.all().delete()
+    enable_realtime_candidates(organization)
+    session = AgentSession.objects.get()
+    initial_session_state = (
+        session.updated_at,
+        session.observation_sequence_cursor,
+        session.status,
+    )
+
+    with pytest.raises(ValueError, match='work_policy_v1'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    session.refresh_from_db()
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == 'observation'
+    assert raw_event.normalization_reason is None
+    assert raw_event.metadata == {}
+    assert (session.updated_at, session.observation_sequence_cursor, session.status) == initial_session_state
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -569,6 +651,179 @@ def test_hook_duplicate_rejects_mismatched_persisted_lifecycle_classification(
     raw_event.refresh_from_db()
     assert raw_event.metadata == {}
     assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('import_adapter', 'import_source'),
+    (
+        (True, False),
+        (False, True),
+        (True, True),
+    ),
+)
+def test_hook_duplicate_rejects_import_owned_idempotency_collision_without_mutation(
+    import_adapter: bool,
+    import_source: bool,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, imported_session, imported_raw_event, imported_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='imported-session',
+        event_id='imported-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='imported-content-hash',
+    )
+    if import_adapter:
+        imported_raw_event.source_adapter = 'claude_mem'
+        imported_raw_event.save(update_fields=['source_adapter', 'updated_at'])
+    if import_source:
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=imported_observation,
+            raw_event=imported_raw_event,
+            source_type='claude_mem',
+            source_id='claude_mem:imported-observation',
+        )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    initial_raw_updated_at = imported_raw_event.updated_at
+    initial_source_count = ObservationSource.objects.count()
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(ValueError, match='another producer'):
+        IngestHookEvent().execute(data)
+
+    imported_raw_event.refresh_from_db()
+    imported_session.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert imported_raw_event.updated_at == initial_raw_updated_at
+    assert imported_raw_event.metadata == {}
+    assert imported_session.observation_sequence_cursor == 1
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == initial_source_count
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cross_team_import_owned_idempotency_collision_denies_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    _agent, foreign_session, foreign_raw_event, foreign_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    foreign_raw_event.source_adapter = 'claude_mem'
+    foreign_raw_event.save(update_fields=['source_adapter', 'updated_at'])
+    foreign_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=foreign_observation,
+        raw_event=foreign_raw_event,
+        source_type='claude_mem',
+        source_id='claude_mem:foreign-observation',
+    )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    initial_state = {
+        'raw_updated_at': foreign_raw_event.updated_at,
+        'foreign_session_updated_at': foreign_session.updated_at,
+        'incoming_session_updated_at': incoming_session.updated_at,
+        'source_updated_at': foreign_source.updated_at,
+        'source_ids': list(ObservationSource.objects.values_list('id', flat=True)),
+    }
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        IngestHookEvent().execute(data)
+
+    assert excinfo.value.code == 'team_scope_denied'
+    foreign_raw_event.refresh_from_db()
+    foreign_session.refresh_from_db()
+    foreign_source.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert foreign_raw_event.updated_at == initial_state['raw_updated_at']
+    assert foreign_raw_event.metadata == {}
+    assert foreign_raw_event.source_adapter == 'claude_mem'
+    assert foreign_session.updated_at == initial_state['foreign_session_updated_at']
+    assert foreign_session.observation_sequence_cursor == 1
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.updated_at == initial_state['incoming_session_updated_at']
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert foreign_source.updated_at == initial_state['source_updated_at']
+    assert list(ObservationSource.objects.values_list('id', flat=True)) == initial_state['source_ids']
+    assert foreign_source.raw_event_id == foreign_raw_event.id
     assert WorkflowWork.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
@@ -651,6 +906,14 @@ def test_cross_session_idempotency_duplicate_uses_persisted_session_without_crea
         idempotency_key='cross-session-idempotency',
         content_hash='persisted-content-hash',
     )
+    persisted_raw_event.metadata = {
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': False,
+            'legacy_policy_fallback': False,
+        },
+    }
+    persisted_raw_event.save(update_fields=['metadata', 'updated_at'])
     data = hook_event_input(
         project,
         team,
@@ -749,6 +1012,31 @@ def test_hook_rejects_content_hash_reuse_across_trusted_lifecycle_class() -> Non
     assert Observation.objects.count() == 1
     assert ObservationSource.objects.count() == 1
     assert AgentSession.objects.get().observation_sequence_cursor == 1
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_across_exact_non_lifecycle_event_type() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first_data = hook_event_input(project, team)
+    IngestHookEvent().execute(first_data)
+    collision = hook_event_input(
+        project,
+        team,
+        event_type='pre_tool_use',
+        event_id='non-lifecycle-collision-event',
+        idempotency_key='non-lifecycle-collision-idempotency',
+        observation=first_data.observation,
+    )
+
+    with pytest.raises(ValueError, match='trusted event type'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -1252,38 +1540,80 @@ def test_post_tool_use_replay_by_session_event_id_returns_existing_rows(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_post_tool_use_replay_race_returns_existing_rows(m_monkeypatch: pytest.MonkeyPatch) -> None:
+def test_concurrent_post_tool_use_submissions_converge_on_one_atomic_result(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
     organization, team, project, _owner, _api_key = create_project_scope()
     enable_realtime_candidates(organization)
-    client = APIClient()
     payload = valid_hook_payload(project, team)
-    first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+    barrier = Barrier(2)
+    request_state = local()
+    backend_pids: list[int] = []
     original_find_duplicate = IngestHookEvent._find_duplicate
-    calls = {'count': 0}
 
-    def miss_once_then_load(
+    def synchronize_after_first_real_miss(
         service: IngestHookEvent,
         organization: Organization,
         project: Project,
-        data: Any,
+        data: HookEventInput,
     ) -> RawEventEnvelope | None:
-        calls['count'] += 1
-        if calls['count'] == 1:
-            return None
+        duplicate = original_find_duplicate(service, organization, project, data)
+        if duplicate is not None or getattr(request_state, 'synchronized', False):
+            return duplicate
 
-        return original_find_duplicate(service, organization, project, data)
+        assert connection.in_atomic_block
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_backend_pid()')
+            backend_pids.append(cursor.fetchone()[0])
+        request_state.synchronized = True
+        barrier.wait(timeout=5)
 
-    m_monkeypatch.setattr(IngestHookEvent, '_find_duplicate', miss_once_then_load)
+        return duplicate
 
-    second = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+    m_monkeypatch.setattr(IngestHookEvent, '_find_duplicate', synchronize_after_first_real_miss)
 
-    assert first.status_code == 202
-    assert second.status_code == 202
-    assert second.json()['duplicate'] is True
-    assert second.json()['raw_event_id'] == first.json()['raw_event_id']
+    def submit() -> tuple[int, dict[str, Any]]:
+        close_old_connections()
+        try:
+            response = APIClient().post(
+                '/v1/hooks/post-tool-use',
+                payload,
+                format='json',
+                **auth_headers(),
+            )
+
+            return response.status_code, response.json()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(submit) for _index in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    assert connection.vendor == 'postgresql'
+    assert len(backend_pids) == 2
+    assert len(set(backend_pids)) == 2
+    assert [status for status, _body in results] == [202, 202]
+    bodies = [body for _status, body in results]
+    assert sorted(body['duplicate'] for body in bodies) == [False, True]
+    assert len({body['raw_event_id'] for body in bodies}) == 1
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    raw_event = RawEventEnvelope.objects.get()
+    session = AgentSession.objects.get()
+    observation = Observation.objects.get()
+    work = WorkflowWork.objects.get()
+    queued = CeleryOutbox.objects.get()
+    assert raw_event.sequence_number == 1
+    assert session.observation_sequence_cursor == 1
+    assert observation.session_sequence == 1
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
