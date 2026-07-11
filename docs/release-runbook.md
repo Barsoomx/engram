@@ -52,7 +52,10 @@ Expected: migrations apply cleanly and `No changes detected`.
 ### 1.3 Backend tests, lint, and format
 
 ```bash
-docker compose -f deploy/compose/docker-compose.yml run --build --rm api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."
+docker compose -f deploy/compose/docker-compose.yml run --build --rm \
+  -v "$PWD/deploy/compose/docker-compose.yml:/contract/docker-compose.yml:ro" \
+  -e ENGRAM_COMPOSE_CONTRACT_PATH=/contract/docker-compose.yml \
+  api sh -ec "poetry install --no-interaction --no-root --with dev && pytest -v && ruff check . && ruff format --check ."
 ```
 
 Expected: pytest passes, ruff reports `All checks passed!`, format reports all
@@ -99,12 +102,15 @@ Expected: both plugin contract suites pass.
 ### 1.8 E2E golden path
 
 ```bash
-python3 scripts/e2e_golden_path.py
+docker compose -f deploy/compose/docker-compose.yml down
+COMPOSE_PROJECT_NAME=engram-release-golden-path python3 scripts/e2e_golden_path.py
 ```
 
 Expected: Compose starts, host CLI connects, hook observation is submitted,
 worker-created retrieval document is observed, future session context bundle is
-returned with citations, and Compose stops cleanly.
+returned with citations, and Compose stops cleanly. The first command stops the
+base release project without deleting its named volumes. The isolated E2E
+project alone deletes its disposable volumes during cleanup.
 
 ### 1.9 Frontend build
 
@@ -122,6 +128,8 @@ docker compose -f deploy/compose/docker-compose.yml down
 ```
 
 Expected: all services stopped, no output from `docker compose ... ps --format json`.
+Named release volumes are preserved. The `restart: unless-stopped` policy
+recovers unexpected exits but does not override this deliberate `down`.
 
 ## 2. Update CHANGELOG
 
@@ -172,7 +180,8 @@ before announcing the release.
 ## 6. Post-Release Verification
 
 Re-run the fresh-clone gate (step 1) against the tagged image and the published
-plugin packages. Specifically verify:
+plugin packages, including the read-only Compose-contract mount and
+`ENGRAM_COMPOSE_CONTRACT_PATH` from step 1.3. Specifically verify:
 
 - local Docker Compose startup from the published images;
 - migrations apply against a clean PostgreSQL volume;
