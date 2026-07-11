@@ -35,6 +35,9 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkType,
 )
 from engram.memory.conflict_links import conflict_candidate_target
 from engram.memory.invariant_queries import (
@@ -42,6 +45,13 @@ from engram.memory.invariant_queries import (
     InvariantResult,
     InvariantState,
     evaluate_invariants,
+    evaluate_post_cutover_p1_p2,
+)
+from engram.memory.workflow_work import (
+    CreateWorkflowWorkInput,
+    create_work,
+    observation_content_digest,
+    work_input_fingerprint,
 )
 
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
@@ -235,6 +245,7 @@ def _make_raw_event(
     suffix: str,
     *,
     entity_id: uuid.UUID | None = None,
+    event_type: str = 'post_tool_use',
 ) -> RawEventEnvelope:
     return RawEventEnvelope.objects.create(
         id=entity_id or uuid.uuid4(),
@@ -243,7 +254,7 @@ def _make_raw_event(
         team=scope.team,
         agent=scope.agent,
         session=session,
-        event_type='post_tool_use',
+        event_type=event_type,
         client_event_id=f'event-{suffix}',
         idempotency_key=f'idempotency-{suffix}',
         content_hash=f'raw-hash-{suffix}',
@@ -282,6 +293,9 @@ def _make_source(
     suffix: str,
     *,
     entity_id: uuid.UUID | None = None,
+    source_type: str = 'raw_event',
+    source_id: str | None = None,
+    metadata: dict[str, object] | None = None,
 ) -> ObservationSource:
     return ObservationSource.objects.create(
         id=entity_id or uuid.uuid4(),
@@ -289,8 +303,97 @@ def _make_source(
         project=scope.project,
         observation=observation,
         raw_event=raw_event,
-        source_type='raw_event',
-        source_id=f'source-{suffix}',
+        source_type=source_type,
+        source_id=source_id or f'source-{suffix}',
+        metadata=metadata or {},
+    )
+
+
+def _make_typed_raw_event(
+    scope: ScopeFixture,
+    session: AgentSession,
+    suffix: str,
+    *,
+    policy: dict[str, object] | None = None,
+    disposition: str = 'observation',
+    reason: str | None = None,
+    entity_id: uuid.UUID | None = None,
+    event_type: str = 'post_tool_use',
+) -> RawEventEnvelope:
+    raw_event = _make_raw_event(scope, session, suffix, entity_id=entity_id, event_type=event_type)
+    raw_event.normalization_contract_version = 1
+    raw_event.normalization_disposition = disposition
+    raw_event.normalization_reason = reason
+    if policy is not None:
+        raw_event.metadata = {'work_policy_v1': policy}
+    raw_event.save(
+        update_fields=[
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'metadata',
+            'updated_at',
+        ],
+    )
+    return raw_event
+
+
+def _make_observation_work(
+    scope: ScopeFixture,
+    observation: Observation,
+    policy: dict[str, object],
+) -> WorkflowWork:
+    if not observation.source_metadata:
+        observation.source_metadata = {'event_type': 'post_tool_use'}
+        observation.save(update_fields=['source_metadata', 'updated_at'])
+
+    work, _created = create_work(
+        CreateWorkflowWorkInput(
+            organization_id=scope.organization.id,
+            project_id=scope.project.id,
+            work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+            subject_type=WorkflowSubjectType.OBSERVATION,
+            subject_id=observation.id,
+            input_snapshot={
+                'schema': 'observation_processing_input/v1',
+                'observation_id': str(observation.id),
+                'observation_digest': observation_content_digest(observation),
+                'policy': policy,
+            },
+        ),
+    )
+    return work
+
+
+def _make_stored_observation_work(
+    scope: ScopeFixture,
+    observation: Observation,
+    policy: dict[str, object],
+) -> WorkflowWork:
+    snapshot = {
+        'schema': 'observation_processing_input/v1',
+        'observation_id': str(observation.id),
+        'observation_digest': observation_content_digest(observation),
+        'policy': policy,
+    }
+    return WorkflowWork.objects.create(
+        organization=scope.organization,
+        project=scope.project,
+        team=observation.team,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        subject_type=WorkflowSubjectType.OBSERVATION,
+        subject_id=observation.id,
+        contract_version=1,
+        occurrence_key='',
+        input_fingerprint=work_input_fingerprint(
+            work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+            subject_type=WorkflowSubjectType.OBSERVATION,
+            subject_id=observation.id,
+            contract_version=1,
+            occurrence_key='',
+            input_snapshot=snapshot,
+        ),
+        input_snapshot=snapshot,
     )
 
 
@@ -592,6 +695,464 @@ def test_p1_foreign_project_anomaly_is_neither_counted_nor_sampled(
     assert result.violation_count == 1
     assert result.sample_ids == (f'raw_event:{target_raw.id}',)
     assert f'raw_event:{foreign_raw.id}' not in result.sample_ids
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_rejects_cross_team_observation_source(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-cross-team')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-cross-team')
+    observation = _make_observation(f_scope, session, 'typed-cross-team')
+    _make_source(f_scope, observation, raw_event, 'typed-cross-team')
+    other_team = Team.objects.create(
+        organization=f_scope.organization,
+        name='Other team',
+        slug='other-team',
+    )
+    Observation.objects.filter(id=observation.id).update(team_id=other_team.id)
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.VIOLATED
+    assert typed_p1.violation_count == 1
+    assert typed_p1.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_team_equality_is_null_safe(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-null-team')
+    AgentSession.objects.filter(id=session.id).update(team_id=None)
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-null-team')
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(team_id=None)
+    observation = _make_observation(f_scope, session, 'typed-null-team')
+    Observation.objects.filter(id=observation.id).update(team_id=None)
+    _make_source(f_scope, observation, raw_event, 'typed-null-team')
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.HEALTHY
+    assert typed_p1.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_is_typed_while_global_p1_retains_legacy_gap(
+    f_scope: ScopeFixture,
+) -> None:
+    legacy_session = _make_session(f_scope, 'typed-legacy')
+    legacy_raw = _make_raw_event(f_scope, legacy_session, 'typed-legacy')
+    typed_session = _make_session(f_scope, 'typed-healthy')
+    typed_raw = _make_typed_raw_event(f_scope, typed_session, 'typed-healthy')
+    typed_observation = _make_observation(f_scope, typed_session, 'typed-healthy')
+    _make_source(f_scope, typed_observation, typed_raw, 'typed-healthy')
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+    global_p1 = _result_by_id(f_scope)['P1']
+    global_p2 = _result_by_id(f_scope)['P2']
+
+    assert typed_p1.state == InvariantState.HEALTHY
+    assert typed_p1.violation_count == 0
+    assert typed_p1.sample_ids == ()
+    assert global_p1.state == InvariantState.VIOLATED
+    assert global_p1.violation_count == 1
+    assert global_p1.sample_ids == (f'raw_event:{legacy_raw.id}',)
+    assert global_p2.state == InvariantState.MISSING_OBSERVABILITY
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_requires_observation_source_and_noop_has_none(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-cardinality')
+    missing_source = _make_typed_raw_event(f_scope, session, 'typed-missing-source')
+    no_op = _make_typed_raw_event(
+        f_scope,
+        session,
+        'typed-no-op',
+        disposition='no_op',
+        reason='evidence_only',
+    )
+    observation = _make_observation(f_scope, session, 'typed-no-op')
+    _make_source(f_scope, observation, no_op, 'typed-no-op')
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.VIOLATED
+    assert typed_p1.violation_count == 2
+    assert typed_p1.sample_ids == tuple(
+        sorted(
+            (f'raw_event:{missing_source.id}', f'raw_event:{no_op.id}'),
+            key=lambda sample_id: uuid.UUID(sample_id.split(':', maxsplit=1)[1]).int,
+        ),
+    )
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_rejects_cross_team_evidence_only_noop(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-no-op-cross-team')
+    raw_event = _make_typed_raw_event(
+        f_scope,
+        session,
+        'typed-no-op-cross-team',
+        disposition='no_op',
+        reason='evidence_only',
+    )
+    other_team = Team.objects.create(
+        organization=f_scope.organization,
+        name='No-op other team',
+        slug='no-op-other-team',
+    )
+    AgentSession.objects.filter(id=session.id).update(team_id=other_team.id)
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.VIOLATED
+    assert typed_p1.violation_count == 1
+    assert typed_p1.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p1_evidence_only_noop_team_equality_is_null_safe(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-no-op-null-team')
+    AgentSession.objects.filter(id=session.id).update(team_id=None)
+    raw_event = _make_typed_raw_event(
+        f_scope,
+        session,
+        'typed-no-op-null-team',
+        disposition='no_op',
+        reason='evidence_only',
+    )
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(team_id=None)
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.HEALTHY
+    assert typed_p1.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_requires_matching_observation_work_and_rejects_malformed_policy(
+    f_scope: ScopeFixture,
+) -> None:
+    policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    session = _make_session(f_scope, 'typed-work')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-work', policy=policy)
+    observation = _make_observation(f_scope, session, 'typed-work')
+    _make_source(
+        f_scope,
+        observation,
+        raw_event,
+        'typed-work',
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    _make_observation_work(f_scope, observation, policy)
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+    WorkflowWork.objects.all().delete()
+    typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )[1]
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_requires_false_legacy_policy_fallback(
+    f_scope: ScopeFixture,
+) -> None:
+    policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': True,
+    }
+    session = _make_session(f_scope, 'typed-fallback')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-fallback', policy=policy)
+    observation = _make_observation(f_scope, session, 'typed-fallback')
+    observation.source_metadata = {'event_type': raw_event.event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    _make_source(
+        f_scope,
+        observation,
+        raw_event,
+        'typed-fallback',
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_rejects_noncanonical_hook_source_before_work_check(
+    f_scope: ScopeFixture,
+) -> None:
+    policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    session = _make_session(f_scope, 'typed-relation')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-relation', policy=policy)
+    observation = _make_observation(f_scope, session, 'typed-relation')
+    observation.source_metadata = {'event_type': raw_event.event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    source = _make_source(
+        f_scope,
+        observation,
+        raw_event,
+        'typed-relation',
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    _make_observation_work(f_scope, observation, policy)
+    ObservationSource.objects.filter(id=source.id).update(source_id='wrong-client-event')
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_reuses_work_when_only_policy_provenance_differs(
+    f_scope: ScopeFixture,
+) -> None:
+    current_policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    stored_policy = {**current_policy, 'legacy_policy_fallback': True}
+    session = _make_session(f_scope, 'typed-provenance')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-provenance', policy=current_policy)
+    observation = _make_observation(f_scope, session, 'typed-provenance')
+    observation.source_metadata = {'event_type': raw_event.event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    _make_source(
+        f_scope,
+        observation,
+        raw_event,
+        'typed-provenance',
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    _make_observation_work(f_scope, observation, stored_policy)
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(
+        metadata={'work_policy_v1': {'schema': 'hook_work_policy/v1'}},
+    )
+    typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )[1]
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 1
+    assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_allows_additional_valid_semantic_policy_work(
+    f_scope: ScopeFixture,
+) -> None:
+    required_policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    other_policy = {**required_policy, 'realtime_candidates_enabled': False}
+    session = _make_session(f_scope, 'typed-additional-policy')
+    raw_event = _make_typed_raw_event(
+        f_scope,
+        session,
+        'typed-additional-policy',
+        policy=required_policy,
+    )
+    observation = _make_observation(f_scope, session, 'typed-additional-policy')
+    observation.source_metadata = {'event_type': raw_event.event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    _make_source(
+        f_scope,
+        observation,
+        raw_event,
+        'typed-additional-policy',
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    _make_observation_work(f_scope, observation, required_policy)
+    _make_stored_observation_work(f_scope, observation, other_policy)
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert WorkflowWork.objects.filter(subject_id=observation.id).count() == 2
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_disabled_and_lifecycle_rows_ignore_preexisting_work(
+    f_scope: ScopeFixture,
+) -> None:
+    disabled_policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': False,
+        'legacy_policy_fallback': False,
+    }
+    disabled_session = _make_session(f_scope, 'typed-disabled')
+    disabled_raw = _make_typed_raw_event(
+        f_scope,
+        disabled_session,
+        'typed-disabled',
+        policy=disabled_policy,
+    )
+    disabled_observation = _make_observation(f_scope, disabled_session, 'typed-disabled')
+    disabled_observation.source_metadata = {'event_type': disabled_raw.event_type}
+    disabled_observation.save(update_fields=['source_metadata', 'updated_at'])
+    _make_source(
+        f_scope,
+        disabled_observation,
+        disabled_raw,
+        'typed-disabled',
+        source_type='hook_event',
+        source_id=disabled_raw.client_event_id,
+        metadata={'event_type': disabled_raw.event_type},
+    )
+
+    lifecycle_policy = {**disabled_policy, 'realtime_candidates_enabled': True}
+    _make_observation_work(f_scope, disabled_observation, lifecycle_policy)
+    lifecycle_session = _make_session(f_scope, 'typed-lifecycle')
+    lifecycle_raw = _make_typed_raw_event(
+        f_scope,
+        lifecycle_session,
+        'typed-lifecycle',
+        policy=lifecycle_policy,
+        event_type='session_start',
+    )
+    lifecycle_observation = _make_observation(
+        f_scope,
+        lifecycle_session,
+        'typed-lifecycle',
+        observation_type='session_start',
+    )
+    lifecycle_observation.source_metadata = {'event_type': 'session_start'}
+    lifecycle_observation.save(update_fields=['source_metadata', 'updated_at'])
+    _make_source(
+        f_scope,
+        lifecycle_observation,
+        lifecycle_raw,
+        'typed-lifecycle',
+        source_type='hook_event',
+        source_id=lifecycle_raw.client_event_id,
+        metadata={'event_type': lifecycle_raw.event_type},
+    )
+    _make_stored_observation_work(f_scope, lifecycle_observation, disabled_policy)
+
+    _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_post_cutover_p2_query_count_is_bounded_for_multiple_rows(
+    f_scope: ScopeFixture,
+) -> None:
+    policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    for index in range(25):
+        session = _make_session(f_scope, f'typed-query-{index}')
+        raw_event = _make_typed_raw_event(f_scope, session, f'typed-query-{index}', policy=policy)
+        observation = _make_observation(f_scope, session, f'typed-query-{index}')
+        observation.source_metadata = {'event_type': raw_event.event_type}
+        observation.save(update_fields=['source_metadata', 'updated_at'])
+        _make_source(
+            f_scope,
+            observation,
+            raw_event,
+            f'typed-query-{index}',
+            source_type='hook_event',
+            source_id=raw_event.client_event_id,
+            metadata={'event_type': raw_event.event_type},
+        )
+
+    with CaptureQueriesContext(connection) as captured:
+        _typed_p1, typed_p2 = evaluate_post_cutover_p1_p2(
+            organization_id=f_scope.organization.id,
+            project_id=f_scope.project.id,
+        )
+
+    assert typed_p2.state == InvariantState.VIOLATED
+    assert typed_p2.violation_count == 25
+    assert len(captured) <= 12
 
 
 @pytest.mark.django_db

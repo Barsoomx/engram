@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 
-from django.db.models import CharField, Count, Exists, OuterRef, Q, QuerySet, Value
+from django.db.models import CharField, Count, Exists, F, OuterRef, Prefetch, Q, QuerySet, Value
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce, Concat
 from django.utils import timezone
@@ -21,6 +22,7 @@ from engram.core.models import (
     MemoryStatus,
     MemoryVersion,
     Observation,
+    ObservationSource,
     Project,
     RawEventEnvelope,
     RetrievalDocument,
@@ -28,10 +30,15 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkType,
 )
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
+from engram.memory.workflow_work import observation_content_digest, work_input_fingerprint
 
 _SAMPLE_LIMIT = 20
+_POST_CUTOVER_BATCH_SIZE = 100
 _LIFECYCLE_OBSERVATION_TYPES = ('session_start', 'session_end')
 _REVIEW_MEMORY_STATUSES = (MemoryStatus.CONFLICT, MemoryStatus.REFUTED)
 _REVIEW_MEMORY_CONFIDENCE_THRESHOLD = Decimal('0.300')
@@ -176,6 +183,19 @@ def evaluate_invariants(
     )
 
 
+def evaluate_post_cutover_p1_p2(
+    *,
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> tuple[InvariantResult, InvariantResult]:
+    project = Project.objects.only('id', 'organization_id').get(
+        id=project_id,
+        organization_id=organization_id,
+    )
+
+    return _evaluate_post_cutover_p1(project), _evaluate_post_cutover_p2(project)
+
+
 def _missing(
     invariant_id: InvariantId,
     *,
@@ -194,6 +214,306 @@ def _missing(
         sample_ids=sample_ids,
         missing_evidence=missing_evidence,
         target_checkpoint=target_checkpoint,
+    )
+
+
+def _evaluate_post_cutover_p1(project: Project) -> InvariantResult:
+    typed_raw_events = RawEventEnvelope.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        normalization_contract_version=1,
+    ).annotate(
+        total_source_count=Count('observation_sources', distinct=True),
+        valid_source_count=Count(
+            'observation_sources',
+            filter=Q(
+                observation_sources__organization_id=project.organization_id,
+                observation_sources__project_id=project.id,
+                observation_sources__raw_event_id=F('id'),
+                observation_sources__observation__organization_id=project.organization_id,
+                observation_sources__observation__project_id=project.id,
+                observation_sources__observation__session_id=F('session_id'),
+            )
+            & (
+                Q(observation_sources__observation__team_id=F('team_id'))
+                | Q(
+                    observation_sources__observation__team_id__isnull=True,
+                    team_id__isnull=True,
+                )
+            )
+            & (Q(session__team_id=F('team_id')) | Q(session__team_id__isnull=True, team_id__isnull=True)),
+            distinct=True,
+        ),
+    )
+    valid_observation = Q(
+        normalization_disposition='observation',
+        total_source_count=1,
+        valid_source_count=1,
+    )
+    valid_no_op = Q(
+        normalization_disposition='no_op',
+        normalization_reason='evidence_only',
+        total_source_count=0,
+    ) & (Q(session__team_id=F('team_id')) | Q(session__team_id__isnull=True, team_id__isnull=True))
+    invalid_raw_events = typed_raw_events.exclude(valid_observation | valid_no_op)
+    violation_count = invalid_raw_events.count()
+
+    if violation_count:
+        return InvariantResult(
+            invariant_id=InvariantId.P1,
+            state=InvariantState.VIOLATED,
+            reason='raw_event_normalization_cardinality_invalid',
+            violation_count=violation_count,
+            sample_ids=_query_samples(invalid_raw_events, 'raw_event'),
+            target_checkpoint='CP1',
+        )
+
+    return InvariantResult(
+        invariant_id=InvariantId.P1,
+        state=InvariantState.HEALTHY,
+        reason='scoped_raw_events_normalized',
+        violation_count=0,
+        target_checkpoint='CP1',
+    )
+
+
+def _valid_hook_work_policy(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {'schema', 'realtime_candidates_enabled', 'legacy_policy_fallback'}
+        and value['schema'] == 'hook_work_policy/v1'
+        and type(value['realtime_candidates_enabled']) is bool
+        and value['legacy_policy_fallback'] is False
+    )
+
+
+def _valid_hook_event_type(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _canonical_hook_observation(
+    *,
+    project: Project,
+    raw_event: RawEventEnvelope,
+    sources: list[ObservationSource],
+) -> Observation | None:
+    if len(sources) != 1:
+        return None
+
+    source = sources[0]
+    observation = source.observation
+    if (
+        source.organization_id != project.organization_id
+        or source.project_id != project.id
+        or source.raw_event_id != raw_event.id
+        or source.source_type != 'hook_event'
+        or source.source_id != raw_event.client_event_id
+        or observation.organization_id != project.organization_id
+        or observation.project_id != project.id
+        or observation.session_id != raw_event.session_id
+        or observation.team_id != raw_event.team_id
+        or raw_event.session.team_id != raw_event.team_id
+    ):
+        return None
+
+    observation_metadata = observation.source_metadata
+    source_metadata = source.metadata
+    trusted_event_type = observation_metadata.get('event_type') if isinstance(observation_metadata, dict) else None
+    source_event_type = source_metadata.get('event_type') if isinstance(source_metadata, dict) else None
+    if (
+        not _valid_hook_event_type(raw_event.event_type)
+        or not _valid_hook_event_type(trusted_event_type)
+        or not _valid_hook_event_type(source_event_type)
+        or trusted_event_type != raw_event.event_type
+        or source_event_type != raw_event.event_type
+    ):
+        return None
+
+    return observation
+
+
+def _record_bounded_sample(sample_ids: set[str], sample_id: str) -> None:
+    sample_ids.add(sample_id)
+    if len(sample_ids) > _SAMPLE_LIMIT:
+        sample_ids.intersection_update(sorted(sample_ids, key=_sample_sort_key)[:_SAMPLE_LIMIT])
+
+
+def _batched_raw_events(queryset: QuerySet[RawEventEnvelope]) -> Iterator[list[RawEventEnvelope]]:
+    batch: list[RawEventEnvelope] = []
+    for raw_event in queryset.iterator(chunk_size=_POST_CUTOVER_BATCH_SIZE):
+        batch.append(raw_event)
+        if len(batch) == _POST_CUTOVER_BATCH_SIZE:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _observation_work_index(
+    *,
+    project: Project,
+    observations: list[Observation],
+) -> dict[tuple[uuid.UUID, uuid.UUID | None], list[WorkflowWork]]:
+    if not observations:
+        return {}
+
+    works = WorkflowWork.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        subject_type=WorkflowSubjectType.OBSERVATION,
+        subject_id__in=[observation.id for observation in observations],
+        contract_version=1,
+        occurrence_key='',
+    ).order_by('id')
+    index: dict[tuple[uuid.UUID, uuid.UUID | None], list[WorkflowWork]] = {}
+    for work in works:
+        index.setdefault((work.subject_id, work.team_id), []).append(work)
+
+    return index
+
+
+def _stored_observation_work_matches(
+    *,
+    work: WorkflowWork,
+    observation: Observation,
+    policy: dict[str, object],
+) -> bool:
+    snapshot = work.input_snapshot
+    if not isinstance(snapshot, dict):
+        return False
+
+    try:
+        stored_fingerprint = work_input_fingerprint(
+            work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+            subject_type=WorkflowSubjectType.OBSERVATION,
+            subject_id=observation.id,
+            contract_version=1,
+            occurrence_key='',
+            input_snapshot=snapshot,
+        )
+    except ValueError:
+        return False
+
+    if stored_fingerprint != work.input_fingerprint:
+        return False
+    if (
+        snapshot.get('schema') != 'observation_processing_input/v1'
+        or snapshot.get('observation_id') != str(observation.id)
+        or snapshot.get('observation_digest') != observation_content_digest(observation)
+    ):
+        return False
+
+    stored_policy = snapshot.get('policy')
+    if not isinstance(stored_policy, dict):
+        return False
+    if stored_policy.get('realtime_candidates_enabled') != policy['realtime_candidates_enabled']:
+        return False
+
+    expected_snapshot = {
+        'schema': 'observation_processing_input/v1',
+        'observation_id': str(observation.id),
+        'observation_digest': observation_content_digest(observation),
+        'policy': policy,
+    }
+    try:
+        expected_fingerprint = work_input_fingerprint(
+            work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+            subject_type=WorkflowSubjectType.OBSERVATION,
+            subject_id=observation.id,
+            contract_version=1,
+            occurrence_key='',
+            input_snapshot=expected_snapshot,
+        )
+    except ValueError:
+        return False
+
+    return stored_fingerprint == expected_fingerprint
+
+
+def _evaluate_post_cutover_p2(project: Project) -> InvariantResult:
+    policy_raw_events = (
+        RawEventEnvelope.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            normalization_contract_version=1,
+        )
+        .select_related('session')
+        .prefetch_related(
+            Prefetch(
+                'observation_sources',
+                queryset=ObservationSource.objects.select_related('observation'),
+            ),
+        )
+        .order_by('id')
+    )
+    violation_count = 0
+    sample_ids: set[str] = set()
+
+    for batch in _batched_raw_events(policy_raw_events):
+        work_inputs: list[tuple[RawEventEnvelope, Observation, dict[str, object]]] = []
+        for raw_event in batch:
+            metadata = raw_event.metadata
+            if not isinstance(metadata, dict) or 'work_policy_v1' not in metadata:
+                continue
+
+            policy = metadata['work_policy_v1']
+            if not _valid_hook_work_policy(policy):
+                violation_count += 1
+                _record_bounded_sample(sample_ids, f'raw_event:{raw_event.id}')
+                continue
+
+            observation = _canonical_hook_observation(
+                project=project,
+                raw_event=raw_event,
+                sources=list(raw_event.observation_sources.all()),
+            )
+            if observation is None:
+                violation_count += 1
+                _record_bounded_sample(sample_ids, f'raw_event:{raw_event.id}')
+                continue
+
+            work_inputs.append((raw_event, observation, policy))
+
+        work_index = _observation_work_index(
+            project=project,
+            observations=[observation for _raw_event, observation, _policy in work_inputs],
+        )
+        for raw_event, observation, policy in work_inputs:
+            is_lifecycle = raw_event.event_type in _LIFECYCLE_OBSERVATION_TYPES
+            realtime_enabled = policy['realtime_candidates_enabled']
+            if not realtime_enabled or is_lifecycle:
+                continue
+
+            matching_work = work_index.get((observation.id, observation.team_id), ())
+            work_is_valid = any(
+                _stored_observation_work_matches(
+                    work=work,
+                    observation=observation,
+                    policy=policy,
+                )
+                for work in matching_work
+            )
+            if not work_is_valid:
+                violation_count += 1
+                _record_bounded_sample(sample_ids, f'raw_event:{raw_event.id}')
+
+    if not violation_count:
+        return InvariantResult(
+            invariant_id=InvariantId.P2,
+            state=InvariantState.HEALTHY,
+            reason='post_cutover_work_intent_present',
+            violation_count=0,
+            target_checkpoint='CP1',
+        )
+
+    return InvariantResult(
+        invariant_id=InvariantId.P2,
+        state=InvariantState.VIOLATED,
+        reason='post_cutover_work_intent_relation_invalid',
+        violation_count=violation_count,
+        sample_ids=tuple(sorted(sample_ids, key=_sample_sort_key)),
+        target_checkpoint='CP1',
     )
 
 
