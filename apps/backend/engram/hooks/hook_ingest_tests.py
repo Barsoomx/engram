@@ -20,7 +20,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import AccessDeniedError, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -33,6 +33,7 @@ from engram.core.models import (
     RawEventEnvelope,
     SessionStatus,
     Team,
+    WorkflowWork,
 )
 from engram.hooks.services import HookEventInput, IngestHookEvent
 from engram.memory.tasks import distill_session
@@ -204,6 +205,65 @@ def hook_event_input(project: Project, team: Team, **overrides: Any) -> HookEven
     fields.update(overrides)
 
     return HookEventInput(**fields)
+
+
+def create_persisted_hook_evidence(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    *,
+    session_id: str,
+    event_id: str,
+    idempotency_key: str,
+    content_hash: str,
+) -> tuple[Agent, AgentSession, RawEventEnvelope, Observation]:
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id=f'agent-{session_id}',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=session_id,
+        runtime='codex',
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id=event_id,
+        idempotency_key=idempotency_key,
+        content_hash=content_hash,
+        runtime='codex',
+        normalization_contract_version=1,
+        normalization_disposition='observation',
+        sequence_number=1,
+        metadata={},
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='persisted foreign evidence',
+        body='persisted foreign body',
+        content_hash=content_hash,
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+
+    return agent, session, raw_event, observation
 
 
 @pytest.mark.django_db
@@ -378,6 +438,345 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_ta
 
 
 @pytest.mark.django_db
+def test_hook_acceptance_persists_v1_evidence_policy_and_id_only_observation_work() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+
+    response = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 202
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    session = AgentSession.objects.get()
+    work = WorkflowWork.objects.get()
+    queued = CeleryOutbox.objects.get()
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == 'observation'
+    assert raw_event.normalization_reason is None
+    assert raw_event.metadata['work_policy_v1'] == {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    assert observation.session_sequence == 1
+    assert session.observation_sequence_cursor == 1
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
+    assert set(work.input_snapshot) == {'schema', 'observation_id', 'observation_digest', 'policy'}
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    response = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+    assert response.status_code == 202
+    raw_event = RawEventEnvelope.objects.get()
+    raw_event.metadata = {}
+    raw_event.save(update_fields=['metadata', 'updated_at'])
+    enable_realtime_candidates(organization)
+
+    duplicate = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert duplicate.status_code == 202
+    raw_event.refresh_from_db()
+    assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is True
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_rejects_invalid_present_work_policy_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    invalid_policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': 'yes',
+        'legacy_policy_fallback': False,
+    }
+    raw_event.metadata = {'work_policy_v1': invalid_policy}
+    raw_event.save(update_fields=['metadata', 'updated_at'])
+    ObservationSource.objects.all().delete()
+    enable_realtime_candidates(organization)
+
+    with pytest.raises(ValueError, match='work_policy_v1'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    assert raw_event.metadata == {'work_policy_v1': invalid_policy}
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('raw_event_type', 'trusted_event_type'),
+    (
+        ('session_start', 'post_tool_use'),
+        ('post_tool_use', 'session_start'),
+    ),
+)
+def test_hook_duplicate_rejects_mismatched_persisted_lifecycle_classification(
+    raw_event_type: str,
+    trusted_event_type: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, _session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='persisted-idempotency',
+        content_hash='persisted-content-hash',
+    )
+    raw_event.event_type = raw_event_type
+    raw_event.save(update_fields=['event_type', 'updated_at'])
+    observation.source_metadata = {'event_type': trusted_event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    enable_realtime_candidates(organization)
+    data = hook_event_input(
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='persisted-idempotency',
+        content_hash='persisted-content-hash',
+    )
+
+    with pytest.raises(ValueError, match='event type'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    assert raw_event.metadata == {}
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cross_team_idempotency_duplicate_denies_without_touching_incoming_or_persisted_sessions() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    _agent, foreign_session, foreign_raw_event, _observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        IngestHookEvent().execute(data)
+
+    assert excinfo.value.code == 'team_scope_denied'
+    assert set(AgentSession.objects.values_list('external_session_id', flat=True)) == {
+        'foreign-session',
+        'incoming-session',
+    }
+    foreign_session.refresh_from_db()
+    foreign_raw_event.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert foreign_session.observation_sequence_cursor == 1
+    assert foreign_raw_event.metadata == {}
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.agent_id == incoming_agent.id
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cross_session_idempotency_duplicate_uses_persisted_session_without_creating_incoming_session() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, persisted_session, persisted_raw_event, _observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='cross-session-idempotency',
+        content_hash='persisted-content-hash',
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='cross-session-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    result = IngestHookEvent().execute(data)
+
+    assert result.duplicate is True
+    assert result.raw_event.id == persisted_raw_event.id
+    assert result.session.id == persisted_session.id
+    assert list(AgentSession.objects.values_list('external_session_id', flat=True)) == ['persisted-session']
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_hook_reuses_existing_observation_sequence_without_advancing_cursor() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+    second = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(
+            project,
+            team,
+            event_id='event-2',
+            idempotency_key='idem-2',
+            request_id='request-event-2',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert Observation.objects.count() == 1
+    assert RawEventEnvelope.objects.count() == 2
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert list(RawEventEnvelope.objects.values_list('sequence_number', flat=True)) == [1, 1]
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_with_different_canonical_redacted_content() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first_data = hook_event_input(project, team)
+    IngestHookEvent().execute(first_data)
+    collision = hook_event_input(
+        project,
+        team,
+        event_id='collision-event',
+        idempotency_key='collision-idempotency',
+        observation={**first_data.observation, 'body': 'different redacted canonical body'},
+    )
+
+    with pytest.raises(ValueError, match='content hash collision'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_across_trusted_lifecycle_class() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    shared_observation = {
+        'type': 'shared',
+        'title': 'same title',
+        'body': 'same body',
+        'files_read': [],
+        'files_modified': [],
+    }
+    IngestHookEvent().execute(hook_event_input(project, team, observation=shared_observation))
+    collision = hook_event_input(
+        project,
+        team,
+        event_type='session_start',
+        event_id='lifecycle-collision-event',
+        idempotency_key='lifecycle-collision-idempotency',
+        observation=shared_observation,
+    )
+
+    with pytest.raises(ValueError, match='lifecycle class'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+
+
+@pytest.mark.django_db
+def test_lifecycle_hook_never_creates_observation_work() -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    enable_realtime_candidates(organization)
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='session_start',
+        event_id='lifecycle-event-1',
+        idempotency_key='lifecycle-idempotency-1',
+        observation={
+            'type': 'session_start',
+            'title': 'Session started',
+            'body': 'started',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 0
+
+
+@pytest.mark.django_db
 def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
@@ -414,11 +813,10 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
         )
 
     assert response.status_code == 202
-    body = response.json()
     queued = CeleryOutbox.objects.get()
 
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
     transport_payload = f'{queued.args} {queued.kwargs} {queued.options}'
     assert RAW_KEY not in transport_payload
@@ -426,7 +824,7 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
 
 
 @pytest.mark.django_db
-def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits() -> None:
+def test_ingest_hook_event_writes_worker_task_inside_transaction() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     enable_realtime_candidates(organization)
     data = hook_event_input(project, team)
@@ -434,7 +832,7 @@ def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits
     with transaction.atomic():
         IngestHookEvent().execute(data)
 
-        assert CeleryOutbox.objects.count() == 0
+        assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -465,11 +863,11 @@ def test_ingest_hook_event_dispatches_worker_task_exactly_once_on_commit(
 
     with f_capture_on_commit(execute=True):
         with transaction.atomic():
-            result = IngestHookEvent().execute(data)
+            IngestHookEvent().execute(data)
 
-    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 1
-    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
-    assert queued.args == [str(result.observation.id)]
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
@@ -482,7 +880,7 @@ def test_ingest_hook_event_does_not_enqueue_realtime_task_by_default(
     with f_capture_on_commit(execute=True):
         IngestHookEvent().execute(data)
 
-    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 0
 
 
 @pytest.mark.django_db
@@ -510,14 +908,14 @@ def test_ingest_hook_event_enqueues_realtime_task_when_setting_enabled(
     data = hook_event_input(project, team)
 
     with f_capture_on_commit(execute=True):
-        result = IngestHookEvent().execute(data)
+        IngestHookEvent().execute(data)
 
-    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
-    assert queued.args == [str(result.observation.id)]
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
-def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
+def test_session_start_hook_persists_lifecycle_event_without_observation_work(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     organization, project, team, raw_key = create_hook_scope()
@@ -542,13 +940,10 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'session_start'
     assert Observation.objects.get().observation_type == 'session_start'
-    queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
-    assert queued.kwargs == {}
+    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -577,12 +972,11 @@ def test_error_hook_persists_error_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/error', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'error'
     assert Observation.objects.get().observation_type == 'error'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
 
 
@@ -612,12 +1006,11 @@ def test_decision_hook_persists_decision_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'decision'
     assert Observation.objects.get().observation_type == 'decision'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
 
 
@@ -1072,13 +1465,7 @@ def test_session_end_marks_session_ended_and_writes_durable_event(
     assert observation.observation_type == 'session_end'
     assert response.json()['agent_session_id'] == str(session.id)
     outbox_tasks = {row.task_name: row for row in CeleryOutbox.objects.all()}
-    assert set(outbox_tasks) == {
-        'engram.memory.process_observation_recorded',
-        'engram.memory.distill_session',
-    }
-    process_task = outbox_tasks['engram.memory.process_observation_recorded']
-    assert process_task.args == [response.json()['observation_id']]
-    assert process_task.kwargs == {}
+    assert set(outbox_tasks) == {'engram.memory.distill_session'}
     distill_task = outbox_tasks['engram.memory.distill_session']
     assert distill_task.args == [str(session.id)]
     assert distill_task.kwargs == {}
@@ -1241,8 +1628,8 @@ def test_pre_tool_use_ingests_raw_event_observation_source_and_queues_worker_tas
     assert raw_event.event_type == 'pre_tool_use'
     assert observation.observation_type == 'pre_tool_use'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
@@ -1347,10 +1734,9 @@ def test_user_prompt_submit_hook_persists_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/user-prompt-submit', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'user_prompt_submit'
     assert Observation.objects.get().observation_type == 'user_prompt_submit'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
