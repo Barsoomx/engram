@@ -496,6 +496,27 @@ def test_hook_result_error_includes_bounded_redacted_stderr() -> None:
     assert len(message) < 4300
 
 
+def test_hook_result_redacts_secret_before_bounding_stderr_tail() -> None:
+    secret = "generated-SYNTHETIC-boundary-secret"
+    prefix = "p" * 100
+    suffix = "x" * (durability.OUTPUT_LIMIT - len(secret) + 5)
+    result = CommandResult(
+        args=(),
+        returncode=0,
+        stdout="",
+        stderr=prefix + secret + suffix,
+    )
+
+    with pytest.raises(HarnessError) as captured:
+        durability.parse_hook_result(result, [secret])  # type: ignore[attr-defined]
+
+    message = str(captured.value)
+    stderr_tail = message.partition("stderr tail:\n")[2]
+    assert secret[5:] not in stderr_tail
+    assert "[REDACTED]" in stderr_tail
+    assert len(stderr_tail) <= durability.OUTPUT_LIMIT
+
+
 def test_hook_result_returns_successful_object_unchanged() -> None:
     result = CommandResult(
         args=(),

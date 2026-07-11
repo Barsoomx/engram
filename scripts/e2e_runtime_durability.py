@@ -240,6 +240,10 @@ def redact_secrets(value: str, generated_secrets: Sequence[str]) -> str:
     return redacted
 
 
+def redact_tail(value: str, generated_secrets: Sequence[str]) -> str:
+    return redact_secrets(value, generated_secrets)[-OUTPUT_LIMIT:]
+
+
 def parse_queue_state(payload: str, queue_name: str) -> QueueState:
     try:
         rows = json.loads(payload)
@@ -552,8 +556,8 @@ class Harness:
 
     def _failure_message(self, result: CommandResult) -> str:
         command = redact_secrets(" ".join(result.args), self.generated_secrets)
-        stdout = redact_secrets(result.stdout[-OUTPUT_LIMIT:], self.generated_secrets)
-        stderr = redact_secrets(result.stderr[-OUTPUT_LIMIT:], self.generated_secrets)
+        stdout = redact_tail(result.stdout, self.generated_secrets)
+        stderr = redact_tail(result.stderr, self.generated_secrets)
 
         return f"Command failed ({result.returncode}): {command}\nstdout tail:\n{stdout}\nstderr tail:\n{stderr}"
 
@@ -1003,8 +1007,9 @@ class Harness:
             result = CommandResult(
                 (), completed.returncode, completed.stdout, completed.stderr
             )
-            output = redact_secrets(
-                (result.stdout + result.stderr)[-OUTPUT_LIMIT:], self.generated_secrets
+            output = redact_tail(
+                result.stdout + result.stderr,
+                self.generated_secrets,
             )
             if output:
                 progress(f"{service} log tail:\n{output}")
@@ -1027,8 +1032,8 @@ def parse_hook_result(
     try:
         return parse_last_json_object(result.stdout, "hook response")
     except HarnessError as error:
-        stderr = redact_secrets(
-            result.stderr[-OUTPUT_LIMIT:],
+        stderr = redact_tail(
+            result.stderr,
             generated_secrets,
         )
         raise HarnessError(
@@ -1878,8 +1883,9 @@ def cleanup(
             f"guarded Compose cleanup timed out after {CLEANUP_COMPOSE_TIMEOUT:.0f}s"
         )
     else:
-        output = redact_secrets(
-            (completed.stdout + completed.stderr)[-OUTPUT_LIMIT:], generated_secrets
+        output = redact_tail(
+            completed.stdout + completed.stderr,
+            generated_secrets,
         )
         output += f"\ncompose_down_exit={completed.returncode}"
     filters = {
