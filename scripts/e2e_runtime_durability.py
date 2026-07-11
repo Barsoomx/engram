@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COMPOSE_FILE = (ROOT / "deploy/compose/docker-compose.yml").resolve()
 ENV_EXAMPLE = (ROOT / "deploy/compose/.env.example").resolve()
 TARGET_QUEUE = "engram-near-realtime"
-TARGET_TASK = "engram.memory.process_observation_recorded"
+TARGET_TASK = "engram.memory.process_observation_work_v1"
 GLOBAL_TIMEOUT = 25 * 60.0
 FAILURE_LOG_SERVICES = (
     "api",
@@ -1074,7 +1074,16 @@ def exact_state_query(project_id: str, run_id: str) -> str:
 import json
 from django.db.models import F
 from django_celery_outbox.models import CeleryOutbox
-from engram.core.models import Memory, MemoryStatus, MemoryVersion, Observation, RetrievalDocument
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Observation,
+    RetrievalDocument,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkType,
+)
 
 project_id = {json.dumps(project_id)}
 client_event_id = {json.dumps(client_event_id)}
@@ -1085,10 +1094,19 @@ observations = Observation.objects.filter(
     raw_event__request_id=request_id,
 )
 observation_ids = [str(value) for value in observations.values_list('id', flat=True)]
+work_ids = [
+    str(value)
+    for value in WorkflowWork.objects.filter(
+        project_id=project_id,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        subject_type=WorkflowSubjectType.OBSERVATION,
+        subject_id__in=observation_ids,
+    ).values_list('id', flat=True)
+]
 outbox = sum(
     1
     for row in CeleryOutbox.objects.filter(task_name={json.dumps(TARGET_TASK)}).only('args')
-    if row.args in ([observation_id] for observation_id in observation_ids)
+    if row.args in ([work_id] for work_id in work_ids)
 )
 versions = MemoryVersion.objects.select_related('memory', 'source_observation__raw_event').filter(
     project_id=project_id,

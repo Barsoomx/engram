@@ -18,6 +18,7 @@ from scripts.e2e_runtime_durability import (
     QueueState,
     RuntimeState,
     StopState,
+    TARGET_TASK,
     cleanup_command,
     deterministic_env,
     exact_state_query,
@@ -1282,3 +1283,19 @@ def test_exact_state_query_requires_exact_golden_path_linkage() -> None:
         "'linked_documents': linked_documents",
     ):
         assert required in query
+
+
+def test_exact_state_query_matches_observation_work_and_work_id_outbox_args() -> None:
+    query = exact_state_query("project-1", "run-1")
+
+    assert TARGET_TASK == "engram.memory.process_observation_work_v1"
+    assert f"task_name={json.dumps(TARGET_TASK)}" in query
+    assert "WorkflowWork" in query
+    assert "WorkflowWorkType.OBSERVATION_PROCESSING" in query
+    assert "WorkflowSubjectType.OBSERVATION" in query
+    assert "subject_id__in=observation_ids" in query
+    assert "row.args in ([work_id] for work_id in work_ids)" in query
+    assert (
+        "row.args in ([observation_id] for observation_id in observation_ids)"
+        not in query
+    )
