@@ -15,6 +15,8 @@ from engram.context import services as context_services
 from engram.core.models import (
     Agent,
     AgentSession,
+    AuditEvent,
+    AuditResult,
     Observation,
     ObservationSource,
     Project,
@@ -241,21 +243,35 @@ def test_observation_task_payload_contains_only_work_id_and_no_secret() -> None:
 @pytest.mark.parametrize('foreign_selector', ('project', 'team'))
 def test_foreign_project_or_team_is_denied_before_any_evidence_mutation(foreign_selector: str) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
+    secret = 'foreign-scope-product-secret'
     if foreign_selector == 'project':
         foreign_project = Project.objects.create(
             organization=_organization,
             name='Foreign project',
             slug='foreign-project',
         )
-        data = hook_event_input(project, team, project_id=foreign_project.id)
+        data = hook_event_input(
+            project,
+            team,
+            project_id=foreign_project.id,
+            payload={'tool_input': {'api_key': secret}},
+            observation={'type': 'tool_use', 'title': secret, 'body': secret},
+        )
     else:
         foreign_team = Team.objects.create(organization=_organization, name='Foreign team', slug='foreign-team')
         ProjectTeam.objects.create(organization=_organization, project=project, team=foreign_team)
-        data = hook_event_input(project, foreign_team)
+        data = hook_event_input(
+            project,
+            foreign_team,
+            payload={'tool_input': {'api_key': secret}},
+            observation={'type': 'tool_use', 'title': secret, 'body': secret},
+        )
 
     before = _counts()
     projects_before = list(Project.objects.order_by('id').values())
     teams_before = list(Team.objects.order_by('id').values())
+    audits_before = list(AuditEvent.objects.order_by('id').values())
+    audit_ids_before = {audit['id'] for audit in audits_before}
     with CaptureQueriesContext(connection) as queries:
         with pytest.raises(AccessDeniedError):
             hook_services.IngestHookEvent().execute(data)
@@ -263,7 +279,22 @@ def test_foreign_project_or_team_is_denied_before_any_evidence_mutation(foreign_
     mutations = [
         query['sql'] for query in queries if query['sql'].lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE'))
     ]
-    assert mutations == []
+    assert len(mutations) == 1
+    assert mutations[0].lstrip().upper().startswith('INSERT')
+    assert 'CORE_AUDITEVENT' in mutations[0].upper()
+
+    assert AuditEvent.objects.count() == len(audits_before) + 1
+    assert list(AuditEvent.objects.filter(id__in=audit_ids_before).order_by('id').values()) == audits_before
+    audit = AuditEvent.objects.exclude(id__in=audit_ids_before).get()
+    assert audit.event_type == 'AccessScopeResolved'
+    assert audit.result == AuditResult.DENIED
+    assert audit.target_type == 'hook_event'
+    assert audit.target_id == data.event_id
+    assert audit.request_id == data.request_id
+    assert audit.metadata['reason'] == f'{foreign_selector}_scope_denied'
+    assert 'payload' not in audit.metadata
+    assert 'observation' not in audit.metadata
+    assert secret not in repr(audit.__dict__)
     assert _counts() == before
     assert list(Project.objects.order_by('id').values()) == projects_before
     assert list(Team.objects.order_by('id').values()) == teams_before
