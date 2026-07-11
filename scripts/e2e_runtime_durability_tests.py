@@ -590,6 +590,36 @@ def test_redaction_removes_disposable_bootstrap_credentials_from_logs() -> None:
     assert redacted.count("[REDACTED]") == 2
 
 
+def test_redaction_removes_bootstrap_key_after_compose_no_color_prefix() -> None:
+    value = "api-1  | engram-default-SYNTHETIC-secret\n"
+
+    assert redact_secrets(value, []) == "api-1  | [REDACTED]\n"
+
+
+def test_compose_e2e_runs_harness_tests_after_golden_path_before_durability() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github/workflows/compose-e2e.yml"
+    ).read_text(encoding="utf-8")
+    step_name = "      - name: Run runtime durability harness tests\n"
+    step_start = workflow.index(step_name)
+    step_end = workflow.find("\n      - name:", step_start + len(step_name))
+    harness_step = workflow[step_start:step_end]
+    expected_command = (
+        '        run: docker run --rm --entrypoint /bin/sh -v "$PWD:/workspace:ro" '
+        "-w /workspace engram-backend:local -ec 'mkdir -p /tmp/backend && cp "
+        "/workspace/apps/backend/pyproject.toml /workspace/apps/backend/poetry.lock "
+        "/tmp/backend/ && poetry -C /tmp/backend install --only dev --no-root "
+        "--no-interaction && PYTHONPATH=/workspace python -m pytest -p "
+        "no:cacheprovider /workspace/scripts/e2e_runtime_durability_tests.py -q'"
+    )
+
+    assert workflow.index("      - name: Run Compose golden path\n") < step_start
+    assert step_start < workflow.index("      - name: Run Compose runtime durability\n")
+    assert expected_command in harness_step
+    for forbidden in ("/var/run/docker.sock", "ENGRAM_ENV_FILE", "secrets."):
+        assert forbidden not in harness_step
+
+
 def test_deadline_uses_injected_monotonic_clock() -> None:
     now = [10.0]
     deadline = Deadline(25.0, clock=lambda: now[0])

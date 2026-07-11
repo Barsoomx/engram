@@ -41,6 +41,18 @@ state (each defines a healthcheck); worker-realtime, worker-near-realtime,
 worker-batch, worker-highmemory, worker-domain-events, beat, and relay have no
 healthcheck and are expected to be running.
 
+For those async services, `/tmp/engram_celery_ready` is Celery-only: workers set
+it when ready and remove it on shutdown, while Beat sets it on initialization.
+The relay does not use it, and the file does not prove live broker
+authentication readiness. Workers reconnect indefinitely, while the relay
+retries its processing loop, across transient RabbitMQ unavailability or restart
+with unchanged valid credentials. `restart: unless-stopped` reacts to process
+exit, not to a running but unhealthy or disconnected service. Treat broker
+credential rotation as a separately reviewed configuration change: recreate the
+async services under operator control, then functionally verify consumer
+registration, terminal work, and outbox drain. Credential rotation is not a D1
+self-healing claim.
+
 ### 1.2 Apply migrations and verify freshness
 
 ```bash

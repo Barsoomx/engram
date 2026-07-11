@@ -53,8 +53,20 @@ does not override a deliberate `docker compose down`. Compose sends `SIGTERM`
 with exact grace periods of 45 seconds for the API, 12 minutes for every
 worker, 30 seconds for Beat, and 60 seconds for the relay. API startup applies
 migrations, bootstraps the admin, and then uses `exec` to hand PID 1 to Granian.
-Workers reconnect indefinitely both during startup and after broker loss, so
-operator intervention is not required for an ordinary broker restart.
+Workers reconnect indefinitely, while the relay retries its processing loop,
+across transient RabbitMQ unavailability or restart with unchanged valid
+credentials. Operator intervention is therefore not required for an ordinary
+broker restart.
+
+Workers, Beat, and the relay have no application healthcheck.
+`/tmp/engram_celery_ready` is Celery-only: workers set it when ready and remove
+it on shutdown, while Beat sets it on initialization. The relay does not use
+it, and the file does not prove live broker authentication readiness.
+`restart: unless-stopped` reacts to process exit, not to a service that remains
+running but is unhealthy or disconnected. Broker credential rotation is a
+separately reviewed configuration change: recreate the async services under
+operator control, then verify consumer registration, terminal work, and outbox
+drain. It is not a D1 self-healing claim.
 
 This D1 contract applies only to fresh or disposable Compose projects. Reusing
 recorded deployment storage and RabbitMQ identity is a D2 operation with a

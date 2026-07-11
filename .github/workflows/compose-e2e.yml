@@ -26,6 +26,9 @@ jobs:
       - name: Run Compose golden path
         run: python3 scripts/e2e_golden_path.py
 
+      - name: Run runtime durability harness tests
+        run: docker run --rm --entrypoint /bin/sh -v "$PWD:/workspace:ro" -w /workspace engram-backend:local -ec 'mkdir -p /tmp/backend && cp /workspace/apps/backend/pyproject.toml /workspace/apps/backend/poetry.lock /tmp/backend/ && poetry -C /tmp/backend install --only dev --no-root --no-interaction && PYTHONPATH=/workspace python -m pytest -p no:cacheprovider /workspace/scripts/e2e_runtime_durability_tests.py -q'
+
       - name: Run Compose claude-mem import
         run: python3 scripts/e2e_claude_mem_import.py
 

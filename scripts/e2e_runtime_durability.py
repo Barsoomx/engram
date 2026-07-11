@@ -235,7 +235,7 @@ def redact_secrets(value: str, generated_secrets: Sequence[str]) -> str:
         r"\1[REDACTED]",
         redacted,
     )
-    redacted = re.sub(r"(?m)^engram-default-[^\s]+$", "[REDACTED]", redacted)
+    redacted = re.sub(r"(?<!\S)engram-default-\S+", "[REDACTED]", redacted)
 
     return redacted
 
