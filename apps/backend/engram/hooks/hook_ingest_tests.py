@@ -246,6 +246,7 @@ def create_persisted_hook_evidence(
         normalization_contract_version=1,
         normalization_disposition='observation',
         sequence_number=1,
+        payload={'tool_name': 'bash', 'tool_input': {'command': 'pytest'}},
         metadata={},
     )
     observation = Observation.objects.create(
