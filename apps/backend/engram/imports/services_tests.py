@@ -6,13 +6,29 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+from django_celery_outbox.models import CeleryOutbox
 
-from engram.core.models import Observation, Organization, Project, ProjectTeam, Team
+from engram.core.models import (
+    Agent,
+    AgentSession,
+    Observation,
+    ObservationSource,
+    Organization,
+    Project,
+    ProjectTeam,
+    RawEventEnvelope,
+    RawEventNormalizationDisposition,
+    RawEventNormalizationReason,
+    Runtime,
+    Team,
+    WorkflowWork,
+)
 from engram.imports.services import (
     _MAX_OBSERVATION_LIST_ITEMS,
     _MAX_OBSERVATION_TEXT_CHARS,
     ClaudeMemImporter,
     ClaudeMemImportInput,
+    ImportContext,
 )
 
 
@@ -90,6 +106,152 @@ def test_import_reports_prompt_with_missing_source_session_as_unsupported(
     ) in unsupported
     assert report['created']['raw_events'] == 3
     assert report['duplicates']['raw_events'] == 0
+
+
+@pytest.mark.django_db
+def test_import_materializes_v1_observation_sequences_and_prompt_no_op(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    ClaudeMemImporter().execute(
+        ClaudeMemImportInput(
+            source_root=f_claude_mem_fixture,
+            organization_id=f_import_scope.organization.id,
+            project_id=f_import_scope.project.id,
+            team_id=f_import_scope.team.id,
+            source_store_id='fixture-store',
+            apply=True,
+        ),
+    )
+
+    session = AgentSession.objects.get(content_session_id='content-session-fixture-001')
+    observations = list(Observation.objects.filter(session=session).order_by('session_sequence'))
+    assert [observation.session_sequence for observation in observations] == [1, 2]
+    assert session.observation_sequence_cursor == 2
+
+    observation_raw_events = RawEventEnvelope.objects.filter(
+        session=session,
+        event_type__in=['claude_mem.observation', 'claude_mem.session_summary'],
+    )
+    assert observation_raw_events.count() == 2
+    assert set(observation_raw_events.values_list('normalization_contract_version', flat=True)) == {1}
+    assert set(observation_raw_events.values_list('normalization_disposition', flat=True)) == {
+        RawEventNormalizationDisposition.OBSERVATION,
+    }
+    assert observation_raw_events.filter(normalization_reason__isnull=True).count() == 2
+    assert observation_raw_events.filter(sequence_number__in=[1, 2]).count() == 2
+    assert ObservationSource.objects.filter(observation__session=session).count() == 2
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+    prompt_raw_event = RawEventEnvelope.objects.get(event_type='claude_mem.user_prompt')
+    assert prompt_raw_event.normalization_contract_version == 1
+    assert prompt_raw_event.normalization_disposition == RawEventNormalizationDisposition.NO_OP
+    assert prompt_raw_event.normalization_reason == RawEventNormalizationReason.EVIDENCE_ONLY
+    assert prompt_raw_event.sequence_number is None
+    assert not ObservationSource.objects.filter(raw_event=prompt_raw_event).exists()
+
+
+@pytest.mark.django_db
+def test_import_reuses_existing_observation_sequence_for_new_raw_source(
+    f_import_scope: ImportScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='fixture-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    row = {
+        'id': 1,
+        'memory_session_id': 'memory-session-fixture-001',
+        'project': '/workspace/example-repo',
+        'text': 'Existing imported observation body.',
+        'type': 'discovery',
+        'title': 'Existing imported observation',
+        'created_at': '2026-06-25T09:02:00Z',
+    }
+    agent = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='existing-import-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id='claude-mem:fixture-store:sdk_session:content-session-fixture-001',
+        content_session_id='content-session-fixture-001',
+        memory_session_id='memory-session-fixture-001',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=7,
+    )
+    source_id = importer._observation_source_id(context, row)
+    observation = Observation.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        session=session,
+        observation_type='discovery',
+        title=str(row['title']),
+        body=str(row['text']),
+        content_hash=importer._content_hash(source_id, row['title'], row['text']),
+        generation_key=source_id,
+        session_sequence=7,
+    )
+
+    def fail_allocate(_session: AgentSession) -> int:
+        raise AssertionError('existing observation sequence must be reused')
+
+    monkeypatch.setattr('engram.imports.services.allocate_observation_sequence', fail_allocate)
+
+    importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    raw_event = RawEventEnvelope.objects.get(client_event_id=source_id)
+    source = ObservationSource.objects.get(source_id=source_id)
+    session.refresh_from_db()
+    assert raw_event.sequence_number == 7
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == RawEventNormalizationDisposition.OBSERVATION
+    assert raw_event.normalization_reason is None
+    assert source.observation_id == observation.id
+    assert source.raw_event_id == raw_event.id
+    assert ObservationSource.objects.filter(observation=observation).count() == 1
+    assert session.observation_sequence_cursor == 7
+    assert Observation.objects.filter(id=observation.id, session_sequence=7).count() == 1
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+def test_repeated_import_reuses_import_sequences_and_cursor(
+    f_import_scope: ImportScope,
+    f_claude_mem_fixture: Path,
+) -> None:
+    import_input = ClaudeMemImportInput(
+        source_root=f_claude_mem_fixture,
+        organization_id=f_import_scope.organization.id,
+        project_id=f_import_scope.project.id,
+        team_id=f_import_scope.team.id,
+        source_store_id='fixture-store',
+        apply=True,
+    )
+    ClaudeMemImporter().execute(import_input)
+    session = AgentSession.objects.get(content_session_id='content-session-fixture-001')
+    first_sequences = list(Observation.objects.filter(session=session).values_list('session_sequence', flat=True))
+    first_cursor = session.observation_sequence_cursor
+
+    ClaudeMemImporter().execute(import_input)
+    session.refresh_from_db()
+
+    assert (
+        list(Observation.objects.filter(session=session).values_list('session_sequence', flat=True)) == first_sequences
+    )
+    assert session.observation_sequence_cursor == first_cursor
 
 
 @pytest.mark.django_db

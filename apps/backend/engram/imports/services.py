@@ -26,12 +26,15 @@ from engram.core.models import (
     Project,
     ProjectTeam,
     RawEventEnvelope,
+    RawEventNormalizationDisposition,
+    RawEventNormalizationReason,
     Runtime,
     SessionStatus,
     Team,
     VisibilityScope,
 )
 from engram.core.redaction import RedactionResult, redact_value
+from engram.memory.observation_work import allocate_observation_sequence, lock_session_for_observation
 from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 
 ImportReport = dict[str, object]
@@ -241,28 +244,29 @@ class ClaudeMemImporter:
         defer_embedding: bool = True,
     ) -> BatchImportResult:
         report = self._empty_batch_report()
-        if table == 'sdk_sessions':
-            created, duplicates, skipped = self._apply_session_batch(context, rows, report)
-        elif table == 'user_prompts':
-            created, duplicates, skipped = self._apply_prompt_batch(context, rows, report)
-        elif table == 'observations':
-            created, duplicates, skipped = self._apply_memory_batch(
-                context,
-                rows,
-                report,
-                defer_embedding,
-                kind='observation',
-            )
-        elif table == 'session_summaries':
-            created, duplicates, skipped = self._apply_memory_batch(
-                context,
-                rows,
-                report,
-                defer_embedding,
-                kind='session_summary',
-            )
-        else:
-            raise ClaudeMemImportError('unsupported import table')
+        with transaction.atomic():
+            if table == 'sdk_sessions':
+                created, duplicates, skipped = self._apply_session_batch(context, rows, report)
+            elif table == 'user_prompts':
+                created, duplicates, skipped = self._apply_prompt_batch(context, rows, report)
+            elif table == 'observations':
+                created, duplicates, skipped = self._apply_memory_batch(
+                    context,
+                    rows,
+                    report,
+                    defer_embedding,
+                    kind='observation',
+                )
+            elif table == 'session_summaries':
+                created, duplicates, skipped = self._apply_memory_batch(
+                    context,
+                    rows,
+                    report,
+                    defer_embedding,
+                    kind='session_summary',
+                )
+            else:
+                raise ClaudeMemImportError('unsupported import table')
 
         return BatchImportResult(created=created, duplicates=duplicates, skipped=skipped, report=report)
 
@@ -328,8 +332,15 @@ class ClaudeMemImporter:
         duplicates = 0
         skipped = 0
         confidence = OBSERVATION_CONFIDENCE if kind == 'observation' else SESSION_SUMMARY_CONFIDENCE
-        for row in rows:
-            session = self._session_for_memory(context, row)
+        sessions = [self._session_for_memory(context, row) for row in rows]
+        locked_sessions = self._lock_import_sessions(
+            [session for session in sessions if session is not None],
+            context,
+        )
+
+        for row, session in zip(rows, sessions, strict=True):
+            if session is not None:
+                session = locked_sessions[session.id]
             if kind == 'observation':
                 result = self._import_observation_memory(
                     context,
@@ -392,6 +403,22 @@ class ClaudeMemImporter:
             .order_by('created_at')
             .first()
         )
+
+    def _lock_import_sessions(
+        self,
+        sessions: list[AgentSession],
+        context: ImportContext,
+    ) -> dict[UUID, AgentSession]:
+        locked_sessions: dict[UUID, AgentSession] = {}
+        for session_id in sorted({session.id for session in sessions}, key=str):
+            locked = lock_session_for_observation(
+                organization_id=context.organization.id,
+                project_id=context.project.id,
+                session_id=session_id,
+            )
+            locked_sessions[locked.id] = locked
+
+        return locked_sessions
 
     def _empty_batch_report(self) -> ImportReport:
         return empty_batch_report()
@@ -690,6 +717,9 @@ class ClaudeMemImporter:
             report['unsupported'].extend(sessions_unsupported)
             redacted = redacted or sessions_redacted
 
+            locked_sessions = self._lock_import_sessions(list(sessions.values()), context)
+            sessions = {key: locked_sessions.get(session.id, session) for key, session in sessions.items()}
+
             for prompt in rows['user_prompts']:
                 session = sessions.get(_capped_session_key(prompt.get('content_session_id')))
                 raw_event, created, prompt_result, prompt_unsupported = self._import_prompt(context, session, prompt)
@@ -799,6 +829,7 @@ class ClaudeMemImporter:
                     'branch': branch,
                     'status': self._session_status(row.get('status')),
                     'prompt_counter': int(row.get('prompt_counter') or 0),
+                    'observation_sequence_cursor': 0,
                     'metadata': session_metadata_result.value,
                     'started_at': self._datetime(row.get('started_at')),
                     'ended_at': self._datetime(row.get('completed_at')),
@@ -852,6 +883,8 @@ class ClaudeMemImporter:
             occurred_at=self._datetime(row.get('created_at')),
             payload=payload_result.value,
             redacted=payload_result.redacted,
+            normalization_disposition=RawEventNormalizationDisposition.NO_OP,
+            normalization_reason=RawEventNormalizationReason.EVIDENCE_ONLY,
         )
 
         return raw_event, created, payload_result, None
@@ -1007,6 +1040,8 @@ class ClaudeMemImporter:
             occurred_at=occurred_at,
             payload=payload,
             redacted=payload_redacted,
+            normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+            normalization_reason=None,
         )
         content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
         raw_body = str(observation_data.get('body') or '')
@@ -1023,6 +1058,18 @@ class ClaudeMemImporter:
             or capped_facts != raw_facts
             or capped_concepts != raw_concepts
         )
+        existing_observation = Observation.objects.filter(
+            organization=organization,
+            project=project,
+            session=session,
+            content_hash=content_hash,
+        ).first()
+        sequence_number = existing_observation.session_sequence if existing_observation is not None else None
+        if existing_observation is None:
+            sequence_number = allocate_observation_sequence(session)
+        if raw_event.sequence_number != sequence_number:
+            raw_event.sequence_number = sequence_number
+            raw_event.save(update_fields=['sequence_number'])
         observation, observation_created = Observation.objects.get_or_create(
             organization=organization,
             project=project,
@@ -1047,6 +1094,7 @@ class ClaudeMemImporter:
                 'redaction_metadata': {'redacted': observation_redacted},
                 'source_metadata': observation_data.get('source_metadata') or {},
                 'observed_at': occurred_at,
+                'session_sequence': sequence_number,
             },
         )
         ObservationSource.objects.get_or_create(
@@ -1120,6 +1168,9 @@ class ClaudeMemImporter:
         occurred_at: object | None,
         payload: object,
         redacted: bool,
+        normalization_disposition: RawEventNormalizationDisposition,
+        normalization_reason: RawEventNormalizationReason | None,
+        sequence_number: int | None = None,
     ) -> tuple[RawEventEnvelope, bool]:
         metadata = {'source': 'claude_mem_import'}
         if redacted:
@@ -1138,6 +1189,10 @@ class ClaudeMemImporter:
                 'content_hash': self._content_hash(source_id, payload),
                 'runtime': session.runtime,
                 'payload_schema_version': 'v1',
+                'normalization_contract_version': 1,
+                'normalization_disposition': normalization_disposition,
+                'normalization_reason': normalization_reason,
+                'sequence_number': sequence_number,
                 'occurred_at': occurred_at,
                 'payload': payload if isinstance(payload, dict) else {'value': payload},
                 'headers': {},
