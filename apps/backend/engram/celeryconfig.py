@@ -171,10 +171,12 @@ worker_max_tasks_per_child = int(os.getenv('ENGRAM_WORKER_MAX_TASKS_PER_CHILD', 
 worker_task_log_format = '[%(asctime)s] [%(levelname)s] %(name)s %(module)s %(process)d | %(message)s'
 worker_log_format = worker_task_log_format
 worker_soft_shutdown_timeout = 60
+worker_enable_soft_shutdown_on_idle = True
 worker_detect_quorum_queues = True
 
-broker_connection_retry_on_startup = False
-broker_connection_retry = False
+broker_connection_retry_on_startup = True
+broker_connection_retry = True
+broker_connection_max_retries = None
 broker_native_delayed_delivery_queue_type = 'quorum'
 broker_transport_options = {
     'confirm_publish': True,

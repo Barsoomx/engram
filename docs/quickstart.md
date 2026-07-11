@@ -290,7 +290,7 @@ policies, organizations, teams, members, roles, API keys, audit, health). See
 
 ```bash
 docker compose down           # stop containers, keep volumes
-docker compose down -v        # also delete the postgres volume
+docker compose down -v        # destructive: delete PostgreSQL, RabbitMQ, and Beat durable volumes; reset/test only
 ```
 
 To remove CLI local state:
