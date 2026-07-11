@@ -43,6 +43,7 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
+from engram.memory.observation_work import lock_session_for_observation
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,
@@ -1153,7 +1154,7 @@ class BuildContextBundle:
         agent: Agent,
         data: ContextBundleInput,
     ) -> AgentSession:
-        session, _created = AgentSession.objects.get_or_create(
+        session, created = AgentSession.objects.get_or_create(
             organization=organization,
             project=project,
             external_session_id=data.session_id,
@@ -1167,25 +1168,40 @@ class BuildContextBundle:
                 'branch': data.branch,
                 'cwd': data.cwd,
                 'started_at': timezone.now(),
+                'observation_sequence_cursor': 0,
             },
         )
-        update_fields = []
-        for field, value in (
-            ('team', team),
-            ('agent', agent),
-            ('runtime', data.agent_runtime),
-            ('platform_source', data.agent_runtime),
-            ('repository_url', data.repository_url),
-            ('repository_root', data.repository_root),
-            ('branch', data.branch),
-            ('cwd', data.cwd),
-        ):
-            if getattr(session, field) != value:
-                setattr(session, field, value)
-                update_fields.append(field)
-        if update_fields:
-            update_fields.append('updated_at')
-            session.save(update_fields=update_fields)
+        if created:
+            return session
+
+        with transaction.atomic():
+            session = lock_session_for_observation(
+                organization_id=organization.id,
+                project_id=project.id,
+                session_id=session.id,
+            )
+            if team is not None and session.team_id not in (None, team.id):
+                raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
+
+            update_fields = []
+            if session.team_id is None and team is not None:
+                session.team = team
+                update_fields.append('team')
+            for field, value in (
+                ('agent', agent),
+                ('runtime', data.agent_runtime),
+                ('platform_source', data.agent_runtime),
+                ('repository_url', data.repository_url),
+                ('repository_root', data.repository_root),
+                ('branch', data.branch),
+                ('cwd', data.cwd),
+            ):
+                if getattr(session, field) != value:
+                    setattr(session, field, value)
+                    update_fields.append(field)
+            if update_fields:
+                update_fields.append('updated_at')
+                session.save(update_fields=update_fields)
 
         return session
 

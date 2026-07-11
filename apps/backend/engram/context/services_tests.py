@@ -19,7 +19,7 @@ from engram.access.models import (
     ProjectGrant,
     Role,
 )
-from engram.access.services import EffectiveScope, api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import AccessDeniedError, EffectiveScope, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.services import (
     BuildContextBundle,
     ContextBundleInput,
@@ -1237,6 +1237,81 @@ def _context_bundle_input(
         token_budget=None,
         purpose='session_start',
     )
+
+
+@pytest.mark.django_db
+def test_get_or_create_session_initializes_observation_cursor_for_new_session() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-context-session')
+    data = _context_bundle_input(
+        project,
+        team,
+        file_paths=(),
+        request_id='request-session-new',
+        session_id='session-new',
+    )
+
+    session = BuildContextBundle()._get_or_create_session(organization, project, team, agent, data)
+
+    assert session.observation_sequence_cursor == 0
+    assert AgentSession.objects.get(id=session.id).observation_sequence_cursor == 0
+
+
+@pytest.mark.django_db
+def test_get_or_create_session_adopts_legacy_null_team_once() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-context-legacy')
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        external_session_id='session-legacy',
+        runtime='codex',
+    )
+    data = _context_bundle_input(
+        project,
+        team,
+        file_paths=(),
+        request_id='request-session-legacy',
+        session_id=session.external_session_id,
+    )
+
+    result = BuildContextBundle()._get_or_create_session(organization, project, team, agent, data)
+
+    assert result.team_id == team.id
+    assert AgentSession.objects.get(id=session.id).team_id == team.id
+
+
+@pytest.mark.django_db
+def test_get_or_create_session_rejects_different_team_without_mutation() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    different_team = Team.objects.create(organization=organization, name='Different', slug='different')
+    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-context-scope')
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='session-scope-locked',
+        runtime='codex',
+        repository_root='/original/root',
+    )
+    data = _context_bundle_input(
+        project,
+        different_team,
+        file_paths=(),
+        request_id='request-session-scope-locked',
+        session_id=session.external_session_id,
+    )
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle()._get_or_create_session(organization, project, different_team, agent, data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    session.refresh_from_db()
+    assert session.team_id == team.id
+    assert session.repository_root == '/original/root'
 
 
 @pytest.mark.django_db
