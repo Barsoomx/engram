@@ -992,8 +992,9 @@ class BuildContextBundle:
             return self._result_from_bundle(existing_bundle)
 
         team = self._resolve_team(organization, data.team_id, scope)
-        agent = self._get_or_create_agent(organization, data)
-        session = self._get_or_create_session(organization, project, team, agent, data)
+        with transaction.atomic():
+            agent = self._get_or_create_agent(organization, data)
+            session = self._get_or_create_session(organization, project, team, agent, data)
         retrieval_started_at = time.monotonic()
         authorized_documents = self._authorized_documents(organization, project, scope, data.kinds)
         matches, has_semantic, embedding_result, semantic_unavailable = self._rank_matches(

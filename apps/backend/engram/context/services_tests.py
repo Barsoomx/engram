@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -49,6 +49,7 @@ from engram.context.services import (
 from engram.core.models import (
     Agent,
     AgentSession,
+    ContextBundle,
     ContextBundleStatus,
     Memory,
     MemoryStatus,
@@ -63,6 +64,7 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
 )
+from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import EMBEDDING_DIMENSION, generated_embedding
 
 PROVENANCE_RAW_KEY = 'egk_test_services_provenance_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -1239,6 +1241,31 @@ def _context_bundle_input(
     )
 
 
+def _create_team_scoped_context_key(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    raw_key: str,
+) -> str:
+    owner = Identity.objects.get(organization=organization, external_id='svc-context-provenance')
+    api_key = ApiKey.objects.create(
+        organization=organization,
+        owner_identity=owner,
+        name=f'Context key {team.slug}',
+        key_prefix=api_key_prefix(raw_key),
+        key_hash=hash_api_key(raw_key),
+        key_fingerprint=api_key_fingerprint(raw_key),
+        team=team,
+        project=project,
+    )
+    ApiKeyCapability.objects.create(
+        api_key=api_key,
+        capability=Capability.objects.get(code='memories:read'),
+    )
+
+    return raw_key
+
+
 @pytest.mark.django_db
 def test_get_or_create_session_initializes_observation_cursor_for_new_session() -> None:
     organization, team, project, _api_key = _provenance_project_scope()
@@ -1312,6 +1339,147 @@ def test_get_or_create_session_rejects_different_team_without_mutation() -> None
     session.refresh_from_db()
     assert session.team_id == team.id
     assert session.repository_root == '/original/root'
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_denial_rolls_back_new_agent_creation() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    different_team = Team.objects.create(organization=organization, name='Different', slug='different')
+    ProjectTeam.objects.create(organization=organization, team=different_team, project=project)
+    raw_key = _create_team_scoped_context_key(
+        organization,
+        project,
+        different_team,
+        'egk_test_services_other_team_new_agent_0123456789',
+    )
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='codex-existing',
+        version='0.1.0',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='session-context-denied-new-agent',
+        runtime='codex',
+        platform_source='original-platform',
+        repository_url='https://original.example/repo',
+        repository_root='/original/root',
+        branch='original-branch',
+        cwd='/original/cwd',
+        observation_sequence_cursor=7,
+    )
+    data = _context_bundle_input(
+        project,
+        different_team,
+        file_paths=(),
+        request_id='request-context-denied-new-agent',
+        session_id=session.external_session_id,
+        raw_key=raw_key,
+    )
+    data = replace(data, agent_external_id='codex-new')
+    agent_count = Agent.objects.count()
+    session_before = AgentSession.objects.get(id=session.id)
+    bundle_count = ContextBundle.objects.count()
+    provider_call_count = ProviderCallRecord.objects.count()
+    retrieval_document_count = RetrievalDocument.objects.count()
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle().execute(data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    assert Agent.objects.count() == agent_count
+    assert not Agent.objects.filter(organization=organization, external_id='codex-new').exists()
+    session_after = AgentSession.objects.get(id=session.id)
+    assert session_after.team_id == session_before.team_id
+    assert session_after.agent_id == session_before.agent_id
+    assert session_after.runtime == session_before.runtime
+    assert session_after.platform_source == session_before.platform_source
+    assert session_after.repository_url == session_before.repository_url
+    assert session_after.repository_root == session_before.repository_root
+    assert session_after.branch == session_before.branch
+    assert session_after.cwd == session_before.cwd
+    assert session_after.observation_sequence_cursor == session_before.observation_sequence_cursor
+    assert session_after.created_at == session_before.created_at
+    assert session_after.started_at == session_before.started_at
+    assert session_after.updated_at == session_before.updated_at
+    assert ContextBundle.objects.count() == bundle_count
+    assert ProviderCallRecord.objects.count() == provider_call_count
+    assert RetrievalDocument.objects.count() == retrieval_document_count
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_denial_rolls_back_agent_version_update() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    different_team = Team.objects.create(organization=organization, name='Different', slug='different')
+    ProjectTeam.objects.create(organization=organization, team=different_team, project=project)
+    raw_key = _create_team_scoped_context_key(
+        organization,
+        project,
+        different_team,
+        'egk_test_services_other_team_agent_update_0123456789',
+    )
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='codex-versioned',
+        version='0.1.0',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='session-context-denied-agent-update',
+        runtime='codex',
+        platform_source='original-platform',
+        repository_url='https://original.example/repo',
+        repository_root='/original/root',
+        branch='original-branch',
+        cwd='/original/cwd',
+        observation_sequence_cursor=11,
+    )
+    data = _context_bundle_input(
+        project,
+        different_team,
+        file_paths=(),
+        request_id='request-context-denied-agent-update',
+        session_id=session.external_session_id,
+        raw_key=raw_key,
+    )
+    data = replace(data, agent_external_id='codex-versioned', agent_version='0.2.0')
+    agent_before = Agent.objects.get(id=agent.id)
+    session_before = AgentSession.objects.get(id=session.id)
+    bundle_count = ContextBundle.objects.count()
+    provider_call_count = ProviderCallRecord.objects.count()
+    retrieval_document_count = RetrievalDocument.objects.count()
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle().execute(data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    agent_after = Agent.objects.get(id=agent.id)
+    assert agent_after.version == agent_before.version
+    assert agent_after.updated_at == agent_before.updated_at
+    session_after = AgentSession.objects.get(id=session.id)
+    assert session_after.team_id == session_before.team_id
+    assert session_after.agent_id == session_before.agent_id
+    assert session_after.runtime == session_before.runtime
+    assert session_after.platform_source == session_before.platform_source
+    assert session_after.repository_url == session_before.repository_url
+    assert session_after.repository_root == session_before.repository_root
+    assert session_after.branch == session_before.branch
+    assert session_after.cwd == session_before.cwd
+    assert session_after.observation_sequence_cursor == session_before.observation_sequence_cursor
+    assert session_after.created_at == session_before.created_at
+    assert session_after.started_at == session_before.started_at
+    assert session_after.updated_at == session_before.updated_at
+    assert ContextBundle.objects.count() == bundle_count
+    assert ProviderCallRecord.objects.count() == provider_call_count
+    assert RetrievalDocument.objects.count() == retrieval_document_count
 
 
 @pytest.mark.django_db
