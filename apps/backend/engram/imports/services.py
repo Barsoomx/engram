@@ -1065,8 +1065,11 @@ class ClaudeMemImporter:
             content_hash=content_hash,
         ).first()
         sequence_number = existing_observation.session_sequence if existing_observation is not None else None
-        if existing_observation is None:
+        if sequence_number is None:
             sequence_number = allocate_observation_sequence(session)
+            if existing_observation is not None:
+                existing_observation.session_sequence = sequence_number
+                existing_observation.save(update_fields=['session_sequence'])
         if raw_event.sequence_number != sequence_number:
             raw_event.sequence_number = sequence_number
             raw_event.save(update_fields=['sequence_number'])

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from django_celery_outbox.models import CeleryOutbox
 
+import engram.imports.services as import_services
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -225,6 +226,105 @@ def test_import_reuses_existing_observation_sequence_for_new_raw_source(
     assert Observation.objects.filter(id=observation.id, session_sequence=7).count() == 1
     assert not WorkflowWork.objects.exists()
     assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+def test_import_assigns_sequence_to_legacy_observation_without_sequence(
+    f_import_scope: ImportScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='fixture-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    row = {
+        'id': 1,
+        'memory_session_id': 'memory-session-fixture-001',
+        'project': '/workspace/example-repo',
+        'text': 'Legacy observation body without a sequence.',
+        'type': 'discovery',
+        'title': 'Legacy observation without a sequence',
+        'created_at': '2026-06-25T09:02:00Z',
+    }
+    agent = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='legacy-import-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id='claude-mem:fixture-store:sdk_session:content-session-fixture-001',
+        content_session_id='content-session-fixture-001',
+        memory_session_id='memory-session-fixture-001',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=None,
+    )
+    Observation.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        session=session,
+        observation_type='discovery',
+        title='Existing positive observation',
+        body='Existing positive observation body.',
+        content_hash='legacy-positive-observation',
+        generation_key='legacy-positive-observation',
+        session_sequence=4,
+    )
+    source_id = importer._observation_source_id(context, row)
+    observation = Observation.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        session=session,
+        observation_type='discovery',
+        title=str(row['title']),
+        body=str(row['text']),
+        content_hash=importer._content_hash(source_id, row['title'], row['text']),
+        generation_key=source_id,
+        session_sequence=None,
+    )
+
+    real_allocate = import_services.allocate_observation_sequence
+    allocated_sessions: list[object] = []
+
+    def track_allocate(locked_session: AgentSession) -> int:
+        allocated_sessions.append(locked_session.id)
+        return real_allocate(locked_session)
+
+    monkeypatch.setattr('engram.imports.services.allocate_observation_sequence', track_allocate)
+
+    importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    raw_event = RawEventEnvelope.objects.get(client_event_id=source_id)
+    source = ObservationSource.objects.get(source_id=source_id)
+    observation.refresh_from_db()
+    session.refresh_from_db()
+    assert allocated_sessions == [session.id]
+    assert raw_event.sequence_number == 5
+    assert source.observation_id == observation.id
+    assert observation.session_sequence == 5
+    assert session.observation_sequence_cursor == 5
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+    importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    raw_event.refresh_from_db()
+    observation.refresh_from_db()
+    session.refresh_from_db()
+    assert allocated_sessions == [session.id]
+    assert raw_event.sequence_number == 5
+    assert observation.session_sequence == 5
+    assert session.observation_sequence_cursor == 5
 
 
 @pytest.mark.django_db
