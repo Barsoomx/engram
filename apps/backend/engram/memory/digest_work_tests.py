@@ -17,6 +17,7 @@ from engram.core.models import (
     Organization,
     Project,
     ProjectTeam,
+    RetrievalDocument,
     Team,
     VisibilityScope,
     WorkflowRun,
@@ -28,8 +29,11 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory.services import MemoryWorkerError
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
 from engram.memory.workflow_work import CreateWorkflowWorkInput
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import FakeProviderGateway, ProviderCallInput, ProviderCallResult
 
 _DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
@@ -803,3 +807,364 @@ def test_signal_failure_rolls_back_weekly_work_and_outbox(monkeypatch: pytest.Mo
     assert WorkflowWork.objects.count() == 0
     assert WorkflowRun.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
+
+
+def _create_digest_policy(organization: Organization, project: Project) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=None,
+        name='Org Digest OpenAI',
+        provider='openai',
+        scope='organization',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=None,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-digest-secret',
+        hmac_digest='digest-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=None,
+        project=project,
+        name='Digest policy',
+        scope='project',
+        task_type='digest',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+
+
+class _CountingDigestGateway:
+    def __init__(self, calls: list[ProviderCallInput]) -> None:
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+
+        return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+def _counting_gateway(calls: list[ProviderCallInput]) -> object:
+    def stub(policy: object, **_kwargs: object) -> object:
+        return _CountingDigestGateway(calls)
+
+    return stub
+
+
+class _MutatingDigestGateway:
+    def __init__(self, version: MemoryVersion, calls: list[ProviderCallInput]) -> None:
+        self._version = version
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+        MemoryVersion.objects.filter(id=self._version.id).update(body='body mutated mid-provider-call')
+
+        return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+def _make_daily_work(
+    organization: Organization,
+    project: Project,
+    schedule_key: str = 'daily:2026-07-10',
+    max_sources: int = 200,
+) -> tuple[WorkflowWork, dict[str, object]]:
+    digest_work = _load_digest_work()
+    window_start, window_end = _daily_window()
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=max_sources,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    return work, snapshot
+
+
+def _make_weekly_work(
+    organization: Organization,
+    project: Project,
+    team: Team | None = None,
+    schedule_key: str = 'weekly:2026-W28',
+) -> tuple[WorkflowWork, dict[str, object]]:
+    digest_work = _load_digest_work()
+    window_start, window_end = _weekly_window()
+    with transaction.atomic():
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id if team is not None else None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_weekly_data(organization, project, team, snapshot, schedule_key),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    return work, snapshot
+
+
+@pytest.mark.django_db
+def test_daily_work_execution_rejects_frozen_input_digest_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-input-digest-drift')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    tampered = dict(work.input_snapshot)
+    tampered['input_digest'] = 'deadbeef' * 8
+    WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='fingerprint'):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_execution_rejects_source_body_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-body-drift')
+    _create_digest_policy(organization, project)
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    MemoryVersion.objects.filter(id=version.id).update(body='body-a tampered at rest')
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='body digest'):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_weekly_work_execution_rejects_source_body_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-body-drift')
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_weekly_work(organization, project)
+
+    MemoryVersion.objects.filter(id=version.id).update(body='body-a tampered at rest')
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='body digest'):
+        generate_weekly_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_weekly_team_work_fails_closed_when_project_team_link_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-team-unlink')
+    team = _make_team(organization, project, 'weekly-team-unlink')
+    _make_memory(
+        organization,
+        project,
+        title='TeamA',
+        body='body-team-a',
+        team=team,
+        visibility=VisibilityScope.TEAM,
+    )
+    work, _snapshot = _make_weekly_work(organization, project, team)
+
+    ProjectTeam.objects.filter(organization=organization, project=project, team=team).delete()
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='team'):
+        generate_weekly_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_discards_provider_result_when_source_invalidated_after_precall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-invalidate')
+    _create_digest_policy(organization, project)
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    calls: list[ProviderCallInput] = []
+
+    def stub(policy: object, **_kwargs: object) -> object:
+        if getattr(policy, 'task_type', None) == 'digest':
+            return _MutatingDigestGateway(version, calls)
+
+        return FakeProviderGateway()
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', stub)
+
+    with pytest.raises(MemoryWorkerError):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
+    assert RetrievalDocument.objects.filter(project=project).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-publish')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    embed_atomic_flags: list[bool] = []
+
+    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
+        embed_atomic_flags.append(connection.in_atomic_block)
+
+    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    assert not any(embed_atomic_flags)
+    assert result == str(work.id)
+    digests = Memory.objects.filter(project=project, kind='digest')
+    assert digests.count() == 1
+    digest_memory = digests.get()
+    versions = MemoryVersion.objects.filter(memory=digest_memory)
+    assert versions.count() == 1
+    assert versions.get().version == 1
+    document = RetrievalDocument.objects.get(memory=digest_memory)
+    assert not document.embedding_vector
+    assert document.embedding_reference == ''
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-publish')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_weekly_work(organization, project)
+
+    embed_atomic_flags: list[bool] = []
+
+    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
+        embed_atomic_flags.append(connection.in_atomic_block)
+
+    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
+
+    result = generate_weekly_digest_work_v1(str(work.id))
+
+    assert not any(embed_atomic_flags)
+    assert result == str(work.id)
+    digests = Memory.objects.filter(project=project, kind='digest')
+    assert digests.count() == 1
+    digest_memory = digests.get()
+    versions = MemoryVersion.objects.filter(memory=digest_memory)
+    assert versions.count() == 1
+    assert versions.get().version == 1
+    document = RetrievalDocument.objects.get(memory=digest_memory)
+    assert not document.embedding_vector
+    assert document.embedding_reference == ''
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_daily_work_second_automatic_delivery_reuses_output_without_second_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-reuse')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    first = generate_daily_digest_work_v1(str(work.id))
+    second = generate_daily_digest_work_v1(str(work.id))
+
+    assert first == second
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 1
+
+
+@pytest.mark.django_db
+def test_execute_frozen_digest_work_returns_none_for_terminal_no_op_daily_work() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-noop-exec')
+    schedule_key = 'daily:2026-07-10'
+    window_start, window_end = _daily_window()
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=10,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+
+    result = digest_work.execute_frozen_digest_work(work, None)
+
+    assert result is None
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
