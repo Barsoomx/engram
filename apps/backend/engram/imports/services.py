@@ -1294,9 +1294,7 @@ class ClaudeMemImporter:
         sequence_number = observation.session_sequence if observation is not None else None
         if sequence_number is not None and sequence_number <= 0:
             raise ValueError('import observation source identity collision')
-        if sequence_number is not None and (
-            session.observation_sequence_cursor is None or session.observation_sequence_cursor < sequence_number
-        ):
+        if sequence_number is not None and session.observation_sequence_cursor < sequence_number:
             raise ValueError('import observation source identity collision')
 
         return sequence_number
@@ -1473,7 +1471,7 @@ class ClaudeMemImporter:
             raise ValueError('import observation source identity collision')
 
         legacy_shape = (
-            raw_event.normalization_contract_version is None
+            raw_event.normalization_contract_version == 0
             and raw_event.normalization_disposition is None
             and raw_event.normalization_reason is None
             and raw_event.sequence_number is None
@@ -1505,8 +1503,7 @@ class ClaudeMemImporter:
             raise ValueError('import observation source identity collision')
 
         if legacy_shape and (
-            observation.session_sequence is not None
-            or (session.observation_sequence_cursor is not None and session.observation_sequence_cursor < 0)
+            observation.session_sequence <= 0 or session.observation_sequence_cursor < observation.session_sequence
         ):
             raise ValueError('import observation source identity collision')
 
@@ -1519,10 +1516,8 @@ class ClaudeMemImporter:
         session: AgentSession,
     ) -> None:
         if (
-            observation.session_sequence is None
-            or observation.session_sequence <= 0
+            observation.session_sequence <= 0
             or raw_event.sequence_number != observation.session_sequence
-            or session.observation_sequence_cursor is None
             or session.observation_sequence_cursor < observation.session_sequence
         ):
             raise ValueError('import observation source identity collision')
@@ -1536,9 +1531,7 @@ class ClaudeMemImporter:
         event_type: str,
         source_store_id: str,
     ) -> None:
-        sequence_number = allocate_observation_sequence(session)
-        observation.session_sequence = sequence_number
-        observation.save(update_fields=['session_sequence'])
+        sequence_number = observation.session_sequence
 
         metadata = dict(raw_event.metadata) if isinstance(raw_event.metadata, dict) else {}
         metadata.update(
