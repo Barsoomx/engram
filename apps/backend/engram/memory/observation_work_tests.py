@@ -8,8 +8,12 @@ from django.db import close_old_connections, connection, transaction
 from django.db.transaction import TransactionManagementError
 from django.test.utils import CaptureQueriesContext
 
-from engram.core.models import Agent, AgentSession, Observation, Organization, Project, Team
-from engram.memory.observation_work import allocate_observation_sequence, lock_session_for_observation
+from engram.core.models import Agent, AgentSession, Observation, Organization, Project, RawEventEnvelope, Team
+from engram.memory.observation_work import (
+    allocate_observation_sequence,
+    lock_session_for_observation,
+    session_has_observation_history,
+)
 
 
 def create_scope(suffix: str) -> tuple[Organization, Project, AgentSession]:
@@ -84,6 +88,50 @@ def test_lock_session_uses_exact_scope_and_locks_only_session_row() -> None:
             project_id=project.id,
             session_id=other_session.id,
         )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('history_kind', 'expected'),
+    (('empty', False), ('raw', True), ('observation', True)),
+)
+def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
+    history_kind: str,
+    expected: bool,
+) -> None:
+    organization, project, session = create_scope(f'history-{history_kind}')
+    if history_kind == 'raw':
+        RawEventEnvelope.objects.create(
+            organization=organization,
+            project=project,
+            team=session.team,
+            agent=session.agent,
+            session=session,
+            event_type='post_tool_use',
+            source_adapter='codex',
+            client_event_id='history-event',
+            idempotency_key='history-idempotency',
+            content_hash='history-raw-hash',
+            runtime='codex',
+        )
+    elif history_kind == 'observation':
+        Observation.objects.create(
+            organization=organization,
+            project=project,
+            team=session.team,
+            agent=session.agent,
+            session=session,
+            observation_type='tool_use',
+            title='Observation-only history',
+            content_hash='history-observation-hash',
+        )
+
+    with CaptureQueriesContext(connection) as queries:
+        has_history = session_has_observation_history(session_id=session.id)
+
+    assert has_history is expected
+    assert len(queries) == 2
+    assert all('LIMIT 1' in query['sql'] for query in queries.captured_queries)
 
 
 @pytest.mark.django_db
@@ -200,9 +248,11 @@ def test_sequential_allocations_are_monotonic_and_persist_once_each() -> None:
 def test_interfaces_have_no_client_sequence_timestamp_or_uuid_inputs() -> None:
     lock_parameters = inspect.signature(lock_session_for_observation).parameters
     allocate_parameters = inspect.signature(allocate_observation_sequence).parameters
+    history_parameters = inspect.signature(session_has_observation_history).parameters
 
     assert tuple(lock_parameters) == ('organization_id', 'project_id', 'session_id')
     assert tuple(allocate_parameters) == ('session',)
+    assert tuple(history_parameters) == ('session_id',)
 
 
 @pytest.mark.django_db(transaction=True)

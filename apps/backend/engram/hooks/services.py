@@ -5,8 +5,7 @@ from dataclasses import dataclass
 
 import structlog
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F, Q, Subquery
-from django.db.models.fields.json import KeyTextTransform
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
@@ -29,7 +28,11 @@ from engram.core.models import (
 )
 from engram.core.redaction import RedactionResult, redact_value
 from engram.core.repository import resolve_project_for_scope
-from engram.memory.observation_work import allocate_observation_sequence, lock_session_for_observation
+from engram.memory.observation_work import (
+    allocate_observation_sequence,
+    lock_session_for_observation,
+    session_has_observation_history,
+)
 from engram.memory.tasks import dispatch_work_task, distill_session, process_observation_work_v1
 from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work, observation_content_digest
 
@@ -300,16 +303,10 @@ class IngestHookEvent:
             )
             if normalization_state != (None, None, None):
                 raise ValueError('malformed legacy hook normalization state')
-            observation = raw_event.observations.order_by('created_at').first()
-            if observation is None:
-                observation = Observation.objects.filter(
-                    organization=organization,
-                    project=project,
-                    session=session,
-                    content_hash=raw_event.content_hash,
-                ).first()
-            if observation is None:
-                raise ValueError('hook duplicate has no persisted observation')
+            direct_observations = list(raw_event.observations.order_by('created_at')[:2])
+            if len(direct_observations) != 1:
+                raise ValueError('legacy hook evidence requires exactly one direct observation')
+            observation = direct_observations[0]
             self._validate_hook_observation_scope(
                 raw_event,
                 observation,
@@ -357,7 +354,8 @@ class IngestHookEvent:
         direct_sources = list(raw_event.observation_sources.select_related('observation').order_by('created_at')[:2])
         if len(direct_sources) != 1:
             raise ValueError('typed hook evidence requires exactly one direct hook source')
-        observation = direct_sources[0].observation
+        source = direct_sources[0]
+        observation = source.observation
         self._validate_hook_observation_scope(
             raw_event,
             observation,
@@ -367,93 +365,19 @@ class IngestHookEvent:
         )
 
         trusted_event_type = self._trusted_duplicate_event_type(raw_event, observation)
-        sources = ObservationSource.objects.filter(observation=observation)
-        source_cardinality = sources.aggregate(
-            source_count=Count('id'),
-            linked_raw_count=Count('raw_event_id', distinct=True),
-        )
-        if source_cardinality['source_count'] != source_cardinality['linked_raw_count']:
-            raise ValueError('ambiguous typed hook source cardinality')
-        valid_source = Q(
-            source_type='hook_event',
-            raw_event__isnull=False,
-            organization_id=organization.id,
-            project_id=project.id,
-            observation_id=observation.id,
-            source_id=F('raw_event__client_event_id'),
-            source_event_type=F('raw_event__event_type'),
-        )
-        valid_source_count = (
-            sources.annotate(
-                source_event_type=KeyTextTransform('event_type', 'metadata'),
-            )
-            .filter(valid_source)
-            .count()
-        )
-        if valid_source_count != source_cardinality['source_count']:
+        if (
+            raw_event.source_adapter not in Runtime.values
+            or source.organization_id != organization.id
+            or source.project_id != project.id
+            or source.raw_event_id != raw_event.id
+            or source.source_type != 'hook_event'
+            or source.source_id != raw_event.client_event_id
+            or not isinstance(source.metadata, dict)
+            or source.metadata.get('event_type') != trusted_event_type
+        ):
             raise ValueError('malformed typed hook source')
-
-        linked_raw_ids = sources.filter(raw_event_id__isnull=False).order_by().values('raw_event_id')
-        typed_policy_false = {
-            'schema': 'hook_work_policy/v1',
-            'realtime_candidates_enabled': False,
-            'legacy_policy_fallback': False,
-        }
-        typed_policy_true = {**typed_policy_false, 'realtime_candidates_enabled': True}
-        legacy_policy_false = {**typed_policy_false, 'legacy_policy_fallback': True}
-        legacy_policy_true = {**typed_policy_true, 'legacy_policy_fallback': True}
-        valid_typed_raw = Q(
-            normalization_contract_version=1,
-            normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
-            normalization_reason__isnull=True,
-        ) & (Q(metadata__work_policy_v1=typed_policy_false) | Q(metadata__work_policy_v1=typed_policy_true))
-        valid_legacy_raw = Q(
-            normalization_contract_version__isnull=True,
-            normalization_disposition__isnull=True,
-            normalization_reason__isnull=True,
-        ) & (
-            Q(metadata__work_policy_v1=typed_policy_false)
-            | Q(metadata__work_policy_v1=typed_policy_true)
-            | Q(metadata__work_policy_v1=legacy_policy_false)
-            | Q(metadata__work_policy_v1=legacy_policy_true)
-        )
-        valid_linked_raw = Q(
-            source_adapter__in=Runtime.values,
-            organization_id=organization.id,
-            project_id=project.id,
-            session_id=session.id,
-            team_id=session.team_id,
-            agent_id=session.agent_id,
-            event_type=trusted_event_type,
-            content_hash=observation.content_hash,
-        ) & (valid_typed_raw | valid_legacy_raw)
-        valid_linked_raw_count = (
-            RawEventEnvelope.objects.filter(
-                id__in=Subquery(linked_raw_ids),
-            )
-            .filter(valid_linked_raw)
-            .count()
-        )
-        if valid_linked_raw_count != source_cardinality['linked_raw_count']:
-            raise ValueError('malformed typed hook linked raw')
-        if (
-            ObservationSource.objects.filter(raw_event_id__in=Subquery(linked_raw_ids))
-            .exclude(
-                observation_id=observation.id,
-            )
-            .exists()
-        ):
-            raise ValueError('ambiguous typed hook linked raw source')
-        if (
-            Observation.objects.filter(raw_event_id__in=Subquery(linked_raw_ids))
-            .exclude(
-                id=observation.id,
-            )
-            .exists()
-        ):
+        if Observation.objects.filter(raw_event_id=raw_event.id).exclude(id=observation.id).exists():
             raise ValueError('ambiguous typed hook direct observation')
-        if observation.raw_event_id is not None and not sources.filter(raw_event_id=observation.raw_event_id).exists():
-            raise ValueError('typed hook direct observation has no canonical source')
 
         return observation, trusted_event_type, policy
 
@@ -602,6 +526,8 @@ class IngestHookEvent:
         if repair_missing_raw and not created and source.raw_event_id is None:
             source.raw_event = raw_event
             source.save(update_fields=['raw_event', 'updated_at'])
+        elif not created and source.raw_event_id not in {None, raw_event.id}:
+            raise ValueError('hook source is bound to a different raw event')
 
         return source
 
@@ -691,8 +617,8 @@ class IngestHookEvent:
             raw_outside_team = Q(team_id__isnull=False)
             session_outside_team = Q(session__team_id__isnull=False)
         else:
-            raw_outside_team = ~Q(team_id=team.id)
-            session_outside_team = ~Q(session__team_id=team.id)
+            raw_outside_team = Q(team_id__isnull=True) | ~Q(team_id=team.id)
+            session_outside_team = Q(session__team_id__isnull=True) | ~Q(session__team_id=team.id)
         foreign_identity = Q(idempotency_key=data.idempotency_key) & raw_outside_team
         foreign_identity |= Q(
             session__external_session_id=data.session_id,
@@ -783,15 +709,7 @@ class IngestHookEvent:
             )
         selected_team = team
         if not created:
-            if session.team_id is not None:
-                if team is None:
-                    raise AccessDeniedError('team_scope_denied', 'Hook session is outside effective team scope')
-                if session.team_id != team.id:
-                    raise AccessDeniedError(
-                        'hook_identity_collision',
-                        'Hook identity collision is not accessible',
-                    )
-                selected_team = session.team
+            selected_team = self._existing_session_team(session, team)
         update_fields = []
         for field, value in (
             ('team', selected_team),
@@ -817,6 +735,25 @@ class IngestHookEvent:
             session.save(update_fields=update_fields)
 
         return session
+
+    def _existing_session_team(self, session: AgentSession, requested_team: Team | None) -> Team | None:
+        if session.team_id is None:
+            if requested_team is not None and session_has_observation_history(session_id=session.id):
+                raise AccessDeniedError(
+                    'hook_identity_collision',
+                    'Hook identity collision is not accessible',
+                )
+
+            return requested_team
+        if requested_team is None:
+            raise AccessDeniedError('team_scope_denied', 'Hook session is outside effective team scope')
+        if session.team_id != requested_team.id:
+            raise AccessDeniedError(
+                'hook_identity_collision',
+                'Hook identity collision is not accessible',
+            )
+
+        return session.team
 
     def _get_or_create_observation(
         self,

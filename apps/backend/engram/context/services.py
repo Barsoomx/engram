@@ -43,7 +43,7 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
-from engram.memory.observation_work import lock_session_for_observation
+from engram.memory.observation_work import lock_session_for_observation, session_has_observation_history
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,
@@ -1182,6 +1182,8 @@ class BuildContextBundle:
                 session_id=session.id,
             )
             if session.team_id is not None and (team is None or session.team_id != team.id):
+                raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
+            if session.team_id is None and team is not None and session_has_observation_history(session_id=session.id):
                 raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
 
             update_fields = []

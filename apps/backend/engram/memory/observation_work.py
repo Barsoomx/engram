@@ -6,7 +6,7 @@ from django.db import transaction
 from django.db.models import Max
 from django.db.transaction import TransactionManagementError
 
-from engram.core.models import AgentSession, Observation
+from engram.core.models import AgentSession, Observation, RawEventEnvelope
 
 
 def _require_active_transaction() -> None:
@@ -19,6 +19,13 @@ def lock_session_for_observation(*, organization_id: UUID, project_id: UUID, ses
     return AgentSession.objects.select_for_update(of=('self',)).get(
         organization_id=organization_id, project_id=project_id, id=session_id
     )
+
+
+def session_has_observation_history(*, session_id: UUID) -> bool:
+    has_raw_event = RawEventEnvelope.objects.filter(session_id=session_id).exists()
+    has_observation = Observation.objects.filter(session_id=session_id).exists()
+
+    return has_raw_event or has_observation
 
 
 def allocate_observation_sequence(session: AgentSession) -> int:

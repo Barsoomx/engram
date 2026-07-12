@@ -59,6 +59,7 @@ from engram.core.models import (
     OrganizationSettings,
     Project,
     ProjectTeam,
+    RawEventEnvelope,
     RetrievalDocument,
     Team,
     VectorField,
@@ -1306,6 +1307,90 @@ def test_get_or_create_session_adopts_legacy_null_team_once() -> None:
 
     assert result.team_id == team.id
     assert AgentSession.objects.get(id=session.id).team_id == team.id
+
+
+@pytest.mark.django_db
+def test_build_context_bundle_rejects_legacy_null_team_session_with_history_without_effects() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='codex-local',
+        version='old-version',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        external_session_id='session-legacy-history',
+        runtime='codex',
+        platform_source='original-platform',
+        repository_url='https://original.example/repo',
+        repository_root='/original/root',
+        branch='original-branch',
+        cwd='/original/cwd',
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id='legacy-history-event',
+        idempotency_key='legacy-history-idempotency',
+        content_hash='legacy-history-hash',
+        runtime='codex',
+        sequence_number=1,
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='Legacy history observation',
+        content_hash=raw_event.content_hash,
+        session_sequence=1,
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-session-legacy-history',
+            session_id=session.external_session_id,
+        ),
+        agent_version='new-version',
+    )
+    initial_entity_state = {
+        'agent': Agent.objects.filter(id=agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    }
+    bundle_count = ContextBundle.objects.count()
+    provider_call_count = ProviderCallRecord.objects.count()
+    retrieval_document_count = RetrievalDocument.objects.count()
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle().execute(data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    assert {
+        'agent': Agent.objects.filter(id=agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    } == initial_entity_state
+    assert ContextBundle.objects.count() == bundle_count
+    assert ProviderCallRecord.objects.count() == provider_call_count
+    assert RetrievalDocument.objects.count() == retrieval_document_count
 
 
 @pytest.mark.django_db
