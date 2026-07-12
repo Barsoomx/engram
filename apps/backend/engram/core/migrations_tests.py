@@ -526,6 +526,7 @@ def test_0033_preflight_cap_aborts_before_any_session_mutation() -> None:
 
         assert MIGRATION_0033_NODE not in reloaded.loader.applied_migrations
     finally:
+        old_apps.get_model('core', 'Observation').objects.filter(session_id=session_high.id).delete()
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
 
