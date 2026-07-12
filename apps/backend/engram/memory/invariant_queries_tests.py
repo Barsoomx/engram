@@ -745,7 +745,7 @@ def test_post_cutover_p1_team_equality_is_null_safe(
     assert typed_p1.violation_count == 0
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_post_cutover_p1_observation_requires_no_normalization_reason(
     f_scope: ScopeFixture,
 ) -> None:
@@ -753,16 +753,37 @@ def test_post_cutover_p1_observation_requires_no_normalization_reason(
     raw_event = _make_typed_raw_event(f_scope, session, 'typed-observation-reason')
     observation = _make_observation(f_scope, session, 'typed-observation-reason')
     _make_source(f_scope, observation, raw_event, 'typed-observation-reason')
-    RawEventEnvelope.objects.filter(id=raw_event.id).update(normalization_reason='evidence_only')
 
-    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
-        organization_id=f_scope.organization.id,
-        project_id=f_scope.project.id,
+    constraint = next(
+        constraint
+        for constraint in RawEventEnvelope._meta.constraints
+        if constraint.name == 'core_raw_norm_expand_valid'
     )
+    with connection.schema_editor() as schema_editor:
+        schema_editor.remove_constraint(RawEventEnvelope, constraint)
+    try:
+        RawEventEnvelope.objects.filter(id=raw_event.id).update(
+            normalization_reason='evidence_only',
+        )
 
-    assert typed_p1.state == InvariantState.VIOLATED
-    assert typed_p1.violation_count == 1
-    assert typed_p1.sample_ids == (f'raw_event:{raw_event.id}',)
+        typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+            organization_id=f_scope.organization.id,
+            project_id=f_scope.project.id,
+        )
+
+        assert typed_p1.state == InvariantState.VIOLATED
+        assert typed_p1.violation_count == 1
+        assert typed_p1.sample_ids == (f'raw_event:{raw_event.id}',)
+    finally:
+        try:
+            RawEventEnvelope.objects.filter(id=raw_event.id).update(
+                normalization_contract_version=1,
+                normalization_disposition='observation',
+                normalization_reason=None,
+            )
+        finally:
+            with connection.schema_editor() as schema_editor:
+                schema_editor.add_constraint(RawEventEnvelope, constraint)
 
 
 @pytest.mark.django_db
