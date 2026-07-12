@@ -508,6 +508,39 @@ def test_import_rejects_corrupt_existing_typed_source_without_mutation(
 
 
 @pytest.mark.django_db
+def test_import_rejects_corrupt_persisted_complete_raw_hash(
+    f_import_scope: ImportScope,
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    importer.import_batch(context, 'observations', [row], defer_embedding=True)
+    raw_event = RawEventEnvelope.objects.get()
+    raw_event.content_hash = 'corrupt-persisted-raw-hash'
+    raw_event.save(update_fields=['content_hash'])
+    before = {
+        'raws': list(RawEventEnvelope.objects.values_list('id', 'content_hash', 'sequence_number')),
+        'observations': list(Observation.objects.values_list('id', 'content_hash', 'session_sequence')),
+        'sources': list(ObservationSource.objects.values_list('id', 'observation_id', 'raw_event_id')),
+        'candidates': MemoryCandidate.objects.count(),
+        'memories': Memory.objects.count(),
+        'work': WorkflowWork.objects.count(),
+        'outbox': CeleryOutbox.objects.count(),
+    }
+
+    with pytest.raises(ValueError, match='^import observation source identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert {
+        'raws': list(RawEventEnvelope.objects.values_list('id', 'content_hash', 'sequence_number')),
+        'observations': list(Observation.objects.values_list('id', 'content_hash', 'session_sequence')),
+        'sources': list(ObservationSource.objects.values_list('id', 'observation_id', 'raw_event_id')),
+        'candidates': MemoryCandidate.objects.count(),
+        'memories': Memory.objects.count(),
+        'work': WorkflowWork.objects.count(),
+        'outbox': CeleryOutbox.objects.count(),
+    } == before
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize('collision', ['raw_source', 'observation_source', 'falsy_source_metadata'])
 def test_import_rejects_noncanonical_first_source_without_mutation(
     f_import_scope: ImportScope,
@@ -1267,6 +1300,60 @@ def test_import_materializes_v1_observation_sequences_and_prompt_no_op(
     assert prompt_raw_event.normalization_reason == RawEventNormalizationReason.EVIDENCE_ONLY
     assert prompt_raw_event.sequence_number is None
     assert not ObservationSource.objects.filter(raw_event=prompt_raw_event).exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('has_source', [False, True])
+def test_existing_import_observation_adoption_uses_two_queries(
+    f_import_scope: ImportScope,
+    has_source: bool,
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    source_id = importer._observation_source_id(context, row)
+    content_hash = importer._content_hash(source_id, row['title'], row['text'])
+    observation = Observation.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=session.agent,
+        session=session,
+        observation_type='discovery',
+        title=str(row['title']),
+        body=str(row['text']),
+        content_hash=content_hash,
+        generation_key='',
+    )
+    if has_source:
+        ObservationSource.objects.create(
+            organization=context.organization,
+            project=context.project,
+            observation=observation,
+            source_type='hook_event',
+            source_id='preexisting-source',
+        )
+
+    with CaptureQueriesContext(connection) as queries:
+        if has_source:
+            with pytest.raises(ValueError, match='^import observation source identity collision$'):
+                importer._existing_import_observation(
+                    context.organization,
+                    context.project,
+                    session,
+                    source_id,
+                    content_hash,
+                )
+            result = None
+        else:
+            result = importer._existing_import_observation(
+                context.organization,
+                context.project,
+                session,
+                source_id,
+                content_hash,
+            )
+
+    assert len(queries) == 2
+    assert result == (None if has_source else observation)
 
 
 @pytest.mark.django_db

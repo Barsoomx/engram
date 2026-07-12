@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import UUID
 
 from django.db import transaction
+from django.db.models import Count
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -1062,8 +1063,6 @@ class ClaudeMemImporter:
             session=session,
             source_id=source_id,
             event_type=event_type,
-            raw_content_hash=raw_content_hash,
-            observation_content_hash=content_hash,
             source_store_id=context.source_store_id,
         ):
             return self._empty_memory_result(payload_redacted or observation_redacted)
@@ -1200,14 +1199,18 @@ class ClaudeMemImporter:
         if observation is not None and observation.content_hash != content_hash:
             raise ValueError('import observation source identity collision')
         if observation is None:
-            observation = Observation.objects.filter(
-                organization=organization,
-                project=project,
-                session=session,
-                content_hash=content_hash,
-                generation_key='',
-            ).first()
-        if observation is not None and ObservationSource.objects.filter(observation=observation).exists():
+            observation = (
+                Observation.objects.filter(
+                    organization=organization,
+                    project=project,
+                    session=session,
+                    content_hash=content_hash,
+                    generation_key='',
+                )
+                .annotate(source_count=Count('sources'))
+                .first()
+            )
+        if observation is not None and observation.source_count:
             raise ValueError('import observation source identity collision')
 
         return observation
@@ -1238,7 +1241,9 @@ class ClaudeMemImporter:
                 organization=organization,
                 project=project,
                 generation_key=source_id,
-            ).order_by('id')[:2],
+            )
+            .annotate(source_count=Count('sources'))
+            .order_by('id')[:2],
         )
 
     def _bind_existing_import_observation(
@@ -1318,8 +1323,6 @@ class ClaudeMemImporter:
         session: AgentSession,
         source_id: str,
         event_type: str,
-        raw_content_hash: str,
-        observation_content_hash: str,
         source_store_id: str,
     ) -> bool:
         sources = list(
@@ -1357,8 +1360,6 @@ class ClaudeMemImporter:
             raw_event=raw_event,
             source_id=source_id,
             event_type=event_type,
-            raw_content_hash=raw_content_hash,
-            observation_content_hash=observation_content_hash,
         )
 
         if legacy_shape:
@@ -1386,8 +1387,6 @@ class ClaudeMemImporter:
         raw_event: RawEventEnvelope,
         source_id: str,
         event_type: str,
-        raw_content_hash: str,
-        observation_content_hash: str,
     ) -> bool:
         expected_team_id = team.id if team is not None else None
         self._validate_import_raw_immutable_identity(
@@ -1399,8 +1398,8 @@ class ClaudeMemImporter:
             source_id=source_id,
             event_type=event_type,
         )
-        if raw_event.content_hash != raw_content_hash:
-            raise ValueError('import raw event identity collision')
+        if raw_event.content_hash != self._content_hash(source_id, raw_event.payload):
+            raise ValueError('import observation source identity collision')
 
         legacy_shape = (
             raw_event.normalization_contract_version is None
@@ -1429,7 +1428,6 @@ class ClaudeMemImporter:
             or not isinstance(observation.source_metadata, dict)
             or observation.source_metadata.get('source_id') != source_id
             or observation.source_metadata.get('event_type') != event_type
-            or observation.content_hash != observation_content_hash
             or ObservationSource.objects.filter(observation=observation).count() != 1
             or ObservationSource.objects.filter(raw_event=raw_event).count() != 1
         ):
