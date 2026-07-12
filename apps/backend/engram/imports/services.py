@@ -944,10 +944,7 @@ class ClaudeMemImporter:
             or (memory_session_id is not None and session.memory_session_id != memory_session_id)
             or not isinstance(metadata, dict)
             or metadata.get('source') != _IMPORT_SESSION_SOURCE
-            or (
-                'source_store_id' in metadata
-                and metadata.get('source_store_id') != context.source_store_id
-            )
+            or ('source_store_id' in metadata and metadata.get('source_store_id') != context.source_store_id)
         ):
             raise ValueError('import session identity collision')
 

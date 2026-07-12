@@ -1874,10 +1874,13 @@ def test_memory_lookup_prefilters_foreign_long_prefix_modern_sessions(
 
     monkeypatch.setattr(importer, '_session_source_id', recording_session_source_id)
 
-    assert importer._session_for_memory(
-        context,
-        {'memory_session_id': 'long-prefix-memory'},
-    ) == exact_session
+    assert (
+        importer._session_for_memory(
+            context,
+            {'memory_session_id': 'long-prefix-memory'},
+        )
+        == exact_session
+    )
     assert evaluated_content_ids == ['exact-content']
 
 
