@@ -250,6 +250,7 @@ def _evaluate_post_cutover_p1(project: Project) -> InvariantResult:
     )
     valid_observation = Q(
         normalization_disposition='observation',
+        normalization_reason__isnull=True,
         total_source_count=1,
         valid_source_count=1,
     )
@@ -409,10 +410,6 @@ def _stored_observation_work_matches(
         or snapshot.get('observation_id') != str(observation.id)
         or snapshot.get('observation_digest') != observation_content_digest(observation)
     ):
-        return False
-
-    stored_policy = snapshot.get('policy')
-    if stored_policy != policy:
         return False
 
     expected_snapshot = {

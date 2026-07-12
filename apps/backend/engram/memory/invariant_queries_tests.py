@@ -746,6 +746,26 @@ def test_post_cutover_p1_team_equality_is_null_safe(
 
 
 @pytest.mark.django_db
+def test_post_cutover_p1_observation_requires_no_normalization_reason(
+    f_scope: ScopeFixture,
+) -> None:
+    session = _make_session(f_scope, 'typed-observation-reason')
+    raw_event = _make_typed_raw_event(f_scope, session, 'typed-observation-reason')
+    observation = _make_observation(f_scope, session, 'typed-observation-reason')
+    _make_source(f_scope, observation, raw_event, 'typed-observation-reason')
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(normalization_reason='evidence_only')
+
+    typed_p1, _typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )
+
+    assert typed_p1.state == InvariantState.VIOLATED
+    assert typed_p1.violation_count == 1
+    assert typed_p1.sample_ids == (f'raw_event:{raw_event.id}',)
+
+
+@pytest.mark.django_db
 def test_post_cutover_p1_is_typed_while_global_p1_retains_legacy_gap(
     f_scope: ScopeFixture,
 ) -> None:
@@ -1084,7 +1104,7 @@ def test_post_cutover_p2_rejects_noncanonical_hook_source_before_work_check(
 
 
 @pytest.mark.django_db
-def test_post_cutover_p2_requires_exact_stored_policy_match(
+def test_post_cutover_p2_matches_stored_policy_semantics_not_fallback_provenance(
     f_scope: ScopeFixture,
 ) -> None:
     current_policy = {
@@ -1114,21 +1134,30 @@ def test_post_cutover_p2_requires_exact_stored_policy_match(
         project_id=f_scope.project.id,
     )
 
+    assert typed_p2.state == InvariantState.HEALTHY
+    assert typed_p2.violation_count == 0
+
+    WorkflowWork.objects.all().delete()
+    _make_stored_observation_work(
+        f_scope,
+        observation,
+        {**current_policy, 'realtime_candidates_enabled': False},
+    )
+    typed_p2 = evaluate_post_cutover_p1_p2(
+        organization_id=f_scope.organization.id,
+        project_id=f_scope.project.id,
+    )[1]
     assert typed_p2.state == InvariantState.VIOLATED
     assert typed_p2.violation_count == 1
     assert typed_p2.sample_ids == (f'raw_event:{raw_event.id}',)
 
     WorkflowWork.objects.all().delete()
-    _make_observation_work(f_scope, observation, current_policy)
-    typed_p2 = evaluate_post_cutover_p1_p2(
-        organization_id=f_scope.organization.id,
-        project_id=f_scope.project.id,
-    )[1]
-    assert typed_p2.state == InvariantState.HEALTHY
-    assert typed_p2.violation_count == 0
-
-    RawEventEnvelope.objects.filter(id=raw_event.id).update(
-        metadata={'work_policy_v1': {'schema': 'hook_work_policy/v1'}},
+    work = _make_observation_work(f_scope, observation, current_policy)
+    WorkflowWork.objects.filter(id=work.id).update(
+        input_snapshot={
+            **work.input_snapshot,
+            'policy': {'schema': 'hook_work_policy/v1'},
+        },
     )
     typed_p2 = evaluate_post_cutover_p1_p2(
         organization_id=f_scope.organization.id,
