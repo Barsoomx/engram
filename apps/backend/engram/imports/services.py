@@ -42,6 +42,7 @@ ImportReport = dict[str, object]
 _MAX_OBSERVATION_TEXT_CHARS = 16000
 _MAX_OBSERVATION_LIST_ITEMS = 100
 _MAX_SESSION_KEY_CHARS = 255
+_SOURCE_ID_DIGEST_SUFFIX_CHARS = 33
 _MAX_PLATFORM_SOURCE_CHARS = 80
 _MAX_OBSERVATION_TYPE_CHARS = 80
 _MAX_GENERATED_MODEL_CHARS = 120
@@ -276,13 +277,12 @@ class ClaudeMemImporter:
         rows: list[dict[str, object]],
         report: ImportReport,
     ) -> tuple[int, int, int]:
-        prelocked_sessions = self._lock_existing_import_sessions(rows, context)
         sessions, agents_created, sessions_created, session_duplicates, redacted, unsupported = self._import_sessions(
             context,
             rows,
             [],
         )
-        self._lock_import_sessions(list(sessions.values()), context, already_locked=prelocked_sessions)
+        self._lock_import_sessions(list(sessions.values()), context)
         report['created']['agents'] += agents_created
         report['created']['sessions'] += sessions_created
         report['duplicates']['sessions'] += session_duplicates
@@ -340,7 +340,15 @@ class ClaudeMemImporter:
         duplicates = 0
         skipped = 0
         confidence = OBSERVATION_CONFIDENCE if kind == 'observation' else SESSION_SUMMARY_CONFIDENCE
-        sessions = [self._session_for_memory(context, row) for row in rows]
+        team_id = context.team.id if context.team is not None else None
+        session_cache: dict[tuple[str, UUID | None, str], AgentSession | None] = {}
+        sessions = []
+        for row in rows:
+            memory_session_id = _capped_session_key(row.get('memory_session_id'))
+            cache_key = (context.source_store_id, team_id, memory_session_id)
+            if cache_key not in session_cache:
+                session_cache[cache_key] = self._session_for_memory(context, row)
+            sessions.append(session_cache[cache_key])
         locked_sessions = self._lock_import_sessions(
             [session for session in sessions if session is not None],
             context,
@@ -401,27 +409,31 @@ class ClaudeMemImporter:
         if not memory_session_id:
             return None
 
-        return (
-            AgentSession.objects.select_related('agent')
-            .filter(
-                organization=context.organization,
-                project=context.project,
-                memory_session_id=memory_session_id,
-            )
-            .order_by('created_at')
-            .first()
+        namespace = f'claude-mem:{context.source_store_id}:sdk_session:'
+        namespace_prefix = namespace[: _MAX_SESSION_KEY_CHARS - _SOURCE_ID_DIGEST_SUFFIX_CHARS]
+        expected_team_id = context.team.id if context.team is not None else None
+        sessions = AgentSession.objects.select_related('agent').filter(
+            organization=context.organization,
+            project=context.project,
+            team_id=expected_team_id,
+            memory_session_id=memory_session_id,
+            external_session_id__startswith=namespace_prefix,
         )
+        for session in sessions.order_by('created_at'):
+            expected_external_id = self._session_source_id(context, session.content_session_id)
+            if session.external_session_id == expected_external_id:
+                return session
+
+        return None
 
     def _lock_import_sessions(
         self,
         sessions: list[AgentSession],
         context: ImportContext,
-        *,
-        already_locked: dict[UUID, AgentSession] | None = None,
     ) -> dict[UUID, AgentSession]:
-        locked_sessions = dict(already_locked or {})
+        locked_sessions: dict[UUID, AgentSession] = {}
         expected_team_id = context.team.id if context.team is not None else None
-        session_ids = {session.id for session in sessions} - set(locked_sessions)
+        session_ids = {session.id for session in sessions}
         for session_id in sorted(session_ids, key=str):
             locked = lock_session_for_observation(
                 organization_id=context.organization.id,
@@ -434,25 +446,6 @@ class ClaudeMemImporter:
             locked_sessions[locked.id] = locked
 
         return locked_sessions
-
-    def _lock_existing_import_sessions(
-        self,
-        rows: list[dict[str, object]],
-        context: ImportContext,
-    ) -> dict[UUID, AgentSession]:
-        external_session_ids = {
-            self._session_source_id(context, content_session_id)
-            for row in rows
-            if (content_session_id := _capped_session_key(row.get('content_session_id')))
-        }
-        existing_sessions = list(
-            AgentSession.objects.filter(
-                organization=context.organization,
-                project=context.project,
-                external_session_id__in=external_session_ids,
-            ),
-        )
-        return self._lock_import_sessions(existing_sessions, context)
 
     def _empty_batch_report(self) -> ImportReport:
         return empty_batch_report()
@@ -738,7 +731,6 @@ class ClaudeMemImporter:
         redacted = False
         truncated = False
         with transaction.atomic():
-            prelocked_sessions = self._lock_existing_import_sessions(rows['sdk_sessions'], context)
             sessions, agents_created, sessions_created, session_duplicates, sessions_redacted, sessions_unsupported = (
                 self._import_sessions(
                     context,
@@ -752,11 +744,7 @@ class ClaudeMemImporter:
             report['unsupported'].extend(sessions_unsupported)
             redacted = redacted or sessions_redacted
 
-            locked_sessions = self._lock_import_sessions(
-                list(sessions.values()),
-                context,
-                already_locked=prelocked_sessions,
-            )
+            locked_sessions = self._lock_import_sessions(list(sessions.values()), context)
             sessions = {key: locked_sessions.get(session.id, session) for key, session in sessions.items()}
 
             for prompt in rows['user_prompts']:
@@ -1065,6 +1053,8 @@ class ClaudeMemImporter:
         if not isinstance(observation_data, dict):
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
+        raw_content_hash = self._content_hash(source_id, payload)
+        content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
         if self._validate_existing_import_replay(
             organization=organization,
             project=project,
@@ -1072,6 +1062,9 @@ class ClaudeMemImporter:
             session=session,
             source_id=source_id,
             event_type=event_type,
+            raw_content_hash=raw_content_hash,
+            observation_content_hash=content_hash,
+            source_store_id=context.source_store_id,
         ):
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
@@ -1088,10 +1081,9 @@ class ClaudeMemImporter:
             normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
             normalization_reason=None,
         )
-        if not raw_created and raw_event.content_hash != self._content_hash(source_id, payload):
+        if not raw_created and raw_event.content_hash != raw_content_hash:
             raise ValueError('import raw event identity collision')
 
-        content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
         raw_body = str(observation_data.get('body') or '')
         raw_narrative = str(observation_data.get('narrative') or '')
         raw_facts = observation_data.get('facts') or []
@@ -1326,6 +1318,9 @@ class ClaudeMemImporter:
         session: AgentSession,
         source_id: str,
         event_type: str,
+        raw_content_hash: str,
+        observation_content_hash: str,
+        source_store_id: str,
     ) -> bool:
         sources = list(
             ObservationSource.objects.select_related('observation', 'raw_event')
@@ -1352,7 +1347,50 @@ class ClaudeMemImporter:
         if len(source_observations) != 1 or source_observations[0].id != observation.id:
             raise ValueError('import observation source identity collision')
 
-        self._validate_import_raw_identity(
+        legacy_shape = self._validate_existing_replay_identity(
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source=source,
+            observation=observation,
+            raw_event=raw_event,
+            source_id=source_id,
+            event_type=event_type,
+            raw_content_hash=raw_content_hash,
+            observation_content_hash=observation_content_hash,
+        )
+
+        if legacy_shape:
+            self._repair_legacy_import_replay(
+                raw_event=raw_event,
+                observation=observation,
+                session=session,
+                source_id=source_id,
+                event_type=event_type,
+                source_store_id=source_store_id,
+            )
+        else:
+            self._validate_existing_replay_sequence(raw_event, observation, session)
+
+        return True
+
+    def _validate_existing_replay_identity(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source: ObservationSource,
+        observation: Observation,
+        raw_event: RawEventEnvelope,
+        source_id: str,
+        event_type: str,
+        raw_content_hash: str,
+        observation_content_hash: str,
+    ) -> bool:
+        expected_team_id = team.id if team is not None else None
+        self._validate_import_raw_immutable_identity(
             raw_event=raw_event,
             organization=organization,
             project=project,
@@ -1360,10 +1398,22 @@ class ClaudeMemImporter:
             session=session,
             source_id=source_id,
             event_type=event_type,
-            normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
-            normalization_reason=None,
         )
-        expected_team_id = team.id if team is not None else None
+        if raw_event.content_hash != raw_content_hash:
+            raise ValueError('import raw event identity collision')
+
+        legacy_shape = (
+            raw_event.normalization_contract_version is None
+            and raw_event.normalization_disposition is None
+            and raw_event.normalization_reason is None
+            and raw_event.sequence_number is None
+        )
+        if not legacy_shape:
+            self._validate_import_raw_normalization_state(
+                raw_event=raw_event,
+                normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+                normalization_reason=None,
+            )
         if (
             source.organization_id != organization.id
             or source.project_id != project.id
@@ -1379,9 +1429,28 @@ class ClaudeMemImporter:
             or not isinstance(observation.source_metadata, dict)
             or observation.source_metadata.get('source_id') != source_id
             or observation.source_metadata.get('event_type') != event_type
+            or observation.content_hash != observation_content_hash
             or ObservationSource.objects.filter(observation=observation).count() != 1
             or ObservationSource.objects.filter(raw_event=raw_event).count() != 1
-            or observation.session_sequence is None
+        ):
+            raise ValueError('import observation source identity collision')
+
+        if legacy_shape and (
+            observation.session_sequence is not None
+            or (session.observation_sequence_cursor is not None and session.observation_sequence_cursor < 0)
+        ):
+            raise ValueError('import observation source identity collision')
+
+        return legacy_shape
+
+    def _validate_existing_replay_sequence(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        session: AgentSession,
+    ) -> None:
+        if (
+            observation.session_sequence is None
             or observation.session_sequence <= 0
             or raw_event.sequence_number != observation.session_sequence
             or session.observation_sequence_cursor is None
@@ -1389,7 +1458,42 @@ class ClaudeMemImporter:
         ):
             raise ValueError('import observation source identity collision')
 
-        return True
+    def _repair_legacy_import_replay(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+        source_store_id: str,
+    ) -> None:
+        sequence_number = allocate_observation_sequence(session)
+        observation.session_sequence = sequence_number
+        observation.save(update_fields=['session_sequence'])
+
+        metadata = dict(raw_event.metadata) if isinstance(raw_event.metadata, dict) else {}
+        metadata.update(
+            {
+                'source': 'claude_mem_import',
+                'source_store_id': source_store_id,
+                'source_id': source_id,
+                'event_type': event_type,
+            },
+        )
+        raw_event.normalization_contract_version = 1
+        raw_event.normalization_disposition = RawEventNormalizationDisposition.OBSERVATION
+        raw_event.normalization_reason = None
+        raw_event.sequence_number = sequence_number
+        raw_event.metadata = metadata
+        raw_event.save(
+            update_fields=[
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'sequence_number',
+                'metadata',
+            ],
+        )
 
     def _get_or_create_raw_event(
         self,
@@ -1463,6 +1567,31 @@ class ClaudeMemImporter:
         normalization_disposition: RawEventNormalizationDisposition,
         normalization_reason: RawEventNormalizationReason | None,
     ) -> None:
+        self._validate_import_raw_immutable_identity(
+            raw_event=raw_event,
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type=event_type,
+        )
+        self._validate_import_raw_normalization_state(
+            raw_event=raw_event,
+            normalization_disposition=normalization_disposition,
+            normalization_reason=normalization_reason,
+        )
+
+    def _validate_import_raw_immutable_identity(
+        self,
+        raw_event: RawEventEnvelope,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+    ) -> None:
         if (
             raw_event.organization_id != organization.id
             or raw_event.project_id != project.id
@@ -1474,7 +1603,19 @@ class ClaudeMemImporter:
             or raw_event.client_event_id != source_id
             or raw_event.idempotency_key != source_id
             or raw_event.payload_schema_version != 'v1'
-            or raw_event.normalization_contract_version != 1
+            or not isinstance(raw_event.metadata, dict)
+            or raw_event.metadata.get('source') != 'claude_mem_import'
+        ):
+            raise ValueError('import raw event identity collision')
+
+    def _validate_import_raw_normalization_state(
+        self,
+        raw_event: RawEventEnvelope,
+        normalization_disposition: RawEventNormalizationDisposition,
+        normalization_reason: RawEventNormalizationReason | None,
+    ) -> None:
+        if (
+            raw_event.normalization_contract_version != 1
             or raw_event.normalization_disposition != normalization_disposition
             or raw_event.normalization_reason != normalization_reason
             or (
@@ -1602,7 +1743,7 @@ class ClaudeMemImporter:
 
         digest = hashlib.sha256(source_id.encode()).hexdigest()[:32]
 
-        return f'{source_id[: _MAX_SESSION_KEY_CHARS - 33]}:{digest}'
+        return f'{source_id[: _MAX_SESSION_KEY_CHARS - _SOURCE_ID_DIGEST_SUFFIX_CHARS]}:{digest}'
 
     def _runtime(self, value: object) -> str:
         normalized = str(value or '').strip().lower()

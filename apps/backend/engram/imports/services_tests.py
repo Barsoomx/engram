@@ -145,6 +145,53 @@ def _raw_import_identity(
     }
 
 
+def _create_master_era_import_graph(
+    importer: ClaudeMemImporter,
+    context: ImportContext,
+    session: AgentSession,
+    row: dict[str, object],
+    raw_metadata: dict[str, object],
+) -> tuple[RawEventEnvelope, Observation, ObservationSource]:
+    session.observation_sequence_cursor = None
+    session.save(update_fields=['observation_sequence_cursor'])
+    source_id = importer._observation_source_id(context, row)
+    raw_identity = _raw_import_identity(importer, context, session, row)
+    raw_identity.update(
+        normalization_contract_version=None,
+        normalization_disposition=None,
+        normalization_reason=None,
+        sequence_number=None,
+        metadata=raw_metadata,
+    )
+    raw_event = RawEventEnvelope.objects.create(**raw_identity)
+    observation = Observation.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=session.agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='discovery',
+        title=str(row['title']),
+        body=str(row['text']),
+        content_hash=importer._content_hash(source_id, row['title'], row['text']),
+        generation_key=source_id,
+        source_metadata={'source_id': source_id, 'event_type': 'claude_mem.observation'},
+        session_sequence=None,
+    )
+    source = ObservationSource.objects.create(
+        organization=context.organization,
+        project=context.project,
+        observation=observation,
+        raw_event=raw_event,
+        source_type='claude_mem',
+        source_id=source_id,
+        metadata={'event_type': 'claude_mem.observation'},
+    )
+
+    return raw_event, observation, source
+
+
 @pytest.mark.django_db
 def test_import_rejects_hook_owned_raw_identity_collision_without_mutation(
     f_import_scope: ImportScope,
@@ -326,7 +373,7 @@ def test_import_rejects_corrupt_existing_typed_source_without_mutation(
         observation_type='discovery',
         title=str(row['title']),
         body=str(row['text']),
-        content_hash='existing-corrupt-replay-observation',
+        content_hash=importer._content_hash(source_id, row['title'], row['text']),
         generation_key=source_id,
         source_metadata={'source_id': source_id, 'event_type': 'claude_mem.observation'},
         session_sequence=1,
@@ -943,6 +990,112 @@ def test_existing_sdk_session_is_locked_once(
 
 
 @pytest.mark.django_db(transaction=True)
+def test_import_locks_existing_and_late_session_ids_in_one_global_order(
+    f_import_scope: ImportScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL row locks')
+
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='fixture-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='lock-order-agent',
+    )
+    high_id = UUID('ffffffff-ffff-4fff-8fff-ffffffffffff')
+    low_id = UUID('00000000-0000-4fff-8fff-000000000001')
+    session_a = AgentSession.objects.create(
+        id=high_id,
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'session-a'),
+        content_session_id='session-a',
+        memory_session_id='memory-a',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+    )
+    rows = [
+        {
+            'id': 101,
+            'content_session_id': 'session-a',
+            'memory_session_id': 'memory-a',
+            'project': '/workspace/example-repo',
+            'platform_source': 'codex',
+        },
+        {
+            'id': 102,
+            'content_session_id': 'session-b',
+            'memory_session_id': 'memory-b',
+            'project': '/workspace/example-repo',
+            'platform_source': 'codex',
+        },
+    ]
+    real_import_sessions = importer._import_sessions
+
+    def import_sessions_with_late_session(
+        import_context: ImportContext,
+        session_rows: list[dict[str, object]],
+        observation_rows: list[dict[str, object]],
+    ) -> tuple[dict[str, AgentSession], int, int, int, bool, list[dict[str, str]]]:
+        AgentSession.objects.create(
+            id=low_id,
+            organization=import_context.organization,
+            project=import_context.project,
+            team=import_context.team,
+            agent=agent,
+            external_session_id=importer._session_source_id(import_context, 'session-b'),
+            content_session_id='session-b',
+            memory_session_id='memory-b',
+            runtime=Runtime.CODEX,
+            observation_sequence_cursor=0,
+        )
+        return real_import_sessions(import_context, session_rows, observation_rows)
+
+    monkeypatch.setattr(importer, '_import_sessions', import_sessions_with_late_session)
+    real_lock_sessions = importer._lock_import_sessions
+    lock_batches: list[set[UUID]] = []
+
+    def recording_lock_batch(
+        sessions: list[AgentSession],
+        lock_context: ImportContext,
+        **lock_options: object,
+    ) -> dict[UUID, AgentSession]:
+        lock_batches.append({session.id for session in sessions})
+        return real_lock_sessions(sessions, lock_context, **lock_options)
+
+    monkeypatch.setattr(importer, '_lock_import_sessions', recording_lock_batch)
+    real_lock = import_services.lock_session_for_observation
+    acquired_ids: list[UUID] = []
+
+    def recording_lock(*, organization_id: UUID, project_id: UUID, session_id: UUID) -> AgentSession:
+        locked = real_lock(
+            organization_id=organization_id,
+            project_id=project_id,
+            session_id=session_id,
+        )
+        acquired_ids.append(locked.id)
+        return locked
+
+    monkeypatch.setattr(import_services, 'lock_session_for_observation', recording_lock)
+
+    result = importer.import_batch(context, 'sdk_sessions', rows)
+
+    assert result.created == 0
+    assert result.duplicates == 2
+    assert lock_batches == [{low_id, session_a.id}]
+    assert acquired_ids == [low_id, session_a.id]
+
+
+@pytest.mark.django_db(transaction=True)
 def test_concurrent_imports_lock_sessions_in_stable_order_without_deadlock(
     f_import_scope: ImportScope,
     monkeypatch: pytest.MonkeyPatch,
@@ -1195,6 +1348,543 @@ def test_import_binds_session_scoped_legacy_observation_and_reuses_sequence(
     assert Observation.objects.filter(id=observation.id, session_sequence=7).count() == 1
     assert not WorkflowWork.objects.exists()
     assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('table', ['observations', 'session_summaries'])
+def test_memory_batch_scopes_session_by_source_store(
+    f_import_scope: ImportScope,
+    table: str,
+) -> None:
+    importer = ClaudeMemImporter()
+    store_a = 'store-a'
+    store_b = 'store-b'
+    context_a = ImportContext(
+        source_store_id=store_a,
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    context_b = ImportContext(
+        source_store_id=store_b,
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent_a = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='store-a-agent',
+    )
+    agent_b = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='store-b-agent',
+    )
+    session_a = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent_a,
+        external_session_id=importer._session_source_id(context_a, 'content-a'),
+        content_session_id='content-a',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=11,
+        metadata={'source': 'claude_mem_import', 'source_store_id': store_a},
+    )
+    session_b = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent_b,
+        external_session_id=importer._session_source_id(context_b, 'content-b'),
+        content_session_id='content-b',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+        metadata={'source': 'claude_mem_import', 'source_store_id': store_b},
+    )
+    row = {
+        'id': 1,
+        'memory_session_id': 'shared-memory-session',
+        'project': '/workspace/example-repo',
+        'text': 'Store B memory body.',
+        'type': 'discovery',
+        'title': 'Store B memory',
+        'request': 'Store B request',
+        'learned': 'Store B learned result',
+        'created_at': '2026-06-25T09:02:00Z',
+    }
+
+    result = importer.import_batch(context_b, table, [row], defer_embedding=True)
+
+    assert result.created == 1
+    assert result.duplicates == 0
+    session_a.refresh_from_db()
+    session_b.refresh_from_db()
+    assert session_a.observation_sequence_cursor == 11
+    assert session_b.observation_sequence_cursor == 1
+    observation = Observation.objects.get()
+    raw_event = RawEventEnvelope.objects.get()
+    assert observation.session_id == session_b.id
+    assert observation.agent_id == agent_b.id
+    assert raw_event.session_id == session_b.id
+    assert raw_event.agent_id == agent_b.id
+
+
+@pytest.mark.django_db
+def test_memory_batch_caches_session_lookup_for_repeated_memory_session(
+    f_import_scope: ImportScope,
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    rows = [
+        {
+            **row,
+            'id': 200 + index,
+            'text': f'Cached lookup memory {index}.',
+            'title': f'Cached lookup {index}',
+        }
+        for index in range(5)
+    ]
+
+    with CaptureQueriesContext(connection) as queries:
+        result = importer.import_batch(context, 'observations', rows, defer_embedding=True)
+
+    candidate_queries = [
+        query['sql']
+        for query in queries
+        if 'core_agentsession' in query['sql'].lower() and ' like ' in query['sql'].lower()
+    ]
+    session.refresh_from_db()
+    assert result.created == 5
+    assert session.observation_sequence_cursor == 5
+    assert len(candidate_queries) == 1
+
+
+@pytest.mark.django_db
+def test_memory_batch_prefilters_unrelated_store_before_exact_session_match(
+    f_import_scope: ImportScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    importer = ClaudeMemImporter()
+    context_a = ImportContext(
+        source_store_id='store-a',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    context_b = ImportContext(
+        source_store_id='store-b',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='prefilter-store-agent',
+    )
+    AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context_a, 'content-a'),
+        content_session_id='content-a',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+    )
+    session_b = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context_b, 'content-b'),
+        content_session_id='content-b',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+    )
+    evaluated_content_ids: list[str] = []
+    real_session_source_id = importer._session_source_id
+
+    def recording_session_source_id(import_context: ImportContext, content_session_id: object) -> str:
+        evaluated_content_ids.append(str(content_session_id))
+        return real_session_source_id(import_context, content_session_id)
+
+    monkeypatch.setattr(importer, '_session_source_id', recording_session_source_id)
+    row = {
+        'id': 5,
+        'memory_session_id': 'shared-memory-session',
+        'project': '/workspace/example-repo',
+        'text': 'Prefiltered Store B memory.',
+        'type': 'discovery',
+        'title': 'Prefiltered Store B',
+        'created_at': '2026-06-25T09:06:00Z',
+    }
+
+    result = importer.import_batch(context_b, 'observations', [row], defer_embedding=True)
+
+    assert result.created == 1
+    assert evaluated_content_ids == ['content-b']
+    assert Observation.objects.get().session_id == session_b.id
+
+
+@pytest.mark.django_db
+def test_memory_batch_does_not_trust_contradictory_source_store_metadata(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context_a = ImportContext(
+        source_store_id='store-a',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    context_b = ImportContext(
+        source_store_id='store-b',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='contradictory-store-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context_a, 'content-a'),
+        content_session_id='content-a',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+        metadata={'source': 'claude_mem_import', 'source_store_id': 'store-b'},
+    )
+    row = {
+        'id': 3,
+        'memory_session_id': 'shared-memory-session',
+        'project': '/workspace/example-repo',
+        'text': 'Contradictory marker memory.',
+        'type': 'discovery',
+        'title': 'Contradictory marker',
+        'created_at': '2026-06-25T09:04:00Z',
+    }
+
+    result = importer.import_batch(context_b, 'observations', [row], defer_embedding=True)
+
+    session.refresh_from_db()
+    assert result.created == 0
+    assert result.skipped == 1
+    assert session.observation_sequence_cursor == 0
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not MemoryCandidate.objects.exists()
+    assert not WorkflowWork.objects.exists()
+
+
+@pytest.mark.django_db
+def test_memory_batch_matches_max_length_source_store_canonical_session_id(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    source_store_id = 's' * 255
+    context = ImportContext(
+        source_store_id=source_store_id,
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='long-store-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'long-store-content'),
+        content_session_id='long-store-content',
+        memory_session_id='long-store-memory',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+        metadata={'source': 'claude_mem_import', 'source_store_id': source_store_id},
+    )
+    row = {
+        'id': 4,
+        'memory_session_id': 'long-store-memory',
+        'project': '/workspace/example-repo',
+        'text': 'Long source store memory.',
+        'type': 'discovery',
+        'title': 'Long source store',
+        'created_at': '2026-06-25T09:05:00Z',
+    }
+
+    result = importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    session.refresh_from_db()
+    assert len(session.external_session_id) == 255
+    assert result.created == 1
+    assert session.observation_sequence_cursor == 1
+    assert Observation.objects.get().session_id == session.id
+    assert RawEventEnvelope.objects.get().session_id == session.id
+
+
+@pytest.mark.django_db
+def test_memory_batch_skips_older_foreign_team_session_in_same_store(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    other_team = Team.objects.create(
+        organization=f_import_scope.organization,
+        name='Store A Team',
+        slug='store-a-team',
+    )
+    context_a = ImportContext(
+        source_store_id='store-b',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=other_team,
+    )
+    context_b = ImportContext(
+        source_store_id='store-b',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent_a = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='foreign-store-agent',
+    )
+    agent_b = Agent.objects.create(
+        organization=f_import_scope.organization,
+        runtime=Runtime.CODEX,
+        external_id='matching-store-agent',
+    )
+    session_a = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=other_team,
+        agent=agent_a,
+        external_session_id=importer._session_source_id(context_a, 'content-a'),
+        content_session_id='content-a',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=9,
+        metadata={'source': 'claude_mem_import', 'source_store_id': 'store-b'},
+    )
+    session_b = AgentSession.objects.create(
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+        agent=agent_b,
+        external_session_id=importer._session_source_id(context_b, 'content-b'),
+        content_session_id='content-b',
+        memory_session_id='shared-memory-session',
+        runtime=Runtime.CODEX,
+        observation_sequence_cursor=0,
+        metadata={'source': 'claude_mem_import', 'source_store_id': 'store-b'},
+    )
+    row = {
+        'id': 2,
+        'memory_session_id': 'shared-memory-session',
+        'project': '/workspace/example-repo',
+        'text': 'Matching team memory body.',
+        'type': 'discovery',
+        'title': 'Matching team memory',
+        'created_at': '2026-06-25T09:03:00Z',
+    }
+
+    result = importer.import_batch(context_b, 'observations', [row], defer_embedding=True)
+
+    assert result.created == 1
+    session_a.refresh_from_db()
+    session_b.refresh_from_db()
+    assert session_a.observation_sequence_cursor == 9
+    assert session_b.observation_sequence_cursor == 1
+    observation = Observation.objects.get()
+    raw_event = RawEventEnvelope.objects.get()
+    assert observation.session_id == session_b.id
+    assert observation.team_id == f_import_scope.team.id
+    assert raw_event.session_id == session_b.id
+    assert raw_event.team_id == f_import_scope.team.id
+
+
+@pytest.mark.django_db
+def test_import_repairs_exact_master_era_legacy_observation_replay(
+    f_import_scope: ImportScope,
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    source_id = importer._observation_source_id(context, row)
+    payload = import_services.redact_value({**row, 'source_id': source_id}).value
+    raw_event, observation, source = _create_master_era_import_graph(
+        importer,
+        context,
+        session,
+        row,
+        {'source': 'claude_mem_import'},
+    )
+    initial_counts = {
+        'raw': RawEventEnvelope.objects.count(),
+        'observations': Observation.objects.count(),
+        'sources': ObservationSource.objects.count(),
+        'candidates': MemoryCandidate.objects.count(),
+        'workflow': WorkflowWork.objects.count(),
+        'outbox': CeleryOutbox.objects.count(),
+    }
+
+    result = importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert result.created == 0
+    assert result.duplicates == 1
+    raw_event.refresh_from_db()
+    observation.refresh_from_db()
+    session.refresh_from_db()
+    source.refresh_from_db()
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == RawEventNormalizationDisposition.OBSERVATION
+    assert raw_event.normalization_reason is None
+    assert raw_event.sequence_number == 1
+    assert raw_event.metadata == {
+        'source': 'claude_mem_import',
+        'source_store_id': context.source_store_id,
+        'source_id': source_id,
+        'event_type': 'claude_mem.observation',
+    }
+    assert observation.session_sequence == 1
+    assert observation.generation_key == source_id
+    assert observation.source_metadata == {'source_id': source_id, 'event_type': 'claude_mem.observation'}
+    assert session.observation_sequence_cursor == 1
+    assert source.observation_id == observation.id
+    assert source.raw_event_id == raw_event.id
+    assert {
+        'raw': RawEventEnvelope.objects.count(),
+        'observations': Observation.objects.count(),
+        'sources': ObservationSource.objects.count(),
+        'candidates': MemoryCandidate.objects.count(),
+        'workflow': WorkflowWork.objects.count(),
+        'outbox': CeleryOutbox.objects.count(),
+    } == initial_counts
+    assert payload == raw_event.payload
+
+
+@pytest.mark.django_db
+def test_import_repairs_multiple_master_era_observations_in_one_session(
+    f_import_scope: ImportScope,
+) -> None:
+    importer, context, session, first_row = _import_context_and_observation(f_import_scope)
+    second_row = {
+        **first_row,
+        'id': 42,
+        'text': 'Second master-era observation body.',
+        'title': 'Second master-era observation',
+    }
+    first_raw, first_observation, _first_source = _create_master_era_import_graph(
+        importer,
+        context,
+        session,
+        first_row,
+        {'source': 'claude_mem_import'},
+    )
+    second_raw, second_observation, _second_source = _create_master_era_import_graph(
+        importer,
+        context,
+        session,
+        second_row,
+        {'source': 'claude_mem_import'},
+    )
+
+    first_result = importer.import_batch(
+        context,
+        'observations',
+        [first_row, second_row],
+        defer_embedding=True,
+    )
+
+    session.refresh_from_db()
+    first_raw.refresh_from_db()
+    second_raw.refresh_from_db()
+    first_observation.refresh_from_db()
+    second_observation.refresh_from_db()
+    assert first_result.created == 0
+    assert first_result.duplicates == 2
+    assert session.observation_sequence_cursor == 2
+    assert [first_observation.session_sequence, second_observation.session_sequence] == [1, 2]
+    assert [first_raw.sequence_number, second_raw.sequence_number] == [1, 2]
+    assert RawEventEnvelope.objects.count() == 2
+    assert Observation.objects.count() == 2
+    assert ObservationSource.objects.count() == 2
+    assert not MemoryCandidate.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+    second_result = importer.import_batch(
+        context,
+        'observations',
+        [first_row, second_row],
+        defer_embedding=True,
+    )
+
+    session.refresh_from_db()
+    first_raw.refresh_from_db()
+    second_raw.refresh_from_db()
+    first_observation.refresh_from_db()
+    second_observation.refresh_from_db()
+    assert second_result.created == 0
+    assert second_result.duplicates == 2
+    assert session.observation_sequence_cursor == 2
+    assert [first_observation.session_sequence, second_observation.session_sequence] == [1, 2]
+    assert [first_raw.sequence_number, second_raw.sequence_number] == [1, 2]
+    assert RawEventEnvelope.objects.count() == 2
+    assert Observation.objects.count() == 2
+    assert ObservationSource.objects.count() == 2
+    assert not MemoryCandidate.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('producer_metadata', [{}, {'source': 'hook'}])
+def test_import_does_not_repair_legacy_replay_without_import_producer(
+    f_import_scope: ImportScope,
+    producer_metadata: dict[str, object],
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    raw_event, observation, _source = _create_master_era_import_graph(
+        importer,
+        context,
+        session,
+        row,
+        producer_metadata,
+    )
+
+    with pytest.raises(ValueError, match='^import raw event identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    raw_event.refresh_from_db()
+    observation.refresh_from_db()
+    session.refresh_from_db()
+    assert raw_event.normalization_contract_version is None
+    assert raw_event.normalization_disposition is None
+    assert raw_event.normalization_reason is None
+    assert raw_event.sequence_number is None
+    assert raw_event.metadata == producer_metadata
+    assert observation.session_sequence is None
+    assert session.observation_sequence_cursor is None
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert not MemoryCandidate.objects.exists()
+    assert not WorkflowWork.objects.exists()
 
 
 @pytest.mark.django_db
