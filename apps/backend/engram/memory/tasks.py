@@ -899,11 +899,9 @@ def sweep_stale_sessions() -> dict[str, int]:
 def retry_failed_distillations() -> dict[str, int]:
     result = RetryFailedDistillations().execute()
 
-    for session_id in result.retriable_session_ids:
-        distill_session.delay(str(session_id))
-
     return {
-        'retried': len(result.retriable_session_ids),
+        'retried': len(result.retried),
+        'unlinked': len(result.unlinked_run_ids),
     }
 
 
