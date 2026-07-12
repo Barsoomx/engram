@@ -887,6 +887,7 @@ def test_hook_duplicate_rejects_malformed_typed_v1_evidence_before_mutation(malf
             body='must not be selected by ordering',
             content_hash='ambiguous-content-hash',
             source_metadata={'event_type': raw_event.event_type},
+            session_sequence=2,
         )
     elif malformation == 'typed_legacy_policy_fallback':
         raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] = True
@@ -1744,6 +1745,7 @@ def test_typed_hook_duplicate_validates_only_current_shared_observation_evidence
             body='must not be accepted as canonical',
             content_hash='wrong-sibling-observation-hash',
             source_metadata={'event_type': sibling.event_type},
+            session_sequence=2,
         )
     elif sibling_malformation == 'content_hash_mismatch':
         sibling.content_hash = 'mismatched-sibling-content-hash'
@@ -1786,7 +1788,7 @@ def test_new_typed_hook_reuse_accepts_valid_legacy_sibling_provenance(
         request_id='request-event-2',
     )
     legacy = IngestHookEvent().execute(legacy_data)
-    legacy.raw_event.normalization_contract_version = None
+    legacy.raw_event.normalization_contract_version = 0
     legacy.raw_event.normalization_disposition = None
     legacy.raw_event.normalization_reason = None
     legacy.raw_event.metadata = {

@@ -1054,6 +1054,7 @@ def test_0034_preflight_rejects_unsequenced_observations() -> None:
         assert MIGRATION_0034_NODE not in reloaded.loader.applied_migrations
         assert _ordered_sequences(old_apps, session.id) == [None]
     finally:
+        old_apps.get_model('core', 'Observation').objects.filter(session_id=session.id).delete()
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
 
@@ -1072,23 +1073,21 @@ def test_0034_rejects_null_inserts_after_contract() -> None:
 
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0034)
-        new_apps = executor.loader.project_state(MIGRATE_0034).apps
-        new_session_model = new_apps.get_model('core', 'AgentSession')
-        migrated_session = new_session_model.objects.get(id=session.id)
+        session_model = old_apps.get_model('core', 'AgentSession')
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
-                _create_historical_raw_event(new_apps, scope, migrated_session, 'null-version', version=None)
+                _create_historical_raw_event(old_apps, scope, session, 'null-version', version=None)
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_observation(
-                    new_apps, scope, migrated_session, 'null-seq', timezone.now(), session_sequence=None
+                    old_apps, scope, session, 'null-seq', timezone.now(), session_sequence=None
                 )
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
-                new_session_model.objects.create(
+                session_model.objects.create(
                     organization=scope['organization'],
                     project=scope['project'],
                     team=scope['team'],
@@ -1116,32 +1115,30 @@ def test_0034_allows_only_three_normalization_forms() -> None:
 
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0034)
-        new_apps = executor.loader.project_state(MIGRATE_0034).apps
-        new_raw_event_model = new_apps.get_model('core', 'RawEventEnvelope')
-        migrated_session = new_apps.get_model('core', 'AgentSession').objects.get(id=session.id)
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
 
-        legal_v0 = _create_historical_raw_event(new_apps, scope, migrated_session, 'legal-v0', version=0)
+        legal_v0 = _create_historical_raw_event(old_apps, scope, session, 'legal-v0', version=0)
         legal_obs = _create_historical_raw_event(
-            new_apps, scope, migrated_session, 'legal-obs', version=1, disposition='observation'
+            old_apps, scope, session, 'legal-obs', version=1, disposition='observation'
         )
         legal_noop = _create_historical_raw_event(
-            new_apps, scope, migrated_session, 'legal-noop', version=1, disposition='no_op', reason='evidence_only'
+            old_apps, scope, session, 'legal-noop', version=1, disposition='no_op', reason='evidence_only'
         )
 
-        assert new_raw_event_model.objects.filter(id__in=[legal_v0.id, legal_obs.id, legal_noop.id]).count() == 3
+        assert raw_event_model.objects.filter(id__in=[legal_v0.id, legal_obs.id, legal_noop.id]).count() == 3
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_raw_event(
-                    new_apps, scope, migrated_session, 'bad-v0-disp', version=0, disposition='observation'
+                    old_apps, scope, session, 'bad-v0-disp', version=0, disposition='observation'
                 )
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_raw_event(
-                    new_apps,
+                    old_apps,
                     scope,
-                    migrated_session,
+                    session,
                     'bad-obs-reason',
                     version=1,
                     disposition='observation',
@@ -1151,14 +1148,12 @@ def test_0034_allows_only_three_normalization_forms() -> None:
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_raw_event(
-                    new_apps, scope, migrated_session, 'bad-noop-reason', version=1, disposition='no_op', reason='other'
+                    old_apps, scope, session, 'bad-noop-reason', version=1, disposition='no_op', reason='other'
                 )
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
-                _create_historical_raw_event(
-                    new_apps, scope, migrated_session, 'bad-null-disp', version=1, disposition=None
-                )
+                _create_historical_raw_event(old_apps, scope, session, 'bad-null-disp', version=1, disposition=None)
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
@@ -1190,17 +1185,15 @@ def test_pre_0034_history_accepts_legacy_null_inserts() -> None:
 
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0034)
-        new_apps = executor.loader.project_state(MIGRATE_0034).apps
-        migrated_session = new_apps.get_model('core', 'AgentSession').objects.get(id=session.id)
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
-                _create_historical_raw_event(new_apps, scope, migrated_session, 'post-null')
+                _create_historical_raw_event(old_apps, scope, session, 'post-null')
 
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_observation(
-                    new_apps, scope, migrated_session, 'post-null-obs', timezone.now(), session_sequence=None
+                    old_apps, scope, session, 'post-null-obs', timezone.now(), session_sequence=None
                 )
     finally:
         executor = MigrationExecutor(connection)
@@ -1264,9 +1257,8 @@ def test_0034_reverse_restores_pre_contract_nullability() -> None:
 
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0033)
-        reverted_apps = executor.loader.project_state(MIGRATE_0033).apps
-        reverted_raw_event_model = reverted_apps.get_model('core', 'RawEventEnvelope')
-        post_reverse = _create_historical_raw_event(reverted_apps, scope, session, 'post-reverse-null')
+        reverted_raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        post_reverse = _create_historical_raw_event(old_apps, scope, session, 'post-reverse-null')
 
         assert reverted_raw_event_model.objects.filter(id=post_reverse.id).count() == 1
         assert reverted_raw_event_model.objects.get(id=legacy.id).normalization_contract_version == 0
