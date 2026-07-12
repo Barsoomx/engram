@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from rest_framework.request import Request
 
-from engram.access.services import EffectiveScope
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.core.models import Organization, Team
 from engram.core.repository import resolve_project_for_scope
 from engram.imports.models import ImportJob
@@ -22,6 +22,8 @@ def resolve_team_for_scope(scope: EffectiveScope, organization: Organization) ->
 
 def authorize_job_project(scope: EffectiveScope, job: ImportJob, request_id: str = '') -> None:
     resolve_project_for_scope(scope=scope, project_id=job.project_id, repository_url='', request_id=request_id)
+    if scope.team_ids and job.team_id not in scope.team_ids:
+        raise AccessDeniedError('team_scope_denied', 'Import job is outside effective team scope')
 
 
 def request_too_large(request: Request) -> bool:

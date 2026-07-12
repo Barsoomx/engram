@@ -34,6 +34,7 @@ class CreateImportView(APIView):
                 organization=organization,
                 project=project,
                 team=team,
+                allowed_team_ids=scope.team_ids,
                 source_store_id=data['source_store_id'],
                 manifest=data['manifest'],
                 api_key_id=scope.api_key_id,

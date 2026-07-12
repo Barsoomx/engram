@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError
 from django.test import override_settings
 from django.utils import timezone
 
-from engram.core.models import AuditEvent, Organization, Project
+from engram.core.models import AuditEvent, Organization, Project, ProjectTeam, Team
 from engram.imports.batch_services import (
     ApplyImportBatch,
     ApplyImportBatchInput,
@@ -68,6 +68,7 @@ def _create_job(
             organization=scope.organization,
             project=scope.project,
             team=None,
+            allowed_team_ids=(),
             source_store_id=store,
             manifest=_manifest(tables if tables is not None else {'sdk_sessions': 1}),
             api_key_id=None,
@@ -232,6 +233,52 @@ def test_create_conflict_carries_active_import_id(f_batch_scope: BatchScope) -> 
 
     assert exc_info.value.error_code == 'import_job_conflict'
     assert exc_info.value.active_import_id == str(active.id)
+
+
+@pytest.mark.django_db
+def test_create_conflict_hides_job_outside_multi_team_scope(f_batch_scope: BatchScope) -> None:
+    allowed_teams = [
+        Team.objects.create(
+            organization=f_batch_scope.organization,
+            name=f'Allowed team {index}',
+            slug=f'allowed-team-{index}',
+        )
+        for index in range(2)
+    ]
+    foreign_team = Team.objects.create(
+        organization=f_batch_scope.organization,
+        name='Foreign team',
+        slug='foreign-team',
+    )
+    for team in [*allowed_teams, foreign_team]:
+        ProjectTeam.objects.create(
+            organization=f_batch_scope.organization,
+            project=f_batch_scope.project,
+            team=team,
+        )
+    active = ImportJob.objects.create(
+        organization=f_batch_scope.organization,
+        project=f_batch_scope.project,
+        team=foreign_team,
+        source_store_id='multi-team-conflict',
+    )
+
+    with pytest.raises(ImportJobConflictError) as exc_info:
+        CreateImportJob().execute(
+            CreateImportJobInput(
+                organization=f_batch_scope.organization,
+                project=f_batch_scope.project,
+                team=None,
+                allowed_team_ids=tuple(team.id for team in allowed_teams),
+                source_store_id=active.source_store_id,
+                manifest=_manifest({'sdk_sessions': 1}),
+                api_key_id=None,
+                identity_id=None,
+            ),
+        )
+
+    assert exc_info.value.error_code == 'import_job_conflict'
+    assert not hasattr(exc_info.value, 'active_import_id')
 
 
 @pytest.mark.django_db
