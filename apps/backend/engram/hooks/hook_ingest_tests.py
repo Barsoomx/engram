@@ -2686,6 +2686,9 @@ def test_history_bearing_hook_rejects_identity_runtime_conflict_without_mutation
         runtime=stored_runtime,
         platform_source=stored_platform_source,
     )
+    Agent.objects.filter(id=existing_agent.id).update(version='old-version')
+    existing_agent.refresh_from_db()
+    initial_agent_state = (existing_agent.version, existing_agent.updated_at)
     payload = valid_hook_payload(
         project,
         team,
@@ -2695,12 +2698,15 @@ def test_history_bearing_hook_rejects_identity_runtime_conflict_without_mutation
         content_hash='history-runtime-incoming-hash',
         agent_runtime=requested_runtime,
         agent_external_id=existing_agent.external_id,
+        agent_version='new-version',
     )
 
     response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
 
     assert response.status_code == 403
     assert response.json()['code'] == 'hook_identity_collision'
+    existing_agent.refresh_from_db()
+    assert (existing_agent.version, existing_agent.updated_at) == initial_agent_state
     session.refresh_from_db()
     assert session.runtime == stored_runtime
     assert session.platform_source == stored_platform_source

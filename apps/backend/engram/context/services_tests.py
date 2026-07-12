@@ -1651,6 +1651,7 @@ def test_history_bearing_context_rejects_same_team_different_agent_without_side_
         BuildContextBundle().execute(data)
 
     assert exc_info.value.code == 'team_scope_denied'
+    assert str(exc_info.value) == 'Session is outside the requested team scope'
     assert Agent.objects.count() == 1
     session.refresh_from_db()
     assert session.agent_id == existing_agent.id
@@ -1785,7 +1786,9 @@ def test_history_bearing_context_rejects_identity_runtime_conflict_without_side_
         organization=organization,
         runtime='codex',
         external_id='context-history-runtime',
+        version='old-version',
     )
+    initial_agent_state = (existing_agent.version, existing_agent.updated_at)
     session = AgentSession.objects.create(
         organization=organization,
         project=project,
@@ -1832,6 +1835,7 @@ def test_history_bearing_context_rejects_identity_runtime_conflict_without_side_
         ),
         agent_runtime=requested_runtime,
         agent_external_id=existing_agent.external_id,
+        agent_version='new-version',
     )
     bundle_count = ContextBundle.objects.count()
     provider_call_count = ProviderCallRecord.objects.count()
@@ -1841,6 +1845,9 @@ def test_history_bearing_context_rejects_identity_runtime_conflict_without_side_
         BuildContextBundle().execute(data)
 
     assert exc_info.value.code == 'team_scope_denied'
+    assert str(exc_info.value) == 'Session is outside the requested team scope'
+    existing_agent.refresh_from_db()
+    assert (existing_agent.version, existing_agent.updated_at) == initial_agent_state
     assert Agent.objects.count() == 1
     session.refresh_from_db()
     assert session.runtime == stored_runtime
