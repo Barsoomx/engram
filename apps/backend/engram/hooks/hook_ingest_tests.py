@@ -1603,14 +1603,40 @@ def test_typed_hook_duplicate_ignores_unlinked_non_hook_observation_source() -> 
         source_id='noncanonical-source',
         metadata={'event_type': 'post_tool_use'},
     )
-    WorkflowWork.objects.all().delete()
-    CeleryOutbox.objects.all().delete()
     initial_state = hook_duplicate_state()
 
     replay = IngestHookEvent().execute(data)
 
     assert replay.duplicate is True
     assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_duplicate_repairs_missing_work_once() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    original_fingerprint = WorkflowWork.objects.get().input_fingerprint
+    WorkflowWork.objects.all().delete()
+    CeleryOutbox.objects.all().delete()
+
+    replay = IngestHookEvent().execute(data)
+
+    assert replay.duplicate is True
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    work = WorkflowWork.objects.get()
+    assert work.input_fingerprint == original_fingerprint
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
+
+    second_replay = IngestHookEvent().execute(data)
+
+    assert second_replay.duplicate is True
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
 
 
 @pytest.mark.django_db

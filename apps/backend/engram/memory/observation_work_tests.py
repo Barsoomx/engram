@@ -108,6 +108,7 @@ def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
             agent=session.agent,
             session=session,
             event_type='post_tool_use',
+            payload={'tool_name': 'bash'},
             source_adapter='codex',
             client_event_id='history-event',
             idempotency_key='history-idempotency',
