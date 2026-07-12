@@ -1241,21 +1241,19 @@ def _context_bundle_input(
     )
 
 
-def _create_team_scoped_context_key(
+def _create_project_scoped_context_key(
     organization: Organization,
     project: Project,
-    team: Team,
     raw_key: str,
 ) -> str:
     owner = Identity.objects.get(organization=organization, external_id='svc-context-provenance')
     api_key = ApiKey.objects.create(
         organization=organization,
         owner_identity=owner,
-        name=f'Context key {team.slug}',
+        name='Project context key',
         key_prefix=api_key_prefix(raw_key),
         key_hash=hash_api_key(raw_key),
         key_fingerprint=api_key_fingerprint(raw_key),
-        team=team,
         project=project,
     )
     ApiKeyCapability.objects.create(
@@ -1342,15 +1340,41 @@ def test_get_or_create_session_rejects_different_team_without_mutation() -> None
 
 
 @pytest.mark.django_db
+def test_get_or_create_session_preserves_legacy_null_team_without_requested_team() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-context-null-team')
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        external_session_id='session-null-team',
+        runtime='codex',
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-session-null-team',
+            session_id=session.external_session_id,
+        ),
+        team_id=None,
+    )
+
+    result = BuildContextBundle()._get_or_create_session(organization, project, None, agent, data)
+
+    assert result.team_id is None
+    assert AgentSession.objects.get(id=session.id).team_id is None
+
+
+@pytest.mark.django_db
 def test_build_context_bundle_denial_rolls_back_new_agent_creation() -> None:
     organization, team, project, _api_key = _provenance_project_scope()
-    different_team = Team.objects.create(organization=organization, name='Different', slug='different')
-    ProjectTeam.objects.create(organization=organization, team=different_team, project=project)
-    raw_key = _create_team_scoped_context_key(
+    raw_key = _create_project_scoped_context_key(
         organization,
         project,
-        different_team,
-        'egk_test_services_other_team_new_agent_0123456789',
+        'egk_test_services_null_team_new_agent_0123456789',
     )
     existing_agent = Agent.objects.create(
         organization=organization,
@@ -1374,13 +1398,13 @@ def test_build_context_bundle_denial_rolls_back_new_agent_creation() -> None:
     )
     data = _context_bundle_input(
         project,
-        different_team,
+        team,
         file_paths=(),
         request_id='request-context-denied-new-agent',
         session_id=session.external_session_id,
         raw_key=raw_key,
     )
-    data = replace(data, agent_external_id='codex-new')
+    data = replace(data, team_id=None, agent_external_id='codex-new')
     agent_count = Agent.objects.count()
     session_before = AgentSession.objects.get(id=session.id)
     bundle_count = ContextBundle.objects.count()
@@ -1414,13 +1438,10 @@ def test_build_context_bundle_denial_rolls_back_new_agent_creation() -> None:
 @pytest.mark.django_db
 def test_build_context_bundle_denial_rolls_back_agent_version_update() -> None:
     organization, team, project, _api_key = _provenance_project_scope()
-    different_team = Team.objects.create(organization=organization, name='Different', slug='different')
-    ProjectTeam.objects.create(organization=organization, team=different_team, project=project)
-    raw_key = _create_team_scoped_context_key(
+    raw_key = _create_project_scoped_context_key(
         organization,
         project,
-        different_team,
-        'egk_test_services_other_team_agent_update_0123456789',
+        'egk_test_services_null_team_agent_update_0123456789',
     )
     agent = Agent.objects.create(
         organization=organization,
@@ -1444,13 +1465,13 @@ def test_build_context_bundle_denial_rolls_back_agent_version_update() -> None:
     )
     data = _context_bundle_input(
         project,
-        different_team,
+        team,
         file_paths=(),
         request_id='request-context-denied-agent-update',
         session_id=session.external_session_id,
         raw_key=raw_key,
     )
-    data = replace(data, agent_external_id='codex-versioned', agent_version='0.2.0')
+    data = replace(data, team_id=None, agent_external_id='codex-versioned', agent_version='0.2.0')
     agent_before = Agent.objects.get(id=agent.id)
     session_before = AgentSession.objects.get(id=session.id)
     bundle_count = ContextBundle.objects.count()

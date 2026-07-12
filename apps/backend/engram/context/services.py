@@ -1181,7 +1181,7 @@ class BuildContextBundle:
                 project_id=project.id,
                 session_id=session.id,
             )
-            if team is not None and session.team_id not in (None, team.id):
+            if session.team_id is not None and (team is None or session.team_id != team.id):
                 raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
 
             update_fields = []
