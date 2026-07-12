@@ -61,6 +61,7 @@ ACCESS_STATUS = {
     'missing_capability': status.HTTP_403_FORBIDDEN,
     'project_scope_denied': status.HTTP_403_FORBIDDEN,
     'team_scope_denied': status.HTTP_403_FORBIDDEN,
+    'hook_identity_collision': status.HTTP_403_FORBIDDEN,
     'invalid_session': status.HTTP_401_UNAUTHORIZED,
     'organization_required': status.HTTP_400_BAD_REQUEST,
     'organization_not_found': status.HTTP_404_NOT_FOUND,

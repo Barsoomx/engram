@@ -100,7 +100,7 @@ class IngestHookEvent:
 
         try:
             with transaction.atomic():
-                duplicate = self._find_duplicate(organization, project, data)
+                duplicate = self._find_duplicate(organization, project, team, data)
                 if duplicate is not None:
                     return self._handle_duplicate(
                         duplicate,
@@ -112,7 +112,7 @@ class IngestHookEvent:
                 with transaction.atomic():
                     agent = self._get_or_create_agent(organization, data)
                     session = self._get_or_create_session(organization, project, team, agent, data)
-                    duplicate = self._find_duplicate(organization, project, data)
+                    duplicate = self._find_duplicate(organization, project, team, data)
                     if duplicate is not None:
                         transaction.set_rollback(True)
                 if duplicate is not None:
@@ -233,7 +233,7 @@ class IngestHookEvent:
                 )
         except IntegrityError:
             with transaction.atomic():
-                duplicate = self._find_duplicate(organization, project, data)
+                duplicate = self._find_duplicate(organization, project, team, data)
                 if duplicate is not None:
                     return self._handle_duplicate(
                         duplicate,
@@ -241,6 +241,7 @@ class IngestHookEvent:
                         project=project,
                         requested_team=team,
                     )
+                self._raise_if_foreign_identity_collision(organization, project, team, data)
 
             raise
 
@@ -649,11 +650,14 @@ class IngestHookEvent:
         self,
         organization: Organization,
         project: Project,
+        team: Team | None,
         data: HookEventInput,
     ) -> RawEventEnvelope | None:
+        team_id = team.id if team is not None else None
         duplicate = RawEventEnvelope.objects.filter(
             organization=organization,
             project=project,
+            team_id=team_id,
             idempotency_key=data.idempotency_key,
         ).first()
         if duplicate is not None:
@@ -662,6 +666,7 @@ class IngestHookEvent:
         session = AgentSession.objects.filter(
             organization=organization,
             project=project,
+            team_id=team_id,
             external_session_id=data.session_id,
         ).first()
         if session is None:
@@ -670,9 +675,41 @@ class IngestHookEvent:
         return RawEventEnvelope.objects.filter(
             organization=organization,
             project=project,
+            team_id=team_id,
             session=session,
             client_event_id=data.event_id,
         ).first()
+
+    def _raise_if_foreign_identity_collision(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        data: HookEventInput,
+    ) -> None:
+        if team is None:
+            raw_outside_team = Q(team_id__isnull=False)
+            session_outside_team = Q(session__team_id__isnull=False)
+        else:
+            raw_outside_team = ~Q(team_id=team.id)
+            session_outside_team = ~Q(session__team_id=team.id)
+        foreign_identity = Q(idempotency_key=data.idempotency_key) & raw_outside_team
+        foreign_identity |= Q(
+            session__external_session_id=data.session_id,
+            client_event_id=data.event_id,
+        ) & (raw_outside_team | session_outside_team)
+        if (
+            RawEventEnvelope.objects.filter(
+                organization=organization,
+                project=project,
+            )
+            .filter(foreign_identity)
+            .exists()
+        ):
+            raise AccessDeniedError(
+                'hook_identity_collision',
+                'Hook identity collision is not accessible',
+            ) from None
 
     def _validate_duplicate_producer(self, raw_event: RawEventEnvelope) -> None:
         if (
@@ -746,9 +783,14 @@ class IngestHookEvent:
             )
         selected_team = team
         if not created:
-            if session.team_id is not None and team is not None and session.team_id != team.id:
-                raise AccessDeniedError('team_scope_denied', 'Hook session is outside effective team scope')
             if session.team_id is not None:
+                if team is None:
+                    raise AccessDeniedError('team_scope_denied', 'Hook session is outside effective team scope')
+                if session.team_id != team.id:
+                    raise AccessDeniedError(
+                        'hook_identity_collision',
+                        'Hook identity collision is not accessible',
+                    )
                 selected_team = session.team
         update_fields = []
         for field, value in (
