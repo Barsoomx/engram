@@ -114,14 +114,17 @@ def test_allocate_sequence_uses_max_existing_positive_sequence_for_legacy_null_c
             session_sequence=sequence,
         )
 
-    with transaction.atomic():
-        locked = lock_session_for_observation(
-            organization_id=organization.id,
-            project_id=project.id,
-            session_id=session.id,
-        )
-        assert allocate_observation_sequence(locked) == 10
-        assert locked.observation_sequence_cursor == 10
+    with CaptureQueriesContext(connection) as queries:
+        with transaction.atomic():
+            locked = lock_session_for_observation(
+                organization_id=organization.id,
+                project_id=project.id,
+                session_id=session.id,
+            )
+            assert allocate_observation_sequence(locked) == 10
+            assert locked.observation_sequence_cursor == 10
+
+    assert any('MAX(' in query['sql'].upper() for query in queries)
 
     session.refresh_from_db()
     assert session.observation_sequence_cursor == 10
@@ -146,7 +149,7 @@ def test_allocate_sequence_increments_zero_or_normal_cursor(cursor: int, expecte
 
 
 @pytest.mark.django_db
-def test_allocate_sequence_catches_up_when_cursor_is_behind_existing_maximum() -> None:
+def test_allocate_sequence_does_not_aggregate_when_cursor_is_non_null() -> None:
     organization, project, session = create_scope('cursor-behind')
     AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=2)
     Observation.objects.create(
@@ -161,13 +164,19 @@ def test_allocate_sequence_catches_up_when_cursor_is_behind_existing_maximum() -
         session_sequence=11,
     )
 
-    with transaction.atomic():
-        locked = lock_session_for_observation(
-            organization_id=organization.id,
-            project_id=project.id,
-            session_id=session.id,
-        )
-        assert allocate_observation_sequence(locked) == 12
+    with CaptureQueriesContext(connection) as queries:
+        with transaction.atomic():
+            locked = lock_session_for_observation(
+                organization_id=organization.id,
+                project_id=project.id,
+                session_id=session.id,
+            )
+            assert allocate_observation_sequence(locked) == 3
+
+    assert not any('MAX(' in query['sql'].upper() for query in queries)
+
+    session.refresh_from_db()
+    assert session.observation_sequence_cursor == 3
 
 
 @pytest.mark.django_db

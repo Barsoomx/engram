@@ -23,14 +23,17 @@ def lock_session_for_observation(*, organization_id: UUID, project_id: UUID, ses
 
 def allocate_observation_sequence(session: AgentSession) -> int:
     _require_active_transaction()
-    existing_max = (
-        Observation.objects.filter(session_id=session.id, session_sequence__gt=0)
-        .aggregate(max_sequence=Max('session_sequence'))
-        .get('max_sequence')
-        or 0
-    )
-    current_cursor = session.observation_sequence_cursor or 0
-    sequence = max(current_cursor, existing_max) + 1
+    current_cursor = session.observation_sequence_cursor
+    if current_cursor is None:
+        existing_max = (
+            Observation.objects.filter(session_id=session.id, session_sequence__gt=0)
+            .aggregate(max_sequence=Max('session_sequence'))
+            .get('max_sequence')
+            or 0
+        )
+        sequence = existing_max + 1
+    else:
+        sequence = current_cursor + 1
     session.observation_sequence_cursor = sequence
     session.save(update_fields=['observation_sequence_cursor'])
     return sequence
