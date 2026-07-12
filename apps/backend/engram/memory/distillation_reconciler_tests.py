@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier
 
 import pytest
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 from structlog.testing import capture_logs
 
 from engram.core.models import (
     Agent,
     AgentSession,
-    Observation,
     Organization,
     Project,
     Runtime,
@@ -18,8 +21,20 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowWork,
+    WorkflowWorkType,
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
+from engram.memory.workflow_work import (
+    CreateWorkflowWorkInput,
+    WorkflowSubjectType,
+    create_work,
+    resolve_work_no_input,
+    resolve_work_succeeded,
+)
+
+_DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
+_LEGACY_DISTILL_TASK_NAME = 'engram.memory.distill_session'
 
 
 @pytest.fixture
@@ -59,27 +74,35 @@ def create_session(
         external_session_id=f'session-{suffix}',
         runtime=Runtime.CODEX,
         status=status,
+        observation_sequence_cursor=0,
     )
 
 
-def create_observation(session: AgentSession, *, suffix: str = '1') -> Observation:
-    return Observation.objects.create(
-        organization=session.organization,
-        project=session.project,
-        team=session.team,
-        agent=session.agent,
-        session=session,
-        observation_type='tool_use',
-        title=f'observation {suffix}',
-        body=f'body {suffix}',
-        content_hash=f'hash-obs-{session.external_session_id}-{suffix}',
-        observed_at=timezone.now(),
-        session_sequence=1,
-    )
+def create_required_session_work(session: AgentSession, *, upper: int = 5) -> WorkflowWork:
+    with transaction.atomic():
+        work, created = create_work(
+            CreateWorkflowWorkInput(
+                organization_id=session.organization_id,
+                project_id=session.project_id,
+                work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                subject_type=WorkflowSubjectType.AGENT_SESSION,
+                subject_id=session.id,
+                input_snapshot={
+                    'schema': 'session_distillation_input/v1',
+                    'session_id': str(session.id),
+                    'lower_sequence_exclusive': 0,
+                    'upper_sequence_inclusive': upper,
+                },
+            ),
+        )
+
+    assert created is True
+
+    return work
 
 
-def create_workflow_run(
-    session: AgentSession,
+def create_linked_run(
+    work: WorkflowWork,
     *,
     status: str = WorkflowRunStatus.FAILED,
     created_at: object = None,
@@ -87,12 +110,13 @@ def create_workflow_run(
     failure_reason: str = '',
 ) -> WorkflowRun:
     run = WorkflowRun.objects.create(
-        organization=session.organization,
-        project=session.project,
-        team=session.team,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
         run_type=WorkflowRunType.SESSION_DISTILLATION,
         status=status,
-        input_snapshot={'session_id': str(session.id)},
+        input_snapshot=work.input_snapshot,
         failure_reason=failure_reason,
     )
 
@@ -109,142 +133,159 @@ def create_workflow_run(
 
 
 @pytest.mark.django_db
-def test_ended_session_with_stale_failed_run_is_retriable(
+def test_required_work_with_stale_failed_run_creates_one_linked_queued_run_and_versioned_signal(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=40))
+    work = create_required_session_work(session)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=40))
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == (session.id,)
+    queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
+    assert queued.count() == 1
+    new_run = queued.get()
+    assert new_run.run_type == WorkflowRunType.SESSION_DISTILLATION
+    assert new_run.organization_id == work.organization_id
+    assert new_run.project_id == work.project_id
+    assert new_run.team_id == work.team_id
+    assert new_run.input_snapshot == work.input_snapshot
+
+    outbox = CeleryOutbox.objects.get()
+    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
+    assert outbox.args == [str(work.id), str(new_run.id)]
+    assert outbox.kwargs == {}
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{new_run.id}'
+    assert CeleryOutbox.objects.filter(task_name=_LEGACY_DISTILL_TASK_NAME).count() == 0
+
+    assert len(result.retried) == 1
+    retried = result.retried[0]
+    assert retried.work_id == work.id
+    assert retried.run_id == new_run.id
+    assert result.unlinked_run_ids == ()
 
 
 @pytest.mark.django_db
-def test_session_with_succeeded_run_is_not_retriable(
+@pytest.mark.parametrize(
+    'scenario',
+    (
+        'latest_succeeded_truncated',
+        'latest_queued',
+        'latest_running',
+        'work_complete',
+        'work_no_op',
+    ),
+)
+def test_execute_suppresses_ineligible_required_or_terminal_work(
+    scenario: str,
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        status=WorkflowRunStatus.SUCCEEDED,
-        finished_at=timezone.now() - timedelta(minutes=40),
-    )
+    work = create_required_session_work(session)
+    now = timezone.now()
+    if scenario == 'latest_succeeded_truncated':
+        create_linked_run(
+            work,
+            status=WorkflowRunStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=2),
+            failure_reason='provider returned 400',
+        )
+        succeeded = create_linked_run(
+            work,
+            status=WorkflowRunStatus.SUCCEEDED,
+            created_at=now - timedelta(hours=1),
+            finished_at=now - timedelta(minutes=40),
+        )
+        WorkflowRun.objects.filter(id=succeeded.id).update(escalation=True)
+    elif scenario == 'latest_queued':
+        create_linked_run(
+            work,
+            status=WorkflowRunStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=2),
+        )
+        create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=now - timedelta(hours=1))
+    elif scenario == 'latest_running':
+        create_linked_run(
+            work,
+            status=WorkflowRunStatus.FAILED,
+            created_at=now - timedelta(hours=2),
+            finished_at=now - timedelta(hours=2),
+        )
+        create_linked_run(work, status=WorkflowRunStatus.RUNNING, created_at=now - timedelta(hours=1))
+    elif scenario == 'work_complete':
+        create_linked_run(work, finished_at=now - timedelta(minutes=40))
+        resolve_work_succeeded(work.id, organization_id=work.organization_id, project_id=work.project_id)
+    else:
+        create_linked_run(work, finished_at=now - timedelta(minutes=40))
+        resolve_work_no_input(work.id, organization_id=work.organization_id, project_id=work.project_id)
+
+    run_ids_before = set(WorkflowRun.objects.values_list('id', flat=True))
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == ()
+    assert set(WorkflowRun.objects.values_list('id', flat=True)) == run_ids_before
+    assert CeleryOutbox.objects.count() == 0
+    assert result.retried == ()
 
 
 @pytest.mark.django_db
-def test_session_at_max_attempts_cap_is_not_retriable(
+def test_two_non_transient_failures_reach_default_cap_and_are_not_retried(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=2),
-        finished_at=timezone.now() - timedelta(hours=2),
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
         failure_reason='provider returned 400',
     )
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=1),
-        finished_at=timezone.now() - timedelta(minutes=40),
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        finished_at=now - timedelta(minutes=40),
         failure_reason='provider returned 400',
     )
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == ()
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert result.retried == ()
 
 
 @pytest.mark.django_db
-def test_active_session_is_not_retriable(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent, status=SessionStatus.ACTIVE)
-    create_observation(session)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=40))
-
-    result = RetryFailedDistillations().execute()
-
-    assert result.retriable_session_ids == ()
-
-
-@pytest.mark.django_db
-def test_ended_session_with_zero_observations_is_not_retriable(
+def test_failed_run_inside_cooldown_is_not_retried(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=40))
+    work = create_required_session_work(session)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=5))
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == ()
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert result.retried == ()
 
 
 @pytest.mark.django_db
-def test_session_whose_latest_run_is_not_failed_is_not_retriable(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=1),
-        finished_at=timezone.now() - timedelta(minutes=40),
-    )
-    create_workflow_run(
-        session,
-        status=WorkflowRunStatus.QUEUED,
-        created_at=timezone.now(),
-    )
-
-    result = RetryFailedDistillations().execute()
-
-    assert result.retriable_session_ids == ()
-
-
-@pytest.mark.django_db
-def test_session_with_failed_run_inside_cooldown_is_not_retriable(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=5))
-
-    result = RetryFailedDistillations().execute()
-
-    assert result.retriable_session_ids == ()
-
-
-@pytest.mark.django_db
-def test_env_override_shrinks_cooldown_and_makes_session_retriable(
+def test_cooldown_env_override_makes_recent_failed_run_retriable(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -253,16 +294,18 @@ def test_env_override_shrinks_cooldown_and_makes_session_retriable(
 ) -> None:
     monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_COOLDOWN_MINUTES', '2')
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=5))
+    work = create_required_session_work(session)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=5))
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == (session.id,)
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
 
 
 @pytest.mark.django_db
-def test_env_override_lowers_max_attempts_and_makes_session_not_retriable(
+def test_max_attempts_env_override_suppresses_single_non_transient_failure(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -271,61 +314,73 @@ def test_env_override_lowers_max_attempts_and_makes_session_not_retriable(
 ) -> None:
     monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_MAX_ATTEMPTS', '1')
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(session, finished_at=timezone.now() - timedelta(minutes=40))
-
-    result = RetryFailedDistillations().execute()
-
-    assert result.retriable_session_ids == ()
-
-
-@pytest.mark.django_db
-def test_two_transient_failures_past_cooldown_are_retriable(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=2),
-        finished_at=timezone.now() - timedelta(hours=2),
-        failure_reason='provider returned 402',
-    )
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=1),
+    work = create_required_session_work(session)
+    create_linked_run(
+        work,
         finished_at=timezone.now() - timedelta(minutes=40),
-        failure_reason='provider returned 402',
+        failure_reason='provider returned 400',
     )
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == (session.id,)
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert result.retried == ()
 
 
 @pytest.mark.django_db
-def test_transient_failures_beyond_non_transient_cap_are_still_retriable(
+def test_two_transient_failures_past_cooldown_are_retried(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        finished_at=now - timedelta(minutes=40),
+        failure_reason='provider returned 402',
+    )
+
+    result = RetryFailedDistillations().execute()
+
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+
+
+@pytest.mark.django_db
+def test_transient_failures_beyond_non_transient_cap_are_still_retried(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
     for index in range(5):
-        create_workflow_run(
-            session,
-            created_at=timezone.now() - timedelta(hours=5 - index),
-            finished_at=timezone.now() - timedelta(minutes=40 + index),
+        create_linked_run(
+            work,
+            created_at=now - timedelta(hours=5 - index),
+            finished_at=now - timedelta(minutes=40 + index),
             failure_reason='provider timed out',
         )
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == (session.id,)
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
 
 
 @pytest.mark.django_db
@@ -338,67 +393,91 @@ def test_transient_failures_exceeding_transient_cap_are_abandoned_and_logged(
 ) -> None:
     monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_TRANSIENT_MAX_ATTEMPTS', '2')
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=2),
-        finished_at=timezone.now() - timedelta(hours=2),
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
         failure_reason='provider returned 429',
     )
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=1),
-        finished_at=timezone.now() - timedelta(minutes=40),
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        finished_at=now - timedelta(minutes=40),
         failure_reason='provider returned 503',
     )
 
     with capture_logs() as logs:
         result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == ()
+    assert result.retried == ()
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
     abandoned = [entry for entry in logs if entry['event'] == 'distillation_reconciler_abandoned']
-
     assert len(abandoned) == 1
-    assert abandoned[0]['session_id'] == str(session.id)
+    assert abandoned[0]['work_id'] == str(work.id)
     assert abandoned[0]['failed_count'] == 2
     assert abandoned[0]['transient_count'] == 2
 
 
 @pytest.mark.django_db
-def test_failures_before_a_succeeded_run_are_excluded_by_the_succeeded_gate(
+def test_failed_run_without_linked_work_is_reported_unlinked_and_never_backfilled(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=4),
-        finished_at=timezone.now() - timedelta(hours=4),
-        failure_reason='provider returned 400',
+    legacy_run = WorkflowRun.objects.create(
+        organization_id=session.organization_id,
+        project_id=session.project_id,
+        team_id=session.team_id,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.FAILED,
+        input_snapshot={'session_id': str(session.id)},
     )
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=3),
-        finished_at=timezone.now() - timedelta(hours=3),
-        failure_reason='provider returned 400',
-    )
-    create_workflow_run(
-        session,
-        status=WorkflowRunStatus.SUCCEEDED,
-        created_at=timezone.now() - timedelta(hours=2),
-        finished_at=timezone.now() - timedelta(hours=2),
-    )
-    create_workflow_run(
-        session,
-        created_at=timezone.now() - timedelta(hours=1),
-        finished_at=timezone.now() - timedelta(minutes=40),
-        failure_reason='provider returned 400',
-    )
+    WorkflowRun.objects.filter(id=legacy_run.id).update(finished_at=timezone.now() - timedelta(minutes=40))
 
     result = RetryFailedDistillations().execute()
 
-    assert result.retriable_session_ids == ()
+    assert result.retried == ()
+    assert legacy_run.id in result.unlinked_run_ids
+    assert WorkflowWork.objects.count() == 0
+    assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_execute_calls_create_one_queued_run_and_one_signal(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=40))
+    barrier = Barrier(2)
+
+    def reconcile() -> object:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+
+            return RetryFailedDistillations().execute()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(reconcile) for _index in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    assert sum(len(result.retried) for result in results) == 1
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_LEGACY_DISTILL_TASK_NAME).count() == 0

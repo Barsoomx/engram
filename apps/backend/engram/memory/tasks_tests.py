@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 from django.db import transaction
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
 from engram import celeryconfig
 from engram.core.models import (
@@ -367,54 +368,70 @@ def create_required_work(
     return work
 
 
-def create_failed_workflow_run(session: AgentSession) -> WorkflowRun:
+def create_linked_run(
+    work: WorkflowWork,
+    *,
+    status: str = WorkflowRunStatus.FAILED,
+    created_at: object = None,
+    finished_at: object = None,
+    failure_reason: str = '',
+) -> WorkflowRun:
     run = WorkflowRun.objects.create(
-        organization=session.organization,
-        project=session.project,
-        team=session.team,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
         run_type=WorkflowRunType.SESSION_DISTILLATION,
-        status=WorkflowRunStatus.FAILED,
-        input_snapshot={'session_id': str(session.id)},
+        status=status,
+        input_snapshot=work.input_snapshot,
+        failure_reason=failure_reason,
     )
-    WorkflowRun.objects.filter(id=run.id).update(finished_at=timezone.now() - timedelta(minutes=40))
-    run.refresh_from_db()
+
+    update_fields: dict[str, object] = {}
+    if created_at is not None:
+        update_fields['created_at'] = created_at
+    if finished_at is not None:
+        update_fields['finished_at'] = finished_at
+    if update_fields:
+        WorkflowRun.objects.filter(id=run.id).update(**update_fields)
+        run.refresh_from_db()
 
     return run
 
 
 @pytest.mark.django_db
-def test_retry_failed_distillations_enqueues_the_retriable_session(
+def test_retry_failed_distillations_signals_versioned_work_retry(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_failed_workflow_run(session)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=40))
 
-    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
-        result = retry_failed_distillations()
+    result = retry_failed_distillations()
 
-    m_delay.assert_called_once_with(str(session.id))
-    assert result == {'retried': 1}
+    assert result == {'retried': 1, 'unlinked': 0}
+
+    queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
+    assert queued.count() == 1
+    new_run = queued.get()
+
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
+    outbox = CeleryOutbox.objects.get(task_name='engram.memory.distill_session_work_v1')
+    assert outbox.args == [str(work.id), str(new_run.id)]
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{new_run.id}'
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session').count() == 0
 
 
 @pytest.mark.django_db
-def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent, status=SessionStatus.ACTIVE)
-    create_observation(session)
+def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible() -> None:
+    result = retry_failed_distillations()
 
-    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
-        result = retry_failed_distillations()
-
-    m_delay.assert_not_called()
-    assert result == {'retried': 0}
+    assert result == {'retried': 0, 'unlinked': 0}
+    assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_attempt() -> None:

@@ -32,6 +32,7 @@ from engram.hooks.hook_ingest_tests import (
     hook_event_input,
 )
 from engram.imports import services as import_services
+from engram.memory import distillation_reconciler as memory_distillation_reconciler
 from engram.memory import session_sweep as memory_session_sweep
 from engram.memory import tasks as memory_tasks
 
@@ -364,6 +365,20 @@ def test_c1_2_producer_census_has_no_legacy_observation_task_or_required_on_comm
         node for node in ast.walk(sweep_task) if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
     ]
     assert sweep_task_distill_delay_calls == []
+
+    retry_task = _function_def(tasks_tree, 'retry_failed_distillations')
+    retry_task_distill_delay_calls = [
+        node for node in ast.walk(retry_task) if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
+    ]
+    assert retry_task_distill_delay_calls == []
+
+    reconciler_tree = ast.parse(Path(inspect.getfile(memory_distillation_reconciler)).read_text(encoding='utf-8'))
+    reconciler_distill_delay_calls = [
+        node
+        for node in ast.walk(reconciler_tree)
+        if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
+    ]
+    assert reconciler_distill_delay_calls == []
 
     for module in (import_services, context_services):
         tree = ast.parse(Path(inspect.getfile(module)).read_text(encoding='utf-8'))
