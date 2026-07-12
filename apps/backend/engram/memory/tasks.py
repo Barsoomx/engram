@@ -430,23 +430,6 @@ def _finalize_session_distill_work(
     )
 
 
-def _run_unfinished_versioned_work(
-    *,
-    work_id: object,
-    workflow_run_id: object,
-    expected_work_type: str,
-) -> str:
-    work, _workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=expected_work_type,
-    )
-    if automatic_terminal:
-        return str(work.id)
-
-    raise MemoryWorkerError(f'{expected_work_type} work adapter is not implemented')
-
-
 def _claim_started_session_run(
     work: WorkflowWork,
     workflow_run: WorkflowRun,
@@ -757,11 +740,19 @@ def generate_daily_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    return _run_unfinished_versioned_work(
+    from engram.memory.digest_work import execute_frozen_digest_work
+
+    work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.DAILY_DIGEST,
     )
+    if automatic_terminal:
+        return str(work.id)
+
+    execute_frozen_digest_work(work, workflow_run)
+
+    return str(work.id)
 
 
 @app.task(
@@ -821,11 +812,19 @@ def generate_weekly_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    return _run_unfinished_versioned_work(
+    from engram.memory.digest_work import execute_frozen_digest_work
+
+    work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.WEEKLY_DIGEST,
     )
+    if automatic_terminal:
+        return str(work.id)
+
+    execute_frozen_digest_work(work, workflow_run)
+
+    return str(work.id)
 
 
 @app.task(name='engram.memory.reembed_missing_embeddings')

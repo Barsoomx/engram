@@ -1339,6 +1339,46 @@ def digest_content_hash(project_id: uuid.UUID, memory_ids: tuple[uuid.UUID, ...]
     return hashlib.sha256(material.encode()).hexdigest()
 
 
+def render_frozen_daily_digest_provider_result(
+    *,
+    project: Project,
+    sources: tuple[object, ...],
+    request_id: str,
+    trace_id: str,
+) -> ProviderCallResult:
+    resolved = ResolveModelPolicy().execute(
+        ResolveModelPolicyInput(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            team_id=None,
+            task_type='digest',
+        ),
+    )
+    prompt = digest_prompt(sources)
+    try:
+        provider_result, _used_resolved = call_with_fallback(
+            resolved,
+            get_provider_gateway(resolved.policy),
+            ProviderCallInput(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                team_id=None,
+                policy=resolved.policy,
+                request_id=request_id,
+                trace_id=trace_id,
+                prompt=prompt,
+                system_prompt=digest_system_prompt(),
+            ),
+        )
+    except (ModelPolicyError, ProviderSecretError) as error:
+        raise MemoryWorkerError(
+            f'digest provider unavailable: {error}',
+            retryable=getattr(error, 'retryable', False),
+        ) from error
+
+    return provider_result
+
+
 class GenerateDigest:
     def execute(self, data: DigestInput) -> DigestResult:
         project = Project.objects.get(id=data.project_id)

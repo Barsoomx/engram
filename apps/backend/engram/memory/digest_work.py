@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import UUID
 
+from django.db import transaction
 from django.db.models import Q, QuerySet
 
+from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     LinkType,
     Memory,
@@ -16,11 +18,17 @@ from engram.core.models import (
     MemoryVersion,
     Project,
     ProjectTeam,
+    Team,
     VisibilityScope,
     WorkflowRun,
     WorkflowWork,
     WorkflowWorkDisposition,
     WorkflowWorkType,
+)
+from engram.memory.services import (
+    MemoryWorkerError,
+    render_frozen_daily_digest_provider_result,
+    render_weekly_digest_body,
 )
 from engram.memory.tasks import dispatch_work_task
 from engram.memory.workflow_work import (
@@ -29,6 +37,8 @@ from engram.memory.workflow_work import (
     canonical_json_bytes,
     create_work,
     resolve_work_no_input,
+    resolve_work_succeeded,
+    work_input_fingerprint,
 )
 
 _DIGEST_VISIBILITY_POLICY = 'digest_visibility/v1'
@@ -448,3 +458,251 @@ def create_digest_work_and_signal(
         )
 
     return work, created
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenSource:
+    title: str
+    body: str
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(UTC)
+
+
+def digest_output_identity(work: WorkflowWork) -> str:
+    snapshot = work.input_snapshot
+    payload = {
+        'workflow_work_id': str(work.id),
+        'input_digest': snapshot['input_digest'],
+        'output_visibility_scope': snapshot['output_visibility_scope'],
+        'output_team_id': snapshot['output_team_id'],
+        'allowed_team_ids': list(snapshot['allowed_team_ids']),
+    }
+
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _digest_visibility_metadata(work: WorkflowWork) -> dict[str, object]:
+    snapshot = work.input_snapshot
+
+    return {
+        'schema': _DIGEST_VISIBILITY_POLICY,
+        'workflow_work_id': str(work.id),
+        'input_digest': snapshot['input_digest'],
+        'output_identity': digest_output_identity(work),
+        'allowed_team_ids': list(snapshot['allowed_team_ids']),
+        'output_visibility_scope': snapshot['output_visibility_scope'],
+        'output_team_id': snapshot['output_team_id'],
+    }
+
+
+def _verify_digest_fingerprint(work: WorkflowWork) -> None:
+    try:
+        fingerprint = work_input_fingerprint(
+            work_type=work.work_type,
+            subject_type=work.subject_type,
+            subject_id=work.subject_id,
+            contract_version=work.contract_version,
+            occurrence_key=work.occurrence_key,
+            input_snapshot=work.input_snapshot,
+        )
+    except ValueError as error:
+        raise MemoryWorkerError('workflow work fingerprint is invalid') from error
+
+    if fingerprint != work.input_fingerprint:
+        raise MemoryWorkerError('workflow work fingerprint does not match frozen input')
+
+
+def _work_source_refs(work: WorkflowWork) -> list[dict[str, object]]:
+    if work.work_type == WorkflowWorkType.DAILY_DIGEST:
+        refs = work.input_snapshot.get('sources')
+    else:
+        refs = work.input_snapshot.get('changes')
+
+    return list(refs) if isinstance(refs, list) else []
+
+
+def _load_output_team(work: WorkflowWork) -> Team | None:
+    if work.team_id is None:
+        return None
+
+    try:
+        return Team.objects.get(id=work.team_id, organization_id=work.organization_id)
+    except Team.DoesNotExist as error:
+        raise MemoryWorkerError('digest output team is outside work scope') from error
+
+
+def _existing_output(work: WorkflowWork) -> UUID | None:
+    memory = (
+        Memory.objects.filter(
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+            kind='digest',
+            metadata__digest_visibility__workflow_work_id=str(work.id),
+        )
+        .order_by('created_at')
+        .first()
+    )
+
+    return memory.id if memory is not None else None
+
+
+def _lock_and_revalidate(
+    work: WorkflowWork,
+    refs: list[dict[str, object]],
+    team: Team | None,
+) -> dict[UUID, MemoryVersion]:
+    memory_ids = sorted({UUID(str(ref['memory_id'])) for ref in refs})
+    version_ids = sorted({UUID(str(ref['memory_version_id'])) for ref in refs})
+
+    list(
+        Memory.objects.select_for_update()
+        .filter(id__in=memory_ids, organization_id=work.organization_id, project_id=work.project_id)
+        .order_by('id')
+    )
+    locked_versions = list(
+        MemoryVersion.objects.select_for_update()
+        .filter(id__in=version_ids, organization_id=work.organization_id, project_id=work.project_id)
+        .order_by('id')
+    )
+    if team is not None:
+        linked = list(
+            ProjectTeam.objects.select_for_update()
+            .filter(organization_id=work.organization_id, project_id=work.project_id, team_id=team.id)
+            .order_by('id')
+        )
+        if not linked:
+            raise MemoryWorkerError('digest output team is no longer linked to its project')
+
+    versions = {version.id: version for version in locked_versions}
+    for ref in refs:
+        version = versions.get(UUID(str(ref['memory_version_id'])))
+        if version is None:
+            raise MemoryWorkerError('digest source is missing its frozen version')
+        if _server_body_digest(version) != ref.get('server_body_digest'):
+            raise MemoryWorkerError('digest source body digest does not match frozen input')
+
+    return versions
+
+
+def _render_daily(
+    work: WorkflowWork,
+    refs: list[dict[str, object]],
+    versions: dict[UUID, MemoryVersion],
+) -> object:
+    ordered = sorted(refs, key=lambda ref: ref['render_position'])
+    sources = tuple(
+        _FrozenSource(
+            title=str(ref['source_title']),
+            body=versions[UUID(str(ref['memory_version_id']))].body,
+        )
+        for ref in ordered
+    )
+    trace_id = f'digest-work:{work.id}'
+
+    return render_frozen_daily_digest_provider_result(
+        project=work.project,
+        sources=sources,
+        request_id=trace_id,
+        trace_id=trace_id,
+    )
+
+
+def _weekly_title_body(snapshot: dict[str, object], refs: list[dict[str, object]]) -> tuple[str, str]:
+    memory_changes: dict[str, list[dict[str, object]]] = {}
+    for ref in sorted(refs, key=lambda item: item['render_position']):
+        bucket = str(ref.get('bucket', 'added'))
+        memory_changes.setdefault(bucket, []).append(
+            {
+                'id': str(ref['memory_id']),
+                'title': str(ref['source_title']),
+                'at': str(ref.get('occurrence_at', '')),
+            }
+        )
+    window_end = _parse_iso(str(snapshot['window_end']))
+    body = render_weekly_digest_body(memory_changes, window_end, 7)
+    title = f'Weekly Structured Digest {str(snapshot["window_start"])[:10]} to {str(snapshot["window_end"])[:10]}'
+
+    return title, body
+
+
+def _publish(
+    work: WorkflowWork,
+    refs: list[dict[str, object]],
+    team: Team | None,
+    provider_result: object,
+) -> UUID:
+    snapshot = work.input_snapshot
+    if work.work_type == WorkflowWorkType.DAILY_DIGEST:
+        title = f'Digest {provider_result.generated_title}'
+        body = provider_result.generated_body
+        digest_kind = 'daily_structured'
+    else:
+        title, body = _weekly_title_body(snapshot, refs)
+        digest_kind = 'weekly_structured'
+
+    visibility = VisibilityScope.TEAM if team is not None else VisibilityScope.PROJECT
+    metadata: dict[str, object] = {
+        'kind': 'digest',
+        'digest_kind': digest_kind,
+        'source_memory_ids': [str(ref['memory_id']) for ref in refs],
+        'digest_visibility': _digest_visibility_metadata(work),
+    }
+    if provider_result is not None:
+        metadata['provider_call_id'] = str(provider_result.call_record_id)
+        metadata['provider'] = provider_result.provider
+        metadata['model'] = provider_result.model
+
+    memory = Memory.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team=team,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=visibility,
+        metadata=metadata,
+    )
+    version = MemoryVersion.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+        source_metadata={'kind': 'digest'},
+    )
+    IndexMemoryVersion().execute(
+        IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=True),
+    )
+    resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+
+    return memory.id
+
+
+def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | None) -> UUID | None:
+    _verify_digest_fingerprint(work)
+    if work.disposition == WorkflowWorkDisposition.NO_OP:
+        return None
+
+    existing = _existing_output(work)
+    if existing is not None:
+        return existing
+
+    refs = _work_source_refs(work)
+    team = _load_output_team(work)
+
+    with transaction.atomic():
+        versions = _lock_and_revalidate(work, refs, team)
+
+    provider_result = _render_daily(work, refs, versions) if work.work_type == WorkflowWorkType.DAILY_DIGEST else None
+
+    with transaction.atomic():
+        _lock_and_revalidate(work, refs, team)
+
+        return _publish(work, refs, team, provider_result)
