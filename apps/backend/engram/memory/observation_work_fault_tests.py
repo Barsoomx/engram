@@ -32,6 +32,8 @@ from engram.hooks.hook_ingest_tests import (
     hook_event_input,
 )
 from engram.imports import services as import_services
+from engram.memory import session_sweep as memory_session_sweep
+from engram.memory import tasks as memory_tasks
 
 _WORK_IMMUTABLE_FIELDS = tuple(field_name for field_name, _field in WorkflowWork._IMMUTABLE_FIELDS)
 _OUTBOX_TASK_FIELDS = (
@@ -103,6 +105,22 @@ def _call_path(node: ast.AST) -> tuple[str, ...]:
 
 def _is_legacy_observation_call(node: ast.Call) -> bool:
     return 'process_observation_recorded' in _call_path(node.func)
+
+
+def _is_distill_session_delay_call(node: ast.Call) -> bool:
+    return _call_path(node.func)[-2:] == ('distill_session', 'delay')
+
+
+def _is_on_commit_call(node: ast.Call) -> bool:
+    return _call_path(node.func)[-1:] == ('on_commit',)
+
+
+def _function_def(tree: ast.Module, name: str) -> ast.FunctionDef:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+
+    raise AssertionError(f'function {name} not found')
 
 
 def _production_trees() -> tuple[Path, list[tuple[Path, ast.Module]]]:
@@ -326,20 +344,27 @@ def test_c1_2_producer_census_has_no_legacy_observation_task_or_required_on_comm
 
     hook_tree = ast.parse(Path(inspect.getfile(hook_services)).read_text(encoding='utf-8'))
     hook_on_commit_calls = [
-        node
-        for node in ast.walk(hook_tree)
-        if isinstance(node, ast.Call) and _call_path(node.func)[-1:] == ('on_commit',)
+        node for node in ast.walk(hook_tree) if isinstance(node, ast.Call) and _is_on_commit_call(node)
     ]
-    assert len(hook_on_commit_calls) == 1
-    callback = hook_on_commit_calls[0].args[0]
-    assert isinstance(callback, ast.Lambda)
-    assert isinstance(callback.body, ast.Call)
-    assert _call_path(callback.body.func) == ('distill_session', 'delay')
+    assert hook_on_commit_calls == []
+    hook_distill_delay_calls = [
+        node for node in ast.walk(hook_tree) if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
+    ]
+    assert hook_distill_delay_calls == []
+
+    sweep_tree = ast.parse(Path(inspect.getfile(memory_session_sweep)).read_text(encoding='utf-8'))
+    sweep_distill_delay_calls = [
+        node for node in ast.walk(sweep_tree) if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
+    ]
+    assert sweep_distill_delay_calls == []
+
+    tasks_tree = ast.parse(Path(inspect.getfile(memory_tasks)).read_text(encoding='utf-8'))
+    sweep_task = _function_def(tasks_tree, 'sweep_stale_sessions')
+    sweep_task_distill_delay_calls = [
+        node for node in ast.walk(sweep_task) if isinstance(node, ast.Call) and _is_distill_session_delay_call(node)
+    ]
+    assert sweep_task_distill_delay_calls == []
 
     for module in (import_services, context_services):
         tree = ast.parse(Path(inspect.getfile(module)).read_text(encoding='utf-8'))
-        assert not [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and _call_path(node.func)[-1:] == ('on_commit',)
-        ]
+        assert not [node for node in ast.walk(tree) if isinstance(node, ast.Call) and _is_on_commit_call(node)]

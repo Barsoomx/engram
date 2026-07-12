@@ -36,12 +36,18 @@ from engram.core.models import (
     RawEventEnvelope,
     SessionStatus,
     Team,
+    WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
 from engram.hooks.services import HookEventInput, IngestHookEvent
-from engram.memory.tasks import distill_session
+from engram.memory.tasks import distill_session, distill_session_work_v1
 
 RAW_KEY = 'egk_test_hook_ingest_0123456789abcdefghijklmnopqrstuvwxyz'
+DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
+LEGACY_DISTILL_TASK_NAME = 'engram.memory.distill_session'
 HOOK_PAYLOAD_MAX_BYTES = 65536
 HOOK_OBSERVATION_BODY_MAX_LENGTH = 16000
 HOOK_PATH_MAX_LENGTH = 1024
@@ -2097,7 +2103,7 @@ def test_ingest_hook_event_does_not_enqueue_realtime_task_by_default(
 
 
 @pytest.mark.django_db
-def test_ingest_hook_event_default_off_still_enqueues_distill_on_session_end(
+def test_session_end_hook_without_useful_input_creates_terminal_no_op_without_signal(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
@@ -2106,10 +2112,20 @@ def test_ingest_hook_event_default_off_still_enqueues_distill_on_session_end(
     with f_capture_on_commit(execute=True):
         result = IngestHookEvent().execute(data)
 
-    outbox_tasks = [row.task_name for row in CeleryOutbox.objects.all()]
-    assert outbox_tasks == ['engram.memory.distill_session']
-    distill_task = CeleryOutbox.objects.get(task_name='engram.memory.distill_session')
-    assert distill_task.args == [str(result.session.id)]
+    session = AgentSession.objects.get()
+    assert session.status == SessionStatus.ENDED
+    assert session.end_work_contract_version == 1
+    work = WorkflowWork.objects.get()
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.subject_type == WorkflowSubjectType.AGENT_SESSION
+    assert work.subject_id == session.id
+    assert work.input_snapshot['upper_sequence_inclusive'] == 0
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert result.session.id == session.id
+    assert CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -3018,47 +3034,65 @@ def test_post_tool_use_rejects_malformed_payload() -> None:
 
 
 @pytest.mark.django_db
-def test_session_end_marks_session_ended_and_writes_durable_event(
+def test_session_end_api_marks_ended_with_marker_and_id_only_distill_work_signal(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
-    enable_realtime_candidates(organization)
     client = APIClient()
-    payload = valid_hook_payload(
-        project,
-        team,
-        event_id='event-stop-1',
-        idempotency_key='idem-stop-1',
-        event_type='session_end',
-        content_hash='hash-stop-1',
-        request_id='request-stop-1',
-        observation={
-            'type': 'session_end',
-            'title': 'Session ended',
-            'body': 'Agent stopped with unresolved work.',
-            'files_read': [],
-            'files_modified': [],
-        },
-    )
 
     with f_capture_on_commit(execute=True):
-        response = client.post('/v1/hooks/session-end', payload, format='json', **auth_headers())
+        useful = client.post(
+            '/v1/hooks/post-tool-use',
+            valid_hook_payload(project, team),
+            format='json',
+            **auth_headers(),
+        )
+        assert useful.status_code == 202
+        response = client.post(
+            '/v1/hooks/session-end',
+            valid_hook_payload(
+                project,
+                team,
+                event_id='event-stop-1',
+                idempotency_key='idem-stop-1',
+                event_type='session_end',
+                content_hash='hash-stop-1',
+                request_id='request-stop-1',
+                observation={
+                    'type': 'session_end',
+                    'title': 'Session ended',
+                    'body': 'Agent stopped with unresolved work.',
+                    'files_read': [],
+                    'files_modified': [],
+                },
+            ),
+            format='json',
+            **auth_headers(),
+        )
 
     assert response.status_code == 202
     session = AgentSession.objects.get()
-    raw_event = RawEventEnvelope.objects.get()
-    observation = Observation.objects.get()
+    end_raw_event = RawEventEnvelope.objects.get(event_type='session_end')
+    end_observation = Observation.objects.get(observation_type='session_end')
 
     assert session.status == SessionStatus.ENDED
     assert session.ended_at is not None
-    assert raw_event.event_type == 'session_end'
-    assert observation.observation_type == 'session_end'
+    assert session.end_work_contract_version == 1
+    assert end_raw_event.event_type == 'session_end'
+    assert end_observation.observation_type == 'session_end'
     assert response.json()['agent_session_id'] == str(session.id)
-    outbox_tasks = {row.task_name: row for row in CeleryOutbox.objects.all()}
-    assert set(outbox_tasks) == {'engram.memory.distill_session'}
-    distill_task = outbox_tasks['engram.memory.distill_session']
-    assert distill_task.args == [str(session.id)]
-    assert distill_task.kwargs == {}
+    work = WorkflowWork.objects.get()
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.subject_type == WorkflowSubjectType.AGENT_SESSION
+    assert work.subject_id == session.id
+    assert work.input_snapshot['upper_sequence_inclusive'] == 1
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    queued = CeleryOutbox.objects.get(task_name=DISTILL_WORK_TASK_NAME)
+    assert queued.args == [str(work.id)]
+    assert queued.task_id == f'workflow-work:{work.id}'
+    assert queued.kwargs == {}
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -3116,19 +3150,33 @@ def test_get_or_create_session_does_not_reactivate_ended_session_on_session_end_
 
 
 @pytest.mark.django_db
-def test_session_end_dispatches_distill_when_session_was_active(
+def test_session_end_when_active_signals_distill_work_and_never_legacy_distill(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _organization, team, project, _owner, _api_key = create_project_scope()
-    data = hook_event_input(project, team, event_type='session_end')
     dispatched: list[str] = []
     m_monkeypatch.setattr(distill_session, 'delay', lambda session_id: dispatched.append(session_id))
 
     with f_capture_on_commit(execute=True):
-        result = IngestHookEvent().execute(data)
+        IngestHookEvent().execute(hook_event_input(project, team))
+        IngestHookEvent().execute(
+            hook_event_input(
+                project,
+                team,
+                event_type='session_end',
+                event_id='event-end-1',
+                idempotency_key='idem-end-1',
+                content_hash='hash-end-1',
+                request_id='request-end-1',
+            ),
+        )
 
-    assert dispatched == [str(result.session.id)]
+    assert dispatched == []
+    work = WorkflowWork.objects.get()
+    queued = CeleryOutbox.objects.get(task_name=DISTILL_WORK_TASK_NAME)
+    assert queued.args == [str(work.id)]
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
 
 
 @pytest.mark.django_db
@@ -3158,6 +3206,179 @@ def test_session_end_does_not_dispatch_distill_when_session_already_ended(
         service.execute(data)
 
     assert dispatched == []
+
+
+def _session_end_input(project: Project, team: Team) -> HookEventInput:
+    return hook_event_input(
+        project,
+        team,
+        event_type='session_end',
+        event_id='event-end-1',
+        idempotency_key='idem-end-1',
+        content_hash='hash-end-1',
+        request_id='request-end-1',
+        observation={
+            'type': 'session_end',
+            'title': 'Session ended',
+            'body': 'Agent stopped.',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+
+@pytest.mark.django_db
+def test_session_end_hook_ends_with_marker_and_id_only_distill_work_signal(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+
+    with f_capture_on_commit(execute=True):
+        IngestHookEvent().execute(hook_event_input(project, team))
+        result = IngestHookEvent().execute(_session_end_input(project, team))
+
+    session = AgentSession.objects.get()
+    assert session.status == SessionStatus.ENDED
+    assert session.ended_at is not None
+    assert session.end_work_contract_version == 1
+    assert result.session.id == session.id
+    work = WorkflowWork.objects.get()
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.subject_type == WorkflowSubjectType.AGENT_SESSION
+    assert work.subject_id == session.id
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.input_snapshot['upper_sequence_inclusive'] == 1
+    queued = CeleryOutbox.objects.get(task_name=DISTILL_WORK_TASK_NAME)
+    assert queued.args == [str(work.id)]
+    assert queued.task_id == f'workflow-work:{work.id}'
+    assert queued.kwargs == {}
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.count() == 1
+
+
+@pytest.mark.django_db
+def test_duplicate_session_end_hook_replay_adds_no_second_work_or_signal(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    end_data = _session_end_input(project, team)
+
+    with f_capture_on_commit(execute=True):
+        IngestHookEvent().execute(hook_event_input(project, team))
+        IngestHookEvent().execute(end_data)
+
+    session = AgentSession.objects.get()
+    assert session.status == SessionStatus.ENDED
+    assert session.end_work_contract_version == 1
+    initial_state = hook_duplicate_state()
+    initial_work_count = WorkflowWork.objects.count()
+    initial_signal_count = CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count()
+
+    with f_capture_on_commit(execute=True):
+        replay = IngestHookEvent().execute(end_data)
+
+    assert replay.duplicate is True
+    assert hook_duplicate_state() == initial_state
+    session.refresh_from_db()
+    assert session.status == SessionStatus.ENDED
+    assert session.end_work_contract_version == 1
+    assert WorkflowWork.objects.count() == initial_work_count == 1
+    assert CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count() == initial_signal_count == 1
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_hook_reactivation_then_session_end_creates_new_generation_distill_work(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+
+    with f_capture_on_commit(execute=True):
+        IngestHookEvent().execute(hook_event_input(project, team))
+        IngestHookEvent().execute(_session_end_input(project, team))
+
+    first_work = WorkflowWork.objects.get()
+
+    with f_capture_on_commit(execute=True):
+        reactivation = IngestHookEvent().execute(
+            hook_event_input(
+                project,
+                team,
+                event_id='event-react-1',
+                idempotency_key='idem-react-1',
+                content_hash='hash-react-1',
+                request_id='request-react-1',
+            ),
+        )
+
+    session = AgentSession.objects.get()
+    assert session.status == SessionStatus.ACTIVE
+    assert session.ended_at is None
+    assert session.end_work_contract_version == 0
+    assert reactivation.observation.session_sequence == 3
+
+    with f_capture_on_commit(execute=True):
+        second_end = IngestHookEvent().execute(
+            hook_event_input(
+                project,
+                team,
+                event_type='session_end',
+                event_id='event-end-2',
+                idempotency_key='idem-end-2',
+                content_hash='hash-end-2',
+                request_id='request-end-2',
+                observation={
+                    'type': 'session_end',
+                    'title': 'Session ended again',
+                    'body': 'Agent stopped a second time.',
+                    'files_read': [],
+                    'files_modified': [],
+                },
+            ),
+        )
+
+    session.refresh_from_db()
+    assert session.status == SessionStatus.ENDED
+    assert session.end_work_contract_version == 1
+    assert second_end.session.id == session.id
+    works = WorkflowWork.objects.filter(work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    assert works.count() == 2
+    assert len(set(works.values_list('input_fingerprint', flat=True))) == 2
+    second_work = works.exclude(id=first_work.id).get()
+    assert second_work.input_snapshot['upper_sequence_inclusive'] == 3
+    assert CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count() == 2
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_session_end_hook_signal_failure_rolls_back_end_marker_work_and_outbox(
+    f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+
+    with f_capture_on_commit(execute=True):
+        IngestHookEvent().execute(hook_event_input(project, team))
+
+    class SignalFailureError(RuntimeError):
+        pass
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise SignalFailureError('signal dispatch failed')
+
+    m_monkeypatch.setattr(distill_session_work_v1, 'apply_async', fail)
+    with pytest.raises(SignalFailureError):
+        IngestHookEvent().execute(_session_end_input(project, team))
+
+    session = AgentSession.objects.get()
+    assert session.status == SessionStatus.ACTIVE
+    assert session.ended_at is None
+    assert session.end_work_contract_version == 0
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.SESSION_DISTILLATION).count() == 0
+    assert CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
 
 
 @pytest.mark.django_db
