@@ -2534,6 +2534,181 @@ def test_team_scoped_hook_rejects_legacy_null_team_session_with_history_without_
 
 
 @pytest.mark.django_db
+def test_history_bearing_hook_rejects_same_team_different_agent_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    original_payload = valid_hook_payload(
+        project,
+        team,
+        session_id='history-agent-session',
+        event_id='history-agent-event',
+        idempotency_key='history-agent-idempotency',
+        content_hash='history-agent-hash',
+    )
+    original_response = client.post('/v1/hooks/post-tool-use', original_payload, format='json', **auth_headers())
+    assert original_response.status_code == 202
+    existing_agent = Agent.objects.get()
+    session = AgentSession.objects.get()
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    initial_state = {
+        'agent': Agent.objects.filter(id=existing_agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    }
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        event_id='history-agent-incoming-event',
+        idempotency_key='history-agent-incoming-idempotency',
+        content_hash='history-agent-incoming-hash',
+        agent_external_id='different-agent',
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert Agent.objects.count() == 1
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert {
+        'agent': Agent.objects.filter(id=existing_agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    } == initial_state
+    replay = client.post('/v1/hooks/post-tool-use', original_payload, format='json', **auth_headers())
+    assert replay.status_code == 202
+    assert replay.json()['duplicate'] is True
+    assert replay.json()['raw_event_id'] == original_response.json()['raw_event_id']
+
+
+@pytest.mark.django_db
+def test_history_free_hook_corrects_agent_and_runtime() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='history-free-hook-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='history-free-hook-session',
+        runtime='codex',
+        platform_source='',
+    )
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        agent_runtime='claude_code',
+        agent_external_id='corrected-hook-agent',
+        event_id='history-free-hook-event',
+        idempotency_key='history-free-hook-idempotency',
+        content_hash='history-free-hook-hash',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    session.refresh_from_db()
+    assert session.runtime == 'claude_code'
+    assert session.platform_source == 'claude_code'
+    assert session.agent.external_id == 'corrected-hook-agent'
+
+
+@pytest.mark.django_db
+def test_history_bearing_hook_adopts_blank_platform_and_updates_agent_version() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    agent, session, _raw_event, _observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='blank-platform-hook-session',
+        event_id='blank-platform-hook-event',
+        idempotency_key='blank-platform-hook-idempotency',
+        content_hash='blank-platform-hook-hash',
+    )
+    Agent.objects.filter(id=agent.id).update(version='old-version')
+    AgentSession.objects.filter(id=session.id).update(platform_source='')
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        agent_external_id=agent.external_id,
+        agent_version='new-version',
+        event_id='blank-platform-hook-incoming-event',
+        idempotency_key='blank-platform-hook-incoming-idempotency',
+        content_hash='blank-platform-hook-incoming-hash',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    agent.refresh_from_db()
+    session.refresh_from_db()
+    assert agent.version == 'new-version'
+    assert session.agent_id == agent.id
+    assert session.runtime == 'codex'
+    assert session.platform_source == 'codex'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('stored_runtime', 'stored_platform_source', 'requested_runtime'),
+    [
+        ('claude_code', 'claude_code', 'codex'),
+        ('codex', 'legacy-platform', 'codex'),
+    ],
+)
+def test_history_bearing_hook_rejects_identity_runtime_conflict_without_mutation(
+    stored_runtime: str,
+    stored_platform_source: str,
+    requested_runtime: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    existing_agent, session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='history-runtime-session',
+        event_id='history-runtime-event',
+        idempotency_key='history-runtime-idempotency',
+        content_hash='history-runtime-hash',
+    )
+    AgentSession.objects.filter(id=session.id).update(
+        runtime=stored_runtime,
+        platform_source=stored_platform_source,
+    )
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        event_id='history-runtime-incoming-event',
+        idempotency_key='history-runtime-incoming-idempotency',
+        content_hash='history-runtime-incoming-hash',
+        agent_runtime=requested_runtime,
+        agent_external_id=existing_agent.external_id,
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    session.refresh_from_db()
+    assert session.runtime == stored_runtime
+    assert session.platform_source == stored_platform_source
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+
+
+@pytest.mark.django_db
 def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:

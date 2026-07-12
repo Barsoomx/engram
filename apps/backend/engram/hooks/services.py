@@ -710,6 +710,16 @@ class IngestHookEvent:
         selected_team = team
         if not created:
             selected_team = self._existing_session_team(session, team)
+            identity_conflict = (
+                session.agent_id != agent.id
+                or session.runtime != data.agent_runtime
+                or (bool(session.platform_source) and session.platform_source != data.agent_runtime)
+            )
+            if identity_conflict and session_has_observation_history(session_id=session.id):
+                raise AccessDeniedError(
+                    'hook_identity_collision',
+                    'Hook identity collision is not accessible',
+                )
         update_fields = []
         for field, value in (
             ('team', selected_team),

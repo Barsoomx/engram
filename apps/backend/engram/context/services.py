@@ -1185,6 +1185,13 @@ class BuildContextBundle:
                 raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
             if session.team_id is None and team is not None and session_has_observation_history(session_id=session.id):
                 raise AccessDeniedError('team_scope_denied', 'Session is outside the requested team scope')
+            identity_conflict = (
+                session.agent_id != agent.id
+                or session.runtime != data.agent_runtime
+                or (bool(session.platform_source) and session.platform_source != data.agent_runtime)
+            )
+            if identity_conflict and session_has_observation_history(session_id=session.id):
+                raise AccessDeniedError('team_scope_denied', 'Session producer identity is immutable')
 
             update_fields = []
             if session.team_id is None and team is not None:

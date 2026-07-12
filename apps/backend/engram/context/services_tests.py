@@ -1589,6 +1589,268 @@ def test_build_context_bundle_denial_rolls_back_agent_version_update() -> None:
 
 
 @pytest.mark.django_db
+def test_history_bearing_context_rejects_same_team_different_agent_without_side_effects() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='context-history-agent',
+        version='0.1.0',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='context-history-agent-session',
+        runtime='codex',
+        platform_source='codex',
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id='context-history-agent-event',
+        idempotency_key='context-history-agent-idempotency',
+        content_hash='context-history-agent-hash',
+        runtime='codex',
+        sequence_number=1,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='History',
+        content_hash=raw_event.content_hash,
+        session_sequence=1,
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-context-history-agent',
+            session_id=session.external_session_id,
+        ),
+        agent_external_id='different-context-agent',
+    )
+    bundle_count = ContextBundle.objects.count()
+    provider_call_count = ProviderCallRecord.objects.count()
+    retrieval_document_count = RetrievalDocument.objects.count()
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle().execute(data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    assert Agent.objects.count() == 1
+    session.refresh_from_db()
+    assert session.agent_id == existing_agent.id
+    assert session.runtime == 'codex'
+    assert session.platform_source == 'codex'
+    assert ContextBundle.objects.count() == bundle_count
+    assert ProviderCallRecord.objects.count() == provider_call_count
+    assert RetrievalDocument.objects.count() == retrieval_document_count
+
+
+@pytest.mark.django_db
+def test_history_free_context_corrects_agent_and_runtime() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='history-free-context-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='history-free-context-session',
+        runtime='codex',
+        platform_source='',
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-history-free-context',
+            session_id=session.external_session_id,
+        ),
+        agent_runtime='claude_code',
+        agent_external_id='corrected-context-agent',
+    )
+
+    result = BuildContextBundle().execute(data)
+
+    session.refresh_from_db()
+    assert result.bundle.session_id == session.id
+    assert session.runtime == 'claude_code'
+    assert session.platform_source == 'claude_code'
+    assert session.agent.external_id == 'corrected-context-agent'
+
+
+@pytest.mark.django_db
+def test_history_bearing_context_adopts_blank_platform_and_updates_agent_version() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='blank-platform-context-agent',
+        version='old-version',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='blank-platform-context-session',
+        runtime='codex',
+        platform_source='',
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id='blank-platform-context-event',
+        idempotency_key='blank-platform-context-idempotency',
+        content_hash='blank-platform-context-hash',
+        runtime='codex',
+        sequence_number=1,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='History',
+        content_hash=raw_event.content_hash,
+        session_sequence=1,
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-blank-platform-context',
+            session_id=session.external_session_id,
+        ),
+        agent_external_id=agent.external_id,
+        agent_version='new-version',
+    )
+
+    result = BuildContextBundle().execute(data)
+
+    agent.refresh_from_db()
+    session.refresh_from_db()
+    assert result.bundle.session_id == session.id
+    assert agent.version == 'new-version'
+    assert session.agent_id == agent.id
+    assert session.runtime == 'codex'
+    assert session.platform_source == 'codex'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('stored_runtime', 'stored_platform_source', 'requested_runtime'),
+    [
+        ('claude_code', 'claude_code', 'codex'),
+        ('codex', 'legacy-platform', 'codex'),
+    ],
+)
+def test_history_bearing_context_rejects_identity_runtime_conflict_without_side_effects(
+    stored_runtime: str,
+    stored_platform_source: str,
+    requested_runtime: str,
+) -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='context-history-runtime',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='context-history-runtime-session',
+        runtime=stored_runtime,
+        platform_source=stored_platform_source,
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id='context-history-runtime-event',
+        idempotency_key='context-history-runtime-idempotency',
+        content_hash='context-history-runtime-hash',
+        runtime=stored_runtime,
+        sequence_number=1,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='History',
+        content_hash=raw_event.content_hash,
+        session_sequence=1,
+    )
+    data = replace(
+        _context_bundle_input(
+            project,
+            team,
+            file_paths=(),
+            request_id='request-context-history-runtime',
+            session_id=session.external_session_id,
+        ),
+        agent_runtime=requested_runtime,
+        agent_external_id=existing_agent.external_id,
+    )
+    bundle_count = ContextBundle.objects.count()
+    provider_call_count = ProviderCallRecord.objects.count()
+    retrieval_document_count = RetrievalDocument.objects.count()
+
+    with pytest.raises(AccessDeniedError) as exc_info:
+        BuildContextBundle().execute(data)
+
+    assert exc_info.value.code == 'team_scope_denied'
+    assert Agent.objects.count() == 1
+    session.refresh_from_db()
+    assert session.runtime == stored_runtime
+    assert session.platform_source == stored_platform_source
+    assert ContextBundle.objects.count() == bundle_count
+    assert ProviderCallRecord.objects.count() == provider_call_count
+    assert RetrievalDocument.objects.count() == retrieval_document_count
+
+
+@pytest.mark.django_db
 def test_build_context_bundle_records_non_null_retrieval_latency_ms() -> None:
     organization, team, project, _api_key = _provenance_project_scope()
     _create_memory_document(
