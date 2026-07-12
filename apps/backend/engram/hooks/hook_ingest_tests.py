@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from django.db import close_old_connections, connection, transaction
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from pytest_django.fixtures import DjangoCaptureOnCommitCallbacks
@@ -267,6 +268,59 @@ def create_persisted_hook_evidence(
     )
 
     return agent, session, raw_event, observation
+
+
+def hook_duplicate_state() -> dict[str, object]:
+    return {
+        'raw_events': list(
+            RawEventEnvelope.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'metadata',
+                'source_adapter',
+                'content_hash',
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'sequence_number',
+            ),
+        ),
+        'observations': list(
+            Observation.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'organization_id',
+                'project_id',
+                'team_id',
+                'agent_id',
+                'session_id',
+                'raw_event_id',
+                'content_hash',
+                'source_metadata',
+            ),
+        ),
+        'sources': list(
+            ObservationSource.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'observation_id',
+                'raw_event_id',
+                'source_type',
+                'source_id',
+                'metadata',
+            ),
+        ),
+        'sessions': list(
+            AgentSession.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'status',
+                'observation_sequence_cursor',
+            ),
+        ),
+        'work': list(WorkflowWork.objects.order_by('id').values('id', 'updated_at', 'input_fingerprint')),
+        'outbox_ids': list(CeleryOutbox.objects.order_by('id').values_list('id', flat=True)),
+    }
 
 
 @pytest.mark.django_db
@@ -550,6 +604,84 @@ def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('normalization_disposition', 'normalization_reason'),
+    (('observation', None), (None, 'evidence_only'), ('no_op', 'evidence_only')),
+)
+def test_legacy_hook_duplicate_rejects_partial_normalization_before_mutation(
+    normalization_disposition: str | None,
+    normalization_reason: str | None,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    result = IngestHookEvent().execute(hook_event_input(project, team))
+    raw_event = result.raw_event
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = normalization_disposition
+    raw_event.normalization_reason = normalization_reason
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='normalization'):
+        IngestHookEvent()._repair_duplicate(
+            raw_event,
+            organization=organization,
+            project=project,
+            session=result.session,
+        )
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('corruption', ('session', 'agent', 'session_and_agent'))
+def test_legacy_hook_duplicate_rejects_corrupted_direct_observation_scope_before_mutation(
+    corruption: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    result = IngestHookEvent().execute(data)
+    raw_event = result.raw_event
+    raw_event.metadata = {}
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+    other_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='corrupt-observation-agent',
+    )
+    other_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=other_agent,
+        external_session_id='corrupt-observation-session',
+        runtime='codex',
+    )
+    observation_updates: dict[str, object] = {}
+    if corruption in {'session', 'session_and_agent'}:
+        observation_updates['session'] = other_session
+    if corruption in {'agent', 'session_and_agent'}:
+        observation_updates['agent'] = other_agent
+    Observation.objects.filter(id=result.observation.id).update(**observation_updates)
+    enable_realtime_candidates(organization)
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='scope'):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
 def test_hook_duplicate_rejects_typed_v1_missing_work_policy_without_mutation() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     data = hook_event_input(project, team)
@@ -557,7 +689,6 @@ def test_hook_duplicate_rejects_typed_v1_missing_work_policy_without_mutation() 
     raw_event = RawEventEnvelope.objects.get()
     raw_event.metadata = {}
     raw_event.save(update_fields=['metadata', 'updated_at'])
-    ObservationSource.objects.all().delete()
     enable_realtime_candidates(organization)
     session = AgentSession.objects.get()
     initial_session_state = (
@@ -578,7 +709,7 @@ def test_hook_duplicate_rejects_typed_v1_missing_work_policy_without_mutation() 
     assert (session.updated_at, session.observation_sequence_cursor, session.status) == initial_session_state
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert ObservationSource.objects.count() == 0
+    assert ObservationSource.objects.count() == 1
     assert WorkflowWork.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
@@ -596,7 +727,6 @@ def test_hook_duplicate_rejects_invalid_present_work_policy_without_mutation() -
     }
     raw_event.metadata = {'work_policy_v1': invalid_policy}
     raw_event.save(update_fields=['metadata', 'updated_at'])
-    ObservationSource.objects.all().delete()
     enable_realtime_candidates(organization)
 
     with pytest.raises(ValueError, match='work_policy_v1'):
@@ -604,9 +734,83 @@ def test_hook_duplicate_rejects_invalid_present_work_policy_without_mutation() -
 
     raw_event.refresh_from_db()
     assert raw_event.metadata == {'work_policy_v1': invalid_policy}
-    assert ObservationSource.objects.count() == 0
+    assert ObservationSource.objects.count() == 1
     assert WorkflowWork.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'malformation',
+    (
+        'evidence_only_disposition',
+        'missing_hook_source',
+        'extra_hook_source',
+        'mismatched_source_event_type',
+        'mismatched_source_raw_event',
+        'ambiguous_direct_observation',
+        'typed_legacy_policy_fallback',
+    ),
+)
+def test_hook_duplicate_rejects_malformed_typed_v1_evidence_before_mutation(malformation: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    source = ObservationSource.objects.get()
+    WorkflowWork.objects.all().delete()
+    CeleryOutbox.objects.all().delete()
+
+    if malformation == 'evidence_only_disposition':
+        raw_event.normalization_disposition = 'no_op'
+        raw_event.normalization_reason = 'evidence_only'
+        raw_event.save(update_fields=['normalization_disposition', 'normalization_reason', 'updated_at'])
+    elif malformation == 'missing_hook_source':
+        source.delete()
+    elif malformation == 'extra_hook_source':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=raw_event,
+            source_type='hook_event',
+            source_id='unexpected-event',
+            metadata={'event_type': raw_event.event_type},
+        )
+    elif malformation == 'mismatched_source_event_type':
+        source.metadata = {'event_type': 'session_start'}
+        source.save(update_fields=['metadata', 'updated_at'])
+    elif malformation == 'mismatched_source_raw_event':
+        source.raw_event = None
+        source.save(update_fields=['raw_event', 'updated_at'])
+    elif malformation == 'ambiguous_direct_observation':
+        Observation.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            agent=raw_event.agent,
+            session=raw_event.session,
+            raw_event=raw_event,
+            observation_type='tool_use',
+            title='ambiguous direct observation',
+            body='must not be selected by ordering',
+            content_hash='ambiguous-content-hash',
+            source_metadata={'event_type': raw_event.event_type},
+        )
+    elif malformation == 'typed_legacy_policy_fallback':
+        raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] = True
+        raw_event.save(update_fields=['metadata', 'updated_at'])
+    else:
+        raise AssertionError(f'Unhandled malformation: {malformation}')
+
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
 
 
 @pytest.mark.django_db
@@ -632,9 +836,25 @@ def test_hook_duplicate_rejects_mismatched_persisted_lifecycle_classification(
         content_hash='persisted-content-hash',
     )
     raw_event.event_type = raw_event_type
-    raw_event.save(update_fields=['event_type', 'updated_at'])
+    raw_event.metadata = {
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': False,
+            'legacy_policy_fallback': False,
+        },
+    }
+    raw_event.save(update_fields=['event_type', 'metadata', 'updated_at'])
     observation.source_metadata = {'event_type': trusted_event_type}
     observation.save(update_fields=['source_metadata', 'updated_at'])
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=raw_event,
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
     enable_realtime_candidates(organization)
     data = hook_event_input(
         project,
@@ -649,8 +869,8 @@ def test_hook_duplicate_rejects_mismatched_persisted_lifecycle_classification(
         IngestHookEvent().execute(data)
 
     raw_event.refresh_from_db()
-    assert raw_event.metadata == {}
-    assert ObservationSource.objects.count() == 0
+    assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is False
+    assert ObservationSource.objects.count() == 1
     assert WorkflowWork.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 
@@ -897,7 +1117,7 @@ def test_cross_team_idempotency_duplicate_denies_without_touching_incoming_or_pe
 @pytest.mark.django_db
 def test_cross_session_idempotency_duplicate_uses_persisted_session_without_creating_incoming_session() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
-    _agent, persisted_session, persisted_raw_event, _observation = create_persisted_hook_evidence(
+    _agent, persisted_session, persisted_raw_event, observation = create_persisted_hook_evidence(
         organization,
         project,
         team,
@@ -914,6 +1134,15 @@ def test_cross_session_idempotency_duplicate_uses_persisted_session_without_crea
         },
     }
     persisted_raw_event.save(update_fields=['metadata', 'updated_at'])
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=persisted_raw_event,
+        source_type='hook_event',
+        source_id=persisted_raw_event.client_event_id,
+        metadata={'event_type': persisted_raw_event.event_type},
+    )
     data = hook_event_input(
         project,
         team,
@@ -961,6 +1190,358 @@ def test_hook_reuses_existing_observation_sequence_without_advancing_cursor() ->
     assert RawEventEnvelope.objects.count() == 2
     assert AgentSession.objects.get().observation_sequence_cursor == 1
     assert list(RawEventEnvelope.objects.values_list('sequence_number', flat=True)) == [1, 1]
+
+
+@pytest.mark.django_db
+def test_typed_hook_replays_each_raw_that_shares_one_canonical_observation_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+
+    first = IngestHookEvent().execute(first_data)
+    second = IngestHookEvent().execute(second_data)
+
+    observation = Observation.objects.get()
+    raw_events = list(RawEventEnvelope.objects.order_by('created_at'))
+    assert first.observation.id == observation.id
+    assert second.observation.id == observation.id
+    assert observation.raw_event_id == first.raw_event.id
+    assert raw_events[0].observations.count() == 1
+    assert raw_events[1].observations.count() == 0
+    assert ObservationSource.objects.count() == 2
+    assert set(ObservationSource.objects.values_list('raw_event_id', flat=True)) == {
+        first.raw_event.id,
+        second.raw_event.id,
+    }
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    initial_state = hook_duplicate_state()
+
+    first_replay = IngestHookEvent().execute(first_data)
+    second_replay = IngestHookEvent().execute(second_data)
+
+    assert first_replay.duplicate is True
+    assert second_replay.duplicate is True
+    assert first_replay.raw_event.id == first.raw_event.id
+    assert second_replay.raw_event.id == second.raw_event.id
+    assert first_replay.observation.id == observation.id
+    assert second_replay.observation.id == observation.id
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_duplicate_rejects_null_linked_non_hook_observation_source_before_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    observation = Observation.objects.get()
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=None,
+        source_type='manual',
+        source_id='noncanonical-source',
+        metadata={'event_type': 'post_tool_use'},
+    )
+    WorkflowWork.objects.all().delete()
+    CeleryOutbox.objects.all().delete()
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('source_malformation', ('null_link_conflict', 'non_hook', 'mismatched_metadata'))
+def test_new_typed_hook_reuse_rejects_malformed_sibling_source_and_rolls_back(source_malformation: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    first = IngestHookEvent().execute(first_data)
+    observation = first.observation
+    source = ObservationSource.objects.get()
+
+    if source_malformation == 'null_link_conflict':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=None,
+            source_type='hook_event',
+            source_id=second_data.event_id,
+            metadata={'event_type': second_data.event_type},
+        )
+    elif source_malformation == 'non_hook':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=first.raw_event,
+            source_type='manual',
+            source_id='manual-source',
+            metadata={'event_type': first_data.event_type},
+        )
+    elif source_malformation == 'mismatched_metadata':
+        source.metadata = {'event_type': 'session_start'}
+        source.save(update_fields=['metadata', 'updated_at'])
+    else:
+        raise AssertionError(f'Unhandled source malformation: {source_malformation}')
+
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(second_data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'sibling_malformation',
+    (
+        'claude_mem_producer',
+        'no_op_normalization',
+        'missing_policy',
+        'legacy_policy',
+        'extra_direct_source',
+        'direct_observation_elsewhere',
+        'content_hash_mismatch',
+        'legacy_absent_policy',
+        'legacy_non_object_metadata',
+    ),
+)
+def test_typed_hook_duplicate_rejects_malformed_shared_observation_sibling_before_mutation(
+    sibling_malformation: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    first = IngestHookEvent().execute(first_data)
+    second = IngestHookEvent().execute(second_data)
+    sibling = second.raw_event
+    observation = first.observation
+
+    if sibling_malformation == 'claude_mem_producer':
+        sibling.source_adapter = 'claude_mem'
+        sibling.save(update_fields=['source_adapter', 'updated_at'])
+    elif sibling_malformation == 'no_op_normalization':
+        sibling.normalization_disposition = 'no_op'
+        sibling.normalization_reason = 'evidence_only'
+        sibling.save(update_fields=['normalization_disposition', 'normalization_reason', 'updated_at'])
+    elif sibling_malformation == 'missing_policy':
+        sibling.metadata = {key: value for key, value in sibling.metadata.items() if key != 'work_policy_v1'}
+        sibling.save(update_fields=['metadata', 'updated_at'])
+    elif sibling_malformation == 'legacy_policy':
+        sibling.metadata = {
+            **sibling.metadata,
+            'work_policy_v1': {
+                **sibling.metadata['work_policy_v1'],
+                'legacy_policy_fallback': True,
+            },
+        }
+        sibling.save(update_fields=['metadata', 'updated_at'])
+    elif sibling_malformation == 'extra_direct_source':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=sibling,
+            source_type='hook_event',
+            source_id='extra-sibling-source',
+            metadata={'event_type': sibling.event_type},
+        )
+    elif sibling_malformation == 'direct_observation_elsewhere':
+        Observation.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            agent=sibling.agent,
+            session=sibling.session,
+            raw_event=sibling,
+            observation_type='tool_use',
+            title='wrong sibling observation',
+            body='must not be accepted as canonical',
+            content_hash='wrong-sibling-observation-hash',
+            source_metadata={'event_type': sibling.event_type},
+        )
+    elif sibling_malformation == 'content_hash_mismatch':
+        sibling.content_hash = 'mismatched-sibling-content-hash'
+        sibling.save(update_fields=['content_hash', 'updated_at'])
+    elif sibling_malformation == 'legacy_absent_policy':
+        sibling.normalization_contract_version = None
+        sibling.normalization_disposition = None
+        sibling.normalization_reason = None
+        sibling.metadata = {key: value for key, value in sibling.metadata.items() if key != 'work_policy_v1'}
+        sibling.save(
+            update_fields=[
+                'metadata',
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'updated_at',
+            ],
+        )
+    elif sibling_malformation == 'legacy_non_object_metadata':
+        sibling.normalization_contract_version = None
+        sibling.normalization_disposition = None
+        sibling.normalization_reason = None
+        sibling.metadata = []
+        sibling.save(
+            update_fields=[
+                'metadata',
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'updated_at',
+            ],
+        )
+    else:
+        raise AssertionError(f'Unhandled sibling malformation: {sibling_malformation}')
+
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(first_data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('realtime_candidates_enabled', 'legacy_policy_fallback'),
+    ((False, False), (True, False), (False, True), (True, True)),
+)
+def test_new_typed_hook_reuse_accepts_valid_legacy_sibling_provenance(
+    realtime_candidates_enabled: bool,
+    legacy_policy_fallback: bool,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    legacy_data = hook_event_input(project, team)
+    typed_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    legacy = IngestHookEvent().execute(legacy_data)
+    legacy.raw_event.normalization_contract_version = None
+    legacy.raw_event.normalization_disposition = None
+    legacy.raw_event.normalization_reason = None
+    legacy.raw_event.metadata = {
+        **legacy.raw_event.metadata,
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': realtime_candidates_enabled,
+            'legacy_policy_fallback': legacy_policy_fallback,
+        },
+    }
+    legacy.raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+
+    typed = IngestHookEvent().execute(typed_data)
+
+    assert typed.duplicate is False
+    assert typed.observation.id == legacy.observation.id
+    assert RawEventEnvelope.objects.count() == 2
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 2
+    initial_state = hook_duplicate_state()
+
+    typed_replay = IngestHookEvent().execute(typed_data)
+
+    assert typed_replay.duplicate is True
+    assert typed_replay.observation.id == legacy.observation.id
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_provenance_validation_query_count_is_independent_of_sibling_count() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('PostgreSQL query-shape assertion')
+    organization, team, project, _owner, _api_key = create_project_scope()
+    service = IngestHookEvent()
+    first = service.execute(hook_event_input(project, team))
+
+    with CaptureQueriesContext(connection) as one_source_queries:
+        service._validate_typed_hook_evidence(
+            first.raw_event,
+            organization=organization,
+            project=project,
+            session=first.session,
+        )
+
+    for index in range(2, 12):
+        service.execute(
+            hook_event_input(
+                project,
+                team,
+                event_id=f'event-{index}',
+                idempotency_key=f'idem-{index}',
+                request_id=f'request-event-{index}',
+            ),
+        )
+
+    with CaptureQueriesContext(connection) as many_source_queries:
+        service._validate_typed_hook_evidence(
+            first.raw_event,
+            organization=organization,
+            project=project,
+            session=first.session,
+        )
+
+    assert len(many_source_queries.captured_queries) == len(one_source_queries.captured_queries)
+    assert len(many_source_queries.captured_queries) <= 8
+
+
+@pytest.mark.django_db
+def test_new_hook_event_locks_agent_session_once() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('PostgreSQL lock SQL assertion')
+    _organization, team, project, _owner, _api_key = create_project_scope()
+
+    with CaptureQueriesContext(connection) as queries:
+        result = IngestHookEvent().execute(hook_event_input(project, team))
+
+    session_lock_queries = [
+        query['sql'] for query in queries.captured_queries if 'FOR UPDATE OF "core_agentsession"' in query['sql']
+    ]
+    assert result.duplicate is False
+    assert len(session_lock_queries) == 1
 
 
 @pytest.mark.django_db

@@ -5,6 +5,8 @@ from dataclasses import dataclass
 
 import structlog
 from django.db import IntegrityError, transaction
+from django.db.models import Count, F, Q, Subquery
+from django.db.models.fields.json import KeyTextTransform
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
@@ -18,6 +20,7 @@ from engram.core.models import (
     Project,
     RawEventEnvelope,
     RawEventNormalizationDisposition,
+    Runtime,
     SessionStatus,
     Team,
     WorkflowSubjectType,
@@ -109,11 +112,6 @@ class IngestHookEvent:
                 with transaction.atomic():
                     agent = self._get_or_create_agent(organization, data)
                     session = self._get_or_create_session(organization, project, team, agent, data)
-                    session = lock_session_for_observation(
-                        organization_id=organization.id,
-                        project_id=project.id,
-                        session_id=session.id,
-                    )
                     duplicate = self._find_duplicate(organization, project, data)
                     if duplicate is not None:
                         transaction.set_rollback(True)
@@ -128,11 +126,6 @@ class IngestHookEvent:
                 team = session.team
 
                 session_was_active = session.status == SessionStatus.ACTIVE
-                if data.event_type == 'session_end':
-                    session.status = SessionStatus.ENDED
-                    session.ended_at = data.occurred_at or timezone.now()
-                    session.save(update_fields=['status', 'ended_at', 'updated_at'])
-
                 existing_observation = Observation.objects.filter(
                     organization=organization,
                     project=project,
@@ -195,10 +188,20 @@ class IngestHookEvent:
                     raw_event=raw_event,
                     source_id=data.event_id,
                     event_type=data.event_type,
+                    repair_missing_raw=False,
                 )
-                policy = raw_event.metadata['work_policy_v1']
+                observation, trusted_event_type, policy = self._validate_typed_hook_evidence(
+                    raw_event,
+                    organization=organization,
+                    project=project,
+                    session=session,
+                )
                 observation_id = str(observation.id)
-                if data.event_type not in {'session_start', 'session_end'} and policy['realtime_candidates_enabled']:
+                if trusted_event_type == 'session_end':
+                    session.status = SessionStatus.ENDED
+                    session.ended_at = data.occurred_at or timezone.now()
+                    session.save(update_fields=['status', 'ended_at', 'updated_at'])
+                if trusted_event_type not in {'session_start', 'session_end'} and policy['realtime_candidates_enabled']:
                     work, created = self._create_observation_work(
                         organization=organization,
                         project=project,
@@ -207,7 +210,7 @@ class IngestHookEvent:
                     )
                     if created:
                         dispatch_work_task(process_observation_work_v1, work.id)
-                if data.event_type == 'session_end' and session_was_active:
+                if trusted_event_type == 'session_end' and session_was_active:
                     session_id = str(session.id)
                     transaction.on_commit(lambda: distill_session.delay(session_id))
 
@@ -264,14 +267,14 @@ class IngestHookEvent:
         if raw_event.team_id != session.team_id or raw_event.team_id != requested_team_id:
             raise AccessDeniedError('team_scope_denied', 'Hook duplicate is outside effective team scope')
         self._validate_duplicate_producer(raw_event)
-        self._repair_duplicate(
+        observation = self._repair_duplicate(
             raw_event,
             organization=organization,
             project=project,
             session=session,
         )
 
-        return self._existing_result(raw_event)
+        return self._existing_result(raw_event, observation)
 
     def _repair_duplicate(
         self,
@@ -280,36 +283,55 @@ class IngestHookEvent:
         organization: Organization,
         project: Project,
         session: AgentSession,
-    ) -> None:
-        observation = raw_event.observations.order_by('created_at').first()
-        if observation is None:
-            observation = Observation.objects.filter(
+    ) -> Observation:
+        if raw_event.normalization_contract_version == 1:
+            observation, trusted_event_type, policy = self._validate_typed_hook_evidence(
+                raw_event,
                 organization=organization,
                 project=project,
                 session=session,
-                content_hash=raw_event.content_hash,
-            ).first()
-        if observation is None:
-            return
-        if observation.team_id != session.team_id:
-            raise AccessDeniedError('team_scope_denied', 'Hook duplicate observation is outside effective team scope')
+            )
+        else:
+            normalization_state = (
+                raw_event.normalization_contract_version,
+                raw_event.normalization_disposition,
+                raw_event.normalization_reason,
+            )
+            if normalization_state != (None, None, None):
+                raise ValueError('malformed legacy hook normalization state')
+            observation = raw_event.observations.order_by('created_at').first()
+            if observation is None:
+                observation = Observation.objects.filter(
+                    organization=organization,
+                    project=project,
+                    session=session,
+                    content_hash=raw_event.content_hash,
+                ).first()
+            if observation is None:
+                raise ValueError('hook duplicate has no persisted observation')
+            self._validate_hook_observation_scope(
+                raw_event,
+                observation,
+                organization=organization,
+                project=project,
+                session=session,
+            )
 
-        trusted_event_type = self._trusted_duplicate_event_type(raw_event, observation)
-        policy, policy_is_new = self._duplicate_work_policy(raw_event, organization)
-
-        self._ensure_hook_source(
-            organization=organization,
-            project=project,
-            observation=observation,
-            raw_event=raw_event,
-            source_id=raw_event.client_event_id,
-            event_type=trusted_event_type,
-        )
-        if policy_is_new:
-            raw_event.metadata = {**raw_event.metadata, 'work_policy_v1': policy}
-            raw_event.save(update_fields=['metadata', 'updated_at'])
+            trusted_event_type = self._trusted_duplicate_event_type(raw_event, observation)
+            policy, policy_is_new = self._duplicate_work_policy(raw_event, organization)
+            self._ensure_hook_source(
+                organization=organization,
+                project=project,
+                observation=observation,
+                raw_event=raw_event,
+                source_id=raw_event.client_event_id,
+                event_type=trusted_event_type,
+            )
+            if policy_is_new:
+                raw_event.metadata = {**raw_event.metadata, 'work_policy_v1': policy}
+                raw_event.save(update_fields=['metadata', 'updated_at'])
         if trusted_event_type in {'session_start', 'session_end'} or not policy['realtime_candidates_enabled']:
-            return
+            return observation
         work, created = self._create_observation_work(
             organization=organization,
             project=project,
@@ -318,6 +340,170 @@ class IngestHookEvent:
         )
         if created:
             dispatch_work_task(process_observation_work_v1, work.id)
+
+        return observation
+
+    def _validate_typed_hook_evidence(
+        self,
+        raw_event: RawEventEnvelope,
+        *,
+        organization: Organization,
+        project: Project,
+        session: AgentSession,
+    ) -> tuple[Observation, str, dict[str, object]]:
+        policy = self._typed_work_policy(raw_event)
+
+        direct_sources = list(raw_event.observation_sources.select_related('observation').order_by('created_at')[:2])
+        if len(direct_sources) != 1:
+            raise ValueError('typed hook evidence requires exactly one direct hook source')
+        observation = direct_sources[0].observation
+        self._validate_hook_observation_scope(
+            raw_event,
+            observation,
+            organization=organization,
+            project=project,
+            session=session,
+        )
+
+        trusted_event_type = self._trusted_duplicate_event_type(raw_event, observation)
+        sources = ObservationSource.objects.filter(observation=observation)
+        source_cardinality = sources.aggregate(
+            source_count=Count('id'),
+            linked_raw_count=Count('raw_event_id', distinct=True),
+        )
+        if source_cardinality['source_count'] != source_cardinality['linked_raw_count']:
+            raise ValueError('ambiguous typed hook source cardinality')
+        valid_source = Q(
+            source_type='hook_event',
+            raw_event__isnull=False,
+            organization_id=organization.id,
+            project_id=project.id,
+            observation_id=observation.id,
+            source_id=F('raw_event__client_event_id'),
+            source_event_type=F('raw_event__event_type'),
+        )
+        valid_source_count = (
+            sources.annotate(
+                source_event_type=KeyTextTransform('event_type', 'metadata'),
+            )
+            .filter(valid_source)
+            .count()
+        )
+        if valid_source_count != source_cardinality['source_count']:
+            raise ValueError('malformed typed hook source')
+
+        linked_raw_ids = sources.filter(raw_event_id__isnull=False).order_by().values('raw_event_id')
+        typed_policy_false = {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': False,
+            'legacy_policy_fallback': False,
+        }
+        typed_policy_true = {**typed_policy_false, 'realtime_candidates_enabled': True}
+        legacy_policy_false = {**typed_policy_false, 'legacy_policy_fallback': True}
+        legacy_policy_true = {**typed_policy_true, 'legacy_policy_fallback': True}
+        valid_typed_raw = Q(
+            normalization_contract_version=1,
+            normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+            normalization_reason__isnull=True,
+        ) & (Q(metadata__work_policy_v1=typed_policy_false) | Q(metadata__work_policy_v1=typed_policy_true))
+        valid_legacy_raw = Q(
+            normalization_contract_version__isnull=True,
+            normalization_disposition__isnull=True,
+            normalization_reason__isnull=True,
+        ) & (
+            Q(metadata__work_policy_v1=typed_policy_false)
+            | Q(metadata__work_policy_v1=typed_policy_true)
+            | Q(metadata__work_policy_v1=legacy_policy_false)
+            | Q(metadata__work_policy_v1=legacy_policy_true)
+        )
+        valid_linked_raw = Q(
+            source_adapter__in=Runtime.values,
+            organization_id=organization.id,
+            project_id=project.id,
+            session_id=session.id,
+            team_id=session.team_id,
+            agent_id=session.agent_id,
+            event_type=trusted_event_type,
+            content_hash=observation.content_hash,
+        ) & (valid_typed_raw | valid_legacy_raw)
+        valid_linked_raw_count = (
+            RawEventEnvelope.objects.filter(
+                id__in=Subquery(linked_raw_ids),
+            )
+            .filter(valid_linked_raw)
+            .count()
+        )
+        if valid_linked_raw_count != source_cardinality['linked_raw_count']:
+            raise ValueError('malformed typed hook linked raw')
+        if (
+            ObservationSource.objects.filter(raw_event_id__in=Subquery(linked_raw_ids))
+            .exclude(
+                observation_id=observation.id,
+            )
+            .exists()
+        ):
+            raise ValueError('ambiguous typed hook linked raw source')
+        if (
+            Observation.objects.filter(raw_event_id__in=Subquery(linked_raw_ids))
+            .exclude(
+                id=observation.id,
+            )
+            .exists()
+        ):
+            raise ValueError('ambiguous typed hook direct observation')
+        if observation.raw_event_id is not None and not sources.filter(raw_event_id=observation.raw_event_id).exists():
+            raise ValueError('typed hook direct observation has no canonical source')
+
+        return observation, trusted_event_type, policy
+
+    def _validate_hook_observation_scope(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        *,
+        organization: Organization,
+        project: Project,
+        session: AgentSession,
+    ) -> None:
+        expected_scope = (
+            organization.id,
+            project.id,
+            session.id,
+            session.team_id,
+            session.agent_id,
+        )
+        if (
+            raw_event.organization_id,
+            raw_event.project_id,
+            raw_event.session_id,
+            raw_event.team_id,
+            raw_event.agent_id,
+        ) != expected_scope or (
+            observation.organization_id,
+            observation.project_id,
+            observation.session_id,
+            observation.team_id,
+            observation.agent_id,
+        ) != expected_scope:
+            raise ValueError('mismatched hook observation scope')
+        if raw_event.content_hash != observation.content_hash:
+            raise ValueError('mismatched hook observation content')
+
+    def _typed_work_policy(self, raw_event: RawEventEnvelope) -> dict[str, object]:
+        if (
+            raw_event.normalization_contract_version != 1
+            or raw_event.normalization_disposition != RawEventNormalizationDisposition.OBSERVATION
+            or raw_event.normalization_reason is not None
+        ):
+            raise ValueError('malformed typed hook normalization disposition')
+        metadata = raw_event.metadata
+        if not isinstance(metadata, dict) or 'work_policy_v1' not in metadata:
+            raise ValueError('missing work_policy_v1')
+        policy = metadata['work_policy_v1']
+        if not self._valid_work_policy(policy) or policy['legacy_policy_fallback'] is not False:
+            raise ValueError('malformed work_policy_v1')
+
+        return policy
 
     def _trusted_duplicate_event_type(self, raw_event: RawEventEnvelope, observation: Observation) -> str:
         observation_metadata = observation.source_metadata
@@ -398,6 +584,7 @@ class IngestHookEvent:
         raw_event: RawEventEnvelope,
         source_id: str,
         event_type: str,
+        repair_missing_raw: bool = True,
     ) -> ObservationSource:
         source, created = ObservationSource.objects.get_or_create(
             organization=organization,
@@ -411,7 +598,7 @@ class IngestHookEvent:
                 'metadata': {'event_type': event_type},
             },
         )
-        if not created and source.raw_event_id is None:
+        if repair_missing_raw and not created and source.raw_event_id is None:
             source.raw_event = raw_event
             source.save(update_fields=['raw_event', 'updated_at'])
 
@@ -494,15 +681,13 @@ class IngestHookEvent:
         ):
             raise ValueError('hook duplicate is owned by another producer')
 
-    def _existing_result(self, raw_event: RawEventEnvelope) -> HookIngestResult:
-        observation = raw_event.observations.order_by('created_at').first()
-        if observation is None:
-            observation = Observation.objects.get(
-                organization=raw_event.organization,
-                project=raw_event.project,
-                session=raw_event.session,
-                content_hash=raw_event.content_hash,
-            )
+    def _existing_result(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+    ) -> HookIngestResult:
+        if raw_event.content_hash != observation.content_hash:
+            raise ValueError('hook duplicate observation content mismatch')
 
         return HookIngestResult(
             request_id=raw_event.request_id,
