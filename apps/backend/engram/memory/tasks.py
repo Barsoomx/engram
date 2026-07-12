@@ -25,7 +25,12 @@ from engram.core.models import (
 )
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.confidence_decay import DecayMemoryConfidence
-from engram.memory.distillation import run_session_distillation_with_tracking
+from engram.memory.distillation import (
+    DistillSession,
+    DistillSessionInput,
+    DistillSessionResult,
+    run_session_distillation_with_tracking,
+)
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
     WEEKLY_DIGEST_WINDOW_DAYS,
@@ -337,6 +342,112 @@ def _load_observation_work_subject(work: WorkflowWork) -> Observation:
     return observation
 
 
+def _load_session_work_upper(work: WorkflowWork) -> int:
+    if work.subject_type != WorkflowSubjectType.AGENT_SESSION:
+        raise MemoryWorkerError('workflow work subject type does not match session task')
+
+    try:
+        fingerprint = work_input_fingerprint(
+            work_type=work.work_type,
+            subject_type=work.subject_type,
+            subject_id=work.subject_id,
+            contract_version=work.contract_version,
+            occurrence_key=work.occurrence_key,
+            input_snapshot=work.input_snapshot,
+        )
+    except ValueError as error:
+        raise MemoryWorkerError('workflow work fingerprint is invalid') from error
+    if fingerprint != work.input_fingerprint:
+        raise MemoryWorkerError('workflow work fingerprint does not match frozen input')
+
+    return work.input_snapshot['upper_sequence_inclusive']
+
+
+def _acquire_session_distill_run(
+    work: WorkflowWork,
+    *,
+    request_id: str,
+    correlation_id: str,
+) -> tuple[WorkflowRun, bool]:
+    with transaction.atomic():
+        WorkflowWork.objects.select_for_update().get(
+            id=work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+        existing = (
+            WorkflowRun.objects.filter(
+                work_id=work.id,
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                run_type=work.work_type,
+            )
+            .order_by('created_at')
+            .first()
+        )
+        if existing is not None:
+            return existing, False
+
+        run = WorkflowRun.objects.create(
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+            team_id=work.team_id,
+            work_id=work.id,
+            run_type=work.work_type,
+            status=WorkflowRunStatus.RUNNING,
+            started_at=timezone.now(),
+            input_snapshot={'session_id': work.input_snapshot['session_id']},
+            request_id=request_id,
+            correlation_id=correlation_id,
+        )
+
+        return run, True
+
+
+def _complete_session_distill_run(
+    workflow_run: WorkflowRun,
+    result: DistillSessionResult,
+    *,
+    escalation: bool,
+) -> None:
+    fields: dict[str, object] = {
+        'status': WorkflowRunStatus.SUCCEEDED,
+        'finished_at': timezone.now(),
+        'provider_call_ids': list(result.provider_call_ids),
+    }
+    if result.auto_promoted:
+        fields['result_memory_id'] = result.auto_promoted[0].id
+    if escalation:
+        fields['escalation'] = True
+
+    updated = WorkflowRun.objects.filter(id=workflow_run.id, status=WorkflowRunStatus.RUNNING).update(**fields)
+    if updated == 1:
+        return
+    if WorkflowRun.objects.filter(id=workflow_run.id, status=WorkflowRunStatus.SUCCEEDED).exists():
+        return
+
+    raise MemoryWorkerError('workflow run is no longer running')
+
+
+def _finalize_session_distill_work(
+    work: WorkflowWork,
+    workflow_run: WorkflowRun,
+    result: DistillSessionResult,
+) -> None:
+    if not result.truncated and work.disposition == WorkflowWorkDisposition.REQUIRED:
+        resolver = (
+            resolve_work_succeeded if result.auto_promoted or result.queued_for_review else resolve_work_no_signal
+        )
+        resolver(
+            work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+
+    _complete_session_distill_run(workflow_run, result, escalation=result.truncated)
+
+
 def _run_unfinished_versioned_work(
     *,
     work_id: object,
@@ -505,11 +616,71 @@ def distill_session_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    return _run_unfinished_versioned_work(
+    work, explicit_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
     )
+    if automatic_terminal:
+        return str(work.id)
+
+    upper = _load_session_work_upper(work)
+    session_id = uuid.UUID(work.input_snapshot['session_id'])
+    correlation_id = f'distill-session:{session_id}'
+    request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
+
+    if explicit_run is not None:
+        workflow_run = _claim_workflow_run(work, explicit_run)
+        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+            return _succeeded_workflow_run_result(work, workflow_run, via='claim')
+        if workflow_run.status != WorkflowRunStatus.RUNNING:
+            raise MemoryWorkerError('workflow run claim returned invalid status')
+    else:
+        workflow_run, created = _acquire_session_distill_run(
+            work,
+            request_id=request_id,
+            correlation_id=correlation_id,
+        )
+        if not created:
+            logger.info(
+                'distill_session_work_initial_run_adopted',
+                work_id=str(work.id),
+                workflow_run_id=str(workflow_run.id),
+                status=workflow_run.status,
+            )
+
+            return str(workflow_run.id)
+
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        correlation_id=correlation_id,
+        request_id=request_id,
+    )
+    try:
+        result = DistillSession().execute(
+            DistillSessionInput(
+                session_id=session_id,
+                upper_sequence_inclusive=upper,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                run_id=str(workflow_run.id),
+            ),
+        )
+        _finalize_session_distill_work(work, workflow_run, result)
+    except MemoryWorkerError as exc:
+        can_retry = exc.retryable and self.request.retries < self.max_retries
+        _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
+        if can_retry:
+            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
+            raise self.retry(exc=exc, countdown=countdown) from None
+        raise
+    except Exception as error:
+        _record_workflow_run_error(workflow_run, error, requeue=False)
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    return str(workflow_run.id)
 
 
 @app.task(

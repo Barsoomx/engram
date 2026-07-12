@@ -9,6 +9,7 @@ from decimal import Decimal
 
 import structlog
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.core.models import (
@@ -60,6 +61,8 @@ from engram.model_policy.services import (
 
 logger = structlog.get_logger(__name__)
 
+_LIFECYCLE_EVENT_TYPES = ('session_start', 'session_end')
+
 
 @dataclass(frozen=True)
 class DistillSessionInput:
@@ -68,6 +71,7 @@ class DistillSessionInput:
     correlation_id: str = ''
     auto_approve_threshold: Decimal | None = None
     run_id: str = ''
+    upper_sequence_inclusive: int | None = None
 
 
 @dataclass(frozen=True)
@@ -276,7 +280,7 @@ def _parse_reduced_candidates(raw_body: str) -> tuple[_ReducedCandidate, ...] | 
 class DistillSession:
     def execute(self, data: DistillSessionInput) -> DistillSessionResult:
         session = self._load_session(data.session_id)
-        observations = self._session_observations(session)
+        observations = self._session_observations(session, data.upper_sequence_inclusive)
         if not observations:
             return DistillSessionResult(session=session, auto_promoted=(), queued_for_review=())
 
@@ -388,13 +392,29 @@ class DistillSession:
         except AgentSession.DoesNotExist as error:
             raise MemoryWorkerError('session not found') from error
 
-    def _session_observations(self, session: AgentSession) -> list[Observation]:
+    def _session_observations(
+        self,
+        session: AgentSession,
+        upper_sequence_inclusive: int | None,
+    ) -> list[Observation]:
+        queryset = Observation.objects.filter(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            session=session,
+        )
+        if upper_sequence_inclusive is None:
+            return list(queryset.order_by('prompt_number', 'created_at'))
+
         return list(
-            Observation.objects.filter(
-                organization_id=session.organization_id,
-                project_id=session.project_id,
-                session=session,
-            ).order_by('prompt_number', 'created_at'),
+            queryset.filter(
+                session_sequence__gt=0,
+                session_sequence__lte=upper_sequence_inclusive,
+            )
+            .filter(
+                Q(source_metadata__event_type__isnull=True)
+                | ~Q(source_metadata__event_type__in=_LIFECYCLE_EVENT_TYPES),
+            )
+            .order_by('session_sequence'),
         )
 
     def _resolve_gateway(
