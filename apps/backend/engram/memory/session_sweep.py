@@ -63,13 +63,17 @@ class SweepStaleSessions:
         if scope is None:
             return None
 
-        result = EndSession().execute(
-            organization_id=scope['organization_id'],
-            project_id=scope['project_id'],
-            session_id=session_id,
-            ended_at=None,
-            source='idle',
-        )
+        try:
+            result = EndSession().execute(
+                organization_id=scope['organization_id'],
+                project_id=scope['project_id'],
+                session_id=session_id,
+                ended_at=None,
+                source='idle',
+            )
+        except AgentSession.DoesNotExist:
+            return None
+
         if not result.transitioned:
             return None
 

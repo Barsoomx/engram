@@ -3,10 +3,18 @@ from __future__ import annotations
 from uuid import UUID
 
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.db.transaction import TransactionManagementError
 
 from engram.core.models import AgentSession, Observation, RawEventEnvelope
+
+LIFECYCLE_EVENT_TYPES = ('session_start', 'session_end')
+
+
+def useful_observation_q() -> Q:
+    return Q(source_metadata__event_type__isnull=True) | ~Q(
+        source_metadata__event_type__in=LIFECYCLE_EVENT_TYPES,
+    )
 
 
 def _require_active_transaction() -> None:

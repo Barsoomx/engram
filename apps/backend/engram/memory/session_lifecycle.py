@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal
 
 from django.db import transaction
-from django.db.models import Max, Q
+from django.db.models import Max
 from django.utils import timezone
 
 from engram.core.models import (
@@ -17,14 +17,13 @@ from engram.core.models import (
     WorkflowWorkDisposition,
     WorkflowWorkType,
 )
+from engram.memory.observation_work import useful_observation_q
 from engram.memory.tasks import dispatch_work_task, distill_session_work_v1
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     create_work,
     resolve_work_no_input,
 )
-
-_LIFECYCLE_EVENT_TYPES = ('session_start', 'session_end')
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,9 +124,7 @@ class EndSession:
                 project_id=session.project_id,
                 session_id=session.id,
             )
-            .filter(
-                Q(source_metadata__event_type__isnull=True) | ~Q(source_metadata__event_type__in=_LIFECYCLE_EVENT_TYPES)
-            )
+            .filter(useful_observation_q())
             .aggregate(upper=Max('session_sequence'))
             .get('upper')
         )

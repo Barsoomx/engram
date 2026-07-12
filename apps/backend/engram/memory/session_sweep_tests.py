@@ -345,6 +345,45 @@ def test_counters_report_totals_across_mixed_batch(
 
 
 @pytest.mark.django_db
+def test_sweep_contains_vanished_session_and_ends_the_rest(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.session_lifecycle import EndSession
+
+    vanished = create_session(f_org, f_team, f_project, f_agent, suffix='vanished')
+    create_raw_event(vanished, received_at=timezone.now() - timedelta(minutes=40), suffix='1')
+    create_observation(vanished, suffix='1', session_sequence=1)
+
+    survivor = create_session(f_org, f_team, f_project, f_agent, suffix='survivor')
+    create_raw_event(survivor, received_at=timezone.now() - timedelta(minutes=40), suffix='2')
+    create_observation(survivor, suffix='2', session_sequence=1)
+
+    original_execute = EndSession.execute
+
+    def flaky_execute(self: EndSession, *, session_id: object, **kwargs: object) -> object:
+        if session_id == vanished.id:
+            raise AgentSession.DoesNotExist
+
+        return original_execute(self, session_id=session_id, **kwargs)
+
+    monkeypatch.setattr(EndSession, 'execute', flaky_execute)
+
+    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
+        result = sweep_stale_sessions()
+
+    vanished.refresh_from_db()
+    survivor.refresh_from_db()
+    assert vanished.status == SessionStatus.ACTIVE
+    assert survivor.status == SessionStatus.ENDED
+    m_delay.assert_not_called()
+    assert result == {'swept': 1, 'distilled': 1}
+
+
+@pytest.mark.django_db
 def test_env_override_moves_stale_cutoff_boundary(
     f_org: Organization,
     f_team: Team,

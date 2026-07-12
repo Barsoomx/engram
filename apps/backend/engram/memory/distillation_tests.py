@@ -5,6 +5,7 @@ import threading
 import urllib.error
 from decimal import Decimal
 from typing import Any
+from unittest import mock
 
 import pytest
 from django.db import connection, transaction
@@ -2230,3 +2231,47 @@ def test_distill_session_work_v1_truncated_result_keeps_work_required_and_adopts
     assert len(opener.calls) == 8
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+class _RetryScheduledError(Exception):
+    pass
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_requeued_initial_run_executes_on_automatic_redelivery(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    work = create_session_distillation_work(session, upper=2)
+    calls: list[Any] = []
+
+    def opener(request: Any, timeout: float = 30) -> _RecordingResponse:
+        calls.append(request)
+        if len(calls) == 1:
+            raise urllib.error.URLError('transient distill failure')
+
+        return _RecordingResponse(held_candidate_body())
+
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    with mock.patch.object(distill_session_work_v1, 'retry', side_effect=_RetryScheduledError):
+        with pytest.raises(_RetryScheduledError):
+            distill_session_work_v1(str(work.id))
+
+    requeued = WorkflowRun.objects.get(work=work)
+    assert requeued.status == WorkflowRunStatus.QUEUED
+    assert len(calls) == 1
+
+    distill_session_work_v1(str(work.id))
+
+    assert len(calls) == 2
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    run = WorkflowRun.objects.get(work=work)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.finished_at is not None
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE

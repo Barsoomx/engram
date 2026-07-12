@@ -9,7 +9,6 @@ from decimal import Decimal
 
 import structlog
 from django.db import transaction
-from django.db.models import Q
 from django.utils import timezone
 
 from engram.core.models import (
@@ -34,6 +33,7 @@ from engram.memory.candidate_parsing import (
     truncate_with_marker,
 )
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
+from engram.memory.observation_work import useful_observation_q
 from engram.memory.services import (
     MemoryWorkerError,
     call_with_fallback,
@@ -60,8 +60,6 @@ from engram.model_policy.services import (
 )
 
 logger = structlog.get_logger(__name__)
-
-_LIFECYCLE_EVENT_TYPES = ('session_start', 'session_end')
 
 
 @dataclass(frozen=True)
@@ -410,10 +408,7 @@ class DistillSession:
                 session_sequence__gt=0,
                 session_sequence__lte=upper_sequence_inclusive,
             )
-            .filter(
-                Q(source_metadata__event_type__isnull=True)
-                | ~Q(source_metadata__event_type__in=_LIFECYCLE_EVENT_TYPES),
-            )
+            .filter(useful_observation_q())
             .order_by('session_sequence'),
         )
 

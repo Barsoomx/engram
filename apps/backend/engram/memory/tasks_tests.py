@@ -713,7 +713,7 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
             'team_id': foreign_team.id,
         },
     ]
-    if task_attribute != 'process_observation_work_v1':
+    if task_attribute not in ('process_observation_work_v1', 'distill_session_work_v1'):
         invalid_updates.append({'status': WorkflowRunStatus.SUCCEEDED})
     task = getattr(tasks_module, task_attribute)
 
@@ -865,6 +865,56 @@ def test_distill_session_work_automatic_delivery_does_not_retry_failed_initial_a
     assert WorkflowRun.objects.filter(work=work).count() == 1
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db
+def test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+    succeeded_run = WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={'session_id': str(session.id)},
+    )
+    now = timezone.now()
+    WorkflowRun.objects.filter(id=succeeded_run.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        started_at=now,
+        finished_at=now,
+    )
+
+    with (
+        mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute,
+        mock.patch('engram.memory.tasks.logger.info') as m_log,
+    ):
+        result = tasks_module.distill_session_work_v1(
+            str(work.id),
+            workflow_run_id=str(succeeded_run.id),
+        )
+
+    m_execute.assert_not_called()
+    assert result == str(succeeded_run.id)
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    m_log.assert_called_once_with(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(succeeded_run.id),
+        via='claim',
+    )
 
 
 @pytest.mark.django_db

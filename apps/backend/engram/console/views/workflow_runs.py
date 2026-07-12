@@ -106,6 +106,9 @@ class WorkflowRunViewSet(
                 workflow_run_id=str(new_run.id),
             )
         elif run.run_type == WorkflowRunType.SESSION_DISTILLATION:
+            if run.work_id is not None:
+                raise InvalidRerunSnapshotError('work-linked session distillation runs cannot be rerun')
+
             raw_session_id = input_snapshot.get('session_id')
 
             try:
