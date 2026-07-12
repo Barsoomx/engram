@@ -209,6 +209,37 @@ existing session, lock it in a short atomic block before adopting a legacy null
 team; a different non-null team fails closed. Bundle creation remains its own
 transaction and creates no raw event, observation, work, or task.
 
+### Final provenance hardening
+
+An existing hook/context session with raw or observation history has immutable
+producer identity. While holding the session lock, reject a different agent,
+runtime, or conflicting nonblank `platform_source` before changing the session
+or writing downstream state. Hook returns the existing generic
+`hook_identity_collision`; context returns `team_scope_denied`. A blank legacy
+`platform_source` may adopt the requested runtime, a history-free session may
+still be corrected, and an agent-version-only update remains allowed. Rejected
+requests roll back any newly created or updated `Agent` and leave prior replay
+valid.
+
+Imported sessions record both `source=claude_mem_import` and the exact
+`source_store_id` in metadata. Reuse of an existing canonical import session
+requires exact team, content-session, and memory-session identity; metadata
+must identify the import producer, and a present store ID must equal the
+requested store. If the store field is absent, legacy eligibility is determined
+by the exact import-producer marker, team/content/memory identity, and canonical
+external-ID recomputation; there is no time-based or implicit legacy exemption.
+A collision fails the surrounding import transaction without leaving a new
+agent or mutating the existing session.
+
+Memory-to-session lookup returns exactly one canonical mapping or fails closed.
+Modern candidates are prefiltered by exact producer/store metadata. Legacy
+candidates must lack the store field, retain import-producer metadata, and are
+searched under the canonical namespace with a hard limit of 32 candidates plus
+one overflow sentinel. Canonical-ID recomputation remains authoritative. Zero
+matches means no session, two matches means ambiguous input, and overflow is a
+bounded lookup failure. Do not add global `memory_session_id` uniqueness or a
+new migration.
+
 ## Failure matrix and RED tests
 
 Each row must be a focused failing test before implementation, then GREEN:
@@ -234,6 +265,11 @@ Each row must be a focused failing test before implementation, then GREEN:
 | malformed v1 disposition/source cardinality | database/service rejects before acceptance |
 | task payload inspection | exact task name and only `[work_id]`; no text, prompt, provider result, or secret |
 | legacy task callsite scan | no new C1.2 producer invokes `process_observation_recorded` |
+| history-bearing session changes agent/runtime | generic denial; session/evidence/work/bundle unchanged; old replay remains valid |
+| empty or blank-platform legacy session correction | requested identity correction succeeds under lock |
+| canonical import session owned by another producer | import identity collision and complete transaction rollback |
+| duplicate same-store memory mapping | explicit ambiguity failure; no imported evidence or cursor mutation |
+| long-prefix or excessive legacy import candidates | exact modern binding or bounded fail-closed legacy lookup |
 
 Replace current hook tests that expect zero outbox rows inside the surrounding
 transaction or post-commit dispatch. Keep lifecycle `distill_session` callback
