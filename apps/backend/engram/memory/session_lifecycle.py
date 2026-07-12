@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Literal
 
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils import timezone
 
 from engram.core.models import (
@@ -125,7 +125,9 @@ class EndSession:
                 project_id=session.project_id,
                 session_id=session.id,
             )
-            .exclude(source_metadata__event_type__in=_LIFECYCLE_EVENT_TYPES)
+            .filter(
+                Q(source_metadata__event_type__isnull=True) | ~Q(source_metadata__event_type__in=_LIFECYCLE_EVENT_TYPES)
+            )
             .aggregate(upper=Max('session_sequence'))
             .get('upper')
         )

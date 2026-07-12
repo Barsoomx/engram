@@ -81,6 +81,56 @@ def test_end_watermark_excludes_lifecycle_uses_server_sequence_and_freezes_prefi
 
 
 @pytest.mark.django_db
+def test_end_watermark_counts_observations_without_event_type_key() -> None:
+    lifecycle = _load_lifecycle()
+    organization, project, session = create_scope('watermark-no-event-type')
+    AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=10)
+    _seed_observation(session, sequence=1, event_type='post_tool_use')
+    Observation.objects.create(
+        organization=session.organization,
+        project=session.project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='observation 2',
+        content_hash=f'content-{session.id}-2',
+        session_sequence=2,
+        source_metadata={},
+    )
+    Observation.objects.create(
+        organization=session.organization,
+        project=session.project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='observation 3',
+        content_hash=f'content-{session.id}-3',
+        session_sequence=3,
+        source_metadata={'kind': 'digest'},
+    )
+    _seed_observation(session, sequence=4, event_type='session_end')
+
+    result = lifecycle.EndSession().execute(
+        organization_id=organization.id,
+        project_id=project.id,
+        session_id=session.id,
+        ended_at=timezone.now(),
+        source='explicit',
+    )
+
+    assert result.upper_sequence_inclusive == 3
+    work = WorkflowWork.objects.get()
+    assert work.input_snapshot == {
+        'schema': 'session_distillation_input/v1',
+        'session_id': str(session.id),
+        'lower_sequence_exclusive': 0,
+        'upper_sequence_inclusive': 3,
+    }
+
+
+@pytest.mark.django_db
 @pytest.mark.parametrize('source', ('explicit', 'idle'))
 def test_end_atomically_transitions_creates_work_and_id_only_signal(source: str) -> None:
     lifecycle = _load_lifecycle()
