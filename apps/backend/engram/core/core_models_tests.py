@@ -185,6 +185,7 @@ def test_raw_event_duplicate_replay_is_scoped_to_session_event_id() -> None:
         content_hash='hash-1',
         runtime='codex',
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
 
     with pytest.raises(IntegrityError):
@@ -200,6 +201,7 @@ def test_raw_event_duplicate_replay_is_scoped_to_session_event_id() -> None:
             content_hash='hash-1',
             runtime='codex',
             payload={'tool_name': 'bash'},
+            normalization_contract_version=0,
         )
 
 
@@ -221,6 +223,7 @@ def test_raw_event_rejects_cross_scope_session_on_create() -> None:
             content_hash='cross-event-hash',
             runtime='codex',
             payload={'tool_name': 'bash'},
+            normalization_contract_version=0,
         )
 
 
@@ -237,6 +240,7 @@ def test_observations_dedupe_by_session_and_content_hash() -> None:
         observation_type='decision',
         title='Use server-side memory',
         content_hash='observation-hash',
+        session_sequence=1,
     )
 
     with pytest.raises(IntegrityError):
@@ -249,6 +253,7 @@ def test_observations_dedupe_by_session_and_content_hash() -> None:
             observation_type='decision',
             title='Use server-side memory',
             content_hash='observation-hash',
+            session_sequence=2,
         )
 
 
@@ -268,6 +273,7 @@ def test_observation_rejects_cross_scope_raw_event_on_create() -> None:
         content_hash='other-event-hash',
         runtime='codex',
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
 
     with pytest.raises(ValidationError):
@@ -281,6 +287,7 @@ def test_observation_rejects_cross_scope_raw_event_on_create() -> None:
             observation_type='decision',
             title='Cross source event',
             content_hash='cross-observation-hash',
+            session_sequence=1,
         )
 
 
@@ -299,6 +306,7 @@ def test_observation_sources_preserve_provenance_with_scoped_uniqueness() -> Non
         content_hash='event-source-hash',
         runtime='codex',
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -310,6 +318,7 @@ def test_observation_sources_preserve_provenance_with_scoped_uniqueness() -> Non
         observation_type='decision',
         title='Record source links',
         content_hash='source-observation-hash',
+        session_sequence=1,
     )
 
     source = ObservationSource.objects.create(
@@ -351,6 +360,7 @@ def test_observation_source_rejects_cross_scope_raw_event_on_create() -> None:
         observation_type='decision',
         title='Record source links',
         content_hash='source-scope-observation-hash',
+        session_sequence=1,
     )
     other_raw_event = RawEventEnvelope.objects.create(
         organization=other_organization,
@@ -364,6 +374,7 @@ def test_observation_source_rejects_cross_scope_raw_event_on_create() -> None:
         content_hash='other-source-event-hash',
         runtime='codex',
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
 
     with pytest.raises(ValidationError):
@@ -390,6 +401,7 @@ def test_memory_candidate_rejects_cross_scope_source_observation_on_create() -> 
         observation_type='decision',
         title='Other observation',
         content_hash='other-candidate-observation-hash',
+        session_sequence=1,
     )
 
     with pytest.raises(ValidationError):
@@ -940,6 +952,7 @@ def create_c11_raw_event(
 
 def create_c11_observation(scope: C11Scope, *, suffix: str) -> Observation:
     organization, team, project, agent, session = scope
+    session_sequence = Observation.objects.filter(session=session).count() + 1
 
     return Observation.objects.create(
         organization=organization,
@@ -950,6 +963,7 @@ def create_c11_observation(scope: C11Scope, *, suffix: str) -> Observation:
         observation_type='decision',
         title=f'C1.1 observation {suffix}',
         content_hash=f'c11-observation-{suffix}',
+        session_sequence=session_sequence,
     )
 
 
@@ -994,7 +1008,7 @@ def assert_c11_save_rejected(work: models.Model, **changes: object) -> None:
 @pytest.mark.parametrize(
     ('contract_version', 'disposition', 'reason'),
     [
-        (None, None, None),
+        (0, None, None),
         (1, 'observation', None),
         (1, 'no_op', 'evidence_only'),
     ],
@@ -1044,7 +1058,7 @@ def test_raw_event_normalization_expand_rejects_partial_or_unknown_combinations(
     raw_event = create_c11_raw_event(
         create_scope(),
         suffix='invalid',
-        contract_version=None,
+        contract_version=0,
         disposition=None,
         reason=None,
     )
@@ -1061,7 +1075,7 @@ def test_raw_event_normalization_expand_rejects_partial_or_unknown_combinations(
         raw_event.normalization_contract_version,
         raw_event.normalization_disposition,
         raw_event.normalization_reason,
-    ) == (None, None, None)
+    ) == (0, None, None)
 
 
 @pytest.mark.django_db
@@ -1088,11 +1102,11 @@ def test_sequence_expand_fields_are_nullable_but_checked_when_present() -> None:
     end_contract_field = AgentSession._meta.get_field('end_work_contract_version')
     sequence_field = Observation._meta.get_field('session_sequence')
 
-    assert cursor_field.null is True
+    assert cursor_field.null is False
     assert cursor_field.default is models.NOT_PROVIDED
     assert end_contract_field.default == 0
-    assert sequence_field.null is True
-    assert sequence_field.blank is True
+    assert sequence_field.null is False
+    assert sequence_field.blank is False
     assert (
         'organization',
         'project',

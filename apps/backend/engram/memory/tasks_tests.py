@@ -211,6 +211,9 @@ def create_observation(
     suffix: str = '1',
     session_sequence: int | None = None,
 ) -> Observation:
+    if session_sequence is None:
+        session_sequence = Observation.objects.filter(session=session).count() + 1
+
     return Observation.objects.create(
         organization=session.organization,
         project=session.project,

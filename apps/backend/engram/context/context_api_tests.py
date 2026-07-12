@@ -1108,6 +1108,7 @@ def test_index_memory_version_creates_retrieval_document_for_approved_memory() -
         agent=agent,
         external_session_id='session-index',
         runtime='codex',
+        observation_sequence_cursor=1,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -1120,6 +1121,7 @@ def test_index_memory_version_creates_retrieval_document_for_approved_memory() -
         files_read=['apps/backend/engram/context/views.py'],
         files_modified=['apps/backend/engram/context/services.py'],
         content_hash='observation-index-hash',
+        session_sequence=1,
     )
     memory = Memory.objects.create(
         organization=organization,

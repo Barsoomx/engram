@@ -77,6 +77,7 @@ def create_raw_event(session: AgentSession, *, received_at: object, suffix: str 
         content_hash=f'hash-{session.external_session_id}-{suffix}',
         runtime=Runtime.CODEX,
         payload={'event': 'noop'},
+        normalization_contract_version=0,
     )
     RawEventEnvelope.objects.filter(id=envelope.id).update(received_at=received_at)
     envelope.refresh_from_db()
@@ -84,7 +85,7 @@ def create_raw_event(session: AgentSession, *, received_at: object, suffix: str 
     return envelope
 
 
-def create_observation(session: AgentSession, *, suffix: str = '1') -> Observation:
+def create_observation(session: AgentSession, *, suffix: str = '1', session_sequence: int = 1) -> Observation:
     return Observation.objects.create(
         organization=session.organization,
         project=session.project,
@@ -96,6 +97,7 @@ def create_observation(session: AgentSession, *, suffix: str = '1') -> Observati
         body=f'body {suffix}',
         content_hash=f'hash-obs-{session.external_session_id}-{suffix}',
         observed_at=timezone.now(),
+        session_sequence=session_sequence,
     )
 
 

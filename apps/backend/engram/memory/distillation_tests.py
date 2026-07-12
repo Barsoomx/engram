@@ -170,6 +170,7 @@ def create_observation(
         'content_hash': f'hash-obs-{session.external_session_id}-{index}',
         'source_metadata': {'event_type': 'post_tool_use'},
         'observed_at': timezone.now(),
+        'session_sequence': index,
     }
     defaults.update(overrides)
 

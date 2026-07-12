@@ -74,6 +74,7 @@ def create_observation(session: AgentSession, *, suffix: str = '1') -> Observati
         body=f'body {suffix}',
         content_hash=f'hash-obs-{session.external_session_id}-{suffix}',
         observed_at=timezone.now(),
+        session_sequence=1,
     )
 
 

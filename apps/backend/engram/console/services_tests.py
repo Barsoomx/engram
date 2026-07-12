@@ -1583,6 +1583,7 @@ def _make_provenanced_candidate(
         files_read=['apps/backend/engram/core/models.py'],
         files_modified=['apps/backend/engram/memory/services.py'],
         content_hash='hash-obs-provenance',
+        session_sequence=1,
     )
 
     return MemoryCandidate.objects.create(
