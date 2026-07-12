@@ -100,6 +100,7 @@ def _import_context_and_observation(
         content_session_id='content-session-collision',
         memory_session_id='memory-session-collision',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import', 'source_store_id': 'fixture-store'},
         observation_sequence_cursor=0,
     )
     row = {
@@ -861,6 +862,7 @@ def test_full_import_rejects_session_team_mismatch_without_partial_writes(
         content_session_id='content-session-fixture-001',
         memory_session_id='memory-session-fixture-001',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=7,
     )
     initial_agent_ids = set(Agent.objects.values_list('id', flat=True))
@@ -1054,6 +1056,7 @@ def test_import_locks_existing_and_late_session_ids_in_one_global_order(
         content_session_id='session-a',
         memory_session_id='memory-a',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=0,
     )
     rows = [
@@ -1089,6 +1092,7 @@ def test_import_locks_existing_and_late_session_ids_in_one_global_order(
             content_session_id='session-b',
             memory_session_id='memory-b',
             runtime=Runtime.CODEX,
+            metadata={'source': 'claude_mem_import'},
             observation_sequence_cursor=0,
         )
         return real_import_sessions(import_context, session_rows, observation_rows)
@@ -1146,6 +1150,7 @@ def test_concurrent_imports_lock_sessions_in_stable_order_without_deadlock(
         content_session_id='content-session-concurrent-2',
         memory_session_id='memory-session-concurrent-2',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=0,
     )
     second_row = {
@@ -1391,6 +1396,7 @@ def test_import_binds_session_scoped_legacy_observation_and_reuses_sequence(
         content_session_id='content-session-fixture-001',
         memory_session_id='memory-session-fixture-001',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=7,
     )
     source_id = importer._observation_source_id(context, row)
@@ -1521,6 +1527,361 @@ def test_memory_batch_scopes_session_by_source_store(
 
 
 @pytest.mark.django_db
+def test_sdk_session_import_collision_rolls_back_new_agent(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='identity-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    hook_agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='hook-owned-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=hook_agent,
+        external_session_id=importer._session_source_id(context, 'identity-content'),
+        content_session_id='identity-content',
+        memory_session_id='identity-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'hook'},
+        observation_sequence_cursor=4,
+    )
+    row = {
+        'id': 501,
+        'content_session_id': 'identity-content',
+        'memory_session_id': 'identity-memory',
+        'platform_source': 'codex',
+        'project': context.project.repository_root,
+    }
+    initial_agent_ids = set(Agent.objects.values_list('id', flat=True))
+
+    with pytest.raises(ValueError, match='^import session identity collision$'):
+        importer.import_batch(context, 'sdk_sessions', [row])
+
+    session.refresh_from_db()
+    assert session.observation_sequence_cursor == 4
+    assert session.metadata == {'source': 'hook'}
+    assert set(Agent.objects.values_list('id', flat=True)) == initial_agent_ids
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+def test_prompt_import_rejects_hook_owned_canonical_session_without_raw_event(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='prompt-identity-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    hook_agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='prompt-hook-owned-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=hook_agent,
+        external_session_id=importer._session_source_id(context, 'prompt-identity-content'),
+        content_session_id='prompt-identity-content',
+        memory_session_id='prompt-identity-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'hook'},
+    )
+    row = {
+        'id': 506,
+        'content_session_id': session.content_session_id,
+        'prompt_number': 1,
+        'prompt_text': 'Hook-owned prompt collision.',
+        'created_at': '2026-06-25T09:02:00Z',
+    }
+
+    with pytest.raises(ValueError, match='^import session identity collision$'):
+        importer.import_batch(context, 'user_prompts', [row])
+
+    session.refresh_from_db()
+    assert session.metadata == {'source': 'hook'}
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+def test_memory_batch_replays_exact_legacy_import_session_without_store_metadata(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='legacy-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='legacy-import-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'legacy-content'),
+        content_session_id='legacy-content',
+        memory_session_id='legacy-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
+        observation_sequence_cursor=0,
+    )
+    row = {
+        'id': 502,
+        'memory_session_id': 'legacy-memory',
+        'project': context.project.repository_root,
+        'text': 'Legacy replay body.',
+        'type': 'discovery',
+        'title': 'Legacy replay',
+        'created_at': '2026-06-25T09:02:00Z',
+    }
+
+    result = importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert result.created == 1
+    assert Observation.objects.get().session_id == session.id
+
+
+@pytest.mark.django_db
+def test_memory_batch_rejects_present_mismatched_store_metadata(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='requested-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='mismatched-store-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'mismatched-content'),
+        content_session_id='mismatched-content',
+        memory_session_id='mismatched-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import', 'source_store_id': 'other-store'},
+        observation_sequence_cursor=0,
+    )
+    row = {
+        'id': 503,
+        'memory_session_id': 'mismatched-memory',
+        'project': context.project.repository_root,
+        'text': 'Mismatched store body.',
+        'type': 'discovery',
+        'title': 'Mismatched store',
+    }
+
+    result = importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    session.refresh_from_db()
+    assert result.created == 0
+    assert result.skipped == 1
+    assert session.observation_sequence_cursor == 0
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not MemoryCandidate.objects.exists()
+
+
+@pytest.mark.django_db
+def test_memory_batch_rejects_two_canonical_same_store_sessions_without_mutation(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='ambiguous-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='ambiguous-store-agent',
+    )
+    for content_session_id in ('ambiguous-content-a', 'ambiguous-content-b'):
+        AgentSession.objects.create(
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+            agent=agent,
+            external_session_id=importer._session_source_id(context, content_session_id),
+            content_session_id=content_session_id,
+            memory_session_id='ambiguous-memory',
+            runtime=Runtime.CODEX,
+            metadata={'source': 'claude_mem_import', 'source_store_id': context.source_store_id},
+            observation_sequence_cursor=0,
+        )
+    row = {
+        'id': 504,
+        'memory_session_id': 'ambiguous-memory',
+        'project': context.project.repository_root,
+        'text': 'Ambiguous same-store body.',
+        'type': 'discovery',
+        'title': 'Ambiguous same-store',
+    }
+
+    with pytest.raises(ValueError, match='^import session identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert AgentSession.objects.filter(memory_session_id='ambiguous-memory').count() == 2
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not MemoryCandidate.objects.exists()
+    assert not Memory.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
+def test_memory_batch_fails_closed_after_legacy_candidate_sentinel(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='overflow-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='overflow-agent',
+    )
+    for index in range(33):
+        content_session_id = f'overflow-content-{index}'
+        AgentSession.objects.create(
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+            agent=agent,
+            external_session_id=importer._session_source_id(context, content_session_id),
+            content_session_id=content_session_id,
+            memory_session_id='overflow-memory',
+            runtime=Runtime.CODEX,
+            metadata={'source': 'claude_mem_import'},
+            observation_sequence_cursor=0,
+        )
+    row = {
+        'id': 505,
+        'memory_session_id': 'overflow-memory',
+        'project': context.project.repository_root,
+        'text': 'Overflow body.',
+        'type': 'discovery',
+        'title': 'Overflow',
+    }
+
+    with pytest.raises(ValueError, match='^import session identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not MemoryCandidate.objects.exists()
+    assert not Memory.objects.exists()
+
+
+@pytest.mark.django_db
+def test_memory_lookup_prefilters_foreign_long_prefix_modern_sessions(
+    f_import_scope: ImportScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    importer = ClaudeMemImporter()
+    exact_store = 's' * 250 + '-exact'
+    context = ImportContext(
+        source_store_id=exact_store,
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='long-prefix-agent',
+    )
+    for index in range(40):
+        foreign_store = 's' * 250 + f'-foreign-{index}'
+        foreign_context = ImportContext(
+            source_store_id=foreign_store,
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+        )
+        AgentSession.objects.create(
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+            agent=agent,
+            external_session_id=importer._session_source_id(foreign_context, f'foreign-content-{index}'),
+            content_session_id=f'foreign-content-{index}',
+            memory_session_id='long-prefix-memory',
+            runtime=Runtime.CODEX,
+            metadata={'source': 'claude_mem_import', 'source_store_id': foreign_store},
+        )
+    exact_session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'exact-content'),
+        content_session_id='exact-content',
+        memory_session_id='long-prefix-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import', 'source_store_id': exact_store},
+    )
+    evaluated_content_ids: list[str] = []
+    real_session_source_id = importer._session_source_id
+
+    def recording_session_source_id(import_context: ImportContext, content_session_id: object) -> str:
+        evaluated_content_ids.append(str(content_session_id))
+        return real_session_source_id(import_context, content_session_id)
+
+    monkeypatch.setattr(importer, '_session_source_id', recording_session_source_id)
+
+    assert importer._session_for_memory(
+        context,
+        {'memory_session_id': 'long-prefix-memory'},
+    ) == exact_session
+    assert evaluated_content_ids == ['exact-content']
+
+
+@pytest.mark.django_db
 def test_memory_batch_caches_session_lookup_for_repeated_memory_session(
     f_import_scope: ImportScope,
 ) -> None:
@@ -1581,6 +1942,7 @@ def test_memory_batch_prefilters_unrelated_store_before_exact_session_match(
         content_session_id='content-a',
         memory_session_id='shared-memory-session',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=0,
     )
     session_b = AgentSession.objects.create(
@@ -1592,6 +1954,7 @@ def test_memory_batch_prefilters_unrelated_store_before_exact_session_match(
         content_session_id='content-b',
         memory_session_id='shared-memory-session',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=0,
     )
     evaluated_content_ids: list[str] = []
@@ -2009,6 +2372,7 @@ def test_import_assigns_sequence_to_legacy_observation_without_sequence(
         content_session_id='content-session-fixture-001',
         memory_session_id='memory-session-fixture-001',
         runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
         observation_sequence_cursor=None,
     )
     Observation.objects.create(

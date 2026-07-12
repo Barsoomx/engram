@@ -47,6 +47,8 @@ _SOURCE_ID_DIGEST_SUFFIX_CHARS = 33
 _MAX_PLATFORM_SOURCE_CHARS = 80
 _MAX_OBSERVATION_TYPE_CHARS = 80
 _MAX_GENERATED_MODEL_CHARS = 120
+_MAX_IMPORT_SESSION_CANDIDATES = 32
+_IMPORT_SESSION_SOURCE = 'claude_mem_import'
 
 
 def _capped_text(value: str, cap: int) -> str:
@@ -394,8 +396,7 @@ class ClaudeMemImporter:
             return None
 
         external_session_id = self._session_source_id(context, content_session_id)
-
-        return (
+        session = (
             AgentSession.objects.select_related('agent')
             .filter(
                 organization=context.organization,
@@ -404,6 +405,16 @@ class ClaudeMemImporter:
             )
             .first()
         )
+        if session is not None:
+            self._validate_import_session_identity(
+                session,
+                context,
+                external_session_id,
+                content_session_id,
+                None,
+            )
+
+        return session
 
     def _session_for_memory(self, context: ImportContext, row: dict[str, object]) -> AgentSession | None:
         memory_session_id = _capped_session_key(row.get('memory_session_id'))
@@ -413,19 +424,47 @@ class ClaudeMemImporter:
         namespace = f'claude-mem:{context.source_store_id}:sdk_session:'
         namespace_prefix = namespace[: _MAX_SESSION_KEY_CHARS - _SOURCE_ID_DIGEST_SUFFIX_CHARS]
         expected_team_id = context.team.id if context.team is not None else None
-        sessions = AgentSession.objects.select_related('agent').filter(
+        scoped_sessions = AgentSession.objects.select_related('agent').filter(
             organization=context.organization,
             project=context.project,
             team_id=expected_team_id,
             memory_session_id=memory_session_id,
             external_session_id__startswith=namespace_prefix,
         )
-        for session in sessions.order_by('created_at'):
-            expected_external_id = self._session_source_id(context, session.content_session_id)
-            if session.external_session_id == expected_external_id:
-                return session
+        modern_sessions = list(
+            scoped_sessions.filter(
+                metadata__source=_IMPORT_SESSION_SOURCE,
+                metadata__source_store_id=context.source_store_id,
+            ).order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
+        )
+        if modern_sessions:
+            return self._resolve_memory_session_candidates(context, modern_sessions)
 
-        return None
+        legacy_sessions = list(
+            scoped_sessions.filter(metadata__source=_IMPORT_SESSION_SOURCE)
+            .exclude(metadata__has_key='source_store_id')
+            .order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
+        )
+
+        return self._resolve_memory_session_candidates(context, legacy_sessions)
+
+    def _resolve_memory_session_candidates(
+        self,
+        context: ImportContext,
+        sessions: list[AgentSession],
+    ) -> AgentSession | None:
+        if len(sessions) > _MAX_IMPORT_SESSION_CANDIDATES:
+            raise ValueError('import session identity collision')
+
+        matches = [
+            session
+            for session in sessions
+            if session.external_session_id == self._session_source_id(context, session.content_session_id)
+        ]
+        if len(matches) > 1:
+            raise ValueError('import session identity collision')
+
+        return matches[0] if matches else None
 
     def _lock_import_sessions(
         self,
@@ -845,6 +884,8 @@ class ClaudeMemImporter:
                 agents_created += 1
 
             external_session_id = self._session_source_id(context, content_session_id)
+            session_metadata = dict(session_metadata_result.value)
+            session_metadata['source_store_id'] = context.source_store_id
             session, session_created = AgentSession.objects.get_or_create(
                 organization=organization,
                 project=project,
@@ -862,7 +903,7 @@ class ClaudeMemImporter:
                     'status': self._session_status(row.get('status')),
                     'prompt_counter': int(row.get('prompt_counter') or 0),
                     'observation_sequence_cursor': 0,
-                    'metadata': session_metadata_result.value,
+                    'metadata': session_metadata,
                     'started_at': self._datetime(row.get('started_at')),
                     'ended_at': self._datetime(row.get('completed_at')),
                 },
@@ -870,12 +911,45 @@ class ClaudeMemImporter:
             if session_created:
                 sessions_created += 1
             else:
+                self._validate_import_session_identity(
+                    session,
+                    context,
+                    external_session_id,
+                    content_session_id,
+                    memory_session_id,
+                )
                 session_duplicates += 1
             sessions[content_session_id] = session
             if memory_session_id:
                 sessions[memory_session_id] = session
 
         return sessions, agents_created, sessions_created, session_duplicates, sessions_redacted, unsupported
+
+    def _validate_import_session_identity(
+        self,
+        session: AgentSession,
+        context: ImportContext,
+        external_session_id: str,
+        content_session_id: str,
+        memory_session_id: str | None,
+    ) -> None:
+        expected_team_id = context.team.id if context.team is not None else None
+        if session.team_id != expected_team_id:
+            raise ValueError('import session team mismatch')
+
+        metadata = session.metadata
+        if (
+            session.external_session_id != external_session_id
+            or session.content_session_id != content_session_id
+            or (memory_session_id is not None and session.memory_session_id != memory_session_id)
+            or not isinstance(metadata, dict)
+            or metadata.get('source') != _IMPORT_SESSION_SOURCE
+            or (
+                'source_store_id' in metadata
+                and metadata.get('source_store_id') != context.source_store_id
+            )
+        ):
+            raise ValueError('import session identity collision')
 
     def _import_prompt(
         self,
