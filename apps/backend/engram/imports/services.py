@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import UUID
 
 from django.db import transaction
+from django.db.models import Count
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -26,12 +27,15 @@ from engram.core.models import (
     Project,
     ProjectTeam,
     RawEventEnvelope,
+    RawEventNormalizationDisposition,
+    RawEventNormalizationReason,
     Runtime,
     SessionStatus,
     Team,
     VisibilityScope,
 )
 from engram.core.redaction import RedactionResult, redact_value
+from engram.memory.observation_work import allocate_observation_sequence, lock_session_for_observation
 from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 
 ImportReport = dict[str, object]
@@ -39,9 +43,12 @@ ImportReport = dict[str, object]
 _MAX_OBSERVATION_TEXT_CHARS = 16000
 _MAX_OBSERVATION_LIST_ITEMS = 100
 _MAX_SESSION_KEY_CHARS = 255
+_SOURCE_ID_DIGEST_SUFFIX_CHARS = 33
 _MAX_PLATFORM_SOURCE_CHARS = 80
 _MAX_OBSERVATION_TYPE_CHARS = 80
 _MAX_GENERATED_MODEL_CHARS = 120
+_MAX_IMPORT_SESSION_CANDIDATES = 32
+_IMPORT_SESSION_SOURCE = 'claude_mem_import'
 
 
 def _capped_text(value: str, cap: int) -> str:
@@ -241,28 +248,29 @@ class ClaudeMemImporter:
         defer_embedding: bool = True,
     ) -> BatchImportResult:
         report = self._empty_batch_report()
-        if table == 'sdk_sessions':
-            created, duplicates, skipped = self._apply_session_batch(context, rows, report)
-        elif table == 'user_prompts':
-            created, duplicates, skipped = self._apply_prompt_batch(context, rows, report)
-        elif table == 'observations':
-            created, duplicates, skipped = self._apply_memory_batch(
-                context,
-                rows,
-                report,
-                defer_embedding,
-                kind='observation',
-            )
-        elif table == 'session_summaries':
-            created, duplicates, skipped = self._apply_memory_batch(
-                context,
-                rows,
-                report,
-                defer_embedding,
-                kind='session_summary',
-            )
-        else:
-            raise ClaudeMemImportError('unsupported import table')
+        with transaction.atomic():
+            if table == 'sdk_sessions':
+                created, duplicates, skipped = self._apply_session_batch(context, rows, report)
+            elif table == 'user_prompts':
+                created, duplicates, skipped = self._apply_prompt_batch(context, rows, report)
+            elif table == 'observations':
+                created, duplicates, skipped = self._apply_memory_batch(
+                    context,
+                    rows,
+                    report,
+                    defer_embedding,
+                    kind='observation',
+                )
+            elif table == 'session_summaries':
+                created, duplicates, skipped = self._apply_memory_batch(
+                    context,
+                    rows,
+                    report,
+                    defer_embedding,
+                    kind='session_summary',
+                )
+            else:
+                raise ClaudeMemImportError('unsupported import table')
 
         return BatchImportResult(created=created, duplicates=duplicates, skipped=skipped, report=report)
 
@@ -272,11 +280,12 @@ class ClaudeMemImporter:
         rows: list[dict[str, object]],
         report: ImportReport,
     ) -> tuple[int, int, int]:
-        _sessions, agents_created, sessions_created, session_duplicates, redacted, unsupported = self._import_sessions(
+        sessions, agents_created, sessions_created, session_duplicates, redacted, unsupported = self._import_sessions(
             context,
             rows,
             [],
         )
+        self._lock_import_sessions(list(sessions.values()), context)
         report['created']['agents'] += agents_created
         report['created']['sessions'] += sessions_created
         report['duplicates']['sessions'] += session_duplicates
@@ -295,8 +304,14 @@ class ClaudeMemImporter:
         created = 0
         duplicates = 0
         skipped = 0
-        for row in rows:
-            session = self._session_for_prompt(context, row)
+        sessions = [self._session_for_prompt(context, row) for row in rows]
+        locked_sessions = self._lock_import_sessions(
+            [session for session in sessions if session is not None],
+            context,
+        )
+        for row, session in zip(rows, sessions, strict=True):
+            if session is not None:
+                session = locked_sessions[session.id]
             raw_event, was_created, prompt_result, unsupported = self._import_prompt(context, session, row)
             if prompt_result.redacted:
                 report['redactions'] = {'redacted': True}
@@ -328,8 +343,23 @@ class ClaudeMemImporter:
         duplicates = 0
         skipped = 0
         confidence = OBSERVATION_CONFIDENCE if kind == 'observation' else SESSION_SUMMARY_CONFIDENCE
+        team_id = context.team.id if context.team is not None else None
+        session_cache: dict[tuple[str, UUID | None, str], AgentSession | None] = {}
+        sessions = []
         for row in rows:
-            session = self._session_for_memory(context, row)
+            memory_session_id = _capped_session_key(row.get('memory_session_id'))
+            cache_key = (context.source_store_id, team_id, memory_session_id)
+            if cache_key not in session_cache:
+                session_cache[cache_key] = self._session_for_memory(context, row)
+            sessions.append(session_cache[cache_key])
+        locked_sessions = self._lock_import_sessions(
+            [session for session in sessions if session is not None],
+            context,
+        )
+
+        for row, session in zip(rows, sessions, strict=True):
+            if session is not None:
+                session = locked_sessions[session.id]
             if kind == 'observation':
                 result = self._import_observation_memory(
                     context,
@@ -366,8 +396,7 @@ class ClaudeMemImporter:
             return None
 
         external_session_id = self._session_source_id(context, content_session_id)
-
-        return (
+        session = (
             AgentSession.objects.select_related('agent')
             .filter(
                 organization=context.organization,
@@ -376,22 +405,87 @@ class ClaudeMemImporter:
             )
             .first()
         )
+        if session is not None:
+            self._validate_import_session_identity(
+                session,
+                context,
+                external_session_id,
+                content_session_id,
+                None,
+            )
+
+        return session
 
     def _session_for_memory(self, context: ImportContext, row: dict[str, object]) -> AgentSession | None:
         memory_session_id = _capped_session_key(row.get('memory_session_id'))
         if not memory_session_id:
             return None
 
-        return (
-            AgentSession.objects.select_related('agent')
-            .filter(
-                organization=context.organization,
-                project=context.project,
-                memory_session_id=memory_session_id,
-            )
-            .order_by('created_at')
-            .first()
+        namespace = f'claude-mem:{context.source_store_id}:sdk_session:'
+        namespace_prefix = namespace[: _MAX_SESSION_KEY_CHARS - _SOURCE_ID_DIGEST_SUFFIX_CHARS]
+        expected_team_id = context.team.id if context.team is not None else None
+        scoped_sessions = AgentSession.objects.select_related('agent').filter(
+            organization=context.organization,
+            project=context.project,
+            team_id=expected_team_id,
+            memory_session_id=memory_session_id,
+            external_session_id__startswith=namespace_prefix,
         )
+        modern_sessions = list(
+            scoped_sessions.filter(
+                metadata__source=_IMPORT_SESSION_SOURCE,
+                metadata__source_store_id=context.source_store_id,
+            ).order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
+        )
+        if modern_sessions:
+            return self._resolve_memory_session_candidates(context, modern_sessions)
+
+        legacy_sessions = list(
+            scoped_sessions.filter(metadata__source=_IMPORT_SESSION_SOURCE)
+            .exclude(metadata__has_key='source_store_id')
+            .order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
+        )
+
+        return self._resolve_memory_session_candidates(context, legacy_sessions)
+
+    def _resolve_memory_session_candidates(
+        self,
+        context: ImportContext,
+        sessions: list[AgentSession],
+    ) -> AgentSession | None:
+        if len(sessions) > _MAX_IMPORT_SESSION_CANDIDATES:
+            raise ValueError('import session identity collision')
+
+        matches = [
+            session
+            for session in sessions
+            if session.external_session_id == self._session_source_id(context, session.content_session_id)
+        ]
+        if len(matches) > 1:
+            raise ValueError('import session identity collision')
+
+        return matches[0] if matches else None
+
+    def _lock_import_sessions(
+        self,
+        sessions: list[AgentSession],
+        context: ImportContext,
+    ) -> dict[UUID, AgentSession]:
+        locked_sessions: dict[UUID, AgentSession] = {}
+        expected_team_id = context.team.id if context.team is not None else None
+        session_ids = {session.id for session in sessions}
+        for session_id in sorted(session_ids, key=str):
+            locked = lock_session_for_observation(
+                organization_id=context.organization.id,
+                project_id=context.project.id,
+                session_id=session_id,
+            )
+            if locked.team_id != expected_team_id:
+                raise ValueError('import session team mismatch')
+
+            locked_sessions[locked.id] = locked
+
+        return locked_sessions
 
     def _empty_batch_report(self) -> ImportReport:
         return empty_batch_report()
@@ -690,6 +784,9 @@ class ClaudeMemImporter:
             report['unsupported'].extend(sessions_unsupported)
             redacted = redacted or sessions_redacted
 
+            locked_sessions = self._lock_import_sessions(list(sessions.values()), context)
+            sessions = {key: locked_sessions.get(session.id, session) for key, session in sessions.items()}
+
             for prompt in rows['user_prompts']:
                 session = sessions.get(_capped_session_key(prompt.get('content_session_id')))
                 raw_event, created, prompt_result, prompt_unsupported = self._import_prompt(context, session, prompt)
@@ -749,7 +846,11 @@ class ClaudeMemImporter:
         session_duplicates = 0
         sessions_redacted = False
         unsupported: list[dict[str, str]] = []
-        for row in session_rows:
+        ordered_rows = sorted(
+            session_rows,
+            key=lambda row: self._session_source_id(context, _capped_session_key(row.get('content_session_id'))),
+        )
+        for row in ordered_rows:
             content_session_id = _capped_session_key(row.get('content_session_id'))
             if not content_session_id:
                 unsupported.append(
@@ -783,6 +884,8 @@ class ClaudeMemImporter:
                 agents_created += 1
 
             external_session_id = self._session_source_id(context, content_session_id)
+            session_metadata = dict(session_metadata_result.value)
+            session_metadata['source_store_id'] = context.source_store_id
             session, session_created = AgentSession.objects.get_or_create(
                 organization=organization,
                 project=project,
@@ -799,7 +902,8 @@ class ClaudeMemImporter:
                     'branch': branch,
                     'status': self._session_status(row.get('status')),
                     'prompt_counter': int(row.get('prompt_counter') or 0),
-                    'metadata': session_metadata_result.value,
+                    'observation_sequence_cursor': 0,
+                    'metadata': session_metadata,
                     'started_at': self._datetime(row.get('started_at')),
                     'ended_at': self._datetime(row.get('completed_at')),
                 },
@@ -807,12 +911,42 @@ class ClaudeMemImporter:
             if session_created:
                 sessions_created += 1
             else:
+                self._validate_import_session_identity(
+                    session,
+                    context,
+                    external_session_id,
+                    content_session_id,
+                    memory_session_id,
+                )
                 session_duplicates += 1
             sessions[content_session_id] = session
             if memory_session_id:
                 sessions[memory_session_id] = session
 
         return sessions, agents_created, sessions_created, session_duplicates, sessions_redacted, unsupported
+
+    def _validate_import_session_identity(
+        self,
+        session: AgentSession,
+        context: ImportContext,
+        external_session_id: str,
+        content_session_id: str,
+        memory_session_id: str | None,
+    ) -> None:
+        expected_team_id = context.team.id if context.team is not None else None
+        if session.team_id != expected_team_id:
+            raise ValueError('import session team mismatch')
+
+        metadata = session.metadata
+        if (
+            session.external_session_id != external_session_id
+            or session.content_session_id != content_session_id
+            or (memory_session_id is not None and session.memory_session_id != memory_session_id)
+            or not isinstance(metadata, dict)
+            or metadata.get('source') != _IMPORT_SESSION_SOURCE
+            or ('source_store_id' in metadata and metadata.get('source_store_id') != context.source_store_id)
+        ):
+            raise ValueError('import session identity collision')
 
     def _import_prompt(
         self,
@@ -852,6 +986,8 @@ class ClaudeMemImporter:
             occurred_at=self._datetime(row.get('created_at')),
             payload=payload_result.value,
             redacted=payload_result.redacted,
+            normalization_disposition=RawEventNormalizationDisposition.NO_OP,
+            normalization_reason=RawEventNormalizationReason.EVIDENCE_ONLY,
         )
 
         return raw_event, created, payload_result, None
@@ -989,12 +1125,17 @@ class ClaudeMemImporter:
         if not isinstance(observation_data, dict):
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
-        if ObservationSource.objects.filter(
+        raw_content_hash = self._content_hash(source_id, payload)
+        content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
+        if self._validate_existing_import_replay(
             organization=organization,
             project=project,
-            source_type='claude_mem',
+            team=team,
+            session=session,
             source_id=source_id,
-        ).exists():
+            event_type=event_type,
+            source_store_id=context.source_store_id,
+        ):
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
         raw_event, raw_created = self._get_or_create_raw_event(
@@ -1007,8 +1148,12 @@ class ClaudeMemImporter:
             occurred_at=occurred_at,
             payload=payload,
             redacted=payload_redacted,
+            normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+            normalization_reason=None,
         )
-        content_hash = self._content_hash(source_id, observation_data.get('title'), observation_data.get('body'))
+        if not raw_created and raw_event.content_hash != raw_content_hash:
+            raise ValueError('import raw event identity collision')
+
         raw_body = str(observation_data.get('body') or '')
         raw_narrative = str(observation_data.get('narrative') or '')
         raw_facts = observation_data.get('facts') or []
@@ -1023,32 +1168,63 @@ class ClaudeMemImporter:
             or capped_facts != raw_facts
             or capped_concepts != raw_concepts
         )
-        observation, observation_created = Observation.objects.get_or_create(
+        existing_observation = self._existing_import_observation(
             organization=organization,
             project=project,
             session=session,
+            source_id=source_id,
             content_hash=content_hash,
-            defaults={
-                'team': team,
-                'agent': session.agent,
-                'raw_event': raw_event,
-                'observation_type': observation_type,
-                'title': str(observation_data.get('title') or '')[:255],
-                'subtitle': str(observation_data.get('subtitle') or '')[:255],
-                'body': capped_body,
-                'facts': capped_facts,
-                'narrative': capped_narrative,
-                'concepts': capped_concepts,
-                'files_read': observation_data.get('files_read') or [],
-                'files_modified': observation_data.get('files_modified') or [],
-                'prompt_number': int(prompt_number) if prompt_number is not None else None,
-                'generation_key': source_id,
-                'generated_model': generated_model,
-                'redaction_metadata': {'redacted': observation_redacted},
-                'source_metadata': observation_data.get('source_metadata') or {},
-                'observed_at': occurred_at,
-            },
         )
+
+        sequence_number = self._reused_observation_sequence(existing_observation, session)
+        if sequence_number is None:
+            sequence_number = allocate_observation_sequence(session)
+            if existing_observation is not None:
+                existing_observation.session_sequence = sequence_number
+                existing_observation.save(update_fields=['session_sequence'])
+        if raw_event.sequence_number != sequence_number:
+            raw_event.sequence_number = sequence_number
+            raw_event.save(update_fields=['sequence_number'])
+        if existing_observation is None:
+            observation, observation_created = Observation.objects.get_or_create(
+                organization=organization,
+                project=project,
+                session=session,
+                content_hash=content_hash,
+                defaults={
+                    'team': team,
+                    'agent': session.agent,
+                    'raw_event': raw_event,
+                    'observation_type': observation_type,
+                    'title': str(observation_data.get('title') or '')[:255],
+                    'subtitle': str(observation_data.get('subtitle') or '')[:255],
+                    'body': capped_body,
+                    'facts': capped_facts,
+                    'narrative': capped_narrative,
+                    'concepts': capped_concepts,
+                    'files_read': observation_data.get('files_read') or [],
+                    'files_modified': observation_data.get('files_modified') or [],
+                    'prompt_number': int(prompt_number) if prompt_number is not None else None,
+                    'generation_key': source_id,
+                    'generated_model': generated_model,
+                    'redaction_metadata': {'redacted': observation_redacted},
+                    'source_metadata': observation_data.get('source_metadata') or {},
+                    'observed_at': occurred_at,
+                    'session_sequence': sequence_number,
+                },
+            )
+        else:
+            observation = existing_observation
+            observation_created = False
+        if not observation_created:
+            self._bind_existing_import_observation(
+                observation=observation,
+                raw_event=raw_event,
+                team=team,
+                session=session,
+                source_id=source_id,
+                event_type=event_type,
+            )
         ObservationSource.objects.get_or_create(
             organization=organization,
             project=project,
@@ -1077,6 +1253,107 @@ class ClaudeMemImporter:
             'observation_created': observation_created,
             **memory_result,
         }
+
+    def _existing_import_observation(
+        self,
+        organization: Organization,
+        project: Project,
+        session: AgentSession,
+        source_id: str,
+        content_hash: str,
+    ) -> Observation | None:
+        source_observations = self._source_identity_observations(organization, project, source_id)
+        if len(source_observations) > 1:
+            raise ValueError('import observation source identity collision')
+
+        observation = source_observations[0] if source_observations else None
+        if observation is not None and observation.content_hash != content_hash:
+            raise ValueError('import observation source identity collision')
+        if observation is None:
+            observation = (
+                Observation.objects.filter(
+                    organization=organization,
+                    project=project,
+                    session=session,
+                    content_hash=content_hash,
+                    generation_key='',
+                )
+                .annotate(source_count=Count('sources'))
+                .first()
+            )
+        if observation is not None and observation.source_count:
+            raise ValueError('import observation source identity collision')
+
+        return observation
+
+    def _reused_observation_sequence(
+        self,
+        observation: Observation | None,
+        session: AgentSession,
+    ) -> int | None:
+        sequence_number = observation.session_sequence if observation is not None else None
+        if sequence_number is not None and sequence_number <= 0:
+            raise ValueError('import observation source identity collision')
+        if sequence_number is not None and (
+            session.observation_sequence_cursor is None or session.observation_sequence_cursor < sequence_number
+        ):
+            raise ValueError('import observation source identity collision')
+
+        return sequence_number
+
+    def _source_identity_observations(
+        self,
+        organization: Organization,
+        project: Project,
+        source_id: str,
+    ) -> list[Observation]:
+        return list(
+            Observation.objects.filter(
+                organization=organization,
+                project=project,
+                generation_key=source_id,
+            )
+            .annotate(source_count=Count('sources'))
+            .order_by('id')[:2],
+        )
+
+    def _bind_existing_import_observation(
+        self,
+        observation: Observation,
+        raw_event: RawEventEnvelope,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+    ) -> None:
+        expected_team_id = team.id if team is not None else None
+        source_metadata = observation.source_metadata
+        if (
+            observation.team_id != expected_team_id
+            or observation.agent_id != session.agent_id
+            or observation.session_id != session.id
+            or observation.raw_event_id not in (None, raw_event.id)
+            or observation.generation_key not in ('', source_id)
+            or not isinstance(source_metadata, dict)
+            or (
+                source_metadata != {}
+                and (source_metadata.get('source_id') != source_id or source_metadata.get('event_type') != event_type)
+            )
+        ):
+            raise ValueError('import observation source identity collision')
+
+        update_fields = []
+        if observation.raw_event_id is None:
+            observation.raw_event = raw_event
+            update_fields.append('raw_event')
+        if not observation.generation_key:
+            observation.generation_key = source_id
+            update_fields.append('generation_key')
+        if source_metadata == {}:
+            observation.source_metadata = {'source_id': source_id, 'event_type': event_type}
+            update_fields.append('source_metadata')
+        if update_fields:
+            observation.save(update_fields=update_fields)
 
     def _empty_memory_result(self, redacted: bool) -> dict[str, object]:
         return {
@@ -1109,6 +1386,184 @@ class ClaudeMemImporter:
 
         return result
 
+    def _validate_existing_import_replay(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+        source_store_id: str,
+    ) -> bool:
+        sources = list(
+            ObservationSource.objects.select_related('observation', 'raw_event')
+            .filter(
+                organization=organization,
+                project=project,
+                source_type='claude_mem',
+                source_id=source_id,
+            )
+            .order_by('id')[:2],
+        )
+        if not sources:
+            return False
+        if len(sources) != 1:
+            raise ValueError('import observation source identity collision')
+
+        source = sources[0]
+        observation = source.observation
+        raw_event = source.raw_event
+        if raw_event is None:
+            raise ValueError('import observation source identity collision')
+
+        source_observations = self._source_identity_observations(organization, project, source_id)
+        if len(source_observations) != 1 or source_observations[0].id != observation.id:
+            raise ValueError('import observation source identity collision')
+
+        legacy_shape = self._validate_existing_replay_identity(
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source=source,
+            observation=observation,
+            raw_event=raw_event,
+            source_id=source_id,
+            event_type=event_type,
+        )
+
+        if legacy_shape:
+            self._repair_legacy_import_replay(
+                raw_event=raw_event,
+                observation=observation,
+                session=session,
+                source_id=source_id,
+                event_type=event_type,
+                source_store_id=source_store_id,
+            )
+        else:
+            self._validate_existing_replay_sequence(raw_event, observation, session)
+
+        return True
+
+    def _validate_existing_replay_identity(
+        self,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source: ObservationSource,
+        observation: Observation,
+        raw_event: RawEventEnvelope,
+        source_id: str,
+        event_type: str,
+    ) -> bool:
+        expected_team_id = team.id if team is not None else None
+        self._validate_import_raw_immutable_identity(
+            raw_event=raw_event,
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type=event_type,
+        )
+        if raw_event.content_hash != self._content_hash(source_id, raw_event.payload):
+            raise ValueError('import observation source identity collision')
+
+        legacy_shape = (
+            raw_event.normalization_contract_version is None
+            and raw_event.normalization_disposition is None
+            and raw_event.normalization_reason is None
+            and raw_event.sequence_number is None
+        )
+        if not legacy_shape:
+            self._validate_import_raw_normalization_state(
+                raw_event=raw_event,
+                normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+                normalization_reason=None,
+            )
+        if (
+            source.organization_id != organization.id
+            or source.project_id != project.id
+            or not isinstance(source.metadata, dict)
+            or source.metadata.get('event_type') != event_type
+            or observation.organization_id != organization.id
+            or observation.project_id != project.id
+            or observation.team_id != expected_team_id
+            or observation.agent_id != session.agent_id
+            or observation.session_id != session.id
+            or observation.raw_event_id != source.raw_event_id
+            or observation.generation_key != source_id
+            or not isinstance(observation.source_metadata, dict)
+            or observation.source_metadata.get('source_id') != source_id
+            or observation.source_metadata.get('event_type') != event_type
+            or ObservationSource.objects.filter(observation=observation).count() != 1
+            or ObservationSource.objects.filter(raw_event=raw_event).count() != 1
+        ):
+            raise ValueError('import observation source identity collision')
+
+        if legacy_shape and (
+            observation.session_sequence is not None
+            or (session.observation_sequence_cursor is not None and session.observation_sequence_cursor < 0)
+        ):
+            raise ValueError('import observation source identity collision')
+
+        return legacy_shape
+
+    def _validate_existing_replay_sequence(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        session: AgentSession,
+    ) -> None:
+        if (
+            observation.session_sequence is None
+            or observation.session_sequence <= 0
+            or raw_event.sequence_number != observation.session_sequence
+            or session.observation_sequence_cursor is None
+            or session.observation_sequence_cursor < observation.session_sequence
+        ):
+            raise ValueError('import observation source identity collision')
+
+    def _repair_legacy_import_replay(
+        self,
+        raw_event: RawEventEnvelope,
+        observation: Observation,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+        source_store_id: str,
+    ) -> None:
+        sequence_number = allocate_observation_sequence(session)
+        observation.session_sequence = sequence_number
+        observation.save(update_fields=['session_sequence'])
+
+        metadata = dict(raw_event.metadata) if isinstance(raw_event.metadata, dict) else {}
+        metadata.update(
+            {
+                'source': 'claude_mem_import',
+                'source_store_id': source_store_id,
+                'source_id': source_id,
+                'event_type': event_type,
+            },
+        )
+        raw_event.normalization_contract_version = 1
+        raw_event.normalization_disposition = RawEventNormalizationDisposition.OBSERVATION
+        raw_event.normalization_reason = None
+        raw_event.sequence_number = sequence_number
+        raw_event.metadata = metadata
+        raw_event.save(
+            update_fields=[
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'sequence_number',
+                'metadata',
+            ],
+        )
+
     def _get_or_create_raw_event(
         self,
         organization: Organization,
@@ -1120,10 +1575,14 @@ class ClaudeMemImporter:
         occurred_at: object | None,
         payload: object,
         redacted: bool,
+        normalization_disposition: RawEventNormalizationDisposition,
+        normalization_reason: RawEventNormalizationReason | None,
+        sequence_number: int | None = None,
     ) -> tuple[RawEventEnvelope, bool]:
         metadata = {'source': 'claude_mem_import'}
         if redacted:
             metadata['redaction'] = {'payload': True}
+        content_hash = self._content_hash(source_id, payload)
         raw_event, created = RawEventEnvelope.objects.get_or_create(
             organization=organization,
             project=project,
@@ -1135,17 +1594,105 @@ class ClaudeMemImporter:
                 'event_type': event_type,
                 'source_adapter': 'claude_mem',
                 'client_event_id': source_id,
-                'content_hash': self._content_hash(source_id, payload),
+                'content_hash': content_hash,
                 'runtime': session.runtime,
                 'payload_schema_version': 'v1',
+                'normalization_contract_version': 1,
+                'normalization_disposition': normalization_disposition,
+                'normalization_reason': normalization_reason,
+                'sequence_number': sequence_number,
                 'occurred_at': occurred_at,
                 'payload': payload if isinstance(payload, dict) else {'value': payload},
                 'headers': {},
                 'metadata': metadata,
             },
         )
+        if not created:
+            self._validate_import_raw_identity(
+                raw_event=raw_event,
+                organization=organization,
+                project=project,
+                team=team,
+                session=session,
+                source_id=source_id,
+                event_type=event_type,
+                normalization_disposition=normalization_disposition,
+                normalization_reason=normalization_reason,
+            )
+            if ObservationSource.objects.filter(raw_event=raw_event).exists():
+                raise ValueError('import observation source identity collision')
 
         return raw_event, created
+
+    def _validate_import_raw_identity(
+        self,
+        raw_event: RawEventEnvelope,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+        normalization_disposition: RawEventNormalizationDisposition,
+        normalization_reason: RawEventNormalizationReason | None,
+    ) -> None:
+        self._validate_import_raw_immutable_identity(
+            raw_event=raw_event,
+            organization=organization,
+            project=project,
+            team=team,
+            session=session,
+            source_id=source_id,
+            event_type=event_type,
+        )
+        self._validate_import_raw_normalization_state(
+            raw_event=raw_event,
+            normalization_disposition=normalization_disposition,
+            normalization_reason=normalization_reason,
+        )
+
+    def _validate_import_raw_immutable_identity(
+        self,
+        raw_event: RawEventEnvelope,
+        organization: Organization,
+        project: Project,
+        team: Team | None,
+        session: AgentSession,
+        source_id: str,
+        event_type: str,
+    ) -> None:
+        if (
+            raw_event.organization_id != organization.id
+            or raw_event.project_id != project.id
+            or raw_event.source_adapter != 'claude_mem'
+            or raw_event.team_id != (team.id if team is not None else None)
+            or raw_event.agent_id != session.agent_id
+            or raw_event.session_id != session.id
+            or raw_event.event_type != event_type
+            or raw_event.client_event_id != source_id
+            or raw_event.idempotency_key != source_id
+            or raw_event.payload_schema_version != 'v1'
+            or not isinstance(raw_event.metadata, dict)
+            or raw_event.metadata.get('source') != 'claude_mem_import'
+        ):
+            raise ValueError('import raw event identity collision')
+
+    def _validate_import_raw_normalization_state(
+        self,
+        raw_event: RawEventEnvelope,
+        normalization_disposition: RawEventNormalizationDisposition,
+        normalization_reason: RawEventNormalizationReason | None,
+    ) -> None:
+        if (
+            raw_event.normalization_contract_version != 1
+            or raw_event.normalization_disposition != normalization_disposition
+            or raw_event.normalization_reason != normalization_reason
+            or (
+                normalization_disposition == RawEventNormalizationDisposition.NO_OP
+                and raw_event.sequence_number is not None
+            )
+        ):
+            raise ValueError('import raw event identity collision')
 
     def _promote_imported_observation(
         self,
@@ -1265,7 +1812,7 @@ class ClaudeMemImporter:
 
         digest = hashlib.sha256(source_id.encode()).hexdigest()[:32]
 
-        return f'{source_id[: _MAX_SESSION_KEY_CHARS - 33]}:{digest}'
+        return f'{source_id[: _MAX_SESSION_KEY_CHARS - _SOURCE_ID_DIGEST_SUFFIX_CHARS]}:{digest}'
 
     def _runtime(self, value: object) -> str:
         normalized = str(value or '').strip().lower()

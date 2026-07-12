@@ -85,6 +85,7 @@ class CreateImportJobInput:
     organization: Organization
     project: Project
     team: Team | None
+    allowed_team_ids: tuple[uuid.UUID, ...]
     source_store_id: str
     manifest: dict[str, object]
     api_key_id: uuid.UUID | None
@@ -135,7 +136,7 @@ class CreateImportJob:
             with transaction.atomic():
                 active = self._active_job(data)
                 if active is not None:
-                    raise self._conflict(active)
+                    raise self._conflict(active, data)
 
                 job = ImportJob.objects.create(
                     organization=data.organization,
@@ -149,7 +150,7 @@ class CreateImportJob:
                     created_by_identity=data.identity_id,
                 )
         except IntegrityError:
-            raise self._conflict(self._active_job(data)) from None
+            raise self._conflict(self._active_job(data), data) from None
 
         _emit_job_audit(
             job,
@@ -173,9 +174,9 @@ class CreateImportJob:
             status__in=NON_TERMINAL_IMPORT_STATUSES,
         ).first()
 
-    def _conflict(self, active: ImportJob | None) -> ImportJobConflictError:
+    def _conflict(self, active: ImportJob | None, data: CreateImportJobInput) -> ImportJobConflictError:
         error = ImportJobConflictError('an active import already exists for this source store')
-        if active is not None:
+        if active is not None and (not data.allowed_team_ids or active.team_id in data.allowed_team_ids):
             error.active_import_id = str(active.id)
 
         return error

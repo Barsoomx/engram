@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from threading import Barrier, local
 from typing import Any
 
 import pytest
-from django.db import transaction
+from django.db import close_old_connections, connection, transaction
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from pytest_django.fixtures import DjangoCaptureOnCommitCallbacks
@@ -20,7 +23,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import AccessDeniedError, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -33,6 +36,7 @@ from engram.core.models import (
     RawEventEnvelope,
     SessionStatus,
     Team,
+    WorkflowWork,
 )
 from engram.hooks.services import HookEventInput, IngestHookEvent
 from engram.memory.tasks import distill_session
@@ -204,6 +208,119 @@ def hook_event_input(project: Project, team: Team, **overrides: Any) -> HookEven
     fields.update(overrides)
 
     return HookEventInput(**fields)
+
+
+def create_persisted_hook_evidence(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    *,
+    session_id: str,
+    event_id: str,
+    idempotency_key: str,
+    content_hash: str,
+) -> tuple[Agent, AgentSession, RawEventEnvelope, Observation]:
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id=f'agent-{session_id}',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=session_id,
+        runtime='codex',
+        observation_sequence_cursor=1,
+    )
+    raw_event = RawEventEnvelope.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        event_type='post_tool_use',
+        source_adapter='codex',
+        client_event_id=event_id,
+        idempotency_key=idempotency_key,
+        content_hash=content_hash,
+        runtime='codex',
+        normalization_contract_version=1,
+        normalization_disposition='observation',
+        sequence_number=1,
+        payload={'tool_name': 'bash', 'tool_input': {'command': 'pytest'}},
+        metadata={},
+    )
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='persisted foreign evidence',
+        body='persisted foreign body',
+        content_hash=content_hash,
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+
+    return agent, session, raw_event, observation
+
+
+def hook_duplicate_state() -> dict[str, object]:
+    return {
+        'raw_events': list(
+            RawEventEnvelope.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'metadata',
+                'source_adapter',
+                'content_hash',
+                'normalization_contract_version',
+                'normalization_disposition',
+                'normalization_reason',
+                'sequence_number',
+            ),
+        ),
+        'observations': list(
+            Observation.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'organization_id',
+                'project_id',
+                'team_id',
+                'agent_id',
+                'session_id',
+                'raw_event_id',
+                'content_hash',
+                'source_metadata',
+            ),
+        ),
+        'sources': list(
+            ObservationSource.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'observation_id',
+                'raw_event_id',
+                'source_type',
+                'source_id',
+                'metadata',
+            ),
+        ),
+        'sessions': list(
+            AgentSession.objects.order_by('id').values(
+                'id',
+                'updated_at',
+                'status',
+                'observation_sequence_cursor',
+            ),
+        ),
+        'work': list(WorkflowWork.objects.order_by('id').values('id', 'updated_at', 'input_fingerprint')),
+        'outbox_ids': list(CeleryOutbox.objects.order_by('id').values_list('id', flat=True)),
+    }
 
 
 @pytest.mark.django_db
@@ -378,6 +495,1498 @@ def test_post_tool_use_ingests_raw_event_observation_source_and_queues_worker_ta
 
 
 @pytest.mark.django_db
+def test_hook_acceptance_persists_v1_evidence_policy_and_id_only_observation_work() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+
+    response = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 202
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    session = AgentSession.objects.get()
+    work = WorkflowWork.objects.get()
+    queued = CeleryOutbox.objects.get()
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == 'observation'
+    assert raw_event.normalization_reason is None
+    assert raw_event.metadata['work_policy_v1'] == {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': True,
+        'legacy_policy_fallback': False,
+    }
+    assert observation.session_sequence == 1
+    assert session.observation_sequence_cursor == 1
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
+    assert set(work.input_snapshot) == {'schema', 'observation_id', 'observation_digest', 'policy'}
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    response = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+    assert response.status_code == 202
+    raw_event = RawEventEnvelope.objects.get()
+    raw_event.metadata = {}
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+    enable_realtime_candidates(organization)
+
+    first_duplicate = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first_duplicate.status_code == 202
+    raw_event.refresh_from_db()
+    assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is True
+    assert raw_event.normalization_contract_version is None
+    assert raw_event.normalization_disposition is None
+    assert raw_event.normalization_reason is None
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    session = AgentSession.objects.get()
+    source = ObservationSource.objects.get()
+    state_after_repair = {
+        'raw_updated_at': raw_event.updated_at,
+        'source_updated_at': source.updated_at,
+        'session_updated_at': session.updated_at,
+        'session_cursor': session.observation_sequence_cursor,
+        'raw_count': RawEventEnvelope.objects.count(),
+        'source_count': ObservationSource.objects.count(),
+        'work_count': WorkflowWork.objects.count(),
+        'outbox_count': CeleryOutbox.objects.count(),
+    }
+
+    second_duplicate = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert second_duplicate.status_code == 202
+    raw_event.refresh_from_db()
+    source.refresh_from_db()
+    session.refresh_from_db()
+    assert raw_event.updated_at == state_after_repair['raw_updated_at']
+    assert source.updated_at == state_after_repair['source_updated_at']
+    assert session.updated_at == state_after_repair['session_updated_at']
+    assert session.observation_sequence_cursor == state_after_repair['session_cursor']
+    assert RawEventEnvelope.objects.count() == state_after_repair['raw_count']
+    assert ObservationSource.objects.count() == state_after_repair['source_count']
+    assert WorkflowWork.objects.count() == state_after_repair['work_count']
+    assert CeleryOutbox.objects.count() == state_after_repair['outbox_count']
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('normalization_disposition', 'normalization_reason'),
+    (('observation', None), (None, 'evidence_only'), ('no_op', 'evidence_only')),
+)
+def test_legacy_hook_duplicate_rejects_partial_normalization_before_mutation(
+    normalization_disposition: str | None,
+    normalization_reason: str | None,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    result = IngestHookEvent().execute(hook_event_input(project, team))
+    raw_event = result.raw_event
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = normalization_disposition
+    raw_event.normalization_reason = normalization_reason
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='normalization'):
+        IngestHookEvent()._repair_duplicate(
+            raw_event,
+            organization=organization,
+            project=project,
+            session=result.session,
+        )
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('corruption', ('session', 'agent', 'session_and_agent'))
+def test_legacy_hook_duplicate_rejects_corrupted_direct_observation_scope_before_mutation(
+    corruption: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    result = IngestHookEvent().execute(data)
+    raw_event = result.raw_event
+    raw_event.metadata = {}
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+    other_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='corrupt-observation-agent',
+    )
+    other_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=other_agent,
+        external_session_id='corrupt-observation-session',
+        runtime='codex',
+    )
+    observation_updates: dict[str, object] = {}
+    if corruption in {'session', 'session_and_agent'}:
+        observation_updates['session'] = other_session
+    if corruption in {'agent', 'session_and_agent'}:
+        observation_updates['agent'] = other_agent
+    Observation.objects.filter(id=result.observation.id).update(**observation_updates)
+    enable_realtime_candidates(organization)
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='scope'):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_legacy_hook_duplicate_rejects_ambiguous_direct_observations_before_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    result = IngestHookEvent().execute(data)
+    raw_event = result.raw_event
+    raw_event.metadata = {}
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=result.session.agent,
+        session=result.session,
+        raw_event=raw_event,
+        observation_type='tool_use',
+        title='ambiguous legacy observation',
+        body='must fail closed',
+        content_hash='ambiguous-legacy-hash',
+        source_metadata={'event_type': data.event_type},
+    )
+    enable_realtime_candidates(organization)
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='exactly one direct observation'):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_legacy_hook_duplicate_rejects_canonical_source_bound_to_another_raw_before_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    result = IngestHookEvent().execute(data)
+    other = IngestHookEvent().execute(
+        hook_event_input(
+            project,
+            team,
+            event_id='event-2',
+            idempotency_key='idem-2',
+            request_id='request-event-2',
+        ),
+    )
+    raw_event = result.raw_event
+    raw_event.metadata = {}
+    raw_event.normalization_contract_version = None
+    raw_event.normalization_disposition = None
+    raw_event.normalization_reason = None
+    raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+    source = ObservationSource.objects.get(raw_event=raw_event)
+    source.raw_event = other.raw_event
+    source.save(update_fields=['raw_event', 'updated_at'])
+    enable_realtime_candidates(organization)
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError, match='different raw event'):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_rejects_typed_v1_missing_work_policy_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    raw_event.metadata = {}
+    raw_event.save(update_fields=['metadata', 'updated_at'])
+    enable_realtime_candidates(organization)
+    session = AgentSession.objects.get()
+    initial_session_state = (
+        session.updated_at,
+        session.observation_sequence_cursor,
+        session.status,
+    )
+
+    with pytest.raises(ValueError, match='work_policy_v1'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    session.refresh_from_db()
+    assert raw_event.normalization_contract_version == 1
+    assert raw_event.normalization_disposition == 'observation'
+    assert raw_event.normalization_reason is None
+    assert raw_event.metadata == {}
+    assert (session.updated_at, session.observation_sequence_cursor, session.status) == initial_session_state
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_hook_duplicate_rejects_invalid_present_work_policy_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    invalid_policy = {
+        'schema': 'hook_work_policy/v1',
+        'realtime_candidates_enabled': 'yes',
+        'legacy_policy_fallback': False,
+    }
+    raw_event.metadata = {'work_policy_v1': invalid_policy}
+    raw_event.save(update_fields=['metadata', 'updated_at'])
+    enable_realtime_candidates(organization)
+
+    with pytest.raises(ValueError, match='work_policy_v1'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    assert raw_event.metadata == {'work_policy_v1': invalid_policy}
+    assert ObservationSource.objects.count() == 1
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'malformation',
+    (
+        'evidence_only_disposition',
+        'missing_hook_source',
+        'extra_hook_source',
+        'mismatched_source_type',
+        'mismatched_source_id',
+        'mismatched_source_event_type',
+        'mismatched_source_raw_event',
+        'ambiguous_direct_observation',
+        'typed_legacy_policy_fallback',
+    ),
+)
+def test_hook_duplicate_rejects_malformed_typed_v1_evidence_before_mutation(malformation: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    source = ObservationSource.objects.get()
+    WorkflowWork.objects.all().delete()
+    CeleryOutbox.objects.all().delete()
+
+    if malformation == 'evidence_only_disposition':
+        raw_event.normalization_disposition = 'no_op'
+        raw_event.normalization_reason = 'evidence_only'
+        raw_event.save(update_fields=['normalization_disposition', 'normalization_reason', 'updated_at'])
+    elif malformation == 'missing_hook_source':
+        source.delete()
+    elif malformation == 'extra_hook_source':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=raw_event,
+            source_type='hook_event',
+            source_id='unexpected-event',
+            metadata={'event_type': raw_event.event_type},
+        )
+    elif malformation == 'mismatched_source_type':
+        source.source_type = 'manual'
+        source.save(update_fields=['source_type', 'updated_at'])
+    elif malformation == 'mismatched_source_id':
+        source.source_id = 'unexpected-event'
+        source.save(update_fields=['source_id', 'updated_at'])
+    elif malformation == 'mismatched_source_event_type':
+        source.metadata = {'event_type': 'session_start'}
+        source.save(update_fields=['metadata', 'updated_at'])
+    elif malformation == 'mismatched_source_raw_event':
+        source.raw_event = None
+        source.save(update_fields=['raw_event', 'updated_at'])
+    elif malformation == 'ambiguous_direct_observation':
+        Observation.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            agent=raw_event.agent,
+            session=raw_event.session,
+            raw_event=raw_event,
+            observation_type='tool_use',
+            title='ambiguous direct observation',
+            body='must not be selected by ordering',
+            content_hash='ambiguous-content-hash',
+            source_metadata={'event_type': raw_event.event_type},
+        )
+    elif malformation == 'typed_legacy_policy_fallback':
+        raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] = True
+        raw_event.save(update_fields=['metadata', 'updated_at'])
+    else:
+        raise AssertionError(f'Unhandled malformation: {malformation}')
+
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('raw_event_type', 'trusted_event_type'),
+    (
+        ('session_start', 'post_tool_use'),
+        ('post_tool_use', 'session_start'),
+    ),
+)
+def test_hook_duplicate_rejects_mismatched_persisted_lifecycle_classification(
+    raw_event_type: str,
+    trusted_event_type: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, _session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='persisted-idempotency',
+        content_hash='persisted-content-hash',
+    )
+    raw_event.event_type = raw_event_type
+    raw_event.metadata = {
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': False,
+            'legacy_policy_fallback': False,
+        },
+    }
+    raw_event.save(update_fields=['event_type', 'metadata', 'updated_at'])
+    observation.source_metadata = {'event_type': trusted_event_type}
+    observation.save(update_fields=['source_metadata', 'updated_at'])
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=raw_event,
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    enable_realtime_candidates(organization)
+    data = hook_event_input(
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='persisted-idempotency',
+        content_hash='persisted-content-hash',
+    )
+
+    with pytest.raises(ValueError, match='event type'):
+        IngestHookEvent().execute(data)
+
+    raw_event.refresh_from_db()
+    assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is False
+    assert ObservationSource.objects.count() == 1
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('import_adapter', 'import_source'),
+    (
+        (True, False),
+        (False, True),
+        (True, True),
+    ),
+)
+def test_hook_duplicate_rejects_import_owned_idempotency_collision_without_mutation(
+    import_adapter: bool,
+    import_source: bool,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, imported_session, imported_raw_event, imported_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='imported-session',
+        event_id='imported-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='imported-content-hash',
+    )
+    if import_adapter:
+        imported_raw_event.source_adapter = 'claude_mem'
+        imported_raw_event.save(update_fields=['source_adapter', 'updated_at'])
+    if import_source:
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=imported_observation,
+            raw_event=imported_raw_event,
+            source_type='claude_mem',
+            source_id='claude_mem:imported-observation',
+        )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    initial_raw_updated_at = imported_raw_event.updated_at
+    initial_source_count = ObservationSource.objects.count()
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(ValueError, match='another producer'):
+        IngestHookEvent().execute(data)
+
+    imported_raw_event.refresh_from_db()
+    imported_session.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert imported_raw_event.updated_at == initial_raw_updated_at
+    assert imported_raw_event.metadata == {}
+    assert imported_session.observation_sequence_cursor == 1
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == initial_source_count
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_find_duplicate_excludes_foreign_team_idempotency_row() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='incoming-content-hash',
+    )
+
+    duplicate = IngestHookEvent()._find_duplicate(organization, project, team, data)
+
+    assert duplicate is None
+
+
+@pytest.mark.django_db
+def test_find_duplicate_excludes_foreign_team_session_event_row() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='shared-session',
+        event_id='shared-event',
+        idempotency_key='foreign-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='shared-session',
+        event_id='shared-event',
+        idempotency_key='incoming-idempotency',
+        content_hash='incoming-content-hash',
+    )
+
+    duplicate = IngestHookEvent()._find_duplicate(organization, project, team, data)
+
+    assert duplicate is None
+
+
+@pytest.mark.django_db
+def test_cross_team_idempotency_collision_api_returns_generic_forbidden_without_writes() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert response.json()['detail'] == 'Hook identity collision is not accessible'
+    assert RawEventEnvelope.objects.count() == 1
+    assert AgentSession.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_legacy_unscoped_idempotency_collision_api_returns_generic_forbidden_without_writes() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='legacy-session',
+        event_id='legacy-event',
+        idempotency_key='legacy-idempotency',
+        content_hash='legacy-content-hash',
+    )
+    AgentSession.objects.filter(id=session.id).update(team=None)
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(team=None)
+    Observation.objects.filter(id=observation.id).update(team=None)
+    initial_state = hook_duplicate_state()
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='legacy-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert response.json()['detail'] == 'Hook identity collision is not accessible'
+    assert hook_duplicate_state() == initial_state
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_foreign_team_session_event_api_returns_generic_forbidden_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    persisted_agent, foreign_session, foreign_raw_event, foreign_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='shared-session',
+        event_id='shared-event',
+        idempotency_key='foreign-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    initial_session_state = (
+        foreign_session.updated_at,
+        foreign_session.team_id,
+        foreign_session.agent_id,
+        foreign_session.runtime,
+        foreign_session.repository_url,
+        foreign_session.status,
+        foreign_session.observation_sequence_cursor,
+    )
+    initial_raw_updated_at = foreign_raw_event.updated_at
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id='shared-session',
+        event_id='shared-event',
+        idempotency_key='incoming-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert response.json()['detail'] == 'Hook identity collision is not accessible'
+    foreign_session.refresh_from_db()
+    foreign_raw_event.refresh_from_db()
+    foreign_observation.refresh_from_db()
+    assert (
+        foreign_session.updated_at,
+        foreign_session.team_id,
+        foreign_session.agent_id,
+        foreign_session.runtime,
+        foreign_session.repository_url,
+        foreign_session.status,
+        foreign_session.observation_sequence_cursor,
+    ) == initial_session_state
+    assert foreign_session.agent_id == persisted_agent.id
+    assert foreign_raw_event.updated_at == initial_raw_updated_at
+    assert foreign_observation.team_id == foreign_team.id
+    assert RawEventEnvelope.objects.count() == 1
+    assert AgentSession.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_legacy_unscoped_session_event_collision_api_returns_generic_forbidden_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    persisted_agent, persisted_session, persisted_raw_event, persisted_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='legacy-session',
+        event_id='legacy-event',
+        idempotency_key='legacy-idempotency',
+        content_hash='legacy-content-hash',
+    )
+    AgentSession.objects.filter(id=persisted_session.id).update(team=None)
+    RawEventEnvelope.objects.filter(id=persisted_raw_event.id).update(team=None)
+    Observation.objects.filter(id=persisted_observation.id).update(team=None)
+    persisted_session.refresh_from_db()
+    persisted_raw_event.refresh_from_db()
+    persisted_observation.refresh_from_db()
+    initial_session_state = (
+        persisted_session.updated_at,
+        persisted_session.team_id,
+        persisted_session.agent_id,
+        persisted_session.runtime,
+        persisted_session.repository_url,
+        persisted_session.status,
+        persisted_session.observation_sequence_cursor,
+    )
+    initial_raw_updated_at = persisted_raw_event.updated_at
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id='legacy-session',
+        event_id='legacy-event',
+        idempotency_key='incoming-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert response.json()['detail'] == 'Hook identity collision is not accessible'
+    persisted_session.refresh_from_db()
+    persisted_raw_event.refresh_from_db()
+    assert (
+        persisted_session.updated_at,
+        persisted_session.team_id,
+        persisted_session.agent_id,
+        persisted_session.runtime,
+        persisted_session.repository_url,
+        persisted_session.status,
+        persisted_session.observation_sequence_cursor,
+    ) == initial_session_state
+    assert persisted_session.agent_id == persisted_agent.id
+    assert persisted_raw_event.updated_at == initial_raw_updated_at
+    assert persisted_observation.team_id is None
+    assert RawEventEnvelope.objects.count() == 1
+    assert AgentSession.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_cross_team_import_owned_idempotency_collision_denies_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    _agent, foreign_session, foreign_raw_event, foreign_observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    foreign_raw_event.source_adapter = 'claude_mem'
+    foreign_raw_event.save(update_fields=['source_adapter', 'updated_at'])
+    foreign_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=foreign_observation,
+        raw_event=foreign_raw_event,
+        source_type='claude_mem',
+        source_id='claude_mem:foreign-observation',
+    )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    initial_state = {
+        'raw_updated_at': foreign_raw_event.updated_at,
+        'foreign_session_updated_at': foreign_session.updated_at,
+        'incoming_session_updated_at': incoming_session.updated_at,
+        'source_updated_at': foreign_source.updated_at,
+        'source_ids': list(ObservationSource.objects.values_list('id', flat=True)),
+    }
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-import-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        IngestHookEvent().execute(data)
+
+    assert excinfo.value.code == 'hook_identity_collision'
+    assert str(excinfo.value) == 'Hook identity collision is not accessible'
+    foreign_raw_event.refresh_from_db()
+    foreign_session.refresh_from_db()
+    foreign_source.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert foreign_raw_event.updated_at == initial_state['raw_updated_at']
+    assert foreign_raw_event.metadata == {}
+    assert foreign_raw_event.source_adapter == 'claude_mem'
+    assert foreign_session.updated_at == initial_state['foreign_session_updated_at']
+    assert foreign_session.observation_sequence_cursor == 1
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.updated_at == initial_state['incoming_session_updated_at']
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert foreign_source.updated_at == initial_state['source_updated_at']
+    assert list(ObservationSource.objects.values_list('id', flat=True)) == initial_state['source_ids']
+    assert foreign_source.raw_event_id == foreign_raw_event.id
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cross_team_idempotency_duplicate_denies_without_touching_incoming_or_persisted_sessions() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    foreign_team = Team.objects.create(organization=organization, name='Security', slug='security')
+    ProjectTeam.objects.create(organization=organization, team=foreign_team, project=project)
+    _agent, foreign_session, foreign_raw_event, _observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        foreign_team,
+        session_id='foreign-session',
+        event_id='foreign-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='foreign-content-hash',
+    )
+    incoming_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='incoming-agent',
+        version='old-version',
+    )
+    incoming_session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=incoming_agent,
+        external_session_id='incoming-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='shared-project-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        IngestHookEvent().execute(data)
+
+    assert excinfo.value.code == 'hook_identity_collision'
+    assert str(excinfo.value) == 'Hook identity collision is not accessible'
+    assert set(AgentSession.objects.values_list('external_session_id', flat=True)) == {
+        'foreign-session',
+        'incoming-session',
+    }
+    foreign_session.refresh_from_db()
+    foreign_raw_event.refresh_from_db()
+    incoming_agent.refresh_from_db()
+    incoming_session.refresh_from_db()
+    assert foreign_session.observation_sequence_cursor == 1
+    assert foreign_raw_event.metadata == {}
+    assert incoming_agent.version == 'old-version'
+    assert incoming_session.agent_id == incoming_agent.id
+    assert incoming_session.runtime == 'claude_code'
+    assert incoming_session.repository_url == 'https://example.test/before.git'
+    assert incoming_session.status == SessionStatus.ENDED
+    assert incoming_session.observation_sequence_cursor == 7
+    assert ObservationSource.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_cross_session_idempotency_duplicate_uses_persisted_session_without_creating_incoming_session() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    _agent, persisted_session, persisted_raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='persisted-session',
+        event_id='persisted-event',
+        idempotency_key='cross-session-idempotency',
+        content_hash='persisted-content-hash',
+    )
+    persisted_raw_event.metadata = {
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': False,
+            'legacy_policy_fallback': False,
+        },
+    }
+    persisted_raw_event.save(update_fields=['metadata', 'updated_at'])
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=persisted_raw_event,
+        source_type='hook_event',
+        source_id=persisted_raw_event.client_event_id,
+        metadata={'event_type': persisted_raw_event.event_type},
+    )
+    data = hook_event_input(
+        project,
+        team,
+        session_id='incoming-session',
+        event_id='incoming-event',
+        idempotency_key='cross-session-idempotency',
+        content_hash='incoming-content-hash',
+        agent_external_id='incoming-agent',
+    )
+
+    result = IngestHookEvent().execute(data)
+
+    assert result.duplicate is True
+    assert result.raw_event.id == persisted_raw_event.id
+    assert result.observation.id == observation.id
+    assert result.session.id == persisted_session.id
+    assert list(AgentSession.objects.values_list('external_session_id', flat=True)) == ['persisted-session']
+    assert not Agent.objects.filter(external_id='incoming-agent').exists()
+
+
+@pytest.mark.django_db
+def test_hook_reuses_existing_observation_sequence_without_advancing_cursor() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(project, team),
+        format='json',
+        **auth_headers(),
+    )
+    second = APIClient().post(
+        '/v1/hooks/post-tool-use',
+        valid_hook_payload(
+            project,
+            team,
+            event_id='event-2',
+            idempotency_key='idem-2',
+            request_id='request-event-2',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 202
+    assert second.status_code == 202
+    assert Observation.objects.count() == 1
+    assert RawEventEnvelope.objects.count() == 2
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert list(RawEventEnvelope.objects.values_list('sequence_number', flat=True)) == [1, 1]
+
+
+@pytest.mark.django_db
+def test_typed_hook_replays_each_raw_that_shares_one_canonical_observation_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+
+    first = IngestHookEvent().execute(first_data)
+    second = IngestHookEvent().execute(second_data)
+
+    observation = Observation.objects.get()
+    raw_events = list(RawEventEnvelope.objects.order_by('created_at'))
+    assert first.observation.id == observation.id
+    assert second.observation.id == observation.id
+    assert observation.raw_event_id == first.raw_event.id
+    assert raw_events[0].observations.count() == 1
+    assert raw_events[1].observations.count() == 0
+    assert ObservationSource.objects.count() == 2
+    assert set(ObservationSource.objects.values_list('raw_event_id', flat=True)) == {
+        first.raw_event.id,
+        second.raw_event.id,
+    }
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    initial_state = hook_duplicate_state()
+
+    first_replay = IngestHookEvent().execute(first_data)
+    second_replay = IngestHookEvent().execute(second_data)
+
+    assert first_replay.duplicate is True
+    assert second_replay.duplicate is True
+    assert first_replay.raw_event.id == first.raw_event.id
+    assert second_replay.raw_event.id == second.raw_event.id
+    assert first_replay.observation.id == observation.id
+    assert second_replay.observation.id == observation.id
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_duplicate_ignores_unlinked_non_hook_observation_source() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    observation = Observation.objects.get()
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=None,
+        source_type='manual',
+        source_id='noncanonical-source',
+        metadata={'event_type': 'post_tool_use'},
+    )
+    initial_state = hook_duplicate_state()
+
+    replay = IngestHookEvent().execute(data)
+
+    assert replay.duplicate is True
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_duplicate_repairs_missing_work_once() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    data = hook_event_input(project, team)
+    IngestHookEvent().execute(data)
+    original_fingerprint = WorkflowWork.objects.get().input_fingerprint
+    WorkflowWork.objects.all().delete()
+    CeleryOutbox.objects.all().delete()
+
+    replay = IngestHookEvent().execute(data)
+
+    assert replay.duplicate is True
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    work = WorkflowWork.objects.get()
+    assert work.input_fingerprint == original_fingerprint
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
+
+    second_replay = IngestHookEvent().execute(data)
+
+    assert second_replay.duplicate is True
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+
+
+@pytest.mark.django_db
+def test_new_typed_hook_reuse_rejects_canonical_source_identity_with_null_raw_link() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    first = IngestHookEvent().execute(first_data)
+    observation = first.observation
+    ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=None,
+        source_type='hook_event',
+        source_id=second_data.event_id,
+        metadata={'event_type': second_data.event_type},
+    )
+
+    initial_state = hook_duplicate_state()
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(second_data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'sibling_malformation',
+    (
+        'claude_mem_producer',
+        'no_op_normalization',
+        'missing_policy',
+        'legacy_policy',
+        'extra_direct_source',
+        'direct_observation_elsewhere',
+        'content_hash_mismatch',
+    ),
+)
+def test_typed_hook_duplicate_validates_only_current_shared_observation_evidence(
+    sibling_malformation: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    first_data = hook_event_input(project, team)
+    second_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    first = IngestHookEvent().execute(first_data)
+    second = IngestHookEvent().execute(second_data)
+    sibling = second.raw_event
+    observation = first.observation
+
+    if sibling_malformation == 'claude_mem_producer':
+        sibling.source_adapter = 'claude_mem'
+        sibling.save(update_fields=['source_adapter', 'updated_at'])
+    elif sibling_malformation == 'no_op_normalization':
+        sibling.normalization_disposition = 'no_op'
+        sibling.normalization_reason = 'evidence_only'
+        sibling.save(update_fields=['normalization_disposition', 'normalization_reason', 'updated_at'])
+    elif sibling_malformation == 'missing_policy':
+        sibling.metadata = {key: value for key, value in sibling.metadata.items() if key != 'work_policy_v1'}
+        sibling.save(update_fields=['metadata', 'updated_at'])
+    elif sibling_malformation == 'legacy_policy':
+        sibling.metadata = {
+            **sibling.metadata,
+            'work_policy_v1': {
+                **sibling.metadata['work_policy_v1'],
+                'legacy_policy_fallback': True,
+            },
+        }
+        sibling.save(update_fields=['metadata', 'updated_at'])
+    elif sibling_malformation == 'extra_direct_source':
+        ObservationSource.objects.create(
+            organization=organization,
+            project=project,
+            observation=observation,
+            raw_event=sibling,
+            source_type='hook_event',
+            source_id='extra-sibling-source',
+            metadata={'event_type': sibling.event_type},
+        )
+    elif sibling_malformation == 'direct_observation_elsewhere':
+        Observation.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            agent=sibling.agent,
+            session=sibling.session,
+            raw_event=sibling,
+            observation_type='tool_use',
+            title='wrong sibling observation',
+            body='must not be accepted as canonical',
+            content_hash='wrong-sibling-observation-hash',
+            source_metadata={'event_type': sibling.event_type},
+        )
+    elif sibling_malformation == 'content_hash_mismatch':
+        sibling.content_hash = 'mismatched-sibling-content-hash'
+        sibling.save(update_fields=['content_hash', 'updated_at'])
+    else:
+        raise AssertionError(f'Unhandled sibling malformation: {sibling_malformation}')
+
+    initial_state = hook_duplicate_state()
+
+    healthy_replay = IngestHookEvent().execute(first_data)
+
+    assert healthy_replay.duplicate is True
+    assert healthy_replay.raw_event.id == first.raw_event.id
+    assert healthy_replay.observation.id == observation.id
+    assert hook_duplicate_state() == initial_state
+
+    with pytest.raises(ValueError):
+        IngestHookEvent().execute(second_data)
+
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('realtime_candidates_enabled', 'legacy_policy_fallback'),
+    ((False, False), (True, False), (False, True), (True, True)),
+)
+def test_new_typed_hook_reuse_accepts_valid_legacy_sibling_provenance(
+    realtime_candidates_enabled: bool,
+    legacy_policy_fallback: bool,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    enable_realtime_candidates(organization)
+    legacy_data = hook_event_input(project, team)
+    typed_data = hook_event_input(
+        project,
+        team,
+        event_id='event-2',
+        idempotency_key='idem-2',
+        request_id='request-event-2',
+    )
+    legacy = IngestHookEvent().execute(legacy_data)
+    legacy.raw_event.normalization_contract_version = None
+    legacy.raw_event.normalization_disposition = None
+    legacy.raw_event.normalization_reason = None
+    legacy.raw_event.metadata = {
+        **legacy.raw_event.metadata,
+        'work_policy_v1': {
+            'schema': 'hook_work_policy/v1',
+            'realtime_candidates_enabled': realtime_candidates_enabled,
+            'legacy_policy_fallback': legacy_policy_fallback,
+        },
+    }
+    legacy.raw_event.save(
+        update_fields=[
+            'metadata',
+            'normalization_contract_version',
+            'normalization_disposition',
+            'normalization_reason',
+            'updated_at',
+        ],
+    )
+
+    typed = IngestHookEvent().execute(typed_data)
+
+    assert typed.duplicate is False
+    assert typed.observation.id == legacy.observation.id
+    assert RawEventEnvelope.objects.count() == 2
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 2
+    initial_state = hook_duplicate_state()
+
+    typed_replay = IngestHookEvent().execute(typed_data)
+
+    assert typed_replay.duplicate is True
+    assert typed_replay.observation.id == legacy.observation.id
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_typed_hook_provenance_validation_query_count_is_independent_of_sibling_count() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('PostgreSQL query-shape assertion')
+    organization, team, project, _owner, _api_key = create_project_scope()
+    service = IngestHookEvent()
+    first = service.execute(hook_event_input(project, team))
+
+    with CaptureQueriesContext(connection) as one_source_queries:
+        service._validate_typed_hook_evidence(
+            first.raw_event,
+            organization=organization,
+            project=project,
+            session=first.session,
+        )
+
+    for index in range(2, 12):
+        service.execute(
+            hook_event_input(
+                project,
+                team,
+                event_id=f'event-{index}',
+                idempotency_key=f'idem-{index}',
+                request_id=f'request-event-{index}',
+            ),
+        )
+
+    with CaptureQueriesContext(connection) as many_source_queries:
+        service._validate_typed_hook_evidence(
+            first.raw_event,
+            organization=organization,
+            project=project,
+            session=first.session,
+        )
+
+    assert len(many_source_queries.captured_queries) == len(one_source_queries.captured_queries)
+    assert len(many_source_queries.captured_queries) <= 8
+    source_queries = [
+        query['sql'] for query in many_source_queries.captured_queries if 'core_observationsource' in query['sql']
+    ]
+    assert source_queries
+    assert all('raw_event_id' in query for query in source_queries)
+    assert all('COUNT(' not in query for query in source_queries)
+
+
+@pytest.mark.django_db
+def test_new_hook_event_locks_agent_session_once() -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('PostgreSQL lock SQL assertion')
+    _organization, team, project, _owner, _api_key = create_project_scope()
+
+    with CaptureQueriesContext(connection) as queries:
+        result = IngestHookEvent().execute(hook_event_input(project, team))
+
+    session_lock_queries = [
+        query['sql'] for query in queries.captured_queries if 'FOR UPDATE OF "core_agentsession"' in query['sql']
+    ]
+    assert result.duplicate is False
+    assert len(session_lock_queries) == 1
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_with_different_canonical_redacted_content() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first_data = hook_event_input(project, team)
+    IngestHookEvent().execute(first_data)
+    collision = hook_event_input(
+        project,
+        team,
+        event_id='collision-event',
+        idempotency_key='collision-idempotency',
+        observation={**first_data.observation, 'body': 'different redacted canonical body'},
+    )
+
+    with pytest.raises(ValueError, match='content hash collision'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_across_trusted_lifecycle_class() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    shared_observation = {
+        'type': 'shared',
+        'title': 'same title',
+        'body': 'same body',
+        'files_read': [],
+        'files_modified': [],
+    }
+    IngestHookEvent().execute(hook_event_input(project, team, observation=shared_observation))
+    collision = hook_event_input(
+        project,
+        team,
+        event_type='session_start',
+        event_id='lifecycle-collision-event',
+        idempotency_key='lifecycle-collision-idempotency',
+        observation=shared_observation,
+    )
+
+    with pytest.raises(ValueError, match='lifecycle class'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+
+
+@pytest.mark.django_db
+def test_hook_rejects_content_hash_reuse_across_exact_non_lifecycle_event_type() -> None:
+    _organization, team, project, _owner, _api_key = create_project_scope()
+    first_data = hook_event_input(project, team)
+    IngestHookEvent().execute(first_data)
+    collision = hook_event_input(
+        project,
+        team,
+        event_type='pre_tool_use',
+        event_id='non-lifecycle-collision-event',
+        idempotency_key='non-lifecycle-collision-idempotency',
+        observation=first_data.observation,
+    )
+
+    with pytest.raises(ValueError, match='trusted event type'):
+        IngestHookEvent().execute(collision)
+
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    assert AgentSession.objects.get().observation_sequence_cursor == 1
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_lifecycle_hook_never_creates_observation_work() -> None:
+    organization, project, team, raw_key = create_hook_scope()
+    enable_realtime_candidates(organization)
+    payload = valid_hook_payload(
+        project,
+        team,
+        event_type='session_start',
+        event_id='lifecycle-event-1',
+        idempotency_key='lifecycle-idempotency-1',
+        observation={
+            'type': 'session_start',
+            'title': 'Session started',
+            'body': 'started',
+            'files_read': [],
+            'files_modified': [],
+        },
+    )
+
+    response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
+
+    assert response.status_code == 202
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 0
+
+
+@pytest.mark.django_db
 def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
@@ -414,11 +2023,10 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
         )
 
     assert response.status_code == 202
-    body = response.json()
     queued = CeleryOutbox.objects.get()
 
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
     transport_payload = f'{queued.args} {queued.kwargs} {queued.options}'
     assert RAW_KEY not in transport_payload
@@ -426,7 +2034,7 @@ def test_post_tool_use_enqueues_memory_worker_task_via_celery_outbox(
 
 
 @pytest.mark.django_db
-def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits() -> None:
+def test_ingest_hook_event_writes_worker_task_inside_transaction() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     enable_realtime_candidates(organization)
     data = hook_event_input(project, team)
@@ -434,7 +2042,7 @@ def test_ingest_hook_event_defers_worker_task_dispatch_until_transaction_commits
     with transaction.atomic():
         IngestHookEvent().execute(data)
 
-        assert CeleryOutbox.objects.count() == 0
+        assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
@@ -465,11 +2073,11 @@ def test_ingest_hook_event_dispatches_worker_task_exactly_once_on_commit(
 
     with f_capture_on_commit(execute=True):
         with transaction.atomic():
-            result = IngestHookEvent().execute(data)
+            IngestHookEvent().execute(data)
 
-    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 1
-    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
-    assert queued.args == [str(result.observation.id)]
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 1
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
@@ -482,7 +2090,7 @@ def test_ingest_hook_event_does_not_enqueue_realtime_task_by_default(
     with f_capture_on_commit(execute=True):
         IngestHookEvent().execute(data)
 
-    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_recorded').count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.process_observation_work_v1').count() == 0
 
 
 @pytest.mark.django_db
@@ -510,14 +2118,14 @@ def test_ingest_hook_event_enqueues_realtime_task_when_setting_enabled(
     data = hook_event_input(project, team)
 
     with f_capture_on_commit(execute=True):
-        result = IngestHookEvent().execute(data)
+        IngestHookEvent().execute(data)
 
-    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_recorded')
-    assert queued.args == [str(result.observation.id)]
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.process_observation_work_v1')
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
-def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
+def test_session_start_hook_persists_lifecycle_event_without_observation_work(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
     organization, project, team, raw_key = create_hook_scope()
@@ -542,13 +2150,10 @@ def test_session_start_hook_persists_lifecycle_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/session-start', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'session_start'
     assert Observation.objects.get().observation_type == 'session_start'
-    queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
-    assert queued.kwargs == {}
+    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -577,12 +2182,11 @@ def test_error_hook_persists_error_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/error', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'error'
     assert Observation.objects.get().observation_type == 'error'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
 
 
@@ -612,12 +2216,11 @@ def test_decision_hook_persists_decision_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/decision', payload, format='json', **auth_headers())
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'decision'
     assert Observation.objects.get().observation_type == 'decision'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}
 
 
@@ -804,6 +2407,340 @@ def test_post_tool_use_uses_key_bound_team_when_request_omits_team_id() -> None:
 
 
 @pytest.mark.django_db
+def test_project_only_hook_denies_existing_team_session_without_mutation() -> None:
+    organization, team, project, _owner, api_key = create_project_scope()
+    api_key.team = None
+    api_key.save(update_fields=['team', 'updated_at'])
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='codex-local',
+        version='old-version',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id='existing-team-session',
+        runtime='claude_code',
+        repository_url='https://example.test/before.git',
+        status=SessionStatus.ENDED,
+        observation_sequence_cursor=7,
+    )
+    initial_agent_state = (agent.updated_at, agent.version)
+    initial_session_state = (
+        session.updated_at,
+        session.team_id,
+        session.agent_id,
+        session.runtime,
+        session.repository_url,
+        session.status,
+        session.observation_sequence_cursor,
+    )
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id='existing-team-session',
+        agent_external_id='codex-local',
+    )
+    payload.pop('team_id')
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'team_scope_denied'
+    agent.refresh_from_db()
+    session.refresh_from_db()
+    assert (agent.updated_at, agent.version) == initial_agent_state
+    assert (
+        session.updated_at,
+        session.team_id,
+        session.agent_id,
+        session.runtime,
+        session.repository_url,
+        session.status,
+        session.observation_sequence_cursor,
+    ) == initial_session_state
+    assert RawEventEnvelope.objects.count() == 0
+    assert Observation.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_team_scoped_hook_adopts_legacy_null_team_session() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='codex-local',
+        version='0.1.0',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=None,
+        agent=agent,
+        external_session_id='legacy-unscoped-session',
+        runtime='codex',
+        repository_url='https://example.test/engram.git',
+        repository_root='/workspace/engram',
+        branch='master',
+        cwd='/workspace/engram',
+        observation_sequence_cursor=0,
+    )
+    payload = valid_hook_payload(project, team, session_id='legacy-unscoped-session')
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    session.refresh_from_db()
+    assert session.team_id == team.id
+    assert RawEventEnvelope.objects.get().team_id == team.id
+    assert Observation.objects.get().team_id == team.id
+
+
+@pytest.mark.django_db
+def test_team_scoped_hook_rejects_legacy_null_team_session_with_history_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    agent, session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='legacy-history-session',
+        event_id='legacy-history-event',
+        idempotency_key='legacy-history-idempotency',
+        content_hash='legacy-history-hash',
+    )
+    agent.version = 'old-version'
+    agent.save(update_fields=['version', 'updated_at'])
+    source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        raw_event=raw_event,
+        source_type='hook_event',
+        source_id=raw_event.client_event_id,
+        metadata={'event_type': raw_event.event_type},
+    )
+    AgentSession.objects.filter(id=session.id).update(team=None)
+    RawEventEnvelope.objects.filter(id=raw_event.id).update(team=None)
+    Observation.objects.filter(id=observation.id).update(team=None)
+    initial_entity_state = {
+        'agent': Agent.objects.filter(id=agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+        'source': ObservationSource.objects.filter(id=source.id).values().get(),
+    }
+    initial_state = hook_duplicate_state()
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        event_id='incoming-history-event',
+        idempotency_key='incoming-history-idempotency',
+        content_hash='incoming-history-hash',
+        agent_external_id=agent.external_id,
+        agent_version='new-version',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert response.json()['detail'] == 'Hook identity collision is not accessible'
+    assert {
+        'agent': Agent.objects.filter(id=agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+        'source': ObservationSource.objects.filter(id=source.id).values().get(),
+    } == initial_entity_state
+    assert hook_duplicate_state() == initial_state
+
+
+@pytest.mark.django_db
+def test_history_bearing_hook_rejects_same_team_different_agent_without_mutation() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    original_payload = valid_hook_payload(
+        project,
+        team,
+        session_id='history-agent-session',
+        event_id='history-agent-event',
+        idempotency_key='history-agent-idempotency',
+        content_hash='history-agent-hash',
+    )
+    original_response = client.post('/v1/hooks/post-tool-use', original_payload, format='json', **auth_headers())
+    assert original_response.status_code == 202
+    existing_agent = Agent.objects.get()
+    session = AgentSession.objects.get()
+    raw_event = RawEventEnvelope.objects.get()
+    observation = Observation.objects.get()
+    initial_state = {
+        'agent': Agent.objects.filter(id=existing_agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    }
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        event_id='history-agent-incoming-event',
+        idempotency_key='history-agent-incoming-idempotency',
+        content_hash='history-agent-incoming-hash',
+        agent_external_id='different-agent',
+    )
+
+    response = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    assert Agent.objects.count() == 1
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+    assert {
+        'agent': Agent.objects.filter(id=existing_agent.id).values().get(),
+        'session': AgentSession.objects.filter(id=session.id).values().get(),
+        'raw_event': RawEventEnvelope.objects.filter(id=raw_event.id).values().get(),
+        'observation': Observation.objects.filter(id=observation.id).values().get(),
+    } == initial_state
+    replay = client.post('/v1/hooks/post-tool-use', original_payload, format='json', **auth_headers())
+    assert replay.status_code == 202
+    assert replay.json()['duplicate'] is True
+    assert replay.json()['raw_event_id'] == original_response.json()['raw_event_id']
+
+
+@pytest.mark.django_db
+def test_history_free_hook_corrects_agent_and_runtime() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    existing_agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id='history-free-hook-agent',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=existing_agent,
+        external_session_id='history-free-hook-session',
+        runtime='codex',
+        platform_source='',
+    )
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        agent_runtime='claude_code',
+        agent_external_id='corrected-hook-agent',
+        event_id='history-free-hook-event',
+        idempotency_key='history-free-hook-idempotency',
+        content_hash='history-free-hook-hash',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    session.refresh_from_db()
+    assert session.runtime == 'claude_code'
+    assert session.platform_source == 'claude_code'
+    assert session.agent.external_id == 'corrected-hook-agent'
+
+
+@pytest.mark.django_db
+def test_history_bearing_hook_adopts_blank_platform_and_updates_agent_version() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    agent, session, _raw_event, _observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='blank-platform-hook-session',
+        event_id='blank-platform-hook-event',
+        idempotency_key='blank-platform-hook-idempotency',
+        content_hash='blank-platform-hook-hash',
+    )
+    Agent.objects.filter(id=agent.id).update(version='old-version')
+    AgentSession.objects.filter(id=session.id).update(platform_source='')
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        agent_external_id=agent.external_id,
+        agent_version='new-version',
+        event_id='blank-platform-hook-incoming-event',
+        idempotency_key='blank-platform-hook-incoming-idempotency',
+        content_hash='blank-platform-hook-incoming-hash',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 202
+    agent.refresh_from_db()
+    session.refresh_from_db()
+    assert agent.version == 'new-version'
+    assert session.agent_id == agent.id
+    assert session.runtime == 'codex'
+    assert session.platform_source == 'codex'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('stored_runtime', 'stored_platform_source', 'requested_runtime'),
+    [
+        ('claude_code', 'claude_code', 'codex'),
+        ('codex', 'legacy-platform', 'codex'),
+    ],
+)
+def test_history_bearing_hook_rejects_identity_runtime_conflict_without_mutation(
+    stored_runtime: str,
+    stored_platform_source: str,
+    requested_runtime: str,
+) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    existing_agent, session, raw_event, observation = create_persisted_hook_evidence(
+        organization,
+        project,
+        team,
+        session_id='history-runtime-session',
+        event_id='history-runtime-event',
+        idempotency_key='history-runtime-idempotency',
+        content_hash='history-runtime-hash',
+    )
+    AgentSession.objects.filter(id=session.id).update(
+        runtime=stored_runtime,
+        platform_source=stored_platform_source,
+    )
+    Agent.objects.filter(id=existing_agent.id).update(version='old-version')
+    existing_agent.refresh_from_db()
+    initial_agent_state = (existing_agent.version, existing_agent.updated_at)
+    payload = valid_hook_payload(
+        project,
+        team,
+        session_id=session.external_session_id,
+        event_id='history-runtime-incoming-event',
+        idempotency_key='history-runtime-incoming-idempotency',
+        content_hash='history-runtime-incoming-hash',
+        agent_runtime=requested_runtime,
+        agent_external_id=existing_agent.external_id,
+        agent_version='new-version',
+    )
+
+    response = APIClient().post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+
+    assert response.status_code == 403
+    assert response.json()['code'] == 'hook_identity_collision'
+    existing_agent.refresh_from_db()
+    assert (existing_agent.version, existing_agent.updated_at) == initial_agent_state
+    session.refresh_from_db()
+    assert session.runtime == stored_runtime
+    assert session.platform_source == stored_platform_source
+    assert RawEventEnvelope.objects.count() == 1
+    assert Observation.objects.count() == 1
+
+
+@pytest.mark.django_db
 def test_post_tool_use_replay_by_idempotency_key_returns_existing_rows(
     f_capture_on_commit: DjangoCaptureOnCommitCallbacks,
 ) -> None:
@@ -858,38 +2795,81 @@ def test_post_tool_use_replay_by_session_event_id_returns_existing_rows(
 
 
 @pytest.mark.django_db(transaction=True)
-def test_post_tool_use_replay_race_returns_existing_rows(m_monkeypatch: pytest.MonkeyPatch) -> None:
+def test_concurrent_post_tool_use_submissions_converge_on_one_atomic_result(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
     organization, team, project, _owner, _api_key = create_project_scope()
     enable_realtime_candidates(organization)
-    client = APIClient()
     payload = valid_hook_payload(project, team)
-    first = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+    barrier = Barrier(2)
+    request_state = local()
+    backend_pids: list[int] = []
     original_find_duplicate = IngestHookEvent._find_duplicate
-    calls = {'count': 0}
 
-    def miss_once_then_load(
+    def synchronize_after_first_real_miss(
         service: IngestHookEvent,
         organization: Organization,
         project: Project,
-        data: Any,
+        team: Team | None,
+        data: HookEventInput,
     ) -> RawEventEnvelope | None:
-        calls['count'] += 1
-        if calls['count'] == 1:
-            return None
+        duplicate = original_find_duplicate(service, organization, project, team, data)
+        if duplicate is not None or getattr(request_state, 'synchronized', False):
+            return duplicate
 
-        return original_find_duplicate(service, organization, project, data)
+        assert connection.in_atomic_block
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_backend_pid()')
+            backend_pids.append(cursor.fetchone()[0])
+        request_state.synchronized = True
+        barrier.wait(timeout=5)
 
-    m_monkeypatch.setattr(IngestHookEvent, '_find_duplicate', miss_once_then_load)
+        return duplicate
 
-    second = client.post('/v1/hooks/post-tool-use', payload, format='json', **auth_headers())
+    m_monkeypatch.setattr(IngestHookEvent, '_find_duplicate', synchronize_after_first_real_miss)
 
-    assert first.status_code == 202
-    assert second.status_code == 202
-    assert second.json()['duplicate'] is True
-    assert second.json()['raw_event_id'] == first.json()['raw_event_id']
+    def submit() -> tuple[int, dict[str, Any]]:
+        close_old_connections()
+        try:
+            response = APIClient().post(
+                '/v1/hooks/post-tool-use',
+                payload,
+                format='json',
+                **auth_headers(),
+            )
+
+            return response.status_code, response.json()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(submit) for _index in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    assert connection.vendor == 'postgresql'
+    assert len(backend_pids) == 2
+    assert len(set(backend_pids)) == 2
+    assert [status for status, _body in results] == [202, 202]
+    bodies = [body for _status, body in results]
+    assert sorted(body['duplicate'] for body in bodies) == [False, True]
+    assert len({body['raw_event_id'] for body in bodies}) == 1
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert ObservationSource.objects.count() == 1
+    raw_event = RawEventEnvelope.objects.get()
+    session = AgentSession.objects.get()
+    observation = Observation.objects.get()
+    work = WorkflowWork.objects.get()
+    queued = CeleryOutbox.objects.get()
+    assert raw_event.sequence_number == 1
+    assert session.observation_sequence_cursor == 1
+    assert observation.session_sequence == 1
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
@@ -1072,13 +3052,7 @@ def test_session_end_marks_session_ended_and_writes_durable_event(
     assert observation.observation_type == 'session_end'
     assert response.json()['agent_session_id'] == str(session.id)
     outbox_tasks = {row.task_name: row for row in CeleryOutbox.objects.all()}
-    assert set(outbox_tasks) == {
-        'engram.memory.process_observation_recorded',
-        'engram.memory.distill_session',
-    }
-    process_task = outbox_tasks['engram.memory.process_observation_recorded']
-    assert process_task.args == [response.json()['observation_id']]
-    assert process_task.kwargs == {}
+    assert set(outbox_tasks) == {'engram.memory.distill_session'}
     distill_task = outbox_tasks['engram.memory.distill_session']
     assert distill_task.args == [str(session.id)]
     assert distill_task.kwargs == {}
@@ -1241,8 +3215,8 @@ def test_pre_tool_use_ingests_raw_event_observation_source_and_queues_worker_tas
     assert raw_event.event_type == 'pre_tool_use'
     assert observation.observation_type == 'pre_tool_use'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
 
 
 @pytest.mark.django_db
@@ -1347,10 +3321,9 @@ def test_user_prompt_submit_hook_persists_event_and_queues_worker_task(
         response = APIClient().post('/v1/hooks/user-prompt-submit', payload, format='json', **auth_headers(raw_key))
 
     assert response.status_code == 202
-    body = response.json()
     assert RawEventEnvelope.objects.get().event_type == 'user_prompt_submit'
     assert Observation.objects.get().observation_type == 'user_prompt_submit'
     queued = CeleryOutbox.objects.get()
-    assert queued.task_name == 'engram.memory.process_observation_recorded'
-    assert queued.args == [body['observation_id']]
+    assert queued.task_name == 'engram.memory.process_observation_work_v1'
+    assert queued.args == [str(WorkflowWork.objects.get().id)]
     assert queued.kwargs == {}

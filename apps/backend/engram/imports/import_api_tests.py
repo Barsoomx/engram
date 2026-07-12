@@ -22,9 +22,12 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     Memory,
+    Observation,
+    ObservationSource,
     Organization,
     Project,
     ProjectTeam,
+    RawEventEnvelope,
     RetrievalDocument,
     Team,
 )
@@ -33,6 +36,7 @@ from engram.imports.services import ClaudeMemImporter, ClaudeMemImportError
 
 RAW_KEY = 'egk_test_m1_import_0123456789abcdefghijklmnopqrstuvwxyz'
 OTHER_RAW_KEY = 'egk_test_m1_other0_0123456789abcdefghijklmnopqrstuvwxyz'
+TEAM_RAW_KEY = 'egk_test_m1_team002_0123456789abcdefghijklmnopqrstuvwxyz'
 CAPABILITIES = ('memories:admin', 'memories:read')
 
 
@@ -86,6 +90,38 @@ def create_admin_scope(slug: str, raw_key: str, capabilities: tuple[str, ...] = 
         ApiKeyCapability.objects.create(api_key=api_key, capability=_ensure_capability(code))
 
     return ImportScope(organization=organization, project=project, team=team, raw_key=raw_key)
+
+
+def create_team_scope(base: ImportScope, slug: str, raw_key: str) -> ImportScope:
+    team = Team.objects.create(
+        organization=base.organization,
+        name=f'Team {slug}',
+        slug=f'team-{slug}',
+    )
+    ProjectTeam.objects.create(organization=base.organization, project=base.project, team=team)
+    owner = Identity.objects.create(
+        organization=base.organization,
+        identity_type='service_account',
+        external_id=f'svc-{slug}',
+        display_name=f'Import owner {slug}',
+    )
+    role = Role.objects.get(code='import-admin')
+    OrganizationMembership.objects.create(organization=base.organization, identity=owner, role=role)
+    ProjectGrant.objects.create(organization=base.organization, project=base.project, identity=owner, role=role)
+    api_key = ApiKey.objects.create(
+        organization=base.organization,
+        owner_identity=owner,
+        name=f'Import key {slug}',
+        key_prefix=api_key_prefix(raw_key),
+        key_hash=hash_api_key(raw_key),
+        key_fingerprint=api_key_fingerprint(raw_key),
+        team=team,
+        project=base.project,
+    )
+    for code in CAPABILITIES:
+        ApiKeyCapability.objects.create(api_key=api_key, capability=_ensure_capability(code))
+
+    return ImportScope(organization=base.organization, project=base.project, team=team, raw_key=raw_key)
 
 
 def auth_headers(raw_key: str) -> dict[str, str]:
@@ -242,6 +278,59 @@ def test_create_rejects_second_active_job_for_same_store(f_scope: ImportScope) -
     assert response.data['active_import_id'] == active_id
 
 
+@pytest.mark.django_db
+def test_team_bound_create_conflict_only_discloses_same_team_job(f_scope: ImportScope) -> None:
+    team_a = create_team_scope(f_scope, 'alpha-team', OTHER_RAW_KEY)
+    team_b = create_team_scope(f_scope, 'bravo', TEAM_RAW_KEY)
+    active_id = _create_job(team_b, store='shared-team-store')
+
+    foreign = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(team_a.project.id), 'source_store_id': 'shared-team-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(team_a.raw_key),
+    )
+    same_team = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(team_b.project.id), 'source_store_id': 'shared-team-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(team_b.raw_key),
+    )
+    unbound = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(f_scope.project.id), 'source_store_id': 'shared-team-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(f_scope.raw_key),
+    )
+
+    assert foreign.status_code == 409
+    assert foreign.data['code'] == 'import_job_conflict'
+    assert 'active_import_id' not in foreign.data
+    assert same_team.status_code == 409
+    assert same_team.data['active_import_id'] == active_id
+    assert unbound.status_code == 409
+    assert unbound.data['active_import_id'] == active_id
+
+    teamless_id = _create_job(f_scope, store='teamless-shared-store')
+    teamless_foreign = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(team_a.project.id), 'source_store_id': 'teamless-shared-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(team_a.raw_key),
+    )
+    teamless_unbound = APIClient().post(
+        '/v1/imports/claude-mem',
+        {'project_id': str(f_scope.project.id), 'source_store_id': 'teamless-shared-store', 'manifest': manifest()},
+        format='json',
+        **auth_headers(f_scope.raw_key),
+    )
+
+    assert teamless_foreign.status_code == 409
+    assert 'active_import_id' not in teamless_foreign.data
+    assert teamless_unbound.status_code == 409
+    assert teamless_unbound.data['active_import_id'] == teamless_id
+
+
 def _cancel(scope: ImportScope, import_id: str) -> Any:
     return APIClient().post(
         f'/v1/imports/claude-mem/{import_id}/cancel',
@@ -249,6 +338,85 @@ def _cancel(scope: ImportScope, import_id: str) -> Any:
         format='json',
         **auth_headers(scope.raw_key),
     )
+
+
+def _request_job_operation(scope: ImportScope, import_id: str, operation: str) -> Any:
+    client = APIClient()
+    if operation == 'detail':
+        return client.get(f'/v1/imports/claude-mem/{import_id}', **auth_headers(scope.raw_key))
+    if operation == 'batch':
+        return _apply_batch(scope, import_id, 0, 'sdk_sessions', [session_row()])
+    if operation == 'finalize':
+        return client.post(
+            f'/v1/imports/claude-mem/{import_id}/finalize',
+            {'client_row_counts': {}},
+            format='json',
+            **auth_headers(scope.raw_key),
+        )
+
+    return _cancel(scope, import_id)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('operation', ('detail', 'batch', 'finalize', 'cancel'))
+def test_team_bound_key_cannot_access_foreign_team_import_job(
+    f_scope: ImportScope,
+    operation: str,
+) -> None:
+    team_a = create_team_scope(f_scope, 'alpha-team', OTHER_RAW_KEY)
+    team_b = create_team_scope(f_scope, 'bravo', TEAM_RAW_KEY)
+    import_id = _create_job(team_b, store=f'foreign-team-{operation}')
+    job_before = ImportJob.objects.values().get(id=import_id)
+    counts_before = (
+        RawEventEnvelope.objects.count(),
+        Observation.objects.count(),
+        ObservationSource.objects.count(),
+        AuditEvent.objects.count(),
+    )
+
+    response = _request_job_operation(team_a, import_id, operation)
+
+    assert response.status_code == 403
+    assert response.data['code'] == 'team_scope_denied'
+    assert ImportJob.objects.values().get(id=import_id) == job_before
+    assert (
+        RawEventEnvelope.objects.count(),
+        Observation.objects.count(),
+        ObservationSource.objects.count(),
+        AuditEvent.objects.count(),
+    ) == counts_before
+
+    unbound = _request_job_operation(f_scope, import_id, 'detail')
+    assert unbound.status_code == 200
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('operation', ('detail', 'batch', 'finalize', 'cancel'))
+def test_team_bound_key_cannot_access_teamless_import_job(
+    f_scope: ImportScope,
+    operation: str,
+) -> None:
+    team_scope = create_team_scope(f_scope, 'alpha-team', OTHER_RAW_KEY)
+    import_id = _create_job(f_scope, store=f'teamless-{operation}')
+    job_before = ImportJob.objects.values().get(id=import_id)
+    counts_before = (
+        RawEventEnvelope.objects.count(),
+        Observation.objects.count(),
+        ObservationSource.objects.count(),
+        AuditEvent.objects.count(),
+    )
+
+    response = _request_job_operation(team_scope, import_id, operation)
+
+    assert response.status_code == 403
+    assert response.data['code'] == 'team_scope_denied'
+    assert ImportJob.objects.values().get(id=import_id) == job_before
+    assert (
+        RawEventEnvelope.objects.count(),
+        Observation.objects.count(),
+        ObservationSource.objects.count(),
+        AuditEvent.objects.count(),
+    ) == counts_before
 
 
 @pytest.mark.django_db
