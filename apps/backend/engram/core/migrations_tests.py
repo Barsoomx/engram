@@ -354,21 +354,26 @@ def _create_historical_observation(
     session_sequence: int | None = None,
     prompt_number: int | None = None,
     observed_at: datetime | None = None,
+    observation_id: uuid.UUID | None = None,
 ) -> models.Model:
     observation_model = historical_apps.get_model('core', 'Observation')
-    observation = observation_model.objects.create(
-        organization=scope['organization'],
-        project=scope['project'],
-        team=scope['team'],
-        agent=scope['agent'],
-        session=session,
-        observation_type='decision',
-        title='Backfill observation',
-        content_hash=content_hash,
-        session_sequence=session_sequence,
-        prompt_number=prompt_number,
-        observed_at=observed_at,
-    )
+    observation_kwargs: dict[str, object] = {
+        'organization': scope['organization'],
+        'project': scope['project'],
+        'team': scope['team'],
+        'agent': scope['agent'],
+        'session': session,
+        'observation_type': 'decision',
+        'title': 'Backfill observation',
+        'content_hash': content_hash,
+        'session_sequence': session_sequence,
+        'prompt_number': prompt_number,
+        'observed_at': observed_at,
+    }
+    if observation_id is not None:
+        observation_kwargs['id'] = observation_id
+
+    observation = observation_model.objects.create(**observation_kwargs)
     observation_model.objects.filter(id=observation.id).update(created_at=created_at)
 
     return observation
@@ -422,14 +427,34 @@ def test_0033_orders_by_created_at_then_id_and_sets_cursor() -> None:
         session = _create_historical_session(old_apps, scope, 'ordering-session')
         base = timezone.now()
         _create_historical_observation(old_apps, scope, session, 'ordering-1', base + timedelta(seconds=1))
-        _create_historical_observation(old_apps, scope, session, 'ordering-2', base + timedelta(seconds=2))
-        _create_historical_observation(old_apps, scope, session, 'ordering-3', base + timedelta(seconds=2))
+        _create_historical_observation(
+            old_apps,
+            scope,
+            session,
+            'ordering-2',
+            base + timedelta(seconds=2),
+            observation_id=uuid.UUID(int=902),
+        )
+        _create_historical_observation(
+            old_apps,
+            scope,
+            session,
+            'ordering-3',
+            base + timedelta(seconds=2),
+            observation_id=uuid.UUID(int=901),
+        )
         _create_historical_observation(old_apps, scope, session, 'ordering-4', base + timedelta(seconds=3))
 
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0033)
 
+        observation_model = old_apps.get_model('core', 'Observation')
+        tie_break_first = observation_model.objects.get(id=uuid.UUID(int=901))
+        tie_break_second = observation_model.objects.get(id=uuid.UUID(int=902))
+
         assert _ordered_sequences(old_apps, session.id) == [1, 2, 3, 4]
+        assert tie_break_first.session_sequence == 2
+        assert tie_break_second.session_sequence == 3
         assert _session_cursor(old_apps, session.id) == 4
     finally:
         executor = MigrationExecutor(connection)

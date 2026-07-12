@@ -35,11 +35,11 @@ def _assert_session_cap(observation_model: type[models.Model], alias: str) -> No
 
 def _process_session(
     connection: BaseDatabaseWrapper,
-    alias: str,
     session_model: type[models.Model],
     observation_model: type[models.Model],
     session_id: uuid.UUID,
 ) -> bool:
+    alias = connection.alias
     with transaction.atomic(using=alias):
         with connection.cursor() as cursor:
             cursor.execute(f"SET LOCAL lock_timeout = '{SESSION_LOCK_TIMEOUT}'")
@@ -62,11 +62,7 @@ def _process_session(
         for index, child in enumerate(children, start=1):
             child.session_sequence = index
 
-        for start in range(0, count, UPDATE_BATCH_SIZE):
-            chunk = children[start : start + UPDATE_BATCH_SIZE]
-            observation_model.objects.using(alias).bulk_update(
-                chunk, ['session_sequence'], batch_size=UPDATE_BATCH_SIZE
-            )
+        observation_model.objects.using(alias).bulk_update(children, ['session_sequence'], batch_size=UPDATE_BATCH_SIZE)
 
         session_model.objects.using(alias).filter(id=session_id).update(observation_sequence_cursor=count)
 
@@ -90,8 +86,8 @@ def backfill_observation_sequences(apps: Apps, schema_editor: BaseDatabaseSchema
 
     for session_id in session_ids:
         try:
-            was_skipped = _process_session(connection, alias, session_model, observation_model, session_id)
-        except DatabaseError as error:
+            was_skipped = _process_session(connection, session_model, observation_model, session_id)
+        except (DatabaseError, session_model.DoesNotExist) as error:
             failed += 1
             if first_error is None:
                 first_error = error
