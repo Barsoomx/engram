@@ -109,6 +109,7 @@ def create_observation(
         concepts=concepts or [],
         content_hash=content_hash,
         observed_at=timezone.now(),
+        session_sequence=1,
     )
 
 
@@ -147,6 +148,7 @@ def create_raw_event(
         runtime=Runtime.CODEX,
         payload={'tool_name': 'bash'},
         correlation_id=correlation_id,
+        normalization_contract_version=0,
     )
 
 
@@ -265,6 +267,7 @@ def test_observation_list_filter_by_observation_type() -> None:
         body='Body.',
         content_hash='h-code-type',
         observed_at=timezone.now(),
+        session_sequence=2,
     )
     client = APIClient()
 

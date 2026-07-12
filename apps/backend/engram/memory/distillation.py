@@ -33,6 +33,7 @@ from engram.memory.candidate_parsing import (
     truncate_with_marker,
 )
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
+from engram.memory.observation_work import useful_observation_q
 from engram.memory.services import (
     MemoryWorkerError,
     call_with_fallback,
@@ -68,6 +69,7 @@ class DistillSessionInput:
     correlation_id: str = ''
     auto_approve_threshold: Decimal | None = None
     run_id: str = ''
+    upper_sequence_inclusive: int | None = None
 
 
 @dataclass(frozen=True)
@@ -276,7 +278,7 @@ def _parse_reduced_candidates(raw_body: str) -> tuple[_ReducedCandidate, ...] | 
 class DistillSession:
     def execute(self, data: DistillSessionInput) -> DistillSessionResult:
         session = self._load_session(data.session_id)
-        observations = self._session_observations(session)
+        observations = self._session_observations(session, data.upper_sequence_inclusive)
         if not observations:
             return DistillSessionResult(session=session, auto_promoted=(), queued_for_review=())
 
@@ -388,13 +390,26 @@ class DistillSession:
         except AgentSession.DoesNotExist as error:
             raise MemoryWorkerError('session not found') from error
 
-    def _session_observations(self, session: AgentSession) -> list[Observation]:
+    def _session_observations(
+        self,
+        session: AgentSession,
+        upper_sequence_inclusive: int | None,
+    ) -> list[Observation]:
+        queryset = Observation.objects.filter(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            session=session,
+        )
+        if upper_sequence_inclusive is None:
+            return list(queryset.order_by('prompt_number', 'created_at'))
+
         return list(
-            Observation.objects.filter(
-                organization_id=session.organization_id,
-                project_id=session.project_id,
-                session=session,
-            ).order_by('prompt_number', 'created_at'),
+            queryset.filter(
+                session_sequence__gt=0,
+                session_sequence__lte=upper_sequence_inclusive,
+            )
+            .filter(useful_observation_q())
+            .order_by('session_sequence'),
         )
 
     def _resolve_gateway(

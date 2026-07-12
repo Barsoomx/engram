@@ -580,6 +580,59 @@ def test_rerun_dispatches_session_distillation_for_session_run_type(
 
 
 @pytest.mark.django_db
+def test_rerun_work_linked_session_distillation_returns_invalid_rerun_snapshot(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    from engram.core.models import (
+        WorkflowSubjectType,
+        WorkflowWork,
+        WorkflowWorkType,
+    )
+
+    project = _make_project(f_admin_org)
+
+    session_id = uuid.uuid4()
+
+    work = WorkflowWork.objects.create(
+        organization=f_admin_org,
+        project=project,
+        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        subject_type=WorkflowSubjectType.AGENT_SESSION,
+        subject_id=session_id,
+        contract_version=1,
+        occurrence_key='',
+        input_fingerprint='0' * 64,
+        input_snapshot={'session_id': str(session_id)},
+    )
+
+    run = WorkflowRun.objects.create(
+        organization=f_admin_org,
+        project=project,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.SUCCEEDED,
+        input_snapshot={'session_id': str(session_id)},
+        request_id='work-linked-original',
+    )
+
+    with patch('engram.console.views.workflow_runs.distill_session') as m_distill:
+        response = f_admin_client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 400
+
+    assert response.data['code'] == 'invalid_rerun_snapshot'
+
+    assert response.data['error_code'] == 'invalid_rerun_snapshot'
+
+    m_distill.delay.assert_not_called()
+
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.SESSION_DISTILLATION).count() == 1
+
+
+@pytest.mark.django_db
 def test_rerun_returns_400_for_unsupported_run_type(
     f_admin_client: APIClient,
     f_admin_org: Organization,

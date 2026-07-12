@@ -1346,6 +1346,7 @@ def test_build_context_bundle_rejects_legacy_null_team_session_with_history_with
         content_hash='legacy-history-hash',
         runtime='codex',
         sequence_number=1,
+        normalization_contract_version=0,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -1622,6 +1623,7 @@ def test_history_bearing_context_rejects_same_team_different_agent_without_side_
         content_hash='context-history-agent-hash',
         runtime='codex',
         sequence_number=1,
+        normalization_contract_version=0,
     )
     Observation.objects.create(
         organization=organization,
@@ -1735,6 +1737,7 @@ def test_history_bearing_context_adopts_blank_platform_and_updates_agent_version
         content_hash='blank-platform-context-hash',
         runtime='codex',
         sequence_number=1,
+        normalization_contract_version=0,
     )
     Observation.objects.create(
         organization=organization,
@@ -1816,6 +1819,7 @@ def test_history_bearing_context_rejects_identity_runtime_conflict_without_side_
         content_hash='context-history-runtime-hash',
         runtime=stored_runtime,
         sequence_number=1,
+        normalization_contract_version=0,
     )
     Observation.objects.create(
         organization=organization,
@@ -1899,6 +1903,7 @@ def test_build_context_bundle_excludes_unprovenanced_memory_when_required() -> N
         agent=agent,
         external_session_id='session-provenance-source',
         runtime='codex',
+        observation_sequence_cursor=1,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -1909,6 +1914,7 @@ def test_build_context_bundle_excludes_unprovenanced_memory_when_required() -> N
         observation_type='decision',
         title='Provenance source',
         content_hash='observation-provenance-hash',
+        session_sequence=1,
     )
     _create_memory_document(
         organization,

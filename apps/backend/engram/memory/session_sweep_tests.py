@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
 from engram.celeryconfig import beat_schedule
 from engram.core.models import (
@@ -17,9 +18,17 @@ from engram.core.models import (
     Runtime,
     SessionStatus,
     Team,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
 from engram.memory.session_sweep import SweepStaleSessions
 from engram.memory.tasks import sweep_stale_sessions
+
+DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
+LEGACY_DISTILL_TASK_NAME = 'engram.memory.distill_session'
 
 
 @pytest.fixture
@@ -77,6 +86,7 @@ def create_raw_event(session: AgentSession, *, received_at: object, suffix: str 
         content_hash=f'hash-{session.external_session_id}-{suffix}',
         runtime=Runtime.CODEX,
         payload={'event': 'noop'},
+        normalization_contract_version=0,
     )
     RawEventEnvelope.objects.filter(id=envelope.id).update(received_at=received_at)
     envelope.refresh_from_db()
@@ -84,7 +94,7 @@ def create_raw_event(session: AgentSession, *, received_at: object, suffix: str 
     return envelope
 
 
-def create_observation(session: AgentSession, *, suffix: str = '1') -> Observation:
+def create_observation(session: AgentSession, *, suffix: str = '1', session_sequence: int = 1) -> Observation:
     return Observation.objects.create(
         organization=session.organization,
         project=session.project,
@@ -96,6 +106,7 @@ def create_observation(session: AgentSession, *, suffix: str = '1') -> Observati
         body=f'body {suffix}',
         content_hash=f'hash-obs-{session.external_session_id}-{suffix}',
         observed_at=timezone.now(),
+        session_sequence=session_sequence,
     )
 
 
@@ -109,7 +120,7 @@ def test_beat_schedule_registers_stale_session_sweep() -> None:
 
 
 @pytest.mark.django_db
-def test_stale_active_session_is_ended_and_distilled(
+def test_stale_active_session_with_useful_input_ends_via_primitive_and_signals_distill_work(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -117,7 +128,7 @@ def test_stale_active_session_is_ended_and_distilled(
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
     create_raw_event(session, received_at=timezone.now() - timedelta(minutes=40))
-    create_observation(session)
+    create_observation(session, session_sequence=1)
 
     with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
         result = sweep_stale_sessions()
@@ -125,8 +136,46 @@ def test_stale_active_session_is_ended_and_distilled(
     session.refresh_from_db()
     assert session.status == SessionStatus.ENDED
     assert session.ended_at is not None
-    m_delay.assert_called_once_with(str(session.id))
+    assert session.end_work_contract_version == 1
+    m_delay.assert_not_called()
+    work = WorkflowWork.objects.get()
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.subject_type == WorkflowSubjectType.AGENT_SESSION
+    assert work.subject_id == session.id
+    assert work.input_snapshot['upper_sequence_inclusive'] == 1
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    queued = CeleryOutbox.objects.get(task_name=DISTILL_WORK_TASK_NAME)
+    assert queued.args == [str(work.id)]
+    assert queued.task_id == f'workflow-work:{work.id}'
+    assert queued.kwargs == {}
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
     assert result == {'swept': 1, 'distilled': 1}
+
+
+@pytest.mark.django_db
+def test_stale_empty_session_ends_via_primitive_without_signal(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    create_raw_event(session, received_at=timezone.now() - timedelta(minutes=40))
+
+    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
+        result = sweep_stale_sessions()
+
+    session.refresh_from_db()
+    assert session.status == SessionStatus.ENDED
+    assert session.end_work_contract_version == 1
+    m_delay.assert_not_called()
+    work = WorkflowWork.objects.get()
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME).count() == 0
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+    assert result == {'swept': 1, 'distilled': 0}
 
 
 @pytest.mark.django_db
@@ -273,7 +322,7 @@ def test_counters_report_totals_across_mixed_batch(
 ) -> None:
     stale_with_observations = create_session(f_org, f_team, f_project, f_agent, suffix='stale-with-obs')
     create_raw_event(stale_with_observations, received_at=timezone.now() - timedelta(minutes=40), suffix='1')
-    create_observation(stale_with_observations, suffix='1')
+    create_observation(stale_with_observations, suffix='1', session_sequence=1)
 
     stale_without_observations = create_session(f_org, f_team, f_project, f_agent, suffix='stale-without-obs')
     create_raw_event(stale_without_observations, received_at=timezone.now() - timedelta(minutes=40), suffix='2')
@@ -285,7 +334,53 @@ def test_counters_report_totals_across_mixed_batch(
         result = sweep_stale_sessions()
 
     assert result == {'swept': 2, 'distilled': 1}
-    m_delay.assert_called_once_with(str(stale_with_observations.id))
+    m_delay.assert_not_called()
+    signals = CeleryOutbox.objects.filter(task_name=DISTILL_WORK_TASK_NAME)
+    assert signals.count() == 1
+    work = WorkflowWork.objects.get(subject_id=stale_with_observations.id)
+    assert work.work_type == WorkflowWorkType.SESSION_DISTILLATION
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert signals.get().args == [str(work.id)]
+    assert CeleryOutbox.objects.filter(task_name=LEGACY_DISTILL_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_sweep_contains_vanished_session_and_ends_the_rest(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.session_lifecycle import EndSession
+
+    vanished = create_session(f_org, f_team, f_project, f_agent, suffix='vanished')
+    create_raw_event(vanished, received_at=timezone.now() - timedelta(minutes=40), suffix='1')
+    create_observation(vanished, suffix='1', session_sequence=1)
+
+    survivor = create_session(f_org, f_team, f_project, f_agent, suffix='survivor')
+    create_raw_event(survivor, received_at=timezone.now() - timedelta(minutes=40), suffix='2')
+    create_observation(survivor, suffix='2', session_sequence=1)
+
+    original_execute = EndSession.execute
+
+    def flaky_execute(self: EndSession, *, session_id: object, **kwargs: object) -> object:
+        if session_id == vanished.id:
+            raise AgentSession.DoesNotExist
+
+        return original_execute(self, session_id=session_id, **kwargs)
+
+    monkeypatch.setattr(EndSession, 'execute', flaky_execute)
+
+    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
+        result = sweep_stale_sessions()
+
+    vanished.refresh_from_db()
+    survivor.refresh_from_db()
+    assert vanished.status == SessionStatus.ACTIVE
+    assert survivor.status == SessionStatus.ENDED
+    m_delay.assert_not_called()
+    assert result == {'swept': 1, 'distilled': 1}
 
 
 @pytest.mark.django_db

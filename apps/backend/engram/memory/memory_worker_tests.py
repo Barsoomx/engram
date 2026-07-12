@@ -143,6 +143,7 @@ def create_observation_recorded_scope(
         request_id=f'request-event-{suffix}',
         actor_type='api_key',
         actor_id=f'api-key-{suffix}',
+        normalization_contract_version=0,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -160,6 +161,7 @@ def create_observation_recorded_scope(
         redaction_metadata={'redacted': True},
         source_metadata={'event_type': 'post_tool_use'},
         observed_at=timezone.now(),
+        session_sequence=1,
     )
     ObservationSource.objects.create(
         organization=organization,
@@ -301,6 +303,7 @@ def create_sibling_observation(base: Observation, *, suffix: str) -> Observation
         request_id=f'request-event-{suffix}',
         actor_type='api_key',
         actor_id=f'api-key-{suffix}',
+        normalization_contract_version=0,
     )
 
     return Observation.objects.create(
@@ -319,6 +322,7 @@ def create_sibling_observation(base: Observation, *, suffix: str) -> Observation
         redaction_metadata={'redacted': True},
         source_metadata={'event_type': 'post_tool_use'},
         observed_at=timezone.now(),
+        session_sequence=base.session.observations.count() + 1,
     )
 
 
@@ -844,6 +848,7 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
         request_id='request-event-dedup',
         actor_type='api_key',
         actor_id='api-key-dedup',
+        normalization_contract_version=0,
     )
     second_observation = Observation.objects.create(
         organization=organization,
@@ -861,6 +866,7 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
         redaction_metadata={'redacted': True},
         source_metadata={'event_type': 'post_tool_use'},
         observed_at=timezone.now(),
+        session_sequence=1,
     )
 
     result = execute_worker(second_observation)

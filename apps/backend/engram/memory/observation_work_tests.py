@@ -114,6 +114,7 @@ def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
             idempotency_key='history-idempotency',
             content_hash='history-raw-hash',
             runtime='codex',
+            normalization_contract_version=0,
         )
     elif history_kind == 'observation':
         Observation.objects.create(
@@ -125,7 +126,9 @@ def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
             observation_type='tool_use',
             title='Observation-only history',
             content_hash='history-observation-hash',
+            session_sequence=1,
         )
+        AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=1)
 
     with CaptureQueriesContext(connection) as queries:
         has_history = session_has_observation_history(session_id=session.id)
@@ -136,20 +139,9 @@ def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
 
 
 @pytest.mark.django_db
-def test_allocate_sequence_uses_max_existing_positive_sequence_for_legacy_null_cursor() -> None:
-    organization, project, session = create_scope('null-cursor')
-    AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=None)
-    Observation.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        agent=session.agent,
-        session=session,
-        observation_type='decision',
-        title='Existing null sequence',
-        content_hash='null-sequence-content',
-        session_sequence=None,
-    )
+def test_allocate_sequence_uses_max_existing_positive_sequence_for_legacy_zero_cursor() -> None:
+    organization, project, session = create_scope('zero-cursor')
+    AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=0)
     for sequence in (3, 9):
         Observation.objects.create(
             organization=organization,

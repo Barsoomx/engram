@@ -6,16 +6,25 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import structlog
-from django.db.models import Count
+from django.db import transaction
 from django.utils import timezone
 
-from engram.core.models import AgentSession, SessionStatus, WorkflowRun, WorkflowRunStatus, WorkflowRunType
+from engram.celery_app import app
+from engram.core.models import (
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkType,
+)
 
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_COOLDOWN_MINUTES = 30
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_TRANSIENT_MAX_ATTEMPTS = 10
+_DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
 
 _TRANSIENT_FAILURE_MARKERS = (
     'provider returned 402',
@@ -36,12 +45,19 @@ def is_transient_failure(failure_reason: str | None) -> bool:
 
 
 @dataclass(frozen=True)
-class RetryFailedDistillationsResult:
-    retriable_session_ids: tuple[uuid.UUID, ...]
+class RetriedWork:
+    work_id: uuid.UUID
+    run_id: uuid.UUID
 
 
 @dataclass(frozen=True)
-class _SessionEvaluation:
+class RetryFailedDistillationsResult:
+    retried: tuple[RetriedWork, ...]
+    unlinked_run_ids: tuple[uuid.UUID, ...]
+
+
+@dataclass(frozen=True)
+class _WorkEvaluation:
     retriable: bool
     abandoned: bool
     failed_count: int
@@ -54,80 +70,147 @@ class RetryFailedDistillations:
         max_attempts = self._max_attempts()
         transient_max_attempts = self._transient_max_attempts()
 
-        ended_session_ids = list(
-            AgentSession.objects.filter(status=SessionStatus.ENDED)
-            .annotate(observation_count=Count('observations', distinct=True))
-            .filter(observation_count__gt=0)
-            .values_list('id', flat=True),
+        unlinked_run_ids = tuple(self._unlinked_failed_run_ids())
+
+        required_works = list(
+            WorkflowWork.objects.filter(
+                work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                disposition=WorkflowWorkDisposition.REQUIRED,
+            ).order_by('created_at', 'id'),
         )
-        if not ended_session_ids:
-            return RetryFailedDistillationsResult(retriable_session_ids=())
+        runs_by_work = self._runs_by_work([work.id for work in required_works])
 
-        runs_by_session = self._runs_by_session([str(session_id) for session_id in ended_session_ids])
-
-        retriable_session_ids: list[uuid.UUID] = []
-        for session_id in ended_session_ids:
+        retried: list[RetriedWork] = []
+        for work in required_works:
             evaluation = self._evaluate(
-                runs_by_session.get(str(session_id), []),
+                runs_by_work.get(work.id, []),
                 cutoff,
                 max_attempts,
                 transient_max_attempts,
             )
-            if evaluation.retriable:
-                retriable_session_ids.append(session_id)
-                continue
-
             if evaluation.abandoned:
                 logger.warning(
                     'distillation_reconciler_abandoned',
-                    session_id=str(session_id),
+                    work_id=str(work.id),
                     failed_count=evaluation.failed_count,
                     transient_count=evaluation.transient_count,
                 )
 
-        return RetryFailedDistillationsResult(retriable_session_ids=tuple(retriable_session_ids))
+                continue
+            if not evaluation.retriable:
+                continue
 
-    def _runs_by_session(self, session_id_strings: list[str]) -> dict[str, list[WorkflowRun]]:
+            retried_work = self._retry_under_lock(
+                work.id,
+                cutoff,
+                max_attempts,
+                transient_max_attempts,
+            )
+            if retried_work is not None:
+                retried.append(retried_work)
+
+        return RetryFailedDistillationsResult(
+            retried=tuple(retried),
+            unlinked_run_ids=unlinked_run_ids,
+        )
+
+    def _unlinked_failed_run_ids(self) -> list[uuid.UUID]:
+        return list(
+            WorkflowRun.objects.filter(
+                run_type=WorkflowRunType.SESSION_DISTILLATION,
+                work__isnull=True,
+                status=WorkflowRunStatus.FAILED,
+            )
+            .order_by('created_at', 'id')
+            .values_list('id', flat=True),
+        )
+
+    def _runs_by_work(self, work_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[WorkflowRun]]:
         runs = WorkflowRun.objects.filter(
             run_type=WorkflowRunType.SESSION_DISTILLATION,
-            input_snapshot__session_id__in=session_id_strings,
+            work_id__in=work_ids,
         ).order_by('created_at', 'id')
 
-        runs_by_session: dict[str, list[WorkflowRun]] = {}
+        runs_by_work: dict[uuid.UUID, list[WorkflowRun]] = {}
         for run in runs:
-            runs_by_session.setdefault(run.input_snapshot.get('session_id'), []).append(run)
+            runs_by_work.setdefault(run.work_id, []).append(run)
 
-        return runs_by_session
+        return runs_by_work
 
-    def _evaluate(
+    def _retry_under_lock(
         self,
-        session_runs: list[WorkflowRun],
+        work_id: uuid.UUID,
         cutoff: object,
         max_attempts: int,
         transient_max_attempts: int,
-    ) -> _SessionEvaluation:
-        if not session_runs:
-            return _SessionEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+    ) -> RetriedWork | None:
+        with transaction.atomic():
+            try:
+                work = WorkflowWork.objects.select_for_update().get(
+                    id=work_id,
+                    work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                    disposition=WorkflowWorkDisposition.REQUIRED,
+                )
+            except WorkflowWork.DoesNotExist:
+                return None
 
-        if any(run.status == WorkflowRunStatus.SUCCEEDED for run in session_runs):
-            return _SessionEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+            runs = list(
+                WorkflowRun.objects.filter(
+                    work_id=work.id,
+                    run_type=WorkflowRunType.SESSION_DISTILLATION,
+                ).order_by('created_at', 'id'),
+            )
+            evaluation = self._evaluate(runs, cutoff, max_attempts, transient_max_attempts)
+            if not evaluation.retriable:
+                return None
 
-        failed_runs = [run for run in session_runs if run.status == WorkflowRunStatus.FAILED]
+            run = WorkflowRun.objects.create(
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                work_id=work.id,
+                run_type=WorkflowRunType.SESSION_DISTILLATION,
+                status=WorkflowRunStatus.QUEUED,
+                input_snapshot=work.input_snapshot,
+            )
+            app.send_task(
+                _DISTILL_WORK_TASK_NAME,
+                args=[str(work.id), str(run.id)],
+                kwargs={},
+                task_id=f'workflow-work:{work.id}:run:{run.id}',
+            )
+
+            return RetriedWork(work_id=work.id, run_id=run.id)
+
+    def _evaluate(
+        self,
+        work_runs: list[WorkflowRun],
+        cutoff: object,
+        max_attempts: int,
+        transient_max_attempts: int,
+    ) -> _WorkEvaluation:
+        if not work_runs:
+            return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+
+        if any(run.status == WorkflowRunStatus.SUCCEEDED for run in work_runs):
+            return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+
+        failed_runs = [run for run in work_runs if run.status == WorkflowRunStatus.FAILED]
         failed_count = len(failed_runs)
         transient_count = sum(1 for run in failed_runs if is_transient_failure(run.failure_reason))
         non_transient_count = failed_count - transient_count
 
         if non_transient_count >= max_attempts or transient_count >= transient_max_attempts:
-            return _SessionEvaluation(
+            return _WorkEvaluation(
                 retriable=False,
                 abandoned=True,
                 failed_count=failed_count,
                 transient_count=transient_count,
             )
 
-        latest_run = session_runs[-1]
+        latest_run = work_runs[-1]
         if latest_run.status != WorkflowRunStatus.FAILED:
-            return _SessionEvaluation(
+            return _WorkEvaluation(
                 retriable=False,
                 abandoned=False,
                 failed_count=failed_count,
@@ -135,14 +218,14 @@ class RetryFailedDistillations:
             )
 
         if latest_run.finished_at is None or latest_run.finished_at >= cutoff:
-            return _SessionEvaluation(
+            return _WorkEvaluation(
                 retriable=False,
                 abandoned=False,
                 failed_count=failed_count,
                 transient_count=transient_count,
             )
 
-        return _SessionEvaluation(
+        return _WorkEvaluation(
             retriable=True,
             abandoned=False,
             failed_count=failed_count,

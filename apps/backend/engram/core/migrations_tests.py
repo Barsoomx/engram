@@ -5,10 +5,10 @@ from datetime import datetime, timedelta
 import psycopg
 import pytest
 from django.apps.registry import Apps
-from django.db import connection, models
+from django.db import connection, models, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.db.models.query import QuerySet
-from django.db.utils import OperationalError
+from django.db.utils import IntegrityError, OperationalError
 from django.utils import timezone
 
 MIGRATE_0031 = [('core', '0031_workflowrun_active_daily_digest_unique')]
@@ -843,6 +843,433 @@ def test_0033_has_non_atomic_runpython_and_noop_reverse() -> None:
 
         assert _ordered_sequences(old_apps, session.id) == [1, 2]
         assert _session_cursor(old_apps, session.id) == 2
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+MIGRATE_0034 = [('core', '0034_memory_loop_input_contract')]
+MIGRATION_0034_NODE = ('core', '0034_memory_loop_input_contract')
+
+
+def _set_session_cursor(historical_apps: Apps, session_id: uuid.UUID, value: int) -> None:
+    session_model = historical_apps.get_model('core', 'AgentSession')
+    session_model.objects.filter(id=session_id).update(observation_sequence_cursor=value)
+
+
+def _create_historical_raw_event(
+    historical_apps: Apps,
+    scope: dict[str, object],
+    session: models.Model,
+    tag: str,
+    version: int | None = None,
+    disposition: str | None = None,
+    reason: str | None = None,
+) -> models.Model:
+    raw_event_model = historical_apps.get_model('core', 'RawEventEnvelope')
+
+    return raw_event_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        agent=scope['agent'],
+        session=session,
+        event_type='post_tool_use',
+        client_event_id=f'event-{tag}',
+        idempotency_key=f'key-{tag}',
+        content_hash=f'raw-{tag}',
+        runtime='codex',
+        payload={'tool_name': 'bash'},
+        normalization_contract_version=version,
+        normalization_disposition=disposition,
+        normalization_reason=reason,
+    )
+
+
+def _capture_and_drop_raw_norm_constraint(table: str) -> str | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            'SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = %s',
+            ['core_raw_norm_expand_valid'],
+        )
+        row = cursor.fetchone()
+        definition = row[0] if row is not None else None
+        if definition is not None:
+            cursor.execute(f'ALTER TABLE "{table}" DROP CONSTRAINT "core_raw_norm_expand_valid"')
+
+    return definition
+
+
+def _restore_raw_norm_constraint(table: str, definition: str | None) -> None:
+    if definition is None:
+        return
+
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT 1 FROM pg_constraint WHERE conname = %s', ['core_raw_norm_expand_valid'])
+        if cursor.fetchone() is None:
+            cursor.execute(f'ALTER TABLE "{table}" ADD CONSTRAINT "core_raw_norm_expand_valid" {definition}')
+
+
+def _delete_raw_event_by_key(table: str, idempotency_key: str) -> None:
+    with connection.cursor() as cursor:
+        cursor.execute(f'DELETE FROM "{table}" WHERE idempotency_key = %s', [idempotency_key])  # noqa: S608
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_marks_all_null_normalization_as_v0() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'norm-v0-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        null_event = _create_historical_raw_event(old_apps, scope, session, 'nullrow')
+        obs_event = _create_historical_raw_event(
+            old_apps, scope, session, 'obsrow', version=1, disposition='observation'
+        )
+        noop_event = _create_historical_raw_event(
+            old_apps, scope, session, 'nooprow', version=1, disposition='no_op', reason='evidence_only'
+        )
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        obs_updated_at = raw_event_model.objects.get(id=obs_event.id).updated_at
+        noop_updated_at = raw_event_model.objects.get(id=noop_event.id).updated_at
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        new_apps = executor.loader.project_state(MIGRATE_0034).apps
+        new_raw_event_model = new_apps.get_model('core', 'RawEventEnvelope')
+        migrated_null = new_raw_event_model.objects.get(id=null_event.id)
+        migrated_obs = new_raw_event_model.objects.get(id=obs_event.id)
+        migrated_noop = new_raw_event_model.objects.get(id=noop_event.id)
+
+        assert migrated_null.normalization_contract_version == 0
+        assert migrated_null.normalization_disposition is None
+        assert migrated_null.normalization_reason is None
+        assert migrated_obs.normalization_contract_version == 1
+        assert migrated_obs.normalization_disposition == 'observation'
+        assert migrated_obs.normalization_reason is None
+        assert migrated_obs.updated_at == obs_updated_at
+        assert migrated_noop.normalization_contract_version == 1
+        assert migrated_noop.normalization_disposition == 'no_op'
+        assert migrated_noop.normalization_reason == 'evidence_only'
+        assert migrated_noop.updated_at == noop_updated_at
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_preflight_rejects_partial_normalization_tuple() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    table: str | None = None
+    definition: str | None = None
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'partial-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        table = raw_event_model._meta.db_table
+        definition = _capture_and_drop_raw_norm_constraint(table)
+        partial = _create_historical_raw_event(
+            old_apps, scope, session, 'partial', version=None, disposition='observation'
+        )
+
+        executor = MigrationExecutor(connection)
+        with pytest.raises(RuntimeError):
+            executor.migrate(MIGRATE_0034)
+
+        reloaded = MigrationExecutor(connection)
+
+        assert MIGRATION_0034_NODE not in reloaded.loader.applied_migrations
+        assert raw_event_model.objects.get(id=partial.id).normalization_contract_version is None
+        assert raw_event_model.objects.get(id=partial.id).normalization_disposition == 'observation'
+    finally:
+        if table is not None:
+            _delete_raw_event_by_key(table, 'key-partial')
+            _restore_raw_norm_constraint(table, definition)
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_preflight_rejects_unknown_normalization_version() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    table: str | None = None
+    definition: str | None = None
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'unknown-version-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        table = raw_event_model._meta.db_table
+        definition = _capture_and_drop_raw_norm_constraint(table)
+        unknown = _create_historical_raw_event(old_apps, scope, session, 'unknown', version=2)
+
+        executor = MigrationExecutor(connection)
+        with pytest.raises(RuntimeError):
+            executor.migrate(MIGRATE_0034)
+
+        reloaded = MigrationExecutor(connection)
+
+        assert MIGRATION_0034_NODE not in reloaded.loader.applied_migrations
+        assert raw_event_model.objects.get(id=unknown.id).normalization_contract_version == 2
+    finally:
+        if table is not None:
+            _delete_raw_event_by_key(table, 'key-unknown')
+            _restore_raw_norm_constraint(table, definition)
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_preflight_rejects_unsequenced_observations() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'unsequenced-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        _create_historical_observation(old_apps, scope, session, 'unseq', timezone.now(), session_sequence=None)
+
+        executor = MigrationExecutor(connection)
+        with pytest.raises(RuntimeError):
+            executor.migrate(MIGRATE_0034)
+
+        reloaded = MigrationExecutor(connection)
+
+        assert MIGRATION_0034_NODE not in reloaded.loader.applied_migrations
+        assert _ordered_sequences(old_apps, session.id) == [None]
+    finally:
+        old_apps.get_model('core', 'Observation').objects.filter(session_id=session.id).delete()
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_rejects_null_inserts_after_contract() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'reject-null-session')
+        _set_session_cursor(old_apps, session.id, 0)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        session_model = old_apps.get_model('core', 'AgentSession')
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(old_apps, scope, session, 'null-version', version=None)
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_observation(
+                    old_apps, scope, session, 'null-seq', timezone.now(), session_sequence=None
+                )
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                session_model.objects.create(
+                    organization=scope['organization'],
+                    project=scope['project'],
+                    team=scope['team'],
+                    agent=scope['agent'],
+                    external_session_id='null-cursor-session',
+                    runtime='codex',
+                    observation_sequence_cursor=None,
+                )
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_allows_only_three_normalization_forms() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'three-forms-session')
+        _set_session_cursor(old_apps, session.id, 0)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+
+        legal_v0 = _create_historical_raw_event(old_apps, scope, session, 'legal-v0', version=0)
+        legal_obs = _create_historical_raw_event(
+            old_apps, scope, session, 'legal-obs', version=1, disposition='observation'
+        )
+        legal_noop = _create_historical_raw_event(
+            old_apps, scope, session, 'legal-noop', version=1, disposition='no_op', reason='evidence_only'
+        )
+
+        assert raw_event_model.objects.filter(id__in=[legal_v0.id, legal_obs.id, legal_noop.id]).count() == 3
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(
+                    old_apps, scope, session, 'bad-v0-disp', version=0, disposition='observation'
+                )
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(
+                    old_apps,
+                    scope,
+                    session,
+                    'bad-obs-reason',
+                    version=1,
+                    disposition='observation',
+                    reason='evidence_only',
+                )
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(
+                    old_apps, scope, session, 'bad-noop-reason', version=1, disposition='no_op', reason='other'
+                )
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(old_apps, scope, session, 'bad-null-disp', version=1, disposition=None)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_pre_0034_history_accepts_legacy_null_inserts() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'legacy-null-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        observation_model = old_apps.get_model('core', 'Observation')
+        legacy_raw = _create_historical_raw_event(old_apps, scope, session, 'legacy-null')
+        legacy_obs = _create_historical_observation(
+            old_apps, scope, session, 'legacy-null-obs', timezone.now(), session_sequence=None
+        )
+
+        assert raw_event_model.objects.filter(id=legacy_raw.id).count() == 1
+        assert observation_model.objects.filter(id=legacy_obs.id).count() == 1
+
+        observation_model.objects.filter(id=legacy_obs.id).delete()
+        raw_event_model.objects.filter(id=legacy_raw.id).delete()
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_raw_event(old_apps, scope, session, 'post-null')
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_observation(
+                    old_apps, scope, session, 'post-null-obs', timezone.now(), session_sequence=None
+                )
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_preserves_end_work_marker_semantics() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'end-marker-session')
+        session_model = old_apps.get_model('core', 'AgentSession')
+        session_model.objects.filter(id=session.id).update(
+            status='ended',
+            end_work_contract_version=0,
+            observation_sequence_cursor=0,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        new_apps = executor.loader.project_state(MIGRATE_0034).apps
+        new_session_model = new_apps.get_model('core', 'AgentSession')
+        migrated = new_session_model.objects.get(id=session.id)
+
+        assert migrated.status == 'ended'
+        assert migrated.end_work_contract_version == 0
+        assert _end_work_contract_column() == ('0', 'NO')
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                new_session_model.objects.filter(id=session.id).update(end_work_contract_version=2)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0034_reverse_restores_pre_contract_nullability() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0033)
+        old_apps = executor.loader.project_state(MIGRATE_0033).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'reverse-contract-session')
+        _set_session_cursor(old_apps, session.id, 0)
+        legacy = _create_historical_raw_event(old_apps, scope, session, 'reverse-null')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        new_apps = executor.loader.project_state(MIGRATE_0034).apps
+        new_raw_event_model = new_apps.get_model('core', 'RawEventEnvelope')
+
+        assert new_raw_event_model.objects.get(id=legacy.id).normalization_contract_version == 0
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0033)
+        reverted_raw_event_model = old_apps.get_model('core', 'RawEventEnvelope')
+        post_reverse = _create_historical_raw_event(old_apps, scope, session, 'post-reverse-null')
+
+        assert reverted_raw_event_model.objects.filter(id=post_reverse.id).count() == 1
+        assert reverted_raw_event_model.objects.get(id=legacy.id).normalization_contract_version == 0
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+        reapplied_apps = executor.loader.project_state(MIGRATE_0034).apps
+        reapplied_raw_event_model = reapplied_apps.get_model('core', 'RawEventEnvelope')
+
+        assert reapplied_raw_event_model.objects.get(id=legacy.id).normalization_contract_version == 0
+        assert reapplied_raw_event_model.objects.get(id=post_reverse.id).normalization_contract_version == 0
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)

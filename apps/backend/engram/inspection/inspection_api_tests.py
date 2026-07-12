@@ -320,6 +320,7 @@ def test_memory_detail_exposes_source_session_and_correlation() -> None:
         runtime=Runtime.CODEX,
         correlation_id='corr-provenance-1',
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -331,6 +332,7 @@ def test_memory_detail_exposes_source_session_and_correlation() -> None:
         observation_type='tool_use',
         title='source observation',
         content_hash='obs-provenance-hash',
+        session_sequence=1,
     )
     version.source_observation = observation
     version.save(update_fields=['source_observation', 'updated_at'])
@@ -388,6 +390,7 @@ def test_memory_detail_emits_correlation_id_unredacted_for_lookup() -> None:
         runtime=Runtime.CODEX,
         correlation_id=correlation_id,
         payload={'tool_name': 'bash'},
+        normalization_contract_version=0,
     )
     observation = Observation.objects.create(
         organization=organization,
@@ -399,6 +402,7 @@ def test_memory_detail_emits_correlation_id_unredacted_for_lookup() -> None:
         observation_type='tool_use',
         title='source observation corr',
         content_hash='obs-provenance-corr-hash',
+        session_sequence=1,
     )
     version.source_observation = observation
     version.save(update_fields=['source_observation', 'updated_at'])

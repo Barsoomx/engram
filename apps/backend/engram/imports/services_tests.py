@@ -153,18 +153,17 @@ def _create_master_era_import_graph(
     row: dict[str, object],
     raw_metadata: dict[str, object],
 ) -> tuple[RawEventEnvelope, Observation, ObservationSource]:
-    session.observation_sequence_cursor = None
-    session.save(update_fields=['observation_sequence_cursor'])
     source_id = importer._observation_source_id(context, row)
     raw_identity = _raw_import_identity(importer, context, session, row)
     raw_identity.update(
-        normalization_contract_version=None,
+        normalization_contract_version=0,
         normalization_disposition=None,
         normalization_reason=None,
         sequence_number=None,
         metadata=raw_metadata,
     )
     raw_event = RawEventEnvelope.objects.create(**raw_identity)
+    sequence_number = Observation.objects.filter(session=session, session_sequence__gt=0).count() + 1
     observation = Observation.objects.create(
         organization=context.organization,
         project=context.project,
@@ -178,8 +177,10 @@ def _create_master_era_import_graph(
         content_hash=importer._content_hash(source_id, row['title'], row['text']),
         generation_key=source_id,
         source_metadata={'source_id': source_id, 'event_type': 'claude_mem.observation'},
-        session_sequence=None,
+        session_sequence=sequence_number,
     )
+    session.observation_sequence_cursor = sequence_number
+    session.save(update_fields=['observation_sequence_cursor'])
     source = ObservationSource.objects.create(
         organization=context.organization,
         project=context.project,
@@ -346,7 +347,6 @@ def test_import_rejects_reused_raw_with_wrong_typed_contract(
         'second_generation_orphan',
         'raw_sequence_null',
         'raw_sequence_mismatch',
-        'observation_sequence_null',
         'cursor_behind',
     ],
 )
@@ -450,13 +450,11 @@ def test_import_rejects_corrupt_existing_typed_source_without_mutation(
             content_hash='second-generation-key-orphan',
             generation_key=source_id,
             source_metadata={'source_id': source_id, 'event_type': 'claude_mem.observation'},
+            session_sequence=2,
         )
     elif corruption in {'raw_sequence_null', 'raw_sequence_mismatch'}:
         raw_event.sequence_number = {'raw_sequence_null': None, 'raw_sequence_mismatch': 2}[corruption]
         raw_event.save(update_fields=['sequence_number'])
-    elif corruption == 'observation_sequence_null':
-        observation.session_sequence = None
-        observation.save(update_fields=['session_sequence'])
     else:
         session.observation_sequence_cursor = 0
         session.save(update_fields=['observation_sequence_cursor'])
@@ -563,6 +561,7 @@ def test_import_rejects_noncanonical_first_source_without_mutation(
             title='Unrelated sourced observation',
             content_hash='unrelated-first-link-observation',
             generation_key='unrelated-first-link-observation',
+            session_sequence=1,
         )
         ObservationSource.objects.create(
             organization=context.organization,
@@ -585,6 +584,7 @@ def test_import_rejects_noncanonical_first_source_without_mutation(
             content_hash=importer._content_hash(source_id, row['title'], row['text']),
             generation_key=source_id,
             source_metadata=[] if collision == 'falsy_source_metadata' else {},
+            session_sequence=1,
         )
         if collision == 'observation_source':
             unrelated_raw_identity = {**raw_identity}
@@ -685,6 +685,7 @@ def test_import_rejects_partial_evidence_identity_mismatch_without_mutation(
             content_hash=importer._content_hash(source_id, row['title'], row['text']),
             generation_key=source_id,
             source_metadata={},
+            session_sequence=1,
         )
         error = 'import observation source identity collision'
     else:
@@ -700,7 +701,7 @@ def test_import_rejects_partial_evidence_identity_mismatch_without_mutation(
             content_hash=importer._content_hash(source_id, row['title'], row['text']),
             generation_key=source_id,
             source_metadata={},
-            session_sequence=7 if partial_evidence == 'cursor_behind_positive_sequence' else None,
+            session_sequence=7 if partial_evidence == 'cursor_behind_positive_sequence' else 1,
         )
         if partial_evidence == 'cursor_behind_positive_sequence':
             session.observation_sequence_cursor = 3
@@ -1327,6 +1328,7 @@ def test_existing_import_observation_adoption_uses_two_queries(
         body=str(row['text']),
         content_hash=content_hash,
         generation_key='',
+        session_sequence=1,
     )
     if has_source:
         ObservationSource.objects.create(
@@ -2326,118 +2328,18 @@ def test_import_does_not_repair_legacy_replay_without_import_producer(
     raw_event.refresh_from_db()
     observation.refresh_from_db()
     session.refresh_from_db()
-    assert raw_event.normalization_contract_version is None
+    assert raw_event.normalization_contract_version == 0
     assert raw_event.normalization_disposition is None
     assert raw_event.normalization_reason is None
     assert raw_event.sequence_number is None
     assert raw_event.metadata == producer_metadata
-    assert observation.session_sequence is None
-    assert session.observation_sequence_cursor is None
+    assert observation.session_sequence == 1
+    assert session.observation_sequence_cursor == 1
     assert RawEventEnvelope.objects.count() == 1
     assert Observation.objects.count() == 1
     assert ObservationSource.objects.count() == 1
     assert not MemoryCandidate.objects.exists()
     assert not WorkflowWork.objects.exists()
-
-
-@pytest.mark.django_db
-def test_import_assigns_sequence_to_legacy_observation_without_sequence(
-    f_import_scope: ImportScope,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    importer = ClaudeMemImporter()
-    context = ImportContext(
-        source_store_id='fixture-store',
-        organization=f_import_scope.organization,
-        project=f_import_scope.project,
-        team=f_import_scope.team,
-    )
-    row = {
-        'id': 1,
-        'memory_session_id': 'memory-session-fixture-001',
-        'project': '/workspace/example-repo',
-        'text': 'Legacy observation body without a sequence.',
-        'type': 'discovery',
-        'title': 'Legacy observation without a sequence',
-        'created_at': '2026-06-25T09:02:00Z',
-    }
-    agent = Agent.objects.create(
-        organization=f_import_scope.organization,
-        runtime=Runtime.CODEX,
-        external_id='legacy-import-agent',
-    )
-    session = AgentSession.objects.create(
-        organization=f_import_scope.organization,
-        project=f_import_scope.project,
-        team=f_import_scope.team,
-        agent=agent,
-        external_session_id='claude-mem:fixture-store:sdk_session:content-session-fixture-001',
-        content_session_id='content-session-fixture-001',
-        memory_session_id='memory-session-fixture-001',
-        runtime=Runtime.CODEX,
-        metadata={'source': 'claude_mem_import'},
-        observation_sequence_cursor=None,
-    )
-    Observation.objects.create(
-        organization=f_import_scope.organization,
-        project=f_import_scope.project,
-        team=f_import_scope.team,
-        agent=agent,
-        session=session,
-        observation_type='discovery',
-        title='Existing positive observation',
-        body='Existing positive observation body.',
-        content_hash='legacy-positive-observation',
-        generation_key='legacy-positive-observation',
-        session_sequence=4,
-    )
-    source_id = importer._observation_source_id(context, row)
-    observation = Observation.objects.create(
-        organization=f_import_scope.organization,
-        project=f_import_scope.project,
-        team=f_import_scope.team,
-        agent=agent,
-        session=session,
-        observation_type='discovery',
-        title=str(row['title']),
-        body=str(row['text']),
-        content_hash=importer._content_hash(source_id, row['title'], row['text']),
-        generation_key=source_id,
-        session_sequence=None,
-    )
-
-    real_allocate = import_services.allocate_observation_sequence
-    allocated_sessions: list[object] = []
-
-    def track_allocate(locked_session: AgentSession) -> int:
-        allocated_sessions.append(locked_session.id)
-        return real_allocate(locked_session)
-
-    monkeypatch.setattr('engram.imports.services.allocate_observation_sequence', track_allocate)
-
-    importer.import_batch(context, 'observations', [row], defer_embedding=True)
-
-    raw_event = RawEventEnvelope.objects.get(client_event_id=source_id)
-    source = ObservationSource.objects.get(source_id=source_id)
-    observation.refresh_from_db()
-    session.refresh_from_db()
-    assert allocated_sessions == [session.id]
-    assert raw_event.sequence_number == 5
-    assert source.observation_id == observation.id
-    assert observation.session_sequence == 5
-    assert session.observation_sequence_cursor == 5
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
-
-    importer.import_batch(context, 'observations', [row], defer_embedding=True)
-
-    raw_event.refresh_from_db()
-    observation.refresh_from_db()
-    session.refresh_from_db()
-    assert allocated_sessions == [session.id]
-    assert raw_event.sequence_number == 5
-    assert observation.session_sequence == 5
-    assert session.observation_sequence_cursor == 5
 
 
 @pytest.mark.django_db

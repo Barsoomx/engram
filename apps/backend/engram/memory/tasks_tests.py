@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 from django.db import transaction
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
 from engram import celeryconfig
 from engram.core.models import (
@@ -24,6 +25,7 @@ from engram.core.models import (
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkDisposition,
     WorkflowWorkType,
 )
 from engram.memory import tasks as tasks_module
@@ -44,6 +46,7 @@ from engram.memory.workflow_work import (
     canonical_json_bytes,
     create_work,
     observation_content_digest,
+    resolve_work_no_input,
     resolve_work_succeeded,
 )
 
@@ -211,6 +214,9 @@ def create_observation(
     suffix: str = '1',
     session_sequence: int | None = None,
 ) -> Observation:
+    if session_sequence is None:
+        session_sequence = Observation.objects.filter(session=session).count() + 1
+
     return Observation.objects.create(
         organization=session.organization,
         project=session.project,
@@ -362,54 +368,70 @@ def create_required_work(
     return work
 
 
-def create_failed_workflow_run(session: AgentSession) -> WorkflowRun:
+def create_linked_run(
+    work: WorkflowWork,
+    *,
+    status: str = WorkflowRunStatus.FAILED,
+    created_at: object = None,
+    finished_at: object = None,
+    failure_reason: str = '',
+) -> WorkflowRun:
     run = WorkflowRun.objects.create(
-        organization=session.organization,
-        project=session.project,
-        team=session.team,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
         run_type=WorkflowRunType.SESSION_DISTILLATION,
-        status=WorkflowRunStatus.FAILED,
-        input_snapshot={'session_id': str(session.id)},
+        status=status,
+        input_snapshot=work.input_snapshot,
+        failure_reason=failure_reason,
     )
-    WorkflowRun.objects.filter(id=run.id).update(finished_at=timezone.now() - timedelta(minutes=40))
-    run.refresh_from_db()
+
+    update_fields: dict[str, object] = {}
+    if created_at is not None:
+        update_fields['created_at'] = created_at
+    if finished_at is not None:
+        update_fields['finished_at'] = finished_at
+    if update_fields:
+        WorkflowRun.objects.filter(id=run.id).update(**update_fields)
+        run.refresh_from_db()
 
     return run
 
 
 @pytest.mark.django_db
-def test_retry_failed_distillations_enqueues_the_retriable_session(
+def test_retry_failed_distillations_signals_versioned_work_retry(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
     f_agent: Agent,
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
-    create_observation(session)
-    create_failed_workflow_run(session)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=40))
 
-    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
-        result = retry_failed_distillations()
+    result = retry_failed_distillations()
 
-    m_delay.assert_called_once_with(str(session.id))
-    assert result == {'retried': 1}
+    assert result == {'retried': 1, 'unlinked': 0}
+
+    queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
+    assert queued.count() == 1
+    new_run = queued.get()
+
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
+    outbox = CeleryOutbox.objects.get(task_name='engram.memory.distill_session_work_v1')
+    assert outbox.args == [str(work.id), str(new_run.id)]
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{new_run.id}'
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session').count() == 0
 
 
 @pytest.mark.django_db
-def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-    f_agent: Agent,
-) -> None:
-    session = create_session(f_org, f_team, f_project, f_agent, status=SessionStatus.ACTIVE)
-    create_observation(session)
+def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible() -> None:
+    result = retry_failed_distillations()
 
-    with mock.patch('engram.memory.tasks.distill_session.delay') as m_delay:
-        result = retry_failed_distillations()
-
-    m_delay.assert_not_called()
-    assert result == {'retried': 0}
+    assert result == {'retried': 0, 'unlinked': 0}
+    assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
 
 
 def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_attempt() -> None:
@@ -691,7 +713,7 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
             'team_id': foreign_team.id,
         },
     ]
-    if task_attribute != 'process_observation_work_v1':
+    if task_attribute not in ('process_observation_work_v1', 'distill_session_work_v1'):
         invalid_updates.append({'status': WorkflowRunStatus.SUCCEEDED})
     task = getattr(tasks_module, task_attribute)
 
@@ -717,11 +739,6 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
 @pytest.mark.parametrize(
     ('task_attribute', 'work_type', 'domain_target'),
     [
-        (
-            'distill_session_work_v1',
-            WorkflowWorkType.SESSION_DISTILLATION,
-            'engram.memory.tasks.run_session_distillation_with_tracking',
-        ),
         (
             'generate_daily_digest_work_v1',
             WorkflowWorkType.DAILY_DIGEST,
@@ -797,3 +814,130 @@ def test_terminal_automatic_delivery_returns_before_unfinished_adapter(
         task(str(work.id))
 
     m_domain.assert_not_called()
+
+
+@pytest.mark.django_db
+def test_distill_session_work_no_op_returns_without_creating_run_or_calling_provider(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    resolve_work_no_input(work.id, organization_id=work.organization_id, project_id=work.project_id)
+
+    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+        result = tasks_module.distill_session_work_v1(str(work.id))
+
+    m_run.assert_not_called()
+    assert result == str(work.id)
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_distill_session_work_automatic_delivery_does_not_retry_failed_initial_attempt(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    failed_run = WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={'session_id': str(session.id)},
+    )
+    WorkflowRun.objects.filter(id=failed_run.id).update(
+        status=WorkflowRunStatus.FAILED,
+        finished_at=timezone.now(),
+    )
+
+    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+        tasks_module.distill_session_work_v1(str(work.id))
+
+    m_run.assert_not_called()
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db
+def test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+    succeeded_run = WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={'session_id': str(session.id)},
+    )
+    now = timezone.now()
+    WorkflowRun.objects.filter(id=succeeded_run.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        started_at=now,
+        finished_at=now,
+    )
+
+    with (
+        mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute,
+        mock.patch('engram.memory.tasks.logger.info') as m_log,
+    ):
+        result = tasks_module.distill_session_work_v1(
+            str(work.id),
+            workflow_run_id=str(succeeded_run.id),
+        )
+
+    m_execute.assert_not_called()
+    assert result == str(succeeded_run.id)
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    m_log.assert_called_once_with(
+        'workflow_run_duplicate_delivery_absorbed',
+        work_id=str(work.id),
+        workflow_run_id=str(succeeded_run.id),
+        via='claim',
+    )
+
+
+@pytest.mark.django_db
+def test_distill_session_work_rejects_altered_snapshot_before_run_or_provider(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    WorkflowWork.objects.filter(id=work.id).update(
+        input_snapshot={
+            'schema': 'session_distillation_input/v1',
+            'session_id': str(session.id),
+            'lower_sequence_exclusive': 0,
+            'upper_sequence_inclusive': 999,
+        },
+    )
+
+    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+        with pytest.raises(MemoryWorkerError, match='fingerprint'):
+            tasks_module.distill_session_work_v1(str(work.id))
+
+    m_run.assert_not_called()
+    assert WorkflowRun.objects.filter(work=work).count() == 0

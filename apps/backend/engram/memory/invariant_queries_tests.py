@@ -260,6 +260,7 @@ def _make_raw_event(
         content_hash=f'raw-hash-{suffix}',
         runtime=Runtime.CODEX,
         payload={'synthetic': True},
+        normalization_contract_version=0,
     )
 
 
@@ -271,6 +272,8 @@ def _make_observation(
     observation_type: str = 'tool_use',
     entity_id: uuid.UUID | None = None,
 ) -> Observation:
+    session_sequence = Observation.objects.filter(session=session).count() + 1
+
     return Observation.objects.create(
         id=entity_id or uuid.uuid4(),
         organization=scope.organization,
@@ -283,6 +286,7 @@ def _make_observation(
         body=f'Synthetic detail {suffix}',
         content_hash=f'observation-hash-{suffix}',
         observed_at=FIXED_AS_OF,
+        session_sequence=session_sequence,
     )
 
 
@@ -757,7 +761,7 @@ def test_post_cutover_p1_observation_requires_no_normalization_reason(
     constraint = next(
         constraint
         for constraint in RawEventEnvelope._meta.constraints
-        if constraint.name == 'core_raw_norm_expand_valid'
+        if constraint.name == 'core_raw_norm_final_valid'
     )
     with connection.schema_editor() as schema_editor:
         schema_editor.remove_constraint(RawEventEnvelope, constraint)

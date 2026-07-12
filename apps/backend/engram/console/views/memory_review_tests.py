@@ -167,6 +167,7 @@ def _make_observation(organization: Organization, project: Project) -> Observati
         body='Obs body',
         observation_type='tool_use',
         content_hash='hash-obs-' + str(Observation.objects.count()),
+        session_sequence=1,
     )
 
 

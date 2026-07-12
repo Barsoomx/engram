@@ -277,7 +277,7 @@ class AgentSession(TimestampedModel):
     cwd = models.TextField(blank=True)
     status = models.CharField(max_length=40, choices=SessionStatus.choices, default=SessionStatus.ACTIVE)
     prompt_counter = models.PositiveIntegerField(default=0)
-    observation_sequence_cursor = models.PositiveBigIntegerField(null=True, blank=True)
+    observation_sequence_cursor = models.PositiveBigIntegerField(db_default=0)
     end_work_contract_version = models.PositiveSmallIntegerField(
         default=0,
         db_default=0,
@@ -342,7 +342,7 @@ class RawEventEnvelope(TimestampedModel):
     content_hash = models.CharField(max_length=128)
     runtime = models.CharField(max_length=40, choices=Runtime.choices, default=Runtime.UNKNOWN)
     payload_schema_version = models.CharField(max_length=40, default='v1')
-    normalization_contract_version = models.PositiveSmallIntegerField(null=True, blank=True)
+    normalization_contract_version = models.PositiveSmallIntegerField()
     normalization_disposition = models.CharField(
         max_length=20,
         choices=RawEventNormalizationDisposition.choices,
@@ -380,27 +380,25 @@ class RawEventEnvelope(TimestampedModel):
             models.CheckConstraint(
                 condition=(
                     models.Q(
-                        normalization_contract_version__isnull=True,
+                        normalization_contract_version=0,
                         normalization_disposition__isnull=True,
                         normalization_reason__isnull=True,
                     )
                     | models.Q(
-                        normalization_contract_version__isnull=False,
                         normalization_contract_version=1,
                         normalization_disposition__isnull=False,
-                        normalization_disposition=RawEventNormalizationDisposition.OBSERVATION,
+                        normalization_disposition='observation',
                         normalization_reason__isnull=True,
                     )
                     | models.Q(
-                        normalization_contract_version__isnull=False,
                         normalization_contract_version=1,
                         normalization_disposition__isnull=False,
-                        normalization_disposition=RawEventNormalizationDisposition.NO_OP,
+                        normalization_disposition='no_op',
                         normalization_reason__isnull=False,
-                        normalization_reason=RawEventNormalizationReason.EVIDENCE_ONLY,
+                        normalization_reason='evidence_only',
                     )
                 ),
-                name='core_raw_norm_expand_valid',
+                name='core_raw_norm_final_valid',
             ),
         ]
         indexes = [
@@ -457,7 +455,7 @@ class Observation(TimestampedModel):
     files_read = models.JSONField(default=list, blank=True)
     files_modified = models.JSONField(default=list, blank=True)
     prompt_number = models.PositiveIntegerField(null=True, blank=True)
-    session_sequence = models.PositiveBigIntegerField(null=True, blank=True)
+    session_sequence = models.PositiveBigIntegerField()
     content_hash = models.CharField(max_length=128)
     generation_key = models.CharField(max_length=255, blank=True)
     generated_model = models.CharField(max_length=120, blank=True)
@@ -477,7 +475,7 @@ class Observation(TimestampedModel):
                 name='core_obs_session_seq_uniq',
             ),
             models.CheckConstraint(
-                condition=models.Q(session_sequence__isnull=True) | models.Q(session_sequence__gt=0),
+                condition=models.Q(session_sequence__gt=0),
                 name='core_obs_session_seq_pos',
             ),
         ]
