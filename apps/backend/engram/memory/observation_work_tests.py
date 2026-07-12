@@ -139,20 +139,9 @@ def test_session_history_predicate_is_bounded_and_detects_each_evidence_type(
 
 
 @pytest.mark.django_db
-def test_allocate_sequence_uses_max_existing_positive_sequence_for_legacy_null_cursor() -> None:
-    organization, project, session = create_scope('null-cursor')
-    AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=None)
-    Observation.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        agent=session.agent,
-        session=session,
-        observation_type='decision',
-        title='Existing null sequence',
-        content_hash='null-sequence-content',
-        session_sequence=None,
-    )
+def test_allocate_sequence_uses_max_existing_positive_sequence_for_legacy_zero_cursor() -> None:
+    organization, project, session = create_scope('zero-cursor')
+    AgentSession.objects.filter(id=session.id).update(observation_sequence_cursor=0)
     for sequence in (3, 9):
         Observation.objects.create(
             organization=organization,

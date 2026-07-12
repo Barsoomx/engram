@@ -301,7 +301,7 @@ class IngestHookEvent:
                 raw_event.normalization_disposition,
                 raw_event.normalization_reason,
             )
-            if normalization_state != (None, None, None):
+            if normalization_state != (0, None, None):
                 raise ValueError('malformed legacy hook normalization state')
             direct_observations = list(raw_event.observations.order_by('created_at')[:2])
             if len(direct_observations) != 1:
@@ -449,7 +449,7 @@ class IngestHookEvent:
         if not isinstance(metadata, dict):
             raise ValueError('malformed hook duplicate metadata')
         if 'work_policy_v1' not in metadata:
-            if raw_event.normalization_contract_version is not None:
+            if raw_event.normalization_contract_version != 0:
                 raise ValueError('missing work_policy_v1')
 
             return self._work_policy(organization, legacy_policy_fallback=True), True

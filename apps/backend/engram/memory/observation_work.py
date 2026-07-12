@@ -31,7 +31,7 @@ def session_has_observation_history(*, session_id: UUID) -> bool:
 def allocate_observation_sequence(session: AgentSession) -> int:
     _require_active_transaction()
     current_cursor = session.observation_sequence_cursor
-    if current_cursor is None:
+    if current_cursor == 0:
         existing_max = (
             Observation.objects.filter(session_id=session.id, session_sequence__gt=0)
             .aggregate(max_sequence=Max('session_sequence'))

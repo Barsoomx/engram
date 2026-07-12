@@ -540,7 +540,7 @@ def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
     assert response.status_code == 202
     raw_event = RawEventEnvelope.objects.get()
     raw_event.metadata = {}
-    raw_event.normalization_contract_version = None
+    raw_event.normalization_contract_version = 0
     raw_event.normalization_disposition = None
     raw_event.normalization_reason = None
     raw_event.save(
@@ -564,7 +564,7 @@ def test_hook_duplicate_repairs_legacy_missing_work_policy_once() -> None:
     assert first_duplicate.status_code == 202
     raw_event.refresh_from_db()
     assert raw_event.metadata['work_policy_v1']['legacy_policy_fallback'] is True
-    assert raw_event.normalization_contract_version is None
+    assert raw_event.normalization_contract_version == 0
     assert raw_event.normalization_disposition is None
     assert raw_event.normalization_reason is None
     assert WorkflowWork.objects.count() == 1
@@ -641,7 +641,7 @@ def test_legacy_hook_duplicate_rejects_corrupted_direct_observation_scope_before
     result = IngestHookEvent().execute(data)
     raw_event = result.raw_event
     raw_event.metadata = {}
-    raw_event.normalization_contract_version = None
+    raw_event.normalization_contract_version = 0
     raw_event.normalization_disposition = None
     raw_event.normalization_reason = None
     raw_event.save(
@@ -688,7 +688,7 @@ def test_legacy_hook_duplicate_rejects_ambiguous_direct_observations_before_muta
     result = IngestHookEvent().execute(data)
     raw_event = result.raw_event
     raw_event.metadata = {}
-    raw_event.normalization_contract_version = None
+    raw_event.normalization_contract_version = 0
     raw_event.normalization_disposition = None
     raw_event.normalization_reason = None
     raw_event.save(
@@ -711,6 +711,7 @@ def test_legacy_hook_duplicate_rejects_ambiguous_direct_observations_before_muta
         title='ambiguous legacy observation',
         body='must fail closed',
         content_hash='ambiguous-legacy-hash',
+        session_sequence=2,
         source_metadata={'event_type': data.event_type},
     )
     enable_realtime_candidates(organization)
@@ -738,7 +739,7 @@ def test_legacy_hook_duplicate_rejects_canonical_source_bound_to_another_raw_bef
     )
     raw_event = result.raw_event
     raw_event.metadata = {}
-    raw_event.normalization_contract_version = None
+    raw_event.normalization_contract_version = 0
     raw_event.normalization_disposition = None
     raw_event.normalization_reason = None
     raw_event.save(
