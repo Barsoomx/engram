@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
-from django.db import connection
+from django.db import connection, transaction
 from django.utils import timezone
 
 from engram.core.models import (
@@ -30,6 +30,11 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
 from engram.memory.distillation import (
     DistillSession,
@@ -45,6 +50,8 @@ from engram.memory.distillation import (
     session_reduce_system_prompt,
 )
 from engram.memory.services import MemoryWorkerError, PromoteMemoryCandidate
+from engram.memory.tasks import distill_session_work_v1
+from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import (
@@ -1983,3 +1990,243 @@ def test_distill_session_reduce_kind_stays_empty_when_no_source_carries_one(
 
     candidate = MemoryCandidate.objects.get(project=project)
     assert candidate.kind == ''
+
+
+def create_session_distillation_work(session: AgentSession, *, upper: int) -> WorkflowWork:
+    data = CreateWorkflowWorkInput(
+        organization_id=session.organization_id,
+        project_id=session.project_id,
+        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        subject_type=WorkflowSubjectType.AGENT_SESSION,
+        subject_id=session.id,
+        input_snapshot={
+            'schema': 'session_distillation_input/v1',
+            'session_id': str(session.id),
+            'lower_sequence_exclusive': 0,
+            'upper_sequence_inclusive': upper,
+        },
+    )
+    with transaction.atomic():
+        work, created = create_work(data)
+
+    assert created is True
+
+    return work
+
+
+def real_prompt_gateway(m_monkeypatch: pytest.MonkeyPatch, *, bodies: list[bytes]) -> Any:
+    m_monkeypatch.setenv('ENGRAM_PROVIDER_MODE', 'real')
+    opener = sequenced_opener(bodies)
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+
+    return opener
+
+
+def held_candidate_body() -> bytes:
+    return candidates_body(
+        [{'title': 'held candidate', 'body': 'held body', 'confidence': 0.4, 'supporting_observation_ids': []}],
+    )
+
+
+def last_prompt(opener: Any) -> str:
+    return json.loads(opener.calls[-1].data)['messages'][-1]['content']
+
+
+@pytest.mark.django_db
+def test_distill_session_input_upper_bound_excludes_later_generation_observations(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    first = create_observation(organization, project, team, agent, session, index=1)
+    second = create_observation(organization, project, team, agent, session, index=2)
+    later = create_observation(organization, project, team, agent, session, index=3)
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    DistillSession().execute(DistillSessionInput(session_id=session.id, upper_sequence_inclusive=2))
+
+    assert len(opener.calls) == 1
+    prompt = last_prompt(opener)
+    assert str(first.id) in prompt
+    assert str(second.id) in prompt
+    assert str(later.id) not in prompt
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_consumes_useful_prefix_and_resolves_work(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    first = create_observation(organization, project, team, agent, session, index=1)
+    second = create_observation(organization, project, team, agent, session, index=2)
+    lifecycle = create_observation(
+        organization,
+        project,
+        team,
+        agent,
+        session,
+        index=3,
+        observation_type='session_lifecycle',
+        source_metadata={'event_type': 'session_end'},
+    )
+    work = create_session_distillation_work(session, upper=2)
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    distill_session_work_v1(str(work.id))
+
+    runs = WorkflowRun.objects.filter(work=work, run_type=WorkflowRunType.SESSION_DISTILLATION)
+    assert runs.count() == 1
+    run = runs.get()
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.started_at is not None
+    assert run.finished_at is not None
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason in (
+        WorkflowWorkResolutionReason.SUCCEEDED,
+        WorkflowWorkResolutionReason.NO_SIGNAL,
+    )
+    assert len(opener.calls) == 1
+    prompt = last_prompt(opener)
+    assert str(first.id) in prompt
+    assert str(second.id) in prompt
+    assert str(lifecycle.id) not in prompt
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_ignores_useful_row_written_after_the_frozen_upper(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    first = create_observation(organization, project, team, agent, session, index=1)
+    second = create_observation(organization, project, team, agent, session, index=2)
+    work = create_session_distillation_work(session, upper=2)
+    late = create_observation(organization, project, team, agent, session, index=3)
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    distill_session_work_v1(str(work.id))
+
+    assert len(opener.calls) == 1
+    prompt = last_prompt(opener)
+    assert str(first.id) in prompt
+    assert str(second.id) in prompt
+    assert str(late.id) not in prompt
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_consumes_keyless_source_metadata_row_within_window(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    keyless = create_observation(organization, project, team, agent, session, index=1, source_metadata={})
+    normal = create_observation(organization, project, team, agent, session, index=2)
+    lifecycle = create_observation(
+        organization,
+        project,
+        team,
+        agent,
+        session,
+        index=3,
+        observation_type='session_lifecycle',
+        source_metadata={'event_type': 'session_end'},
+    )
+    work = create_session_distillation_work(session, upper=2)
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    distill_session_work_v1(str(work.id))
+
+    assert len(opener.calls) == 1
+    prompt = last_prompt(opener)
+    assert str(keyless.id) in prompt
+    assert str(normal.id) in prompt
+    assert str(lifecycle.id) not in prompt
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_duplicate_automatic_delivery_creates_one_run_and_no_second_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    work = create_session_distillation_work(session, upper=2)
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    distill_session_work_v1(str(work.id))
+    distill_session_work_v1(str(work.id))
+
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert len(opener.calls) == 1
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_uses_supplied_queued_run_without_creating_another(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    create_observation(organization, project, team, agent, session, index=2)
+    work = create_session_distillation_work(session, upper=2)
+    queued = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot={'session_id': str(session.id)},
+    )
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
+
+    distill_session_work_v1(str(work.id), workflow_run_id=str(queued.id))
+
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert len(opener.calls) == 1
+    queued.refresh_from_db()
+    assert queued.status == WorkflowRunStatus.SUCCEEDED
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_truncated_result_keeps_work_required_and_adopts_on_redelivery(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope()
+    create_curation_policy(organization, team, project)
+    for index in range(1, 11):
+        create_observation(organization, project, team, agent, session, index=index)
+    work = create_session_distillation_work(session, upper=10)
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
+    opener = real_prompt_gateway(m_monkeypatch, bodies=[body] * 8)
+
+    distill_session_work_v1(str(work.id))
+
+    assert len(opener.calls) == 8
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    runs = WorkflowRun.objects.filter(work=work)
+    assert runs.count() == 1
+    assert runs.get().escalation is True
+    assert AuditEvent.objects.filter(
+        event_type='SessionDistillationTruncated',
+        target_id=str(session.id),
+    ).exists()
+
+    distill_session_work_v1(str(work.id))
+
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert len(opener.calls) == 8
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
