@@ -718,9 +718,6 @@ def run_scheduled_digests() -> dict[str, int]:
 def sweep_stale_sessions() -> dict[str, int]:
     result = SweepStaleSessions().execute()
 
-    for session_id in result.distillable_session_ids:
-        distill_session.delay(str(session_id))
-
     return {
         'swept': len(result.ended_session_ids),
         'distilled': len(result.distillable_session_ids),

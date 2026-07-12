@@ -33,7 +33,8 @@ from engram.memory.observation_work import (
     lock_session_for_observation,
     session_has_observation_history,
 )
-from engram.memory.tasks import dispatch_work_task, distill_session, process_observation_work_v1
+from engram.memory.session_lifecycle import EndSession
+from engram.memory.tasks import dispatch_work_task, process_observation_work_v1
 from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work, observation_content_digest
 
 logger = structlog.get_logger(__name__)
@@ -200,10 +201,6 @@ class IngestHookEvent:
                     session=session,
                 )
                 observation_id = str(observation.id)
-                if trusted_event_type == 'session_end':
-                    session.status = SessionStatus.ENDED
-                    session.ended_at = data.occurred_at or timezone.now()
-                    session.save(update_fields=['status', 'ended_at', 'updated_at'])
                 if trusted_event_type not in {'session_start', 'session_end'} and policy['realtime_candidates_enabled']:
                     work, created = self._create_observation_work(
                         organization=organization,
@@ -214,8 +211,14 @@ class IngestHookEvent:
                     if created:
                         dispatch_work_task(process_observation_work_v1, work.id)
                 if trusted_event_type == 'session_end' and session_was_active:
-                    session_id = str(session.id)
-                    transaction.on_commit(lambda: distill_session.delay(session_id))
+                    EndSession().execute(
+                        organization_id=organization.id,
+                        project_id=project.id,
+                        session_id=session.id,
+                        ended_at=data.occurred_at or timezone.now(),
+                        source='explicit',
+                    )
+                    session.refresh_from_db()
 
                 logger.info(
                     'hook_event_ingested',
@@ -738,8 +741,10 @@ class IngestHookEvent:
         if not created and session.status == SessionStatus.ENDED and data.event_type != 'session_end':
             session.status = SessionStatus.ACTIVE
             session.ended_at = None
+            session.end_work_contract_version = 0
             update_fields.append('status')
             update_fields.append('ended_at')
+            update_fields.append('end_work_contract_version')
         if update_fields:
             update_fields.append('updated_at')
             session.save(update_fields=update_fields)
