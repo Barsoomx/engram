@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -13,8 +13,19 @@ RUN apt-get update \
 
 COPY apps/backend/pyproject.toml apps/backend/poetry.lock ./
 
-RUN poetry config virtualenvs.create false \
-    && poetry install --no-interaction --no-root --only main
+RUN poetry config virtualenvs.create false
+
+FROM base AS test
+
+RUN poetry install --no-interaction --no-root
+
+COPY apps/backend /srv/app
+
+CMD ["pytest", "-q"]
+
+FROM base AS runtime
+
+RUN poetry install --no-interaction --no-root --only main
 
 COPY apps/backend /srv/app
 
