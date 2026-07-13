@@ -12,6 +12,7 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkType,
 )
+from engram.memory.aware_time import require_aware
 
 RESIGNAL_WINDOW = timedelta(minutes=5)
 _RESIGNAL_WINDOW = RESIGNAL_WINDOW
@@ -23,12 +24,17 @@ _TASK_NAME_BY_WORK = {
     WorkflowWorkType.WEEKLY_DIGEST: 'engram.memory.generate_weekly_digest_work_v1',
 }
 
+ALLOWED_TASK_NAMES = frozenset(_TASK_NAME_BY_WORK.values())
 
-def _require_aware(now: datetime) -> None:
-    if now.tzinfo is None or now.utcoffset() is None:
-        raise ValueError('now must be timezone-aware')
+_TASK_ID_PREFIX = 'workflow-work:'
+_RUN_MARKER = ':run:'
 
-    return
+
+def _uuid_or_none(value: object) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def work_task_signature(
@@ -36,12 +42,25 @@ def work_task_signature(
     workflow_run_id: uuid.UUID | None = None,
 ) -> tuple[list[str], str]:
     args = [str(work_id)]
-    task_id = f'workflow-work:{work_id}'
+    task_id = f'{_TASK_ID_PREFIX}{work_id}'
     if workflow_run_id is not None:
         args.append(str(workflow_run_id))
-        task_id = f'{task_id}:run:{workflow_run_id}'
+        task_id = f'{task_id}{_RUN_MARKER}{workflow_run_id}'
 
     return args, task_id
+
+
+def parse_work_task_id(task_id: object) -> tuple[uuid.UUID | None, uuid.UUID | None]:
+    if not isinstance(task_id, str) or not task_id.startswith(_TASK_ID_PREFIX):
+        return None, None
+
+    rest = task_id[len(_TASK_ID_PREFIX) :]
+    if _RUN_MARKER in rest:
+        work_part, run_part = rest.split(_RUN_MARKER, 1)
+
+        return _uuid_or_none(work_part), _uuid_or_none(run_part)
+
+    return _uuid_or_none(rest), None
 
 
 def _signal_package(task_name: str, work_id: uuid.UUID, run_id: uuid.UUID) -> None:
@@ -70,7 +89,7 @@ def _eligible_queued_run(work: WorkflowWork) -> WorkflowRun | None:
 
 
 def queue_work_attempt(*, work_id: uuid.UUID, now: datetime, origin: str) -> WorkflowRun:
-    _require_aware(now)
+    require_aware(now, field='now')
 
     with transaction.atomic():
         try:

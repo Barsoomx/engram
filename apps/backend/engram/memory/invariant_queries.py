@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
@@ -33,9 +33,12 @@ from engram.core.models import (
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.memory import candidate_work_reconciler
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
+from engram.memory.session_work_reconciler import inspect_session_work
 from engram.memory.workflow_work import observation_content_digest, work_input_fingerprint
 
 _SAMPLE_LIMIT = 20
@@ -168,10 +171,10 @@ def evaluate_invariants(
     return (
         _evaluate_p1(project),
         _missing(InvariantId.P2),
-        _evaluate_p3(project),
+        _evaluate_p3(project, effective_as_of),
         _evaluate_p4(project, effective_as_of),
         _missing(InvariantId.P5),
-        _evaluate_p6(project),
+        _evaluate_p6(project, effective_as_of),
         _evaluate_p7(project),
         _missing(InvariantId.P8),
         _missing(InvariantId.P9),
@@ -575,12 +578,58 @@ def _evaluate_p1(project: Project) -> InvariantResult:
     )
 
 
-def _evaluate_p3(project: Project) -> InvariantResult:
+def _pre_cutover_residue_sessions(project: Project) -> QuerySet:
     non_lifecycle_observations = Observation.objects.filter(
         organization_id=project.organization_id,
         project_id=project.id,
         session_id=OuterRef('id'),
     ).exclude(observation_type__in=_LIFECYCLE_OBSERVATION_TYPES)
+
+    return (
+        AgentSession.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            status=SessionStatus.ENDED,
+        )
+        .exclude(end_work_contract_version=1)
+        .annotate(has_non_lifecycle_observation=Exists(non_lifecycle_observations))
+        .filter(has_non_lifecycle_observation=True)
+    )
+
+
+def _evaluate_p3(project: Project, as_of: datetime) -> InvariantResult:
+    inspection = inspect_session_work(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        as_of=as_of,
+    )
+    if inspection.findings:
+        sample_ids = tuple(
+            sorted(
+                {f'session:{finding.entity_id}' for finding in inspection.findings},
+                key=_sample_sort_key,
+            )[:_SAMPLE_LIMIT]
+        )
+
+        return InvariantResult(
+            invariant_id=InvariantId.P3,
+            state=InvariantState.VIOLATED,
+            reason='ended_session_current_generation_work_inexact',
+            violation_count=len(inspection.findings),
+            sample_ids=sample_ids,
+            target_checkpoint='CP2',
+        )
+
+    residue = _pre_cutover_residue_sessions(project)
+    if not residue.exists():
+        return InvariantResult(
+            invariant_id=InvariantId.P3,
+            state=InvariantState.HEALTHY,
+            reason='ended_session_current_generation_work_exact',
+            violation_count=0,
+            target_checkpoint='CP2',
+        )
+
     successful_runs = (
         WorkflowRun.objects.filter(
             organization_id=project.organization_id,
@@ -591,90 +640,99 @@ def _evaluate_p3(project: Project) -> InvariantResult:
         .annotate(session_id_text=KeyTextTransform('session_id', 'input_snapshot'))
         .filter(session_id_text=Cast(OuterRef('id'), output_field=CharField()))
     )
-    sessions = (
-        AgentSession.objects.filter(
-            organization_id=project.organization_id,
-            project_id=project.id,
-            status=SessionStatus.ENDED,
-        )
-        .annotate(
-            has_non_lifecycle_observation=Exists(non_lifecycle_observations),
-            has_successful_run=Exists(successful_runs),
-        )
-        .filter(has_non_lifecycle_observation=True, has_successful_run=False)
-    )
+    unproven = residue.annotate(has_successful_run=Exists(successful_runs)).filter(has_successful_run=False)
 
-    return _missing(
-        InvariantId.P3,
-        proxy_count=sessions.count(),
-        sample_ids=_query_samples(sessions, 'session'),
+    return InvariantResult(
+        invariant_id=InvariantId.P3,
+        state=InvariantState.MISSING_OBSERVABILITY,
+        reason='pre_cutover_session_distillation_unproven',
+        proxy_count=unproven.count(),
+        sample_ids=_query_samples(unproven, 'session'),
+        missing_evidence='exact latest and completed input watermarks',
+        target_checkpoint='CP2/CP3',
     )
 
 
 def _evaluate_p4(project: Project, as_of: datetime) -> InvariantResult:
-    stale_runs = (
-        WorkflowRun.objects.filter(
-            organization_id=project.organization_id,
-            project_id=project.id,
-            status=WorkflowRunStatus.RUNNING,
+    expired_leases = WorkflowWork.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        execution_state=WorkflowWorkExecutionState.LEASED,
+        lease_expires_at__lt=as_of,
+    )
+    violation_count = expired_leases.count()
+    if not violation_count:
+        return InvariantResult(
+            invariant_id=InvariantId.P4,
+            state=InvariantState.HEALTHY,
+            reason='no_expired_work_leases',
+            violation_count=0,
+            target_checkpoint='CP2',
         )
-        .annotate(effective_started_at=Coalesce('started_at', 'created_at'))
-        .filter(effective_started_at__lt=as_of - timedelta(minutes=30))
+
+    return InvariantResult(
+        invariant_id=InvariantId.P4,
+        state=InvariantState.VIOLATED,
+        reason='expired_work_lease_unreclaimed',
+        violation_count=violation_count,
+        sample_ids=_query_samples(expired_leases, 'workflow_work'),
+        target_checkpoint='CP2',
     )
 
-    return _missing(
-        InvariantId.P4,
-        proxy_count=stale_runs.count(),
-        sample_ids=_query_samples(stale_runs, 'workflow_run'),
-    )
 
-
-def _evaluate_p6(project: Project) -> InvariantResult:
+def _evaluate_p6(project: Project, as_of: datetime) -> InvariantResult:
     proposed_candidates = MemoryCandidate.objects.filter(
         organization_id=project.organization_id,
         project_id=project.id,
         status=CandidateStatus.PROPOSED,
     )
+    if candidate_work_reconciler.get_candidate_decision_work_builder() is None:
+        return _missing(
+            InvariantId.P6,
+            proxy_count=proposed_candidates.count(),
+            sample_ids=_query_samples(proposed_candidates, 'candidate'),
+        )
+
+    findings = candidate_work_reconciler.inspect_candidate_work(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        as_of=as_of,
+    )
+    sample_ids = tuple(
+        sorted(
+            {f'candidate:{finding.entity_id}' for finding in findings},
+            key=_sample_sort_key,
+        )[:_SAMPLE_LIMIT]
+    )
 
     return _missing(
         InvariantId.P6,
-        proxy_count=proposed_candidates.count(),
-        sample_ids=_query_samples(proposed_candidates, 'candidate'),
+        proxy_count=len(findings),
+        sample_ids=sample_ids,
     )
 
 
-def _evaluate_p7(project: Project) -> InvariantResult:
-    scoped_promoted_memory = Memory.objects.filter(
-        organization_id=project.organization_id,
-        project_id=project.id,
-        id=OuterRef('promoted_memory_id'),
-    )
-    candidates_without_memory = (
-        MemoryCandidate.objects.filter(
-            organization_id=project.organization_id,
-            project_id=project.id,
-            status=CandidateStatus.PROMOTED,
-        )
-        .annotate(has_scoped_promoted_memory=Exists(scoped_promoted_memory))
-        .filter(has_scoped_promoted_memory=False)
-    )
+def _p7_memory_projection_querysets(
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> tuple[QuerySet, QuerySet, QuerySet]:
     current_versions = MemoryVersion.objects.filter(
-        organization_id=project.organization_id,
-        project_id=project.id,
-        memory__organization_id=project.organization_id,
-        memory__project_id=project.id,
+        organization_id=organization_id,
+        project_id=project_id,
+        memory__organization_id=organization_id,
+        memory__project_id=project_id,
         memory_id=OuterRef('id'),
         version=OuterRef('current_version'),
     )
     matching_current_bodies = current_versions.filter(body=OuterRef('body'))
     consistent_documents = (
         RetrievalDocument.objects.filter(
-            organization_id=project.organization_id,
-            project_id=project.id,
-            memory__organization_id=project.organization_id,
-            memory__project_id=project.id,
-            memory_version__organization_id=project.organization_id,
-            memory_version__project_id=project.id,
+            organization_id=organization_id,
+            project_id=project_id,
+            memory__organization_id=organization_id,
+            memory__project_id=project_id,
+            memory_version__organization_id=organization_id,
+            memory_version__project_id=project_id,
             memory_id=OuterRef('id'),
             memory_version__memory_id=OuterRef('id'),
             memory_version__version=OuterRef('current_version'),
@@ -692,8 +750,8 @@ def _evaluate_p7(project: Project) -> InvariantResult:
     )
     memories = (
         Memory.objects.filter(
-            organization_id=project.organization_id,
-            project_id=project.id,
+            organization_id=organization_id,
+            project_id=project_id,
         )
         .annotate(
             team_key=Coalesce(
@@ -715,6 +773,43 @@ def _evaluate_p7(project: Project) -> InvariantResult:
     missing_or_inconsistent_documents = memories.filter(
         has_current_version=True,
         has_consistent_document=False,
+    )
+
+    return missing_current_versions, mismatched_current_bodies, missing_or_inconsistent_documents
+
+
+def projection_inconsistency_memory_ids(
+    *,
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+) -> tuple[uuid.UUID, ...]:
+    missing_current_versions, mismatched_current_bodies, missing_or_inconsistent_documents = (
+        _p7_memory_projection_querysets(organization_id, project_id)
+    )
+    memory_ids: set[uuid.UUID] = set()
+    for queryset in (missing_current_versions, mismatched_current_bodies, missing_or_inconsistent_documents):
+        memory_ids.update(queryset.values_list('id', flat=True))
+
+    return tuple(sorted(memory_ids, key=lambda memory_id: memory_id.int))
+
+
+def _evaluate_p7(project: Project) -> InvariantResult:
+    scoped_promoted_memory = Memory.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        id=OuterRef('promoted_memory_id'),
+    )
+    candidates_without_memory = (
+        MemoryCandidate.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            status=CandidateStatus.PROMOTED,
+        )
+        .annotate(has_scoped_promoted_memory=Exists(scoped_promoted_memory))
+        .filter(has_scoped_promoted_memory=False)
+    )
+    missing_current_versions, mismatched_current_bodies, missing_or_inconsistent_documents = (
+        _p7_memory_projection_querysets(project.organization_id, project.id)
     )
     violation_count = (
         candidates_without_memory.count()

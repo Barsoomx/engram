@@ -18,7 +18,7 @@
         {
           "invariant_id": "P3",
           "state": "missing_observability",
-          "reason": "latest_input_watermark_missing",
+          "reason": "pre_cutover_session_distillation_unproven",
           "violation_count": null,
           "proxy_count": 1,
           "sample_refs": ["session:no-run"],
@@ -41,12 +41,12 @@
       "expected_characterization": [
         {
           "invariant_id": "P4",
-          "state": "missing_observability",
-          "reason": "work_lease_and_reclaim_evidence_missing",
-          "violation_count": null,
-          "proxy_count": 1,
-          "sample_refs": ["workflow_run:stale-running"],
-          "missing_evidence": "lease expiry, owner, heartbeat, and reclaim evidence",
+          "state": "healthy",
+          "reason": "no_expired_work_leases",
+          "violation_count": 0,
+          "proxy_count": null,
+          "sample_refs": [],
+          "missing_evidence": null,
           "target_checkpoint": "CP2"
         }
       ],
@@ -66,7 +66,7 @@
         {
           "invariant_id": "P3",
           "state": "missing_observability",
-          "reason": "latest_input_watermark_missing",
+          "reason": "pre_cutover_session_distillation_unproven",
           "violation_count": null,
           "proxy_count": 0,
           "sample_refs": [],
@@ -206,7 +206,7 @@
         {
           "invariant_id": "P3",
           "state": "missing_observability",
-          "reason": "latest_input_watermark_missing",
+          "reason": "pre_cutover_session_distillation_unproven",
           "violation_count": null,
           "proxy_count": 1,
           "sample_refs": ["session:oversized"],
