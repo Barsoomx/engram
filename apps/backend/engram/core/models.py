@@ -583,6 +583,7 @@ class MemoryCandidate(TimestampedModel):
     content_hash = models.CharField(max_length=128)
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
     kind = models.CharField(max_length=40, blank=True, default='')
+    decision_work_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
 
     class Meta:
         constraints = [
@@ -590,9 +591,17 @@ class MemoryCandidate(TimestampedModel):
                 fields=['organization', 'project', 'content_hash'],
                 name='core_memory_candidate_unique_content_hash_per_project',
             ),
+            models.CheckConstraint(
+                condition=models.Q(decision_work_contract_version__in=(0, 1)),
+                name='core_memory_candidate_decision_ver_ck',
+            ),
         ]
         indexes = [
             models.Index(fields=['organization', 'project', 'status']),
+            models.Index(
+                fields=['organization', 'project', 'status', 'decision_work_contract_version'],
+                name='core_cand_decision_ver_idx',
+            ),
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
@@ -1027,6 +1036,7 @@ class WorkflowWorkType(models.TextChoices):
     SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
+    CANDIDATE_DECISION = 'candidate_decision', 'Candidate Decision'
 
 
 class WorkflowSubjectType(models.TextChoices):
@@ -1034,6 +1044,7 @@ class WorkflowSubjectType(models.TextChoices):
     AGENT_SESSION = 'agent_session', 'Agent Session'
     PROJECT = 'project', 'Project'
     TEAM = 'team', 'Team'
+    MEMORY_CANDIDATE = 'memory_candidate', 'Memory Candidate'
 
 
 class WorkflowWorkDisposition(models.TextChoices):
@@ -1185,6 +1196,11 @@ class WorkflowWork(TimestampedModel):
                             team__isnull=False,
                         )
                         & ~models.Q(occurrence_key='')
+                    )
+                    | models.Q(
+                        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+                        subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+                        occurrence_key='',
                     )
                 ),
                 name='core_work_subject_scope_ck',
@@ -1569,3 +1585,484 @@ class WorkflowRun(TimestampedModel):
 
     def __str__(self) -> str:
         return f'{self.run_type}:{self.status}:{self.id}'
+
+
+def enforce_immutable_fields(
+    instance: models.Model,
+    fields: tuple[tuple[str, str], ...],
+    errors: dict[str, list[str]],
+) -> None:
+    if instance._state.adding:
+        return
+
+    persisted = (
+        type(instance).objects.filter(pk=instance.pk).values(*[value_field for value_field, _ in fields]).first()
+    )
+    if persisted is None:
+        return
+
+    for value_field, error_field in fields:
+        if getattr(instance, value_field) != persisted[value_field]:
+            add_scope_error(errors, error_field, f'{error_field} is immutable')
+
+    return
+
+
+class DistillationStageKind(models.TextChoices):
+    EXTRACT = 'extract', 'Extract'
+    REDUCE = 'reduce', 'Reduce'
+
+
+class DistillationStageStatus(models.TextChoices):
+    REQUIRED = 'required', 'Required'
+    COMPLETE = 'complete', 'Complete'
+
+
+class DistillationStagePolicyRole(models.TextChoices):
+    PRIMARY = 'primary', 'Primary'
+    FALLBACK = 'fallback', 'Fallback'
+
+
+class DistillationCoverageOutcome(models.TextChoices):
+    SIGNAL = 'signal', 'Signal'
+    NO_SIGNAL = 'no_signal', 'No signal'
+
+
+class DistillationWindow(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='distillation_windows')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='distillation_windows')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='distillation_windows',
+        null=True,
+        blank=True,
+    )
+    work = models.OneToOneField(WorkflowWork, on_delete=models.PROTECT, related_name='distillation_window')
+    session = models.ForeignKey(AgentSession, on_delete=models.PROTECT, related_name='distillation_windows')
+    contract_version = models.PositiveSmallIntegerField()
+    lower_sequence_exclusive = models.PositiveBigIntegerField()
+    upper_sequence_inclusive = models.PositiveBigIntegerField()
+    observation_count = models.PositiveIntegerField()
+    input_hash = models.CharField(max_length=64)
+    chunk_char_budget = models.PositiveIntegerField()
+    reduction_target = models.PositiveIntegerField()
+    chunk_contract_version = models.PositiveSmallIntegerField()
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('work_id', 'work'),
+        ('session_id', 'session'),
+        ('contract_version', 'contract_version'),
+        ('lower_sequence_exclusive', 'lower_sequence_exclusive'),
+        ('upper_sequence_inclusive', 'upper_sequence_inclusive'),
+        ('observation_count', 'observation_count'),
+        ('input_hash', 'input_hash'),
+        ('chunk_char_budget', 'chunk_char_budget'),
+        ('reduction_target', 'reduction_target'),
+        ('chunk_contract_version', 'chunk_contract_version'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'session', 'input_hash'],
+                name='core_distill_window_scope_hash_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(lower_sequence_exclusive__gte=0)
+                & models.Q(upper_sequence_inclusive__gt=models.F('lower_sequence_exclusive')),
+                name='core_distill_window_bounds_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(observation_count__gt=0),
+                name='core_distill_window_obs_count_pos',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(input_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_window_input_hash_hex',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(contract_version=1),
+                name='core_distill_window_contract_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(chunk_contract_version=1),
+                name='core_distill_window_chunk_contract_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'session', 'upper_sequence_inclusive'],
+                name='core_distill_window_scope_idx',
+            ),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.session_id:
+            check_project_scope(errors, 'session', self.session, self.organization_id, self.project_id)
+        if self.work_id:
+            check_project_scope(errors, 'work', self.work, self.organization_id, self.project_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'window:{self.work_id}'
+
+
+class DistillationChunk(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='distillation_chunks')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='distillation_chunks')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='distillation_chunks',
+        null=True,
+        blank=True,
+    )
+    window = models.ForeignKey(DistillationWindow, on_delete=models.PROTECT, related_name='chunks')
+    ordinal = models.PositiveIntegerField()
+    first_sequence = models.PositiveBigIntegerField()
+    last_sequence = models.PositiveBigIntegerField()
+    observation_count = models.PositiveIntegerField()
+    input_manifest = models.JSONField()
+    input_hash = models.CharField(max_length=64)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('window_id', 'window'),
+        ('ordinal', 'ordinal'),
+        ('first_sequence', 'first_sequence'),
+        ('last_sequence', 'last_sequence'),
+        ('observation_count', 'observation_count'),
+        ('input_manifest', 'input_manifest'),
+        ('input_hash', 'input_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['window', 'ordinal'],
+                name='core_distill_chunk_window_ordinal_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['window', 'input_hash'],
+                name='core_distill_chunk_window_hash_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(first_sequence__gt=0) & models.Q(last_sequence__gte=models.F('first_sequence')),
+                name='core_distill_chunk_sequence_bounds_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(observation_count__gt=0),
+                name='core_distill_chunk_obs_count_pos',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(input_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_chunk_input_hash_hex',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'window', 'ordinal'],
+                name='core_distill_chunk_scope_idx',
+            ),
+        ]
+        ordering = ['window_id', 'ordinal']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'chunk:{self.window_id}:{self.ordinal}'
+
+
+class DistillationStage(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='distillation_stages')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='distillation_stages')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='distillation_stages',
+        null=True,
+        blank=True,
+    )
+    window = models.ForeignKey(DistillationWindow, on_delete=models.PROTECT, related_name='stages')
+    chunk = models.ForeignKey(
+        DistillationChunk,
+        on_delete=models.PROTECT,
+        related_name='stages',
+        null=True,
+        blank=True,
+    )
+    stage_kind = models.CharField(max_length=16, choices=DistillationStageKind.choices)
+    level = models.PositiveSmallIntegerField()
+    ordinal = models.PositiveIntegerField()
+    target_key = models.CharField(max_length=64)
+    stage_key = models.CharField(max_length=64)
+    input_hash = models.CharField(max_length=64)
+    input_manifest = models.JSONField()
+    prompt_contract = models.CharField(max_length=80)
+    policy = models.ForeignKey('model_policy.ModelPolicy', on_delete=models.PROTECT, related_name='distillation_stages')
+    policy_version = models.PositiveIntegerField()
+    policy_role = models.CharField(max_length=16, choices=DistillationStagePolicyRole.choices)
+    status = models.CharField(max_length=16, choices=DistillationStageStatus.choices)
+    attempt_count = models.PositiveIntegerField(default=0)
+    last_failure_class = models.CharField(max_length=80, blank=True, default='')
+    last_failure_at = models.DateTimeField(null=True, blank=True)
+    accepted_provider_call = models.OneToOneField(
+        'model_policy.ProviderCallRecord',
+        on_delete=models.PROTECT,
+        related_name='accepted_distillation_stage',
+        null=True,
+        blank=True,
+    )
+    response_hash = models.CharField(max_length=64, blank=True, default='')
+    response_size = models.PositiveIntegerField(null=True, blank=True)
+    output_snapshot = models.JSONField(null=True, blank=True)
+    output_hash = models.CharField(max_length=64, blank=True, default='')
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('window_id', 'window'),
+        ('chunk_id', 'chunk'),
+        ('stage_kind', 'stage_kind'),
+        ('level', 'level'),
+        ('ordinal', 'ordinal'),
+        ('target_key', 'target_key'),
+        ('stage_key', 'stage_key'),
+        ('input_hash', 'input_hash'),
+        ('input_manifest', 'input_manifest'),
+        ('prompt_contract', 'prompt_contract'),
+        ('policy_id', 'policy'),
+        ('policy_version', 'policy_version'),
+        ('policy_role', 'policy_role'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'stage_key'],
+                name='core_distill_stage_key_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['window', 'stage_kind', 'level', 'ordinal', 'policy', 'policy_version'],
+                name='core_distill_stage_coord_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['window', 'target_key'],
+                condition=models.Q(status=DistillationStageStatus.COMPLETE),
+                name='core_distill_stage_target_complete_uniq',
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(stage_kind=DistillationStageKind.EXTRACT)
+                | (models.Q(chunk__isnull=False) & models.Q(level=0)),
+                name='core_distill_stage_extract_shape_ck',
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(stage_kind=DistillationStageKind.REDUCE)
+                | (models.Q(chunk__isnull=True) & models.Q(level__gt=0)),
+                name='core_distill_stage_reduce_shape_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        status=DistillationStageStatus.REQUIRED,
+                        accepted_provider_call__isnull=True,
+                        response_hash='',
+                        response_size__isnull=True,
+                        output_snapshot__isnull=True,
+                        output_hash='',
+                        completed_at__isnull=True,
+                    )
+                    | models.Q(
+                        status=DistillationStageStatus.COMPLETE,
+                        accepted_provider_call__isnull=False,
+                        response_hash__regex=r'^[0-9a-f]{64}$',
+                        response_size__isnull=False,
+                        output_snapshot__isnull=False,
+                        output_hash__regex=r'^[0-9a-f]{64}$',
+                        completed_at__isnull=False,
+                    )
+                ),
+                name='core_distill_stage_status_shape_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'window', 'stage_kind', 'status'],
+                name='core_distill_stage_scope_idx',
+            ),
+        ]
+        ordering = ['window_id', 'stage_kind', 'level', 'ordinal']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.policy_id:
+            check_organization_scope(errors, 'policy', self.policy, self.organization_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        if not self._state.adding:
+            persisted_status = type(self).objects.filter(pk=self.pk).values_list('status', flat=True).first()
+            if persisted_status == DistillationStageStatus.COMPLETE and self.status != DistillationStageStatus.COMPLETE:
+                add_scope_error(errors, 'status', 'completed stage cannot return to required')
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'stage:{self.window_id}:{self.stage_kind}:{self.level}:{self.ordinal}'
+
+
+class DistillationObservationCoverage(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='distillation_coverages')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='distillation_coverages')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='distillation_coverages',
+        null=True,
+        blank=True,
+    )
+    window = models.ForeignKey(DistillationWindow, on_delete=models.PROTECT, related_name='coverages')
+    observation = models.ForeignKey(Observation, on_delete=models.PROTECT, related_name='distillation_coverages')
+    session_sequence = models.PositiveBigIntegerField()
+    observation_digest = models.CharField(max_length=64)
+    outcome = models.CharField(max_length=16, choices=DistillationCoverageOutcome.choices)
+    deciding_stage = models.ForeignKey(DistillationStage, on_delete=models.PROTECT, related_name='coverages')
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('window_id', 'window'),
+        ('observation_id', 'observation'),
+        ('session_sequence', 'session_sequence'),
+        ('observation_digest', 'observation_digest'),
+        ('outcome', 'outcome'),
+        ('deciding_stage_id', 'deciding_stage'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['window', 'observation'],
+                name='core_distill_coverage_window_obs_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['window', 'session_sequence'],
+                name='core_distill_coverage_window_seq_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(observation_digest__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_coverage_digest_hex',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(session_sequence__gt=0),
+                name='core_distill_coverage_seq_pos',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'window'],
+                name='core_distill_cov_scope_idx',
+            ),
+        ]
+        ordering = ['window_id', 'session_sequence']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'coverage:{self.window_id}:{self.session_sequence}'
+
+
+class MemoryCandidateSource(TimestampedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='memory_candidate_sources')
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='memory_candidate_sources')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='memory_candidate_sources',
+        null=True,
+        blank=True,
+    )
+    candidate = models.ForeignKey(MemoryCandidate, on_delete=models.PROTECT, related_name='sources')
+    window = models.ForeignKey(DistillationWindow, on_delete=models.PROTECT, related_name='candidate_sources')
+    observation = models.ForeignKey(Observation, on_delete=models.PROTECT, related_name='candidate_sources')
+    stage = models.ForeignKey(DistillationStage, on_delete=models.PROTECT, related_name='candidate_sources')
+    anchors = models.JSONField()
+    anchors_hash = models.CharField(max_length=64)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('candidate_id', 'candidate'),
+        ('window_id', 'window'),
+        ('observation_id', 'observation'),
+        ('stage_id', 'stage'),
+        ('anchors', 'anchors'),
+        ('anchors_hash', 'anchors_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['candidate', 'window', 'observation'],
+                name='core_candidate_source_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(anchors_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_candidate_source_anchors_hex',
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=['organization', 'project', 'candidate'],
+                name='core_cand_source_scope_idx',
+            ),
+            models.Index(
+                fields=['window', 'observation'],
+                name='core_cand_source_winobs_idx',
+            ),
+        ]
+        ordering = ['candidate_id', 'window_id', 'observation_id']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+    def __str__(self) -> str:
+        return f'source:{self.candidate_id}:{self.observation_id}'
