@@ -19,6 +19,7 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.memory.aware_time import require_aware
 from engram.memory.observation_work import useful_observation_upper
 from engram.memory.work_dispatch import RESIGNAL_WINDOW, queue_work_attempt
 from engram.memory.work_execution import execution_configuration_fingerprint, fingerprint_matches
@@ -87,13 +88,6 @@ class SessionWorkReconciliation:
     as_of: datetime
     queued: int
     applied: tuple[str, ...]
-
-
-def _require_aware(value: datetime) -> None:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError('as_of must be timezone-aware')
-
-    return
 
 
 def _snapshot_upper(work: WorkflowWork) -> int | None:
@@ -200,6 +194,51 @@ def _classify(work: WorkflowWork, runs: list[WorkflowRun], as_of: datetime) -> t
     return _classify_ready(work, runs, as_of)
 
 
+_CONFIGURATION_ONSET_CODES = frozenset(
+    {
+        CONFIGURATION_BLOCKED,
+        CONFIGURATION_CHANGED,
+        TERMINAL_INPUT_FAILURE,
+    }
+)
+
+
+def _run_by_id(runs: list[WorkflowRun], run_id: uuid.UUID | None) -> WorkflowRun | None:
+    if run_id is None:
+        return None
+
+    return next((run for run in runs if run.id == run_id), None)
+
+
+def _condition_onset(
+    code: str,
+    work: WorkflowWork,
+    runs: list[WorkflowRun],
+    run_id: uuid.UUID | None,
+) -> datetime:
+    if code == ATTEMPT_SIGNAL_STALE:
+        run = _run_by_id(runs, run_id)
+        if run is not None:
+            return run.dispatched_at or run.created_at
+
+        return work.created_at
+
+    if code == LEASE_EXPIRED:
+        return work.lease_expires_at or work.created_at
+
+    if code == LOGICAL_RETRY_DUE:
+        return work.next_retry_at or work.created_at
+
+    if code in _CONFIGURATION_ONSET_CODES:
+        latest = runs[-1] if runs else None
+        if latest is not None and latest.finished_at is not None:
+            return latest.finished_at
+
+        return work.updated_at
+
+    return work.created_at
+
+
 def _build_finding(
     session: AgentSession,
     work: WorkflowWork | None,
@@ -207,14 +246,21 @@ def _build_finding(
     as_of: datetime,
 ) -> SessionWorkFinding | None:
     if work is None:
-        return _finding(session, SESSION_CURRENT_WORK_MISSING, work_id=None, run_id=None, as_of=as_of)
+        return _finding(
+            session,
+            SESSION_CURRENT_WORK_MISSING,
+            work_id=None,
+            run_id=None,
+            observed_at=min(session.created_at, as_of),
+        )
 
     if work.disposition != WorkflowWorkDisposition.REQUIRED:
         return None
 
     code, run_id = _classify(work, runs, as_of)
+    observed_at = min(_condition_onset(code, work, runs, run_id), as_of)
 
-    return _finding(session, code, work_id=work.id, run_id=run_id, as_of=as_of)
+    return _finding(session, code, work_id=work.id, run_id=run_id, observed_at=observed_at)
 
 
 def _finding(
@@ -223,7 +269,7 @@ def _finding(
     *,
     work_id: uuid.UUID | None,
     run_id: uuid.UUID | None,
-    as_of: datetime,
+    observed_at: datetime,
 ) -> SessionWorkFinding:
     return SessionWorkFinding(
         code=code,
@@ -233,7 +279,7 @@ def _finding(
         entity_id=str(session.id),
         work_id=work_id,
         workflow_run_id=run_id,
-        observed_at=as_of,
+        observed_at=observed_at,
         proposed_action=_PROPOSED_ACTION[code],
         auto_repair_eligible=code in _AUTO_REPAIR_CODES,
     )
@@ -284,7 +330,7 @@ def inspect_session_work(
     project_id: uuid.UUID,
     as_of: datetime,
 ) -> SessionWorkInspection:
-    _require_aware(as_of)
+    require_aware(as_of)
 
     findings: list[SessionWorkFinding] = []
     for session in _scoped_ended_sessions(organization_id, project_id):
@@ -366,7 +412,7 @@ def reconcile_session_work(
     project_id: uuid.UUID,
     as_of: datetime,
 ) -> SessionWorkReconciliation:
-    _require_aware(as_of)
+    require_aware(as_of)
 
     applied: list[str] = []
     session_ids = [session.id for session in _scoped_ended_sessions(organization_id, project_id, unresolved_only=True)]
@@ -385,7 +431,7 @@ def reconcile_session_work(
 
 
 def reconcile_scheduled_session_work(*, as_of: datetime) -> int:
-    _require_aware(as_of)
+    require_aware(as_of)
 
     scopes = (
         AgentSession.objects.filter(
