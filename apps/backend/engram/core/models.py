@@ -127,6 +127,26 @@ def check_project_organization(
         add_scope_error(errors, field, f'{field} organization must match record organization')
 
 
+def check_window_scope(
+    errors: dict[str, list[str]],
+    window: object,
+    organization_id: uuid.UUID | None,
+    project_id: uuid.UUID | None,
+    team_id: uuid.UUID | None,
+) -> None:
+    if window is None:
+        return
+
+    if window.organization_id != organization_id:
+        add_scope_error(errors, 'window', 'window organization must match record organization')
+    if window.project_id != project_id:
+        add_scope_error(errors, 'window', 'window project must match record project')
+    if window.team_id != team_id:
+        add_scope_error(errors, 'window', 'window team must match record team')
+
+    return
+
+
 def raise_scope_errors(errors: dict[str, list[str]]) -> None:
     if errors:
         raise ValidationError(errors)
@@ -1333,19 +1353,13 @@ class WorkflowWork(TimestampedModel):
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
 
-        if not self._state.adding:
-            value_fields = tuple(field for field, _error_field in self._IMMUTABLE_FIELDS)
-            persisted = type(self).objects.filter(pk=self.pk).values(*value_fields, 'disposition').first()
-            if persisted is not None:
-                for field, error_field in self._IMMUTABLE_FIELDS:
-                    if getattr(self, field) != persisted[field]:
-                        add_scope_error(errors, error_field, f'{error_field} is immutable')
-
-                if (
-                    persisted['disposition'] != WorkflowWorkDisposition.REQUIRED
-                    and self.disposition == WorkflowWorkDisposition.REQUIRED
-                ):
-                    add_scope_error(errors, 'disposition', 'terminal work cannot return to required')
+        persisted = enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors, extra_fields=('disposition',))
+        if (
+            persisted is not None
+            and persisted['disposition'] != WorkflowWorkDisposition.REQUIRED
+            and self.disposition == WorkflowWorkDisposition.REQUIRED
+        ):
+            add_scope_error(errors, 'disposition', 'terminal work cannot return to required')
 
         raise_scope_errors(errors)
 
@@ -1358,6 +1372,7 @@ class WorkflowRunType(models.TextChoices):
     OBSERVATION_PROCESSING = 'observation_processing', 'Observation Processing'
     SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
     WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
+    CANDIDATE_DECISION = 'candidate_decision', 'Candidate Decision'
 
 
 class WorkflowRunStatus(models.TextChoices):
@@ -1591,21 +1606,22 @@ def enforce_immutable_fields(
     instance: models.Model,
     fields: tuple[tuple[str, str], ...],
     errors: dict[str, list[str]],
-) -> None:
+    *,
+    extra_fields: tuple[str, ...] = (),
+) -> dict[str, object] | None:
     if instance._state.adding:
-        return
+        return None
 
-    persisted = (
-        type(instance).objects.filter(pk=instance.pk).values(*[value_field for value_field, _ in fields]).first()
-    )
+    value_fields = [value_field for value_field, _ in fields]
+    persisted = type(instance).objects.filter(pk=instance.pk).values(*value_fields, *extra_fields).first()
     if persisted is None:
-        return
+        return None
 
     for value_field, error_field in fields:
         if getattr(instance, value_field) != persisted[value_field]:
             add_scope_error(errors, error_field, f'{error_field} is immutable')
 
-    return
+    return persisted
 
 
 class DistillationStageKind(models.TextChoices):
@@ -1681,6 +1697,14 @@ class DistillationWindow(TimestampedModel):
                 name='core_distill_window_obs_count_pos',
             ),
             models.CheckConstraint(
+                condition=models.Q(chunk_char_budget__gt=0),
+                name='core_distill_window_budget_pos',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(reduction_target__gt=0),
+                name='core_distill_window_reduction_target_pos',
+            ),
+            models.CheckConstraint(
                 condition=models.Q(input_hash__regex=r'^[0-9a-f]{64}$'),
                 name='core_distill_window_input_hash_hex',
             ),
@@ -1711,6 +1735,12 @@ class DistillationWindow(TimestampedModel):
             check_project_scope(errors, 'session', self.session, self.organization_id, self.project_id)
         if self.work_id:
             check_project_scope(errors, 'work', self.work, self.organization_id, self.project_id)
+            if self.session_id and self.work.subject_id != self.session_id:
+                add_scope_error(errors, 'work', 'work subject must match window session')
+            if self.work.team_id != self.team_id:
+                add_scope_error(errors, 'work', 'work team must match window team')
+        if self.session_id and self.session.team_id != self.team_id:
+            add_scope_error(errors, 'session', 'session team must match window team')
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
 
@@ -1786,6 +1816,8 @@ class DistillationChunk(TimestampedModel):
             check_project_organization(errors, 'project', self.project, self.organization_id)
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.window_id:
+            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
 
@@ -1898,13 +1930,29 @@ class DistillationStage(TimestampedModel):
                         status=DistillationStageStatus.COMPLETE,
                         accepted_provider_call__isnull=False,
                         response_hash__regex=r'^[0-9a-f]{64}$',
-                        response_size__isnull=False,
+                        response_size__gt=0,
                         output_snapshot__isnull=False,
                         output_hash__regex=r'^[0-9a-f]{64}$',
                         completed_at__isnull=False,
                     )
                 ),
                 name='core_distill_stage_status_shape_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(policy_version__gt=0),
+                name='core_distill_stage_policy_version_pos',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(target_key__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_stage_target_key_hex',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(stage_key__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_stage_stage_key_hex',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(input_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_distill_stage_input_hash_hex',
             ),
         ]
         indexes = [
@@ -1915,6 +1963,15 @@ class DistillationStage(TimestampedModel):
         ]
         ordering = ['window_id', 'stage_kind', 'level', 'ordinal']
 
+    _COMPLETION_FIELDS = (
+        ('output_snapshot', 'output_snapshot'),
+        ('output_hash', 'output_hash'),
+        ('response_hash', 'response_hash'),
+        ('response_size', 'response_size'),
+        ('accepted_provider_call_id', 'accepted_provider_call'),
+        ('completed_at', 'completed_at'),
+    )
+
     def clean(self) -> None:
         errors: dict[str, list[str]] = {}
         if self.project_id:
@@ -1923,12 +1980,28 @@ class DistillationStage(TimestampedModel):
             check_organization_scope(errors, 'team', self.team, self.organization_id)
         if self.policy_id:
             check_organization_scope(errors, 'policy', self.policy, self.organization_id)
-        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
-        if not self._state.adding:
-            persisted_status = type(self).objects.filter(pk=self.pk).values_list('status', flat=True).first()
-            if persisted_status == DistillationStageStatus.COMPLETE and self.status != DistillationStageStatus.COMPLETE:
-                add_scope_error(errors, 'status', 'completed stage cannot return to required')
+        if self.window_id:
+            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
+        if self.chunk_id:
+            check_project_scope(errors, 'chunk', self.chunk, self.organization_id, self.project_id)
+            if self.window_id and self.chunk.window_id != self.window_id:
+                add_scope_error(errors, 'chunk', 'chunk window must match stage window')
+        extra_fields = ('status', *(value_field for value_field, _ in self._COMPLETION_FIELDS))
+        persisted = enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors, extra_fields=extra_fields)
+        self._enforce_completion_immutable(persisted, errors)
         raise_scope_errors(errors)
+
+    def _enforce_completion_immutable(self, persisted: dict[str, object] | None, errors: dict[str, list[str]]) -> None:
+        if persisted is None or persisted['status'] != DistillationStageStatus.COMPLETE:
+            return
+
+        if self.status != DistillationStageStatus.COMPLETE:
+            add_scope_error(errors, 'status', 'completed stage cannot return to required')
+        for value_field, error_field in self._COMPLETION_FIELDS:
+            if getattr(self, value_field) != persisted[value_field]:
+                add_scope_error(errors, error_field, f'{error_field} is immutable once complete')
+
+        return
 
     def __str__(self) -> str:
         return f'stage:{self.window_id}:{self.stage_kind}:{self.level}:{self.ordinal}'
@@ -1996,6 +2069,12 @@ class DistillationObservationCoverage(TimestampedModel):
             check_project_organization(errors, 'project', self.project, self.organization_id)
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.window_id:
+            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
+        if self.observation_id:
+            check_project_scope(errors, 'observation', self.observation, self.organization_id, self.project_id)
+            if self.window_id and self.observation.session_id != self.window.session_id:
+                add_scope_error(errors, 'observation', 'observation session must match window session')
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
 
@@ -2061,6 +2140,8 @@ class MemoryCandidateSource(TimestampedModel):
             check_project_organization(errors, 'project', self.project, self.organization_id)
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.window_id:
+            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
 
