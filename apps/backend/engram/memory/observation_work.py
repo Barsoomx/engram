@@ -17,6 +17,21 @@ def useful_observation_q() -> Q:
     )
 
 
+def useful_observation_upper(session: AgentSession) -> int:
+    upper = (
+        Observation.objects.filter(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            session_id=session.id,
+        )
+        .filter(useful_observation_q())
+        .aggregate(upper=Max('session_sequence'))
+        .get('upper')
+    )
+
+    return upper or 0
+
+
 def _require_active_transaction() -> None:
     if not transaction.get_connection().in_atomic_block:
         raise TransactionManagementError('observation sequencing requires an active transaction')

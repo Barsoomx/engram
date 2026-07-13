@@ -975,7 +975,8 @@ def retry_failed_distillations() -> dict[str, int]:
     reconciled = reconcile_scheduled_session_work(as_of=timezone.now())
 
     return {
-        'retried': len(legacy.retried) + reconciled,
+        'retried': len(legacy.retried),
+        'reconciled': reconciled,
         'unlinked': len(legacy.unlinked_run_ids),
     }
 
