@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from threading import Barrier
 from types import ModuleType
+from unittest import mock
 
 import pytest
 from django.db import close_old_connections, connection
@@ -18,6 +19,7 @@ from engram.core.models import (
     Organization,
     Project,
     SessionStatus,
+    Team,
     WorkflowRun,
     WorkflowRunOrigin,
     WorkflowRunStatus,
@@ -185,6 +187,24 @@ def test_missing_current_work_reports_session_current_work_missing() -> None:
 
 
 @pytest.mark.django_db
+def test_work_reassigned_to_other_team_reports_missing() -> None:
+    scope = create_scope('reconcile-team-mismatch')
+    organization, _project, _session = scope
+    work = _current_work(scope, sequence=1)
+    other_team = Team.objects.create(
+        organization=organization,
+        name='Other Team',
+        slug='reconcile-team-mismatch-other',
+    )
+    WorkflowWork.objects.filter(id=work.id).update(team=other_team)
+
+    findings = _inspect(scope, as_of=timezone.now())
+
+    finding = _one(findings, 'session_current_work_missing')
+    assert finding.work_id is None
+
+
+@pytest.mark.django_db
 def test_required_latest_with_older_success_reports_incomplete() -> None:
     scope = create_scope('reconcile-incomplete')
     organization, project, session = scope
@@ -265,6 +285,98 @@ def test_retry_wait_due_reports_logical_retry_due() -> None:
 
     finding = _one(findings, 'logical_retry_due')
     assert finding.work_id == work.id
+
+
+@pytest.mark.django_db
+def test_retry_wait_with_stale_queued_attempt_reports_attempt_signal_stale() -> None:
+    scope = create_scope('reconcile-retrywait-stale-queued')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    claimed = _claim(work, now=now)
+    _we().fail_work_claim(
+        claim=claimed.claim,
+        now=now,
+        failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout'),
+    )
+    as_of = now + timedelta(seconds=60)
+    queued = _queued_run(work, dispatched_at=as_of - _STALE)
+
+    findings = _inspect(scope, as_of=as_of)
+
+    finding = _one(findings, 'attempt_signal_stale')
+    assert finding.work_id == work.id
+    assert finding.workflow_run_id == queued.id
+
+
+@pytest.mark.django_db
+def test_retry_wait_with_fresh_queued_attempt_reports_incomplete() -> None:
+    scope = create_scope('reconcile-retrywait-fresh-queued')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    claimed = _claim(work, now=now)
+    _we().fail_work_claim(
+        claim=claimed.claim,
+        now=now,
+        failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout'),
+    )
+    as_of = now + timedelta(seconds=60)
+    _queued_run(work, dispatched_at=as_of)
+
+    findings = _inspect(scope, as_of=as_of)
+
+    finding = _one(findings, 'session_current_work_incomplete')
+    assert finding.work_id == work.id
+
+
+@pytest.mark.django_db
+def test_expired_lease_with_stale_queued_attempt_reports_attempt_signal_stale() -> None:
+    scope = create_scope('reconcile-lease-stale-queued')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    _claim(work, now=now)
+    as_of = now + _SESSION_LEASE + timedelta(seconds=60)
+    queued = _queued_run(work, dispatched_at=as_of - _STALE)
+
+    findings = _inspect(scope, as_of=as_of)
+
+    finding = _one(findings, 'attempt_signal_stale')
+    assert finding.work_id == work.id
+    assert finding.workflow_run_id == queued.id
+
+
+@pytest.mark.django_db
+def test_reconcile_within_window_queue_counts_no_action() -> None:
+    scope = create_scope('reconcile-within-window-noop')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    claimed = _claim(work, now=now)
+    _we().fail_work_claim(
+        claim=claimed.claim,
+        now=now,
+        failure=ClassifiedWorkFailure(
+            failure_class=CONFIGURATION,
+            code='model_policy_unavailable',
+            configuration_fingerprint=_HEX_A,
+        ),
+    )
+    as_of = now + timedelta(seconds=60)
+    _queued_run(work, dispatched_at=as_of - timedelta(minutes=2))
+    CeleryOutbox.objects.all().delete()
+
+    result = _reconcile(scope, as_of=as_of)
+
+    assert result.queued == 0
+    assert result.applied == ()
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 0
+    assert (
+        WorkflowRun.objects.filter(
+            work=work,
+            status=WorkflowRunStatus.QUEUED,
+            execution_contract_version=1,
+        ).count()
+        == 1
+    )
+    assert WorkflowWork.objects.get(id=work.id).execution_state != WorkflowWorkExecutionState.BLOCKED
 
 
 @pytest.mark.django_db
@@ -488,6 +600,92 @@ def test_reconcile_logical_retry_due_queues_one_new_run() -> None:
 
 
 @pytest.mark.django_db
+def test_reconcile_attempt_signal_stale_resignals_same_run() -> None:
+    scope = create_scope('reconcile-apply-signal-stale')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    queued = _queued_run(work, dispatched_at=now - _STALE)
+    CeleryOutbox.objects.all().delete()
+
+    result = _reconcile(scope, as_of=now)
+
+    assert result.queued == 1
+    runs = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert runs.count() == 1
+    refreshed = runs.get()
+    assert refreshed.id == queued.id
+    assert refreshed.dispatched_at == now
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
+
+
+@pytest.mark.django_db
+def test_reconcile_lease_expired_queues_new_run_without_mutating_running_run() -> None:
+    scope = create_scope('reconcile-apply-lease-expired')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    claimed = _claim(work, now=now)
+    running_before = WorkflowRun.objects.get(id=claimed.claim.workflow_run_id)
+    work_before = WorkflowWork.objects.get(id=work.id)
+    CeleryOutbox.objects.all().delete()
+
+    as_of = now + _SESSION_LEASE + timedelta(seconds=60)
+    result = _reconcile(scope, as_of=as_of)
+
+    assert result.queued == 1
+    queued = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert queued.get().id != running_before.id
+
+    running_after = WorkflowRun.objects.get(id=running_before.id)
+    assert running_after.status == running_before.status
+    assert running_after.fencing_token == running_before.fencing_token
+    assert running_after.lease_owner == running_before.lease_owner
+
+    work_after = WorkflowWork.objects.get(id=work.id)
+    assert work_after.lease_expires_at == work_before.lease_expires_at
+    assert work_after.lease_owner == work_before.lease_owner
+    assert work_after.fencing_token == work_before.fencing_token
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('scenario', ('new_run', 'resignal'))
+def test_reconcile_rolls_back_run_and_dispatch_on_package_failure(scenario: str) -> None:
+    from engram.memory import work_dispatch
+
+    scope = create_scope(f'reconcile-rollback-{scenario}')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    if scenario == 'new_run':
+        _backdate_required_work(work, scope[2], now - _STALE)
+        existing_id = None
+        dispatched_before = None
+    else:
+        existing = _queued_run(work, dispatched_at=now - _STALE)
+        existing_id = existing.id
+        dispatched_before = existing.dispatched_at
+    CeleryOutbox.objects.all().delete()
+    runs_before = set(WorkflowRun.objects.filter(work=work).values_list('id', flat=True))
+
+    with mock.patch.object(work_dispatch.app, 'send_task', side_effect=RuntimeError('broker down')):
+        with pytest.raises(RuntimeError, match='broker down'):
+            _reconcile(scope, as_of=now)
+
+    assert set(WorkflowRun.objects.filter(work=work).values_list('id', flat=True)) == runs_before
+    assert CeleryOutbox.objects.count() == 0
+    if existing_id is not None:
+        assert WorkflowRun.objects.get(id=existing_id).dispatched_at == dispatched_before
+
+
+@pytest.mark.django_db
 def test_reconcile_configuration_changed_clears_block_and_queues_run() -> None:
     scope = create_scope('reconcile-apply-config-changed')
     now = timezone.now()
@@ -541,6 +739,57 @@ def test_reconcile_report_only_codes_mutate_nothing(code: str) -> None:
     assert WorkflowRun.objects.filter(work=work).count() == runs_before
     assert WorkflowWork.objects.get(id=work.id).execution_state == state_before
     assert CeleryOutbox.objects.count() == 0
+
+
+@requires_postgres
+@pytest.mark.django_db
+def test_reconcile_skips_locking_when_no_unresolved_work() -> None:
+    scope = create_scope('reconcile-bounded')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    _settle(work, now=now)
+
+    with CaptureQueriesContext(connection) as queries:
+        result = _reconcile(scope, as_of=now)
+
+    assert result.queued == 0
+    locking = [entry['sql'] for entry in queries.captured_queries if 'FOR UPDATE' in entry['sql'].upper()]
+    assert locking == []
+
+
+@requires_postgres
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_reconcile_stale_attempt_resignals_once() -> None:
+    scope = create_scope('reconcile-concurrent-stale')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    queued = _queued_run(work, dispatched_at=now - _STALE)
+    CeleryOutbox.objects.all().delete()
+    barrier = Barrier(2)
+
+    def run() -> None:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+            _reconcile(scope, as_of=now)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run) for _index in range(2)]
+        for future in futures:
+            future.result(timeout=15)
+
+    runs = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert runs.count() == 1
+    refreshed = runs.get()
+    assert refreshed.id == queued.id
+    assert refreshed.dispatched_at == now
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
 
 
 @requires_postgres
