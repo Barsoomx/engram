@@ -51,3 +51,8 @@ class DailyDigestAlreadyRunningError(DomainError):
 class LegacyWorkUnlinkedError(DomainError):
     default_error_code = 'legacy_work_unlinked'
     default_status_code = 409
+
+
+class WorkflowRunNotTerminalError(DomainError):
+    default_error_code = 'workflow_run_not_terminal'
+    default_status_code = 409

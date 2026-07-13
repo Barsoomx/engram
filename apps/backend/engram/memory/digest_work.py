@@ -26,11 +26,13 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.services import (
+    WEEKLY_DIGEST_WINDOW_DAYS,
     MemoryWorkerError,
     render_frozen_daily_digest_provider_result,
     render_weekly_digest_body,
+    weekly_digest_content_hash,
 )
-from engram.memory.tasks import dispatch_work_task
+from engram.memory.tasks import _verify_work_fingerprint, dispatch_work_task
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     WorkflowWorkScopeError,
@@ -38,7 +40,6 @@ from engram.memory.workflow_work import (
     create_work,
     resolve_work_no_input,
     resolve_work_succeeded,
-    work_input_fingerprint,
 )
 
 _DIGEST_VISIBILITY_POLICY = 'digest_visibility/v1'
@@ -384,17 +385,15 @@ def freeze_weekly_digest_input(
     return snapshot
 
 
-def _digest_source_refs(data: CreateWorkflowWorkInput) -> list[dict[str, object]]:
-    if data.work_type == WorkflowWorkType.DAILY_DIGEST:
-        refs = data.input_snapshot.get('sources')
-    else:
-        refs = data.input_snapshot.get('changes')
+def _snapshot_refs(work_type: str, snapshot: dict[str, object]) -> list[dict[str, object]]:
+    key = 'sources' if work_type == WorkflowWorkType.DAILY_DIGEST else 'changes'
+    refs = snapshot.get(key)
 
     return list(refs) if isinstance(refs, list) else []
 
 
 def _validate_digest_sources(data: CreateWorkflowWorkInput) -> None:
-    refs = _digest_source_refs(data)
+    refs = _snapshot_refs(data.work_type, data.input_snapshot)
     if not refs:
         return
 
@@ -426,7 +425,7 @@ def _validate_digest_sources(data: CreateWorkflowWorkInput) -> None:
 
 
 def _authorized_input_is_empty(data: CreateWorkflowWorkInput) -> bool:
-    return not _digest_source_refs(data)
+    return not _snapshot_refs(data.work_type, data.input_snapshot)
 
 
 def create_digest_work_and_signal(
@@ -497,32 +496,6 @@ def _digest_visibility_metadata(work: WorkflowWork) -> dict[str, object]:
     }
 
 
-def _verify_digest_fingerprint(work: WorkflowWork) -> None:
-    try:
-        fingerprint = work_input_fingerprint(
-            work_type=work.work_type,
-            subject_type=work.subject_type,
-            subject_id=work.subject_id,
-            contract_version=work.contract_version,
-            occurrence_key=work.occurrence_key,
-            input_snapshot=work.input_snapshot,
-        )
-    except ValueError as error:
-        raise MemoryWorkerError('workflow work fingerprint is invalid') from error
-
-    if fingerprint != work.input_fingerprint:
-        raise MemoryWorkerError('workflow work fingerprint does not match frozen input')
-
-
-def _work_source_refs(work: WorkflowWork) -> list[dict[str, object]]:
-    if work.work_type == WorkflowWorkType.DAILY_DIGEST:
-        refs = work.input_snapshot.get('sources')
-    else:
-        refs = work.input_snapshot.get('changes')
-
-    return list(refs) if isinstance(refs, list) else []
-
-
 def _load_output_team(work: WorkflowWork) -> Team | None:
     if work.team_id is None:
         return None
@@ -533,19 +506,41 @@ def _load_output_team(work: WorkflowWork) -> Team | None:
         raise MemoryWorkerError('digest output team is outside work scope') from error
 
 
-def _existing_output(work: WorkflowWork) -> UUID | None:
-    memory = (
-        Memory.objects.filter(
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-            kind='digest',
-            metadata__digest_visibility__workflow_work_id=str(work.id),
-        )
-        .order_by('created_at')
-        .first()
+def _visibility_block_matches(block: object, expected: dict[str, object]) -> bool:
+    if not isinstance(block, dict):
+        return False
+
+    scalar_keys = (
+        'schema',
+        'workflow_work_id',
+        'input_digest',
+        'output_identity',
+        'output_visibility_scope',
+        'output_team_id',
+    )
+    if any(block.get(key) != expected.get(key) for key in scalar_keys):
+        return False
+
+    return sorted(str(item) for item in block.get('allowed_team_ids', [])) == sorted(
+        str(item) for item in expected['allowed_team_ids']
     )
 
-    return memory.id if memory is not None else None
+
+def _existing_output(work: WorkflowWork) -> UUID | None:
+    expected = _digest_visibility_metadata(work)
+    candidates = Memory.objects.filter(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        kind='digest',
+        metadata__digest_visibility__workflow_work_id=str(work.id),
+    ).order_by('created_at')
+    for memory in candidates:
+        block = memory.metadata.get('digest_visibility') if isinstance(memory.metadata, dict) else None
+        if _visibility_block_matches(block, expected):
+            return memory.id
+
+    return None
 
 
 def _lock_and_revalidate(
@@ -609,7 +604,7 @@ def _render_daily(
     )
 
 
-def _weekly_title_body(snapshot: dict[str, object], refs: list[dict[str, object]]) -> tuple[str, str]:
+def _weekly_memory_changes(refs: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
     memory_changes: dict[str, list[dict[str, object]]] = {}
     for ref in sorted(refs, key=lambda item: item['render_position']):
         bucket = str(ref.get('bucket', 'added'))
@@ -620,11 +615,30 @@ def _weekly_title_body(snapshot: dict[str, object], refs: list[dict[str, object]
                 'at': str(ref.get('occurrence_at', '')),
             }
         )
-    window_end = _parse_iso(str(snapshot['window_end']))
-    body = render_weekly_digest_body(memory_changes, window_end, 7)
-    title = f'Weekly Structured Digest {str(snapshot["window_start"])[:10]} to {str(snapshot["window_end"])[:10]}'
 
-    return title, body
+    return memory_changes
+
+
+def _weekly_metadata(work: WorkflowWork, refs: list[dict[str, object]]) -> tuple[str, str, dict[str, object]]:
+    snapshot = work.input_snapshot
+    memory_changes = _weekly_memory_changes(refs)
+    counts = {bucket: len(items) for bucket, items in memory_changes.items()}
+    window_start = _parse_iso(str(snapshot['window_start']))
+    window_end = _parse_iso(str(snapshot['window_end']))
+    body = render_weekly_digest_body(memory_changes, window_end, WEEKLY_DIGEST_WINDOW_DAYS)
+    title = f'Weekly Structured Digest {str(snapshot["window_start"])[:10]} to {str(snapshot["window_end"])[:10]}'
+    metadata: dict[str, object] = {
+        'window_start': str(snapshot['window_start']),
+        'window_end': str(snapshot['window_end']),
+        'window_days': WEEKLY_DIGEST_WINDOW_DAYS,
+        'memory_changes': memory_changes,
+        'counts': counts,
+        'content_hash': weekly_digest_content_hash(work.project_id, window_start, window_end, work.team_id),
+        'ready': False,
+        'reviewed_at': None,
+    }
+
+    return title, body, metadata
 
 
 def _publish(
@@ -633,13 +647,13 @@ def _publish(
     team: Team | None,
     provider_result: object,
 ) -> UUID:
-    snapshot = work.input_snapshot
     if work.work_type == WorkflowWorkType.DAILY_DIGEST:
         title = f'Digest {provider_result.generated_title}'
         body = provider_result.generated_body
         digest_kind = 'daily_structured'
+        legacy_metadata: dict[str, object] = {}
     else:
-        title, body = _weekly_title_body(snapshot, refs)
+        title, body, legacy_metadata = _weekly_metadata(work, refs)
         digest_kind = 'weekly_structured'
 
     visibility = VisibilityScope.TEAM if team is not None else VisibilityScope.PROJECT
@@ -648,6 +662,7 @@ def _publish(
         'digest_kind': digest_kind,
         'source_memory_ids': [str(ref['memory_id']) for ref in refs],
         'digest_visibility': _digest_visibility_metadata(work),
+        **legacy_metadata,
     }
     if provider_result is not None:
         metadata['provider_call_id'] = str(provider_result.call_record_id)
@@ -686,7 +701,7 @@ def _publish(
 
 
 def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | None) -> UUID | None:
-    _verify_digest_fingerprint(work)
+    _verify_work_fingerprint(work)
     if work.disposition == WorkflowWorkDisposition.NO_OP:
         return None
 
@@ -694,7 +709,7 @@ def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | N
     if existing is not None:
         return existing
 
-    refs = _work_source_refs(work)
+    refs = _snapshot_refs(work.work_type, work.input_snapshot)
     team = _load_output_team(work)
 
     with transaction.atomic():
@@ -703,6 +718,17 @@ def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | N
     provider_result = _render_daily(work, refs, versions) if work.work_type == WorkflowWorkType.DAILY_DIGEST else None
 
     with transaction.atomic():
+        locked_work = WorkflowWork.objects.select_for_update().get(
+            id=work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+        existing = _existing_output(locked_work)
+        if existing is not None:
+            return existing
+        if locked_work.disposition != WorkflowWorkDisposition.REQUIRED:
+            return _existing_output(locked_work)
+
         _lock_and_revalidate(work, refs, team)
 
         return _publish(work, refs, team, provider_result)

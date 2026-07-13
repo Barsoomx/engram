@@ -6,6 +6,7 @@ from typing import Any
 
 import structlog
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
@@ -33,7 +34,7 @@ from engram.memory.services import (
     WeeklyDigestInput,
 )
 from engram.memory.tasks import generate_weekly_digest_work_v1
-from engram.memory.workflow_work import CreateWorkflowWorkInput
+from engram.memory.workflow_work import CreateWorkflowWorkInput, WorkflowWorkScopeError
 
 logger = structlog.get_logger(__name__)
 
@@ -122,28 +123,31 @@ class WeeklyDigestView(APIView):
         window_start, window_end = _current_weekly_window()
         schedule_key = f'weekly:{project.id}:{window_start.date().isoformat()}:{team_id or ""}'
 
-        with transaction.atomic():
-            snapshot = freeze_weekly_digest_input(
-                organization_id=organization.id,
-                project_id=project.id,
-                team_id=team_id,
-                window_start=window_start,
-                window_end=window_end,
-                schedule_key=schedule_key,
-            )
-            data = CreateWorkflowWorkInput(
-                organization_id=organization.id,
-                project_id=project.id,
-                work_type=WorkflowWorkType.WEEKLY_DIGEST,
-                subject_type=WorkflowSubjectType.TEAM if team_id is not None else WorkflowSubjectType.PROJECT,
-                subject_id=team_id if team_id is not None else project.id,
-                input_snapshot=snapshot,
-                occurrence_key=schedule_key,
-            )
-            work, _created = create_digest_work_and_signal(
-                data=data,
-                signal_task=generate_weekly_digest_work_v1,
-            )
+        try:
+            with transaction.atomic():
+                snapshot = freeze_weekly_digest_input(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=team_id,
+                    window_start=window_start,
+                    window_end=window_end,
+                    schedule_key=schedule_key,
+                )
+                data = CreateWorkflowWorkInput(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                    subject_type=WorkflowSubjectType.TEAM if team_id is not None else WorkflowSubjectType.PROJECT,
+                    subject_id=team_id if team_id is not None else project.id,
+                    input_snapshot=snapshot,
+                    occurrence_key=schedule_key,
+                )
+                work, _created = create_digest_work_and_signal(
+                    data=data,
+                    signal_task=generate_weekly_digest_work_v1,
+                )
+        except WorkflowWorkScopeError:
+            return Response({'detail': 'team not found'}, status=HTTP_404_NOT_FOUND)
 
         proven = _proven_output_for_work(organization, project, work)
 
@@ -201,13 +205,17 @@ class DigestReviewView(APIView):
                 status=HTTP_400_BAD_REQUEST,
             )
 
-        memory = Memory.objects.filter(
-            organization=organization,
-            id=memory_id,
-            kind='digest',
-            metadata__digest_kind=digest_kind,
-            project_id__in=scope.project_ids,
-        ).first()
+        memory = (
+            Memory.objects.filter(
+                organization=organization,
+                id=memory_id,
+                kind='digest',
+                metadata__digest_kind=digest_kind,
+                project_id__in=scope.project_ids,
+            )
+            .filter(Q(team_id__isnull=True) | Q(team_id__in=scope.team_ids))
+            .first()
+        )
 
         if memory is None or not proven_digest_memory(memory):
             raise DigestNotFoundError('digest not found')

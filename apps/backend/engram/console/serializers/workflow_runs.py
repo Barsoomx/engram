@@ -5,6 +5,9 @@ from typing import Any
 from rest_framework import serializers
 
 from engram.core.models import WorkflowRun
+from engram.memory.digest_visibility import proven_digest_memory
+
+_UNPROVEN_DIGEST_TITLE = 'digest_visibility_unproven'
 
 
 class WorkflowRunListSerializer(serializers.ModelSerializer):
@@ -86,9 +89,13 @@ class WorkflowRunDetailSerializer(serializers.ModelSerializer):
         if memory is None:
             return None
 
+        title = memory.title
+        if memory.kind == 'digest' and not proven_digest_memory(memory):
+            title = _UNPROVEN_DIGEST_TITLE
+
         return {
             'id': str(memory.id),
-            'title': memory.title,
+            'title': title,
             'status': memory.status,
         }
 

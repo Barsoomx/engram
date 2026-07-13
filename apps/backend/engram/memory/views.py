@@ -11,9 +11,10 @@ from rest_framework.views import APIView
 
 from engram.access.request_scope import resolve_request_scope
 from engram.access.services import EffectiveScope
-from engram.core.models import MemoryLink, MemoryVersion
+from engram.core.models import Memory, MemoryLink, MemoryVersion
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
+from engram.memory.digest_visibility import digest_visibility_failure
 from engram.memory.serializers import (
     MemoryDiffQuerySerializer,
     MemoryFeedbackSerializer,
@@ -121,6 +122,14 @@ class MemoryVersionView(APIView):
             project_id=data.get('project_id'),
             repository_url=data.get('repository_url', ''),
         )
+
+        memory = Memory.objects.filter(
+            organization_id=scope.organization_id,
+            project_id=project.id,
+            id=memory_id,
+        ).first()
+        if memory is not None and digest_visibility_failure(memory) is not None:
+            return Response({'count': 0, 'items': []})
 
         versions = list(
             MemoryVersion.objects.filter(
@@ -321,6 +330,16 @@ class MemoryDiffView(APIView):
                 project_id=data.get('project_id'),
                 repository_url=data.get('repository_url', ''),
             )
+            memory = Memory.objects.filter(
+                organization_id=scope.organization_id,
+                project_id=project.id,
+                id=memory_id,
+            ).first()
+            if memory is not None and digest_visibility_failure(memory) is not None:
+                return Response(
+                    {'code': 'memory_not_found', 'detail': 'memory not found'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
             result = ResolveMemoryDiff().execute(
                 MemoryDiffInput(
                     scope=scope,

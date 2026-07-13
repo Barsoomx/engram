@@ -6,7 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import structlog
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework.permissions import BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -112,7 +112,7 @@ class ProjectDigestRunView(APIView):
 
         sources = snapshot.get('sources') or []
 
-        if not sources or work.disposition != WorkflowWorkDisposition.REQUIRED:
+        if not sources:
             if work.disposition == WorkflowWorkDisposition.REQUIRED:
                 resolve_work_no_input(
                     work.id,
@@ -125,18 +125,31 @@ class ProjectDigestRunView(APIView):
                 status=HTTP_200_OK,
             )
 
+        if work.disposition != WorkflowWorkDisposition.REQUIRED:
+            reason = 'already_built' if work.disposition == WorkflowWorkDisposition.COMPLETE else 'no_recent_memories'
+
+            return Response(
+                {'enqueued': False, 'reason': reason},
+                status=HTTP_200_OK,
+            )
+
         request_id = f'daily-digest:{project.id}:{uuid.uuid4().hex[:8]}'
 
-        run = WorkflowRun.objects.create(
-            organization=organization,
-            project=project,
-            work=work,
-            run_type=WorkflowRunType.DAILY_DIGEST,
-            status=WorkflowRunStatus.QUEUED,
-            input_snapshot=work.input_snapshot,
-            request_id=request_id,
-            correlation_id=request_id,
-        )
+        try:
+            run = WorkflowRun.objects.create(
+                organization=organization,
+                project=project,
+                work=work,
+                run_type=WorkflowRunType.DAILY_DIGEST,
+                status=WorkflowRunStatus.QUEUED,
+                input_snapshot=work.input_snapshot,
+                request_id=request_id,
+                correlation_id=request_id,
+            )
+        except IntegrityError as error:
+            raise DailyDigestAlreadyRunningError(
+                'a daily digest is already queued or running for this project',
+            ) from error
 
         dispatch_work_task(generate_daily_digest_work_v1, work.id, run.id)
 

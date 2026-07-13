@@ -53,10 +53,12 @@ def digest_visibility_failure(memory: Memory) -> str | None:
 def proven_digest_memory_map(memories: Iterable[Memory]) -> dict[UUID, bool]:
     result: dict[UUID, bool] = {}
     digests: list[Memory] = []
+    seen_digest_ids: set[UUID] = set()
     for memory in memories:
         if memory.kind != _DIGEST_KIND:
             result[memory.id] = True
-        elif memory.id not in result and memory.id not in {digest.id for digest in digests}:
+        elif memory.id not in result and memory.id not in seen_digest_ids:
+            seen_digest_ids.add(memory.id)
             digests.append(memory)
 
     if not digests:
