@@ -425,3 +425,61 @@ def test_post_digest_run_tenant_isolation(
     assert WorkflowWork.objects.count() == 0
 
     assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_digest_run_reports_already_built_when_occurrence_complete(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    from engram.memory.workflow_work import resolve_work_succeeded
+
+    _make_approved_memory(f_org, f_project)
+
+    first = f_admin_client.post(_endpoint(f_project.id))
+
+    assert first.status_code == 202
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+    run = WorkflowRun.objects.get(work=work)
+    resolve_work_succeeded(work.id, organization_id=f_org.id, project_id=f_project.id)
+    WorkflowRun.objects.filter(id=run.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        finished_at=timezone.now(),
+    )
+
+    second = f_admin_client.post(_endpoint(f_project.id))
+
+    assert second.status_code == 200
+    assert second.data['enqueued'] is False
+    assert second.data['reason'] == 'already_built'
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+
+
+@pytest.mark.django_db
+def test_post_digest_run_active_run_integrity_error_maps_to_409(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_approved_memory(f_org, f_project)
+
+    WorkflowRun.objects.create(
+        organization=f_org,
+        project=f_project,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    monkeypatch.setattr(
+        'engram.console.views.project_digest._has_active_daily_digest_run',
+        lambda _organization, _project: False,
+    )
+
+    response = f_admin_client.post(_endpoint(f_project.id))
+
+    assert response.status_code == 409
+    assert response.data['code'] == 'daily_digest_already_running'
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.DAILY_DIGEST).count() == 1

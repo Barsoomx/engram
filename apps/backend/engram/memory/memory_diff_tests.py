@@ -24,7 +24,15 @@ from engram.context.context_api_tests import (
     create_project_scope,
     create_scoped_api_key,
 )
-from engram.core.models import MemoryVersion, Organization, Project, Team, VisibilityScope
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Organization,
+    Project,
+    Team,
+    VisibilityScope,
+)
 
 AGENT_RAW_KEY = 'egk_test_memory_diff_agent_0123456789abcdefghijklmnopqrstuvwxyz'
 AGENT_CAPS = ('memories:read', 'projects:agent')
@@ -425,3 +433,52 @@ def test_memory_diff_repository_url_resolving_elsewhere_never_leaks_object_from_
     assert response.status_code == 404
     assert response.json()['code'] == 'memory_not_found'
     assert 'Project A secret memory body' not in str(response.json())
+
+
+def _make_unproven_digest_with_two_versions(
+    organization: Organization,
+    project: Project,
+    *,
+    body_v1: str,
+    body_v2: str,
+) -> Memory:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Weekly digest',
+        body=body_v2,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={'kind': 'digest', 'digest_kind': 'weekly_structured'},
+        current_version=2,
+    )
+    _create_version(memory, organization, project, 1, body_v1)
+    _create_version(memory, organization, project, 2, body_v2)
+
+    return memory
+
+
+@pytest.mark.django_db
+def test_memory_diff_withholds_unproven_digest_body() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_read_capability()
+    body_v1 = 'Unproven digest body one that must not diff-leak.'
+    body_v2 = 'Unproven digest body two that must not diff-leak.'
+    memory = _make_unproven_digest_with_two_versions(
+        organization,
+        project,
+        body_v1=body_v1,
+        body_v2=body_v2,
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/diff',
+        {'project_id': str(project.id), 'from_version': 1, 'to_version': 2},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    text = str(response.json())
+    assert body_v1 not in text
+    assert body_v2 not in text

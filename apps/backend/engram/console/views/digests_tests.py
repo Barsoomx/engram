@@ -7,6 +7,7 @@ import uuid
 import pytest
 import structlog
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from rest_framework.authtoken.models import Token
@@ -29,6 +30,7 @@ from engram.core.models import (
     MemoryVersion,
     Organization,
     Project,
+    ProjectTeam,
     RetrievalDocument,
     Team,
     VisibilityScope,
@@ -40,10 +42,53 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
-from engram.memory.digest_work import digest_output_identity
+from engram.memory.digest_visibility import proven_digest_memory
+from engram.memory.digest_work import (
+    create_digest_work_and_signal,
+    digest_output_identity,
+    freeze_weekly_digest_input,
+)
 from engram.memory.services import weekly_digest_content_hash
+from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.workflow_work import CreateWorkflowWorkInput, WorkflowWorkScopeError
 
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
+
+
+def _publish_weekly_digest(
+    org: Organization,
+    project: Project,
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    *,
+    team: Team | None = None,
+) -> WorkflowWork:
+    schedule_key = f'weekly:{window_start.date().isoformat()}:{team.id if team is not None else ""}'
+    with transaction.atomic():
+        snapshot = freeze_weekly_digest_input(
+            organization_id=org.id,
+            project_id=project.id,
+            team_id=team.id if team is not None else None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, _created = create_digest_work_and_signal(
+            data=CreateWorkflowWorkInput(
+                organization_id=org.id,
+                project_id=project.id,
+                work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                subject_type=WorkflowSubjectType.TEAM if team is not None else WorkflowSubjectType.PROJECT,
+                subject_id=team.id if team is not None else project.id,
+                input_snapshot=snapshot,
+                occurrence_key=schedule_key,
+            ),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    generate_weekly_digest_work_v1(str(work.id))
+
+    return work
 
 
 def _make_user(username: str) -> User:
@@ -797,3 +842,97 @@ def test_post_digest_review_rejects_invalid_digest_kind(
     )
 
     assert response.status_code == 400
+
+
+@pytest.mark.django_db
+def test_get_weekly_current_built_true_payload_carries_window_and_changelog(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start, _window_end = _current_weekly_window(0)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+
+    first = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert first.data['built'] is False
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.WEEKLY_DIGEST)
+    generate_weekly_digest_work_v1(str(work.id))
+
+    second = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert second.status_code == 200
+    assert second.data['built'] is True
+    assert second.data['window_start'] is not None
+    assert second.data['window_end'] is not None
+    assert second.data['window_days'] == 7
+    assert second.data['changelog'] != []
+    assert second.data['counts'] != {}
+
+
+@pytest.mark.django_db
+def test_get_weekly_weeks_back_one_finds_new_format_digest(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start, window_end = _current_weekly_window(1)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+
+    work = _publish_weekly_digest(f_org, f_project, window_start, window_end)
+    published = Memory.objects.get(project=f_project, kind='digest')
+    assert proven_digest_memory(published)
+
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'weeks_back': '1'},
+    )
+
+    assert response.status_code == 200
+    assert response.data['built'] is True
+    assert response.data['digest_memory_id'] == str(published.id)
+    assert WorkflowWork.objects.filter(id=work.id).exists()
+
+
+@pytest.mark.django_db
+def test_get_weekly_current_scope_error_returns_404(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def m_freeze(**_kwargs: object) -> dict[str, object]:
+        raise WorkflowWorkScopeError('team is not linked to the declared project')
+
+    monkeypatch.setattr('engram.console.views.digests.freeze_weekly_digest_input', m_freeze)
+
+    response = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert response.status_code == 404
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_digest_review_team_bound_digest_outside_team_scope_not_found(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team = Team.objects.create(organization=f_org, name='Squad', slug='squad')
+    ProjectTeam.objects.create(organization=f_org, project=f_project, team=team)
+    window_start, window_end = _current_weekly_window(1)
+    source = _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    Memory.objects.filter(id=source.id).update(team=team, visibility_scope=VisibilityScope.TEAM)
+
+    _publish_weekly_digest(f_org, f_project, window_start, window_end, team=team)
+    digest = Memory.objects.get(project=f_project, kind='digest', team=team)
+    assert proven_digest_memory(digest)
+
+    response = f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
+
+    assert response.status_code == 404
+    assert response.data['code'] == 'digest_not_found'
+    digest.refresh_from_db()
+    assert digest.metadata['ready'] is False

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from datetime import timedelta
+from datetime import datetime, timedelta
 from threading import Barrier
 
 import pytest
@@ -29,7 +29,7 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
-from engram.memory.services import MemoryWorkerError
+from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
 from engram.memory.workflow_work import CreateWorkflowWorkInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
@@ -1168,3 +1168,118 @@ def test_execute_frozen_digest_work_returns_none_for_terminal_no_op_daily_work()
 
     assert result is None
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+def _linked_daily_run(organization: Organization, project: Project, work: WorkflowWork) -> WorkflowRun:
+    return WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        work=work,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot=work.input_snapshot,
+        request_id=f'daily-digest:{work.id}',
+        correlation_id=f'daily-digest:{work.id}',
+    )
+
+
+def _digest_output_for_work(project: Project, work: WorkflowWork) -> int:
+    return Memory.objects.filter(
+        project=project,
+        kind='digest',
+        metadata__digest_visibility__workflow_work_id=str(work.id),
+    ).count()
+
+
+@pytest.mark.django_db
+def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
+    organization, project = _make_scope('daily-run-succeeded')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    run.refresh_from_db()
+    digest = Memory.objects.get(project=project, kind='digest')
+    assert result == str(run.id)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.result_memory_id == digest.id
+    assert run.finished_at is not None
+
+
+@pytest.mark.django_db
+def test_daily_work_linked_run_fails_on_frozen_drift_before_provider() -> None:
+    organization, project = _make_scope('daily-run-failed')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    tampered = dict(work.input_snapshot)
+    tampered['input_digest'] = 'deadbeef' * 8
+    WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
+
+    with pytest.raises(MemoryWorkerError, match='fingerprint'):
+        generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    run.refresh_from_db()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_reason != ''
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_automatic_path_creates_no_run_and_publishes_once() -> None:
+    organization, project = _make_scope('daily-run-automatic')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    assert result == str(work.id)
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert _digest_output_for_work(project, work) == 1
+
+
+@pytest.mark.django_db
+def test_daily_work_second_delivery_past_existing_check_publishes_one_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-double-publish')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    monkeypatch.setattr('engram.memory.digest_work._existing_output', lambda _work: None)
+
+    digest_work.execute_frozen_digest_work(work, None)
+    work.refresh_from_db()
+    digest_work.execute_frozen_digest_work(work, None)
+
+    assert _digest_output_for_work(project, work) == 1
+
+
+@pytest.mark.django_db
+def test_weekly_work_publishes_legacy_metadata_block() -> None:
+    organization, project = _make_scope('weekly-metadata')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, snapshot = _make_weekly_work(organization, project)
+
+    generate_weekly_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    metadata = digest.metadata
+    window_start = datetime.fromisoformat(str(snapshot['window_start']).replace('Z', '+00:00'))
+    window_end = datetime.fromisoformat(str(snapshot['window_end']).replace('Z', '+00:00'))
+    expected_hash = weekly_digest_content_hash(project.id, window_start, window_end, None)
+
+    assert metadata['window_start'] is not None
+    assert metadata['window_end'] is not None
+    assert metadata['window_days'] == 7
+    assert isinstance(metadata['counts'], dict)
+    assert isinstance(metadata['memory_changes'], dict)
+    assert metadata['content_hash'] == expected_hash

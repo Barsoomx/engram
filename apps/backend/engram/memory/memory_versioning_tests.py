@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 import pytest
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -25,7 +27,22 @@ from engram.context.context_api_tests import (
     create_scoped_api_key,
 )
 from engram.context.services import authorized_retrieval_documents
-from engram.core.models import AuditEvent, MemoryVersion, Organization, Project, RetrievalDocument, VisibilityScope
+from engram.core.models import (
+    AuditEvent,
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Organization,
+    Project,
+    RetrievalDocument,
+    VisibilityScope,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
+)
+from engram.memory.digest_work import digest_output_identity
 
 VERSION_BODY_MAX_LENGTH = 16000
 AGENT_RAW_KEY = 'egk_test_memory_version_agent_0123456789abcdefghijklmnopqrstuv'
@@ -674,3 +691,179 @@ def test_update_memory_body_retrieval_returns_new_body_only() -> None:
     assert len(documents) == 1
     assert 'Corrected memory body after the review fix.' in documents[0].full_text
     assert 'Original memory body before the correction.' not in documents[0].full_text
+
+
+def grant_capabilities(codes: tuple[str, ...], raw_key: str = RAW_KEY) -> None:
+    developer = Role.objects.get(code='developer')
+    for code in codes:
+        capability, _ = Capability.objects.get_or_create(code=code, defaults={'description': code})
+        RoleCapability.objects.get_or_create(role=developer, capability=capability)
+    api_key = ApiKey.objects.get(key_hash=hash_api_key(raw_key))
+    for code in codes:
+        ApiKeyCapability.objects.get_or_create(
+            api_key=api_key,
+            capability=Capability.objects.get(code=code),
+        )
+
+
+def make_unproven_digest_memory(
+    organization: Organization,
+    project: Project,
+    *,
+    body: str,
+) -> Memory:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Weekly digest',
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={'kind': 'digest', 'digest_kind': 'weekly_structured'},
+    )
+    MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+
+    return memory
+
+
+def make_proven_digest_memory(
+    organization: Organization,
+    project: Project,
+    *,
+    body: str,
+) -> Memory:
+    snapshot: dict[str, object] = {
+        'schema': 'weekly_digest_input/v1',
+        'project_id': str(project.id),
+        'team_id': None,
+        'schedule_key': 'weekly:2026-W28',
+        'window_start': '2026-05-11T00:00:00Z',
+        'window_end': '2026-05-18T00:00:00Z',
+        'visibility_policy': 'digest_visibility/v1',
+        'allowed_team_ids': [],
+        'output_visibility_scope': 'project',
+        'output_team_id': None,
+        'input_digest': 'a' * 64,
+        'changes': [],
+    }
+    work = WorkflowWork.objects.create(
+        organization=organization,
+        project=project,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        subject_type=WorkflowSubjectType.PROJECT,
+        subject_id=project.id,
+        contract_version=1,
+        occurrence_key='weekly:2026-W28',
+        input_fingerprint='0' * 64,
+        input_snapshot=snapshot,
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        resolution_reason=WorkflowWorkResolutionReason.SUCCEEDED,
+        resolved_at=timezone.now(),
+    )
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Weekly digest',
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={
+            'kind': 'digest',
+            'digest_kind': 'weekly_structured',
+            'digest_visibility': {
+                'schema': 'digest_visibility/v1',
+                'workflow_work_id': str(work.id),
+                'input_digest': snapshot['input_digest'],
+                'output_identity': digest_output_identity(work),
+                'allowed_team_ids': [],
+                'output_visibility_scope': 'project',
+                'output_team_id': None,
+            },
+        },
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+    RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        full_text=body,
+    )
+
+    return memory
+
+
+@pytest.mark.django_db
+def test_memory_versions_withholds_unproven_digest_body() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_capabilities(('memories:read',))
+    digest_body = 'Unproven digest body that must never reach a version reader.'
+    memory = make_unproven_digest_memory(organization, project, body=digest_body)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert digest_body not in str(response.json())
+    if response.status_code == 200:
+        assert response.json()['items'] == []
+    else:
+        assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_memory_versions_unproven_digest_not_bypassed_by_admin_capability() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_capabilities(('memories:read', 'memories:admin'))
+    digest_body = 'Admin must not bypass the digest body quarantine here.'
+    memory = make_unproven_digest_memory(organization, project, body=digest_body)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert digest_body not in str(response.json())
+    if response.status_code == 200:
+        assert response.json()['items'] == []
+    else:
+        assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_memory_versions_serves_proven_digest_body() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_capabilities(('memories:read',))
+    digest_body = 'Proven digest body that a version reader is allowed to see.'
+    memory = make_proven_digest_memory(organization, project, body=digest_body)
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()['count'] == 1
+    assert digest_body in str(response.json())

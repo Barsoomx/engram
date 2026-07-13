@@ -15,6 +15,7 @@ from engram.access.models import (
     Identity,
     IdentityType,
     OrganizationMembership,
+    ProjectGrant,
     Role,
     RoleCapability,
 )
@@ -46,6 +47,7 @@ def _make_linked_digest_work_and_run(
     work_type: str,
     run_type: str,
     occurrence_key: str,
+    run_status: str = WorkflowRunStatus.SUCCEEDED,
 ) -> tuple[WorkflowWork, WorkflowRun]:
     schema = 'daily_digest_input/v1' if work_type == WorkflowWorkType.DAILY_DIGEST else 'weekly_digest_input/v1'
     snapshot: dict[str, object] = {
@@ -77,15 +79,16 @@ def _make_linked_digest_work_and_run(
         resolution_reason=WorkflowWorkResolutionReason.SUCCEEDED,
         resolved_at=timezone.now(),
     )
+    terminal = run_status in (WorkflowRunStatus.SUCCEEDED, WorkflowRunStatus.FAILED)
     run = WorkflowRun.objects.create(
         organization=org,
         project=project,
         work=work,
         run_type=run_type,
-        status=WorkflowRunStatus.SUCCEEDED,
+        status=run_status,
         input_snapshot=snapshot,
         request_id='linked-original',
-        finished_at=timezone.now(),
+        finished_at=timezone.now() if terminal else None,
     )
 
     return work, run
@@ -826,3 +829,154 @@ def test_list_denied_without_read_capability() -> None:
     response = client.get('/v1/admin/workflow-runs/')
 
     assert response.status_code == 403
+
+
+def _scoped_admin_client(org: Organization, project: Project, username: str) -> APIClient:
+    user = _make_user(username)
+    identity = _make_identity(user, org)
+    role = _make_role_with_capabilities(f'{username}_role', ('memories:read', 'memories:admin'))
+    OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
+    ProjectGrant.objects.create(organization=org, project=project, identity=identity, role=role)
+
+    from rest_framework.authtoken.models import Token
+
+    token = Token.objects.create(user=user).key
+
+    return _client(token, org)
+
+
+def _make_unproven_digest_memory(org: Organization, project: Project, *, title: str) -> Memory:
+    return Memory.objects.create(
+        organization=org,
+        project=project,
+        title=title,
+        body='digest body',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={'kind': 'digest', 'digest_kind': 'weekly_structured'},
+    )
+
+
+@pytest.mark.django_db
+def test_retrieve_masks_unproven_digest_result_memory_title(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+    digest = _make_unproven_digest_memory(f_admin_org, project, title='Secret weekly digest title')
+    run = _make_run(f_admin_org, project, result_memory=digest, request_id='digest-result')
+
+    response = f_admin_client.get(f'/v1/admin/workflow-runs/{run.id}/')
+
+    assert response.status_code == 200
+    assert response.data['result_memory']['title'] != 'Secret weekly digest title'
+    assert response.data['result_memory']['title'] in (None, 'digest_visibility_unproven')
+
+
+@pytest.mark.django_db
+def test_retrieve_keeps_non_digest_result_memory_title(
+    f_admin_client: APIClient,
+    f_admin_org: Organization,
+) -> None:
+    project = _make_project(f_admin_org)
+    memory = Memory.objects.create(
+        organization=f_admin_org,
+        project=project,
+        title='Plain result title',
+        body='plain body',
+        status='approved',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    run = _make_run(f_admin_org, project, result_memory=memory, request_id='plain-result')
+
+    response = f_admin_client.get(f'/v1/admin/workflow-runs/{run.id}/')
+
+    assert response.status_code == 200
+    assert response.data['result_memory']['title'] == 'Plain result title'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('work_type', 'run_type', 'occurrence_key'),
+    [
+        (WorkflowWorkType.DAILY_DIGEST, WorkflowRunType.DAILY_DIGEST, 'daily:2026-07-10'),
+        (WorkflowWorkType.WEEKLY_DIGEST, WorkflowRunType.WEEKLY_DIGEST, 'weekly:2026-W28'),
+    ],
+)
+def test_rerun_non_terminal_digest_run_conflicts_without_writing(
+    work_type: str,
+    run_type: str,
+    occurrence_key: str,
+) -> None:
+    org = Organization.objects.create(name='Scoped Rerun', slug=f'scoped-rerun-{run_type}')
+    project = _make_project(org, slug=f'scoped-{run_type}')
+    client = _scoped_admin_client(org, project, f'scoped-admin-{run_type}')
+
+    _work, run = _make_linked_digest_work_and_run(
+        org,
+        project,
+        work_type=work_type,
+        run_type=run_type,
+        occurrence_key=occurrence_key,
+        run_status=WorkflowRunStatus.QUEUED,
+    )
+
+    response = client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 409
+    assert WorkflowRun.objects.filter(run_type=run_type).count() == 1
+    assert CeleryOutbox.objects.count() == 0
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+
+@pytest.mark.django_db
+def test_rerun_daily_digest_active_run_collision_maps_to_409() -> None:
+    org = Organization.objects.create(name='Daily Collision', slug='daily-collision')
+    project = _make_project(org, slug='daily-collision')
+    client = _scoped_admin_client(org, project, 'daily-collision-admin')
+
+    work, original = _make_linked_digest_work_and_run(
+        org,
+        project,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        occurrence_key='daily:2026-07-10',
+        run_status=WorkflowRunStatus.SUCCEEDED,
+    )
+    WorkflowRun.objects.create(
+        organization=org,
+        project=project,
+        work=work,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        request_id='separate-active',
+    )
+
+    response = client.post(f'/v1/admin/workflow-runs/{original.id}/rerun/')
+
+    assert response.status_code == 409
+    assert response.data['code'] == 'daily_digest_already_running'
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.DAILY_DIGEST).count() == 2
+
+
+@pytest.mark.django_db
+def test_rerun_out_of_scope_run_returns_404() -> None:
+    org = Organization.objects.create(name='Scope Guard', slug='scope-guard')
+    granted_project = _make_project(org, slug='granted')
+    other_project = _make_project(org, slug='ungranted')
+    client = _scoped_admin_client(org, granted_project, 'scope-guard-admin')
+
+    _work, run = _make_linked_digest_work_and_run(
+        org,
+        other_project,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        occurrence_key='daily:2026-07-10',
+        run_status=WorkflowRunStatus.SUCCEEDED,
+    )
+
+    response = client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 404
+    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowRun.objects.filter(work=_work).count() == 1
