@@ -88,6 +88,21 @@ The admin UI is at `http://localhost:3000`, the API at `http://localhost:8000`.
 
 **[Full Quickstart →](docs/quickstart.md)**
 
+## Running Tests
+
+Backend tests run from a thin root compose stack with dependencies baked into
+the image (no runtime `poetry install`). From the repo root:
+
+```bash
+docker compose run --rm app pytest -q                    # full backend suite
+docker compose run --rm app python manage.py migrate     # once, then:
+docker compose run --rm app python manage.py check
+docker compose down -v                                   # tear down
+```
+
+Rebuild the image only when `pyproject.toml`/`poetry.lock` change
+(`docker compose build`); source is bind-mounted so code edits need no rebuild.
+
 ## How It Works
 
 1. **Capture** — agent lifecycle hooks stream observations to the API.
