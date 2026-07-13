@@ -1,31 +1,29 @@
 from __future__ import annotations
 
-import uuid
+import hashlib
 from datetime import timedelta
-from unittest import mock
 
 import pytest
-from django.core.management import call_command
+from celery.schedules import crontab
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 
+from engram.celeryconfig import beat_schedule, task_routes
 from engram.core.models import (
     Memory,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
     Team,
     VisibilityScope,
-    WorkflowRun,
-    WorkflowRunStatus,
-    WorkflowRunType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkType,
 )
-from engram.memory.tasks import (
-    daily_digest_window_start,
-    generate_daily_digest,
-    recent_approved_memory_ids,
-    run_scheduled_digests,
-)
+from engram.memory.tasks import run_scheduled_digests
+
+_DAILY_WORK_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 
 
 def create_organization_project_team(slug: str = 'daily') -> tuple[Organization, Team, Project]:
@@ -48,97 +46,66 @@ def create_approved_memory(
     team: Team | None,
     *,
     title: str,
+    in_window: bool = True,
 ) -> Memory:
-    return Memory.objects.create(
+    body = f'{title} body detail.'
+    memory = Memory.objects.create(
         organization=organization,
         project=project,
         team=team,
         title=title,
-        body=f'{title} body detail.',
+        body=body,
         status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
-
-
-@pytest.mark.django_db
-def test_management_command_enqueues_digest_for_project_with_recent_memories() -> None:
-    organization, team, project = create_organization_project_team(slug='alpha')
-    memory = create_approved_memory(organization, project, team, title='Alpha source')
-
-    call_command('engram_run_daily_digest')
-
-    outbox = CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest')
-    assert outbox.count() == 1
-    args = outbox.first().args
-    assert args == [str(organization.id), str(project.id), [str(memory.id)]]
-
-
-@pytest.mark.django_db
-def test_management_command_skips_project_without_recent_memories() -> None:
-    organization, _team, project = create_organization_project_team(slug='beta')
-
-    call_command('engram_run_daily_digest')
-
-    assert not CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest').exists()
-
-
-@pytest.mark.django_db
-def test_management_command_excludes_digest_memories_and_non_approved() -> None:
-    organization, team, project = create_organization_project_team(slug='gamma')
-    create_approved_memory(organization, project, team, title='Gamma source')
-    Memory.objects.create(
+    MemoryVersion.objects.create(
         organization=organization,
         project=project,
-        team=team,
-        title='Existing digest',
-        body='Existing digest body.',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
-        metadata={'kind': 'digest'},
+        memory=memory,
+        version=memory.current_version,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
     )
-    Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        title='Archived memory',
-        body='Archived memory body.',
-        status=MemoryStatus.ARCHIVED,
-        visibility_scope=VisibilityScope.PROJECT,
-    )
+    if in_window:
+        Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(days=1))
 
-    call_command('engram_run_daily_digest')
-
-    outbox = CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest')
-    assert outbox.count() == 1
-    memory_ids = outbox.first().args[2]
-    assert len(memory_ids) == 1
+    return memory
 
 
 @pytest.mark.django_db
-def test_run_scheduled_digests_enqueues_per_project() -> None:
+def test_run_scheduled_digests_returns_producer_aggregate_and_id_only_signal() -> None:
     organization, team, project = create_organization_project_team(slug='delta')
     memory = create_approved_memory(organization, project, team, title='Delta source')
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        result = run_scheduled_digests()
+    result = run_scheduled_digests()
 
-    m_delay.assert_called_once_with(
-        str(organization.id),
-        str(project.id),
-        [str(memory.id)],
-    )
-    assert result == {'enqueued_projects': 1, 'enqueued_tasks': 1}
+    assert set(result) == {'scheduled_projects', 'required_work', 'no_input_projects', 'task_enqueued'}
+    assert result['required_work'] == 1
+    assert result['no_input_projects'] == 0
+    assert result['scheduled_projects'] == 1
+    assert result['task_enqueued'] == 1
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == _DAILY_WORK_TASK_NAME
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
+    assert str(memory.id) not in repr(queued.args)
 
 
 @pytest.mark.django_db
-def test_run_scheduled_digests_skips_empty_projects() -> None:
+def test_run_scheduled_digests_empty_project_creates_no_input_terminal_without_signal() -> None:
     create_organization_project_team(slug='epsilon')
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        result = run_scheduled_digests()
+    result = run_scheduled_digests()
 
-    m_delay.assert_not_called()
-    assert result == {'enqueued_projects': 0, 'enqueued_tasks': 0}
+    assert result == {
+        'scheduled_projects': 1,
+        'required_work': 0,
+        'no_input_projects': 1,
+        'task_enqueued': 0,
+    }
+    assert not CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).exists()
+    assert WorkflowWork.objects.get().disposition == WorkflowWorkDisposition.NO_OP
 
 
 @pytest.mark.django_db
@@ -154,123 +121,45 @@ def test_run_scheduled_digests_excludes_digest_kind_memories() -> None:
         visibility_scope=VisibilityScope.PROJECT,
         metadata={'kind': 'digest'},
     )
-
     organization_b, team_b, project_b = create_organization_project_team(slug='eta')
     normal_memory = create_approved_memory(organization_b, project_b, team_b, title='Normal source')
 
-    with mock.patch.object(generate_daily_digest, 'delay') as m_delay:
-        result = run_scheduled_digests()
+    result = run_scheduled_digests()
 
-    m_delay.assert_called_once_with(
-        str(organization_b.id),
-        str(project_b.id),
-        [str(normal_memory.id)],
-    )
-    assert result == {'enqueued_projects': 1, 'enqueued_tasks': 1}
-
-
-def _make_succeeded_daily_run(
-    organization: Organization,
-    project: Project,
-    *,
-    finished_at: object,
-) -> WorkflowRun:
-    return WorkflowRun.objects.create(
-        organization=organization,
-        project=project,
-        run_type=WorkflowRunType.DAILY_DIGEST,
-        status=WorkflowRunStatus.SUCCEEDED,
-        finished_at=finished_at,
-    )
+    assert result['required_work'] == 1
+    assert result['no_input_projects'] == 1
+    work = WorkflowWork.objects.get(project=project_b, disposition=WorkflowWorkDisposition.REQUIRED)
+    queued = CeleryOutbox.objects.get()
+    assert queued.args == [str(work.id)]
+    assert str(normal_memory.id) not in repr(queued.args)
+    assert WorkflowWork.objects.get(project=project_a).disposition == WorkflowWorkDisposition.NO_OP
 
 
 @pytest.mark.django_db
-def test_window_start_defaults_to_one_day_without_prior_success() -> None:
-    _organization, _team, project = create_organization_project_team(slug='win-default')
-    now = timezone.now()
+def test_run_scheduled_digests_second_run_reuses_occurrence_without_second_signal() -> None:
+    organization, team, project = create_organization_project_team(slug='theta')
+    create_approved_memory(organization, project, team, title='Theta source')
 
-    start = daily_digest_window_start(project, now=now)
+    run_scheduled_digests()
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
 
-    assert start == now - timedelta(days=1)
+    second = run_scheduled_digests()
 
-
-@pytest.mark.django_db
-def test_window_start_uses_last_success_when_within_cap() -> None:
-    organization, _team, project = create_organization_project_team(slug='win-last')
-    now = timezone.now()
-    last_success = now - timedelta(days=3)
-    _make_succeeded_daily_run(organization, project, finished_at=last_success)
-
-    start = daily_digest_window_start(project, now=now)
-
-    assert start == last_success
+    assert second['task_enqueued'] == 0
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
 
 
-@pytest.mark.django_db
-def test_window_start_capped_at_max_when_last_success_is_old() -> None:
-    organization, _team, project = create_organization_project_team(slug='win-cap')
-    now = timezone.now()
-    _make_succeeded_daily_run(organization, project, finished_at=now - timedelta(days=15))
+def test_daily_beat_and_work_routing_registered_once() -> None:
+    daily_beats = [
+        key for key, entry in beat_schedule.items() if entry['task'] == 'engram.memory.run_scheduled_digests'
+    ]
+    assert daily_beats == ['daily-digest']
 
-    start = daily_digest_window_start(project, now=now)
-
-    assert start == now - timedelta(days=7)
-
-
-@pytest.mark.django_db
-def test_window_start_ignores_failed_runs() -> None:
-    organization, _team, project = create_organization_project_team(slug='win-failed')
-    now = timezone.now()
-    WorkflowRun.objects.create(
-        organization=organization,
-        project=project,
-        run_type=WorkflowRunType.DAILY_DIGEST,
-        status=WorkflowRunStatus.FAILED,
-        finished_at=now - timedelta(days=2),
-    )
-
-    start = daily_digest_window_start(project, now=now)
-
-    assert start == now - timedelta(days=1)
-
-
-@pytest.mark.django_db
-def test_recent_ids_exclude_memories_before_last_success() -> None:
-    organization, team, project = create_organization_project_team(slug='win-ids')
-    now = timezone.now()
-    _make_succeeded_daily_run(organization, project, finished_at=now - timedelta(days=2))
-    after = create_approved_memory(organization, project, team, title='after-success')
-    before = create_approved_memory(organization, project, team, title='before-success')
-    Memory.objects.filter(id=after.id).update(updated_at=now - timedelta(days=1))
-    Memory.objects.filter(id=before.id).update(updated_at=now - timedelta(days=4))
-
-    ids = recent_approved_memory_ids(project)
-
-    assert after.id in ids
-    assert before.id not in ids
-
-
-@pytest.mark.skip(reason='stale mock: GenerateDigest does not exist in tasks; update separately')
-def test_generate_daily_digest_parses_ids_and_calls_service() -> None:
-    organization_id = uuid.uuid4()
-    project_id = uuid.uuid4()
-    memory_id = uuid.uuid4()
-
-    with mock.patch('engram.memory.tasks.GenerateDigest') as m_service_cls:
-        m_result = mock.Mock()
-        m_result.memory.id = uuid.uuid4()
-        m_service_cls.return_value.execute.return_value = m_result
-
-        returned = generate_daily_digest(
-            str(organization_id),
-            str(project_id),
-            [str(memory_id)],
-        )
-
-    m_service_cls.return_value.execute.assert_called_once()
-    args, _kwargs = m_service_cls.return_value.execute.call_args
-    digest_input = args[0]
-    assert digest_input.project_id == project_id
-    assert digest_input.memory_ids == (memory_id,)
-    assert digest_input.request_id == f'daily-digest:{project_id}'
-    assert returned == str(m_result.memory.id)
+    entry = beat_schedule['daily-digest']
+    assert isinstance(entry['schedule'], crontab)
+    assert 2 in entry['schedule'].hour
+    assert 0 in entry['schedule'].minute
+    assert entry['options']['queue'] == 'engram-batch'
+    assert task_routes[_DAILY_WORK_TASK_NAME] == {'queue': 'engram-batch'}

@@ -1,32 +1,46 @@
 from __future__ import annotations
 
-from unittest import mock
+import hashlib
+from datetime import timedelta
 
 import pytest
 from celery.schedules import crontab
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
-from engram.celeryconfig import beat_schedule
+from engram.celeryconfig import beat_schedule, task_routes
 from engram.core.models import (
     Memory,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
+    VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkType,
 )
 from engram.memory.tasks import generate_weekly_digest, run_scheduled_weekly_digests
 
+_WEEKLY_WORK_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
 
-def test_weekly_beat_schedule_is_registered() -> None:
-    assert 'weekly-digest' in beat_schedule
+
+def test_weekly_beat_and_work_routing_registered_once() -> None:
+    weekly_beats = [
+        key for key, entry in beat_schedule.items() if entry['task'] == 'engram.memory.run_scheduled_weekly_digests'
+    ]
+    assert weekly_beats == ['weekly-digest']
 
     entry = beat_schedule['weekly-digest']
-
-    assert entry['task'] == 'engram.memory.run_scheduled_weekly_digests'
-
     assert isinstance(entry['schedule'], crontab)
+    assert 1 in entry['schedule'].day_of_week
+    assert 3 in entry['schedule'].hour
+    assert 0 in entry['schedule'].minute
+    assert entry['options']['queue'] == 'engram-batch'
+    assert task_routes[_WEEKLY_WORK_TASK_NAME] == {'queue': 'engram-batch'}
 
 
 @pytest.fixture
@@ -35,99 +49,103 @@ def f_org() -> Organization:
 
 
 @pytest.fixture
-def f_project_with_memory(f_org: Organization) -> Project:
-    project = Project.objects.create(
-        organization=f_org,
-        name='project-with-memory',
-        slug='project-with-memory',
-    )
-    Memory.objects.create(
+def f_weekly_source_project(f_org: Organization) -> Project:
+    project = Project.objects.create(organization=f_org, name='weekly-source', slug='weekly-source')
+    body = 'body'
+    memory = Memory.objects.create(
         organization=f_org,
         project=project,
         title='approved-mem',
-        body='body',
+        body=body,
         status=MemoryStatus.APPROVED,
-        updated_at=timezone.now(),
+        visibility_scope=VisibilityScope.PROJECT,
     )
+    MemoryVersion.objects.create(
+        organization=f_org,
+        project=project,
+        memory=memory,
+        version=memory.current_version,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+    Memory.objects.filter(id=memory.id).update(created_at=timezone.now() - timedelta(days=7))
 
     return project
 
 
 @pytest.fixture
 def f_project_empty(f_org: Organization) -> Project:
-    return Project.objects.create(
-        organization=f_org,
-        name='project-empty',
-        slug='project-empty',
-    )
+    return Project.objects.create(organization=f_org, name='project-empty', slug='project-empty')
 
 
 @pytest.fixture
 def f_project_digest_only(f_org: Organization) -> Project:
-    project = Project.objects.create(
-        organization=f_org,
-        name='project-digest-only',
-        slug='project-digest-only',
-    )
-    Memory.objects.create(
+    project = Project.objects.create(organization=f_org, name='project-digest-only', slug='project-digest-only')
+    memory = Memory.objects.create(
         organization=f_org,
         project=project,
         title='digest-mem',
         body='body',
         status=MemoryStatus.APPROVED,
-        updated_at=timezone.now(),
+        visibility_scope=VisibilityScope.PROJECT,
         metadata={'kind': 'digest'},
     )
+    Memory.objects.filter(id=memory.id).update(created_at=timezone.now() - timedelta(days=7))
 
     return project
 
 
 @pytest.mark.django_db
-def test_run_scheduled_weekly_digests_enqueues_per_project_with_memories(
-    f_project_with_memory: Project,
+def test_run_scheduled_weekly_digests_returns_aggregate_and_id_only_signal(
+    f_weekly_source_project: Project,
     f_project_empty: Project,
 ) -> None:
-    with mock.patch.object(generate_weekly_digest, 'delay') as m_delay:
-        run_scheduled_weekly_digests()
+    result = run_scheduled_weekly_digests()
 
-    m_delay.assert_called_once_with(
-        str(f_project_with_memory.organization_id),
-        str(f_project_with_memory.id),
+    assert set(result) == {'scheduled_projects', 'required_work', 'no_input_projects', 'task_enqueued'}
+    assert result['required_work'] == 1
+    assert result['no_input_projects'] == 1
+    assert result['task_enqueued'] == 1
+    work = WorkflowWork.objects.get(
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        disposition=WorkflowWorkDisposition.REQUIRED,
     )
+    queued = CeleryOutbox.objects.get()
+    assert queued.task_name == _WEEKLY_WORK_TASK_NAME
+    assert queued.args == [str(work.id)]
+    assert queued.kwargs == {}
 
 
 @pytest.mark.django_db
-def test_run_scheduled_weekly_digests_skips_digest_kind_only_project(
-    f_project_with_memory: Project,
+def test_run_scheduled_weekly_digests_excludes_digest_only_project(
+    f_weekly_source_project: Project,
     f_project_digest_only: Project,
 ) -> None:
-    with mock.patch.object(generate_weekly_digest, 'delay') as m_delay:
-        run_scheduled_weekly_digests()
+    result = run_scheduled_weekly_digests()
 
-    m_delay.assert_called_once_with(
-        str(f_project_with_memory.organization_id),
-        str(f_project_with_memory.id),
-    )
+    assert result['required_work'] == 1
+    assert result['no_input_projects'] >= 1
+    work = WorkflowWork.objects.get(project=f_weekly_source_project, disposition=WorkflowWorkDisposition.REQUIRED)
+    queued = CeleryOutbox.objects.get()
+    assert queued.args == [str(work.id)]
+    assert WorkflowWork.objects.get(project=f_project_digest_only).disposition == WorkflowWorkDisposition.NO_OP
 
 
 @pytest.mark.django_db
 def test_generate_weekly_digest_builds_digest_and_returns_memory_id(
-    f_project_with_memory: Project,
+    f_weekly_source_project: Project,
 ) -> None:
-    org_id = str(f_project_with_memory.organization_id)
-    project_id = str(f_project_with_memory.id)
+    org_id = str(f_weekly_source_project.organization_id)
+    project_id = str(f_weekly_source_project.id)
 
     result_id = generate_weekly_digest.run(org_id, project_id)
 
     assert result_id is not None
-
     run = WorkflowRun.objects.filter(
-        organization_id=f_project_with_memory.organization_id,
-        project=f_project_with_memory,
+        organization_id=f_weekly_source_project.organization_id,
+        project=f_weekly_source_project,
         run_type=WorkflowRunType.WEEKLY_DIGEST,
         status=WorkflowRunStatus.SUCCEEDED,
     ).first()
-
     assert run is not None
-
     assert str(run.result_memory_id) == result_id
