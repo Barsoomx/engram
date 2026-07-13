@@ -786,11 +786,17 @@ def test_digest_work_adapter_rejects_altered_snapshot_before_provider(
     task = getattr(tasks_module, task_attribute)
 
     with mock.patch('engram.memory.services.get_provider_gateway') as m_gateway:
-        with pytest.raises(MemoryWorkerError, match='fingerprint'):
-            task(str(work.id))
+        result = task(str(work.id))
 
     m_gateway.assert_not_called()
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert result == str(work.id)
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_fingerprint_mismatch'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
@@ -937,12 +943,21 @@ def test_distill_session_work_rejects_altered_snapshot_before_run_or_provider(
         },
     )
 
-    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
-        with pytest.raises(MemoryWorkerError, match='fingerprint'):
-            tasks_module.distill_session_work_v1(str(work.id))
+    with mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute:
+        with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+            result = tasks_module.distill_session_work_v1(str(work.id))
 
     m_run.assert_not_called()
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    m_execute.assert_not_called()
+    assert result == str(work.id)
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.failure_streak == 1
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_fingerprint_mismatch'
 
 
 # ---------------------------------------------------------------------------
@@ -1204,6 +1219,38 @@ def test_observation_work_v1_invalid_input_is_terminal_and_keeps_work_required(
     assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
     assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_stores_claim_time_configuration_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    error = ModelPolicyError('model_policy_not_found', 'no policy', http_status=404)
+    phase = {'value': 'claim'}
+    monkeypatch.setattr(
+        'engram.memory.tasks.execution_configuration_fingerprint',
+        lambda _work: ('a' * 64) if phase['value'] == 'claim' else ('b' * 64),
+    )
+
+    def _fail(_input: object) -> object:
+        phase['value'] = 'failure'
+
+        raise error
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute', side_effect=_fail):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            process_observation_work_v1(str(work.id))
+
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.configuration_fingerprint == 'a' * 64
+    work.refresh_from_db()
+    assert work.blocked_configuration_fingerprint == 'a' * 64
 
 
 @pytest.mark.django_db

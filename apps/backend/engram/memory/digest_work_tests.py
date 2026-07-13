@@ -954,12 +954,18 @@ def test_daily_work_execution_rejects_frozen_input_digest_drift_before_provider(
     calls: list[ProviderCallInput] = []
     monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
 
-    with pytest.raises(MemoryWorkerError, match='fingerprint'):
-        generate_daily_digest_work_v1(str(work.id))
+    result = generate_daily_digest_work_v1(str(work.id))
 
     assert calls == []
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert result == str(work.id)
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_fingerprint_mismatch'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
@@ -1490,6 +1496,46 @@ def test_daily_second_automatic_delivery_absorbs_at_claim_without_second_provide
     work.refresh_from_db()
     assert work.execution_state == WorkflowWorkExecutionState.SETTLED
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+@pytest.mark.django_db
+def test_daily_non_required_publish_branch_preserves_terminal_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.work_execution import claim_work
+
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-resolved-elsewhere')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.DAILY_DIGEST,
+        lease_owner='host:1:00000000-0000-4000-8000-000000000001',
+        now=timezone.now(),
+        lease_for=timedelta(seconds=240),
+    )
+    resolved_at = timezone.now()
+    WorkflowWork.objects.filter(id=work.id).update(
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        resolution_reason=WorkflowWorkResolutionReason.NO_SIGNAL,
+        resolved_at=resolved_at,
+    )
+    monkeypatch.setattr('engram.memory.digest_work._existing_output', lambda _work: None)
+
+    result = digest_work.execute_frozen_digest_work(work, None, claimed.claim)
+
+    assert result is None
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+    assert work.resolved_at == resolved_at
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.SUCCEEDED
 
 
 @pytest.mark.django_db

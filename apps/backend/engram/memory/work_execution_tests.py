@@ -463,10 +463,27 @@ def test_claim_rejects_tampered_fingerprint() -> None:
     work = create_required_work(scope, suffix='claim-fingerprint')
     WorkflowWork.objects.filter(id=work.id).update(input_fingerprint='f' * 64)
 
-    with pytest.raises(ValueError):
-        claim(module, work, lease_owner=owner('tampered'), now=NOW)
+    result = claim(module, work, lease_owner=owner('tampered'), now=NOW)
 
-    assert get_work(work).execution_state == WorkflowWorkExecutionState.READY
+    assert result.outcome == 'terminal'
+    assert result.claim is None
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert stored.disposition == WorkflowWorkDisposition.REQUIRED
+    assert stored.fencing_token == 1
+    assert stored.failure_streak == 1
+    assert stored.lease_owner == ''
+    assert stored.lease_expires_at is None
+    assert stored.heartbeat_at is None
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == 'invalid_input'
+    assert run.failure_code == 'work_fingerprint_mismatch'
+    assert run.fencing_token == 1
+    assert run.lease_owner != ''
+    assert run.started_at is not None
+    assert run.finished_at is not None
+    assert run.configuration_fingerprint == ''
 
 
 @pytest.mark.django_db
@@ -1012,6 +1029,87 @@ def test_concurrent_reclaim_of_expired_lease_converges() -> None:
     assert get_work(work).fencing_token == 2
     assert running_v1_count(work) == 1
     assert get_run(first.claim.workflow_run_id).failure_class == 'worker_lost'
+
+
+@pytest.mark.django_db
+def test_finish_product_succeeded_resets_failure_streak() -> None:
+    module = _we()
+    scope = create_scope('finish-streak-reset')
+    work = create_required_work(scope, suffix='finish-streak-reset')
+
+    first = claim(module, work, lease_owner=owner('a'), now=NOW)
+    module.fail_work_claim(
+        claim=first.claim,
+        now=NOW,
+        failure=ClassifiedWorkFailure(failure_class='provider_transient', code='provider_timeout'),
+    )
+    due_at = NOW + timedelta(seconds=30)
+    second = claim(module, work, lease_owner=owner('b'), now=due_at)
+    assert get_work(work).failure_streak == 1
+
+    module.lock_work_fence(claim=second.claim, now=due_at)
+    module.finish_work_claim(claim=second.claim, now=due_at, completion='product_succeeded')
+
+    assert get_work(work).failure_streak == 0
+
+
+@pytest.mark.django_db
+def test_expired_running_run_redelivered_commits_worker_lost_before_raise() -> None:
+    module = _we()
+    scope = create_scope('reclaim-self')
+    work = create_required_work(scope, suffix='reclaim-self')
+
+    first = claim(module, work, lease_owner=owner('lost'), now=NOW)
+    old_run_id = first.claim.workflow_run_id
+    reclaim_at = NOW + timedelta(seconds=200)
+
+    with pytest.raises(ValueError):
+        claim(module, work, lease_owner=owner('redeliver'), now=reclaim_at, run_id=old_run_id)
+
+    old_run = get_run(old_run_id)
+    assert old_run.status == WorkflowRunStatus.FAILED
+    assert old_run.failure_class == 'worker_lost'
+    assert old_run.failure_code == 'lease_expired'
+
+
+@pytest.mark.django_db
+def test_claim_rejects_project_scope_mismatch() -> None:
+    module = _we()
+    scope = create_scope('claim-scope')
+    work = create_required_work(scope, suffix='claim-scope')
+    _org, _team, foreign_project, _agent, _session = create_scope('claim-scope-foreign')
+    WorkflowWork.objects.filter(id=work.id).update(project_id=foreign_project.id)
+
+    with pytest.raises(ValueError):
+        claim(module, work, lease_owner=owner('scope'), now=NOW)
+
+    assert get_work(work).execution_state == WorkflowWorkExecutionState.READY
+
+
+@pytest.mark.django_db
+def test_finish_claim_resolved_elsewhere_preserves_terminal_resolution() -> None:
+    module = _we()
+    scope = create_scope('resolved-elsewhere')
+    work = create_required_work(scope, suffix='resolved-elsewhere')
+
+    first = claim(module, work, lease_owner=owner('elsewhere'), now=NOW)
+    resolved_at = NOW + timedelta(seconds=1)
+    WorkflowWork.objects.filter(id=work.id).update(
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        resolution_reason=WorkflowWorkResolutionReason.NO_SIGNAL,
+        resolved_at=resolved_at,
+    )
+
+    module.finish_claim_resolved_elsewhere(claim=first.claim, now=NOW + timedelta(seconds=10))
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert stored.disposition == WorkflowWorkDisposition.COMPLETE
+    assert stored.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+    assert stored.resolved_at == resolved_at
+    assert stored.lease_owner == ''
+    assert stored.lease_expires_at is None
+    assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.SUCCEEDED
 
 
 @pytest.mark.django_db
