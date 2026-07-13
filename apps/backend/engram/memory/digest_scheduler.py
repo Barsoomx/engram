@@ -6,12 +6,15 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
+import structlog
+from django.db import Error as DatabaseError
 from django.db import transaction
 
 from engram.core.models import (
     Project,
     WorkflowRun,
     WorkflowSubjectType,
+    WorkflowWork,
     WorkflowWorkDisposition,
     WorkflowWorkType,
 )
@@ -26,8 +29,11 @@ from engram.memory.tasks import (
 )
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
+    WorkflowWorkCollisionError,
     WorkflowWorkScopeError,
 )
+
+logger = structlog.get_logger(__name__)
 
 _DAILY_CUT_HOUR = 2
 _WEEKLY_CUT_HOUR = 3
@@ -139,6 +145,27 @@ def _resolve_run(
         raise WorkflowWorkScopeError('workflow run is outside the declared work scope') from error
 
 
+def _source_count(snapshot: dict[str, object], source_key: str) -> int:
+    refs = snapshot.get(source_key)
+
+    return len(refs) if isinstance(refs, list) else 0
+
+
+def _log_frozen_decision(*, work: WorkflowWork, occurrence_key: str, proposed: dict[str, object]) -> None:
+    proposed_digest = proposed.get('input_digest')
+    frozen_digest = work.input_snapshot.get('input_digest')
+    if proposed_digest == frozen_digest:
+        return
+
+    logger.info(
+        'digest_occurrence_frozen_decision_retained',
+        work_id=str(work.id),
+        occurrence_key=occurrence_key,
+        proposed_input_digest=proposed_digest,
+        frozen_input_digest=frozen_digest,
+    )
+
+
 def _create_from_snapshot(
     *,
     project: Project,
@@ -153,8 +180,6 @@ def _create_from_snapshot(
     source_key: str,
 ) -> ScheduleResult:
     workflow_run = _resolve_run(project, work_type, team_id, workflow_run_id) if workflow_run_id is not None else None
-    refs = snapshot.get(source_key)
-    source_count = len(refs) if isinstance(refs, list) else 0
     data = CreateWorkflowWorkInput(
         organization_id=project.organization_id,
         project_id=project.id,
@@ -170,6 +195,11 @@ def _create_from_snapshot(
             signal_task=signal_task,
             workflow_run=workflow_run,
         )
+    if created:
+        source_count = _source_count(snapshot, source_key)
+    else:
+        source_count = _source_count(work.input_snapshot, source_key)
+        _log_frozen_decision(work=work, occurrence_key=occurrence_key, proposed=snapshot)
     task_enqueued = created and work.disposition == WorkflowWorkDisposition.REQUIRED
 
     return ScheduleResult(
@@ -248,13 +278,26 @@ def schedule_weekly_project(
 def _run_schedule(
     projects: Iterable[Project],
     schedule: Callable[[Project], ScheduleResult],
+    *,
+    schedule_name: str,
 ) -> dict[str, int]:
     scheduled_projects = 0
     required_work = 0
     no_input_projects = 0
     task_enqueued = 0
+    failed_projects = 0
     for project in projects:
-        result = schedule(project)
+        try:
+            result = schedule(project)
+        except (WorkflowWorkScopeError, WorkflowWorkCollisionError, ValueError, DatabaseError) as error:
+            failed_projects += 1
+            logger.warning(
+                'digest_schedule_project_failed',
+                schedule=schedule_name,
+                project_id=str(project.id),
+                error=str(error),
+            )
+            continue
         scheduled_projects += 1
         if result.disposition == WorkflowWorkDisposition.REQUIRED:
             required_work += 1
@@ -268,6 +311,7 @@ def _run_schedule(
         'required_work': required_work,
         'no_input_projects': no_input_projects,
         'task_enqueued': task_enqueued,
+        'failed_projects': failed_projects,
     }
 
 
@@ -278,6 +322,7 @@ def run_daily_schedule(*, as_of: datetime) -> dict[str, int]:
     return _run_schedule(
         Project.objects.order_by('id'),
         lambda project: schedule_daily_project(project_id=project.id, bucket=bucket, max_sources=max_sources),
+        schedule_name='daily',
     )
 
 
@@ -287,4 +332,5 @@ def run_weekly_schedule(*, as_of: datetime) -> dict[str, int]:
     return _run_schedule(
         Project.objects.order_by('id'),
         lambda project: schedule_weekly_project(project_id=project.id, bucket=bucket),
+        schedule_name='weekly',
     )

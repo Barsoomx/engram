@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+from io import StringIO
+
 import pytest
 from django.core.management import call_command
 from django.core.management.base import CommandError
 from django_celery_outbox.models import CeleryOutbox
 
+from engram.core.management.commands import engram_run_daily_digest as daily_digest_command
 from engram.core.models import WorkflowWork, WorkflowWorkDisposition, WorkflowWorkType
 from engram.memory.daily_digest_tests import create_approved_memory, create_organization_project_team
+from engram.memory.digest_scheduler import ScheduleResult, schedule_daily_project
 from engram.memory.tasks import run_scheduled_digests
 
 _DAILY_WORK_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
@@ -76,3 +80,30 @@ def test_command_rejects_out_of_range_window_days(override: str) -> None:
 
     with pytest.raises(CommandError):
         call_command('engram_run_daily_digest', '--window-days', override)
+
+
+@pytest.mark.django_db
+def test_command_isolates_failing_project_and_reports_failure_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization_a, team_a, project_a = create_organization_project_team(slug='cmd-fail-a')
+    organization_b, team_b, project_b = create_organization_project_team(slug='cmd-fail-b')
+    create_approved_memory(organization_a, project_a, team_a, title='Alpha source')
+    create_approved_memory(organization_b, project_b, team_b, title='Beta source')
+    failing, healthy = sorted((project_a, project_b), key=lambda project: str(project.id))
+
+    def failing_schedule(*, project_id: object, bucket: object, max_sources: int) -> ScheduleResult:
+        if project_id == failing.id:
+            raise ValueError('poisoned occurrence row')
+
+        return schedule_daily_project(project_id=project_id, bucket=bucket, max_sources=max_sources)
+
+    monkeypatch.setattr(daily_digest_command, 'schedule_daily_project', failing_schedule)
+
+    out = StringIO()
+    call_command('engram_run_daily_digest', stdout=out)
+
+    assert 'failed_projects=1' in out.getvalue()
+    assert 'scheduled_projects=1' in out.getvalue()
+    assert WorkflowWork.objects.filter(project=healthy).exists()
+    assert not WorkflowWork.objects.filter(project=failing).exists()

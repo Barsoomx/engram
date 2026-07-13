@@ -79,7 +79,13 @@ def test_run_scheduled_digests_returns_producer_aggregate_and_id_only_signal() -
 
     result = run_scheduled_digests()
 
-    assert set(result) == {'scheduled_projects', 'required_work', 'no_input_projects', 'task_enqueued'}
+    assert set(result) == {
+        'scheduled_projects',
+        'required_work',
+        'no_input_projects',
+        'task_enqueued',
+        'failed_projects',
+    }
     assert result['required_work'] == 1
     assert result['no_input_projects'] == 0
     assert result['scheduled_projects'] == 1
@@ -103,6 +109,7 @@ def test_run_scheduled_digests_empty_project_creates_no_input_terminal_without_s
         'required_work': 0,
         'no_input_projects': 1,
         'task_enqueued': 0,
+        'failed_projects': 0,
     }
     assert not CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).exists()
     assert WorkflowWork.objects.get().disposition == WorkflowWorkDisposition.NO_OP

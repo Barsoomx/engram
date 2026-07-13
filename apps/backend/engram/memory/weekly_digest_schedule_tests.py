@@ -102,7 +102,13 @@ def test_run_scheduled_weekly_digests_returns_aggregate_and_id_only_signal(
 ) -> None:
     result = run_scheduled_weekly_digests()
 
-    assert set(result) == {'scheduled_projects', 'required_work', 'no_input_projects', 'task_enqueued'}
+    assert set(result) == {
+        'scheduled_projects',
+        'required_work',
+        'no_input_projects',
+        'task_enqueued',
+        'failed_projects',
+    }
     assert result['required_work'] == 1
     assert result['no_input_projects'] == 1
     assert result['task_enqueued'] == 1

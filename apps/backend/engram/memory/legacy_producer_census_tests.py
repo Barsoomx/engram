@@ -23,17 +23,14 @@ _LEGACY_SESSION_CALLS = frozenset(
     }
 )
 _RETAINED_LEGACY_TASK_DEFINITIONS = ('generate_daily_digest', 'generate_weekly_digest', 'distill_session')
-_PRODUCER_SURFACES = (
-    'hook_observation_ingest',
-    'explicit_session_end',
-    'idle_session_sweep',
-    'scheduled_daily_and_weekly',
-    'project_digest_run_view',
-    'workflow_run_rerun',
-    'weekly_digest_view',
-    'management_command_daily',
-    'retry_failed_distillations',
+_LEGACY_TASK_NAMES = frozenset(
+    {
+        'engram.memory.generate_daily_digest',
+        'engram.memory.generate_weekly_digest',
+        'engram.memory.distill_session',
+    }
 )
+_DISPATCH_BY_NAME_FUNCS = frozenset({'send_task', 'signature'})
 
 
 def _call_path(node: ast.AST) -> tuple[str, ...]:
@@ -53,6 +50,16 @@ def _is_legacy_digest_call(node: ast.Call) -> bool:
 
 def _is_legacy_session_call(node: ast.Call) -> bool:
     return _call_path(node.func)[-2:] in _LEGACY_SESSION_CALLS
+
+
+def _is_legacy_dispatch_name_call(node: ast.Call) -> bool:
+    path = _call_path(node.func)
+    if not path or path[-1] not in _DISPATCH_BY_NAME_FUNCS:
+        return False
+    constants = [argument for argument in node.args if isinstance(argument, ast.Constant)]
+    constants += [keyword.value for keyword in node.keywords if isinstance(keyword.value, ast.Constant)]
+
+    return any(constant.value in _LEGACY_TASK_NAMES for constant in constants)
 
 
 def _function_def(tree: ast.Module, name: str) -> ast.FunctionDef:
@@ -129,12 +136,25 @@ def test_scheduled_producer_tasks_carry_no_legacy_digest_call() -> None:
         assert legacy == [], task_name
 
 
-def test_producer_surface_inventory_is_classified() -> None:
-    package_root, _production = _production_trees()
-    legacy_digest = {path for path, _lineno in _legacy_call_sites(_is_legacy_digest_call)}
-    legacy_session = {path for path, _lineno in _legacy_call_sites(_is_legacy_session_call)}
+@pytest.mark.parametrize(
+    'source',
+    (
+        "app.send_task('engram.memory.generate_daily_digest', args=[work_id])",
+        "app.send_task('engram.memory.generate_weekly_digest')",
+        "app.send_task(name='engram.memory.distill_session')",
+        "signature('engram.memory.generate_daily_digest')",
+    ),
+)
+def test_legacy_dispatch_name_census_recognizes_send_task_and_signature_forms(source: str) -> None:
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)]
+    assert [node for node in calls if _is_legacy_dispatch_name_call(node)]
 
-    assert len(_PRODUCER_SURFACES) == 9
-    assert legacy_digest == set()
-    assert legacy_session == set()
-    assert package_root.name == 'engram'
+
+def test_legacy_dispatch_name_census_ignores_work_v1_task_names() -> None:
+    source = "app.send_task('engram.memory.distill_session_work_v1', args=[work_id])"
+    calls = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)]
+    assert [node for node in calls if _is_legacy_dispatch_name_call(node)] == []
+
+
+def test_final_census_has_zero_legacy_task_name_dispatches() -> None:
+    assert _legacy_call_sites(_is_legacy_dispatch_name_call) == []
