@@ -43,6 +43,7 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 from engram.memory.observation_work import lock_session_for_observation, session_has_observation_history
 from engram.model_policy.services import (
     EmbeddingCallInput,
@@ -115,8 +116,12 @@ class RetrievalMatch:
 class ContextBundleResult:
     bundle: ContextBundle
     matches: tuple[RetrievalMatch, ...]
+    digest_visibility_unproven: bool = False
 
     def to_response(self) -> dict[str, object]:
+        if self.digest_visibility_unproven:
+            return self._quarantined_response()
+
         rendered_context = self.bundle.rendered_text
         hook_specific_output: dict[str, str] = {}
         if self.bundle.purpose == 'session_start':
@@ -139,6 +144,24 @@ class ContextBundleResult:
             'hook_specific_output': hook_specific_output,
             'items': [self._item_response(match) for match in self.matches],
             'warnings': list(self.bundle.metadata.get('warnings', [])),
+        }
+
+    def _quarantined_response(self) -> dict[str, object]:
+        hook_specific_output: dict[str, str] = {}
+        if self.bundle.purpose == 'session_start':
+            hook_specific_output = {'hookEventName': 'SessionStart', 'additionalContext': ''}
+        elif self.bundle.purpose == 'user_prompt_submit':
+            hook_specific_output = {'hookEventName': 'UserPromptSubmit', 'additionalContext': ''}
+
+        return {
+            'status': self.bundle.status,
+            'request_id': self.bundle.request_id,
+            'context_bundle_id': str(self.bundle.id),
+            'purpose': self.bundle.purpose,
+            'rendered_context': '',
+            'hook_specific_output': hook_specific_output,
+            'items': [],
+            'warnings': [{'code': 'context_bundle_digest_visibility_unproven'}],
         }
 
     def _item_response(self, match: RetrievalMatch) -> dict[str, object]:
@@ -336,7 +359,21 @@ def authorized_retrieval_documents(
     if not include_embeddings:
         documents = documents.defer(*retrieval_embedding_deferred_fields())
 
-    return filter_documents_by_team_visibility(documents, scope)
+    authorized = filter_documents_by_team_visibility(documents, scope)
+
+    return _quarantine_unproven_digests(authorized)
+
+
+def _quarantine_unproven_digests(documents: tuple[RetrievalDocument, ...]) -> tuple[RetrievalDocument, ...]:
+    digest_memories = [document.memory for document in documents if document.memory.kind == 'digest']
+    if not digest_memories:
+        return documents
+
+    unproven = unproven_digest_memory_ids(digest_memories)
+    if not unproven:
+        return documents
+
+    return tuple(document for document in documents if document.memory_id not in unproven)
 
 
 def request_has_terms(query: str, file_paths: tuple[str, ...], symbols: tuple[str, ...]) -> bool:
@@ -1100,6 +1137,10 @@ class BuildContextBundle:
                     inclusion_reason=item.inclusion_reason,
                 ),
             )
+
+        digest_memories = [match.document.memory for match in matches if match.document.memory.kind == 'digest']
+        if digest_memories and unproven_digest_memory_ids(digest_memories):
+            return ContextBundleResult(bundle=bundle, matches=(), digest_visibility_unproven=True)
 
         return ContextBundleResult(bundle=bundle, matches=tuple(matches))
 

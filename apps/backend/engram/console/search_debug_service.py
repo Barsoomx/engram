@@ -22,6 +22,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 DEFAULT_PACK_LIMIT = 20
 
@@ -112,7 +113,10 @@ class ReplaySearchDebug:
             'team_ids': [str(tid) for tid in sorted(allowed_team_ids)],
         }
 
-        authorized, excluded = self._classify_documents(all_documents, allowed_team_ids)
+        unproven_digest_ids = unproven_digest_memory_ids(
+            [doc.memory for doc in all_documents if doc.memory.kind == 'digest'],
+        )
+        authorized, excluded = self._classify_documents(all_documents, allowed_team_ids, unproven_digest_ids)
 
         has_request_terms = bool(query.strip() or file_paths or symbols)
         scored, scoring_excluded = self._score_authorized(authorized, query, file_paths, symbols, has_request_terms)
@@ -165,12 +169,13 @@ class ReplaySearchDebug:
         self,
         documents: list[RetrievalDocument],
         allowed_team_ids: set[uuid.UUID],
+        unproven_digest_ids: set[uuid.UUID],
     ) -> tuple[list[RetrievalDocument], list[DebugExcluded]]:
         authorized: list[RetrievalDocument] = []
         excluded: list[DebugExcluded] = []
 
         for doc in documents:
-            reason = self._exclusion_reason(doc, allowed_team_ids)
+            reason = self._exclusion_reason(doc, allowed_team_ids, unproven_digest_ids)
             if reason:
                 excluded.append(
                     DebugExcluded(
@@ -362,8 +367,12 @@ class ReplaySearchDebug:
         self,
         doc: RetrievalDocument,
         allowed_team_ids: set[uuid.UUID],
+        unproven_digest_ids: set[uuid.UUID],
     ) -> str:
         memory = doc.memory
+
+        if doc.memory_id in unproven_digest_ids:
+            return 'digest_visibility_unproven'
 
         if memory.status != MemoryStatus.APPROVED:
             return 'not_approved'

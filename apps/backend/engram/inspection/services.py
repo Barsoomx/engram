@@ -23,6 +23,7 @@ from engram.inspection.filters import (
     InspectionContextBundleFilterSet,
     InspectionMemoryFilterSet,
 )
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 
 class InspectionNotFoundError(Exception):
@@ -63,6 +64,7 @@ class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
         ordering = self._ordering(inspection_scope.ordering)
         qs = self._base_queryset(inspection_scope).order_by(ordering, 'id')
+        qs = self._quarantine(qs, inspection_scope)
         filter_data = {
             'status': inspection_scope.status or MemoryStatus.APPROVED,
             'kind': inspection_scope.kind,
@@ -78,7 +80,8 @@ class ListInspectionMemories:
         return DEFAULT_MEMORY_ORDERING
 
     def detail(self, inspection_scope: InspectionScope, memory_id: uuid.UUID) -> Memory:
-        memory = self._base_queryset(inspection_scope).filter(id=memory_id).first()
+        qs = self._quarantine(self._base_queryset(inspection_scope), inspection_scope)
+        memory = qs.filter(id=memory_id).first()
         if memory is None:
             raise InspectionNotFoundError('memory_not_found', 'Memory was not found')
 
@@ -89,6 +92,7 @@ class ListInspectionMemories:
             organization_id=inspection_scope.scope.organization_id,
             project=inspection_scope.project,
         ).filter(inspection_scope.team_filter)
+        qs = self._quarantine(qs, inspection_scope)
         filter_data = {
             'status': inspection_scope.status or MemoryStatus.APPROVED,
             'kind': inspection_scope.kind,
@@ -96,6 +100,18 @@ class ListInspectionMemories:
         }
 
         return InspectionMemoryFilterSet(data=filter_data, queryset=qs).qs.count()
+
+    def _quarantine(self, queryset: QuerySet[Memory], inspection_scope: InspectionScope) -> QuerySet[Memory]:
+        digests = Memory.objects.filter(
+            organization_id=inspection_scope.scope.organization_id,
+            project=inspection_scope.project,
+            kind='digest',
+        ).filter(inspection_scope.team_filter)
+        unproven = unproven_digest_memory_ids(digests)
+        if unproven:
+            return queryset.exclude(id__in=unproven)
+
+        return queryset
 
     def related_memories(
         self,
