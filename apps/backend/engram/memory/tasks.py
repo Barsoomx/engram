@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta
 
 import structlog
 from django.db import transaction
@@ -11,13 +10,9 @@ from django.utils import timezone
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import (
-    Memory,
-    MemoryStatus,
     Observation,
-    Project,
     WorkflowRun,
     WorkflowRunStatus,
-    WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
@@ -33,7 +28,6 @@ from engram.memory.distillation import (
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
-    WEEKLY_DIGEST_WINDOW_DAYS,
     MemoryCandidateWorkerInput,
     MemoryCandidateWorkerResult,
     MemoryWorkerError,
@@ -874,60 +868,16 @@ def reembed_missing_embeddings() -> dict[str, int]:
 
 @app.task(name='engram.memory.run_scheduled_weekly_digests')
 def run_scheduled_weekly_digests() -> dict[str, int]:
-    enqueued_projects = 0
-    enqueued_tasks = 0
+    from engram.memory.digest_scheduler import run_weekly_schedule
 
-    weekly_window_start = timezone.now() - timedelta(days=WEEKLY_DIGEST_WINDOW_DAYS)
-
-    for project in Project.objects.all():
-        has_approved = (
-            Memory.objects.filter(
-                organization_id=project.organization_id,
-                project=project,
-                status=MemoryStatus.APPROVED,
-                updated_at__gte=weekly_window_start,
-            )
-            .exclude(kind='digest')
-            .exists()
-        )
-        if not has_approved:
-            continue
-
-        generate_weekly_digest.delay(
-            str(project.organization_id),
-            str(project.id),
-        )
-        enqueued_projects += 1
-        enqueued_tasks += 1
-
-    return {
-        'enqueued_projects': enqueued_projects,
-        'enqueued_tasks': enqueued_tasks,
-    }
+    return run_weekly_schedule(as_of=timezone.now())
 
 
 @app.task(name='engram.memory.run_scheduled_digests')
 def run_scheduled_digests() -> dict[str, int]:
-    enqueued_projects = 0
-    enqueued_tasks = 0
+    from engram.memory.digest_scheduler import run_daily_schedule
 
-    for project in Project.objects.all():
-        memory_ids = recent_approved_memory_ids(project)
-        if not memory_ids:
-            continue
-
-        generate_daily_digest.delay(
-            str(project.organization_id),
-            str(project.id),
-            [str(value) for value in memory_ids],
-        )
-        enqueued_projects += 1
-        enqueued_tasks += 1
-
-    return {
-        'enqueued_projects': enqueued_projects,
-        'enqueued_tasks': enqueued_tasks,
-    }
+    return run_daily_schedule(as_of=timezone.now())
 
 
 @app.task(name='engram.memory.sweep_stale_sessions')
@@ -983,49 +933,3 @@ def expire_stale_candidates() -> dict[str, int]:
     )
 
     return {'scanned': result.scanned, 'rejected': result.rejected}
-
-
-def _daily_digest_window_days() -> int:
-    return int(os.environ.get('ENGRAM_DAILY_DIGEST_WINDOW_DAYS', '1'))
-
-
-def _daily_digest_max_window_days() -> int:
-    return int(os.environ.get('ENGRAM_DAILY_DIGEST_MAX_WINDOW_DAYS', '7'))
-
-
-def daily_digest_window_start(project: Project, now: datetime | None = None) -> datetime:
-    now = now or timezone.now()
-    floor_start = now - timedelta(days=_daily_digest_max_window_days())
-    last_success = (
-        WorkflowRun.objects.filter(
-            organization_id=project.organization_id,
-            project=project,
-            run_type=WorkflowRunType.DAILY_DIGEST,
-            status=WorkflowRunStatus.SUCCEEDED,
-            finished_at__isnull=False,
-        )
-        .order_by('-finished_at')
-        .values_list('finished_at', flat=True)
-        .first()
-    )
-    if last_success is not None:
-        candidate = last_success
-    else:
-        candidate = now - timedelta(days=_daily_digest_window_days())
-
-    return max(candidate, floor_start)
-
-
-def recent_approved_memory_ids(project: Project) -> list[uuid.UUID]:
-    window_start = daily_digest_window_start(project)
-
-    return list(
-        Memory.objects.filter(
-            organization_id=project.organization_id,
-            project=project,
-            status=MemoryStatus.APPROVED,
-            updated_at__gte=window_start,
-        )
-        .exclude(kind='digest')
-        .values_list('id', flat=True),
-    )
