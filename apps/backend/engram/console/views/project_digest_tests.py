@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
 from datetime import timedelta
-from unittest.mock import patch
 
 import pytest
 from django.contrib.auth.models import User
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
@@ -16,6 +17,7 @@ from engram.access.models import (
     Identity,
     IdentityType,
     OrganizationMembership,
+    ProjectGrant,
     Role,
     RoleCapability,
 )
@@ -23,13 +25,20 @@ from engram.core.models import (
     AuditEvent,
     Memory,
     MemoryStatus,
+    MemoryVersion,
     Organization,
     Project,
     VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
+
+_DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 
 
 def _make_user(username: str) -> User:
@@ -78,7 +87,7 @@ def _make_client(token: str, organization: Organization) -> APIClient:
 
 
 def _make_approved_memory(org: Organization, project: Project) -> Memory:
-    return Memory.objects.create(
+    memory = Memory.objects.create(
         organization=org,
         project=project,
         title='recent approved memory',
@@ -86,6 +95,17 @@ def _make_approved_memory(org: Organization, project: Project) -> Memory:
         status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
+    MemoryVersion.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        version=memory.current_version,
+        body='body',
+        content_hash=hashlib.sha256(b'body').hexdigest(),
+    )
+    Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(hours=1))
+
+    return memory
 
 
 def _endpoint(project_id: object) -> str:
@@ -121,11 +141,12 @@ def f_other_project(f_other_org: Organization) -> Project:
 
 
 @pytest.fixture
-def f_admin_client(f_org: Organization) -> APIClient:
+def f_admin_client(f_org: Organization, f_project: Project) -> APIClient:
     user = _make_user('digest-run-admin')
     identity = _make_identity(user, f_org)
     role = _make_role_with_capabilities('digest_run_admin_role', ('memories:admin',))
     OrganizationMembership.objects.create(organization=f_org, identity=identity, role=role)
+    ProjectGrant.objects.create(organization=f_org, project=f_project, identity=identity, role=role)
     token = Token.objects.create(user=user).key
 
     return _make_client(token, f_org)
@@ -143,51 +164,44 @@ def f_no_cap_client(f_org: Organization) -> APIClient:
 
 
 @pytest.mark.django_db
-def test_post_digest_run_enqueues_with_recent_memory_ids(
-    f_admin_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_approved_memory(f_org, f_project)
-
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_project.id))
-
-    assert response.status_code == 202
-
-    assert response.data['enqueued'] is True
-
-    m_task.delay.assert_called_once()
-
-    args = m_task.delay.call_args[0]
-
-    assert args[0] == str(f_org.id)
-
-    assert args[1] == str(f_project.id)
-
-    assert args[2] == [str(memory.id)]
-
-
-@pytest.mark.django_db
-def test_post_digest_run_returns_workflow_visibility_hint(
+def test_post_digest_run_creates_work_linked_run_and_composite_package(
     f_admin_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
     _make_approved_memory(f_org, f_project)
 
-    with patch('engram.console.views.project_digest.generate_daily_digest'):
-        response = f_admin_client.post(_endpoint(f_project.id))
+    response = f_admin_client.post(_endpoint(f_project.id))
 
     assert response.status_code == 202
 
-    workflow = response.data['workflow']
+    assert response.data['enqueued'] is True
 
-    assert workflow['run_type'] == WorkflowRunType.DAILY_DIGEST.value
+    work = WorkflowWork.objects.get(
+        organization=f_org,
+        project=f_project,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+    )
 
-    assert workflow['project_id'] == str(f_project.id)
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
-    assert workflow['request_id'].startswith(f'daily-digest:{f_project.id}:')
+    assert work.occurrence_key != ''
+
+    run = WorkflowRun.objects.get(work=work)
+
+    assert run.status == WorkflowRunStatus.QUEUED
+
+    assert run.run_type == WorkflowRunType.DAILY_DIGEST
+
+    outbox = CeleryOutbox.objects.get()
+
+    assert outbox.task_name == _DAILY_TASK_NAME
+
+    assert outbox.args == [str(work.id), str(run.id)]
+
+    assert outbox.kwargs == {}
+
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{run.id}'
 
 
 @pytest.mark.django_db
@@ -198,8 +212,7 @@ def test_post_digest_run_writes_audit_event(
 ) -> None:
     _make_approved_memory(f_org, f_project)
 
-    with patch('engram.console.views.project_digest.generate_daily_digest'):
-        f_admin_client.post(_endpoint(f_project.id))
+    f_admin_client.post(_endpoint(f_project.id))
 
     event = AuditEvent.objects.filter(
         organization=f_org,
@@ -211,109 +224,81 @@ def test_post_digest_run_writes_audit_event(
 
     assert event.target_type == 'project'
 
-    assert event.metadata['memory_count'] == 1
-
 
 @pytest.mark.django_db
-def test_post_digest_run_empty_window_does_not_enqueue(
-    f_admin_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_project.id))
-
-    assert response.status_code == 200
-
-    assert response.data['enqueued'] is False
-
-    assert response.data['reason'] == 'no_recent_memories'
-
-    m_task.delay.assert_not_called()
-
-
-@pytest.mark.django_db
-def test_post_digest_run_empty_window_writes_no_audit_event(
-    f_admin_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    with patch('engram.console.views.project_digest.generate_daily_digest'):
-        f_admin_client.post(_endpoint(f_project.id))
-
-    assert not AuditEvent.objects.filter(
-        organization=f_org,
-        event_type='DailyDigestRunRequested',
-    ).exists()
-
-
-@pytest.mark.django_db
-def test_post_digest_run_creates_queued_workflow_run(
-    f_admin_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_approved_memory(f_org, f_project)
-
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_project.id))
-
-    assert response.status_code == 202
-
-    run = WorkflowRun.objects.get(
-        organization=f_org,
-        project=f_project,
-        run_type=WorkflowRunType.DAILY_DIGEST,
-    )
-
-    assert run.status == WorkflowRunStatus.QUEUED
-
-    assert run.input_snapshot['memory_ids'] == [str(memory.id)]
-
-    assert response.data['workflow']['request_id'] == run.request_id
-
-    assert m_task.delay.call_args[1]['workflow_run_id'] == str(run.id)
-
-
-@pytest.mark.django_db
-def test_post_digest_run_concurrent_second_request_conflicts(
+def test_post_digest_run_reuses_work_across_manual_requests_with_distinct_runs(
     f_admin_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
     _make_approved_memory(f_org, f_project)
 
-    with (
-        patch('engram.console.views.project_digest.generate_daily_digest') as m_task,
-        patch(
-            'engram.console.views.project_digest._has_active_daily_digest_run',
-            return_value=False,
-        ),
-    ):
-        first = f_admin_client.post(_endpoint(f_project.id))
-        second = f_admin_client.post(_endpoint(f_project.id))
+    first = f_admin_client.post(_endpoint(f_project.id))
 
     assert first.status_code == 202
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+
+    run_one = WorkflowRun.objects.get(work=work)
+
+    WorkflowRun.objects.filter(id=run_one.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        finished_at=timezone.now(),
+    )
+
+    second = f_admin_client.post(_endpoint(f_project.id))
+
+    assert second.status_code == 202
+
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+
+    runs = WorkflowRun.objects.filter(work=work)
+
+    assert runs.count() == 2
+
+    run_two = runs.exclude(id=run_one.id).get()
+
+    assert run_two.id != run_one.id
+
+    assert CeleryOutbox.objects.count() == 2
+
+    outbox_two = CeleryOutbox.objects.get(task_id=f'workflow-work:{work.id}:run:{run_two.id}')
+
+    assert outbox_two.task_name == _DAILY_TASK_NAME
+
+    assert outbox_two.args == [str(work.id), str(run_two.id)]
+
+
+@pytest.mark.django_db
+def test_post_digest_run_active_run_conflict_creates_no_rows(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    _make_approved_memory(f_org, f_project)
+
+    first = f_admin_client.post(_endpoint(f_project.id))
+
+    assert first.status_code == 202
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+
+    second = f_admin_client.post(_endpoint(f_project.id))
 
     assert second.status_code == 409
 
     assert second.data['code'] == 'daily_digest_already_running'
 
-    assert m_task.delay.call_count == 1
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
 
-    assert (
-        WorkflowRun.objects.filter(
-            organization=f_org,
-            project=f_project,
-            run_type=WorkflowRunType.DAILY_DIGEST,
-        ).count()
-        == 1
-    )
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+
+    assert CeleryOutbox.objects.count() == 1
 
 
 @pytest.mark.django_db
 @pytest.mark.parametrize('running_status', [WorkflowRunStatus.QUEUED, WorkflowRunStatus.RUNNING])
-def test_post_digest_run_conflicts_when_run_in_flight(
+def test_post_digest_run_conflicts_with_preexisting_active_run(
     f_admin_client: APIClient,
     f_org: Organization,
     f_project: Project,
@@ -328,14 +313,15 @@ def test_post_digest_run_conflicts_when_run_in_flight(
         status=running_status,
     )
 
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_project.id))
+    response = f_admin_client.post(_endpoint(f_project.id))
 
     assert response.status_code == 409
 
     assert response.data['code'] == 'daily_digest_already_running'
 
-    m_task.delay.assert_not_called()
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 0
+
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -354,12 +340,43 @@ def test_post_digest_run_ignores_finished_runs_for_conflict(
 
     _make_approved_memory(f_org, f_project)
 
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_project.id))
+    response = f_admin_client.post(_endpoint(f_project.id))
 
     assert response.status_code == 202
 
-    m_task.delay.assert_called_once()
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
+
+
+@pytest.mark.django_db
+def test_post_digest_run_empty_input_creates_terminal_no_input_work_without_package(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    response = f_admin_client.post(_endpoint(f_project.id))
+
+    assert response.status_code == 200
+
+    assert response.data['enqueued'] is False
+
+    assert response.data['reason'] == 'no_recent_memories'
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.DAILY_DIGEST).count() == 0
+
+    assert CeleryOutbox.objects.count() == 0
+
+    assert not AuditEvent.objects.filter(
+        organization=f_org,
+        event_type='DailyDigestRunRequested',
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -401,9 +418,10 @@ def test_post_digest_run_tenant_isolation(
 ) -> None:
     _make_approved_memory(f_other_org, f_other_project)
 
-    with patch('engram.console.views.project_digest.generate_daily_digest') as m_task:
-        response = f_admin_client.post(_endpoint(f_other_project.id))
+    response = f_admin_client.post(_endpoint(f_other_project.id))
 
     assert response.status_code == 404
 
-    m_task.delay.assert_not_called()
+    assert WorkflowWork.objects.count() == 0
+
+    assert CeleryOutbox.objects.count() == 0
