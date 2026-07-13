@@ -67,6 +67,7 @@ _DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
 
 _OBSERVATION_LEASE = timedelta(seconds=120)
 _SESSION_LEASE = timedelta(seconds=720)
+_DIGEST_LEASE = timedelta(seconds=240)
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
 
@@ -286,7 +287,7 @@ def _lease_owner(task: object) -> str:
 
 
 def _root_cause_error(error: Exception) -> BaseException:
-    if isinstance(error, MemoryWorkerError) and error.__cause__ is not None:
+    if isinstance(error, MemoryWorkerError) and not error.code and error.__cause__ is not None:
         return error.__cause__
 
     return error
@@ -327,29 +328,6 @@ def _finalize_observation_work(
     return
 
 
-def _prepare_versioned_work(
-    *,
-    work_id: object,
-    workflow_run_id: object,
-    expected_work_type: str,
-    allow_succeeded_run: bool = False,
-) -> tuple[WorkflowWork, WorkflowRun | None, bool]:
-    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
-    work = _load_versioned_work(parsed_work_id, expected_work_type)
-    workflow_run = (
-        _load_workflow_run(
-            work,
-            parsed_run_id,
-            allow_succeeded=allow_succeeded_run,
-        )
-        if parsed_run_id is not None
-        else None
-    )
-    automatic_terminal = workflow_run is None and work.disposition != WorkflowWorkDisposition.REQUIRED
-
-    return work, workflow_run, automatic_terminal
-
-
 def _verify_work_fingerprint(work: WorkflowWork) -> None:
     try:
         fingerprint = work_input_fingerprint(
@@ -361,10 +339,13 @@ def _verify_work_fingerprint(work: WorkflowWork) -> None:
             input_snapshot=work.input_snapshot,
         )
     except ValueError as error:
-        raise MemoryWorkerError('workflow work fingerprint is invalid') from error
+        raise MemoryWorkerError('workflow work fingerprint is invalid', code='work_contract_invalid') from error
 
     if fingerprint != work.input_fingerprint:
-        raise MemoryWorkerError('workflow work fingerprint does not match frozen input')
+        raise MemoryWorkerError(
+            'workflow work fingerprint does not match frozen input',
+            code='work_fingerprint_mismatch',
+        )
 
 
 def _load_observation_work_subject(work: WorkflowWork) -> Observation:
@@ -771,32 +752,23 @@ def generate_daily_digest(
     return str(result.memory.id)
 
 
-def _run_digest_work(
-    task: object,
-    work: WorkflowWork,
-    workflow_run: WorkflowRun | None,
-    automatic_terminal: bool,
-) -> str:
+def _run_digest_explicit_delivery(task: object, work: WorkflowWork, workflow_run_id: uuid.UUID) -> str:
     from engram.memory.digest_work import execute_frozen_digest_work
 
-    if automatic_terminal:
-        return str(work.id)
-
-    if workflow_run is not None:
-        duplicate_via = 'load'
-        if workflow_run.status == WorkflowRunStatus.QUEUED:
-            workflow_run = _claim_workflow_run(work, workflow_run)
-            duplicate_via = 'claim_cas_loss'
-        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-            return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
-        if workflow_run.status != WorkflowRunStatus.RUNNING:
-            raise MemoryWorkerError('workflow run claim returned invalid status')
+    workflow_run = _load_workflow_run(work, workflow_run_id, allow_succeeded=True)
+    duplicate_via = 'load'
+    if workflow_run.status == WorkflowRunStatus.QUEUED:
+        workflow_run = _claim_workflow_run(work, workflow_run)
+        duplicate_via = 'claim_cas_loss'
+    if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+        return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
+    if workflow_run.status != WorkflowRunStatus.RUNNING:
+        raise MemoryWorkerError('workflow run claim returned invalid status')
 
     structlog.contextvars.clear_contextvars()
     try:
         result_memory_id = execute_frozen_digest_work(work, workflow_run)
-        if workflow_run is not None:
-            _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
+        _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
     except MemoryWorkerError as exc:
         can_retry = exc.retryable and task.request.retries < task.max_retries
         _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
@@ -810,7 +782,53 @@ def _run_digest_work(
     finally:
         structlog.contextvars.clear_contextvars()
 
-    return str(workflow_run.id if workflow_run is not None else work.id)
+    return str(workflow_run.id)
+
+
+def _run_digest_automatic_delivery(task: object, work: WorkflowWork, expected_work_type: str) -> str:
+    from engram.memory.digest_work import execute_frozen_digest_work
+
+    _verify_work_fingerprint(work)
+
+    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+        logger.info(
+            'digest_work_already_resolved',
+            work_id=str(work.id),
+            disposition=work.disposition,
+        )
+
+        return str(work.id)
+
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=expected_work_type,
+        lease_owner=_lease_owner(task),
+        now=timezone.now(),
+        lease_for=_DIGEST_LEASE,
+    )
+    if claim_result.outcome in _NON_EXECUTING_CLAIM_OUTCOMES:
+        logger.info(
+            'digest_work_claim_skipped',
+            work_id=str(work.id),
+            outcome=claim_result.outcome,
+        )
+
+        return str(work.id)
+
+    claim = claim_result.claim
+    structlog.contextvars.clear_contextvars()
+    try:
+        if work.work_type == WorkflowWorkType.DAILY_DIGEST:
+            heartbeat_work(claim=claim, now=timezone.now(), lease_for=_DIGEST_LEASE)
+        execute_frozen_digest_work(work, None, claim)
+    except Exception as error:
+        _record_claim_failure(work, claim, error)
+
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    return str(claim.workflow_run_id)
 
 
 @app.task(
@@ -825,14 +843,13 @@ def generate_daily_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.DAILY_DIGEST,
-        allow_succeeded_run=True,
-    )
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.DAILY_DIGEST)
 
-    return _run_digest_work(self, work, workflow_run, automatic_terminal)
+    if parsed_run_id is not None:
+        return _run_digest_explicit_delivery(self, work, parsed_run_id)
+
+    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.DAILY_DIGEST)
 
 
 @app.task(
@@ -892,14 +909,13 @@ def generate_weekly_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.WEEKLY_DIGEST,
-        allow_succeeded_run=True,
-    )
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.WEEKLY_DIGEST)
 
-    return _run_digest_work(self, work, workflow_run, automatic_terminal)
+    if parsed_run_id is not None:
+        return _run_digest_explicit_delivery(self, work, parsed_run_id)
+
+    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.WEEKLY_DIGEST)
 
 
 @app.task(name='engram.memory.reembed_missing_embeddings')

@@ -137,9 +137,10 @@ class MemoryCandidateWorkerResult:
 
 
 class MemoryWorkerError(Exception):
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
+    def __init__(self, message: str, *, retryable: bool = False, code: str = '') -> None:
         super().__init__(message)
         self.retryable = retryable
+        self.code = code
 
 
 @dataclass(frozen=True)

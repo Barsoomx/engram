@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from django.db.utils import DatabaseError
 
+from engram.memory.services import MemoryWorkerError
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 
 WORKER_LOST = 'worker_lost'
@@ -23,6 +24,14 @@ _BACKOFF = {
     PROVIDER_TRANSIENT: (30, 1800),
     UNEXPECTED: (300, 21600),
 }
+
+_WORKER_INVALID_INPUT_CODES = frozenset(
+    {
+        'work_contract_invalid',
+        'work_scope_invalid',
+        'work_fingerprint_mismatch',
+    }
+)
 
 _MODEL_POLICY_CODE_MAP = {
     'provider_timeout': (PROVIDER_TRANSIENT, 'provider_timeout'),
@@ -86,6 +95,9 @@ def _classify_model_policy(error: ModelPolicyError) -> tuple[str, str]:
 
 
 def _classify(error: BaseException) -> tuple[str, str]:
+    if isinstance(error, MemoryWorkerError) and error.code in _WORKER_INVALID_INPUT_CODES:
+        return INVALID_INPUT, error.code
+
     if isinstance(error, ModelPolicyError):
         return _classify_model_policy(error)
 
