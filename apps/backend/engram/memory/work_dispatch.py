@@ -30,12 +30,26 @@ def _require_aware(now: datetime) -> None:
     return
 
 
+def work_task_signature(
+    work_id: uuid.UUID,
+    workflow_run_id: uuid.UUID | None = None,
+) -> tuple[list[str], str]:
+    args = [str(work_id)]
+    task_id = f'workflow-work:{work_id}'
+    if workflow_run_id is not None:
+        args.append(str(workflow_run_id))
+        task_id = f'{task_id}:run:{workflow_run_id}'
+
+    return args, task_id
+
+
 def _signal_package(task_name: str, work_id: uuid.UUID, run_id: uuid.UUID) -> None:
+    args, task_id = work_task_signature(work_id, run_id)
     app.send_task(
         task_name,
-        args=[str(work_id), str(run_id)],
+        args=args,
         kwargs={},
-        task_id=f'workflow-work:{work_id}:run:{run_id}',
+        task_id=task_id,
     )
 
     return

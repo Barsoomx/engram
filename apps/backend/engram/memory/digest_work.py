@@ -33,7 +33,12 @@ from engram.memory.services import (
     weekly_digest_content_hash,
 )
 from engram.memory.tasks import _verify_work_fingerprint, dispatch_work_task
-from engram.memory.work_execution import WorkClaim, finish_work_claim, lock_work_fence
+from engram.memory.work_execution import (
+    WorkClaim,
+    finish_claim_resolved_elsewhere,
+    finish_work_claim,
+    lock_work_fence,
+)
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     WorkflowWorkScopeError,
@@ -730,6 +735,15 @@ def _finish_reused_claim(claim: WorkClaim | None, memory_id: UUID | None) -> Non
     return
 
 
+def _release_claim_resolved_elsewhere(claim: WorkClaim | None) -> None:
+    if claim is None:
+        return
+
+    finish_claim_resolved_elsewhere(claim=claim, now=datetime.now(UTC))
+
+    return
+
+
 def _lock_work_for_publish(work: WorkflowWork, claim: WorkClaim | None) -> WorkflowWork:
     if claim is not None:
         locked_work, _run = lock_work_fence(claim=claim, now=datetime.now(UTC))
@@ -774,10 +788,9 @@ def execute_frozen_digest_work(
 
             return existing
         if locked_work.disposition != WorkflowWorkDisposition.REQUIRED:
-            reused = _existing_output(locked_work)
-            _finish_reused_claim(claim, reused)
+            _release_claim_resolved_elsewhere(claim)
 
-            return reused
+            return None
 
         _lock_and_revalidate(work, refs, team)
 

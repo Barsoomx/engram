@@ -106,6 +106,24 @@ def _envelope_section(envelope: ProviderSecretEnvelope | None) -> dict[str, obje
     }
 
 
+def _unavailable_marker(
+    work: WorkflowWork,
+    task_type: str,
+    error: ModelPolicyError | ProviderSecretError,
+) -> dict[str, object]:
+    code = getattr(error, 'code', '') or getattr(error, 'error_code', '')
+
+    return {
+        'status': 'unavailable',
+        'error_type': type(error).__name__,
+        'code': code,
+        'organization_id': str(work.organization_id),
+        'project_id': str(work.project_id),
+        'team_id': str(work.team_id) if work.team_id else None,
+        'task_type': task_type,
+    }
+
+
 def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
     task_type = _TASK_TYPE_BY_WORK.get(work.work_type, '')
     try:
@@ -117,9 +135,11 @@ def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
                 task_type=task_type,
             )
         )
-    except (ModelPolicyError, ProviderSecretError):
+    except (ModelPolicyError, ProviderSecretError) as error:
+        marker = _unavailable_marker(work, task_type, error)
+
         return {
-            'model_policy': {'status': 'unavailable'},
+            'model_policy': marker,
             'provider_secret': {'status': 'unavailable'},
             'envelope': {'status': 'unavailable'},
         }
@@ -185,19 +205,72 @@ def _lock_work(work_id: uuid.UUID, expected_work_type: str) -> WorkflowWork:
         raise ValueError('workflow work does not match the expected type or scope') from error
 
 
-def _revalidate_identity(work: WorkflowWork) -> None:
-    fingerprint = work_input_fingerprint(
-        work_type=work.work_type,
-        subject_type=work.subject_type,
-        subject_id=work.subject_id,
-        contract_version=work.contract_version,
-        occurrence_key=work.occurrence_key,
-        input_snapshot=work.input_snapshot,
-    )
-    if fingerprint != work.input_fingerprint:
-        raise ValueError('workflow work fingerprint does not match its immutable snapshot')
+def _revalidate_scope(work: WorkflowWork) -> None:
+    if work.project.organization_id != work.organization_id:
+        raise ValueError('workflow work project scope is invalid')
+
+    if work.team_id is not None and work.team.organization_id != work.organization_id:
+        raise ValueError('workflow work team scope is invalid')
 
     return
+
+
+def _fingerprint_matches(work: WorkflowWork) -> bool:
+    try:
+        fingerprint = work_input_fingerprint(
+            work_type=work.work_type,
+            subject_type=work.subject_type,
+            subject_id=work.subject_id,
+            contract_version=work.contract_version,
+            occurrence_key=work.occurrence_key,
+            input_snapshot=work.input_snapshot,
+        )
+    except ValueError:
+        return False
+
+    return fingerprint == work.input_fingerprint
+
+
+def _terminalize_fingerprint_mismatch(work: WorkflowWork, *, lease_owner: str, now: datetime) -> None:
+    token = work.fencing_token + 1
+    WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
+        run_type=work.work_type,
+        status=WorkflowRunStatus.FAILED,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.AUTOMATIC,
+        fencing_token=token,
+        lease_owner=lease_owner,
+        started_at=now,
+        finished_at=now,
+        failure_class=INVALID_INPUT,
+        failure_code='work_fingerprint_mismatch',
+        input_snapshot=work.input_snapshot,
+    )
+    work.execution_state = WorkflowWorkExecutionState.TERMINAL_FAILURE
+    work.fencing_token = token
+    work.next_retry_at = None
+    work.blocked_configuration_fingerprint = ''
+    work.failure_streak = work.failure_streak + 1
+    _clear_lease_fields(work)
+    work.save(update_fields=list(_LEASE_WORK_FIELDS))
+
+    return
+
+
+def _handle_identity(work: WorkflowWork, *, lease_owner: str, now: datetime) -> ClaimResult | None:
+    if _fingerprint_matches(work):
+        return None
+
+    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+        raise ValueError('workflow work fingerprint does not match its immutable snapshot')
+
+    _terminalize_fingerprint_mismatch(work, lease_owner=lease_owner, now=now)
+
+    return ClaimResult(outcome='terminal', claim=None)
 
 
 def _locked_v1_runs(work: WorkflowWork) -> list[WorkflowRun]:
@@ -337,6 +410,71 @@ def _do_claim(
     )
 
 
+def _short_circuit_state(work: WorkflowWork, *, now: datetime, is_automatic: bool) -> ClaimResult | None:
+    state = work.execution_state
+
+    if state in _TERMINAL_EXECUTION_STATES and is_automatic:
+        return ClaimResult(outcome='terminal', claim=None)
+
+    if state == WorkflowWorkExecutionState.RETRY_WAIT and now < work.next_retry_at:
+        return ClaimResult(outcome='not_due', claim=None)
+
+    if state == WorkflowWorkExecutionState.BLOCKED:
+        current_fingerprint = execution_configuration_fingerprint(work)
+        if current_fingerprint == work.blocked_configuration_fingerprint:
+            return ClaimResult(outcome='blocked', claim=None)
+
+        work.failure_streak = 0
+        work.blocked_configuration_fingerprint = ''
+
+    return None
+
+
+def _handle_leased_state(
+    work: WorkflowWork,
+    runs: list[WorkflowRun],
+    *,
+    now: datetime,
+    lease_owner: str,
+    workflow_run_id: uuid.UUID | None,
+) -> ClaimResult | None:
+    running = _running_run(runs)
+    if now < work.lease_expires_at:
+        if running is not None and workflow_run_id == running.id and lease_owner == work.lease_owner:
+            return ClaimResult(
+                outcome='replayed',
+                claim=WorkClaim(
+                    work_id=work.id,
+                    workflow_run_id=running.id,
+                    fencing_token=work.fencing_token,
+                    lease_owner=work.lease_owner,
+                    lease_expires_at=work.lease_expires_at,
+                ),
+            )
+
+        return ClaimResult(outcome='busy', claim=None)
+
+    if running is not None:
+        _fail_run_worker_lost(running, now)
+
+    return None
+
+
+def _resolve_supplied_run(
+    runs: list[WorkflowRun],
+    workflow_run_id: uuid.UUID | None,
+    *,
+    is_automatic: bool,
+) -> tuple[WorkflowRun | None, ValueError | None]:
+    if is_automatic:
+        return None, None
+
+    try:
+        return _select_supplied_run(runs, workflow_run_id), None
+    except ValueError as error:
+        return None, error
+
+
 def claim_work(
     *,
     work_id: uuid.UUID,
@@ -351,49 +489,34 @@ def claim_work(
 
     with transaction.atomic():
         work = _lock_work(work_id, expected_work_type)
-        _revalidate_identity(work)
+        _revalidate_scope(work)
         runs = _locked_v1_runs(work)
-        state = work.execution_state
         is_automatic = workflow_run_id is None
 
-        if state in _TERMINAL_EXECUTION_STATES and is_automatic:
-            return ClaimResult(outcome='terminal', claim=None)
+        short_circuit = _short_circuit_state(work, now=now, is_automatic=is_automatic)
+        if short_circuit is not None:
+            return short_circuit
 
-        if state == WorkflowWorkExecutionState.RETRY_WAIT:
-            if now < work.next_retry_at:
-                return ClaimResult(outcome='not_due', claim=None)
-        elif state == WorkflowWorkExecutionState.BLOCKED:
-            current_fingerprint = execution_configuration_fingerprint(work)
-            if current_fingerprint == work.blocked_configuration_fingerprint:
-                return ClaimResult(outcome='blocked', claim=None)
+        identity = _handle_identity(work, lease_owner=lease_owner, now=now)
+        if identity is not None:
+            return identity
 
-            work.failure_streak = 0
-            work.blocked_configuration_fingerprint = ''
+        if work.execution_state == WorkflowWorkExecutionState.LEASED:
+            leased = _handle_leased_state(
+                work,
+                runs,
+                now=now,
+                lease_owner=lease_owner,
+                workflow_run_id=workflow_run_id,
+            )
+            if leased is not None:
+                return leased
 
-        if state == WorkflowWorkExecutionState.LEASED:
-            running = _running_run(runs)
-            expired = now >= work.lease_expires_at
-            if not expired:
-                if running is not None and workflow_run_id == running.id and lease_owner == work.lease_owner:
-                    return ClaimResult(
-                        outcome='replayed',
-                        claim=WorkClaim(
-                            work_id=work.id,
-                            workflow_run_id=running.id,
-                            fencing_token=work.fencing_token,
-                            lease_owner=work.lease_owner,
-                            lease_expires_at=work.lease_expires_at,
-                        ),
-                    )
+        supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
+        if pending_error is None:
+            return _do_claim(work, supplied_run, lease_owner=lease_owner, now=now, lease_for=lease_for)
 
-                return ClaimResult(outcome='busy', claim=None)
-
-            if running is not None:
-                _fail_run_worker_lost(running, now)
-
-        supplied_run = None if is_automatic else _select_supplied_run(runs, workflow_run_id)
-
-        return _do_claim(work, supplied_run, lease_owner=lease_owner, now=now, lease_for=lease_for)
+    raise pending_error
 
 
 def _lock_and_verify(claim: WorkClaim, now: datetime) -> tuple[WorkflowWork, WorkflowRun]:
@@ -458,7 +581,30 @@ def lock_work_fence(*, claim: WorkClaim, now: datetime) -> tuple[WorkflowWork, W
     return _lock_and_verify(claim, now)
 
 
-def _recorded_completion(work: WorkflowWork, run: WorkflowRun) -> str:
+def _lock_claim_rows(claim: WorkClaim) -> tuple[WorkflowWork, WorkflowRun]:
+    work = WorkflowWork.objects.select_for_update().get(id=claim.work_id)
+    run = WorkflowRun.objects.select_for_update().get(
+        id=claim.workflow_run_id,
+        work_id=claim.work_id,
+        execution_contract_version=1,
+    )
+
+    return work, run
+
+
+def _require_claim_fence(work: WorkflowWork, run: WorkflowRun, claim: WorkClaim) -> None:
+    if (
+        run.fencing_token != claim.fencing_token
+        or run.lease_owner != claim.lease_owner
+        or work.fencing_token != claim.fencing_token
+        or work.execution_state != WorkflowWorkExecutionState.LEASED
+    ):
+        raise StaleWorkFenceError('workflow run no longer matches the claim')
+
+    return
+
+
+def _recorded_completion(work: WorkflowWork) -> str:
     if (
         work.execution_state == WorkflowWorkExecutionState.SETTLED
         and work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
@@ -481,6 +627,7 @@ def _settle_work(work: WorkflowWork, *, reason: str, now: datetime) -> None:
     work.execution_state = WorkflowWorkExecutionState.SETTLED
     work.next_retry_at = None
     work.blocked_configuration_fingerprint = ''
+    work.failure_streak = 0
     _clear_lease_fields(work)
     work.save(
         update_fields=[
@@ -493,6 +640,7 @@ def _settle_work(work: WorkflowWork, *, reason: str, now: datetime) -> None:
             'heartbeat_at',
             'next_retry_at',
             'blocked_configuration_fingerprint',
+            'failure_streak',
             'updated_at',
         ]
     )
@@ -543,6 +691,17 @@ def _apply_finish(
     return
 
 
+def _settle_lease_preserving_resolution(work: WorkflowWork) -> None:
+    work.execution_state = WorkflowWorkExecutionState.SETTLED
+    work.next_retry_at = None
+    work.blocked_configuration_fingerprint = ''
+    work.failure_streak = 0
+    _clear_lease_fields(work)
+    work.save(update_fields=list(_LEASE_WORK_FIELDS))
+
+    return
+
+
 def finish_work_claim(
     *,
     claim: WorkClaim,
@@ -555,15 +714,10 @@ def finish_work_claim(
         raise ValueError(f'unsupported completion {completion!r}')
 
     with transaction.atomic():
-        work = WorkflowWork.objects.select_for_update().get(id=claim.work_id)
-        run = WorkflowRun.objects.select_for_update().get(
-            id=claim.workflow_run_id,
-            work_id=claim.work_id,
-            execution_contract_version=1,
-        )
+        work, run = _lock_claim_rows(claim)
 
         if run.status == WorkflowRunStatus.SUCCEEDED:
-            if _recorded_completion(work, run) != completion:
+            if _recorded_completion(work) != completion:
                 raise ValueError('workflow run already completed with a different outcome')
 
             return
@@ -571,20 +725,34 @@ def finish_work_claim(
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a completable state')
 
-        if (
-            run.fencing_token != claim.fencing_token
-            or run.lease_owner != claim.lease_owner
-            or work.fencing_token != claim.fencing_token
-            or work.execution_state != WorkflowWorkExecutionState.LEASED
-        ):
-            raise StaleWorkFenceError('workflow run no longer matches the claim')
-
+        _require_claim_fence(work, run, claim)
         _apply_finish(work, run, now=now, completion=completion, result_memory_id=result_memory_id)
 
     return
 
 
-def _apply_failure_run(work: WorkflowWork, run: WorkflowRun, *, now: datetime, failure: ClassifiedWorkFailure) -> None:
+def finish_claim_resolved_elsewhere(*, claim: WorkClaim, now: datetime) -> None:
+    _require_aware(now)
+    with transaction.atomic():
+        work, run = _lock_claim_rows(claim)
+
+        if run.status == WorkflowRunStatus.SUCCEEDED:
+            return
+
+        if run.status != WorkflowRunStatus.RUNNING:
+            raise ValueError('workflow run is not in a completable state')
+
+        _require_claim_fence(work, run, claim)
+
+        run.status = WorkflowRunStatus.SUCCEEDED
+        run.finished_at = now
+        run.save(update_fields=['status', 'finished_at', 'updated_at'])
+        _settle_lease_preserving_resolution(work)
+
+    return
+
+
+def _apply_failure_run(run: WorkflowRun, *, now: datetime, failure: ClassifiedWorkFailure) -> None:
     run.status = WorkflowRunStatus.FAILED
     run.finished_at = now
     run.failure_class = failure.failure_class
@@ -644,12 +812,7 @@ def _apply_failure_work(work: WorkflowWork, *, now: datetime, failure: Classifie
 def fail_work_claim(*, claim: WorkClaim, now: datetime, failure: ClassifiedWorkFailure) -> None:
     _require_aware(now)
     with transaction.atomic():
-        work = WorkflowWork.objects.select_for_update().get(id=claim.work_id)
-        run = WorkflowRun.objects.select_for_update().get(
-            id=claim.workflow_run_id,
-            work_id=claim.work_id,
-            execution_contract_version=1,
-        )
+        work, run = _lock_claim_rows(claim)
 
         if run.status == WorkflowRunStatus.FAILED:
             if run.failure_class == failure.failure_class and run.failure_code == failure.code:
@@ -660,15 +823,8 @@ def fail_work_claim(*, claim: WorkClaim, now: datetime, failure: ClassifiedWorkF
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a failable state')
 
-        if (
-            run.fencing_token != claim.fencing_token
-            or run.lease_owner != claim.lease_owner
-            or work.fencing_token != claim.fencing_token
-            or work.execution_state != WorkflowWorkExecutionState.LEASED
-        ):
-            raise StaleWorkFenceError('workflow run no longer matches the claim')
-
-        _apply_failure_run(work, run, now=now, failure=failure)
+        _require_claim_fence(work, run, claim)
+        _apply_failure_run(run, now=now, failure=failure)
         _apply_failure_work(work, now=now, failure=failure)
 
     return
