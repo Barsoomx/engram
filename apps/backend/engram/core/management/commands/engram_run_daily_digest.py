@@ -1,17 +1,27 @@
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any
 
-from django.core.management.base import BaseCommand, CommandParser
+import structlog
+from django.core.management.base import BaseCommand, CommandError, CommandParser
+from django.db import Error as DatabaseError
 from django.utils import timezone
 
-from engram.core.models import Memory, MemoryStatus, Project
-from engram.memory.tasks import daily_digest_window_start, generate_daily_digest
+from engram.core.models import Project, WorkflowWorkDisposition
+from engram.memory.digest_scheduler import (
+    daily_bucket,
+    daily_window_days_default,
+    daily_window_days_max,
+    digest_max_sources,
+    schedule_daily_project,
+)
+from engram.memory.workflow_work import WorkflowWorkCollisionError, WorkflowWorkScopeError
+
+logger = structlog.get_logger(__name__)
 
 
 class Command(BaseCommand):
-    help = 'Enqueue daily digest tasks for every project with recent approved memories.'
+    help = 'Create daily digest work for every project with a frozen closed window.'
 
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
@@ -20,44 +30,45 @@ class Command(BaseCommand):
             default=None,
         )
 
+    def _resolve_window_days(self, override: int | None) -> int:
+        if override is None:
+            return daily_window_days_default()
+        if override < 0 or override > daily_window_days_max():
+            raise CommandError(f'--window-days must be between 0 and {daily_window_days_max()}')
+
+        return override
+
     def handle(self, *args: Any, **options: Any) -> None:
-        override_days = options['window_days']
+        window_days = self._resolve_window_days(options['window_days'])
+        bucket = daily_bucket(as_of=timezone.now(), window_days=window_days)
+        max_sources = digest_max_sources()
 
-        enqueued_projects = 0
-        enqueued_memories = 0
-        skipped_projects = 0
+        scheduled_projects = 0
+        no_input_projects = 0
+        failed_projects = 0
 
-        for project in Project.objects.all():
-            if override_days is None:
-                window_start = daily_digest_window_start(project)
-            else:
-                window_start = timezone.now() - timedelta(days=int(override_days))
-
-            memory_ids = list(
-                Memory.objects.filter(
-                    organization_id=project.organization_id,
-                    project=project,
-                    status=MemoryStatus.APPROVED,
-                    updated_at__gte=window_start,
+        for project in Project.objects.order_by('id'):
+            try:
+                result = schedule_daily_project(
+                    project_id=project.id,
+                    bucket=bucket,
+                    max_sources=max_sources,
                 )
-                .exclude(kind='digest')
-                .values_list('id', flat=True),
-            )
-            if not memory_ids:
-                skipped_projects += 1
-
+            except (WorkflowWorkScopeError, WorkflowWorkCollisionError, ValueError, DatabaseError) as error:
+                failed_projects += 1
+                logger.warning(
+                    'digest_command_project_failed',
+                    project_id=str(project.id),
+                    error=str(error),
+                )
                 continue
-
-            generate_daily_digest.delay(
-                str(project.organization_id),
-                str(project.id),
-                [str(value) for value in memory_ids],
-            )
-            enqueued_projects += 1
-            enqueued_memories += len(memory_ids)
+            if result.disposition == WorkflowWorkDisposition.REQUIRED:
+                scheduled_projects += 1
+            else:
+                no_input_projects += 1
 
         self.stdout.write(
-            f'enqueued_projects={enqueued_projects} '
-            f'enqueued_memories={enqueued_memories} '
-            f'skipped_projects={skipped_projects}',
+            f'scheduled_projects={scheduled_projects} '
+            f'no_input_projects={no_input_projects} '
+            f'failed_projects={failed_projects}',
         )

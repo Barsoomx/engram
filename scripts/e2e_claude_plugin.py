@@ -535,7 +535,28 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
     return state
 
 
+def backdate_memories_into_daily_window() -> str:
+    return f"""
+import json
+from datetime import timedelta
+from django.utils import timezone
+from engram.core.models import Memory, Project
+from engram.memory.digest_scheduler import daily_bucket
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+bucket = daily_bucket(as_of=timezone.now())
+backdated = Memory.objects.filter(project=project).exclude(kind='digest').update(
+    updated_at=bucket.window_end - timedelta(hours=1),
+)
+print(json.dumps({{'backdated': backdated}}))
+"""
+
+
 def run_daily_digest_and_verify(*, secret: str) -> dict[str, object]:
+    backdated = compose_shell_json(backdate_memories_into_daily_window(), secret=secret)
+    if int(backdated.get('backdated') or 0) <= 0:
+        raise E2EError(f'no memories backdated into the daily digest window: {backdated}')
+
     run(
         ['docker', 'compose', 'exec', '-T', 'api', 'python', 'manage.py', 'engram_run_daily_digest'],
         cwd=COMPOSE_DIR,
