@@ -37,6 +37,7 @@ from engram.memory.services import (
     run_weekly_digest_with_tracking,
 )
 from engram.memory.session_sweep import SweepStaleSessions
+from engram.memory.session_work_reconciler import reconcile_scheduled_session_work
 from engram.memory.work_dispatch import queue_work_attempt, work_task_signature
 from engram.memory.work_execution import (
     claim_work,
@@ -970,11 +971,12 @@ def sweep_stale_sessions() -> dict[str, int]:
 
 @app.task(name='engram.memory.retry_failed_distillations')
 def retry_failed_distillations() -> dict[str, int]:
-    result = RetryFailedDistillations().execute()
+    legacy = RetryFailedDistillations().execute()
+    reconciled = reconcile_scheduled_session_work(as_of=timezone.now())
 
     return {
-        'retried': len(result.retried),
-        'unlinked': len(result.unlinked_run_ids),
+        'retried': len(legacy.retried) + reconciled,
+        'unlinked': len(legacy.unlinked_run_ids),
     }
 
 
