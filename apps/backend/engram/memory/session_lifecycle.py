@@ -6,18 +6,16 @@ from datetime import datetime
 from typing import Literal
 
 from django.db import transaction
-from django.db.models import Max
 from django.utils import timezone
 
 from engram.core.models import (
     AgentSession,
-    Observation,
     SessionStatus,
     WorkflowSubjectType,
     WorkflowWorkDisposition,
     WorkflowWorkType,
 )
-from engram.memory.observation_work import useful_observation_q
+from engram.memory.observation_work import useful_observation_upper
 from engram.memory.tasks import dispatch_work_task, distill_session_work_v1
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -71,7 +69,7 @@ class EndSession:
                 initial_signal_created=False,
             )
 
-        upper = self._useful_upper(session)
+        upper = useful_observation_upper(session)
 
         session.status = SessionStatus.ENDED
         session.ended_at = timezone.now()
@@ -116,17 +114,3 @@ class EndSession:
             upper_sequence_inclusive=upper,
             initial_signal_created=initial_signal_created,
         )
-
-    def _useful_upper(self, session: AgentSession) -> int:
-        upper = (
-            Observation.objects.filter(
-                organization_id=session.organization_id,
-                project_id=session.project_id,
-                session_id=session.id,
-            )
-            .filter(useful_observation_q())
-            .aggregate(upper=Max('session_sequence'))
-            .get('upper')
-        )
-
-        return upper or 0

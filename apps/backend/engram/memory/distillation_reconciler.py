@@ -7,10 +7,12 @@ from datetime import timedelta
 
 import structlog
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from engram.celery_app import app
 from engram.core.models import (
+    AgentSession,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
@@ -33,6 +35,15 @@ _TRANSIENT_FAILURE_MARKERS = (
     'provider timed out',
     'provider unreachable',
 )
+
+
+def _v1_managed_session() -> Exists:
+    return Exists(
+        AgentSession.objects.filter(
+            id=OuterRef('subject_id'),
+            end_work_contract_version=1,
+        )
+    )
 
 
 def is_transient_failure(failure_reason: str | None) -> bool:
@@ -76,7 +87,9 @@ class RetryFailedDistillations:
             WorkflowWork.objects.filter(
                 work_type=WorkflowWorkType.SESSION_DISTILLATION,
                 disposition=WorkflowWorkDisposition.REQUIRED,
-            ).order_by('created_at', 'id'),
+            )
+            .exclude(_v1_managed_session())
+            .order_by('created_at', 'id'),
         )
         runs_by_work = self._runs_by_work([work.id for work in required_works])
 
@@ -146,10 +159,14 @@ class RetryFailedDistillations:
     ) -> RetriedWork | None:
         with transaction.atomic():
             try:
-                work = WorkflowWork.objects.select_for_update().get(
-                    id=work_id,
-                    work_type=WorkflowWorkType.SESSION_DISTILLATION,
-                    disposition=WorkflowWorkDisposition.REQUIRED,
+                work = (
+                    WorkflowWork.objects.select_for_update()
+                    .exclude(_v1_managed_session())
+                    .get(
+                        id=work_id,
+                        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                        disposition=WorkflowWorkDisposition.REQUIRED,
+                    )
                 )
             except WorkflowWork.DoesNotExist:
                 return None

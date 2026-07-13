@@ -215,7 +215,7 @@ def _revalidate_scope(work: WorkflowWork) -> None:
     return
 
 
-def _fingerprint_matches(work: WorkflowWork) -> bool:
+def fingerprint_matches(work: WorkflowWork) -> bool:
     try:
         fingerprint = work_input_fingerprint(
             work_type=work.work_type,
@@ -262,7 +262,7 @@ def _terminalize_fingerprint_mismatch(work: WorkflowWork, *, lease_owner: str, n
 
 
 def _handle_identity(work: WorkflowWork, *, lease_owner: str, now: datetime) -> ClaimResult | None:
-    if _fingerprint_matches(work):
+    if fingerprint_matches(work):
         return None
 
     if work.disposition != WorkflowWorkDisposition.REQUIRED:

@@ -50,6 +50,7 @@ from engram.memory.work_execution import (
     StaleWorkFenceError,
     claim_work,
     execution_configuration_fingerprint,
+    fail_work_claim,
     lock_work_fence,
 )
 from engram.memory.work_failures import (
@@ -57,6 +58,7 @@ from engram.memory.work_failures import (
     INVALID_INPUT,
     PROVIDER_TRANSIENT,
     WORKER_LOST,
+    ClassifiedWorkFailure,
 )
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -434,7 +436,7 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 
     result = retry_failed_distillations()
 
-    assert result == {'retried': 1, 'unlinked': 0}
+    assert result == {'retried': 1, 'reconciled': 0, 'unlinked': 0}
 
     queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
     assert queued.count() == 1
@@ -451,7 +453,7 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible() -> None:
     result = retry_failed_distillations()
 
-    assert result == {'retried': 0, 'unlinked': 0}
+    assert result == {'retried': 0, 'reconciled': 0, 'unlinked': 0}
     assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
     assert CeleryOutbox.objects.count() == 0
 
@@ -1408,3 +1410,82 @@ def test_digest_work_v1_settled_work_is_absorbed_without_execution(
 
     m_execute.assert_not_called()
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
+
+
+def _end_v1_session_with_useful_observation(suffix: str) -> tuple[Organization, Project, AgentSession, WorkflowWork]:
+    from engram.memory.observation_work_tests import create_scope as create_session_scope
+    from engram.memory.session_lifecycle import EndSession
+
+    organization, project, session = create_session_scope(suffix)
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='useful observation',
+        content_hash=f'content-{session.id}-1',
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    result = EndSession().execute(
+        organization_id=organization.id,
+        project_id=project.id,
+        session_id=session.id,
+        ended_at=timezone.now(),
+        source='explicit',
+    )
+    work = WorkflowWork.objects.get(id=result.work_id)
+
+    return organization, project, session, work
+
+
+@pytest.mark.django_db
+def test_retry_failed_distillations_routes_required_work_through_reconciler() -> None:
+    _organization, _project, session, work = _end_v1_session_with_useful_observation('beat-retire-required')
+    past_grace = timezone.now() - timedelta(minutes=6)
+    WorkflowWork.objects.filter(id=work.id).update(created_at=past_grace)
+    AgentSession.objects.filter(id=session.id).update(ended_at=past_grace)
+    CeleryOutbox.objects.all().delete()
+
+    retry_failed_distillations()
+
+    queued = WorkflowRun.objects.filter(
+        work_id=work.id,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert queued.get().origin == WorkflowRunOrigin.RECONCILIATION
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
+
+
+@pytest.mark.django_db
+def test_retry_failed_distillations_leaves_v1_retry_wait_work_to_reconciler() -> None:
+    _organization, _project, session, work = _end_v1_session_with_useful_observation('beat-retire-retrywait')
+
+    failed_at = timezone.now() - timedelta(minutes=40)
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='host:beat:worker',
+        now=failed_at,
+        lease_for=timedelta(seconds=720),
+    )
+    fail_work_claim(
+        claim=claimed.claim,
+        now=failed_at,
+        failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout'),
+    )
+    AgentSession.objects.filter(id=session.id).update(ended_at=failed_at)
+    CeleryOutbox.objects.all().delete()
+
+    result = retry_failed_distillations()
+
+    queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
+    assert queued.count() == 1
+    assert queued.get().execution_contract_version == 1
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=0).count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
+    assert result == {'retried': 0, 'reconciled': 1, 'unlinked': 0}

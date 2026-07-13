@@ -13,7 +13,8 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 
-_RESIGNAL_WINDOW = timedelta(minutes=5)
+RESIGNAL_WINDOW = timedelta(minutes=5)
+_RESIGNAL_WINDOW = RESIGNAL_WINDOW
 
 _TASK_NAME_BY_WORK = {
     WorkflowWorkType.OBSERVATION_PROCESSING: 'engram.memory.process_observation_work_v1',
