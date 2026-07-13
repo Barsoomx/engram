@@ -9,7 +9,7 @@ import pytest
 from django.core.management import call_command
 from structlog.testing import capture_logs
 
-from engram.core.export import guard_export_stream, iter_export_memories_json
+from engram.core.export import export_queryset, guard_export_stream, iter_export_memories_json
 from engram.core.models import (
     Memory,
     MemoryStatus,
@@ -20,6 +20,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
 
 LEAKED_TOKEN = 'egk_export_secret_0123456789abcdefghijklmnopqrstuvwxyz'
 
@@ -407,3 +408,27 @@ def test_export_excludes_non_approved_memories(tmp_path: Any) -> None:
     exported_titles = [entry['title'] for entry in payload['memories']]
     assert exported_titles == ['Approved memory']
     assert payload['memory_count'] == 1
+
+
+# digest visibility quarantine — approved export
+
+
+@pytest.mark.django_db
+def test_export_queryset_withholds_unproven_digest() -> None:
+    organization = Organization.objects.create(name='Export DV Org', slug='export-dv-org')
+    project = Project.objects.create(organization=organization, name='Main', slug='export-dv-main')
+    proven = build_proven_weekly_digest(organization, project)
+    legacy = build_legacy_digest(organization, project)
+
+    exported_ids = {
+        memory.id
+        for memory in export_queryset(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            all_statuses=False,
+        )
+    }
+
+    assert proven.id in exported_ids
+    assert legacy.id not in exported_ids
