@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from django.db import connection
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 
 from engram.core.models import (
     Agent,
@@ -39,6 +40,8 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkType,
 )
+from engram.memory import work_execution
+from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
 from engram.memory.invariant_queries import (
     InvariantId,
@@ -47,6 +50,8 @@ from engram.memory.invariant_queries import (
     evaluate_invariants,
     evaluate_post_cutover_p1_p2,
 )
+from engram.memory.observation_work_tests import create_scope
+from engram.memory.reconciler_test_support import StubBuilder, ended_session_work
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     create_work,
@@ -1339,62 +1344,6 @@ def test_post_cutover_p2_query_count_is_bounded_for_multiple_rows(
 
 
 @pytest.mark.django_db
-def test_p3_requires_non_lifecycle_input_and_correlates_json_session_id(
-    f_scope: ScopeFixture,
-) -> None:
-    lifecycle_session = _make_session(f_scope, 'p3-lifecycle')
-    _make_observation(
-        f_scope,
-        lifecycle_session,
-        'p3-lifecycle',
-        observation_type='session_start',
-    )
-    uncovered_session = _make_session(f_scope, 'p3-uncovered')
-    _make_observation(f_scope, uncovered_session, 'p3-uncovered')
-    covered_session = _make_session(f_scope, 'p3-covered')
-    _make_observation(f_scope, covered_session, 'p3-covered')
-    _make_workflow_run(
-        f_scope,
-        status=WorkflowRunStatus.SUCCEEDED,
-        session=covered_session,
-    )
-
-    result = _result_by_id(f_scope)['P3']
-
-    assert result.proxy_count == 1
-    assert result.sample_ids == (f'session:{uncovered_session.id}',)
-
-    _make_workflow_run(
-        f_scope,
-        status=WorkflowRunStatus.SUCCEEDED,
-        session=uncovered_session,
-    )
-
-    result = _result_by_id(f_scope)['P3']
-
-    assert result.proxy_count == 0
-    assert result.sample_ids == ()
-
-
-@pytest.mark.django_db
-def test_p4_coalesces_started_at_over_created_at(f_scope: ScopeFixture) -> None:
-    fallback_run = _make_workflow_run(f_scope, status=WorkflowRunStatus.RUNNING)
-    recent_started_run = _make_workflow_run(
-        f_scope,
-        status=WorkflowRunStatus.RUNNING,
-        started_at=FIXED_AS_OF - timedelta(minutes=1),
-    )
-    WorkflowRun.objects.filter(id__in=(fallback_run.id, recent_started_run.id)).update(
-        created_at=FIXED_AS_OF - timedelta(minutes=31),
-    )
-
-    result = _result_by_id(f_scope)['P4']
-
-    assert result.proxy_count == 1
-    assert result.sample_ids == (f'workflow_run:{fallback_run.id}',)
-
-
-@pytest.mark.django_db
 def test_p7_sums_guarded_promotion_version_body_and_document_anomalies(
     f_scope: ScopeFixture,
     f_foreign_scope: ScopeFixture,
@@ -1707,7 +1656,7 @@ def test_missing_observability_catalog_is_exact(f_scope: ScopeFixture) -> None:
 def test_zero_proxies_remain_missing_observability(f_scope: ScopeFixture) -> None:
     results = _result_by_id(f_scope)
 
-    for invariant_id in ('P3', 'P4', 'P6'):
+    for invariant_id in ('P6',):
         result = results[invariant_id]
 
         assert result.state == InvariantState.MISSING_OBSERVABILITY
@@ -1943,3 +1892,303 @@ def test_manifest_scenarios_materialize_and_foreign_controls_are_isolated(
 
     for expected in scenario['expected_characterization']:
         _assert_characterization(after_by_id[expected['invariant_id']], expected)
+
+
+_EXACT_SESSION_LEASE = timedelta(seconds=720)
+
+
+def _exact_results(scope: tuple[Organization, Project, AgentSession], as_of: datetime) -> dict[str, InvariantResult]:
+    organization, project, _session = scope
+
+    return {
+        str(result.invariant_id): result
+        for result in evaluate_invariants(
+            organization_id=organization.id,
+            project_id=project.id,
+            as_of=as_of,
+        )
+    }
+
+
+def _claim_session_work(work: WorkflowWork, now: datetime) -> object:
+    return work_execution.claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'host:exact:{uuid.uuid4()}',
+        now=now,
+        lease_for=_EXACT_SESSION_LEASE,
+    )
+
+
+def _settle_session_work(work: WorkflowWork) -> None:
+    now = timezone.now()
+    claimed = _claim_session_work(work, now)
+    work_execution.finish_work_claim(claim=claimed.claim, now=now, completion='product_succeeded')
+
+
+def _candidate_input(candidate: MemoryCandidate, *, manifest: str) -> CandidateDecisionWorkInput:
+    return CandidateDecisionWorkInput(
+        candidate_id=candidate.id,
+        candidate_content_hash=candidate.content_hash,
+        organization_id=candidate.organization_id,
+        project_id=candidate.project_id,
+        team_id=candidate.team_id,
+        evidence_manifest_hash=manifest,
+        policy_version=1,
+    )
+
+
+@pytest.mark.django_db
+def test_p3_is_exact_and_violated_for_required_latest_generation() -> None:
+    scope = create_scope('p3-exact-required')
+    _organization, _project, session = scope
+    ended_session_work(scope, sequence=1)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.VIOLATED
+    assert any(str(session.id) in sample for sample in p3.sample_ids)
+
+
+@pytest.mark.django_db
+def test_p3_is_exact_and_healthy_when_latest_generation_is_settled() -> None:
+    scope = create_scope('p3-exact-settled')
+    work = ended_session_work(scope, sequence=1)
+    _settle_session_work(work)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.HEALTHY
+
+
+@pytest.mark.django_db
+def test_p3_exact_success_of_older_generation_never_covers_required_latest() -> None:
+    scope = create_scope('p3-exact-no-cover')
+    _organization, _project, session = scope
+    older = ended_session_work(scope, sequence=1)
+    _settle_session_work(older)
+    AgentSession.objects.filter(id=session.id).update(
+        status=SessionStatus.ACTIVE,
+        ended_at=None,
+        end_work_contract_version=0,
+        observation_sequence_cursor=1,
+    )
+    ended_session_work(scope, sequence=2)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.VIOLATED
+    assert any(str(session.id) in sample for sample in p3.sample_ids)
+
+
+@pytest.mark.django_db
+def test_p4_is_exact_and_violated_for_expired_lease() -> None:
+    scope = create_scope('p4-exact-expired')
+    work = ended_session_work(scope, sequence=1)
+    now = timezone.now()
+    _claim_session_work(work, now)
+
+    p4 = _exact_results(scope, now + _EXACT_SESSION_LEASE + timedelta(seconds=60))['P4']
+
+    assert p4.state == InvariantState.VIOLATED
+    assert any(str(work.id) in sample for sample in p4.sample_ids)
+
+
+@pytest.mark.django_db
+def test_p4_is_exact_and_healthy_with_zero_expired_leases() -> None:
+    scope = create_scope('p4-exact-healthy')
+    ended_session_work(scope, sequence=1)
+
+    p4 = _exact_results(scope, timezone.now())['P4']
+
+    assert p4.state == InvariantState.HEALTHY
+
+
+@pytest.mark.django_db
+def test_p6_is_builder_aware_and_counts_only_missing_or_inactive_or_mismatched() -> None:
+    from engram.memory import candidate_work_reconciler
+
+    scope = create_scope('p6-builder-aware')
+    organization, project, session = scope
+    satisfied = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        title='p6 satisfied',
+        body='p6 satisfied body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='p6-satisfied-hash',
+        confidence=Decimal('0.900'),
+    )
+    missing = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        title='p6 missing',
+        body='p6 missing body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='p6-missing-hash',
+        confidence=Decimal('0.900'),
+    )
+    active_work = ended_session_work(scope, sequence=1)
+    builder = StubBuilder(
+        inputs={
+            satisfied.id: _candidate_input(satisfied, manifest='manifest-satisfied'),
+            missing.id: _candidate_input(missing, manifest='manifest-missing'),
+        },
+        works_by_manifest={'manifest-satisfied': active_work, 'manifest-missing': None},
+    )
+    candidate_work_reconciler.set_candidate_decision_work_builder(builder)
+    try:
+        p6 = _exact_results(scope, timezone.now())['P6']
+    finally:
+        candidate_work_reconciler.set_candidate_decision_work_builder(None)
+
+    assert p6.state == InvariantState.MISSING_OBSERVABILITY
+    assert p6.proxy_count == 1
+    assert any(str(missing.id) in sample for sample in p6.sample_ids)
+    assert all(str(satisfied.id) not in sample for sample in p6.sample_ids)
+
+
+@pytest.mark.django_db
+def test_p6_without_builder_counts_all_proposed_candidates() -> None:
+    from engram.memory import candidate_work_reconciler
+
+    scope = create_scope('p6-no-builder')
+    organization, project, session = scope
+    for suffix in ('a', 'b'):
+        MemoryCandidate.objects.create(
+            organization=organization,
+            project=project,
+            team=session.team,
+            title=f'p6 {suffix}',
+            body=f'p6 {suffix} body',
+            status=CandidateStatus.PROPOSED,
+            content_hash=f'p6-no-builder-{suffix}',
+            confidence=Decimal('0.900'),
+        )
+    candidate_work_reconciler.set_candidate_decision_work_builder(None)
+
+    p6 = _exact_results(scope, timezone.now())['P6']
+
+    assert p6.state == InvariantState.MISSING_OBSERVABILITY
+    assert p6.proxy_count == 2
+
+
+@pytest.mark.django_db
+def test_p13_remains_missing_observability_with_cp2_cp10_target() -> None:
+    scope = create_scope('p13-partial')
+
+    p13 = _exact_results(scope, timezone.now())['P13']
+
+    assert p13.state == InvariantState.MISSING_OBSERVABILITY
+    assert p13.reason == 'repair_run_relation_missing'
+    assert p13.target_checkpoint == 'CP2/CP10'
+
+
+@pytest.mark.django_db
+def test_exact_invariants_ignore_foreign_scope() -> None:
+    owned = create_scope('p34-owned')
+    foreign = create_scope('p34-foreign')
+    work = ended_session_work(owned, sequence=1)
+    now = timezone.now()
+    _claim_session_work(work, now)
+
+    foreign_results = _exact_results(foreign, now + _EXACT_SESSION_LEASE + timedelta(seconds=60))
+
+    assert foreign_results['P3'].state == InvariantState.HEALTHY
+    assert foreign_results['P4'].state == InvariantState.HEALTHY
+
+
+def _v0_ended_session_with_useful_observation(
+    scope: tuple[Organization, Project, AgentSession],
+    suffix: str,
+    *,
+    with_successful_run: bool = False,
+) -> AgentSession:
+    organization, project, base_session = scope
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=base_session.team,
+        agent=base_session.agent,
+        external_session_id=f'v0-residue-{suffix}',
+        runtime=Runtime.CODEX,
+        status=SessionStatus.ENDED,
+        ended_at=timezone.now(),
+        end_work_contract_version=0,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=base_session.team,
+        agent=base_session.agent,
+        session=session,
+        observation_type='tool_use',
+        title=f'v0 residue observation {suffix}',
+        content_hash=f'v0-residue-obs-{session.id}',
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    if with_successful_run:
+        WorkflowRun.objects.create(
+            organization=organization,
+            project=project,
+            team=base_session.team,
+            run_type=WorkflowRunType.SESSION_DISTILLATION,
+            status=WorkflowRunStatus.SUCCEEDED,
+            input_snapshot={'session_id': str(session.id)},
+        )
+
+    return session
+
+
+@pytest.mark.django_db
+def test_p3_v0_residue_without_successful_run_is_missing_observability() -> None:
+    scope = create_scope('p3-v0-residue')
+    session = _v0_ended_session_with_useful_observation(scope, '1')
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.MISSING_OBSERVABILITY
+    assert p3.proxy_count == 1
+    assert p3.sample_ids == (f'session:{session.id}',)
+
+
+@pytest.mark.django_db
+def test_p3_v0_residue_with_successful_run_stays_missing_at_zero_proxy() -> None:
+    scope = create_scope('p3-v0-residue-covered')
+    _v0_ended_session_with_useful_observation(scope, '1', with_successful_run=True)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.MISSING_OBSERVABILITY
+    assert p3.proxy_count == 0
+    assert p3.sample_ids == ()
+
+
+@pytest.mark.django_db
+def test_p3_v0_residue_with_clean_v1_cohort_stays_missing() -> None:
+    scope = create_scope('p3-mixed-clean')
+    v0_session = _v0_ended_session_with_useful_observation(scope, '1')
+    settled = ended_session_work(scope, sequence=1)
+    _settle_session_work(settled)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.MISSING_OBSERVABILITY
+    assert p3.proxy_count == 1
+    assert p3.sample_ids == (f'session:{v0_session.id}',)
+
+
+@pytest.mark.django_db
+def test_p3_v1_violation_wins_over_v0_residue() -> None:
+    scope = create_scope('p3-mixed-violated')
+    _organization, _project, base_session = scope
+    _v0_ended_session_with_useful_observation(scope, '1')
+    ended_session_work(scope, sequence=1)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.VIOLATED
+    assert any(str(base_session.id) in sample for sample in p3.sample_ids)

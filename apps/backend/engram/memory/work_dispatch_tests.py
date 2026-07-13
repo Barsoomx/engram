@@ -162,3 +162,17 @@ def test_work_dispatch_never_reads_package_rows() -> None:
             imported_modules.add(node.module)
 
     assert not any(module.startswith('django_celery_outbox.models') for module in imported_modules)
+
+
+def test_work_task_signature_round_trips_through_parse_work_task_id() -> None:
+    from engram.memory.work_dispatch import parse_work_task_id, work_task_signature
+
+    work_id = uuid.uuid4()
+    run_id = uuid.uuid4()
+
+    _args, task_id_work_only = work_task_signature(work_id)
+    _args, task_id_with_run = work_task_signature(work_id, run_id)
+
+    assert parse_work_task_id(task_id_work_only) == (work_id, None)
+    assert parse_work_task_id(task_id_with_run) == (work_id, run_id)
+    assert parse_work_task_id('not-a-workflow-task') == (None, None)
