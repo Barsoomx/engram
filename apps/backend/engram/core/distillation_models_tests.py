@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from django.core.exceptions import ValidationError
@@ -11,12 +11,21 @@ from django.utils import timezone
 from engram.core.models import (
     Agent,
     AgentSession,
+    DistillationChunk,
+    DistillationObservationCoverage,
+    DistillationStage,
+    DistillationWindow,
     MemoryCandidate,
+    MemoryCandidateSource,
     Observation,
     Organization,
     Project,
     Runtime,
     Team,
+    WorkflowRun,
+    WorkflowRunOrigin,
+    WorkflowRunStatus,
+    WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkType,
@@ -45,25 +54,7 @@ class _Deps:
     call: ProviderCallRecord
 
 
-def _distillation_models() -> tuple[type, type, type, type, type]:
-    from engram.core.models import (
-        DistillationChunk,
-        DistillationObservationCoverage,
-        DistillationStage,
-        DistillationWindow,
-        MemoryCandidateSource,
-    )
-
-    return (
-        DistillationWindow,
-        DistillationChunk,
-        DistillationStage,
-        DistillationObservationCoverage,
-        MemoryCandidateSource,
-    )
-
-
-def _deps(suffix: str) -> _Deps:
+def _deps(suffix: str, *, policy: bool = True, candidate: bool = True) -> _Deps:
     deps = _Deps()
     deps.organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
     deps.team = Team.objects.create(organization=deps.organization, name=f'Team {suffix}', slug=f'team-{suffix}')
@@ -113,63 +104,65 @@ def _deps(suffix: str) -> _Deps:
                 },
             )
         )
-    secret = ProviderSecret.objects.create(
-        organization=deps.organization,
-        team=deps.team,
-        name='secret',
-        provider='openai',
-        scope='team',
-        current_version=1,
-    )
-    ProviderSecretEnvelope.objects.create(
-        organization=deps.organization,
-        team=deps.team,
-        secret=secret,
-        version=1,
-        key_version='v1',
-        ciphertext='cipher',
-        hmac_digest='hmac',
-        active=True,
-    )
-    deps.policy = ModelPolicy.objects.create(
-        organization=deps.organization,
-        team=deps.team,
-        project=deps.project,
-        name='Curation policy',
-        scope='project',
-        task_type='curation',
-        provider='openai',
-        model='gpt-4.1-mini',
-        secret=secret,
-        version=2,
-    )
-    deps.call = ProviderCallRecord.objects.create(
-        organization=deps.organization,
-        project=deps.project,
-        team=deps.team,
-        policy=deps.policy,
-        secret=secret,
-        provider='openai',
-        model='gpt-4.1-mini',
-        task_type='curation',
-        policy_version=2,
-        request_id=f'distill-stage:{suffix}',
-        redaction_state='redacted',
-    )
-    deps.candidate = MemoryCandidate.objects.create(
-        organization=deps.organization,
-        project=deps.project,
-        team=deps.team,
-        title='candidate',
-        body='candidate body',
-        content_hash=f'candidate-{suffix}',
-    )
+    if policy:
+        secret = ProviderSecret.objects.create(
+            organization=deps.organization,
+            team=deps.team,
+            name='secret',
+            provider='openai',
+            scope='team',
+            current_version=1,
+        )
+        ProviderSecretEnvelope.objects.create(
+            organization=deps.organization,
+            team=deps.team,
+            secret=secret,
+            version=1,
+            key_version='v1',
+            ciphertext='cipher',
+            hmac_digest='hmac',
+            active=True,
+        )
+        deps.policy = ModelPolicy.objects.create(
+            organization=deps.organization,
+            team=deps.team,
+            project=deps.project,
+            name='Curation policy',
+            scope='project',
+            task_type='curation',
+            provider='openai',
+            model='gpt-4.1-mini',
+            secret=secret,
+            version=2,
+        )
+        deps.call = ProviderCallRecord.objects.create(
+            organization=deps.organization,
+            project=deps.project,
+            team=deps.team,
+            policy=deps.policy,
+            secret=secret,
+            provider='openai',
+            model='gpt-4.1-mini',
+            task_type='curation',
+            policy_version=2,
+            request_id=f'distill-stage:{suffix}',
+            redaction_state='redacted',
+        )
+    if candidate:
+        deps.candidate = MemoryCandidate.objects.create(
+            organization=deps.organization,
+            project=deps.project,
+            team=deps.team,
+            title='candidate',
+            body='candidate body',
+            content_hash=f'candidate-{suffix}',
+        )
 
     return deps
 
 
 def _window(deps: _Deps, **overrides: object) -> object:
-    window_model = _distillation_models()[0]
+    window_model = DistillationWindow
     fields: dict[str, object] = {
         'organization': deps.organization,
         'project': deps.project,
@@ -191,7 +184,7 @@ def _window(deps: _Deps, **overrides: object) -> object:
 
 
 def _chunk(deps: _Deps, window: object, **overrides: object) -> object:
-    chunk_model = _distillation_models()[1]
+    chunk_model = DistillationChunk
     fields: dict[str, object] = {
         'organization': deps.organization,
         'project': deps.project,
@@ -217,7 +210,7 @@ def _chunk(deps: _Deps, window: object, **overrides: object) -> object:
 
 
 def _stage(deps: _Deps, window: object, chunk: object | None, **overrides: object) -> object:
-    stage_model = _distillation_models()[2]
+    stage_model = DistillationStage
     fields: dict[str, object] = {
         'organization': deps.organization,
         'project': deps.project,
@@ -258,7 +251,7 @@ def _complete_overrides(deps: _Deps, now: datetime) -> dict[str, object]:
 
 @pytest.mark.django_db
 def test_window_rejects_project_from_another_organization() -> None:
-    deps = _deps('win-scope')
+    deps = _deps('win-scope', policy=False, candidate=False)
     other = Organization.objects.create(name='Other', slug='other-win-scope')
     other_project = Project.objects.create(organization=other, name='Other project', slug='other-project-win-scope')
 
@@ -267,50 +260,28 @@ def test_window_rejects_project_from_another_organization() -> None:
 
 
 @pytest.mark.django_db
-def test_window_is_immutable_after_insert() -> None:
-    deps = _deps('win-immutable')
-    window = _window(deps)
-    window.input_hash = _HEX_B
-
-    with pytest.raises(ValidationError):
-        window.save()
-
-
-@pytest.mark.django_db
-def test_window_rejects_non_positive_and_out_of_order_bounds() -> None:
-    deps = _deps('win-bounds')
-
-    with transaction.atomic(), pytest.raises(IntegrityError):
-        _window(deps, lower_sequence_exclusive=1, upper_sequence_inclusive=1)
-
-
-@pytest.mark.django_db
-def test_window_requires_positive_observation_count() -> None:
-    deps = _deps('win-count')
+@pytest.mark.parametrize(
+    ('label', 'overrides'),
+    (
+        ('out_of_order_bounds', {'lower_sequence_exclusive': 1, 'upper_sequence_inclusive': 1}),
+        ('non_positive_count', {'observation_count': 0}),
+        ('non_positive_budget', {'chunk_char_budget': 0}),
+        ('non_positive_reduction_target', {'reduction_target': 0}),
+        ('uppercase_input_hash', {'input_hash': _HEX_A.upper()}),
+        ('contract_version', {'contract_version': 2}),
+        ('chunk_contract_version', {'chunk_contract_version': 2}),
+    ),
+)
+def test_window_constraints_reject_invalid_columns(label: str, overrides: dict[str, object]) -> None:
+    deps = _deps(f'win-ck-{label}', policy=False, candidate=False)
 
     with transaction.atomic(), pytest.raises(IntegrityError):
-        _window(deps, observation_count=0)
-
-
-@pytest.mark.django_db
-def test_window_input_hash_must_be_lowercase_sha256() -> None:
-    deps = _deps('win-hash')
-
-    with transaction.atomic(), pytest.raises(IntegrityError):
-        _window(deps, input_hash=_HEX_A.upper())
-
-
-@pytest.mark.django_db
-def test_window_contract_versions_must_be_one() -> None:
-    deps = _deps('win-contract')
-
-    with transaction.atomic(), pytest.raises(IntegrityError):
-        _window(deps, contract_version=2)
+        _window(deps, **overrides)
 
 
 @pytest.mark.django_db
 def test_window_is_unique_per_work() -> None:
-    deps = _deps('win-per-work')
+    deps = _deps('win-per-work', policy=False, candidate=False)
     _window(deps)
 
     with transaction.atomic(), pytest.raises(IntegrityError):
@@ -319,13 +290,29 @@ def test_window_is_unique_per_work() -> None:
 
 @pytest.mark.django_db
 def test_window_is_unique_per_scope_and_input_hash() -> None:
-    deps = _deps('win-scope-hash')
+    deps = _deps('win-scope-hash', policy=False, candidate=False)
     _window(deps)
     with transaction.atomic():
         second_work, _created = _duplicate_session_work(deps)
 
     with transaction.atomic(), pytest.raises(IntegrityError):
         _window(deps, work=second_work, input_hash=_HEX_A)
+
+
+@pytest.mark.django_db
+def test_window_requires_session_and_team_to_match_work() -> None:
+    deps = _deps('win-crossrow', policy=False, candidate=False)
+    other_session = AgentSession.objects.create(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        agent=deps.agent,
+        external_session_id='session-win-crossrow-other',
+        runtime=Runtime.CODEX,
+    )
+
+    with pytest.raises(ValidationError):
+        _window(deps, session=other_session)
 
 
 def _duplicate_session_work(deps: _Deps) -> tuple[WorkflowWork, bool]:
@@ -348,7 +335,7 @@ def _duplicate_session_work(deps: _Deps) -> tuple[WorkflowWork, bool]:
 
 @pytest.mark.django_db
 def test_chunk_is_unique_per_window_ordinal() -> None:
-    deps = _deps('chunk-ordinal')
+    deps = _deps('chunk-ordinal', policy=False, candidate=False)
     window = _window(deps)
     _chunk(deps, window)
 
@@ -358,7 +345,7 @@ def test_chunk_is_unique_per_window_ordinal() -> None:
 
 @pytest.mark.django_db
 def test_chunk_is_unique_per_window_input_hash() -> None:
-    deps = _deps('chunk-hash')
+    deps = _deps('chunk-hash', policy=False, candidate=False)
     window = _window(deps)
     _chunk(deps, window)
 
@@ -367,41 +354,29 @@ def test_chunk_is_unique_per_window_input_hash() -> None:
 
 
 @pytest.mark.django_db
-def test_chunk_requires_ordered_positive_sequence_bounds() -> None:
-    deps = _deps('chunk-bounds')
+@pytest.mark.parametrize(
+    ('label', 'overrides'),
+    (
+        ('out_of_order_bounds', {'first_sequence': 3, 'last_sequence': 1}),
+        ('non_positive_count', {'observation_count': 0}),
+        ('uppercase_input_hash', {'input_hash': _HEX_B.upper()}),
+    ),
+)
+def test_chunk_constraints_reject_invalid_columns(label: str, overrides: dict[str, object]) -> None:
+    deps = _deps(f'chunk-ck-{label}', policy=False, candidate=False)
     window = _window(deps)
 
     with transaction.atomic(), pytest.raises(IntegrityError):
-        _chunk(deps, window, first_sequence=3, last_sequence=1)
+        _chunk(deps, window, **overrides)
 
 
 @pytest.mark.django_db
-def test_chunk_requires_positive_observation_count() -> None:
-    deps = _deps('chunk-count')
+def test_chunk_scope_must_match_window() -> None:
+    deps = _deps('chunk-crossrow', policy=False, candidate=False)
     window = _window(deps)
-
-    with transaction.atomic(), pytest.raises(IntegrityError):
-        _chunk(deps, window, observation_count=0)
-
-
-@pytest.mark.django_db
-def test_chunk_input_hash_must_be_lowercase_sha256() -> None:
-    deps = _deps('chunk-hex')
-    window = _window(deps)
-
-    with transaction.atomic(), pytest.raises(IntegrityError):
-        _chunk(deps, window, input_hash=_HEX_B.upper())
-
-
-@pytest.mark.django_db
-def test_chunk_is_immutable_after_insert() -> None:
-    deps = _deps('chunk-immutable')
-    window = _window(deps)
-    chunk = _chunk(deps, window)
-    chunk.input_hash = _HEX_C
 
     with pytest.raises(ValidationError):
-        chunk.save()
+        _chunk(deps, window, team=None)
 
 
 @pytest.mark.django_db
@@ -493,12 +468,70 @@ def test_required_stage_cannot_carry_completion_fields() -> None:
 
 
 @pytest.mark.django_db
-def test_stage_identity_is_immutable_after_insert() -> None:
-    deps = _deps('stage-immutable')
+@pytest.mark.parametrize(
+    ('label', 'overrides'),
+    (
+        ('non_positive_policy_version', {'policy_version': 0}),
+        ('uppercase_target_key', {'target_key': _HEX_C.upper()}),
+        ('uppercase_stage_key', {'stage_key': _HEX_D.upper()}),
+        ('uppercase_input_hash', {'input_hash': _HEX_E.upper()}),
+    ),
+)
+def test_stage_constraints_reject_invalid_columns(label: str, overrides: dict[str, object]) -> None:
+    deps = _deps(f'stage-ck-{label}')
     window = _window(deps)
     chunk = _chunk(deps, window)
-    stage = _stage(deps, window, chunk)
-    stage.stage_key = _HEX_F
+
+    with transaction.atomic(), pytest.raises(IntegrityError):
+        _stage(deps, window, chunk, **overrides)
+
+
+@pytest.mark.django_db
+def test_complete_stage_requires_positive_response_size() -> None:
+    deps = _deps('stage-response-size')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    now = timezone.now()
+    overrides = _complete_overrides(deps, now)
+    overrides['response_size'] = 0
+
+    with transaction.atomic(), pytest.raises(IntegrityError):
+        _stage(deps, window, chunk, **overrides)
+
+
+@pytest.mark.django_db
+def test_stage_chunk_must_belong_to_stage_window() -> None:
+    deps = _deps('stage-crossrow')
+    window = _window(deps)
+    with transaction.atomic():
+        second_work, _created = _duplicate_session_work(deps)
+    other_window = _window(deps, work=second_work, input_hash=_HEX_B)
+    foreign_chunk = _chunk(deps, other_window)
+
+    with pytest.raises(ValidationError):
+        _stage(deps, window, foreign_chunk)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'field',
+    ('output_snapshot', 'output_hash', 'response_hash', 'response_size', 'accepted_provider_call', 'completed_at'),
+)
+def test_completed_stage_output_is_immutable(field: str) -> None:
+    deps = _deps(f'stage-complete-immutable-{field.replace("_", "-")}')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    now = timezone.now()
+    stage = _stage(deps, window, chunk, **_complete_overrides(deps, now))
+    mutations: dict[str, object] = {
+        'output_snapshot': {'memories': [{'title': 'changed'}]},
+        'output_hash': _HEX_C,
+        'response_hash': _HEX_C,
+        'response_size': 99,
+        'accepted_provider_call': None,
+        'completed_at': now + timedelta(seconds=5),
+    }
+    setattr(stage, field, mutations[field])
 
     with pytest.raises(ValidationError):
         stage.save()
@@ -562,8 +595,39 @@ def test_coverage_requires_positive_sequence() -> None:
         _coverage(deps, window, stage, session_sequence=0)
 
 
+@pytest.mark.django_db
+def test_coverage_observation_session_must_match_window() -> None:
+    deps = _deps('coverage-crossrow')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    stage = _stage(deps, window, chunk)
+    other_session = AgentSession.objects.create(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        agent=deps.agent,
+        external_session_id='session-coverage-crossrow-other',
+        runtime=Runtime.CODEX,
+    )
+    foreign_observation = Observation.objects.create(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        agent=deps.agent,
+        session=other_session,
+        observation_type='tool_use',
+        title='foreign',
+        content_hash='content-coverage-crossrow-foreign',
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+
+    with pytest.raises(ValidationError):
+        _coverage(deps, window, stage, observation=foreign_observation)
+
+
 def _coverage(deps: _Deps, window: object, stage: object, **overrides: object) -> object:
-    coverage_model = _distillation_models()[3]
+    coverage_model = DistillationObservationCoverage
     fields: dict[str, object] = {
         'organization': deps.organization,
         'project': deps.project,
@@ -581,7 +645,7 @@ def _coverage(deps: _Deps, window: object, stage: object, **overrides: object) -
 
 
 def _candidate_source(deps: _Deps, window: object, stage: object, **overrides: object) -> object:
-    source_model = _distillation_models()[4]
+    source_model = MemoryCandidateSource
     fields: dict[str, object] = {
         'organization': deps.organization,
         'project': deps.project,
@@ -622,16 +686,41 @@ def test_candidate_source_anchors_hash_must_be_lowercase_sha256() -> None:
 
 
 @pytest.mark.django_db
-def test_candidate_source_is_immutable_after_insert() -> None:
-    deps = _deps('source-immutable')
+def test_candidate_source_scope_must_match_window() -> None:
+    deps = _deps('source-crossrow')
     window = _window(deps)
     chunk = _chunk(deps, window)
     stage = _stage(deps, window, chunk)
-    source = _candidate_source(deps, window, stage)
-    source.anchors_hash = _HEX_B
 
     with pytest.raises(ValidationError):
-        source.save()
+        _candidate_source(deps, window, stage, team=None)
+
+
+def _build_row(deps: _Deps, window: object, kind: str) -> tuple[object, str, object]:
+    if kind == 'window':
+        return window, 'input_hash', _HEX_F
+
+    if kind == 'chunk':
+        return _chunk(deps, window), 'input_hash', _HEX_F
+
+    chunk = _chunk(deps, window)
+    stage = _stage(deps, window, chunk)
+    if kind == 'stage':
+        return stage, 'stage_key', _HEX_F
+
+    return _candidate_source(deps, window, stage), 'anchors_hash', _HEX_F
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('kind', ('window', 'chunk', 'stage', 'source'))
+def test_distillation_row_identity_is_immutable_after_insert(kind: str) -> None:
+    deps = _deps(f'immutable-{kind}')
+    window = _window(deps)
+    row, field, value = _build_row(deps, window, kind)
+    setattr(row, field, value)
+
+    with pytest.raises(ValidationError):
+        row.save()
 
 
 @pytest.mark.django_db
@@ -668,3 +757,65 @@ def test_workflow_work_accepts_candidate_decision_subject_pair() -> None:
 
     assert work.work_type == WorkflowWorkType.CANDIDATE_DECISION
     assert work.subject_type == WorkflowSubjectType.MEMORY_CANDIDATE
+
+
+def _candidate_decision_work(deps: _Deps) -> WorkflowWork:
+    return WorkflowWork.objects.create(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+        subject_id=deps.candidate.id,
+        contract_version=1,
+        occurrence_key='',
+        input_fingerprint=_HEX_A,
+        input_snapshot={'schema': 'candidate_decision_input/v1'},
+    )
+
+
+@pytest.mark.django_db
+def test_workflow_run_accepts_candidate_decision_run_type() -> None:
+    deps = _deps('run-candidate-decision')
+    work = _candidate_decision_work(deps)
+    now = timezone.now()
+
+    run = WorkflowRun(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        work=work,
+        run_type=WorkflowRunType.CANDIDATE_DECISION,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.AUTOMATIC,
+        dispatched_at=now,
+        input_snapshot=work.input_snapshot,
+    )
+    run.full_clean()
+    run.save()
+
+    assert WorkflowRun.objects.get(id=run.id).run_type == WorkflowRunType.CANDIDATE_DECISION
+
+
+@pytest.mark.django_db
+def test_workflow_run_rejects_unknown_run_type() -> None:
+    deps = _deps('run-unknown-type')
+    work = _candidate_decision_work(deps)
+    now = timezone.now()
+
+    run = WorkflowRun(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        work=work,
+        run_type='not_a_real_run_type',
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.AUTOMATIC,
+        dispatched_at=now,
+        input_snapshot=work.input_snapshot,
+    )
+
+    with pytest.raises(ValidationError):
+        run.full_clean()

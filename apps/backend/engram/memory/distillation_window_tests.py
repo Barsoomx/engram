@@ -5,7 +5,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
-from types import ModuleType
 
 import pytest
 from django.db import close_old_connections, connection, transaction
@@ -15,6 +14,9 @@ from django_celery_outbox.models import CeleryOutbox
 from engram.core.models import (
     Agent,
     AgentSession,
+    DistillationChunk,
+    DistillationStage,
+    DistillationWindow,
     Observation,
     Organization,
     Project,
@@ -29,9 +31,11 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.memory import distillation_window as dw
+from engram.memory.services import MemoryWorkerError
 from engram.memory.session_lifecycle import EndSession
 from engram.memory.work_execution import claim_work, finish_work_claim
-from engram.memory.work_failures import INVALID_INPUT
+from engram.memory.work_failures import INVALID_INPUT, translate_failure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     canonical_json_bytes,
@@ -51,12 +55,6 @@ requires_postgres = pytest.mark.skipif(not POSTGRES, reason='concurrency evidenc
 
 _WINDOW_MANIFEST_SCHEMA = 'distillation_window_manifest.v1'
 _CHUNK_MANIFEST_SCHEMA = 'distillation_chunk_manifest.v1'
-
-
-def _dw() -> ModuleType:
-    from engram.memory import distillation_window
-
-    return distillation_window
 
 
 def _scope(suffix: str, *, project_slug: str | None = None) -> Scope:
@@ -182,19 +180,42 @@ def _provider_call(scope: Scope, policy: ModelPolicy) -> ProviderCallRecord:
     )
 
 
-def _complete_stage(scope: Scope, policy: ModelPolicy, stage: object, now: datetime) -> None:
+def _complete_extraction_stage(
+    scope: Scope,
+    policy: ModelPolicy,
+    window: DistillationWindow,
+    chunk: DistillationChunk,
+    now: datetime,
+) -> object:
+    organization, team, project, _agent, _session = scope
     call = _provider_call(scope, policy)
-    stage.status = 'complete'
-    stage.attempt_count = stage.attempt_count + 1
-    stage.accepted_provider_call = call
-    stage.response_hash = _HEX_A
-    stage.response_size = 32
-    stage.output_snapshot = {'memories': [], 'no_signal_observation_ids': []}
-    stage.output_hash = _HEX_B
-    stage.completed_at = now
-    stage.save()
 
-    return
+    return DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        window=window,
+        chunk=chunk,
+        stage_kind='extract',
+        level=0,
+        ordinal=chunk.ordinal,
+        target_key=hashlib.sha256(f'target:{chunk.id}'.encode()).hexdigest(),
+        stage_key=hashlib.sha256(f'stage:{chunk.id}'.encode()).hexdigest(),
+        input_hash=chunk.input_hash,
+        input_manifest={'chunk_ordinal': chunk.ordinal},
+        prompt_contract='distill_extract.v1',
+        policy=policy,
+        policy_version=policy.version,
+        policy_role='primary',
+        status='complete',
+        attempt_count=1,
+        accepted_provider_call=call,
+        response_hash=_HEX_A,
+        response_size=32,
+        output_snapshot={'memories': [], 'no_signal_observation_ids': []},
+        output_hash=_HEX_B,
+        completed_at=now,
+    )
 
 
 def _expected_window_manifest(work: WorkflowWork, observations: list[Observation]) -> dict[str, object]:
@@ -237,7 +258,7 @@ def test_window_materialization_uses_exact_scoped_sequence_prefix() -> None:
     work = _session_work(scope, upper=3)
     _late = _observation(scope, sequence=5)
 
-    window = _dw().materialize_distillation_window(work)
+    window = dw.materialize_distillation_window(work)
 
     assert window.observation_count == 2
     assert window.lower_sequence_exclusive == 0
@@ -253,7 +274,7 @@ def test_window_and_chunk_hashes_are_stable_across_query_order_and_replay() -> N
     second = _observation(scope, sequence=2)
     work = _session_work(scope, upper=3)
 
-    window = _dw().materialize_distillation_window(work)
+    window = dw.materialize_distillation_window(work)
     expected = _expected_window_manifest(work, [first, second, third])
     expected_hash = hashlib.sha256(canonical_json_bytes(expected)).hexdigest()
 
@@ -274,7 +295,7 @@ def test_window_and_chunk_hashes_are_stable_across_query_order_and_replay() -> N
         assert chunk.input_manifest == chunk_manifest
         assert chunk.input_hash == hashlib.sha256(canonical_json_bytes(chunk_manifest)).hexdigest()
 
-    replay = _dw().materialize_distillation_window(work)
+    replay = dw.materialize_distillation_window(work)
 
     assert replay.id == window.id
     assert replay.input_hash == window.input_hash
@@ -295,7 +316,7 @@ def test_concurrent_window_materialization_converges_on_one_plan() -> None:
         close_old_connections()
         try:
             barrier.wait(timeout=5)
-            window = _dw().materialize_distillation_window(work)
+            window = dw.materialize_distillation_window(work)
             results.append(window.id)
         finally:
             close_old_connections()
@@ -305,7 +326,7 @@ def test_concurrent_window_materialization_converges_on_one_plan() -> None:
         for future in futures:
             future.result(timeout=15)
 
-    windows = list(_dw().DistillationWindow.objects.filter(work=work))
+    windows = list(dw.DistillationWindow.objects.filter(work=work))
     assert len(windows) == 1
     assert set(results) == {windows[0].id}
     assert windows[0].chunks.count() >= 1
@@ -323,8 +344,8 @@ def test_success_for_generation_n_does_not_cover_failed_generation_n_plus_1() ->
     work_n = _session_work(scope, upper=3)
     work_next = _session_work(scope, upper=5)
 
-    window_n = _dw().materialize_distillation_window(work_n)
-    window_next = _dw().materialize_distillation_window(work_next)
+    window_n = dw.materialize_distillation_window(work_n)
+    window_next = dw.materialize_distillation_window(work_next)
 
     assert window_n.id != window_next.id
     assert window_n.input_hash != window_next.input_hash
@@ -347,7 +368,6 @@ def test_max_calls_per_attempt_continues_same_work_without_tail_loss(monkeypatch
     for sequence in range(1, chunk_count + 1):
         _observation(scope, sequence=sequence, body=oversized)
     work = _session_work(scope, upper=chunk_count)
-    dw = _dw()
 
     window = dw.materialize_distillation_window(work)
     assert window.chunks.count() == chunk_count
@@ -372,11 +392,11 @@ def test_max_calls_per_attempt_continues_same_work_without_tail_loss(monkeypatch
         assert claim is not None
 
         planned = 0
-        stage = dw.next_distillation_stage(window)
-        while stage is not None and planned < max_calls:
-            _complete_stage(scope, policy, stage, now)
+        chunk = dw.next_distillation_stage(window)
+        while chunk is not None and planned < max_calls:
+            _complete_extraction_stage(scope, policy, window, chunk, now)
             planned += 1
-            stage = dw.next_distillation_stage(window)
+            chunk = dw.next_distillation_stage(window)
 
         if dw.next_distillation_stage(window) is not None:
             new_run = dw.continue_distillation_work(work=work, claim=claim, now=now)
@@ -409,7 +429,6 @@ def test_max_calls_per_attempt_continues_same_work_without_tail_loss(monkeypatch
 
 @pytest.mark.django_db
 def test_max_provider_calls_per_attempt_config_defaults_and_validates(monkeypatch: pytest.MonkeyPatch) -> None:
-    dw = _dw()
     monkeypatch.delenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', raising=False)
     assert dw.max_provider_calls_per_attempt() == 8
 
@@ -425,6 +444,29 @@ def test_max_provider_calls_per_attempt_config_defaults_and_validates(monkeypatc
 
 
 @pytest.mark.django_db
+def test_continue_distillation_work_rejects_foreign_claim() -> None:
+    scope = _scope('window-continue-guard')
+    _observation(scope, sequence=1)
+    work = _session_work(scope, upper=1)
+    foreign_scope = _scope('window-continue-guard-foreign')
+    _observation(foreign_scope, sequence=1)
+    foreign_work = _session_work(foreign_scope, upper=1)
+
+    now = timezone.now()
+    result = claim_work(
+        work_id=foreign_work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'host:{uuid.uuid4()}',
+        now=now,
+        lease_for=_LEASE,
+    )
+    assert result.claim is not None
+
+    with pytest.raises(ValueError):
+        dw.continue_distillation_work(work=work, claim=result.claim, now=now)
+
+
+@pytest.mark.django_db
 def test_next_distillation_stage_derives_first_uncovered_extraction_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
     scope = _scope('window-next-stage')
     policy = _curation_policy(scope)
@@ -432,7 +474,6 @@ def test_next_distillation_stage_derives_first_uncovered_extraction_chunk(monkey
     for sequence in range(1, 4):
         _observation(scope, sequence=sequence, body=oversized)
     work = _session_work(scope, upper=3)
-    dw = _dw()
 
     window = dw.materialize_distillation_window(work)
     ordinals = list(window.chunks.order_by('ordinal').values_list('ordinal', flat=True))
@@ -440,13 +481,12 @@ def test_next_distillation_stage_derives_first_uncovered_extraction_chunk(monkey
 
     now = timezone.now()
     seen: list[int] = []
-    stage = dw.next_distillation_stage(window)
-    while stage is not None:
-        assert stage.stage_kind == 'extract'
-        assert stage.level == 0
-        seen.append(stage.chunk.ordinal)
-        _complete_stage(scope, policy, stage, now)
-        stage = dw.next_distillation_stage(window)
+    chunk = dw.next_distillation_stage(window)
+    while chunk is not None:
+        assert isinstance(chunk, DistillationChunk)
+        seen.append(chunk.ordinal)
+        _complete_extraction_stage(scope, policy, window, chunk, now)
+        chunk = dw.next_distillation_stage(window)
 
     assert seen == [0, 1, 2]
     assert dw.next_distillation_stage(window) is None
@@ -458,7 +498,6 @@ def test_invalid_scope_or_content_digest_fails_before_provider_call(tamper: str)
     scope = _scope('window-invalid')
     _observation(scope, sequence=1)
     work = _session_work(scope, upper=1)
-    dw = _dw()
 
     if tamper == 'fingerprint':
         WorkflowWork.objects.filter(id=work.id).update(input_fingerprint='0' * 64)
@@ -471,12 +510,29 @@ def test_invalid_scope_or_content_digest_fails_before_provider_call(tamper: str)
         WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
 
     reloaded = WorkflowWork.objects.get(id=work.id)
-    with pytest.raises(dw.DistillationInputError) as error:
+    with pytest.raises(MemoryWorkerError) as error:
         dw.materialize_distillation_window(reloaded)
 
-    assert error.value.failure_class == INVALID_INPUT
+    assert translate_failure(error.value).failure_class == INVALID_INPUT
     assert dw.DistillationWindow.objects.filter(work=work).count() == 0
     assert dw.DistillationStage.objects.filter(window__work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_replaying_window_rejects_tampered_observation_content() -> None:
+    scope = _scope('window-tamper-replay')
+    observation = _observation(scope, sequence=1, body='original body')
+    work = _session_work(scope, upper=1)
+
+    window = dw.materialize_distillation_window(work)
+    Observation.objects.filter(id=observation.id).update(body='forged body')
+
+    with pytest.raises(MemoryWorkerError) as error:
+        dw.materialize_distillation_window(work)
+
+    assert translate_failure(error.value).failure_class == INVALID_INPUT
+    assert dw.DistillationWindow.objects.filter(work=work).count() == 1
+    assert dw.DistillationWindow.objects.get(work=work).id == window.id
 
 
 @requires_postgres
@@ -493,7 +549,7 @@ def test_window_owning_required_work_restores_signal_through_reconciler() -> Non
         source='explicit',
     )
     work = WorkflowWork.objects.get(id=result.work_id)
-    _dw().materialize_distillation_window(work)
+    dw.materialize_distillation_window(work)
     CeleryOutbox.objects.all().delete()
 
     now = timezone.now()
@@ -517,4 +573,4 @@ def test_window_owning_required_work_restores_signal_through_reconciler() -> Non
         == 1
     )
     assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
-    assert _dw().DistillationWindow.objects.filter(work=work).count() == 1
+    assert dw.DistillationWindow.objects.filter(work=work).count() == 1
