@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import uuid
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 
 import pytest
@@ -21,17 +22,20 @@ from engram.core.models import (
     SessionStatus,
     Team,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
+    WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
 from engram.memory import tasks as tasks_module
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
-from engram.memory.services import MemoryWorkerError
+from engram.memory.services import MemoryCandidateWorkerResult, MemoryWorkerError
 from engram.memory.tasks import (
     decay_memory_confidence,
     distill_session,
@@ -39,7 +43,20 @@ from engram.memory.tasks import (
     generate_daily_digest,
     generate_weekly_digest,
     process_observation_recorded,
+    process_observation_work_v1,
     retry_failed_distillations,
+)
+from engram.memory.work_execution import (
+    StaleWorkFenceError,
+    claim_work,
+    execution_configuration_fingerprint,
+    lock_work_fence,
+)
+from engram.memory.work_failures import (
+    CONFIGURATION,
+    INVALID_INPUT,
+    PROVIDER_TRANSIENT,
+    WORKER_LOST,
 )
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -49,6 +66,11 @@ from engram.memory.workflow_work import (
     resolve_work_no_input,
     resolve_work_succeeded,
 )
+from engram.model_policy.errors import ModelPolicyError
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+
+_OBS_LEASE = timedelta(seconds=120)
+_OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
 
 _VERSIONED_WORK_TASKS = (
     (
@@ -717,6 +739,11 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
         invalid_updates.append({'status': WorkflowRunStatus.SUCCEEDED})
     task = getattr(tasks_module, task_attribute)
 
+    # CONVERTED: the supplied-run link/state guard moves from _load_workflow_run/_claim_workflow_run
+    # into claim_work, which only leases a QUEUED v1 attempt linked to this exact work. These rows are
+    # execution_contract_version 0 (legacy), so the registry rejects every one of them as 'not a v1
+    # attempt' before any domain execution; the rejection surfaces as ValueError from claim_work rather
+    # than the old MemoryWorkerError. Domain execution must still never be reached.
     with mock.patch(domain_target) as m_execute:
         for invalid_update in invalid_updates:
             invalid_run = WorkflowRun.objects.create(
@@ -728,7 +755,7 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
                 status=WorkflowRunStatus.QUEUED,
             )
             WorkflowRun.objects.filter(id=invalid_run.id).update(**invalid_update)
-            with pytest.raises(MemoryWorkerError, match='workflow run'):
+            with pytest.raises((MemoryWorkerError, ValueError)):
                 task(str(work.id), workflow_run_id=str(invalid_run.id))
             invalid_run.delete()
 
@@ -862,8 +889,14 @@ def test_distill_session_work_automatic_delivery_does_not_retry_failed_initial_a
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
 
+# CONVERTED from test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery.
+# Old idiom: an explicit already-SUCCEEDED (v0) run redelivered on settled work was absorbed by
+# _succeeded_workflow_run_result, emitting 'workflow_run_duplicate_delivery_absorbed' via='claim'.
+# That helper is superseded by the execution registry. Under the cutover a redelivered settled
+# work is absorbed at the claim boundary (claim_work -> terminal) with NO domain execution and NO
+# new run; the ad-hoc duplicate-delivery log path no longer runs.
 @pytest.mark.django_db
-def test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery(
+def test_distill_session_work_v1_settled_work_is_absorbed_as_terminal_without_execution(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -876,40 +909,14 @@ def test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery(
         organization_id=work.organization_id,
         project_id=work.project_id,
     )
-    succeeded_run = WorkflowRun.objects.create(
-        organization_id=work.organization_id,
-        project_id=work.project_id,
-        team_id=work.team_id,
-        work=work,
-        run_type=WorkflowRunType.SESSION_DISTILLATION,
-        status=WorkflowRunStatus.QUEUED,
-        input_snapshot={'session_id': str(session.id)},
-    )
-    now = timezone.now()
-    WorkflowRun.objects.filter(id=succeeded_run.id).update(
-        status=WorkflowRunStatus.SUCCEEDED,
-        started_at=now,
-        finished_at=now,
-    )
+    WorkflowWork.objects.filter(id=work.id).update(execution_state=WorkflowWorkExecutionState.SETTLED)
 
-    with (
-        mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute,
-        mock.patch('engram.memory.tasks.logger.info') as m_log,
-    ):
-        result = tasks_module.distill_session_work_v1(
-            str(work.id),
-            workflow_run_id=str(succeeded_run.id),
-        )
+    with mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute:
+        result = tasks_module.distill_session_work_v1(str(work.id))
 
     m_execute.assert_not_called()
-    assert result == str(succeeded_run.id)
-    assert WorkflowRun.objects.filter(work=work).count() == 1
-    m_log.assert_called_once_with(
-        'workflow_run_duplicate_delivery_absorbed',
-        work_id=str(work.id),
-        workflow_run_id=str(succeeded_run.id),
-        via='claim',
-    )
+    assert result == str(work.id)
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
 
 
 @pytest.mark.django_db
@@ -936,3 +943,343 @@ def test_distill_session_work_rejects_altered_snapshot_before_run_or_provider(
 
     m_run.assert_not_called()
     assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# C2.1 Zone-C task-level execution-registry cutover (RED)
+#
+# These specify the NEW registry-backed behavior of the versioned adapters: each
+# automatic delivery must go through claim_work (fenced lease + append-only v1
+# WorkflowRun), execute the domain, then commit the durable semantic outcome in
+# the same short transaction as lock_work_fence + finish_work_claim/fail_work_claim.
+# The old idioms (no run on automatic observation delivery, resolve_work_* without
+# touching execution_state, self.retry on retryable failures) fail these tests.
+# ---------------------------------------------------------------------------
+
+
+def _observation_work(session: AgentSession) -> WorkflowWork:
+    return create_required_work(session, work_type=WorkflowWorkType.OBSERVATION_PROCESSING)
+
+
+def _no_signal_result() -> MemoryCandidateWorkerResult:
+    return MemoryCandidateWorkerResult(candidate=None, duplicate=False, memory=None)
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_automatic_delivery_leases_and_settles_with_run_evidence(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=_no_signal_result(),
+    ):
+        process_observation_work_v1(str(work.id))
+
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.origin == WorkflowRunOrigin.AUTOMATIC
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == 1
+    assert run.started_at is not None
+    assert run.finished_at is not None
+    assert _OWNER_RE.match(run.lease_owner) is not None
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason in (
+        WorkflowWorkResolutionReason.SUCCEEDED,
+        WorkflowWorkResolutionReason.NO_SIGNAL,
+    )
+    assert work.fencing_token == 1
+    assert work.lease_owner == ''
+    assert work.lease_expires_at is None
+    assert work.heartbeat_at is None
+    assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_observation_work_required_ready_work_with_no_run_stays_signal_eligible_f7(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+    assert work.fencing_token == 0
+    assert work.lease_owner == ''
+    assert work.lease_expires_at is None
+    assert work.heartbeat_at is None
+    assert work.next_retry_at is None
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+    result = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        lease_owner='host:1:00000000-0000-4000-8000-000000000000',
+        now=datetime(2026, 7, 12, 12, 0, tzinfo=UTC),
+        lease_for=_OBS_LEASE,
+    )
+
+    assert result.outcome == 'claimed'
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_expired_lease_is_reclaimed_and_stale_owner_is_fenced_f8(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    past = timezone.now() - timedelta(hours=1)
+    stale = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        lease_owner='ghost:1:11111111-1111-4111-8111-111111111111',
+        now=past,
+        lease_for=_OBS_LEASE,
+    )
+    stale_claim = stale.claim
+    old_run_id = stale_claim.workflow_run_id
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=_no_signal_result(),
+    ):
+        process_observation_work_v1(str(work.id))
+
+    old_run = WorkflowRun.objects.get(id=old_run_id)
+    assert old_run.status == WorkflowRunStatus.FAILED
+    assert old_run.failure_class == WORKER_LOST
+    assert old_run.failure_code == 'lease_expired'
+
+    fresh = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.SUCCEEDED).get()
+    assert fresh.fencing_token == 2
+    assert fresh.origin == WorkflowRunOrigin.AUTOMATIC
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.fencing_token == 2
+
+    with pytest.raises(StaleWorkFenceError):
+        with transaction.atomic():
+            lock_work_fence(claim=stale_claim, now=timezone.now())
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_busy_foreign_live_lease_returns_without_execution(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    foreign = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        lease_owner='rival:1:22222222-2222-4222-8222-222222222222',
+        now=timezone.now(),
+        lease_for=_OBS_LEASE,
+    )
+    foreign_run_id = foreign.claim.workflow_run_id
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        process_observation_work_v1(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.lease_owner == foreign.claim.lease_owner
+    assert work.fencing_token == foreign.claim.fencing_token
+    foreign_run = WorkflowRun.objects.get(id=foreign_run_id)
+    assert foreign_run.status == WorkflowRunStatus.RUNNING
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_provider_transient_records_retry_wait_without_self_retry(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    error = ModelPolicyError('provider_http_error', 'rate limited', retryable=True, http_status=429)
+    m_retry = mock.Mock(side_effect=AssertionError('self.retry must not be scheduled for domain failures'))
+
+    with (
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute', side_effect=error),
+        mock.patch.object(process_observation_work_v1, 'retry', m_retry),
+    ):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            process_observation_work_v1(str(work.id))
+
+    m_retry.assert_not_called()
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == PROVIDER_TRANSIENT
+    assert run.failure_code == 'provider_rate_limited'
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.failure_streak == 1
+    assert work.next_retry_at is not None
+    delay = (work.next_retry_at - run.finished_at).total_seconds()
+    assert 29 <= delay <= 31
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_configuration_failure_blocks_with_fingerprint(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    error = ModelPolicyError('model_policy_not_found', 'no policy', http_status=404)
+    expected_fingerprint = execution_configuration_fingerprint(work)
+    m_retry = mock.Mock(side_effect=AssertionError('configuration failure must not self.retry'))
+
+    with (
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute', side_effect=error),
+        mock.patch.object(process_observation_work_v1, 'retry', m_retry),
+    ):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            process_observation_work_v1(str(work.id))
+
+    m_retry.assert_not_called()
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == CONFIGURATION
+    assert run.failure_code == 'model_policy_unavailable'
+    assert run.configuration_fingerprint == expected_fingerprint
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.blocked_configuration_fingerprint == expected_fingerprint
+    assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_invalid_input_is_terminal_and_keeps_work_required(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    error = ModelPolicyError('provider_http_error', 'bad request', http_status=400)
+    m_retry = mock.Mock(side_effect=AssertionError('invalid input must not self.retry'))
+
+    with (
+        mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute', side_effect=error),
+        mock.patch.object(process_observation_work_v1, 'retry', m_retry),
+    ):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            process_observation_work_v1(str(work.id))
+
+    m_retry.assert_not_called()
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'provider_request_invalid'
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_observation_work_v1_blocked_redelivery_skips_provider_until_config_changes(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    config_error = ModelPolicyError('model_policy_not_found', 'no policy', http_status=404)
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        side_effect=config_error,
+    ):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            process_observation_work_v1(str(work.id))
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    blocked_fingerprint = work.blocked_configuration_fingerprint
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        process_observation_work_v1(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert work.blocked_configuration_fingerprint == blocked_fingerprint
+
+    ModelPolicy.objects.create(
+        organization=f_org,
+        team=f_team,
+        project=f_project,
+        name='generation policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=_provider_secret(f_org, f_team),
+        version=1,
+    )
+    assert execution_configuration_fingerprint(work) != blocked_fingerprint
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=_no_signal_result(),
+    ) as m_execute:
+        process_observation_work_v1(str(work.id))
+
+    m_execute.assert_called_once()
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+def _provider_secret(organization: Organization, team: Team) -> ProviderSecret:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='resume secret',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+
+    return secret

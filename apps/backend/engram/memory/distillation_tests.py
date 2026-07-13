@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import urllib.error
 from decimal import Decimal
@@ -10,6 +11,7 @@ from unittest import mock
 import pytest
 from django.db import connection, transaction
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
     Agent,
@@ -34,6 +36,7 @@ from engram.core.models import (
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
@@ -52,6 +55,12 @@ from engram.memory.distillation import (
 )
 from engram.memory.services import MemoryWorkerError, PromoteMemoryCandidate
 from engram.memory.tasks import distill_session_work_v1
+from engram.memory.work_dispatch import queue_work_attempt
+from engram.memory.work_failures import (
+    INFRASTRUCTURE_TRANSIENT,
+    PROVIDER_TRANSIENT,
+    UNEXPECTED,
+)
 from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
@@ -65,6 +74,9 @@ from engram.model_policy.services import (
     ProviderCallResult,
     _completion_body,
 )
+
+_OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
+_RETRYING_CLASSES = frozenset({UNEXPECTED, INFRASTRUCTURE_TRANSIENT, PROVIDER_TRANSIENT})
 
 
 @pytest.fixture
@@ -2169,8 +2181,14 @@ def test_distill_session_work_v1_duplicate_automatic_delivery_creates_one_run_an
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
 
 
+# CONVERTED from test_distill_session_work_v1_uses_supplied_queued_run_without_creating_another.
+# Old idiom: a bare v0 QUEUED run was adopted through _load_workflow_run + _claim_workflow_run (a
+# status CAS to RUNNING) with no fencing token/owner. Under the cutover the supplied attempt is a v1
+# queued run produced by queue_work_attempt; the adapter leases it through claim_work (token 1,
+# process-owner), executes, then fences + finishes it in one short transaction. A v0 run can no longer
+# satisfy the v1 running/succeeded contract, so the old CAS path cannot lease it.
 @pytest.mark.django_db
-def test_distill_session_work_v1_uses_supplied_queued_run_without_creating_another(
+def test_distill_session_work_v1_leases_supplied_queued_v1_run_without_creating_another(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     organization, team, project, agent, session = create_session_scope()
@@ -2178,29 +2196,35 @@ def test_distill_session_work_v1_uses_supplied_queued_run_without_creating_anoth
     create_observation(organization, project, team, agent, session, index=1)
     create_observation(organization, project, team, agent, session, index=2)
     work = create_session_distillation_work(session, upper=2)
-    queued = WorkflowRun.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        work=work,
-        run_type=WorkflowRunType.SESSION_DISTILLATION,
-        status=WorkflowRunStatus.QUEUED,
-        input_snapshot={'session_id': str(session.id)},
+    queued = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin='reconciliation',
     )
     opener = real_prompt_gateway(m_monkeypatch, bodies=[held_candidate_body()])
 
     distill_session_work_v1(str(work.id), workflow_run_id=str(queued.id))
 
-    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 1
     assert len(opener.calls) == 1
     queued.refresh_from_db()
     assert queued.status == WorkflowRunStatus.SUCCEEDED
+    assert queued.fencing_token == 1
+    assert _OWNER_RE.match(queued.lease_owner) is not None
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
 
 
+# CONVERTED from test_distill_session_work_v1_truncated_result_keeps_work_required_and_adopts_on_redelivery.
+# Old idiom: _finalize_session_distill_work left the work REQUIRED, completed the single v0 run with
+# escalation=True, and relied on a later automatic redelivery adopting the same finished run without
+# re-running the provider. Under the registry cutover a truncated distillation is a continue_required
+# completion: the leased v1 run SUCCEEDS, the work returns to required/ready, and a NEW queued v1
+# continuation attempt is signaled (composite task id) in the same outer transaction as the fence and
+# finish -- never by reusing the finished run/token.
 @pytest.mark.django_db
-def test_distill_session_work_v1_truncated_result_keeps_work_required_and_adopts_on_redelivery(
+def test_distill_session_work_v1_truncated_result_continues_with_new_queued_attempt(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     organization, team, project, agent, session = create_session_scope()
@@ -2215,30 +2239,51 @@ def test_distill_session_work_v1_truncated_result_keeps_work_required_and_adopts
     distill_session_work_v1(str(work.id))
 
     assert len(opener.calls) == 8
-    work.refresh_from_db()
-    assert work.disposition == WorkflowWorkDisposition.REQUIRED
-    runs = WorkflowRun.objects.filter(work=work)
-    assert runs.count() == 1
-    assert runs.get().escalation is True
     assert AuditEvent.objects.filter(
         event_type='SessionDistillationTruncated',
         target_id=str(session.id),
     ).exists()
 
-    distill_session_work_v1(str(work.id))
-
-    assert WorkflowRun.objects.filter(work=work).count() == 1
-    assert len(opener.calls) == 8
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+    assert work.lease_owner == ''
+    assert work.lease_expires_at is None
+
+    executed = WorkflowRun.objects.get(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.SUCCEEDED,
+    )
+    assert executed.fencing_token == 1
+    assert executed.finished_at is not None
+
+    continuation = WorkflowRun.objects.get(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    assert continuation.id != executed.id
+    assert continuation.dispatched_at is not None
+    assert CeleryOutbox.objects.filter(
+        task_name='engram.memory.distill_session_work_v1',
+        task_id=f'workflow-work:{work.id}:run:{continuation.id}',
+    ).exists()
 
 
 class _RetryScheduledError(Exception):
     pass
 
 
+# CONVERTED from test_distill_session_work_v1_requeued_initial_run_executes_on_automatic_redelivery.
+# Old idiom (C1.3b requeue-QUEUED-claim + self.retry-on-retryable): a transient provider error
+# requeued the RUNNING run back to QUEUED and scheduled self.retry so the next automatic redelivery
+# re-executed the same run. The cutover removes self.retry for domain failures: the leased v1 run is
+# FAILED with a typed retrying class, the work moves to retry_wait with a bounded next_retry_at, and
+# the task RAISES for observability. The logical reconciler -- not automatic Celery redelivery --
+# creates the later attempt after next_retry_at.
 @pytest.mark.django_db
-def test_distill_session_work_v1_requeued_initial_run_executes_on_automatic_redelivery(
+def test_distill_session_work_v1_transient_failure_records_retry_wait_without_self_retry(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     organization, team, project, agent, session = create_session_scope()
@@ -2246,32 +2291,25 @@ def test_distill_session_work_v1_requeued_initial_run_executes_on_automatic_rede
     create_observation(organization, project, team, agent, session, index=1)
     create_observation(organization, project, team, agent, session, index=2)
     work = create_session_distillation_work(session, upper=2)
-    calls: list[Any] = []
 
     def opener(request: Any, timeout: float = 30) -> _RecordingResponse:
-        calls.append(request)
-        if len(calls) == 1:
-            raise urllib.error.URLError('transient distill failure')
-
-        return _RecordingResponse(held_candidate_body())
+        raise urllib.error.URLError('transient distill failure')
 
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
     m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
+    m_retry = mock.Mock(side_effect=_RetryScheduledError)
 
-    with mock.patch.object(distill_session_work_v1, 'retry', side_effect=_RetryScheduledError):
-        with pytest.raises(_RetryScheduledError):
+    with mock.patch.object(distill_session_work_v1, 'retry', m_retry):
+        with pytest.raises((MemoryWorkerError, _RetryScheduledError)):
             distill_session_work_v1(str(work.id))
 
-    requeued = WorkflowRun.objects.get(work=work)
-    assert requeued.status == WorkflowRunStatus.QUEUED
-    assert len(calls) == 1
-
-    distill_session_work_v1(str(work.id))
-
-    assert len(calls) == 2
-    assert WorkflowRun.objects.filter(work=work).count() == 1
-    run = WorkflowRun.objects.get(work=work)
-    assert run.status == WorkflowRunStatus.SUCCEEDED
-    assert run.finished_at is not None
+    m_retry.assert_not_called()
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class in _RETRYING_CLASSES
     work.refresh_from_db()
-    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.next_retry_at is not None
+    assert work.failure_streak == 1
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 0
