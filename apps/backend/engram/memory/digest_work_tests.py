@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
+from unittest import mock
 
 import pytest
 from django.db import close_old_connections, connection, transaction
@@ -21,22 +23,28 @@ from engram.core.models import (
     Team,
     VisibilityScope,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
+from engram.memory.work_execution import execution_configuration_fingerprint
+from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
 from engram.memory.workflow_work import CreateWorkflowWorkInput
+from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import FakeProviderGateway, ProviderCallInput, ProviderCallResult
 
 _DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
+_OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
 
 
 def _load_digest_work() -> object:
@@ -973,7 +981,11 @@ def test_daily_work_execution_rejects_source_body_drift_before_provider(
 
     assert calls == []
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_scope_invalid'
 
 
 @pytest.mark.django_db
@@ -994,7 +1006,11 @@ def test_weekly_work_execution_rejects_source_body_drift_before_provider(
 
     assert calls == []
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_scope_invalid'
 
 
 @pytest.mark.django_db
@@ -1023,7 +1039,11 @@ def test_weekly_team_work_fails_closed_when_project_team_link_removed(
 
     assert calls == []
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_scope_invalid'
 
 
 @pytest.mark.django_db
@@ -1073,7 +1093,7 @@ def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
     result = generate_daily_digest_work_v1(str(work.id))
 
     assert not any(embed_atomic_flags)
-    assert result == str(work.id)
+    assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
     digest_memory = digests.get()
@@ -1106,7 +1126,7 @@ def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
     result = generate_weekly_digest_work_v1(str(work.id))
 
     assert not any(embed_atomic_flags)
-    assert result == str(work.id)
+    assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
     digest_memory = digests.get()
@@ -1136,7 +1156,8 @@ def test_daily_work_second_automatic_delivery_reuses_output_without_second_provi
     first = generate_daily_digest_work_v1(str(work.id))
     second = generate_daily_digest_work_v1(str(work.id))
 
-    assert first == second
+    assert first == str(_v1_runs(work).get().id)
+    assert second == str(work.id)
     assert len(calls) == 1
     assert Memory.objects.filter(project=project, kind='digest').count() == 1
 
@@ -1239,8 +1260,9 @@ def test_daily_work_automatic_path_creates_no_run_and_publishes_once() -> None:
 
     result = generate_daily_digest_work_v1(str(work.id))
 
-    assert result == str(work.id)
-    assert WorkflowRun.objects.filter(work=work).count() == 0
+    run = _v1_runs(work).get()
+    assert result == str(run.id)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
     assert _digest_output_for_work(project, work) == 1
 
 
@@ -1283,3 +1305,238 @@ def test_weekly_work_publishes_legacy_metadata_block() -> None:
     assert isinstance(metadata['counts'], dict)
     assert isinstance(metadata['memory_changes'], dict)
     assert metadata['content_hash'] == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# C2.1 Zone-D digest execution-registry cutover (RED)
+#
+# These specify the NEW registry-backed behavior of the digest adapters. Each
+# automatic delivery must lease through claim_work (240s), append a v1
+# WorkflowRun, then either publish + finish_work_claim inside execute_frozen_
+# digest_work's publication TX2 (success) or translate_failure + fail_work_claim
+# at the adapter boundary (failure). The legacy no-claim behavior of
+# execute_frozen_digest_work stays byte-identical when claim is None.
+# ---------------------------------------------------------------------------
+
+
+class _RaisingDigestGateway:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        raise self._error
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+def _raising_gateway(error: Exception) -> object:
+    def stub(policy: object, **_kwargs: object) -> object:
+        return _RaisingDigestGateway(error)
+
+    return stub
+
+
+def _v1_runs(work: WorkflowWork) -> object:
+    return WorkflowRun.objects.filter(work=work, execution_contract_version=1)
+
+
+@pytest.mark.django_db
+def test_daily_automatic_delivery_leases_and_settles_with_run_evidence() -> None:
+    organization, project = _make_scope('daily-lease-settle')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    generate_daily_digest_work_v1(str(work.id))
+
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    digest = Memory.objects.get(project=project, kind='digest')
+    assert run.origin == WorkflowRunOrigin.AUTOMATIC
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == 1
+    assert run.started_at is not None
+    assert run.finished_at is not None
+    assert run.result_memory_id == digest.id
+    assert _OWNER_RE.match(run.lease_owner) is not None
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert work.fencing_token == 1
+    assert work.lease_owner == ''
+    assert work.lease_expires_at is None
+    assert work.heartbeat_at is None
+    assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_weekly_automatic_delivery_leases_and_settles_with_run_evidence() -> None:
+    organization, project = _make_scope('weekly-lease-settle')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_weekly_work(organization, project)
+
+    generate_weekly_digest_work_v1(str(work.id))
+
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    digest = Memory.objects.get(project=project, kind='digest')
+    assert run.origin == WorkflowRunOrigin.AUTOMATIC
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == 1
+    assert run.started_at is not None
+    assert run.finished_at is not None
+    assert run.result_memory_id == digest.id
+    assert _OWNER_RE.match(run.lease_owner) is not None
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert work.fencing_token == 1
+    assert work.lease_owner == ''
+    assert work.lease_expires_at is None
+
+
+@pytest.mark.django_db
+def test_daily_automatic_provider_transient_records_retry_wait_without_self_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-provider-transient')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    error = ModelPolicyError('provider_http_error', 'rate limited', retryable=True, http_status=429)
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _raising_gateway(error))
+    m_retry = mock.Mock(side_effect=AssertionError('self.retry must not be scheduled for domain failures'))
+
+    with mock.patch.object(generate_daily_digest_work_v1, 'retry', m_retry):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            generate_daily_digest_work_v1(str(work.id))
+
+    m_retry.assert_not_called()
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == PROVIDER_TRANSIENT
+    assert run.failure_code == 'provider_rate_limited'
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.failure_streak == 1
+    assert work.next_retry_at is not None
+    delay = (work.next_retry_at - run.finished_at).total_seconds()
+    assert 29 <= delay <= 31
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_automatic_configuration_failure_blocks_with_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-config-blocked')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    expected_fingerprint = execution_configuration_fingerprint(work)
+    m_retry = mock.Mock(side_effect=AssertionError('configuration failure must not self.retry'))
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _raising_gateway(RuntimeError('unused')))
+
+    with mock.patch.object(generate_daily_digest_work_v1, 'retry', m_retry):
+        with pytest.raises((ModelPolicyError, MemoryWorkerError)):
+            generate_daily_digest_work_v1(str(work.id))
+
+    m_retry.assert_not_called()
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == CONFIGURATION
+    assert run.failure_code == 'model_policy_unavailable'
+    assert run.configuration_fingerprint == expected_fingerprint
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.blocked_configuration_fingerprint == expected_fingerprint
+    assert work.next_retry_at is None
+
+
+@pytest.mark.django_db
+def test_daily_second_automatic_delivery_absorbs_at_claim_without_second_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-reuse-claim')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    generate_daily_digest_work_v1(str(work.id))
+    generate_daily_digest_work_v1(str(work.id))
+
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 1
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+
+
+@pytest.mark.django_db
+def test_daily_source_body_drift_under_claim_is_terminal_invalid_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-body-drift-terminal')
+    _create_digest_policy(organization, project)
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    MemoryVersion.objects.filter(id=version.id).update(body='body-a tampered at rest')
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='body digest'):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert _v1_runs(work).count() == 1
+    run = _v1_runs(work).get()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == INVALID_INPUT
+    assert run.failure_code == 'work_scope_invalid'
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.next_retry_at is None
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_execute_frozen_digest_work_without_claim_publishes_via_legacy_resolver() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-legacy-noclaim')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    result = digest_work.execute_frozen_digest_work(work, None)
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    assert result == digest.id
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
+
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED

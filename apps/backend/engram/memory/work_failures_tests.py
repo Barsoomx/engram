@@ -4,6 +4,7 @@ from types import ModuleType
 import pytest
 from django.db.utils import DatabaseError, OperationalError
 
+from engram.memory.services import MemoryWorkerError
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 
 HEX64 = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
@@ -299,3 +300,49 @@ def test_retry_backoff_clamps_exponent_at_sixteen() -> None:
     saturated = _wf().retry_backoff(failure_class='unexpected', failure_streak=100000)
 
     assert clamped == saturated == timedelta(seconds=21600)
+
+
+# ---------------------------------------------------------------------------
+# C2.1 Zone-D translator mapping for deterministic worker-boundary faults (RED)
+#
+# Pinned contract: MemoryWorkerError gains an optional keyword `code`. When a
+# MemoryWorkerError raised by the digest/session validation boundary carries one
+# of the invalid_input terminal codes, translate_failure classifies it as the
+# terminal `invalid_input` class with that exact stable code (never bounded
+# retry / unexpected). An uncoded MemoryWorkerError keeps classifying as
+# unexpected.
+# ---------------------------------------------------------------------------
+
+INVALID_INPUT_TERMINAL_CODES = (
+    'work_contract_invalid',
+    'work_scope_invalid',
+    'work_fingerprint_mismatch',
+)
+
+
+@pytest.mark.parametrize('code', INVALID_INPUT_TERMINAL_CODES)
+def test_translate_failure_maps_worker_boundary_code_to_invalid_input(code: str) -> None:
+    failure = _wf().translate_failure(MemoryWorkerError('deterministic boundary fault', code=code))
+
+    assert failure.failure_class == 'invalid_input'
+    assert failure.code == code
+    assert failure.configuration_fingerprint == ''
+
+
+@pytest.mark.parametrize('code', INVALID_INPUT_TERMINAL_CODES)
+def test_translate_failure_worker_boundary_code_survives_configuration_fingerprint_kwarg(code: str) -> None:
+    failure = _wf().translate_failure(
+        MemoryWorkerError('deterministic boundary fault', code=code),
+        configuration_fingerprint=HEX64,
+    )
+
+    assert failure.failure_class == 'invalid_input'
+    assert failure.code == code
+    assert failure.configuration_fingerprint == ''
+
+
+def test_translate_failure_uncoded_worker_error_stays_unexpected() -> None:
+    failure = _wf().translate_failure(MemoryWorkerError('opaque worker failure'))
+
+    assert failure.failure_class == 'unexpected'
+    assert failure.code == 'unexpected_exception'

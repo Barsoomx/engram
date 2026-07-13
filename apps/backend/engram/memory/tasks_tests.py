@@ -1283,3 +1283,81 @@ def _provider_secret(organization: Organization, team: Team) -> ProviderSecret:
     )
 
     return secret
+
+
+# ---------------------------------------------------------------------------
+# C2.1 Zone-D digest adapter claim short-circuits (RED)
+#
+# The digest adapters must route automatic delivery through claim_work before any
+# execute_frozen_digest_work call: a live foreign lease must return 'busy' and
+# skip the domain entirely, never re-entering publication.
+# ---------------------------------------------------------------------------
+
+_DIGEST_LEASE = timedelta(seconds=240)
+
+_DIGEST_BUSY_CASES = (
+    ('generate_daily_digest_work_v1', WorkflowWorkType.DAILY_DIGEST),
+    ('generate_weekly_digest_work_v1', WorkflowWorkType.WEEKLY_DIGEST),
+)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(('task_attribute', 'work_type'), _DIGEST_BUSY_CASES)
+def test_digest_work_v1_busy_foreign_live_lease_returns_without_execution(
+    task_attribute: str,
+    work_type: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    foreign = claim_work(
+        work_id=work.id,
+        expected_work_type=work_type,
+        lease_owner='rival:1:22222222-2222-4222-8222-222222222222',
+        now=timezone.now(),
+        lease_for=_DIGEST_LEASE,
+    )
+    foreign_run_id = foreign.claim.workflow_run_id
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch('engram.memory.digest_work.execute_frozen_digest_work') as m_execute:
+        task(str(work.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.lease_owner == foreign.claim.lease_owner
+    assert work.fencing_token == foreign.claim.fencing_token
+    foreign_run = WorkflowRun.objects.get(id=foreign_run_id)
+    assert foreign_run.status == WorkflowRunStatus.RUNNING
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(('task_attribute', 'work_type'), _DIGEST_BUSY_CASES)
+def test_digest_work_v1_settled_work_is_absorbed_without_execution(
+    task_attribute: str,
+    work_type: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=work_type)
+    resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+    WorkflowWork.objects.filter(id=work.id).update(execution_state=WorkflowWorkExecutionState.SETTLED)
+    task = getattr(tasks_module, task_attribute)
+
+    with mock.patch('engram.memory.digest_work.execute_frozen_digest_work') as m_execute:
+        task(str(work.id))
+
+    m_execute.assert_not_called()
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
