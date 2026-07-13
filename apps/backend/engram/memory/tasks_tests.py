@@ -1408,3 +1408,50 @@ def test_digest_work_v1_settled_work_is_absorbed_without_execution(
 
     m_execute.assert_not_called()
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
+
+
+@pytest.mark.django_db
+def test_retry_failed_distillations_routes_required_work_through_reconciler(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    from engram.memory.observation_work_tests import create_scope as create_session_scope
+    from engram.memory.session_lifecycle import EndSession
+
+    organization, project, session = create_session_scope('beat-retire-required')
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='useful observation',
+        content_hash=f'content-{session.id}-1',
+        session_sequence=1,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    result = EndSession().execute(
+        organization_id=organization.id,
+        project_id=project.id,
+        session_id=session.id,
+        ended_at=timezone.now(),
+        source='explicit',
+    )
+    past_grace = timezone.now() - timedelta(minutes=6)
+    WorkflowWork.objects.filter(id=result.work_id).update(created_at=past_grace)
+    AgentSession.objects.filter(id=session.id).update(ended_at=past_grace)
+    CeleryOutbox.objects.all().delete()
+
+    retry_failed_distillations()
+
+    queued = WorkflowRun.objects.filter(
+        work_id=result.work_id,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert queued.get().origin == WorkflowRunOrigin.RECONCILIATION
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
