@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import datetime
+import hashlib
 import uuid
-from unittest.mock import MagicMock, patch
 
 import pytest
 import structlog
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
@@ -16,6 +19,7 @@ from engram.access.models import (
     Identity,
     IdentityType,
     OrganizationMembership,
+    ProjectGrant,
     Role,
     RoleCapability,
 )
@@ -26,10 +30,65 @@ from engram.core.models import (
     MemoryVersion,
     Organization,
     Project,
+    ProjectTeam,
     RetrievalDocument,
+    Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
 )
-from engram.memory.services import WeeklyDigestResult
+from engram.memory.digest_visibility import proven_digest_memory
+from engram.memory.digest_work import (
+    create_digest_work_and_signal,
+    digest_output_identity,
+    freeze_weekly_digest_input,
+)
+from engram.memory.services import weekly_digest_content_hash
+from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.workflow_work import CreateWorkflowWorkInput, WorkflowWorkScopeError
+
+_WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
+
+
+def _publish_weekly_digest(
+    org: Organization,
+    project: Project,
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    *,
+    team: Team | None = None,
+) -> WorkflowWork:
+    schedule_key = f'weekly:{window_start.date().isoformat()}:{team.id if team is not None else ""}'
+    with transaction.atomic():
+        snapshot = freeze_weekly_digest_input(
+            organization_id=org.id,
+            project_id=project.id,
+            team_id=team.id if team is not None else None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, _created = create_digest_work_and_signal(
+            data=CreateWorkflowWorkInput(
+                organization_id=org.id,
+                project_id=project.id,
+                work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                subject_type=WorkflowSubjectType.TEAM if team is not None else WorkflowSubjectType.PROJECT,
+                subject_id=team.id if team is not None else project.id,
+                input_snapshot=snapshot,
+                occurrence_key=schedule_key,
+            ),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    generate_weekly_digest_work_v1(str(work.id))
+
+    return work
 
 
 def _make_user(username: str) -> User:
@@ -77,13 +136,144 @@ def _make_client(token: str, organization: Organization) -> APIClient:
     return client
 
 
-def _make_digest_memory(
+def _current_weekly_window(weeks_back: int) -> tuple[datetime.datetime, datetime.datetime]:
+    today = timezone.now().date()
+    current_monday = today - datetime.timedelta(days=today.isoweekday() - 1)
+    anchor_monday = current_monday - datetime.timedelta(weeks=weeks_back)
+    tzinfo = timezone.get_current_timezone()
+    window_end = datetime.datetime.combine(anchor_monday, datetime.time.min, tzinfo=tzinfo)
+    window_start = datetime.datetime.combine(
+        anchor_monday - datetime.timedelta(days=7),
+        datetime.time.min,
+        tzinfo=tzinfo,
+    )
+
+    return window_start, window_end
+
+
+def _make_source_memory(org: Organization, project: Project, created_at: datetime.datetime) -> Memory:
+    memory = Memory.objects.create(
+        organization=org,
+        project=project,
+        title='weekly source memory',
+        body='source body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    MemoryVersion.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        version=memory.current_version,
+        body='source body',
+        content_hash=hashlib.sha256(b'source body').hexdigest(),
+    )
+    Memory.objects.filter(id=memory.id).update(created_at=created_at, updated_at=created_at)
+
+    return memory
+
+
+def _make_weekly_work(
     org: Organization,
     project: Project,
-    ready: bool = False,
+    *,
+    occurrence_key: str = 'weekly:2026-W28',
+) -> WorkflowWork:
+    snapshot: dict[str, object] = {
+        'schema': 'weekly_digest_input/v1',
+        'project_id': str(project.id),
+        'team_id': None,
+        'schedule_key': occurrence_key,
+        'window_start': '2026-05-11T00:00:00Z',
+        'window_end': '2026-05-18T00:00:00Z',
+        'visibility_policy': 'digest_visibility/v1',
+        'allowed_team_ids': [],
+        'output_visibility_scope': 'project',
+        'output_team_id': None,
+        'input_digest': 'a' * 64,
+        'changes': [],
+    }
+
+    return WorkflowWork.objects.create(
+        organization=org,
+        project=project,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        subject_type=WorkflowSubjectType.PROJECT,
+        subject_id=project.id,
+        contract_version=1,
+        occurrence_key=occurrence_key,
+        input_fingerprint='0' * 64,
+        input_snapshot=snapshot,
+    )
+
+
+def _attach_proven_digest(
+    org: Organization,
+    project: Project,
+    work: WorkflowWork,
+    *,
     digest_kind: str = 'weekly_structured',
 ) -> Memory:
-    return Memory.objects.create(
+    WorkflowWork.objects.filter(id=work.id).update(
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        resolution_reason=WorkflowWorkResolutionReason.SUCCEEDED,
+        resolved_at=timezone.now(),
+    )
+    work.refresh_from_db()
+    snapshot = work.input_snapshot
+
+    memory = Memory.objects.create(
+        organization=org,
+        project=project,
+        title='Weekly Structured Digest 2026-06-23 to 2026-06-30',
+        body='digest body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={
+            'kind': 'digest',
+            'digest_kind': digest_kind,
+            'ready': False,
+            'reviewed_at': None,
+            'digest_visibility': {
+                'schema': 'digest_visibility/v1',
+                'workflow_work_id': str(work.id),
+                'input_digest': snapshot['input_digest'],
+                'output_identity': digest_output_identity(work),
+                'allowed_team_ids': list(snapshot['allowed_team_ids']),
+                'output_visibility_scope': snapshot['output_visibility_scope'],
+                'output_team_id': snapshot['output_team_id'],
+            },
+        },
+    )
+    version = MemoryVersion.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        version=1,
+        body='digest body',
+        content_hash=hashlib.sha256(b'digest body').hexdigest(),
+    )
+    RetrievalDocument.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        full_text='digest body',
+    )
+
+    return memory
+
+
+def _make_unproven_digest(
+    org: Organization,
+    project: Project,
+    *,
+    content_hash: str = 'legacy-hash',
+    digest_kind: str = 'weekly_structured',
+    ready: bool = False,
+) -> Memory:
+    memory = Memory.objects.create(
         organization=org,
         project=project,
         title='Weekly Structured Digest 2026-06-23 to 2026-06-30',
@@ -104,11 +294,29 @@ def _make_digest_memory(
                 'added': [{'id': str(uuid.uuid4()), 'title': 'mem', 'at': '2026-06-25T12:00:00+00:00'}],
             },
             'counts': {'refuted': 0, 'retired': 0, 'superseded': 0, 'merged': 0, 'added': 1},
-            'content_hash': 'abc123',
+            'content_hash': content_hash,
             'ready': ready,
             'reviewed_at': None,
         },
     )
+    version = MemoryVersion.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        version=1,
+        body='Structured weekly digest.',
+        content_hash=hashlib.sha256(b'Structured weekly digest.').hexdigest(),
+    )
+    RetrievalDocument.objects.create(
+        organization=org,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        full_text='Structured weekly digest.',
+    )
+
+    return memory
 
 
 @pytest.fixture
@@ -140,22 +348,24 @@ def f_other_project(f_other_org: Organization) -> Project:
 
 
 @pytest.fixture
-def f_read_client(f_org: Organization) -> APIClient:
+def f_read_client(f_org: Organization, f_project: Project) -> APIClient:
     user = _make_user('digest-read-user')
     identity = _make_identity(user, f_org)
     role = _make_role_with_capabilities('digest_read_role', ('memories:read',))
     OrganizationMembership.objects.create(organization=f_org, identity=identity, role=role)
+    ProjectGrant.objects.create(organization=f_org, project=f_project, identity=identity, role=role)
     token = Token.objects.create(user=user).key
 
     return _make_client(token, f_org)
 
 
 @pytest.fixture
-def f_review_client(f_org: Organization) -> APIClient:
+def f_review_client(f_org: Organization, f_project: Project) -> APIClient:
     user = _make_user('digest-review-user')
     identity = _make_identity(user, f_org)
     role = _make_role_with_capabilities('digest_review_role', ('memories:read', 'memories:review'))
     OrganizationMembership.objects.create(organization=f_org, identity=identity, role=role)
+    ProjectGrant.objects.create(organization=f_org, project=f_project, identity=identity, role=role)
     token = Token.objects.create(user=user).key
 
     return _make_client(token, f_org)
@@ -172,69 +382,128 @@ def f_no_cap_client(f_org: Organization) -> APIClient:
     return _make_client(token, f_org)
 
 
-def _fake_weekly_result(project: Project) -> WeeklyDigestResult:
-    digest_memory = MagicMock(spec=Memory)
-    digest_memory.id = uuid.uuid4()
-    digest_memory.metadata = {
-        'kind': 'digest',
-        'digest_kind': 'weekly_structured',
-        'window_start': '2026-06-23T00:00:00+00:00',
-        'window_end': '2026-06-30T00:00:00+00:00',
-        'window_days': 7,
-        'ready': False,
-    }
-
-    return WeeklyDigestResult(
-        digest_memory=digest_memory,
-        counts={'refuted': 0, 'retired': 0, 'superseded': 0, 'merged': 0, 'added': 1},
-        memory_changes={
-            'refuted': [],
-            'retired': [],
-            'superseded': [],
-            'merged': [],
-            'added': [{'id': str(uuid.uuid4()), 'title': 'added-mem', 'at': '2026-06-25T12:00:00+00:00'}],
-        },
-        ready=False,
-    )
-
-
 @pytest.mark.django_db
-def test_get_weekly_digest_returns_expected_structure(
+def test_get_weekly_current_enqueues_work_and_initial_signal_built_false(
     f_read_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
+    window_start, _window_end = _current_weekly_window(0)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
 
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id)},
-        )
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id)},
+    )
 
     assert response.status_code == 200
 
-    data = response.data
+    assert response.data['built'] is False
 
-    assert 'window_start' in data
+    assert response.data['digest_memory_id'] is None
 
-    assert 'window_end' in data
+    work = WorkflowWork.objects.get(
+        organization=f_org,
+        project=f_project,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+    )
 
-    assert 'window_days' in data
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
-    assert 'counts' in data
+    assert WorkflowRun.objects.filter(run_type=WorkflowRunType.WEEKLY_DIGEST).count() == 0
 
-    assert 'memory_changes' in data
+    outbox = CeleryOutbox.objects.get()
 
-    assert 'changelog' in data
+    assert outbox.task_name == _WEEKLY_TASK_NAME
 
-    assert 'ready' in data
+    assert outbox.args == [str(work.id)]
 
-    assert isinstance(data['changelog'], list)
+    assert outbox.kwargs == {}
 
-    assert data['ready'] is False
+    assert outbox.task_id == f'workflow-work:{work.id}'
 
-    assert data['built'] is True
+
+@pytest.mark.django_db
+def test_get_weekly_current_returns_built_true_only_for_proven_output(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    first = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id)},
+    )
+
+    assert first.status_code == 200
+
+    assert first.data['built'] is False
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.WEEKLY_DIGEST)
+
+    proven = _attach_proven_digest(f_org, f_project, work)
+
+    second = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id)},
+    )
+
+    assert second.status_code == 200
+
+    assert second.data['built'] is True
+
+    assert second.data['digest_memory_id'] == str(proven.id)
+
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.WEEKLY_DIGEST).count() == 1
+
+
+@pytest.mark.django_db
+def test_get_weekly_current_denies_team_outside_caller_scope_without_work(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    team = Team.objects.create(organization=f_org, name='Unscoped', slug='unscoped')
+
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'team_id': str(team.id)},
+    )
+
+    assert response.status_code in (400, 403, 404)
+
+    assert WorkflowWork.objects.count() == 0
+
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_get_weekly_historical_read_only_quarantines_unproven_digest(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start, window_end = _current_weekly_window(3)
+    content_hash = weekly_digest_content_hash(f_project.id, window_start, window_end, None)
+    digest = _make_unproven_digest(f_org, f_project, content_hash=content_hash)
+
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'weeks_back': '3'},
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['built'] is False
+
+    assert response.data['digest_memory_id'] is None
+
+    assert WorkflowWork.objects.count() == 0
+
+    assert CeleryOutbox.objects.count() == 0
+
+    digest.refresh_from_db()
+
+    assert digest.metadata['ready'] is False
 
 
 @pytest.mark.django_db
@@ -258,130 +527,9 @@ def test_get_weekly_digest_past_week_never_built_returns_not_built_without_writi
 
     assert Memory.objects.filter(organization=f_org).count() == 0
 
-    assert MemoryVersion.objects.count() == 0
+    assert WorkflowWork.objects.count() == 0
 
-    assert RetrievalDocument.objects.count() == 0
-
-
-@pytest.mark.django_db
-def test_weekly_digest_forwards_weeks_back(
-    f_read_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    now = timezone.now()
-
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.find_existing.return_value = (_fake_weekly_result(f_project), now, now)
-
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id), 'weeks_back': '2'},
-        )
-
-    assert response.status_code == 200
-
-    m_service_cls.return_value.execute.assert_not_called()
-
-    passed_input = m_service_cls.return_value.find_existing.call_args.args[0]
-
-    assert passed_input.weeks_back == 2
-
-
-@pytest.mark.django_db
-def test_get_weekly_digest_returns_digest_memory_id(
-    f_read_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    result = _fake_weekly_result(f_project)
-
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = result
-
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id)},
-        )
-
-    assert response.status_code == 200
-
-    assert response.data['digest_memory_id'] == str(result.digest_memory.id)
-
-
-@pytest.mark.django_db
-def test_get_weekly_digest_changelog_flattens_buckets(
-    f_read_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
-
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id)},
-        )
-
-    assert response.status_code == 200
-
-    changelog = response.data['changelog']
-
-    assert len(changelog) == 1
-
-    entry = changelog[0]
-
-    assert entry['bucket'] == 'added'
-
-    assert 'id' in entry
-
-    assert 'title' in entry
-
-    assert 'at' in entry
-
-
-@pytest.mark.django_db
-def test_get_weekly_digest_threads_team_id_into_service_input(
-    f_read_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    team_id = uuid.uuid4()
-
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
-
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id), 'team_id': str(team_id)},
-        )
-
-    assert response.status_code == 200
-
-    called_input = m_service_cls.return_value.execute.call_args[0][0]
-
-    assert called_input.team_id == team_id
-
-
-@pytest.mark.django_db
-def test_get_weekly_digest_without_team_id_passes_none(
-    f_read_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    with patch('engram.console.views.digests.BuildWeeklyStructuredDigest') as m_service_cls:
-        m_service_cls.return_value.execute.return_value = _fake_weekly_result(f_project)
-
-        response = f_read_client.get(
-            '/v1/admin/digests/weekly',
-            {'project_id': str(f_project.id)},
-        )
-
-    assert response.status_code == 200
-
-    called_input = m_service_cls.return_value.execute.call_args[0][0]
-
-    assert called_input.team_id is None
+    assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
@@ -449,12 +597,14 @@ def test_get_weekly_digest_returns_404_for_unknown_project(
 
 
 @pytest.mark.django_db
-def test_post_digest_review_flips_ready_to_true(
+def test_post_digest_review_flips_proven_digest_ready_to_true(
     f_review_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project, ready=False)
+    work = _make_weekly_work(f_org, f_project)
+
+    digest = _attach_proven_digest(f_org, f_project, work)
 
     response = f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
 
@@ -474,12 +624,40 @@ def test_post_digest_review_flips_ready_to_true(
 
 
 @pytest.mark.django_db
+def test_post_digest_review_unproven_digest_not_found_and_not_mutated(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    digest = _make_unproven_digest(f_org, f_project)
+
+    response = f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
+
+    assert response.status_code == 404
+
+    assert response.data['code'] == 'digest_not_found'
+
+    digest.refresh_from_db()
+
+    assert digest.metadata['ready'] is False
+
+    assert digest.metadata['reviewed_at'] is None
+
+    assert not AuditEvent.objects.filter(
+        organization=f_org,
+        event_type='DigestReviewed',
+        target_id=str(digest.id),
+    ).exists()
+
+
+@pytest.mark.django_db
 def test_post_digest_review_writes_audit_event(
     f_review_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project)
+    work = _make_weekly_work(f_org, f_project)
+    digest = _attach_proven_digest(f_org, f_project, work)
 
     f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
 
@@ -495,12 +673,67 @@ def test_post_digest_review_writes_audit_event(
 
 
 @pytest.mark.django_db
+def test_post_digest_review_accepts_daily_digest_kind(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    work = _make_weekly_work(f_org, f_project)
+    digest = _attach_proven_digest(f_org, f_project, work, digest_kind='daily_structured')
+
+    response = f_review_client.post(
+        f'/v1/admin/digests/{digest.id}/review',
+        {'digest_kind': 'daily_structured'},
+        format='json',
+    )
+
+    assert response.status_code == 200
+
+    assert response.data['ready'] is True
+
+    digest.refresh_from_db()
+
+    assert digest.metadata['digest_kind'] == 'daily_structured'
+
+    event = AuditEvent.objects.get(
+        organization=f_org,
+        event_type='DigestReviewed',
+        target_id=str(digest.id),
+    )
+
+    assert event.metadata['digest_kind'] == 'daily_structured'
+
+
+@pytest.mark.django_db
+def test_post_digest_review_logs_digest_reviewed_event(
+    f_review_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    work = _make_weekly_work(f_org, f_project)
+    digest = _attach_proven_digest(f_org, f_project, work)
+
+    with structlog.testing.capture_logs() as captured_logs:
+        f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
+
+    events = [entry for entry in captured_logs if entry['event'] == 'digest_reviewed']
+
+    assert len(events) == 1
+
+    assert events[0]['organization_id'] == str(f_org.id)
+
+    assert events[0]['memory_id'] == str(digest.id)
+
+    assert events[0]['digest_kind'] == 'weekly_structured'
+
+
+@pytest.mark.django_db
 def test_post_digest_review_requires_memories_review_capability(
     f_read_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project)
+    digest = _make_unproven_digest(f_org, f_project)
 
     response = f_read_client.post(f'/v1/admin/digests/{digest.id}/review')
 
@@ -512,7 +745,7 @@ def test_post_digest_review_requires_authentication(
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project)
+    digest = _make_unproven_digest(f_org, f_project)
 
     client = APIClient()
 
@@ -527,7 +760,7 @@ def test_post_digest_review_tenant_isolation(
     f_other_org: Organization,
     f_other_project: Project,
 ) -> None:
-    other_digest = _make_digest_memory(f_other_org, f_other_project)
+    other_digest = _make_unproven_digest(f_other_org, f_other_project)
 
     response = f_review_client.post(f'/v1/admin/digests/{other_digest.id}/review')
 
@@ -578,43 +811,12 @@ def test_post_digest_review_404_uses_domain_error_shape(
 
 
 @pytest.mark.django_db
-def test_post_digest_review_accepts_daily_digest_kind(
-    f_review_client: APIClient,
-    f_org: Organization,
-    f_project: Project,
-) -> None:
-    digest = _make_digest_memory(f_org, f_project, digest_kind='daily_structured')
-
-    response = f_review_client.post(
-        f'/v1/admin/digests/{digest.id}/review',
-        {'digest_kind': 'daily_structured'},
-        format='json',
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['ready'] is True
-
-    digest.refresh_from_db()
-
-    assert digest.metadata['digest_kind'] == 'daily_structured'
-
-    event = AuditEvent.objects.get(
-        organization=f_org,
-        event_type='DigestReviewed',
-        target_id=str(digest.id),
-    )
-
-    assert event.metadata['digest_kind'] == 'daily_structured'
-
-
-@pytest.mark.django_db
 def test_post_digest_review_digest_kind_mismatch_returns_404(
     f_review_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project, digest_kind='weekly_structured')
+    digest = _make_unproven_digest(f_org, f_project, digest_kind='weekly_structured')
 
     response = f_review_client.post(
         f'/v1/admin/digests/{digest.id}/review',
@@ -631,7 +833,7 @@ def test_post_digest_review_rejects_invalid_digest_kind(
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project)
+    digest = _make_unproven_digest(f_org, f_project)
 
     response = f_review_client.post(
         f'/v1/admin/digests/{digest.id}/review',
@@ -643,22 +845,94 @@ def test_post_digest_review_rejects_invalid_digest_kind(
 
 
 @pytest.mark.django_db
-def test_post_digest_review_logs_digest_reviewed_event(
+def test_get_weekly_current_built_true_payload_carries_window_and_changelog(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start, _window_end = _current_weekly_window(0)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+
+    first = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert first.data['built'] is False
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.WEEKLY_DIGEST)
+    generate_weekly_digest_work_v1(str(work.id))
+
+    second = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert second.status_code == 200
+    assert second.data['built'] is True
+    assert second.data['window_start'] is not None
+    assert second.data['window_end'] is not None
+    assert second.data['window_days'] == 7
+    assert second.data['changelog'] != []
+    assert second.data['counts'] != {}
+
+
+@pytest.mark.django_db
+def test_get_weekly_weeks_back_one_finds_new_format_digest(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+) -> None:
+    window_start, window_end = _current_weekly_window(1)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+
+    work = _publish_weekly_digest(f_org, f_project, window_start, window_end)
+    published = Memory.objects.get(project=f_project, kind='digest')
+    assert proven_digest_memory(published)
+
+    response = f_read_client.get(
+        '/v1/admin/digests/weekly',
+        {'project_id': str(f_project.id), 'weeks_back': '1'},
+    )
+
+    assert response.status_code == 200
+    assert response.data['built'] is True
+    assert response.data['digest_memory_id'] == str(published.id)
+    assert WorkflowWork.objects.filter(id=work.id).exists()
+
+
+@pytest.mark.django_db
+def test_get_weekly_current_scope_error_returns_404(
+    f_read_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def m_freeze(**_kwargs: object) -> dict[str, object]:
+        raise WorkflowWorkScopeError('team is not linked to the declared project')
+
+    monkeypatch.setattr('engram.console.views.digests.freeze_weekly_digest_input', m_freeze)
+
+    response = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
+
+    assert response.status_code == 404
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_post_digest_review_team_bound_digest_outside_team_scope_not_found(
     f_review_client: APIClient,
     f_org: Organization,
     f_project: Project,
 ) -> None:
-    digest = _make_digest_memory(f_org, f_project)
+    team = Team.objects.create(organization=f_org, name='Squad', slug='squad')
+    ProjectTeam.objects.create(organization=f_org, project=f_project, team=team)
+    window_start, window_end = _current_weekly_window(1)
+    source = _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    Memory.objects.filter(id=source.id).update(team=team, visibility_scope=VisibilityScope.TEAM)
 
-    with structlog.testing.capture_logs() as captured_logs:
-        f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
+    _publish_weekly_digest(f_org, f_project, window_start, window_end, team=team)
+    digest = Memory.objects.get(project=f_project, kind='digest', team=team)
+    assert proven_digest_memory(digest)
 
-    events = [entry for entry in captured_logs if entry['event'] == 'digest_reviewed']
+    response = f_review_client.post(f'/v1/admin/digests/{digest.id}/review')
 
-    assert len(events) == 1
-
-    assert events[0]['organization_id'] == str(f_org.id)
-
-    assert events[0]['memory_id'] == str(digest.id)
-
-    assert events[0]['digest_kind'] == 'weekly_structured'
+    assert response.status_code == 404
+    assert response.data['code'] == 'digest_not_found'
+    digest.refresh_from_db()
+    assert digest.metadata['ready'] is False

@@ -687,7 +687,7 @@ def test_team_scoped_digest_has_independent_content_hash_from_unscoped(
 
 
 @pytest.mark.django_db
-def test_weekly_digest_creates_retrievable_version_and_document(
+def test_weekly_digest_output_is_quarantined_from_retrieval_until_proven(
     f_org: Organization,
     f_project: Project,
 ) -> None:
@@ -701,7 +701,7 @@ def test_weekly_digest_creates_retrievable_version_and_document(
 
     authorized = authorized_retrieval_documents(f_org, f_project, _read_scope(f_org, f_project))
 
-    assert document.id in [doc.id for doc in authorized]
+    assert document.id not in [doc.id for doc in authorized]
 
 
 @pytest.mark.django_db

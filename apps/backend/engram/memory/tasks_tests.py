@@ -737,24 +737,15 @@ def test_versioned_work_tasks_reject_invalid_run_link_or_state_before_domain_acc
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(
-    ('task_attribute', 'work_type', 'domain_target'),
+    ('task_attribute', 'work_type'),
     [
-        (
-            'generate_daily_digest_work_v1',
-            WorkflowWorkType.DAILY_DIGEST,
-            'engram.memory.tasks.run_daily_digest_with_tracking',
-        ),
-        (
-            'generate_weekly_digest_work_v1',
-            WorkflowWorkType.WEEKLY_DIGEST,
-            'engram.memory.tasks.run_weekly_digest_with_tracking',
-        ),
+        ('generate_daily_digest_work_v1', WorkflowWorkType.DAILY_DIGEST),
+        ('generate_weekly_digest_work_v1', WorkflowWorkType.WEEKLY_DIGEST),
     ],
 )
-def test_unfinished_versioned_work_adapters_fail_closed_without_legacy_domain_execution(
+def test_digest_work_adapter_rejects_altered_snapshot_before_provider(
     task_attribute: str,
     work_type: str,
-    domain_target: str,
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -762,13 +753,17 @@ def test_unfinished_versioned_work_adapters_fail_closed_without_legacy_domain_ex
 ) -> None:
     session = create_session(f_org, f_team, f_project, f_agent)
     work = create_required_work(session, work_type=work_type)
+    tampered = dict(work.input_snapshot)
+    tampered['schedule_key'] = 'tampered-occurrence'
+    WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
     task = getattr(tasks_module, task_attribute)
 
-    with mock.patch(domain_target) as m_domain:
-        with pytest.raises(MemoryWorkerError, match='not implemented'):
+    with mock.patch('engram.memory.services.get_provider_gateway') as m_gateway:
+        with pytest.raises(MemoryWorkerError, match='fingerprint'):
             task(str(work.id))
 
-    m_domain.assert_not_called()
+    m_gateway.assert_not_called()
+    assert WorkflowRun.objects.filter(work=work).count() == 0
 
 
 @pytest.mark.django_db

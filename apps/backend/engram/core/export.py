@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from engram.core.models import Memory, MemoryStatus, MemoryVersion, RetrievalDocument
 from engram.core.redaction import redact_value
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 logger = structlog.get_logger(__name__)
 
@@ -64,7 +65,36 @@ def export_queryset(
     if team_id is not None:
         memories = memories.filter(team_id=team_id)
 
+    unproven = _unproven_digest_ids(
+        organization_id=organization_id,
+        project_id=project_id,
+        team_id=team_id,
+        all_statuses=all_statuses,
+    )
+    if unproven:
+        memories = memories.exclude(id__in=unproven)
+
     return memories
+
+
+def _unproven_digest_ids(
+    *,
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    team_id: uuid.UUID | None,
+    all_statuses: bool,
+) -> set[uuid.UUID]:
+    digests = Memory.objects.filter(
+        organization_id=organization_id,
+        project_id=project_id,
+        kind='digest',
+    )
+    if not all_statuses:
+        digests = digests.filter(status=MemoryStatus.APPROVED)
+    if team_id is not None:
+        digests = digests.filter(team_id=team_id)
+
+    return unproven_digest_memory_ids(digests)
 
 
 def export_memories(

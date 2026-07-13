@@ -65,6 +65,7 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
 )
+from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import EMBEDDING_DIMENSION, generated_embedding
 
@@ -2076,3 +2077,98 @@ def test_build_context_bundle_session_start_response_carries_skipped_status() ->
 
     assert response['status'] == ContextBundleStatus.SKIPPED
     assert response['hook_specific_output']['hookEventName'] == 'SessionStart'
+
+
+# digest visibility quarantine — retrieval candidates and stored replay
+
+
+_UNPROVEN_BUNDLE = 'context_bundle_digest_visibility_unproven'
+
+
+def _admin_scope(organization: Organization, project: Project) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(project.id,),
+        team_ids=(),
+        capabilities=('memories:read', 'memories:admin'),
+        actor_type='api_key',
+        actor_id='admin-key',
+        project_bound=False,
+    )
+
+
+@pytest.mark.django_db
+def test_authorized_retrieval_documents_excludes_unproven_digest() -> None:
+    organization = Organization.objects.create(name='DV Retrieval', slug='dv-retrieval')
+    project = Project.objects.create(organization=organization, name='Main', slug='dv-retrieval-main')
+    proven = build_proven_weekly_digest(organization, project)
+    legacy = build_legacy_digest(organization, project)
+
+    documents = authorized_retrieval_documents(organization, project, _admin_scope(organization, project))
+    memory_ids = {document.memory_id for document in documents}
+
+    assert proven.id in memory_ids
+    assert legacy.id not in memory_ids
+
+
+@pytest.mark.django_db
+def test_authorized_retrieval_documents_admin_capability_does_not_bypass_quarantine() -> None:
+    organization = Organization.objects.create(name='DV Retrieval Admin', slug='dv-retrieval-admin')
+    project = Project.objects.create(organization=organization, name='Main', slug='dv-retrieval-admin-main')
+    legacy = build_legacy_digest(organization, project)
+
+    documents = authorized_retrieval_documents(organization, project, _admin_scope(organization, project))
+    memory_ids = {document.memory_id for document in documents}
+
+    assert legacy.id not in memory_ids
+
+
+def _tamper_digest_unproven(memory: Memory) -> None:
+    fresh = Memory.objects.get(id=memory.id)
+    metadata = dict(fresh.metadata)
+    visibility = dict(metadata['digest_visibility'])
+    visibility['input_digest'] = 'deadbeef' * 8
+    metadata['digest_visibility'] = visibility
+    fresh.metadata = metadata
+    fresh.save(update_fields=['metadata', 'updated_at'])
+
+
+@pytest.mark.django_db
+def test_context_bundle_replay_fails_closed_on_unproven_digest() -> None:
+    organization, team, project, _api_key = _provenance_project_scope()
+    proven = build_proven_weekly_digest(organization, project)
+    data = ContextBundleInput(
+        raw_key=PROVENANCE_RAW_KEY,
+        project_id=project.id,
+        team_id=team.id,
+        agent_runtime='codex',
+        agent_version='0.1.0',
+        agent_external_id='codex-local',
+        session_id='dv-replay-session',
+        request_id='dv-replay-request',
+        correlation_id='dv-replay-correlation',
+        trace_id='dv-replay-trace',
+        repository_url='',
+        repository_root='',
+        branch='',
+        cwd='',
+        query='',
+        file_paths=(),
+        symbols=(),
+        limit=5,
+        token_budget=None,
+        purpose='session_start',
+    )
+
+    first = BuildContextBundle().execute(data).to_response()
+    assert proven.body in first['rendered_context']
+
+    _tamper_digest_unproven(proven)
+
+    replay = BuildContextBundle().execute(data).to_response()
+
+    assert replay['rendered_context'] == ''
+    assert replay['items'] == []
+    assert _UNPROVEN_BUNDLE in str(replay)

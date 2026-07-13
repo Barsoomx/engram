@@ -46,3 +46,13 @@ class EmbeddingSecretNotFoundError(DomainError):
 class DailyDigestAlreadyRunningError(DomainError):
     default_error_code = 'daily_digest_already_running'
     default_status_code = 409
+
+
+class LegacyWorkUnlinkedError(DomainError):
+    default_error_code = 'legacy_work_unlinked'
+    default_status_code = 409
+
+
+class WorkflowRunNotTerminalError(DomainError):
+    default_error_code = 'workflow_run_not_terminal'
+    default_status_code = 409

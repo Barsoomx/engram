@@ -21,11 +21,13 @@ from engram.core.models import (
     SessionStatus,
 )
 from engram.inspection.services import (
+    InspectionNotFoundError,
     InspectionScope,
     ListInspectionAuditEvents,
     ListInspectionContextBundles,
     ListInspectionMemories,
 )
+from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
 
 
 def create_inspection_scope_models() -> tuple[object, object, object]:
@@ -374,15 +376,7 @@ def test_list_inspection_memories_count_honors_status_param() -> None:
 @pytest.mark.django_db
 def test_list_inspection_memories_count_honors_kind_param() -> None:
     organization, team, project = create_inspection_scope_models()
-    digest, _digest_version, _digest_document = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Digest memory',
-    )
-    digest.metadata = {'kind': 'digest'}
-    digest.kind = 'digest'
-    digest.save(update_fields=['metadata', 'kind', 'updated_at'])
+    build_proven_weekly_digest(organization, project)
     snippet, _snippet_version, _snippet_document = create_approved_memory_document(
         organization,
         team,
@@ -477,3 +471,28 @@ def test_list_inspection_memories_honors_explicit_status_param() -> None:
 
     assert {memory.status for memory in memories} == {MemoryStatus.ARCHIVED}
     assert len(memories) == 1
+
+
+# digest visibility quarantine — inspection counts and detail
+
+
+@pytest.mark.django_db
+def test_inspection_memory_count_and_detail_withhold_unproven_digest() -> None:
+    organization, team, project = create_inspection_scope_models()
+    proven = build_proven_weekly_digest(organization, project)
+    legacy = build_legacy_digest(organization, project)
+    inspection_scope = InspectionScope(
+        project=project,
+        scope=_effective_scope(organization, team),
+        kind='digest',
+    )
+
+    assert ListInspectionMemories().count(inspection_scope) == 1
+
+    listed_ids = {memory.id for memory in ListInspectionMemories().execute(inspection_scope)}
+    assert proven.id in listed_ids
+    assert legacy.id not in listed_ids
+
+    assert ListInspectionMemories().detail(inspection_scope, proven.id).id == proven.id
+    with pytest.raises(InspectionNotFoundError):
+        ListInspectionMemories().detail(inspection_scope, legacy.id)

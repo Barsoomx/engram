@@ -43,6 +43,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.digest_visibility_tests import build_proven_weekly_digest
 
 AUDIT_RAW_KEY = 'egk_test_inspection_audit_0123456789abcdefghijklmnopqrstuvwxyz'
 INSPECTION_RAW_KEY = 'egk_test_inspection_admin_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -450,19 +451,12 @@ def test_memory_detail_source_session_is_null_without_source_observation() -> No
 @pytest.mark.django_db
 def test_memory_inspection_returns_enriched_payload_fields() -> None:
     scope = create_project_scope()
-    organization, team, project, _owner, _api_key = scope
+    organization, _team, project, _owner, _api_key = scope
     create_memory_admin_key(scope)
-    memory, _version, _document = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Enriched memory',
-        body='Enriched body.',
-        visibility_scope=VisibilityScope.TEAM,
-    )
+    memory = build_proven_weekly_digest(organization, project)
     memory.confidence = '0.750'
     memory.metadata = {
-        'kind': 'digest',
+        **memory.metadata,
         'tags': ['auth', 'retrieval'],
         'file_paths': ['apps/backend/engram/core/models.py'],
     }
@@ -1315,17 +1309,7 @@ def test_memory_list_filter_by_kind() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
     create_memory_admin_key(scope)
-    digest, _vd, _dd = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Digest memory',
-        body='Body.',
-        visibility_scope=VisibilityScope.TEAM,
-    )
-    digest.metadata = {'kind': 'digest'}
-    digest.kind = 'digest'
-    digest.save(update_fields=['metadata', 'kind', 'updated_at'])
+    digest = build_proven_weekly_digest(organization, project)
     snippet, _vs, _ds = create_approved_memory_document(
         organization,
         team,

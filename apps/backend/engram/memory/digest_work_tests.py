@@ -1,0 +1,1285 @@
+from __future__ import annotations
+
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+from threading import Barrier
+
+import pytest
+from django.db import close_old_connections, connection, transaction
+from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
+
+from engram.core.models import (
+    Memory,
+    MemoryStatus,
+    MemoryVersion,
+    Organization,
+    Project,
+    ProjectTeam,
+    RetrievalDocument,
+    Team,
+    VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
+    WorkflowRunType,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
+)
+from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
+from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
+from engram.memory.workflow_work import CreateWorkflowWorkInput
+from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.services import FakeProviderGateway, ProviderCallInput, ProviderCallResult
+
+_DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
+_WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
+
+
+def _load_digest_work() -> object:
+    import engram.memory.digest_work as digest_work
+
+    return digest_work
+
+
+class _SignalFailureError(RuntimeError):
+    pass
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(character in '0123456789abcdef' for character in value)
+
+
+def _make_scope(suffix: str) -> tuple[Organization, Project]:
+    organization = Organization.objects.create(name=f'Organization {suffix}', slug=f'organization-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+
+    return organization, project
+
+
+def _make_team(organization: Organization, project: Project, suffix: str) -> Team:
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    ProjectTeam.objects.create(organization=organization, project=project, team=team)
+
+    return team
+
+
+def _make_memory(
+    organization: Organization,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+    team: Team | None = None,
+    visibility: str = VisibilityScope.PROJECT,
+    status: str = MemoryStatus.APPROVED,
+    kind: str = '',
+) -> tuple[Memory, MemoryVersion]:
+    metadata = {'kind': kind} if kind else {}
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=title,
+        body=body,
+        status=status,
+        visibility_scope=visibility,
+        metadata=metadata,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=memory.current_version,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+
+    return memory, version
+
+
+def _add_version(memory: Memory, *, body: str) -> MemoryVersion:
+    next_version = memory.current_version + 1
+    version = MemoryVersion.objects.create(
+        organization=memory.organization,
+        project=memory.project,
+        memory=memory,
+        version=next_version,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+    Memory.objects.filter(id=memory.id).update(current_version=next_version, body=body)
+
+    return version
+
+
+def _daily_window() -> tuple[object, object]:
+    now = timezone.now()
+
+    return now - timedelta(days=1), now + timedelta(minutes=5)
+
+
+def _weekly_window() -> tuple[object, object]:
+    now = timezone.now()
+
+    return now - timedelta(days=7), now + timedelta(minutes=5)
+
+
+def _daily_data(
+    organization: Organization,
+    project: Project,
+    snapshot: dict[str, object],
+    schedule_key: str,
+) -> CreateWorkflowWorkInput:
+    return CreateWorkflowWorkInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+        subject_type=WorkflowSubjectType.PROJECT,
+        subject_id=project.id,
+        input_snapshot=snapshot,
+        occurrence_key=schedule_key,
+    )
+
+
+def _weekly_data(
+    organization: Organization,
+    project: Project,
+    team: Team | None,
+    snapshot: dict[str, object],
+    schedule_key: str,
+) -> CreateWorkflowWorkInput:
+    subject_type = WorkflowSubjectType.TEAM if team is not None else WorkflowSubjectType.PROJECT
+    subject_id = team.id if team is not None else project.id
+
+    return CreateWorkflowWorkInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        input_snapshot=snapshot,
+        occurrence_key=schedule_key,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_daily_creates_leave_one_immutable_snapshot() -> None:
+    digest_work = _load_digest_work()
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
+    organization, project = _make_scope('daily-concurrent')
+    memory, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _daily_window()
+    schedule_key = 'daily:2026-07-10'
+    barrier = Barrier(2)
+
+    def produce() -> tuple[bool, dict[str, object]]:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+            with transaction.atomic():
+                snapshot = digest_work.freeze_daily_digest_input(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    window_start=window_start,
+                    window_end=window_end,
+                    schedule_key=schedule_key,
+                    max_sources=10,
+                )
+                work, created = digest_work.create_digest_work_and_signal(
+                    data=_daily_data(organization, project, snapshot, schedule_key),
+                    signal_task=generate_daily_digest_work_v1,
+                )
+
+                return created, work.input_snapshot
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(produce) for _index in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    created_flags = [created for created, _snapshot in results]
+    assert sum(1 for flag in created_flags if flag) == 1
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    frozen = WorkflowWork.objects.get()
+    original_snapshot = frozen.input_snapshot
+
+    Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
+    frozen.refresh_from_db()
+    assert frozen.input_snapshot == original_snapshot
+
+
+@pytest.mark.django_db(transaction=True)
+def test_concurrent_weekly_creates_leave_one_immutable_snapshot() -> None:
+    digest_work = _load_digest_work()
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
+    organization, project = _make_scope('weekly-concurrent')
+    memory, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _weekly_window()
+    schedule_key = 'weekly:2026-W28'
+    barrier = Barrier(2)
+
+    def produce() -> bool:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=5)
+            with transaction.atomic():
+                snapshot = digest_work.freeze_weekly_digest_input(
+                    organization_id=organization.id,
+                    project_id=project.id,
+                    team_id=None,
+                    window_start=window_start,
+                    window_end=window_end,
+                    schedule_key=schedule_key,
+                )
+                _work, created = digest_work.create_digest_work_and_signal(
+                    data=_weekly_data(organization, project, None, snapshot, schedule_key),
+                    signal_task=generate_weekly_digest_work_v1,
+                )
+
+                return created
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(produce) for _index in range(2)]
+        created_flags = [future.result(timeout=15) for future in futures]
+
+    assert sum(1 for flag in created_flags if flag) == 1
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    frozen = WorkflowWork.objects.get()
+    original_snapshot = frozen.input_snapshot
+
+    Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
+    frozen.refresh_from_db()
+    assert frozen.input_snapshot == original_snapshot
+
+
+@pytest.mark.django_db
+def test_daily_source_change_after_create_does_not_rewrite_snapshot() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-immutable')
+    memory, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _daily_window()
+    schedule_key = 'daily:2026-07-10'
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=10,
+        )
+        work, created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    assert created is True
+    original_snapshot = WorkflowWork.objects.get(id=work.id).input_snapshot
+
+    Memory.objects.filter(id=memory.id).update(title='Alpha changed')
+    _add_version(memory, body='body-a-v2')
+
+    with transaction.atomic():
+        rebuilt = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=10,
+        )
+        reused, created_again = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, rebuilt, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    assert reused.id == work.id
+    assert created_again is False
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
+
+
+@pytest.mark.django_db
+def test_weekly_source_change_after_create_does_not_rewrite_snapshot() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-immutable')
+    memory, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _weekly_window()
+    schedule_key = 'weekly:2026-W28'
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, created = digest_work.create_digest_work_and_signal(
+            data=_weekly_data(organization, project, None, snapshot, schedule_key),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    assert created is True
+    original_snapshot = WorkflowWork.objects.get(id=work.id).input_snapshot
+
+    Memory.objects.filter(id=memory.id).update(title='Alpha changed')
+    _add_version(memory, body='body-a-v2')
+    _make_memory(organization, project, title='Beta', body='body-b')
+
+    with transaction.atomic():
+        rebuilt = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        reused, created_again = digest_work.create_digest_work_and_signal(
+            data=_weekly_data(organization, project, None, rebuilt, schedule_key),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    assert reused.id == work.id
+    assert created_again is False
+    assert WorkflowWork.objects.count() == 1
+    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
+
+
+@pytest.mark.django_db
+def test_daily_snapshot_records_exact_versions_and_body_digests() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-exact')
+    memory_a, version_a = _make_memory(organization, project, title='Alpha', body='body-a')
+    memory_b, version_b = _make_memory(organization, project, title='Beta', body='body-b')
+    window_start, window_end = _daily_window()
+
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='daily:2026-07-10',
+        max_sources=10,
+    )
+
+    assert snapshot['schema'] == 'daily_digest_input/v1'
+    assert snapshot['output_visibility_scope'] == 'project'
+    assert snapshot['output_team_id'] is None
+    assert snapshot['allowed_team_ids'] == []
+    assert snapshot['eligible_source_count'] == 2
+    assert snapshot['sources_truncated'] is False
+    assert _is_sha256(snapshot['input_digest'])
+
+    sources = sorted(snapshot['sources'], key=lambda source: source['render_position'])
+    assert [source['memory_id'] for source in sources] == [str(memory_a.id), str(memory_b.id)]
+    positions = [source['render_position'] for source in sources]
+    assert positions == sorted(set(positions))
+    expected_versions = {str(memory_a.id): version_a, str(memory_b.id): version_b}
+    for source in sources:
+        expected_version = expected_versions[source['memory_id']]
+        assert source['memory_version_id'] == str(expected_version.id)
+        assert source['version'] == expected_version.version
+        assert source['visibility_scope'] == 'project'
+        assert source['team_id'] is None
+        assert _is_sha256(source['server_body_digest'])
+    assert sources[0]['source_title'] == 'Alpha'
+    assert sources[1]['source_title'] == 'Beta'
+
+
+@pytest.mark.django_db
+def test_weekly_snapshot_records_exact_versions_and_body_digests() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-exact')
+    memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _weekly_window()
+
+    snapshot = digest_work.freeze_weekly_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='weekly:2026-W28',
+    )
+
+    assert snapshot['schema'] == 'weekly_digest_input/v1'
+    assert snapshot['team_id'] is None
+    assert snapshot['allowed_team_ids'] == []
+    assert snapshot['output_visibility_scope'] == 'project'
+    assert snapshot['output_team_id'] is None
+    assert _is_sha256(snapshot['input_digest'])
+
+    changes = snapshot['changes']
+    assert isinstance(changes, list)
+    change_memory_ids = {change['memory_id'] for change in changes}
+    assert str(memory.id) in change_memory_ids
+    for change in changes:
+        assert {'memory_version_id', 'version', 'server_body_digest'} <= change.keys()
+        assert _is_sha256(change['server_body_digest'])
+    frozen = next(change for change in changes if change['memory_id'] == str(memory.id))
+    assert frozen['memory_version_id'] == str(version.id)
+    assert frozen['version'] == version.version
+
+
+@pytest.mark.django_db
+def test_daily_input_digest_covers_body_not_memory_ids_only() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-body-digest')
+    memory, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    window_start, window_end = _daily_window()
+
+    def freeze() -> dict[str, object]:
+        return digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='daily:2026-07-10',
+            max_sources=10,
+        )
+
+    first = freeze()
+    Memory.objects.filter(id=memory.id).update(body='mutable body only')
+    unchanged = freeze()
+    assert unchanged['input_digest'] == first['input_digest']
+
+    _add_version(memory, body='body-a-v2')
+    reselected = freeze()
+    assert reselected['input_digest'] != first['input_digest']
+    first_source = first['sources'][0]
+    reselected_source = reselected['sources'][0]
+    assert reselected_source['server_body_digest'] != first_source['server_body_digest']
+
+
+@pytest.mark.django_db
+def test_daily_project_output_excludes_team_private_session_org_and_digest_sources() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-exclusions')
+    team = _make_team(organization, project, 'daily-exclusions')
+    included, _version = _make_memory(organization, project, title='Included', body='body-included')
+    _make_memory(organization, project, title='Team', body='body-team', team=team, visibility=VisibilityScope.TEAM)
+    _make_memory(organization, project, title='Session', body='body-session', visibility=VisibilityScope.SESSION)
+    _make_memory(
+        organization,
+        project,
+        title='Org',
+        body='body-org',
+        visibility=VisibilityScope.ORGANIZATION,
+    )
+    _make_memory(organization, project, title='Digest', body='body-digest', kind='digest')
+    foreign_organization, foreign_project = _make_scope('daily-exclusions-foreign')
+    _make_memory(foreign_organization, foreign_project, title='Foreign', body='body-foreign')
+    window_start, window_end = _daily_window()
+
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='daily:2026-07-10',
+        max_sources=10,
+    )
+
+    assert {source['memory_id'] for source in snapshot['sources']} == {str(included.id)}
+    assert snapshot['eligible_source_count'] == 1
+
+
+@pytest.mark.django_db
+def test_daily_caps_sources_and_marks_truncated_by_updated_order() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-cap')
+    older, _older_version = _make_memory(organization, project, title='Older', body='body-older')
+    newer, _newer_version = _make_memory(organization, project, title='Newer', body='body-newer')
+    now = timezone.now()
+    Memory.objects.filter(id=older.id).update(updated_at=now - timedelta(hours=2))
+    Memory.objects.filter(id=newer.id).update(updated_at=now - timedelta(hours=1))
+    window_start, window_end = _daily_window()
+
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='daily:2026-07-10',
+        max_sources=1,
+    )
+
+    assert snapshot['max_sources'] == 1
+    assert snapshot['eligible_source_count'] == 2
+    assert snapshot['sources_truncated'] is True
+    assert {source['memory_id'] for source in snapshot['sources']} == {str(newer.id)}
+
+
+@pytest.mark.django_db
+def test_daily_rejects_cross_project_source_reference() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-cross-project')
+    _included, _version = _make_memory(organization, project, title='Included', body='body-included')
+    foreign_org, foreign_project = _make_scope('daily-cross-project-foreign')
+    foreign_memory, foreign_version = _make_memory(
+        foreign_org,
+        foreign_project,
+        title='Foreign',
+        body='body-foreign',
+    )
+    window_start, window_end = _daily_window()
+    schedule_key = 'daily:2026-07-10'
+
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key=schedule_key,
+        max_sources=10,
+    )
+    tampered = dict(snapshot)
+    tampered['sources'] = [
+        *snapshot['sources'],
+        {
+            'render_position': len(snapshot['sources']),
+            'memory_id': str(foreign_memory.id),
+            'memory_version_id': str(foreign_version.id),
+            'version': foreign_version.version,
+            'server_body_digest': hashlib.sha256(b'body-foreign').hexdigest(),
+            'visibility_scope': 'project',
+            'team_id': None,
+            'source_title': 'Foreign',
+        },
+    ]
+
+    from engram.memory.workflow_work import WorkflowWorkScopeError
+
+    with pytest.raises((ValueError, WorkflowWorkScopeError)):
+        with transaction.atomic():
+            digest_work.create_digest_work_and_signal(
+                data=_daily_data(organization, project, tampered, schedule_key),
+                signal_task=generate_daily_digest_work_v1,
+            )
+
+    assert WorkflowWork.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_weekly_team_output_admits_only_selected_team() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-team')
+    team_a = _make_team(organization, project, 'weekly-team-a')
+    team_b = _make_team(organization, project, 'weekly-team-b')
+    project_memory, _project_version = _make_memory(organization, project, title='Project', body='body-project')
+    team_a_memory, _team_a_version = _make_memory(
+        organization,
+        project,
+        title='TeamA',
+        body='body-team-a',
+        team=team_a,
+        visibility=VisibilityScope.TEAM,
+    )
+    team_b_memory, _team_b_version = _make_memory(
+        organization,
+        project,
+        title='TeamB',
+        body='body-team-b',
+        team=team_b,
+        visibility=VisibilityScope.TEAM,
+    )
+    window_start, window_end = _weekly_window()
+
+    snapshot = digest_work.freeze_weekly_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team_a.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='weekly:2026-W28',
+    )
+
+    assert snapshot['team_id'] == str(team_a.id)
+    assert snapshot['allowed_team_ids'] == [str(team_a.id)]
+    assert snapshot['output_visibility_scope'] == 'team'
+    assert snapshot['output_team_id'] == str(team_a.id)
+    change_memory_ids = {change['memory_id'] for change in snapshot['changes']}
+    assert str(project_memory.id) in change_memory_ids
+    assert str(team_a_memory.id) in change_memory_ids
+    assert str(team_b_memory.id) not in change_memory_ids
+
+
+@pytest.mark.django_db
+def test_weekly_project_output_excludes_team_private_sources() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-project-excl')
+    team = _make_team(organization, project, 'weekly-project-excl')
+    project_memory, _project_version = _make_memory(organization, project, title='Project', body='body-project')
+    team_memory, _team_version = _make_memory(
+        organization,
+        project,
+        title='Team',
+        body='body-team',
+        team=team,
+        visibility=VisibilityScope.TEAM,
+    )
+    window_start, window_end = _weekly_window()
+
+    snapshot = digest_work.freeze_weekly_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=None,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='weekly:2026-W28',
+    )
+
+    change_memory_ids = {change['memory_id'] for change in snapshot['changes']}
+    assert str(project_memory.id) in change_memory_ids
+    assert str(team_memory.id) not in change_memory_ids
+
+
+@pytest.mark.django_db
+def test_weekly_rejects_team_not_linked_to_project() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-unlinked-team')
+    unlinked_team = Team.objects.create(organization=organization, name='Unlinked', slug='weekly-unlinked')
+    _make_memory(organization, project, title='Project', body='body-project')
+    window_start, window_end = _weekly_window()
+
+    from engram.memory.workflow_work import WorkflowWorkScopeError
+
+    with pytest.raises((ValueError, WorkflowWorkScopeError)):
+        digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=unlinked_team.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='weekly:2026-W28',
+        )
+
+
+@pytest.mark.django_db
+def test_empty_authorized_daily_input_resolves_no_input_without_package_or_outbox() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-empty')
+    schedule_key = 'daily:2026-07-10'
+    window_start, window_end = _daily_window()
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=10,
+        )
+        work, created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    assert snapshot['eligible_source_count'] == 0
+    assert snapshot['sources'] == []
+    assert created is True
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowRun.objects.count() == 0
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_empty_authorized_weekly_input_resolves_no_input_without_outbox() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-empty')
+    schedule_key = 'weekly:2026-W28'
+    window_start, window_end = _weekly_window()
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, created = digest_work.create_digest_work_and_signal(
+            data=_weekly_data(organization, project, None, snapshot, schedule_key),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    assert snapshot['changes'] == []
+    assert created is True
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowRun.objects.count() == 0
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_signal_failure_rolls_back_daily_work_run_and_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-rollback')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    schedule_key = 'daily:2026-07-10'
+    window_start, window_end = _daily_window()
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise _SignalFailureError('signal dispatch failed')
+
+    monkeypatch.setattr(generate_daily_digest_work_v1, 'apply_async', fail)
+
+    with pytest.raises(_SignalFailureError):
+        with transaction.atomic():
+            snapshot = digest_work.freeze_daily_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+                max_sources=10,
+            )
+            run = WorkflowRun.objects.create(
+                organization=organization,
+                project=project,
+                run_type=WorkflowRunType.DAILY_DIGEST,
+                status=WorkflowRunStatus.QUEUED,
+            )
+            digest_work.create_digest_work_and_signal(
+                data=_daily_data(organization, project, snapshot, schedule_key),
+                signal_task=generate_daily_digest_work_v1,
+                workflow_run=run,
+            )
+
+    assert WorkflowWork.objects.count() == 0
+    assert WorkflowRun.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_signal_failure_rolls_back_weekly_work_and_outbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('weekly-rollback')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    schedule_key = 'weekly:2026-W28'
+    window_start, window_end = _weekly_window()
+
+    def fail(*args: object, **kwargs: object) -> object:
+        raise _SignalFailureError('signal dispatch failed')
+
+    monkeypatch.setattr(generate_weekly_digest_work_v1, 'apply_async', fail)
+
+    with pytest.raises(_SignalFailureError):
+        with transaction.atomic():
+            snapshot = digest_work.freeze_weekly_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+            )
+            digest_work.create_digest_work_and_signal(
+                data=_weekly_data(organization, project, None, snapshot, schedule_key),
+                signal_task=generate_weekly_digest_work_v1,
+            )
+
+    assert WorkflowWork.objects.count() == 0
+    assert WorkflowRun.objects.count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+def _create_digest_policy(organization: Organization, project: Project) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=None,
+        name='Org Digest OpenAI',
+        provider='openai',
+        scope='organization',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=None,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-digest-secret',
+        hmac_digest='digest-hmac',
+        active=True,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=None,
+        project=project,
+        name='Digest policy',
+        scope='project',
+        task_type='digest',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+
+
+class _CountingDigestGateway:
+    def __init__(self, calls: list[ProviderCallInput]) -> None:
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+
+        return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+def _counting_gateway(calls: list[ProviderCallInput]) -> object:
+    def stub(policy: object, **_kwargs: object) -> object:
+        return _CountingDigestGateway(calls)
+
+    return stub
+
+
+class _MutatingDigestGateway:
+    def __init__(self, version: MemoryVersion, calls: list[ProviderCallInput]) -> None:
+        self._version = version
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+        MemoryVersion.objects.filter(id=self._version.id).update(body='body mutated mid-provider-call')
+
+        return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+def _make_daily_work(
+    organization: Organization,
+    project: Project,
+    schedule_key: str = 'daily:2026-07-10',
+    max_sources: int = 200,
+) -> tuple[WorkflowWork, dict[str, object]]:
+    digest_work = _load_digest_work()
+    window_start, window_end = _daily_window()
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=max_sources,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    return work, snapshot
+
+
+def _make_weekly_work(
+    organization: Organization,
+    project: Project,
+    team: Team | None = None,
+    schedule_key: str = 'weekly:2026-W28',
+) -> tuple[WorkflowWork, dict[str, object]]:
+    digest_work = _load_digest_work()
+    window_start, window_end = _weekly_window()
+    with transaction.atomic():
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id if team is not None else None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_weekly_data(organization, project, team, snapshot, schedule_key),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+
+    return work, snapshot
+
+
+@pytest.mark.django_db
+def test_daily_work_execution_rejects_frozen_input_digest_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-input-digest-drift')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    tampered = dict(work.input_snapshot)
+    tampered['input_digest'] = 'deadbeef' * 8
+    WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='fingerprint'):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_execution_rejects_source_body_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-body-drift')
+    _create_digest_policy(organization, project)
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    MemoryVersion.objects.filter(id=version.id).update(body='body-a tampered at rest')
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='body digest'):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_weekly_work_execution_rejects_source_body_drift_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-body-drift')
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_weekly_work(organization, project)
+
+    MemoryVersion.objects.filter(id=version.id).update(body='body-a tampered at rest')
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='body digest'):
+        generate_weekly_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_weekly_team_work_fails_closed_when_project_team_link_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-team-unlink')
+    team = _make_team(organization, project, 'weekly-team-unlink')
+    _make_memory(
+        organization,
+        project,
+        title='TeamA',
+        body='body-team-a',
+        team=team,
+        visibility=VisibilityScope.TEAM,
+    )
+    work, _snapshot = _make_weekly_work(organization, project, team)
+
+    ProjectTeam.objects.filter(organization=organization, project=project, team=team).delete()
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError, match='team'):
+        generate_weekly_digest_work_v1(str(work.id))
+
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_discards_provider_result_when_source_invalidated_after_precall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-invalidate')
+    _create_digest_policy(organization, project)
+    _memory, version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    calls: list[ProviderCallInput] = []
+
+    def stub(policy: object, **_kwargs: object) -> object:
+        if getattr(policy, 'task_type', None) == 'digest':
+            return _MutatingDigestGateway(version, calls)
+
+        return FakeProviderGateway()
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', stub)
+
+    with pytest.raises(MemoryWorkerError):
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
+    assert RetrievalDocument.objects.filter(project=project).count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-publish')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    embed_atomic_flags: list[bool] = []
+
+    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
+        embed_atomic_flags.append(connection.in_atomic_block)
+
+    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    assert not any(embed_atomic_flags)
+    assert result == str(work.id)
+    digests = Memory.objects.filter(project=project, kind='digest')
+    assert digests.count() == 1
+    digest_memory = digests.get()
+    versions = MemoryVersion.objects.filter(memory=digest_memory)
+    assert versions.count() == 1
+    assert versions.get().version == 1
+    document = RetrievalDocument.objects.get(memory=digest_memory)
+    assert not document.embedding_vector
+    assert document.embedding_reference == ''
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('weekly-publish')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_weekly_work(organization, project)
+
+    embed_atomic_flags: list[bool] = []
+
+    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
+        embed_atomic_flags.append(connection.in_atomic_block)
+
+    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
+
+    result = generate_weekly_digest_work_v1(str(work.id))
+
+    assert not any(embed_atomic_flags)
+    assert result == str(work.id)
+    digests = Memory.objects.filter(project=project, kind='digest')
+    assert digests.count() == 1
+    digest_memory = digests.get()
+    versions = MemoryVersion.objects.filter(memory=digest_memory)
+    assert versions.count() == 1
+    assert versions.get().version == 1
+    document = RetrievalDocument.objects.get(memory=digest_memory)
+    assert not document.embedding_vector
+    assert document.embedding_reference == ''
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_daily_work_second_automatic_delivery_reuses_output_without_second_provider_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-reuse')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    first = generate_daily_digest_work_v1(str(work.id))
+    second = generate_daily_digest_work_v1(str(work.id))
+
+    assert first == second
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 1
+
+
+@pytest.mark.django_db
+def test_execute_frozen_digest_work_returns_none_for_terminal_no_op_daily_work() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-noop-exec')
+    schedule_key = 'daily:2026-07-10'
+    window_start, window_end = _daily_window()
+
+    with transaction.atomic():
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key=schedule_key,
+            max_sources=10,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=_daily_data(organization, project, snapshot, schedule_key),
+            signal_task=generate_daily_digest_work_v1,
+        )
+
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+
+    result = digest_work.execute_frozen_digest_work(work, None)
+
+    assert result is None
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+def _linked_daily_run(organization: Organization, project: Project, work: WorkflowWork) -> WorkflowRun:
+    return WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        work=work,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        status=WorkflowRunStatus.QUEUED,
+        input_snapshot=work.input_snapshot,
+        request_id=f'daily-digest:{work.id}',
+        correlation_id=f'daily-digest:{work.id}',
+    )
+
+
+def _digest_output_for_work(project: Project, work: WorkflowWork) -> int:
+    return Memory.objects.filter(
+        project=project,
+        kind='digest',
+        metadata__digest_visibility__workflow_work_id=str(work.id),
+    ).count()
+
+
+@pytest.mark.django_db
+def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
+    organization, project = _make_scope('daily-run-succeeded')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    run.refresh_from_db()
+    digest = Memory.objects.get(project=project, kind='digest')
+    assert result == str(run.id)
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.result_memory_id == digest.id
+    assert run.finished_at is not None
+
+
+@pytest.mark.django_db
+def test_daily_work_linked_run_fails_on_frozen_drift_before_provider() -> None:
+    organization, project = _make_scope('daily-run-failed')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    tampered = dict(work.input_snapshot)
+    tampered['input_digest'] = 'deadbeef' * 8
+    WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
+
+    with pytest.raises(MemoryWorkerError, match='fingerprint'):
+        generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    run.refresh_from_db()
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_reason != ''
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_automatic_path_creates_no_run_and_publishes_once() -> None:
+    organization, project = _make_scope('daily-run-automatic')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    assert result == str(work.id)
+    assert WorkflowRun.objects.filter(work=work).count() == 0
+    assert _digest_output_for_work(project, work) == 1
+
+
+@pytest.mark.django_db
+def test_daily_work_second_delivery_past_existing_check_publishes_one_digest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-double-publish')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+
+    monkeypatch.setattr('engram.memory.digest_work._existing_output', lambda _work: None)
+
+    digest_work.execute_frozen_digest_work(work, None)
+    work.refresh_from_db()
+    digest_work.execute_frozen_digest_work(work, None)
+
+    assert _digest_output_for_work(project, work) == 1
+
+
+@pytest.mark.django_db
+def test_weekly_work_publishes_legacy_metadata_block() -> None:
+    organization, project = _make_scope('weekly-metadata')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, snapshot = _make_weekly_work(organization, project)
+
+    generate_weekly_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    metadata = digest.metadata
+    window_start = datetime.fromisoformat(str(snapshot['window_start']).replace('Z', '+00:00'))
+    window_end = datetime.fromisoformat(str(snapshot['window_end']).replace('Z', '+00:00'))
+    expected_hash = weekly_digest_content_hash(project.id, window_start, window_end, None)
+
+    assert metadata['window_start'] is not None
+    assert metadata['window_end'] is not None
+    assert metadata['window_days'] == 7
+    assert isinstance(metadata['counts'], dict)
+    assert isinstance(metadata['memory_changes'], dict)
+    assert metadata['content_hash'] == expected_hash

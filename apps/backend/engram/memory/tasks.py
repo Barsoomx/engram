@@ -430,23 +430,6 @@ def _finalize_session_distill_work(
     )
 
 
-def _run_unfinished_versioned_work(
-    *,
-    work_id: object,
-    workflow_run_id: object,
-    expected_work_type: str,
-) -> str:
-    work, _workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=expected_work_type,
-    )
-    if automatic_terminal:
-        return str(work.id)
-
-    raise MemoryWorkerError(f'{expected_work_type} work adapter is not implemented')
-
-
 def _claim_started_session_run(
     work: WorkflowWork,
     workflow_run: WorkflowRun,
@@ -745,6 +728,48 @@ def generate_daily_digest(
     return str(result.memory.id)
 
 
+def _run_digest_work(
+    task: object,
+    work: WorkflowWork,
+    workflow_run: WorkflowRun | None,
+    automatic_terminal: bool,
+) -> str:
+    from engram.memory.digest_work import execute_frozen_digest_work
+
+    if automatic_terminal:
+        return str(work.id)
+
+    if workflow_run is not None:
+        duplicate_via = 'load'
+        if workflow_run.status == WorkflowRunStatus.QUEUED:
+            workflow_run = _claim_workflow_run(work, workflow_run)
+            duplicate_via = 'claim_cas_loss'
+        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+            return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
+        if workflow_run.status != WorkflowRunStatus.RUNNING:
+            raise MemoryWorkerError('workflow run claim returned invalid status')
+
+    structlog.contextvars.clear_contextvars()
+    try:
+        result_memory_id = execute_frozen_digest_work(work, workflow_run)
+        if workflow_run is not None:
+            _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
+    except MemoryWorkerError as exc:
+        can_retry = exc.retryable and task.request.retries < task.max_retries
+        _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
+        if can_retry:
+            countdown = _RETRY_BACKOFF_BASE ** (task.request.retries + 1)
+            raise task.retry(exc=exc, countdown=countdown) from None
+        raise
+    except Exception as error:
+        _record_workflow_run_error(workflow_run, error, requeue=False)
+        raise
+    finally:
+        structlog.contextvars.clear_contextvars()
+
+    return str(workflow_run.id if workflow_run is not None else work.id)
+
+
 @app.task(
     bind=True,
     name='engram.memory.generate_daily_digest_work_v1',
@@ -757,11 +782,14 @@ def generate_daily_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    return _run_unfinished_versioned_work(
+    work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.DAILY_DIGEST,
+        allow_succeeded_run=True,
     )
+
+    return _run_digest_work(self, work, workflow_run, automatic_terminal)
 
 
 @app.task(
@@ -821,11 +849,14 @@ def generate_weekly_digest_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    return _run_unfinished_versioned_work(
+    work, workflow_run, automatic_terminal = _prepare_versioned_work(
         work_id=work_id,
         workflow_run_id=workflow_run_id,
         expected_work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        allow_succeeded_run=True,
     )
+
+    return _run_digest_work(self, work, workflow_run, automatic_terminal)
 
 
 @app.task(name='engram.memory.reembed_missing_embeddings')

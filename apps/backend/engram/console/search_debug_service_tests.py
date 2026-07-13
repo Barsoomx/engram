@@ -21,6 +21,7 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
 )
+from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
 from engram.model_policy.services import EmbeddingCallResult
 
 pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
@@ -397,3 +398,35 @@ def test_replay_admin_narrows_to_requested_team_and_authorizes_team_document() -
     assert team_doc.memory_id in {m.memory_id for m in result.exact_matches}
     assert team_doc.memory_id not in {e.memory_id for e in result.excluded}
     assert result.scope_filters['team_ids'] == [str(team.id)]
+
+
+# digest visibility quarantine — search debug candidates and pack
+
+
+@pytest.mark.django_db
+def test_search_debug_excludes_unproven_digest_and_admin_does_not_bypass() -> None:
+    organization, project, _team = _make_org_project_team()
+    proven = build_proven_weekly_digest(organization, project)
+    legacy = build_legacy_digest(organization, project)
+    scope = _make_scope(organization, project, capabilities=('memories:read', 'memories:admin'))
+
+    result = ReplaySearchDebug().execute(
+        organization,
+        project,
+        scope,
+        query='',
+        team_id=None,
+        file_paths=(),
+        symbols=(),
+    )
+
+    exact_ids = {match.memory_id for match in result.exact_matches}
+    semantic_ids = {candidate.memory_id for candidate in result.semantic_candidates}
+    lexical_ids = {candidate.memory_id for candidate in result.lexical_candidates}
+    packed_ids = {item.memory_id for item in result.packed_context}
+
+    assert proven.id in packed_ids
+    assert legacy.id not in exact_ids
+    assert legacy.id not in semantic_ids
+    assert legacy.id not in lexical_ids
+    assert legacy.id not in packed_ids

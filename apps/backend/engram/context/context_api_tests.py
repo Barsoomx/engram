@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
+from django.db import transaction
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -40,7 +43,12 @@ from engram.core.models import (
     Team,
     VectorField,
     VisibilityScope,
+    WorkflowSubjectType,
+    WorkflowWorkType,
 )
+from engram.memory.digest_visibility_tests import make_source_memory
+from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.workflow_work import CreateWorkflowWorkInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 
 RAW_KEY = 'egk_test_context_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -229,6 +237,42 @@ def create_approved_memory_document(
     )
 
     return memory, version, document
+
+
+def build_ordered_proven_digest(organization: Organization, project: Project, *, schedule_key: str) -> Memory:
+    import engram.memory.digest_work as digest_work
+
+    make_source_memory(organization, project, title=f'Source {schedule_key}', body=f'source body {schedule_key}')
+    now = timezone.now()
+    with transaction.atomic():
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=now - timedelta(days=7),
+            window_end=now + timedelta(minutes=5),
+            schedule_key=schedule_key,
+        )
+        work, _created = digest_work.create_digest_work_and_signal(
+            data=CreateWorkflowWorkInput(
+                organization_id=organization.id,
+                project_id=project.id,
+                work_type=WorkflowWorkType.WEEKLY_DIGEST,
+                subject_type=WorkflowSubjectType.PROJECT,
+                subject_id=project.id,
+                input_snapshot=snapshot,
+                occurrence_key=schedule_key,
+            ),
+            signal_task=generate_weekly_digest_work_v1,
+        )
+    generate_weekly_digest_work_v1(str(work.id))
+
+    return Memory.objects.get(
+        organization=organization,
+        project=project,
+        kind='digest',
+        metadata__digest_visibility__workflow_work_id=str(work.id),
+    )
 
 
 @pytest.mark.django_db
@@ -783,30 +827,9 @@ def test_session_start_filter_only_returns_authorized_project_memory() -> None:
 @pytest.mark.django_db
 def test_session_start_filter_only_keeps_single_most_recent_digest() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
-    digest_one, _v1, _d1 = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Digest one',
-        body='Oldest digest memory.',
-        kind='digest',
-    )
-    digest_two, _v2, _d2 = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Digest two',
-        body='Middle digest memory.',
-        kind='digest',
-    )
-    digest_three, _v3, _d3 = create_approved_memory_document(
-        organization,
-        team,
-        project,
-        title='Digest three',
-        body='Most recent digest memory.',
-        kind='digest',
-    )
+    digest_one = build_ordered_proven_digest(organization, project, schedule_key='weekly:digest-one')
+    digest_two = build_ordered_proven_digest(organization, project, schedule_key='weekly:digest-two')
+    digest_three = build_ordered_proven_digest(organization, project, schedule_key='weekly:digest-three')
     non_digest_one, _v4, _d4 = create_approved_memory_document(
         organization,
         team,

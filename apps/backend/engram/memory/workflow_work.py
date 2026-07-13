@@ -610,7 +610,11 @@ def _create_digest_work(
                 },
             )
     except IntegrityError as error:
-        raise WorkflowWorkCollisionError('digest identity collides outside its occurrence') from error
+        work = WorkflowWork.objects.filter(**occurrence_lookup).first()
+        if work is None:
+            raise WorkflowWorkCollisionError('digest identity collides outside its occurrence') from error
+
+        created = False
 
     _verify_existing_work(
         work=work,
