@@ -1273,3 +1273,914 @@ def test_0034_reverse_restores_pre_contract_nullability() -> None:
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
+
+
+MIGRATE_0035 = [('core', '0035_workflow_work_execution')]
+MIGRATION_0035_NODE = ('core', '0035_workflow_work_execution')
+
+HEX64 = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+HEX64_UPPER = HEX64.upper()
+
+
+def _hex_fingerprint() -> str:
+    return uuid.uuid4().hex + uuid.uuid4().hex
+
+
+def _create_historical_work(
+    historical_apps: Apps,
+    scope: dict[str, object],
+    disposition: str = 'required',
+    work_type: str = 'observation_processing',
+    subject_type: str = 'observation',
+    subject_id: uuid.UUID | None = None,
+    occurrence_key: str = '',
+) -> models.Model:
+    work_model = historical_apps.get_model('core', 'WorkflowWork')
+    if disposition == 'required':
+        resolution_reason = ''
+        resolved_at: datetime | None = None
+    elif disposition == 'no_op':
+        resolution_reason = 'no_input'
+        resolved_at = timezone.now()
+    else:
+        resolution_reason = 'succeeded'
+        resolved_at = timezone.now()
+
+    return work_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=None,
+        work_type=work_type,
+        subject_type=subject_type,
+        subject_id=subject_id or uuid.uuid4(),
+        contract_version=1,
+        occurrence_key=occurrence_key,
+        input_fingerprint=_hex_fingerprint(),
+        input_snapshot={'seed': 'value'},
+        disposition=disposition,
+        resolution_reason=resolution_reason,
+        resolved_at=resolved_at,
+    )
+
+
+def _create_historical_run(
+    historical_apps: Apps,
+    scope: dict[str, object],
+    work: models.Model | None = None,
+    status: str = 'queued',
+    run_type: str = 'observation_processing',
+) -> models.Model:
+    run_model = historical_apps.get_model('core', 'WorkflowRun')
+
+    return run_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=None,
+        run_type=run_type,
+        status=status,
+        work=work,
+        input_snapshot={},
+        provider_call_ids=[],
+        failure_reason='legacy detail',
+    )
+
+
+def _execution_work_fields(scope: dict[str, object], **overrides: object) -> dict[str, object]:
+    fields: dict[str, object] = {
+        'organization': scope['organization'],
+        'project': scope['project'],
+        'team': None,
+        'work_type': 'observation_processing',
+        'subject_type': 'observation',
+        'subject_id': uuid.uuid4(),
+        'contract_version': 1,
+        'occurrence_key': '',
+        'input_fingerprint': _hex_fingerprint(),
+        'input_snapshot': {'seed': 'value'},
+        'disposition': 'required',
+        'resolution_reason': '',
+        'resolved_at': None,
+        'execution_state': 'ready',
+        'fencing_token': 0,
+        'lease_owner': '',
+        'lease_expires_at': None,
+        'heartbeat_at': None,
+        'next_retry_at': None,
+        'failure_streak': 0,
+        'blocked_configuration_fingerprint': '',
+    }
+    fields.update(overrides)
+
+    return fields
+
+
+def _v1_run_fields(scope: dict[str, object], work: models.Model, status: str, **overrides: object) -> dict[str, object]:
+    fields: dict[str, object] = {
+        'organization': scope['organization'],
+        'project': scope['project'],
+        'team': None,
+        'run_type': work.work_type,
+        'status': status,
+        'work': work,
+        'input_snapshot': {},
+        'provider_call_ids': [],
+        'execution_contract_version': 1,
+        'origin': 'automatic',
+        'fencing_token': None,
+        'lease_owner': '',
+        'dispatched_at': None,
+        'lease_expires_at': None,
+        'heartbeat_at': None,
+        'started_at': None,
+        'finished_at': None,
+        'failure_class': '',
+        'failure_code': '',
+        'configuration_fingerprint': '',
+    }
+    fields.update(overrides)
+
+    return fields
+
+
+def _execution_column(column: str) -> tuple[str | None, str] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_default, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'core_workflowwork'
+              AND column_name = %s
+            """,
+            [column],
+        )
+        row = cursor.fetchone()
+
+    return (row[0], row[1]) if row is not None else None
+
+
+def _table_indexdefs(table: str) -> list[str]:
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT indexdef FROM pg_indexes WHERE tablename = %s', [table])
+
+        return [row[0] for row in cursor.fetchall()]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_backfills_dispositions_to_execution_states() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0034)
+        old_apps = executor.loader.project_state(MIGRATE_0034).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        required = _create_historical_work(old_apps, scope, disposition='required')
+        complete = _create_historical_work(old_apps, scope, disposition='complete')
+        no_op = _create_historical_work(old_apps, scope, disposition='no_op')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        migrated_required = work_model.objects.get(id=required.id)
+        migrated_complete = work_model.objects.get(id=complete.id)
+        migrated_no_op = work_model.objects.get(id=no_op.id)
+
+        assert migrated_required.execution_state == 'ready'
+        assert migrated_complete.execution_state == 'settled'
+        assert migrated_no_op.execution_state == 'settled'
+        assert migrated_required.fencing_token == 0
+        assert migrated_required.failure_streak == 0
+        assert migrated_required.lease_owner == ''
+        assert migrated_required.lease_expires_at is None
+        assert migrated_required.heartbeat_at is None
+        assert migrated_required.next_retry_at is None
+        assert migrated_required.blocked_configuration_fingerprint == ''
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_work_accepts_legal_execution_shapes() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        now = timezone.now()
+
+        legal_shapes = [
+            _execution_work_fields(scope),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='celery@host:12:uuid',
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='retry_wait',
+                fencing_token=1,
+                failure_streak=1,
+                next_retry_at=now + timedelta(seconds=30),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint=HEX64,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='terminal_failure',
+                fencing_token=1,
+                failure_streak=1,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='settled',
+                disposition='complete',
+                resolution_reason='succeeded',
+                resolved_at=now,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='settled',
+                disposition='no_op',
+                resolution_reason='no_input',
+                resolved_at=now,
+            ),
+        ]
+
+        created = [work_model.objects.create(**shape) for shape in legal_shapes]
+
+        assert work_model.objects.filter(id__in=[row.id for row in created]).count() == len(legal_shapes)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_work_rejects_illegal_execution_shapes() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        now = timezone.now()
+
+        illegal_shapes = [
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='',
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='owner',
+                heartbeat_at=None,
+                lease_expires_at=now + timedelta(seconds=120),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='owner',
+                heartbeat_at=now,
+                lease_expires_at=None,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='owner',
+                heartbeat_at=now,
+                lease_expires_at=now,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='owner',
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                next_retry_at=now + timedelta(seconds=30),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='leased',
+                fencing_token=1,
+                lease_owner='owner',
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                blocked_configuration_fingerprint=HEX64,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='retry_wait',
+                fencing_token=1,
+                failure_streak=1,
+                next_retry_at=None,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='retry_wait',
+                fencing_token=1,
+                failure_streak=1,
+                next_retry_at=now + timedelta(seconds=30),
+                lease_owner='owner',
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='retry_wait',
+                fencing_token=1,
+                failure_streak=1,
+                next_retry_at=now + timedelta(seconds=30),
+                lease_expires_at=now + timedelta(seconds=120),
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='retry_wait',
+                fencing_token=1,
+                failure_streak=1,
+                next_retry_at=now + timedelta(seconds=30),
+                blocked_configuration_fingerprint=HEX64,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint='',
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint=HEX64_UPPER,
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint='not-hex',
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint=HEX64,
+                lease_owner='owner',
+            ),
+            _execution_work_fields(
+                scope,
+                execution_state='blocked',
+                fencing_token=1,
+                failure_streak=1,
+                blocked_configuration_fingerprint=HEX64,
+                next_retry_at=now + timedelta(seconds=30),
+            ),
+            _execution_work_fields(scope, execution_state='ready', lease_owner='owner'),
+            _execution_work_fields(scope, execution_state='ready', next_retry_at=now + timedelta(seconds=30)),
+            _execution_work_fields(scope, execution_state='ready', blocked_configuration_fingerprint=HEX64),
+            _execution_work_fields(
+                scope,
+                execution_state='terminal_failure',
+                disposition='complete',
+                resolution_reason='succeeded',
+                resolved_at=now,
+            ),
+            _execution_work_fields(scope, execution_state='terminal_failure', lease_owner='owner'),
+            _execution_work_fields(scope, execution_state='settled', disposition='required'),
+            _execution_work_fields(
+                scope,
+                execution_state='settled',
+                disposition='complete',
+                resolution_reason='succeeded',
+                resolved_at=now,
+                next_retry_at=now + timedelta(seconds=30),
+            ),
+            _execution_work_fields(scope, execution_state='ready', fencing_token=-1),
+            _execution_work_fields(scope, execution_state='ready', failure_streak=-1),
+        ]
+
+        for shape in illegal_shapes:
+            with pytest.raises(IntegrityError):
+                with transaction.atomic():
+                    work_model.objects.create(**shape)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_run_accepts_legal_v1_shapes() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+
+        def _fresh_work() -> models.Model:
+            return work_model.objects.create(**_execution_work_fields(scope))
+
+        queued = run_model.objects.create(**_v1_run_fields(scope, _fresh_work(), 'queued', dispatched_at=now))
+        running = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                _fresh_work(),
+                'running',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+            )
+        )
+        succeeded = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                _fresh_work(),
+                'succeeded',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+            )
+        )
+        failed = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                _fresh_work(),
+                'failed',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+                failure_class='provider_transient',
+                failure_code='provider_timeout',
+            )
+        )
+        config_failed = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                _fresh_work(),
+                'failed',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+                failure_class='configuration',
+                failure_code='model_policy_unavailable',
+                configuration_fingerprint=HEX64,
+            )
+        )
+
+        assert (
+            run_model.objects.filter(id__in=[queued.id, running.id, succeeded.id, failed.id, config_failed.id]).count()
+            == 5
+        )
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_run_rejects_illegal_v1_shapes() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+        expires = now + timedelta(seconds=120)
+        finished = now + timedelta(seconds=10)
+
+        def _running(**overrides: object) -> dict[str, object]:
+            base = {
+                'fencing_token': 1,
+                'lease_owner': 'owner',
+                'started_at': now,
+                'heartbeat_at': now,
+                'lease_expires_at': expires,
+            }
+            base.update(overrides)
+
+            return base
+
+        def _succeeded(**overrides: object) -> dict[str, object]:
+            base = _running(finished_at=finished)
+            base.update(overrides)
+
+            return base
+
+        def _failed(**overrides: object) -> dict[str, object]:
+            base = _succeeded(failure_class='provider_transient', failure_code='provider_timeout')
+            base.update(overrides)
+
+            return base
+
+        illegal = [
+            ('queued', {'dispatched_at': now, 'fencing_token': 1}),
+            ('queued', {'dispatched_at': now, 'started_at': now}),
+            ('queued', {'dispatched_at': now, 'lease_owner': 'owner'}),
+            (
+                'queued',
+                {'dispatched_at': now, 'failure_class': 'provider_transient', 'failure_code': 'provider_timeout'},
+            ),
+            ('queued', {'dispatched_at': None}),
+            ('running', _running(fencing_token=0)),
+            ('running', _running(fencing_token=None)),
+            ('running', _running(lease_owner='')),
+            ('running', _running(started_at=None)),
+            ('running', _running(heartbeat_at=None)),
+            ('running', _running(lease_expires_at=None)),
+            ('running', _running(finished_at=finished)),
+            ('running', _running(failure_class='provider_transient', failure_code='provider_timeout')),
+            ('succeeded', _succeeded(fencing_token=None)),
+            ('succeeded', _succeeded(lease_owner='')),
+            ('succeeded', _succeeded(started_at=None)),
+            ('succeeded', _succeeded(finished_at=None)),
+            ('succeeded', _succeeded(failure_class='provider_transient', failure_code='provider_timeout')),
+            ('failed', _failed(fencing_token=None)),
+            ('failed', _failed(failure_class='')),
+            ('failed', _failed(failure_code='')),
+            ('failed', _failed(finished_at=None)),
+        ]
+
+        for status, overrides in illegal:
+            work = work_model.objects.create(**_execution_work_fields(scope))
+            with pytest.raises(IntegrityError):
+                with transaction.atomic():
+                    run_model.objects.create(**_v1_run_fields(scope, work, status, **overrides))
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_run_configuration_fingerprint_bound_to_configuration_failure() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+
+        def _failed(**overrides: object) -> dict[str, object]:
+            work = work_model.objects.create(**_execution_work_fields(scope))
+            base = _v1_run_fields(
+                scope,
+                work,
+                'failed',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+            )
+            base.update(overrides)
+
+            return base
+
+        valid = run_model.objects.create(
+            **_failed(
+                failure_class='configuration', failure_code='model_policy_unavailable', configuration_fingerprint=HEX64
+            )
+        )
+
+        assert run_model.objects.filter(id=valid.id).count() == 1
+
+        illegal = [
+            _failed(
+                failure_class='configuration', failure_code='model_policy_unavailable', configuration_fingerprint=''
+            ),
+            _failed(
+                failure_class='configuration',
+                failure_code='model_policy_unavailable',
+                configuration_fingerprint=HEX64_UPPER,
+            ),
+            _failed(
+                failure_class='provider_transient', failure_code='provider_timeout', configuration_fingerprint=HEX64
+            ),
+        ]
+
+        for shape in illegal:
+            with pytest.raises(IntegrityError):
+                with transaction.atomic():
+                    run_model.objects.create(**shape)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_unique_work_fencing_token_for_v1() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+        work = work_model.objects.create(**_execution_work_fields(scope))
+
+        run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                work,
+                'failed',
+                fencing_token=5,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+                failure_class='provider_transient',
+                failure_code='provider_timeout',
+            )
+        )
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                run_model.objects.create(
+                    **_v1_run_fields(
+                        scope,
+                        work,
+                        'running',
+                        fencing_token=5,
+                        lease_owner='owner',
+                        started_at=now,
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=120),
+                    )
+                )
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_allows_null_fencing_token_duplicates_for_v1() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+        work = work_model.objects.create(**_execution_work_fields(scope))
+
+        first = run_model.objects.create(**_v1_run_fields(scope, work, 'queued', dispatched_at=now))
+        second = run_model.objects.create(**_v1_run_fields(scope, work, 'queued', dispatched_at=now))
+
+        assert run_model.objects.filter(id__in=[first.id, second.id], fencing_token__isnull=True).count() == 2
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_at_most_one_running_v1_run_per_work() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        now = timezone.now()
+        work = work_model.objects.create(**_execution_work_fields(scope))
+
+        run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                work,
+                'running',
+                fencing_token=1,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+            )
+        )
+        succeeded = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                work,
+                'succeeded',
+                fencing_token=2,
+                lease_owner='owner',
+                started_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=120),
+                finished_at=now + timedelta(seconds=10),
+            )
+        )
+
+        assert run_model.objects.filter(id=succeeded.id).count() == 1
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                run_model.objects.create(
+                    **_v1_run_fields(
+                        scope,
+                        work,
+                        'running',
+                        fencing_token=3,
+                        lease_owner='owner',
+                        started_at=now,
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(seconds=120),
+                    )
+                )
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_v0_rows_keep_defaults_and_stay_readable() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0034)
+        old_apps = executor.loader.project_state(MIGRATE_0034).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        work = _create_historical_work(old_apps, scope, disposition='complete')
+        linked_succeeded = _create_historical_run(old_apps, scope, work=work, status='succeeded')
+        unlinked_queued = _create_historical_run(old_apps, scope, work=None, status='queued')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0035)
+        new_apps = executor.loader.project_state(MIGRATE_0035).apps
+        run_model = new_apps.get_model('core', 'WorkflowRun')
+        migrated_linked = run_model.objects.get(id=linked_succeeded.id)
+        migrated_unlinked = run_model.objects.get(id=unlinked_queued.id)
+
+        for migrated in (migrated_linked, migrated_unlinked):
+            assert migrated.execution_contract_version == 0
+            assert migrated.origin == 'legacy'
+            assert migrated.fencing_token is None
+            assert migrated.lease_owner == ''
+            assert migrated.dispatched_at is None
+            assert migrated.lease_expires_at is None
+            assert migrated.heartbeat_at is None
+            assert migrated.failure_class == ''
+            assert migrated.failure_code == ''
+            assert migrated.configuration_fingerprint == ''
+            assert migrated.failure_reason == 'legacy detail'
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.parametrize('status', ['queued', 'running'])
+def test_0035_activation_fails_closed_on_linked_v0_active_run(status: str) -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0034)
+        old_apps = executor.loader.project_state(MIGRATE_0034).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        work = _create_historical_work(old_apps, scope, disposition='required')
+        run = _create_historical_run(old_apps, scope, work=work, status=status)
+
+        executor = MigrationExecutor(connection)
+        with pytest.raises(RuntimeError):
+            executor.migrate(MIGRATE_0035)
+
+        reloaded = MigrationExecutor(connection)
+
+        assert MIGRATION_0035_NODE not in reloaded.loader.applied_migrations
+    finally:
+        old_apps.get_model('core', 'WorkflowRun').objects.filter(id=run.id).delete()
+        old_apps.get_model('core', 'WorkflowWork').objects.filter(id=work.id).delete()
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_reverse_restores_pre_execution_schema() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0034)
+        old_apps = executor.loader.project_state(MIGRATE_0034).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        work = _create_historical_work(old_apps, scope, disposition='complete')
+        legacy_run = _create_historical_run(old_apps, scope, work=work, status='succeeded')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0035)
+
+        assert _execution_column('execution_state') is not None
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0034)
+
+        assert _execution_column('execution_state') is None
+
+        reverted_run = old_apps.get_model('core', 'WorkflowRun').objects.get(id=legacy_run.id)
+
+        assert reverted_run.status == 'succeeded'
+        assert reverted_run.failure_reason == 'legacy detail'
+
+        post_reverse_work = _create_historical_work(old_apps, scope, disposition='required')
+
+        assert old_apps.get_model('core', 'WorkflowWork').objects.filter(id=post_reverse_work.id).count() == 1
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0035)
+
+        assert _execution_column('execution_state') is not None
+
+        reapplied_apps = executor.loader.project_state(MIGRATE_0035).apps
+        reapplied_run_model = reapplied_apps.get_model('core', 'WorkflowRun')
+
+        assert reapplied_run_model.objects.get(id=legacy_run.id).execution_contract_version == 0
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_creates_execution_indexes() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        work_indexdefs = _table_indexdefs('core_workflowwork')
+        run_indexdefs = _table_indexdefs('core_workflowrun')
+
+        expected_work = [
+            '(organization_id, project_id, execution_state, next_retry_at)',
+            '(organization_id, project_id, work_type, execution_state)',
+            '(execution_state, lease_expires_at)',
+        ]
+        expected_run = [
+            '(work_id, status, created_at)',
+            '(work_id, fencing_token)',
+            '(organization_id, project_id, failure_class, finished_at)',
+        ]
+
+        for columns in expected_work:
+            assert any(columns in definition for definition in work_indexdefs)
+
+        for columns in expected_run:
+            assert any(columns in definition for definition in run_indexdefs)
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
