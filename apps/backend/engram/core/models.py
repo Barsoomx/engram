@@ -1048,6 +1048,15 @@ class WorkflowWorkResolutionReason(models.TextChoices):
     NO_INPUT = 'no_input', 'No input'
 
 
+class WorkflowWorkExecutionState(models.TextChoices):
+    READY = 'ready', 'Ready'
+    LEASED = 'leased', 'Leased'
+    RETRY_WAIT = 'retry_wait', 'Retry wait'
+    BLOCKED = 'blocked', 'Blocked'
+    TERMINAL_FAILURE = 'terminal_failure', 'Terminal failure'
+    SETTLED = 'settled', 'Settled'
+
+
 class WorkflowWork(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='workflow_works')
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='workflow_works')
@@ -1076,6 +1085,19 @@ class WorkflowWork(TimestampedModel):
         blank=True,
     )
     resolved_at = models.DateTimeField(null=True, blank=True)
+    execution_state = models.CharField(
+        max_length=24,
+        choices=WorkflowWorkExecutionState.choices,
+        default=WorkflowWorkExecutionState.READY,
+        db_default=WorkflowWorkExecutionState.READY,
+    )
+    fencing_token = models.PositiveBigIntegerField(default=0, db_default=0)
+    lease_owner = models.CharField(max_length=255, blank=True, db_default='')
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    next_retry_at = models.DateTimeField(null=True, blank=True)
+    failure_streak = models.PositiveIntegerField(default=0, db_default=0)
+    blocked_configuration_fingerprint = models.CharField(max_length=64, blank=True, db_default='')
 
     _IMMUTABLE_FIELDS = (
         ('organization_id', 'organization'),
@@ -1190,6 +1212,72 @@ class WorkflowWork(TimestampedModel):
                 ),
                 name='core_work_terminal_state_ck',
             ),
+            models.CheckConstraint(
+                condition=(
+                    (
+                        models.Q(execution_state=WorkflowWorkExecutionState.LEASED)
+                        & ~models.Q(lease_owner='')
+                        & models.Q(heartbeat_at__isnull=False)
+                        & models.Q(lease_expires_at__isnull=False)
+                        & models.Q(lease_expires_at__gt=models.F('heartbeat_at'))
+                        & models.Q(next_retry_at__isnull=True)
+                        & models.Q(blocked_configuration_fingerprint='')
+                    )
+                    | (
+                        models.Q(execution_state=WorkflowWorkExecutionState.RETRY_WAIT)
+                        & models.Q(lease_owner='')
+                        & models.Q(heartbeat_at__isnull=True)
+                        & models.Q(lease_expires_at__isnull=True)
+                        & models.Q(next_retry_at__isnull=False)
+                        & models.Q(blocked_configuration_fingerprint='')
+                    )
+                    | (
+                        models.Q(execution_state=WorkflowWorkExecutionState.BLOCKED)
+                        & models.Q(lease_owner='')
+                        & models.Q(heartbeat_at__isnull=True)
+                        & models.Q(lease_expires_at__isnull=True)
+                        & models.Q(next_retry_at__isnull=True)
+                        & models.Q(blocked_configuration_fingerprint__regex=r'^[0-9a-f]{64}$')
+                    )
+                    | (
+                        models.Q(
+                            execution_state__in=(
+                                WorkflowWorkExecutionState.READY,
+                                WorkflowWorkExecutionState.TERMINAL_FAILURE,
+                                WorkflowWorkExecutionState.SETTLED,
+                            )
+                        )
+                        & models.Q(lease_owner='')
+                        & models.Q(heartbeat_at__isnull=True)
+                        & models.Q(lease_expires_at__isnull=True)
+                        & models.Q(next_retry_at__isnull=True)
+                        & models.Q(blocked_configuration_fingerprint='')
+                    )
+                ),
+                name='core_work_execution_shape_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(execution_state=WorkflowWorkExecutionState.SETTLED)
+                    | ~models.Q(disposition=WorkflowWorkDisposition.REQUIRED)
+                ),
+                name='core_work_settled_disposition_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(execution_state=WorkflowWorkExecutionState.TERMINAL_FAILURE)
+                    | models.Q(disposition=WorkflowWorkDisposition.REQUIRED)
+                ),
+                name='core_work_terminal_disposition_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(fencing_token__gte=0),
+                name='core_work_fencing_token_nonneg',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(failure_streak__gte=0),
+                name='core_work_failure_streak_nonneg',
+            ),
         ]
         indexes = [
             models.Index(
@@ -1207,6 +1295,18 @@ class WorkflowWork(TimestampedModel):
             models.Index(
                 fields=['organization', 'project', 'work_type', 'occurrence_key'],
                 name='core_work_occurrence_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'execution_state', 'next_retry_at'],
+                name='core_work_exec_retry_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'work_type', 'execution_state'],
+                name='core_work_type_exec_idx',
+            ),
+            models.Index(
+                fields=['execution_state', 'lease_expires_at'],
+                name='core_work_exec_lease_idx',
             ),
         ]
 
@@ -1251,6 +1351,22 @@ class WorkflowRunStatus(models.TextChoices):
     FAILED = 'failed', 'Failed'
 
 
+class WorkflowRunOrigin(models.TextChoices):
+    LEGACY = 'legacy', 'Legacy'
+    AUTOMATIC = 'automatic', 'Automatic'
+    RECONCILIATION = 'reconciliation', 'Reconciliation'
+    MANUAL = 'manual', 'Manual'
+
+
+class WorkflowRunFailureClass(models.TextChoices):
+    WORKER_LOST = 'worker_lost', 'Worker lost'
+    INFRASTRUCTURE_TRANSIENT = 'infrastructure_transient', 'Infrastructure transient'
+    PROVIDER_TRANSIENT = 'provider_transient', 'Provider transient'
+    CONFIGURATION = 'configuration', 'Configuration'
+    INVALID_INPUT = 'invalid_input', 'Invalid input'
+    UNEXPECTED = 'unexpected', 'Unexpected'
+
+
 class WorkflowRun(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='workflow_runs')
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='workflow_runs')
@@ -1290,6 +1406,26 @@ class WorkflowRun(TimestampedModel):
         null=True,
         blank=True,
     )
+    execution_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
+    origin = models.CharField(
+        max_length=24,
+        choices=WorkflowRunOrigin.choices,
+        default=WorkflowRunOrigin.LEGACY,
+        db_default=WorkflowRunOrigin.LEGACY,
+    )
+    fencing_token = models.PositiveBigIntegerField(null=True, blank=True)
+    lease_owner = models.CharField(max_length=255, blank=True, db_default='')
+    dispatched_at = models.DateTimeField(null=True, blank=True)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    failure_class = models.CharField(
+        max_length=32,
+        choices=WorkflowRunFailureClass.choices,
+        blank=True,
+        db_default='',
+    )
+    failure_code = models.CharField(max_length=128, blank=True, db_default='')
+    configuration_fingerprint = models.CharField(max_length=64, blank=True, db_default='')
 
     class Meta:
         constraints = [
@@ -1301,10 +1437,111 @@ class WorkflowRun(TimestampedModel):
                 ),
                 name='core_workflowrun_uniq_active_daily_digest',
             ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(execution_contract_version=1)
+                    | (
+                        models.Q(
+                            status=WorkflowRunStatus.QUEUED,
+                            fencing_token__isnull=True,
+                            lease_owner='',
+                            started_at__isnull=True,
+                            finished_at__isnull=True,
+                            heartbeat_at__isnull=True,
+                            lease_expires_at__isnull=True,
+                            failure_class='',
+                            failure_code='',
+                            dispatched_at__isnull=False,
+                        )
+                        | (
+                            models.Q(
+                                status=WorkflowRunStatus.RUNNING,
+                                fencing_token__gt=0,
+                                fencing_token__isnull=False,
+                                started_at__isnull=False,
+                                heartbeat_at__isnull=False,
+                                lease_expires_at__isnull=False,
+                                finished_at__isnull=True,
+                                failure_class='',
+                                failure_code='',
+                            )
+                            & ~models.Q(lease_owner='')
+                        )
+                        | (
+                            models.Q(
+                                status=WorkflowRunStatus.SUCCEEDED,
+                                fencing_token__gt=0,
+                                fencing_token__isnull=False,
+                                started_at__isnull=False,
+                                finished_at__isnull=False,
+                                failure_class='',
+                                failure_code='',
+                            )
+                            & ~models.Q(lease_owner='')
+                        )
+                        | (
+                            models.Q(
+                                status=WorkflowRunStatus.FAILED,
+                                fencing_token__gt=0,
+                                fencing_token__isnull=False,
+                                started_at__isnull=False,
+                                finished_at__isnull=False,
+                            )
+                            & ~models.Q(lease_owner='')
+                            & ~models.Q(failure_class='')
+                            & ~models.Q(failure_code='')
+                        )
+                    )
+                ),
+                name='core_run_v1_status_shape_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    (
+                        models.Q(configuration_fingerprint='')
+                        & ~models.Q(failure_class=WorkflowRunFailureClass.CONFIGURATION)
+                    )
+                    | models.Q(
+                        failure_class=WorkflowRunFailureClass.CONFIGURATION,
+                        configuration_fingerprint__regex=r'^[0-9a-f]{64}$',
+                    )
+                ),
+                name='core_run_config_fingerprint_ck',
+            ),
+            models.UniqueConstraint(
+                fields=['work', 'fencing_token'],
+                condition=models.Q(
+                    execution_contract_version=1,
+                    fencing_token__isnull=False,
+                    work__isnull=False,
+                ),
+                name='core_run_v1_work_token_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['work'],
+                condition=models.Q(
+                    execution_contract_version=1,
+                    status=WorkflowRunStatus.RUNNING,
+                    work__isnull=False,
+                ),
+                name='core_run_v1_one_running_uniq',
+            ),
         ]
         indexes = [
             models.Index(fields=['organization', 'status']),
             models.Index(fields=['organization', 'created_at']),
+            models.Index(
+                fields=['work', 'status', 'created_at'],
+                name='core_run_work_status_time_idx',
+            ),
+            models.Index(
+                fields=['work', 'fencing_token'],
+                name='core_run_work_token_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'failure_class', 'finished_at'],
+                name='core_run_scope_failclass_idx',
+            ),
         ]
         ordering = ['organization_id', '-created_at']
 
