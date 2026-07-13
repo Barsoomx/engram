@@ -33,6 +33,12 @@ from engram.memory.services import (
     weekly_digest_content_hash,
 )
 from engram.memory.tasks import _verify_work_fingerprint, dispatch_work_task
+from engram.memory.work_execution import (
+    WorkClaim,
+    finish_claim_resolved_elsewhere,
+    finish_work_claim,
+    lock_work_fence,
+)
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     WorkflowWorkScopeError,
@@ -503,7 +509,7 @@ def _load_output_team(work: WorkflowWork) -> Team | None:
     try:
         return Team.objects.get(id=work.team_id, organization_id=work.organization_id)
     except Team.DoesNotExist as error:
-        raise MemoryWorkerError('digest output team is outside work scope') from error
+        raise MemoryWorkerError('digest output team is outside work scope', code='work_scope_invalid') from error
 
 
 def _visibility_block_matches(block: object, expected: dict[str, object]) -> bool:
@@ -568,15 +574,21 @@ def _lock_and_revalidate(
             .order_by('id')
         )
         if not linked:
-            raise MemoryWorkerError('digest output team is no longer linked to its project')
+            raise MemoryWorkerError(
+                'digest output team is no longer linked to its project',
+                code='work_scope_invalid',
+            )
 
     versions = {version.id: version for version in locked_versions}
     for ref in refs:
         version = versions.get(UUID(str(ref['memory_version_id'])))
         if version is None:
-            raise MemoryWorkerError('digest source is missing its frozen version')
+            raise MemoryWorkerError('digest source is missing its frozen version', code='work_scope_invalid')
         if _server_body_digest(version) != ref.get('server_body_digest'):
-            raise MemoryWorkerError('digest source body digest does not match frozen input')
+            raise MemoryWorkerError(
+                'digest source body digest does not match frozen input',
+                code='work_scope_invalid',
+            )
 
     return versions
 
@@ -646,6 +658,7 @@ def _publish(
     refs: list[dict[str, object]],
     team: Team | None,
     provider_result: object,
+    claim: WorkClaim | None = None,
 ) -> UUID:
     if work.work_type == WorkflowWorkType.DAILY_DIGEST:
         title = f'Digest {provider_result.generated_title}'
@@ -691,22 +704,72 @@ def _publish(
     IndexMemoryVersion().execute(
         IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=True),
     )
-    resolve_work_succeeded(
-        work.id,
-        organization_id=work.organization_id,
-        project_id=work.project_id,
-    )
+    if claim is not None:
+        finish_work_claim(
+            claim=claim,
+            now=datetime.now(UTC),
+            completion='product_succeeded',
+            result_memory_id=memory.id,
+        )
+    else:
+        resolve_work_succeeded(
+            work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
 
     return memory.id
 
 
-def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | None) -> UUID | None:
+def _finish_reused_claim(claim: WorkClaim | None, memory_id: UUID | None) -> None:
+    if claim is None:
+        return
+
+    finish_work_claim(
+        claim=claim,
+        now=datetime.now(UTC),
+        completion='product_succeeded',
+        result_memory_id=memory_id,
+    )
+
+    return
+
+
+def _release_claim_resolved_elsewhere(claim: WorkClaim | None) -> None:
+    if claim is None:
+        return
+
+    finish_claim_resolved_elsewhere(claim=claim, now=datetime.now(UTC))
+
+    return
+
+
+def _lock_work_for_publish(work: WorkflowWork, claim: WorkClaim | None) -> WorkflowWork:
+    if claim is not None:
+        locked_work, _run = lock_work_fence(claim=claim, now=datetime.now(UTC))
+
+        return locked_work
+
+    return WorkflowWork.objects.select_for_update().get(
+        id=work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+
+
+def execute_frozen_digest_work(
+    work: WorkflowWork,
+    workflow_run: WorkflowRun | None = None,
+    claim: WorkClaim | None = None,
+) -> UUID | None:
     _verify_work_fingerprint(work)
     if work.disposition == WorkflowWorkDisposition.NO_OP:
         return None
 
     existing = _existing_output(work)
     if existing is not None:
+        _finish_reused_claim(claim, existing)
+
         return existing
 
     refs = _snapshot_refs(work.work_type, work.input_snapshot)
@@ -718,17 +781,17 @@ def execute_frozen_digest_work(work: WorkflowWork, workflow_run: WorkflowRun | N
     provider_result = _render_daily(work, refs, versions) if work.work_type == WorkflowWorkType.DAILY_DIGEST else None
 
     with transaction.atomic():
-        locked_work = WorkflowWork.objects.select_for_update().get(
-            id=work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-        )
+        locked_work = _lock_work_for_publish(work, claim)
         existing = _existing_output(locked_work)
         if existing is not None:
+            _finish_reused_claim(claim, existing)
+
             return existing
         if locked_work.disposition != WorkflowWorkDisposition.REQUIRED:
-            return _existing_output(locked_work)
+            _release_claim_resolved_elsewhere(claim)
+
+            return None
 
         _lock_and_revalidate(work, refs, team)
 
-        return _publish(work, refs, team, provider_result)
+        return _publish(work, refs, team, provider_result, claim)

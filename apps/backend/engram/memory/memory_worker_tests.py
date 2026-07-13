@@ -36,11 +36,13 @@ from engram.core.models import (
     Team,
     VisibilityScope,
     WorkflowRun,
+    WorkflowRunFailureClass,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
@@ -1660,9 +1662,15 @@ def test_observation_work_task_rejects_changed_fingerprint_before_domain_access(
     task = tasks_module.process_observation_work_v1
 
     with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
-        with pytest.raises(MemoryWorkerError, match='fingerprint'):
-            task(str(work.id))
+        result = task(str(work.id))
 
     m_execute.assert_not_called()
+    assert result == str(work.id)
     work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.failure_streak == 1
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == WorkflowRunFailureClass.INVALID_INPUT
+    assert run.failure_code == 'work_fingerprint_mismatch'

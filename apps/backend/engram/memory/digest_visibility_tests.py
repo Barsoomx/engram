@@ -15,6 +15,7 @@ from engram.core.models import (
     Organization,
     Project,
     VisibilityScope,
+    WorkflowRun,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkType,
@@ -197,6 +198,7 @@ def test_missing_linked_work_is_unproven() -> None:
     organization, project = make_org_project('missing-work')
     digest = build_proven_weekly_digest(organization, project)
     work_id = digest.metadata['digest_visibility']['workflow_work_id']
+    WorkflowRun.objects.filter(work_id=work_id).delete()
     WorkflowWork.objects.filter(id=work_id).delete()
 
     assert digest_visibility.proven_digest_memory(_reload(digest)) is False

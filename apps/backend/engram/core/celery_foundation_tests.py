@@ -14,8 +14,19 @@ from engram.celery_bootsteps import LivenessProbe
 from engram.core import redis_sentinel
 from engram.core.domain.event_dispatcher import QUEUE_DOMAIN_EVENTS, CeleryEventDispatcher
 from engram.core.domain.events import DomainEvent
+from engram.core.models import WorkflowWorkType
 from engram.core.redis_sentinel import REDIS_DB_CACHE, DynamicRedisConnectionFactory
 from engram.core.retryable_django_task import RetryableTask
+from engram.memory import tasks as memory_tasks
+
+_LEASE_MARGIN_SECONDS = 30
+
+_VERSIONED_WORK_TASKS_BY_TYPE = {
+    WorkflowWorkType.OBSERVATION_PROCESSING: memory_tasks.process_observation_work_v1,
+    WorkflowWorkType.SESSION_DISTILLATION: memory_tasks.distill_session_work_v1,
+    WorkflowWorkType.DAILY_DIGEST: memory_tasks.generate_daily_digest_work_v1,
+    WorkflowWorkType.WEEKLY_DIGEST: memory_tasks.generate_weekly_digest_work_v1,
+}
 
 EXPECTED_QUEUE_NAMES = {
     'engram-realtime',
@@ -130,6 +141,16 @@ def test_celery_app_uses_outbox_transport_and_foundation_config() -> None:
         'worker_enable_soft_shutdown_on_idle': True,
     }
     assert LivenessProbe in celery_app.steps['worker']
+
+
+def test_versioned_work_hard_time_limit_fits_inside_lease() -> None:
+    for work_type, task in _VERSIONED_WORK_TASKS_BY_TYPE.items():
+        lease_seconds = memory_tasks.LEASE_BY_WORK_TYPE[work_type].total_seconds()
+
+        assert task.soft_time_limit is not None, f'{work_type} task must set a soft time limit'
+        assert task.time_limit is not None, f'{work_type} task must set a hard time limit'
+        assert task.soft_time_limit < task.time_limit
+        assert task.time_limit + _LEASE_MARGIN_SECONDS <= lease_seconds
 
 
 def test_celery_support_classes_are_available() -> None:

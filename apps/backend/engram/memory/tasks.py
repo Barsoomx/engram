@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import socket
 import uuid
+from datetime import timedelta
 
 import structlog
 from django.db import transaction
@@ -12,6 +14,7 @@ from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import (
     Observation,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
@@ -23,19 +26,27 @@ from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import (
     DistillSession,
     DistillSessionInput,
-    DistillSessionResult,
     run_session_distillation_with_tracking,
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
     MemoryCandidateWorkerInput,
-    MemoryCandidateWorkerResult,
     MemoryWorkerError,
     ProcessObservationRecorded,
     run_daily_digest_with_tracking,
     run_weekly_digest_with_tracking,
 )
 from engram.memory.session_sweep import SweepStaleSessions
+from engram.memory.work_dispatch import queue_work_attempt, work_task_signature
+from engram.memory.work_execution import (
+    claim_work,
+    execution_configuration_fingerprint,
+    fail_work_claim,
+    finish_work_claim,
+    heartbeat_work,
+    lock_work_fence,
+)
+from engram.memory.work_failures import translate_failure
 from engram.memory.workflow_work import (
     observation_content_digest,
     resolve_work_no_signal,
@@ -53,6 +64,21 @@ _DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', 
 _DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
 _DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
 _DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
+_DIGEST_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_SOFT_TIME_LIMIT', '180'))
+_DIGEST_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_TIME_LIMIT', '210'))
+
+_OBSERVATION_LEASE = timedelta(seconds=120)
+_SESSION_LEASE = timedelta(seconds=720)
+_DIGEST_LEASE = timedelta(seconds=240)
+_LEASE_OWNER_MAX = 255
+_NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
+
+LEASE_BY_WORK_TYPE = {
+    WorkflowWorkType.OBSERVATION_PROCESSING: _OBSERVATION_LEASE,
+    WorkflowWorkType.SESSION_DISTILLATION: _SESSION_LEASE,
+    WorkflowWorkType.DAILY_DIGEST: _DIGEST_LEASE,
+    WorkflowWorkType.WEEKLY_DIGEST: _DIGEST_LEASE,
+}
 
 
 def dispatch_work_task(
@@ -60,13 +86,9 @@ def dispatch_work_task(
     work_id: uuid.UUID,
     workflow_run_id: uuid.UUID | None = None,
 ) -> object:
-    args = (str(work_id),)
-    task_id = f'workflow-work:{work_id}'
-    if workflow_run_id is not None:
-        args = (*args, str(workflow_run_id))
-        task_id = f'{task_id}:run:{workflow_run_id}'
+    args, task_id = work_task_signature(work_id, workflow_run_id)
 
-    return task.apply_async(args=args, task_id=task_id)
+    return task.apply_async(args=tuple(args), task_id=task_id)
 
 
 def _parse_work_task_ids(
@@ -260,10 +282,78 @@ def _record_workflow_run_error(
         _fail_workflow_run(workflow_run, error)
 
 
+def _lease_owner(task: object) -> str:
+    hostname = getattr(getattr(task, 'request', None), 'hostname', None) or socket.gethostname()
+    hostname = hostname.replace(':', '_')
+    tail = f':{os.getpid()}:{uuid.uuid4()}'
+    max_hostname = _LEASE_OWNER_MAX - len(tail)
+
+    return f'{hostname[:max_hostname]}{tail}'
+
+
+def _root_cause_error(error: Exception) -> BaseException:
+    if isinstance(error, MemoryWorkerError) and not error.code and error.__cause__ is not None:
+        return error.__cause__
+
+    return error
+
+
+def _record_claim_failure(
+    claim: object,
+    error: Exception,
+    *,
+    configuration_fingerprint: str,
+) -> None:
+    failure = translate_failure(
+        _root_cause_error(error),
+        configuration_fingerprint=configuration_fingerprint,
+    )
+    fail_work_claim(claim=claim, now=timezone.now(), failure=failure)
+
+    return
+
+
+def _run_fenced_automatic(
+    task: object,
+    work: WorkflowWork,
+    *,
+    work_type: str,
+    lease_for: timedelta,
+    event_prefix: str,
+    execute: object,
+    workflow_run_id: uuid.UUID | None = None,
+) -> str:
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=work_type,
+        lease_owner=_lease_owner(task),
+        now=timezone.now(),
+        lease_for=lease_for,
+        workflow_run_id=workflow_run_id,
+    )
+    if claim_result.outcome in _NON_EXECUTING_CLAIM_OUTCOMES:
+        logger.info(
+            f'{event_prefix}_claim_skipped',
+            work_id=str(work.id),
+            outcome=claim_result.outcome,
+        )
+
+        return str(work.id)
+
+    claim = claim_result.claim
+    configuration_fingerprint = execution_configuration_fingerprint(work)
+    try:
+        return execute(claim)
+    except Exception as error:
+        _record_claim_failure(claim, error, configuration_fingerprint=configuration_fingerprint)
+
+        raise
+
+
 def _finalize_observation_work(
     work: WorkflowWork,
-    workflow_run: WorkflowRun | None,
-    result: MemoryCandidateWorkerResult,
+    workflow_run: WorkflowRun,
+    result: object,
 ) -> None:
     if work.disposition == WorkflowWorkDisposition.REQUIRED:
         resolver = (
@@ -277,34 +367,12 @@ def _finalize_observation_work(
             project_id=work.project_id,
         )
 
-    if workflow_run is not None:
-        _complete_workflow_run(
-            workflow_run,
-            result_memory_id=result.memory.id if result.memory is not None else None,
-        )
-
-
-def _prepare_versioned_work(
-    *,
-    work_id: object,
-    workflow_run_id: object,
-    expected_work_type: str,
-    allow_succeeded_run: bool = False,
-) -> tuple[WorkflowWork, WorkflowRun | None, bool]:
-    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
-    work = _load_versioned_work(parsed_work_id, expected_work_type)
-    workflow_run = (
-        _load_workflow_run(
-            work,
-            parsed_run_id,
-            allow_succeeded=allow_succeeded_run,
-        )
-        if parsed_run_id is not None
-        else None
+    _complete_workflow_run(
+        workflow_run,
+        result_memory_id=result.memory.id if result.memory is not None else None,
     )
-    automatic_terminal = workflow_run is None and work.disposition != WorkflowWorkDisposition.REQUIRED
 
-    return work, workflow_run, automatic_terminal
+    return
 
 
 def _verify_work_fingerprint(work: WorkflowWork) -> None:
@@ -318,10 +386,13 @@ def _verify_work_fingerprint(work: WorkflowWork) -> None:
             input_snapshot=work.input_snapshot,
         )
     except ValueError as error:
-        raise MemoryWorkerError('workflow work fingerprint is invalid') from error
+        raise MemoryWorkerError('workflow work fingerprint is invalid', code='work_contract_invalid') from error
 
     if fingerprint != work.input_fingerprint:
-        raise MemoryWorkerError('workflow work fingerprint does not match frozen input')
+        raise MemoryWorkerError(
+            'workflow work fingerprint does not match frozen input',
+            code='work_fingerprint_mismatch',
+        )
 
 
 def _load_observation_work_subject(work: WorkflowWork) -> Observation:
@@ -338,8 +409,6 @@ def _load_observation_work_subject(work: WorkflowWork) -> Observation:
     except Observation.DoesNotExist as error:
         raise MemoryWorkerError('observation is outside workflow work scope') from error
 
-    _verify_work_fingerprint(work)
-
     try:
         current_digest = observation_content_digest(observation)
     except ValueError as error:
@@ -354,118 +423,43 @@ def _load_session_work_upper(work: WorkflowWork) -> int:
     if work.subject_type != WorkflowSubjectType.AGENT_SESSION:
         raise MemoryWorkerError('workflow work subject type does not match session task')
 
-    _verify_work_fingerprint(work)
-
     return work.input_snapshot['upper_sequence_inclusive']
 
 
-def _acquire_session_distill_run(
+def _adopt_legacy_session_run(work: WorkflowWork) -> WorkflowRun | None:
+    return (
+        WorkflowRun.objects.filter(work_id=work.id, execution_contract_version=0).order_by('created_at', 'id').first()
+    )
+
+
+def _finish_session_claim(
     work: WorkflowWork,
-    *,
-    request_id: str,
-    correlation_id: str,
-) -> tuple[WorkflowRun, bool]:
-    with transaction.atomic():
-        WorkflowWork.objects.select_for_update().get(
-            id=work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-        )
-        existing = (
-            WorkflowRun.objects.filter(
-                work_id=work.id,
-                organization_id=work.organization_id,
-                project_id=work.project_id,
-                team_id=work.team_id,
-                run_type=work.work_type,
-            )
-            .order_by('created_at')
-            .first()
-        )
-        if existing is not None:
-            return existing, False
-
-        run = WorkflowRun.objects.create(
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-            team_id=work.team_id,
-            work_id=work.id,
-            run_type=work.work_type,
-            status=WorkflowRunStatus.RUNNING,
-            started_at=timezone.now(),
-            input_snapshot={'session_id': work.input_snapshot['session_id']},
-            request_id=request_id,
-            correlation_id=correlation_id,
-        )
-
-        return run, True
-
-
-def _finalize_session_distill_work(
-    work: WorkflowWork,
-    workflow_run: WorkflowRun,
-    result: DistillSessionResult,
+    claim: object,
+    result: object,
 ) -> None:
-    if not result.truncated and work.disposition == WorkflowWorkDisposition.REQUIRED:
-        resolver = (
-            resolve_work_succeeded if result.auto_promoted or result.queued_for_review else resolve_work_no_signal
-        )
-        resolver(
-            work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-        )
+    now = timezone.now()
+    with transaction.atomic():
+        lock_work_fence(claim=claim, now=now)
+        if result.truncated:
+            finish_work_claim(claim=claim, now=now, completion='continue_required')
+            queue_work_attempt(
+                work_id=work.id,
+                now=now,
+                origin=WorkflowRunOrigin.RECONCILIATION,
+            )
 
-    _complete_workflow_run(
-        workflow_run,
-        result_memory_id=result.auto_promoted[0].id if result.auto_promoted else None,
-        provider_call_ids=list(result.provider_call_ids),
-        escalation=result.truncated,
-    )
+            return
 
-
-def _claim_started_session_run(
-    work: WorkflowWork,
-    workflow_run: WorkflowRun,
-) -> tuple[WorkflowRun, str | None]:
-    claimed = _claim_workflow_run(work, workflow_run)
-    if claimed.status == WorkflowRunStatus.SUCCEEDED:
-        return claimed, _succeeded_workflow_run_result(work, claimed, via='claim')
-    if claimed.status != WorkflowRunStatus.RUNNING:
-        raise MemoryWorkerError('workflow run claim returned invalid status')
-
-    return claimed, None
-
-
-def _resolve_session_distill_run(
-    work: WorkflowWork,
-    explicit_run: WorkflowRun | None,
-    *,
-    request_id: str,
-    correlation_id: str,
-) -> tuple[WorkflowRun, str | None]:
-    if explicit_run is not None:
-        return _claim_started_session_run(work, explicit_run)
-
-    workflow_run, created = _acquire_session_distill_run(
-        work,
-        request_id=request_id,
-        correlation_id=correlation_id,
-    )
-    if created:
-        return workflow_run, None
-
-    if workflow_run.status != WorkflowRunStatus.QUEUED:
-        logger.info(
-            'distill_session_work_initial_run_adopted',
-            work_id=str(work.id),
-            workflow_run_id=str(workflow_run.id),
-            status=workflow_run.status,
+        completion = 'product_succeeded' if result.auto_promoted or result.queued_for_review else 'product_no_signal'
+        result_memory_id = result.auto_promoted[0].id if result.auto_promoted else None
+        finish_work_claim(
+            claim=claim,
+            now=now,
+            completion=completion,
+            result_memory_id=result_memory_id,
         )
 
-        return workflow_run, str(workflow_run.id)
-
-    return _claim_started_session_run(work, workflow_run)
+    return
 
 
 @app.task(
@@ -519,41 +513,44 @@ def process_observation_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
-        allow_succeeded_run=True,
-    )
-    if automatic_terminal:
-        return str(work.id)
-    if workflow_run is not None:
-        duplicate_via = 'load'
-        if workflow_run.status == WorkflowRunStatus.QUEUED:
-            workflow_run = _claim_workflow_run(work, workflow_run)
-            duplicate_via = 'claim_cas_loss'
-        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-            return _succeeded_workflow_run_result(
-                work,
-                workflow_run,
-                via=duplicate_via,
-            )
-        if workflow_run.status != WorkflowRunStatus.RUNNING:
-            raise MemoryWorkerError('workflow run claim returned invalid status')
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.OBSERVATION_PROCESSING)
+
+    if parsed_run_id is not None:
+        return _run_observation_explicit_delivery(self, work, parsed_run_id)
+
+    return _run_observation_automatic_delivery(self, work)
+
+
+def _run_observation_explicit_delivery(
+    task: object,
+    work: WorkflowWork,
+    workflow_run_id: uuid.UUID,
+) -> str:
+    workflow_run = _load_workflow_run(work, workflow_run_id, allow_succeeded=True)
+    duplicate_via = 'load'
+    if workflow_run.status == WorkflowRunStatus.QUEUED:
+        workflow_run = _claim_workflow_run(work, workflow_run)
+        duplicate_via = 'claim_cas_loss'
+    if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+        return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
+    if workflow_run.status != WorkflowRunStatus.RUNNING:
+        raise MemoryWorkerError('workflow run claim returned invalid status')
 
     structlog.contextvars.clear_contextvars()
     try:
+        _verify_work_fingerprint(work)
         observation = _load_observation_work_subject(work)
         result = ProcessObservationRecorded().execute(
             MemoryCandidateWorkerInput(observation_id=observation.id),
         )
         _finalize_observation_work(work, workflow_run, result)
     except MemoryWorkerError as exc:
-        can_retry = exc.retryable and self.request.retries < self.max_retries
+        can_retry = exc.retryable and task.request.retries < task.max_retries
         _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
         if can_retry:
-            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
-            raise self.retry(exc=exc, countdown=countdown) from None
+            countdown = _RETRY_BACKOFF_BASE ** (task.request.retries + 1)
+            raise task.retry(exc=exc, countdown=countdown) from None
         raise
     except Exception as error:
         _record_workflow_run_error(workflow_run, error, requeue=False)
@@ -561,7 +558,54 @@ def process_observation_work_v1(
     finally:
         structlog.contextvars.clear_contextvars()
 
-    return str(workflow_run.id if workflow_run is not None else work.id)
+    return str(workflow_run.id)
+
+
+def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str:
+    observation = _load_observation_work_subject(work)
+
+    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+        logger.info(
+            'observation_work_already_resolved',
+            work_id=str(work.id),
+            disposition=work.disposition,
+        )
+
+        return str(work.id)
+
+    def execute(claim: object) -> str:
+        structlog.contextvars.clear_contextvars()
+        try:
+            result = ProcessObservationRecorded().execute(
+                MemoryCandidateWorkerInput(observation_id=observation.id),
+            )
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+        completion = (
+            'product_succeeded' if result.memory is not None or result.candidate is not None else 'product_no_signal'
+        )
+        result_memory_id = result.memory.id if result.memory is not None else None
+        now = timezone.now()
+        with transaction.atomic():
+            lock_work_fence(claim=claim, now=now)
+            finish_work_claim(
+                claim=claim,
+                now=now,
+                completion=completion,
+                result_memory_id=result_memory_id,
+            )
+
+        return str(claim.workflow_run_id)
+
+    return _run_fenced_automatic(
+        task,
+        work,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+        lease_for=_OBSERVATION_LEASE,
+        event_prefix='observation_work',
+        execute=execute,
+    )
 
 
 @app.task(
@@ -619,59 +663,67 @@ def distill_session_work_v1(
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, explicit_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
-        allow_succeeded_run=True,
-    )
-    if automatic_terminal:
-        return str(work.id)
-
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.SESSION_DISTILLATION)
     upper = _load_session_work_upper(work)
     session_id = uuid.UUID(work.input_snapshot['session_id'])
+
+    if parsed_run_id is None:
+        if work.disposition != WorkflowWorkDisposition.REQUIRED:
+            logger.info(
+                'distill_session_work_already_resolved',
+                work_id=str(work.id),
+                disposition=work.disposition,
+            )
+
+            return str(work.id)
+
+        legacy_run = _adopt_legacy_session_run(work)
+        if legacy_run is not None:
+            logger.info(
+                'distill_session_work_legacy_run_adopted',
+                work_id=str(work.id),
+                workflow_run_id=str(legacy_run.id),
+            )
+
+            return str(legacy_run.id)
+
     correlation_id = f'distill-session:{session_id}'
     request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
 
-    workflow_run, absorbed_result = _resolve_session_distill_run(
-        work,
-        explicit_run,
-        request_id=request_id,
-        correlation_id=correlation_id,
-    )
-    if absorbed_result is not None:
-        return absorbed_result
-
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        correlation_id=correlation_id,
-        request_id=request_id,
-    )
-    try:
-        result = DistillSession().execute(
-            DistillSessionInput(
-                session_id=session_id,
-                upper_sequence_inclusive=upper,
-                request_id=request_id,
-                correlation_id=correlation_id,
-                run_id=str(workflow_run.id),
-            ),
-        )
-        _finalize_session_distill_work(work, workflow_run, result)
-    except MemoryWorkerError as exc:
-        can_retry = exc.retryable and self.request.retries < self.max_retries
-        _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
-        if can_retry:
-            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
-            raise self.retry(exc=exc, countdown=countdown) from None
-        raise
-    except Exception as error:
-        _record_workflow_run_error(workflow_run, error, requeue=False)
-        raise
-    finally:
+    def execute(claim: object) -> str:
         structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(
+            correlation_id=correlation_id,
+            request_id=request_id,
+        )
+        try:
+            heartbeat_work(claim=claim, now=timezone.now(), lease_for=_SESSION_LEASE)
+            result = DistillSession().execute(
+                DistillSessionInput(
+                    session_id=session_id,
+                    upper_sequence_inclusive=upper,
+                    request_id=request_id,
+                    correlation_id=correlation_id,
+                    run_id=str(claim.workflow_run_id),
+                ),
+            )
+        finally:
+            structlog.contextvars.clear_contextvars()
 
-    return str(workflow_run.id)
+        _finish_session_claim(work, claim, result)
+
+        return str(claim.workflow_run_id)
+
+    return _run_fenced_automatic(
+        self,
+        work,
+        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_for=_SESSION_LEASE,
+        event_prefix='distill_session_work',
+        execute=execute,
+        workflow_run_id=parsed_run_id,
+    )
 
 
 @app.task(
@@ -722,32 +774,23 @@ def generate_daily_digest(
     return str(result.memory.id)
 
 
-def _run_digest_work(
-    task: object,
-    work: WorkflowWork,
-    workflow_run: WorkflowRun | None,
-    automatic_terminal: bool,
-) -> str:
+def _run_digest_explicit_delivery(task: object, work: WorkflowWork, workflow_run_id: uuid.UUID) -> str:
     from engram.memory.digest_work import execute_frozen_digest_work
 
-    if automatic_terminal:
-        return str(work.id)
-
-    if workflow_run is not None:
-        duplicate_via = 'load'
-        if workflow_run.status == WorkflowRunStatus.QUEUED:
-            workflow_run = _claim_workflow_run(work, workflow_run)
-            duplicate_via = 'claim_cas_loss'
-        if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-            return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
-        if workflow_run.status != WorkflowRunStatus.RUNNING:
-            raise MemoryWorkerError('workflow run claim returned invalid status')
+    workflow_run = _load_workflow_run(work, workflow_run_id, allow_succeeded=True)
+    duplicate_via = 'load'
+    if workflow_run.status == WorkflowRunStatus.QUEUED:
+        workflow_run = _claim_workflow_run(work, workflow_run)
+        duplicate_via = 'claim_cas_loss'
+    if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
+        return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
+    if workflow_run.status != WorkflowRunStatus.RUNNING:
+        raise MemoryWorkerError('workflow run claim returned invalid status')
 
     structlog.contextvars.clear_contextvars()
     try:
         result_memory_id = execute_frozen_digest_work(work, workflow_run)
-        if workflow_run is not None:
-            _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
+        _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
     except MemoryWorkerError as exc:
         can_retry = exc.retryable and task.request.retries < task.max_retries
         _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
@@ -761,7 +804,40 @@ def _run_digest_work(
     finally:
         structlog.contextvars.clear_contextvars()
 
-    return str(workflow_run.id if workflow_run is not None else work.id)
+    return str(workflow_run.id)
+
+
+def _run_digest_automatic_delivery(task: object, work: WorkflowWork, expected_work_type: str) -> str:
+    from engram.memory.digest_work import execute_frozen_digest_work
+
+    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+        logger.info(
+            'digest_work_already_resolved',
+            work_id=str(work.id),
+            disposition=work.disposition,
+        )
+
+        return str(work.id)
+
+    def execute(claim: object) -> str:
+        structlog.contextvars.clear_contextvars()
+        try:
+            if work.work_type == WorkflowWorkType.DAILY_DIGEST:
+                heartbeat_work(claim=claim, now=timezone.now(), lease_for=_DIGEST_LEASE)
+            execute_frozen_digest_work(work, None, claim)
+        finally:
+            structlog.contextvars.clear_contextvars()
+
+        return str(claim.workflow_run_id)
+
+    return _run_fenced_automatic(
+        task,
+        work,
+        work_type=expected_work_type,
+        lease_for=_DIGEST_LEASE,
+        event_prefix='digest_work',
+        execute=execute,
+    )
 
 
 @app.task(
@@ -770,20 +846,21 @@ def _run_digest_work(
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
+    soft_time_limit=_DIGEST_SOFT_TIME_LIMIT,
+    time_limit=_DIGEST_TIME_LIMIT,
 )
 def generate_daily_digest_work_v1(
     self: object,
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.DAILY_DIGEST,
-        allow_succeeded_run=True,
-    )
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.DAILY_DIGEST)
 
-    return _run_digest_work(self, work, workflow_run, automatic_terminal)
+    if parsed_run_id is not None:
+        return _run_digest_explicit_delivery(self, work, parsed_run_id)
+
+    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.DAILY_DIGEST)
 
 
 @app.task(
@@ -837,20 +914,21 @@ def generate_weekly_digest(
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
+    soft_time_limit=_DIGEST_SOFT_TIME_LIMIT,
+    time_limit=_DIGEST_TIME_LIMIT,
 )
 def generate_weekly_digest_work_v1(
     self: object,
     work_id: object,
     workflow_run_id: object = None,
 ) -> str:
-    work, workflow_run, automatic_terminal = _prepare_versioned_work(
-        work_id=work_id,
-        workflow_run_id=workflow_run_id,
-        expected_work_type=WorkflowWorkType.WEEKLY_DIGEST,
-        allow_succeeded_run=True,
-    )
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.WEEKLY_DIGEST)
 
-    return _run_digest_work(self, work, workflow_run, automatic_terminal)
+    if parsed_run_id is not None:
+        return _run_digest_explicit_delivery(self, work, parsed_run_id)
+
+    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.WEEKLY_DIGEST)
 
 
 @app.task(name='engram.memory.reembed_missing_embeddings')
