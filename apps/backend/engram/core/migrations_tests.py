@@ -2184,3 +2184,213 @@ def test_0035_creates_execution_indexes() -> None:
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
+
+
+MIGRATE_0036 = [('core', '0036_distillation_coverage')]
+MIGRATION_0036_NODE = ('core', '0036_distillation_coverage')
+
+_DISTILLATION_TABLES = (
+    'core_distillationwindow',
+    'core_distillationchunk',
+    'core_distillationstage',
+    'core_distillationobservationcoverage',
+    'core_memorycandidatesource',
+)
+
+_DISTILLATION_CONSTRAINTS = (
+    'core_distill_window_scope_hash_uniq',
+    'core_distill_window_bounds_ck',
+    'core_distill_window_obs_count_pos',
+    'core_distill_window_input_hash_hex',
+    'core_distill_window_contract_ck',
+    'core_distill_window_chunk_contract_ck',
+    'core_distill_chunk_window_ordinal_uniq',
+    'core_distill_chunk_window_hash_uniq',
+    'core_distill_chunk_sequence_bounds_ck',
+    'core_distill_chunk_obs_count_pos',
+    'core_distill_chunk_input_hash_hex',
+    'core_distill_stage_key_uniq',
+    'core_distill_stage_coord_uniq',
+    'core_distill_stage_extract_shape_ck',
+    'core_distill_stage_reduce_shape_ck',
+    'core_distill_stage_status_shape_ck',
+    'core_distill_coverage_window_obs_uniq',
+    'core_distill_coverage_window_seq_uniq',
+    'core_distill_coverage_digest_hex',
+    'core_distill_coverage_seq_pos',
+    'core_candidate_source_uniq',
+    'core_candidate_source_anchors_hex',
+    'core_memory_candidate_decision_ver_ck',
+)
+
+_DISTILLATION_INDEX_COLUMNS = {
+    'core_distillationwindow': '(organization_id, project_id, session_id, upper_sequence_inclusive)',
+    'core_distillationchunk': '(organization_id, project_id, window_id, ordinal)',
+    'core_memorycandidatesource': '(organization_id, project_id, candidate_id)',
+}
+
+
+def _pg_table_exists(table: str) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT to_regclass(%s)', [f'public.{table}'])
+        row = cursor.fetchone()
+
+    return row is not None and row[0] is not None
+
+
+def _pg_constraint_exists(name: str) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT 1 FROM pg_constraint WHERE conname = %s', [name])
+
+        return cursor.fetchone() is not None
+
+
+def _pg_index_exists(name: str) -> bool:
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT 1 FROM pg_indexes WHERE indexname = %s', [name])
+
+        return cursor.fetchone() is not None
+
+
+def _pg_column(table: str, column: str) -> tuple[str | None, str] | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT column_default, is_nullable
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+              AND column_name = %s
+            """,
+            [table, column],
+        )
+        row = cursor.fetchone()
+
+    return (row[0], row[1]) if row is not None else None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0036_depends_on_0035_and_creates_distillation_tables() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        migration = executor.loader.graph.nodes[MIGRATION_0036_NODE]
+
+        assert MIGRATION_0035_NODE in migration.dependencies
+        for table in _DISTILLATION_TABLES:
+            assert _pg_table_exists(table)
+        for name in _DISTILLATION_CONSTRAINTS:
+            assert _pg_constraint_exists(name)
+        assert _pg_index_exists('core_distill_stage_target_complete_uniq')
+        for table, columns in _DISTILLATION_INDEX_COLUMNS.items():
+            assert any(columns in definition for definition in _table_indexdefs(table))
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0036_adds_candidate_decision_contract_column_and_enum() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        column = _pg_column('core_memorycandidate', 'decision_work_contract_version')
+
+        assert column is not None
+        assert column[0] is not None and '0' in column[0]
+
+        new_apps = executor.loader.project_state(MIGRATE_0036).apps
+        work_model = new_apps.get_model('core', 'WorkflowWork')
+        work_type_choices = dict(work_model._meta.get_field('work_type').choices)
+        subject_choices = dict(work_model._meta.get_field('subject_type').choices)
+
+        assert 'candidate_decision' in work_type_choices
+        assert 'memory_candidate' in subject_choices
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0036_reverse_drops_tables_and_reapply_restores_them() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        assert all(_pg_table_exists(table) for table in _DISTILLATION_TABLES)
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0035)
+
+        assert not any(_pg_table_exists(table) for table in _DISTILLATION_TABLES)
+        assert _pg_column('core_memorycandidate', 'decision_work_contract_version') is None
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0036)
+
+        assert all(_pg_table_exists(table) for table in _DISTILLATION_TABLES)
+        assert _pg_column('core_memorycandidate', 'decision_work_contract_version') is not None
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0036_fresh_database_accepts_window_and_chunk_insert() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        new_apps = executor.loader.project_state(MIGRATE_0036).apps
+        scope = _create_historical_0032b_scope(new_apps)
+        session = _create_historical_session(new_apps, scope, 'window-fresh-session')
+        work = _create_historical_work(
+            new_apps,
+            scope,
+            disposition='required',
+            work_type='session_distillation',
+            subject_type='agent_session',
+            subject_id=session.id,
+        )
+        window_model = new_apps.get_model('core', 'DistillationWindow')
+        chunk_model = new_apps.get_model('core', 'DistillationChunk')
+
+        window = window_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            work=work,
+            session=session,
+            contract_version=1,
+            lower_sequence_exclusive=0,
+            upper_sequence_inclusive=1,
+            observation_count=1,
+            input_hash='a' * 64,
+            chunk_char_budget=8000,
+            reduction_target=12,
+            chunk_contract_version=1,
+        )
+        chunk_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            window=window,
+            ordinal=0,
+            first_sequence=1,
+            last_sequence=1,
+            observation_count=1,
+            input_manifest={'schema': 'distillation_chunk_manifest.v1', 'ordinal': 0, 'observations': []},
+            input_hash='b' * 64,
+        )
+
+        assert window_model.objects.filter(work=work).count() == 1
+        assert chunk_model.objects.filter(window=window).count() == 1
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
