@@ -78,7 +78,7 @@ from engram.memory.workflow_work import (
     resolve_work_succeeded,
 )
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 
 _OBS_LEASE = timedelta(seconds=120)
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
@@ -1771,3 +1771,93 @@ def test_stale_embedding_completion_is_discarded_without_vector_or_repromotion(
     work.refresh_from_db()
     assert work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
     assert WorkflowWork.objects.filter(subject_id=document.id, work_type='memory_embedding').count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedding_worker_calls_provider_outside_transaction_and_records_policy(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    from engram.memory import projections
+
+    memory = Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=f_team,
+        title='Worker embedding memory',
+        body='Worker embedding body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=f_org,
+        project=f_project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='d' * 64,
+    )
+    transition_id = uuid.uuid4()
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            document = projections.write_exact_memory_projection(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=[_embedding_source(version)],
+            )
+            work, _created = projections.create_embedding_work_and_signal(document=document)
+    _activate_v1_embedding_chain(
+        memory=memory,
+        version=version,
+        document=document,
+        work=work,
+        transition_id=transition_id,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=f_org,
+        team=f_team,
+        project=f_project,
+        name='embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=_provider_secret(f_org, f_team),
+        version=1,
+    )
+    embedding = [0.3, 0.4, *([0.0] * 1534)]
+
+    class RecordingGateway:
+        def embed(self, data: object) -> SimpleNamespace:
+            assert transaction.get_connection().in_atomic_block is False
+            assert data.policy.id == policy.id
+            record = ProviderCallRecord.objects.create(
+                organization=f_org,
+                project=f_project,
+                team=f_team,
+                policy=policy,
+                secret=policy.secret,
+                provider=policy.provider,
+                model=policy.model,
+                task_type=policy.task_type,
+                policy_version=policy.version,
+                request_id=data.request_id,
+                trace_id=data.trace_id,
+                redaction_state='redacted',
+                result=AuditResult.RECORDED,
+                metadata={'schema': 'embedding_call/v1'},
+            )
+            return SimpleNamespace(embedding=embedding, call_record_id=record.id)
+
+    with mock.patch('engram.model_policy.services.get_provider_gateway', return_value=RecordingGateway()):
+        tasks_module.embed_memory_projection_work_v1(str(work.id))
+
+    document.refresh_from_db()
+    work.refresh_from_db()
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.policy_id == policy.id
+    assert provider_call.task_type == 'embedding'
+    assert document.embedding_vector == embedding
+    assert document.embedding_projection_hash == document.exact_projection_hash
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert Memory.objects.filter(id=memory.id).count() == 1
