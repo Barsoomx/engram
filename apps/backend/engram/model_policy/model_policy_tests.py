@@ -916,6 +916,76 @@ def test_fake_provider_distill_extract_is_strict_deterministic_and_near_miss_saf
     }
 
 
+@pytest.mark.django_db
+def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_string_source_ids() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI Distill Reduce',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Distill reduce policy',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+    prompt = json.dumps(
+        {
+            'drafts': [
+                {'id': 'draft-b', 'title': 'B'},
+                {'id': 'draft-a', 'title': 'A'},
+                {'id': 'draft-b', 'title': 'duplicate'},
+                {'source_id': 'near-miss'},
+                {'id': 1},
+            ]
+        }
+    )
+    data = ProviderCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='distill-reduce:session-1',
+        trace_id='trace-distill-reduce-1',
+        prompt=prompt,
+        response_kind='distill_reduce.v1',
+    )
+
+    result = FakeProviderGateway().call(data)
+    replay = FakeProviderGateway().call(data)
+
+    payload = json.loads(result.generated_body)
+    assert set(payload) == {'memories'}
+    assert len(payload['memories']) == 1
+    memory = payload['memories'][0]
+    assert set(memory) == {'title', 'body', 'confidence', 'source_ids', 'kind'}
+    assert memory['source_ids'] == ['draft-b', 'draft-a']
+    assert all(isinstance(source_id, str) for source_id in memory['source_ids'])
+    assert replay.generated_body == result.generated_body
+    assert replay.call_record_id != result.call_record_id
+    assert ProviderCallRecord.objects.filter(request_id='distill-reduce:session-1').count() == 2
+
+
 def test_completion_body_passes_through_full_output_for_candidates_kind() -> None:
     pretty_json = json.dumps(
         [

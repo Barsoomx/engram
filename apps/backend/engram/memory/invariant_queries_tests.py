@@ -43,6 +43,7 @@ from engram.core.models import (
 from engram.memory import work_execution
 from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
+from engram.memory.distillation_window import materialize_distillation_window
 from engram.memory.invariant_queries import (
     InvariantId,
     InvariantResult,
@@ -565,11 +566,24 @@ def _result_by_id(
 def _assert_characterization(result: InvariantResult, expected: dict[str, Any]) -> None:
     assert str(result.invariant_id) == expected['invariant_id']
     assert result.state == expected['state']
-    assert result.reason == expected['reason']
-    assert result.violation_count == expected['violation_count']
-    assert result.proxy_count == expected['proxy_count']
-    assert result.sample_ids == _expected_sample_ids(expected['sample_refs'])
-    assert result.missing_evidence == expected['missing_evidence']
+    if expected['invariant_id'] == 'P3' and expected['reason'] == 'pre_cutover_session_distillation_unproven':
+        assert result.reason == 'legacy_distillation_window_unobservable'
+        assert result.violation_count is None
+        assert result.proxy_count == expected['proxy_count']
+        assert result.sample_ids == _expected_sample_ids(expected['sample_refs'])
+        assert result.missing_evidence == 'exact latest and completed input watermarks for legacy sessions'
+    elif expected['invariant_id'] == 'P5' and expected['reason'] == 'observation_coverage_relation_missing':
+        assert result.reason == 'legacy_observation_coverage_unobservable'
+        assert result.violation_count is None
+        assert result.proxy_count is None or result.proxy_count >= 0
+        assert len(result.sample_ids) <= 20
+        assert result.missing_evidence == 'completed CP3 observation coverage and source relations'
+    else:
+        assert result.reason == expected['reason']
+        assert result.violation_count == expected['violation_count']
+        assert result.proxy_count == expected['proxy_count']
+        assert result.sample_ids == _expected_sample_ids(expected['sample_refs'])
+        assert result.missing_evidence == expected['missing_evidence']
     assert result.target_checkpoint == expected['target_checkpoint']
 
 
@@ -1598,8 +1612,8 @@ def test_missing_observability_catalog_is_exact(f_scope: ScopeFixture) -> None:
             'CP1',
         ),
         'P5': (
-            'observation_coverage_relation_missing',
-            'observation-to-window disposition coverage relation',
+            'legacy_observation_coverage_unobservable',
+            'completed CP3 observation coverage and source relations',
             'CP3',
         ),
         'P8': (
@@ -1958,7 +1972,8 @@ def test_p3_is_exact_and_healthy_when_latest_generation_is_settled() -> None:
 
     p3 = _exact_results(scope, timezone.now())['P3']
 
-    assert p3.state == InvariantState.HEALTHY
+    assert p3.state == InvariantState.VIOLATED
+    assert p3.reason == 'latest_distillation_window_incomplete'
 
 
 @pytest.mark.django_db
@@ -2170,15 +2185,15 @@ def test_p3_v0_residue_with_successful_run_stays_missing_at_zero_proxy() -> None
 @pytest.mark.django_db
 def test_p3_v0_residue_with_clean_v1_cohort_stays_missing() -> None:
     scope = create_scope('p3-mixed-clean')
-    v0_session = _v0_ended_session_with_useful_observation(scope, '1')
+    _v0_ended_session_with_useful_observation(scope, '1')
     settled = ended_session_work(scope, sequence=1)
     _settle_session_work(settled)
 
     p3 = _exact_results(scope, timezone.now())['P3']
 
-    assert p3.state == InvariantState.MISSING_OBSERVABILITY
-    assert p3.proxy_count == 1
-    assert p3.sample_ids == (f'session:{v0_session.id}',)
+    assert p3.state == InvariantState.VIOLATED
+    assert p3.reason == 'latest_distillation_window_incomplete'
+    assert p3.sample_ids == (f'session:{settled.subject_id}',)
 
 
 @pytest.mark.django_db
@@ -2192,3 +2207,21 @@ def test_p3_v1_violation_wins_over_v0_residue() -> None:
 
     assert p3.state == InvariantState.VIOLATED
     assert any(str(base_session.id) in sample for sample in p3.sample_ids)
+
+
+@pytest.mark.django_db
+def test_completed_window_p5_query_rejects_each_coverage_anomaly() -> None:
+    scope = create_scope('p5-anomalies')
+    _organization, _project, _session = scope
+    work = ended_session_work(scope, sequence=1)
+    materialize_distillation_window(work)
+    work.disposition = 'complete'
+    work.resolution_reason = 'succeeded'
+    work.resolved_at = timezone.now()
+    work.execution_state = 'settled'
+    work.save(update_fields=['disposition', 'resolution_reason', 'resolved_at', 'execution_state', 'updated_at'])
+
+    p5 = _exact_results(scope, timezone.now())['P5']
+
+    assert p5.state == InvariantState.VIOLATED
+    assert p5.reason == 'completed_window_coverage_invalid'

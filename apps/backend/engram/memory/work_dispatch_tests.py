@@ -15,6 +15,7 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunOrigin,
     WorkflowRunStatus,
+    WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkType,
 )
@@ -27,6 +28,7 @@ from engram.memory.workflow_work_tests import (
 NOW = datetime(2026, 7, 12, 12, 0, 0, tzinfo=UTC)
 OBSERVATION_TASK = 'engram.memory.process_observation_work_v1'
 SESSION_TASK = 'engram.memory.distill_session_work_v1'
+CANDIDATE_TASK = 'engram.memory.process_candidate_decision_work_v1'
 
 
 def _wd() -> ModuleType:
@@ -90,6 +92,30 @@ def test_queue_work_attempt_uses_matching_versioned_task_for_session_work() -> N
 
     assert run.run_type == WorkflowWorkType.SESSION_DISTILLATION
     outbox = CeleryOutbox.objects.get(task_name=SESSION_TASK)
+    assert outbox.args == [str(work.id), str(run.id)]
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{run.id}'
+
+
+@pytest.mark.django_db
+def test_queue_work_attempt_uses_candidate_decision_task() -> None:
+    module = _wd()
+    organization, team, project, _agent, _session = create_scope('dispatch-candidate')
+    work = WorkflowWork.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+        subject_id=uuid.uuid4(),
+        contract_version=1,
+        input_fingerprint='f' * 64,
+        input_snapshot={'schema': 'candidate_decision_input/v1'},
+    )
+
+    run = module.queue_work_attempt(work_id=work.id, now=NOW, origin=WorkflowRunOrigin.AUTOMATIC)
+
+    assert run.run_type == WorkflowWorkType.CANDIDATE_DECISION
+    outbox = CeleryOutbox.objects.get(task_name=CANDIDATE_TASK)
     assert outbox.args == [str(work.id), str(run.id)]
     assert outbox.task_id == f'workflow-work:{work.id}:run:{run.id}'
 

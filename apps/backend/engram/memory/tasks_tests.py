@@ -15,6 +15,7 @@ from engram import celeryconfig
 from engram.core.models import (
     Agent,
     AgentSession,
+    MemoryCandidate,
     Observation,
     Organization,
     Project,
@@ -33,6 +34,7 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory import tasks as tasks_module
+from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
 from engram.memory.services import MemoryCandidateWorkerResult, MemoryWorkerError
@@ -46,6 +48,7 @@ from engram.memory.tasks import (
     process_observation_work_v1,
     retry_failed_distillations,
 )
+from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import (
     StaleWorkFenceError,
     claim_work,
@@ -83,6 +86,11 @@ _VERSIONED_WORK_TASKS = (
     (
         'distill_session_work_v1',
         'engram.memory.distill_session_work_v1',
+        celeryconfig.QUEUE_BATCH,
+    ),
+    (
+        'process_candidate_decision_work_v1',
+        'engram.memory.process_candidate_decision_work_v1',
         celeryconfig.QUEUE_BATCH,
     ),
     (
@@ -255,6 +263,56 @@ def create_observation(
         session_sequence=session_sequence,
         observed_at=timezone.now(),
     )
+
+
+@pytest.mark.django_db
+def test_candidate_decision_handler_blocks_unavailable_capability_without_semantic_mutation(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    candidate = MemoryCandidate.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=f_team,
+        title='Frozen candidate',
+        body='Frozen body',
+        evidence=[{'kind': 'frozen'}],
+        content_hash='a' * 64,
+        confidence='0.800',
+        kind='gotcha',
+    )
+    with transaction.atomic():
+        work, created = ensure_candidate_decision_work_locked(candidate, sources=[])
+    assert created is True
+    run = queue_work_attempt(work_id=work.id, now=timezone.now(), origin=WorkflowRunOrigin.AUTOMATIC)
+    semantic_before = (
+        candidate.status,
+        candidate.title,
+        candidate.body,
+        candidate.evidence,
+        candidate.promoted_memory_id,
+    )
+
+    task = tasks_module.process_candidate_decision_work_v1
+    task(str(work.id), str(run.id))
+
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert (
+        candidate.status,
+        candidate.title,
+        candidate.body,
+        candidate.evidence,
+        candidate.promoted_memory_id,
+    ) == semantic_before
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert work.blocked_configuration_fingerprint == execution_configuration_fingerprint(work)
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == CONFIGURATION
+    assert run.failure_code == 'candidate_decision_capability_unavailable'
 
 
 def frozen_input_digest(value: object) -> str:
@@ -857,7 +915,7 @@ def test_distill_session_work_no_op_returns_without_creating_run_or_calling_prov
     work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
     resolve_work_no_input(work.id, organization_id=work.organization_id, project_id=work.project_id)
 
-    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_run:
         result = tasks_module.distill_session_work_v1(str(work.id))
 
     m_run.assert_not_called()
@@ -866,7 +924,7 @@ def test_distill_session_work_no_op_returns_without_creating_run_or_calling_prov
 
 
 @pytest.mark.django_db
-def test_distill_session_work_automatic_delivery_does_not_retry_failed_initial_attempt(
+def test_distill_session_work_automatic_delivery_starts_v1_after_failed_legacy_attempt(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -888,13 +946,12 @@ def test_distill_session_work_automatic_delivery_does_not_retry_failed_initial_a
         finished_at=timezone.now(),
     )
 
-    with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_run:
         tasks_module.distill_session_work_v1(str(work.id))
 
-    m_run.assert_not_called()
-    assert WorkflowRun.objects.filter(work=work).count() == 1
-    work.refresh_from_db()
-    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    m_run.assert_called_once()
+    assert WorkflowRun.objects.filter(work=work).count() == 2
+    assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 1
 
 
 # CONVERTED from test_distill_session_work_succeeded_explicit_run_is_absorbed_on_redelivery.
@@ -919,7 +976,7 @@ def test_distill_session_work_v1_settled_work_is_absorbed_as_terminal_without_ex
     )
     WorkflowWork.objects.filter(id=work.id).update(execution_state=WorkflowWorkExecutionState.SETTLED)
 
-    with mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute:
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_execute:
         result = tasks_module.distill_session_work_v1(str(work.id))
 
     m_execute.assert_not_called()
@@ -945,7 +1002,7 @@ def test_distill_session_work_rejects_altered_snapshot_before_run_or_provider(
         },
     )
 
-    with mock.patch('engram.memory.tasks.DistillSession.execute') as m_execute:
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_execute:
         with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
             result = tasks_module.distill_session_work_v1(str(work.id))
 
