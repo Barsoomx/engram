@@ -27,6 +27,7 @@ def create_unembedded_document(
     *,
     sequence: int,
     stale: bool = False,
+    projection_contract_version: int = 0,
 ) -> RetrievalDocument:
     memory = Memory.objects.create(
         organization=organization,
@@ -56,6 +57,8 @@ def create_unembedded_document(
         visibility_scope=memory.visibility_scope,
         full_text=f'{memory.title}\n\n{memory.body}',
         stale=stale,
+        projection_contract_version=projection_contract_version,
+        exact_projection_hash='a' * 64 if projection_contract_version == 1 else '',
     )
 
 
@@ -112,6 +115,30 @@ def test_reembed_is_idempotent_once_embedded() -> None:
 
     assert first.embedded == 1
     assert second.scanned == 0
+
+
+@pytest.mark.django_db
+def test_reembed_excludes_v1_documents_before_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    create_unembedded_document(
+        organization,
+        team,
+        project,
+        sequence=5,
+        projection_contract_version=1,
+    )
+
+    def fail_if_called(_self: ReembedMissingEmbeddings, _document: RetrievalDocument) -> bool:
+        raise AssertionError('v1 projection must not be sent to the legacy provider')
+
+    monkeypatch.setattr(ReembedMissingEmbeddings, '_embed', fail_if_called)
+
+    result = ReembedMissingEmbeddings().execute()
+
+    assert result.scanned == 0
+    assert result.embedded == 0
+    assert result.failed == 0
 
 
 def test_reembed_beat_schedule_is_registered() -> None:

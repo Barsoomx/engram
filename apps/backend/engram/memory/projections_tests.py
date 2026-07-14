@@ -119,6 +119,35 @@ def test_exact_projection_is_deterministic_and_provider_free() -> None:
     assert 'provider' not in first.document_values
 
 
+def test_current_projection_requires_its_transition_to_be_loadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _projection_module()
+    memory_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    exact_hash = 'a' * 64
+    memory = SimpleNamespace(
+        id=memory_id,
+        transition_contract_version=1,
+        current_transition_id=uuid.uuid4(),
+        current_version=1,
+        stale=False,
+        refuted=False,
+    )
+    document = SimpleNamespace(
+        id=uuid.uuid4(),
+        memory_id=memory_id,
+        memory_version_id=version_id,
+        memory_version=SimpleNamespace(version=1),
+        exact_projection_hash=exact_hash,
+        stale=False,
+    )
+    version = SimpleNamespace(id=version_id, memory_id=memory_id, version=1, body='body')
+    memory.body = 'body'
+    work = SimpleNamespace(id=uuid.uuid4())
+    monkeypatch.setattr(module, '_load_current_transition', lambda *_args: None)
+
+    assert module._projection_is_current(document, memory, version, exact_hash, work) is False
+
+
 @pytest.mark.parametrize(
     'changes',
     [

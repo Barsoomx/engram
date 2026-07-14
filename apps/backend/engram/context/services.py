@@ -462,13 +462,23 @@ def _document_embedding_vectors(
     return vectors
 
 
+def _embedding_projection_is_current(document: RetrievalDocument) -> bool:
+    return document.projection_contract_version == 0 or (
+        bool(document.exact_projection_hash) and document.embedding_projection_hash == document.exact_projection_hash
+    )
+
+
 def _semantic_retrieval_matches_python(
     documents: tuple[RetrievalDocument, ...],
     exact_matches: list[RetrievalMatch],
     query_vector: list[float],
 ) -> list[RetrievalMatch]:
     already_matched = {match.document.id for match in exact_matches}
-    candidates = tuple(document for document in documents if document.id not in already_matched)
+    candidates = tuple(
+        document
+        for document in documents
+        if document.id not in already_matched and _embedding_projection_is_current(document)
+    )
     vectors = _document_embedding_vectors(candidates)
     scored: list[tuple[float, RetrievalMatch]] = []
     for document in candidates:
@@ -500,7 +510,11 @@ def semantic_retrieval_matches_pgvector(
     query_vector: list[float],
 ) -> list[RetrievalMatch]:
     already_matched = {match.document.id for match in exact_matches}
-    remaining = tuple(document for document in documents if document.id not in already_matched)
+    remaining = tuple(
+        document
+        for document in documents
+        if document.id not in already_matched and _embedding_projection_is_current(document)
+    )
     if not remaining:
         return []
 
@@ -944,7 +958,12 @@ class ReembedMissingEmbeddings:
 
         documents = list(
             RetrievalDocument.objects.select_related('memory')
-            .filter(embedding_pgvector__isnull=True, stale=False, refuted=False)
+            .filter(
+                embedding_pgvector__isnull=True,
+                projection_contract_version=0,
+                stale=False,
+                refuted=False,
+            )
             .order_by('updated_at')[: max(1, batch_size)],
         )
         embedded = 0

@@ -9,23 +9,26 @@ from django.db import transaction
 from django.db.transaction import TransactionManagementError
 from django.utils import timezone
 
-from engram.core.models import Memory, MemoryVersion, RetrievalDocument
+from engram.core.models import (
+    Memory,
+    MemoryTransition,
+    MemoryVersion,
+    MemoryVersionSource,
+    RetrievalDocument,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkResolutionReason,
+    WorkflowWorkType,
+)
+from engram.memory.work_dispatch import queue_work_attempt
+from engram.memory.work_execution import WorkClaim, finish_work_claim, lock_work_fence
+from engram.memory.workflow_work import CreateWorkflowWorkInput, canonical_json_bytes, create_work
 
 
 @dataclass(frozen=True, slots=True)
 class ExactMemoryProjection:
     document_values: dict[str, object]
     exact_projection_hash: str
-
-
-def _attr(obj: object, name: str, default: object = None) -> object:
-    value = getattr(obj, name, default)
-    if value is not None:
-        return value
-    metadata = getattr(obj, 'metadata', None) or getattr(obj, 'source_metadata', None)
-    if isinstance(metadata, dict):
-        return metadata.get(name, default)
-    return default
 
 
 def _canonical(value: object) -> object:
@@ -43,46 +46,55 @@ def _canonical(value: object) -> object:
 
 
 def _json_bytes(value: object) -> bytes:
-    from engram.memory.workflow_work import canonical_json_bytes
-
     return canonical_json_bytes(_canonical(value))
 
 
 def build_exact_memory_projection(
-    *, memory: object, version: object, transition_id: uuid.UUID, sources: list[object] | tuple[object, ...]
+    *,
+    memory: Memory,
+    version: MemoryVersion,
+    transition_id: uuid.UUID,
+    sources: list[MemoryVersionSource] | tuple[MemoryVersionSource, ...],
 ) -> ExactMemoryProjection:
-    file_paths = _attr(version, 'file_paths', _attr(memory, 'file_paths', [])) or []
-    symbols = _attr(version, 'symbols', _attr(memory, 'symbols', [])) or []
-    exact_terms = _attr(version, 'exact_terms', _attr(memory, 'exact_terms', [])) or []
-    source_observation_ids = _attr(version, 'source_observation_ids', _attr(memory, 'source_observation_ids', [])) or []
-    title = _attr(version, 'title', _attr(memory, 'title', '')) or ''
-    body = _attr(version, 'body', _attr(memory, 'body', '')) or ''
-    full_text = _attr(version, 'full_text', _attr(memory, 'full_text', '')) or f'{title}\n{body}'.strip()
-    visibility = _attr(memory, 'visibility_scope', 'project')
+    memory_metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
+    version_metadata = version.source_metadata if isinstance(version.source_metadata, dict) else {}
+
+    def metadata_value(name: str, default: object) -> object:
+        if name in version_metadata:
+            return version_metadata[name]
+        return memory_metadata.get(name, default)
+
+    title = memory.title
+    body = version.body
+    file_paths = metadata_value('file_paths', []) or []
+    symbols = metadata_value('symbols', []) or []
+    exact_terms = metadata_value('exact_terms', []) or []
+    source_observation_ids = metadata_value('source_observation_ids', []) or []
+    full_text = metadata_value('full_text', '') or f'{title}\n\n{body}'.strip()
     source_values = [
         {
-            'id': _attr(source, 'id'),
-            'source_kind': _attr(source, 'source_kind', _attr(source, 'source_type', _attr(source, 'kind', ''))),
-            'source_content_hash': _attr(source, 'source_content_hash', _attr(source, 'content_hash', '')),
-            'candidate_source_id': _attr(source, 'candidate_source_id'),
-            'source_memory_version_id': _attr(source, 'source_memory_version_id', _attr(source, 'memory_version_id')),
+            'id': source.id,
+            'source_kind': 'candidate_source' if source.candidate_source_id is not None else 'memory_version',
+            'source_content_hash': source.source_content_hash,
+            'candidate_source_id': source.candidate_source_id,
+            'source_memory_version_id': source.source_memory_version_id,
         }
         for source in sources
     ]
     document_values = {
-        'organization_id': _attr(memory, 'organization_id'),
-        'project_id': _attr(memory, 'project_id'),
-        'team_id': _attr(memory, 'team_id'),
-        'memory_id': _attr(memory, 'id'),
-        'memory_version_id': _attr(version, 'id'),
+        'organization_id': memory.organization_id,
+        'project_id': memory.project_id,
+        'team_id': memory.team_id,
+        'memory_id': memory.id,
+        'memory_version_id': version.id,
         'transition_id': transition_id,
-        'content_hash': _attr(version, 'content_hash', ''),
+        'content_hash': version.content_hash,
         'title': title,
         'body': body,
-        'visibility_scope': visibility,
-        'status': _attr(memory, 'status', ''),
-        'stale': bool(_attr(memory, 'stale', False)),
-        'refuted': bool(_attr(memory, 'refuted', False)),
+        'visibility_scope': memory.visibility_scope,
+        'status': memory.status,
+        'stale': memory.stale,
+        'refuted': memory.refuted,
         'file_paths': file_paths,
         'symbols': symbols,
         'exact_terms': exact_terms,
@@ -90,25 +102,28 @@ def build_exact_memory_projection(
         'full_text': full_text,
         'sources': source_values,
     }
-    exact_hash = hashlib.sha256(_json_bytes(document_values)).hexdigest()
+    canonical_values = _canonical(document_values)
+    if not isinstance(canonical_values, dict):
+        raise TypeError('exact projection values must be a mapping')
+    exact_hash = hashlib.sha256(_json_bytes(canonical_values)).hexdigest()
 
-    return ExactMemoryProjection(document_values=document_values, exact_projection_hash=exact_hash)
+    return ExactMemoryProjection(document_values=canonical_values, exact_projection_hash=exact_hash)
 
 
-def _require_scope(memory: object, version: object) -> None:
-    fields = ('organization_id', 'project_id', 'team_id')
-    for field in fields:
-        version_value = getattr(version, field, None)
-        if field == 'team_id' and not hasattr(version, field):
-            continue
-        if getattr(memory, field, None) != version_value:
+def _require_scope(memory: Memory, version: MemoryVersion) -> None:
+    for field in ('organization_id', 'project_id'):
+        if getattr(memory, field) != getattr(version, field):
             raise ValueError(f'memory version scope mismatch: {field}')
-    if getattr(version, 'memory_id', None) != getattr(memory, 'id', None):
+    if version.memory_id != memory.id:
         raise ValueError('memory version does not belong to memory scope')
 
 
 def write_exact_memory_projection(
-    *, memory: Memory, version: MemoryVersion, transition_id: uuid.UUID, sources: list[object] | tuple[object, ...]
+    *,
+    memory: Memory,
+    version: MemoryVersion,
+    transition_id: uuid.UUID,
+    sources: list[MemoryVersionSource] | tuple[MemoryVersionSource, ...],
 ) -> RetrievalDocument:
     if not transaction.get_connection().in_atomic_block:
         raise TransactionManagementError('exact projection writer requires an active transaction')
@@ -130,8 +145,6 @@ def write_exact_memory_projection(
             memory_id=memory.id,
             memory_version_id=version.id,
         )
-    else:
-        RetrievalDocument.objects.filter(memory_id=memory.id).exclude(id=document.id).update(stale=True)
     document.organization_id = memory.organization_id
     document.project_id = memory.project_id
     document.team_id = memory.team_id
@@ -145,30 +158,21 @@ def write_exact_memory_projection(
     document.full_text = values['full_text']
     document.stale = False
     document.refuted = bool(values['refuted'])
-    document.metadata = {'projection': _canonical(values)}
-    if hasattr(document, 'projection_contract_version'):
-        document.projection_contract_version = 1
-    if hasattr(document, 'exact_projection_hash'):
-        document.exact_projection_hash = projection.exact_projection_hash
-    for field, empty in (
-        ('embedding_reference', ''),
-        ('embedding_vector', []),
-        ('embedding_pgvector', None),
-        ('embedding_projection_hash', ''),
-        ('embedding_projected_at', None),
-    ):
-        if hasattr(document, field):
-            setattr(document, field, empty)
+    document.metadata = {'projection': values}
+    document.projection_contract_version = 1
+    document.exact_projection_hash = projection.exact_projection_hash
+    document.embedding_reference = ''
+    document.embedding_vector = []
+    document.embedding_pgvector = None
+    document.embedding_projection_hash = ''
+    document.embedding_projected_at = None
     document.save()
     RetrievalDocument.objects.filter(memory_id=memory.id).exclude(id=document.id).update(stale=True)
 
     return document
 
 
-def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[object, bool]:
-    from engram.memory.work_dispatch import queue_work_attempt
-    from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work
-
+def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[WorkflowWork, bool]:
     snapshot = {
         'schema': 'memory_embedding/v1',
         'retrieval_document_id': str(document.id),
@@ -191,104 +195,123 @@ def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[ob
     return work, created
 
 
-def _load_current_transition(memory: Memory, transition_id: object) -> object | None:
-    try:
-        from engram.core.models import MemoryTransition
-
-        return MemoryTransition.objects.filter(id=transition_id, memory_id=memory.id).first()
-    except (ImportError, AttributeError):
-        return None
+def _load_current_transition(memory: Memory, transition_id: uuid.UUID) -> MemoryTransition | None:
+    return MemoryTransition.objects.filter(id=transition_id, memory_id=memory.id).first()
 
 
-def _transition_matches_projection(transition: object, document: RetrievalDocument, version_id: uuid.UUID) -> bool:
-    document_ids = {
-        getattr(transition, 'result_exact_document_id', None),
-        getattr(transition, 'exact_document_id', None),
-    }
-    version_ids = {
-        getattr(transition, 'result_version_id', None),
-        getattr(transition, 'to_version_id', None),
-    }
-    document_ids.discard(None)
-    version_ids.discard(None)
-    if document_ids and document.id not in document_ids:
-        return False
-    if version_ids and version_id not in version_ids:
-        return False
-    return True
+def _transition_matches_projection(
+    transition: MemoryTransition,
+    document: RetrievalDocument,
+    version: MemoryVersion,
+    work: WorkflowWork,
+) -> bool:
+    return all(
+        (
+            transition.organization_id == document.organization_id,
+            transition.project_id == document.project_id,
+            transition.team_id == document.team_id,
+            transition.memory_id == document.memory_id,
+            transition.result_memory_id == document.memory_id,
+            transition.to_version_id == version.id,
+            transition.result_version_id == version.id,
+            transition.exact_document_id == document.id,
+            transition.result_exact_document_id == document.id,
+            transition.embedding_work_id == work.id,
+        )
+    )
 
 
-def _memory_version_matches_projection(memory: Memory, document: RetrievalDocument, version_id: uuid.UUID) -> bool:
-    if getattr(memory, 'current_version_id', None) not in (None, version_id):
-        return False
-    current_version = getattr(memory, 'current_version', None)
-    if current_version is None:
-        return True
-    try:
-        return int(current_version) == int(document.memory_version.version)
-    except (AttributeError, TypeError, ValueError):
-        return True
+def _memory_version_matches_projection(memory: Memory, version: MemoryVersion) -> bool:
+    return version.memory_id == memory.id and version.version == memory.current_version and version.body == memory.body
 
 
 def _projection_is_current(
-    document: RetrievalDocument, memory: Memory, version_id: uuid.UUID, expected_hash: str
+    document: RetrievalDocument,
+    memory: Memory,
+    version: MemoryVersion,
+    expected_hash: str,
+    work: WorkflowWork,
 ) -> bool:
-    if getattr(document, 'exact_projection_hash', '') != expected_hash:
+    if document.exact_projection_hash != expected_hash:
         return False
-    if document.memory_id != memory.id or document.memory_version_id != version_id or document.stale:
+    if document.memory_id != memory.id or document.memory_version_id != version.id or document.stale:
         return False
-    if getattr(memory, 'transition_contract_version', 0) != 1:
+    if memory.transition_contract_version != 1:
         return False
-    transition_id = getattr(memory, 'current_transition_id', None)
+    transition_id = memory.current_transition_id
     if transition_id is None:
         return False
     transition = _load_current_transition(memory, transition_id)
-    if transition is not None and not _transition_matches_projection(transition, document, version_id):
+    if transition is None or not _transition_matches_projection(transition, document, version, work):
         return False
-    if not _memory_version_matches_projection(memory, document, version_id):
+    if not _memory_version_matches_projection(memory, version):
         return False
-    return not bool(getattr(memory, 'stale', False) or getattr(memory, 'refuted', False))
+    return not (memory.stale or memory.refuted)
+
+
+def _snapshot_uuid(work: WorkflowWork, key: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(work.input_snapshot[key]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
+def _finish_projection_superseded(*, claim: WorkClaim, now: datetime) -> None:
+    finish_work_claim(
+        claim=claim,
+        now=now,
+        completion='product_no_signal',
+        resolution_reason=WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
 
 
 def complete_embedding_projection(
     *,
-    claim: object,
+    claim: WorkClaim,
     expected_projection_hash: str,
     embedding: list[float] | tuple[float, ...],
     provider_call_id: uuid.UUID,
     now: datetime,
 ) -> RetrievalDocument | None:
-    from engram.memory.work_execution import finish_work_claim, lock_work_fence
-
     with transaction.atomic():
         work, _run = lock_work_fence(claim=claim, now=now)
-        try:
-            document = (
-                RetrievalDocument.objects.select_for_update()
-                .select_related('memory', 'memory_version')
-                .get(
-                    id=work.subject_id,
-                )
-            )
-        except RetrievalDocument.DoesNotExist:
-            finish_work_claim(claim=claim, now=now, completion='product_no_signal')
-            return None
-        memory = Memory.objects.select_for_update().get(id=document.memory_id)
-        snapshot_hash = work.input_snapshot.get('exact_projection_hash')
-        expected_version = uuid.UUID(str(work.input_snapshot.get('memory_version_id')))
-        if snapshot_hash != expected_projection_hash or not _projection_is_current(
-            document, memory, expected_version, expected_projection_hash
+        snapshot_document_id = _snapshot_uuid(work, 'retrieval_document_id')
+        snapshot_memory_id = _snapshot_uuid(work, 'memory_id')
+        snapshot_version_id = _snapshot_uuid(work, 'memory_version_id')
+        if (
+            work.work_type != WorkflowWorkType.MEMORY_EMBEDDING
+            or work.subject_type != WorkflowSubjectType.RETRIEVAL_DOCUMENT
+            or snapshot_document_id != work.subject_id
+            or snapshot_memory_id is None
+            or snapshot_version_id is None
         ):
-            finish_work_claim(claim=claim, now=now, completion='product_no_signal')
+            _finish_projection_superseded(claim=claim, now=now)
+            return None
+        try:
+            memory = Memory.objects.select_for_update().get(id=snapshot_memory_id)
+            version = MemoryVersion.objects.select_for_update().get(
+                id=snapshot_version_id,
+                memory_id=memory.id,
+            )
+            document = RetrievalDocument.objects.select_for_update(of=('self',)).get(id=work.subject_id)
+        except (Memory.DoesNotExist, MemoryVersion.DoesNotExist, RetrievalDocument.DoesNotExist):
+            _finish_projection_superseded(claim=claim, now=now)
+            return None
+        snapshot_hash = work.input_snapshot.get('exact_projection_hash')
+        if snapshot_hash != expected_projection_hash or not _projection_is_current(
+            document,
+            memory,
+            version,
+            expected_projection_hash,
+            work,
+        ):
+            _finish_projection_superseded(claim=claim, now=now)
             return None
         document.embedding_vector = list(embedding)
-        if hasattr(document, 'embedding_pgvector'):
-            document.embedding_pgvector = list(embedding)
+        document.embedding_pgvector = list(embedding)
         document.embedding_reference = f'provider:{provider_call_id}'
-        if hasattr(document, 'embedding_projection_hash'):
-            document.embedding_projection_hash = expected_projection_hash
-        if hasattr(document, 'embedding_projected_at'):
-            document.embedding_projected_at = now
+        document.embedding_projection_hash = expected_projection_hash
+        document.embedding_projected_at = now
         document.save()
         finish_work_claim(
             claim=claim,

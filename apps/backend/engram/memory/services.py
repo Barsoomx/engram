@@ -6,6 +6,7 @@ import os
 import uuid
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 import structlog
 from django.conf import settings
@@ -58,6 +59,9 @@ from engram.model_policy.services import (
 )
 
 logger = structlog.get_logger(__name__)
+
+if TYPE_CHECKING:
+    from engram.memory.work_execution import WorkClaim
 
 _ProviderGateway = FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway
 
@@ -156,6 +160,14 @@ class GeneratedMemoryCandidate:
 class PromoteMemoryCandidateInput:
     candidate_id: uuid.UUID
     defer_embedding: bool = False
+    actor_type: str = 'memory_worker'
+    actor_id: str = 'memory-worker'
+    capability: str = 'memories:write'
+    request_id: str = ''
+    correlation_id: str = ''
+    reason: str = 'candidate promotion'
+    origin: str = 'memory-worker'
+    work_claim: WorkClaim | None = None
 
 
 @dataclass(frozen=True)
@@ -719,19 +731,20 @@ class PromoteMemoryCandidate:
                             team_id=candidate.team_id,
                         ),
                         idempotency_key=f'candidate:{candidate.id}:settle:v1',
-                        actor_type='memory_worker',
-                        actor_id='memory-worker',
-                        capability='memories:write',
-                        request_id=f'legacy-promotion:{candidate.id}',
-                        correlation_id=f'legacy-promotion:{candidate.id}',
-                        reason='candidate promotion',
-                        origin='memory-worker',
+                        actor_type=data.actor_type,
+                        actor_id=data.actor_id,
+                        capability=data.capability,
+                        request_id=data.request_id or f'legacy-promotion:{candidate.id}',
+                        correlation_id=data.correlation_id or f'legacy-promotion:{candidate.id}',
+                        reason=data.reason,
+                        origin=data.origin,
                     ),
                     candidate_fence=CandidateFence(
                         candidate_id=candidate.id,
                         candidate_content_hash=candidate.content_hash,
                         evidence_manifest_hash=manifest_hash,
                     ),
+                    work_claim=data.work_claim,
                 ),
             )
             candidate.refresh_from_db()

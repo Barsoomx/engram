@@ -563,7 +563,7 @@ def approve_memory_candidate(
             'only proposed candidates can be approved',
         )
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=candidate,
@@ -571,7 +571,23 @@ def approve_memory_candidate(
         reason=reason,
     )
 
-    memory = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id)).memory
+    operation_id = f'console-memory-review:{review_example.id}'
+    memory = (
+        PromoteMemoryCandidate()
+        .execute(
+            PromoteMemoryCandidateInput(
+                candidate_id=candidate.id,
+                actor_type='user',
+                actor_id=str(actor_identity.id),
+                capability='memories:review',
+                request_id=operation_id,
+                correlation_id=operation_id,
+                reason=reason,
+                origin='console',
+            )
+        )
+        .memory
+    )
 
     audit_admin_action(
         organization=organization,

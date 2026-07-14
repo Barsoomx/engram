@@ -5,11 +5,13 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
 import pytest
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, transaction
+from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
@@ -20,13 +22,22 @@ from engram.core.models import (
     Observation,
     RetrievalDocument,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
     WorkflowWork,
+    WorkflowWorkExecutionState,
+    WorkflowWorkType,
 )
-from engram.memory.candidate_decision_work import evidence_manifest
-from engram.memory.distillation_provenance import candidate_source_anchors, canonical_source_manifest
+from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked, evidence_manifest
+from engram.memory.distillation_provenance import (
+    candidate_source_anchors,
+    canonical_source_manifest,
+    session_candidate_content_hash,
+)
 from engram.memory.distillation_window import materialize_distillation_window
 from engram.memory.observation_work_tests import create_scope
 from engram.memory.reconciler_test_support import ended_session_work
+from engram.memory.work_execution import StaleWorkFenceError, claim_work
 from engram.memory.workflow_work import observation_content_digest
 
 
@@ -52,17 +63,19 @@ def _provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, 
 
     stage, _primary = _make_stage_history((organization, project, session), window)
     observation = Observation.objects.get(session=session, session_sequence=1)
+    title = f'Promotion candidate {suffix}'
+    body = f'Promotion body {suffix}'
     candidate = MemoryCandidate.objects.create(
         organization=organization,
         project=project,
         team=session.team,
         source_observation=observation,
-        title=f'Promotion candidate {suffix}',
-        body=f'Promotion body {suffix}',
+        title=title,
+        body=body,
         status=CandidateStatus.PROPOSED,
         visibility_scope=VisibilityScope.PROJECT,
         evidence=[{'observation_id': str(observation.id)}],
-        content_hash='a' * 64,
+        content_hash=session_candidate_content_hash(session.id, title, body),
         confidence=Decimal('0.900'),
         decision_work_contract_version=1,
     )
@@ -232,6 +245,68 @@ def test_replay_is_idempotent_and_collision_or_stale_fence_writes_nothing() -> N
 
 
 @pytest.mark.django_db
+def test_locked_candidate_content_is_recomputed_before_promotion_writes() -> None:
+    candidate, _source, _scope = _provenanced_candidate('content-recompute')
+    payload = _request(candidate)
+    MemoryCandidate.objects.filter(id=candidate.id).update(body='mutated without refreshing the stored hash')
+    before = _counts(candidate)
+
+    with pytest.raises(Exception, match='stale_decision'):
+        _transitions().PromoteMemoryCandidate().execute(payload)
+
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert _counts(candidate) == before
+
+
+def _claim_candidate_decision_work(candidate: MemoryCandidate) -> tuple[WorkflowWork, Any]:
+    with transaction.atomic():
+        locked = MemoryCandidate.objects.select_for_update().get(id=candidate.id)
+        work, _created = ensure_candidate_decision_work_locked(locked)
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_owner=f'transition-test:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=5),
+    )
+    assert claimed.claim is not None
+    return work, claimed.claim
+
+
+@pytest.mark.django_db
+def test_promotion_rejects_stale_owning_work_claim_before_semantic_writes() -> None:
+    candidate, _source, _scope = _provenanced_candidate('stale-work-claim')
+    _work, claim = _claim_candidate_decision_work(candidate)
+    payload = replace(_request(candidate), work_claim=replace(claim, fencing_token=claim.fencing_token + 1))
+    before = _counts(candidate)
+
+    with pytest.raises(StaleWorkFenceError):
+        _transitions().PromoteMemoryCandidate().execute(payload)
+
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert _counts(candidate) == before
+
+
+@pytest.mark.django_db
+def test_promotion_finishes_owning_work_claim_in_the_semantic_transaction() -> None:
+    candidate, _source, _scope = _provenanced_candidate('valid-work-claim')
+    work, claim = _claim_candidate_decision_work(candidate)
+
+    result = _transitions().PromoteMemoryCandidate().execute(replace(_request(candidate), work_claim=claim))
+
+    work.refresh_from_db()
+    run = WorkflowRun.objects.get(id=claim.workflow_run_id)
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.result_memory_id == result.memory.id
+
+
+@pytest.mark.django_db
 def test_foreign_scope_is_rejected_before_semantic_or_package_writes() -> None:
     candidate, _source, _scope = _provenanced_candidate('foreign-target')
     foreign_candidate, _foreign_source, _foreign_scope = _provenanced_candidate('foreign-request')
@@ -262,6 +337,11 @@ def test_source_committed_before_request_is_copied_into_version_provenance() -> 
 
     version_source = _model('MemoryVersionSource').objects.get(memory_version_id=result.memory_version.id)
     assert version_source.candidate_source_id == source.id
+    assert result.transition.audit_event.metadata['exact_document_id'] == str(result.retrieval_document.id)
+    assert (
+        result.transition.audit_event.metadata['exact_projection_hash']
+        == result.retrieval_document.exact_projection_hash
+    )
 
 
 @pytest.mark.django_db

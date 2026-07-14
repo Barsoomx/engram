@@ -195,6 +195,13 @@ def test_embedding_projection_worker_is_registered_on_batch_queue() -> None:
     assert celeryconfig.task_routes[task_name]['queue'] == celeryconfig.QUEUE_BATCH
 
 
+def test_embedding_projection_worker_uses_explicit_embedding_time_limits() -> None:
+    task = tasks_module.embed_memory_projection_work_v1
+
+    assert task.soft_time_limit == tasks_module._EMBEDDING_SOFT_TIME_LIMIT == 180
+    assert task.time_limit == tasks_module._EMBEDDING_TIME_LIMIT == 210
+
+
 def test_embedding_work_uses_embedding_policy_task_type_for_configuration_scope() -> None:
     from engram.memory import work_execution
 
@@ -1769,7 +1776,7 @@ def test_stale_embedding_completion_is_discarded_without_vector_or_repromotion(
     assert document.embedding_vector == []
     assert document.embedding_projection_hash == ''
     work.refresh_from_db()
-    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+    assert work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
     assert WorkflowWork.objects.filter(subject_id=document.id, work_type='memory_embedding').count() == 1
 
 

@@ -126,6 +126,24 @@ def settle_work(module: ModuleType, work: WorkflowWork) -> None:
 
 
 @pytest.mark.django_db
+def test_product_no_signal_can_persist_projection_superseded_reason() -> None:
+    module = _we()
+    scope = create_scope('projection-superseded-reason')
+    work = create_required_work(scope, suffix='projection-superseded-reason')
+    claimed = claim(module, work, lease_owner=owner('projection'), now=NOW)
+
+    module.finish_work_claim(
+        claim=claimed.claim,
+        now=NOW,
+        completion='product_no_signal',
+        resolution_reason=WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
+
+    stored = get_work(work)
+    assert stored.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
+
+
+@pytest.mark.django_db
 def test_automatic_claim_creates_v1_run_and_leases_both_rows() -> None:
     module = _we()
     scope = create_scope('claim-automatic')

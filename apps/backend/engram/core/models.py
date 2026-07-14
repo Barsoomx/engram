@@ -812,6 +812,7 @@ def retrieval_embedding_state_constraint() -> models.Q:
         embedding_projection_hash__regex=r'^[0-9a-f]{64}$',
         embedding_projected_at__isnull=False,
         embedding_reference__gt='',
+        embedding_projection_hash=models.F('exact_projection_hash'),
     ) & ~models.Q(embedding_vector=[])
     if VectorField is not None:
         empty &= models.Q(embedding_pgvector__isnull=True)
@@ -1160,6 +1161,7 @@ class WorkflowWorkDisposition(models.TextChoices):
 class WorkflowWorkResolutionReason(models.TextChoices):
     SUCCEEDED = 'succeeded', 'Succeeded'
     NO_SIGNAL = 'no_signal', 'No signal'
+    PROJECTION_SUPERSEDED = 'projection_superseded', 'Projection superseded'
     NO_INPUT = 'no_input', 'No input'
 
 
@@ -1326,6 +1328,7 @@ class WorkflowWork(TimestampedModel):
                         resolution_reason__in=(
                             WorkflowWorkResolutionReason.SUCCEEDED,
                             WorkflowWorkResolutionReason.NO_SIGNAL,
+                            WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
                         ),
                         resolved_at__isnull=False,
                     )

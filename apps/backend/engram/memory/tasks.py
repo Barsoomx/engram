@@ -75,6 +75,8 @@ _DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600
 _DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
 _DIGEST_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_SOFT_TIME_LIMIT', '180'))
 _DIGEST_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_TIME_LIMIT', '210'))
+_EMBEDDING_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_SOFT_TIME_LIMIT', '180'))
+_EMBEDDING_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_TIME_LIMIT', '210'))
 
 _OBSERVATION_LEASE = timedelta(seconds=120)
 _SESSION_LEASE = timedelta(seconds=720)
@@ -444,7 +446,7 @@ def _load_session_work_upper(work: WorkflowWork) -> int:
 
 
 def _load_embedding_work_document(work: WorkflowWork) -> RetrievalDocument:
-    if work.subject_type != 'retrieval_document':
+    if work.subject_type != WorkflowSubjectType.RETRIEVAL_DOCUMENT:
         raise MemoryWorkerError(
             'workflow work subject type does not match embedding task', code='work_contract_invalid'
         )
@@ -690,8 +692,8 @@ def process_candidate_decision_work_v1(
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
-    soft_time_limit=_DIGEST_SOFT_TIME_LIMIT,
-    time_limit=_DIGEST_TIME_LIMIT,
+    soft_time_limit=_EMBEDDING_SOFT_TIME_LIMIT,
+    time_limit=_EMBEDDING_TIME_LIMIT,
 )
 def embed_memory_projection_work_v1(
     self: object,
@@ -707,7 +709,7 @@ def embed_memory_projection_work_v1(
     )
 
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
-    work = _load_versioned_work(parsed_work_id, 'memory_embedding')
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.MEMORY_EMBEDDING)
     document = _load_embedding_work_document(work)
 
     def execute(claim: object) -> str:

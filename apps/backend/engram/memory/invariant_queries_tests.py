@@ -2476,6 +2476,35 @@ def test_p7_version_one_malformed_transition_pointer_is_violated() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize('corruption', ('document', 'provenance_source', 'provenance_hash', 'audit_projection'))
+def test_p7_version_one_recomputes_projection_and_provenance_contracts(corruption: str) -> None:
+    from engram.core.models import MemoryVersionSource
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    candidate, _source, (organization, project, session) = _provenanced_candidate(f'p7-v1-{corruption}')
+    result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    scope = ScopeFixture(organization, project, session.team, session.agent)
+    if corruption == 'document':
+        RetrievalDocument.objects.filter(id=result.retrieval_document.id).update(full_text='tampered exact projection')
+    elif corruption == 'provenance_source':
+        MemoryVersionSource.objects.filter(memory_version_id=result.memory_version.id).update(
+            source_content_hash='f' * 64
+        )
+    elif corruption == 'provenance_hash':
+        type(result.transition).objects.filter(id=result.transition.id).update(provenance_hash='f' * 64)
+    else:
+        audit = result.transition.audit_event
+        metadata = dict(audit.metadata)
+        metadata['exact_projection_hash'] = 'f' * 64
+        type(audit).objects.filter(id=audit.id).update(metadata=metadata)
+
+    p7 = _result_by_id(scope)['P7']
+
+    assert p7.state == InvariantState.VIOLATED
+    assert f'memory:{result.memory.id}' in p7.sample_ids
+
+
+@pytest.mark.django_db
 def test_p7_version_zero_rows_remain_missing_observability() -> None:
     scope = _create_scope('p7-v0-observability')
     memory = _make_memory(scope, 'p7-v0', current_version=1)

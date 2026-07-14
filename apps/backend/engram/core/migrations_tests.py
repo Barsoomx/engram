@@ -2815,5 +2815,31 @@ def test_0038_migration_module_declares_hash_and_scope_constraints() -> None:
         'core_memory_version_source_exactly_one_fk_ck',
         'core_memory_conflict_open_close_ck',
         'core_retrieval_document_embedding_state_ck',
+        'projection_superseded',
     ):
         assert token in operations_text
+
+
+def test_0038_reverse_guard_is_last_and_refuses_transition_history() -> None:
+    migration_module = importlib.import_module(MIGRATION_0038_MODULE)
+    migration = migration_module.Migration
+    operation = migration.operations[-1]
+    assert operation.__class__.__name__ == 'RunPython'
+
+    class _TransitionManager:
+        @staticmethod
+        def exists() -> bool:
+            return True
+
+    class _TransitionModel:
+        objects = _TransitionManager()
+
+    class _Apps:
+        @staticmethod
+        def get_model(app_label: str, model_name: str) -> type[_TransitionModel]:
+            assert (app_label, model_name) == ('core', 'MemoryTransition')
+            return _TransitionModel
+
+    assert operation.reverse_code is not None
+    with pytest.raises(RuntimeError, match='cannot reverse 0038'):
+        operation.reverse_code(_Apps(), None)

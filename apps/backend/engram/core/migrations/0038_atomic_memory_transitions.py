@@ -3,7 +3,19 @@
 import uuid
 
 import django.db.models.deletion
+from django.apps.registry import Apps
 from django.db import migrations, models
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+
+def _allow_forward(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
+    return None
+
+
+def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
+    transition_model = apps.get_model('core', 'MemoryTransition')
+    if transition_model.objects.exists():
+        raise RuntimeError('cannot reverse 0038 while MemoryTransition history exists')
 
 
 class Migration(migrations.Migration):
@@ -86,6 +98,10 @@ class Migration(migrations.Migration):
             model_name='workflowwork',
             name='core_work_subject_scope_ck',
         ),
+        migrations.RemoveConstraint(
+            model_name='workflowwork',
+            name='core_work_terminal_state_ck',
+        ),
         migrations.AddField(
             model_name='memory',
             name='transition_contract_version',
@@ -159,6 +175,20 @@ class Migration(migrations.Migration):
         ),
         migrations.AlterField(
             model_name='workflowwork',
+            name='resolution_reason',
+            field=models.CharField(
+                blank=True,
+                choices=[
+                    ('succeeded', 'Succeeded'),
+                    ('no_signal', 'No signal'),
+                    ('projection_superseded', 'Projection superseded'),
+                    ('no_input', 'No input'),
+                ],
+                max_length=40,
+            ),
+        ),
+        migrations.AlterField(
+            model_name='workflowwork',
             name='work_type',
             field=models.CharField(
                 choices=[
@@ -200,6 +230,7 @@ class Migration(migrations.Migration):
                             ),
                             models.Q(
                                 ('embedding_projected_at__isnull', False),
+                                ('embedding_projection_hash', models.F('exact_projection_hash')),
                                 ('embedding_projection_hash__regex', '^[0-9a-f]{64}$'),
                                 ('embedding_reference__gt', ''),
                                 models.Q(('embedding_vector', []), _negated=True),
@@ -257,6 +288,24 @@ class Migration(migrations.Migration):
                     _connector='OR',
                 ),
                 name='core_work_subject_scope_ck',
+            ),
+        ),
+        migrations.AddConstraint(
+            model_name='workflowwork',
+            constraint=models.CheckConstraint(
+                condition=models.Q(
+                    models.Q(('disposition', 'required'), ('resolution_reason', ''), ('resolved_at__isnull', True)),
+                    models.Q(
+                        ('disposition', 'complete'),
+                        ('resolution_reason__in', ('succeeded', 'no_signal', 'projection_superseded')),
+                        ('resolved_at__isnull', False),
+                    ),
+                    models.Q(
+                        ('disposition', 'no_op'), ('resolution_reason', 'no_input'), ('resolved_at__isnull', False)
+                    ),
+                    _connector='OR',
+                ),
+                name='core_work_terminal_state_ck',
             ),
         ),
         migrations.AddField(
@@ -698,4 +747,5 @@ class Migration(migrations.Migration):
                 name='core_memory_version_source_hash_hex',
             ),
         ),
+        migrations.RunPython(_allow_forward, _guard_reverse),
     ]

@@ -18,9 +18,12 @@ from engram.core.models import (
     ProjectTeam,
     RetrievalDocument,
     Team,
+    WorkflowRun,
+    WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
@@ -30,6 +33,14 @@ _MAX_SIGNED_64 = 2**63 - 1
 _MAX_POSITIVE_SMALL_INTEGER = 32767
 _LIFECYCLE_EVENT_TYPES = frozenset({'session_start', 'session_end'})
 _DIGEST_WORK_TYPES = frozenset({WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST})
+_DIRECT_SETTLEMENT_STATES = frozenset(
+    {
+        WorkflowWorkExecutionState.READY,
+        WorkflowWorkExecutionState.BLOCKED,
+        WorkflowWorkExecutionState.RETRY_WAIT,
+        WorkflowWorkExecutionState.TERMINAL_FAILURE,
+    }
+)
 _WORK_SUBJECT_PAIRS = frozenset(
     {
         (WorkflowWorkType.OBSERVATION_PROCESSING, WorkflowSubjectType.OBSERVATION),
@@ -38,7 +49,7 @@ _WORK_SUBJECT_PAIRS = frozenset(
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.PROJECT),
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.TEAM),
         (WorkflowWorkType.CANDIDATE_DECISION, WorkflowSubjectType.MEMORY_CANDIDATE),
-        ('memory_embedding', 'retrieval_document'),
+        (WorkflowWorkType.MEMORY_EMBEDDING, WorkflowSubjectType.RETRIEVAL_DOCUMENT),
     }
 )
 _OBSERVATION_SNAPSHOT_KEYS = frozenset({'schema', 'observation_id', 'observation_digest', 'policy'})
@@ -443,19 +454,34 @@ def _identity_input_for_work(
     occurrence_key: str,
     input_snapshot: dict[str, object],
 ) -> object:
-    builders = (
-        (WorkflowWorkType.OBSERVATION_PROCESSING, _identity_input_for_observation),
-        (WorkflowWorkType.SESSION_DISTILLATION, _identity_input_for_session),
-        (WorkflowWorkType.DAILY_DIGEST, _identity_input_for_daily),
-        (WorkflowWorkType.CANDIDATE_DECISION, _identity_input_for_candidate),
-        ('memory_embedding', _identity_input_for_embedding),
-    )
-    builder = _identity_input_for_weekly
-    for known_work_type, known_builder in builders:
-        if work_type == known_work_type:
-            builder = known_builder
-            break
-    return builder(
+    if work_type == WorkflowWorkType.OBSERVATION_PROCESSING:
+        return _identity_input_for_observation(
+            subject_id=subject_id,
+            input_snapshot=input_snapshot,
+        )
+    elif work_type == WorkflowWorkType.SESSION_DISTILLATION:
+        return _identity_input_for_session(
+            subject_id=subject_id,
+            input_snapshot=input_snapshot,
+        )
+    elif work_type == WorkflowWorkType.DAILY_DIGEST:
+        return _identity_input_for_daily(
+            subject_id=subject_id,
+            occurrence_key=occurrence_key,
+            input_snapshot=input_snapshot,
+        )
+    elif work_type == WorkflowWorkType.CANDIDATE_DECISION:
+        return _identity_input_for_candidate(
+            subject_id=subject_id,
+            input_snapshot=input_snapshot,
+        )
+    elif work_type == WorkflowWorkType.MEMORY_EMBEDDING:
+        return _identity_input_for_embedding(
+            subject_id=subject_id,
+            input_snapshot=input_snapshot,
+        )
+
+    return _identity_input_for_weekly(
         subject_type=subject_type,
         subject_id=subject_id,
         occurrence_key=occurrence_key,
@@ -850,6 +876,42 @@ def create_work(data: CreateWorkflowWorkInput) -> tuple[WorkflowWork, bool]:
     )
 
 
+def _settle_direct_runs(work: WorkflowWork, *, now: datetime) -> None:
+    runs = list(
+        WorkflowRun.objects.select_for_update().filter(
+            work_id=work.id,
+            execution_contract_version=1,
+        )
+    )
+    if any(run.status == WorkflowRunStatus.RUNNING for run in runs):
+        raise WorkflowWorkStateError('running workflow run requires a claim to resolve')
+
+    queued_fencing_token = work.fencing_token + 1
+    queued_run_found = False
+    for run in runs:
+        if run.status != WorkflowRunStatus.QUEUED:
+            continue
+        queued_run_found = True
+        run.status = WorkflowRunStatus.SUCCEEDED
+        run.fencing_token = queued_fencing_token
+        run.lease_owner = f'direct-resolution:{work.id}'
+        run.started_at = now
+        run.finished_at = now
+        run.save(
+            update_fields=[
+                'status',
+                'fencing_token',
+                'lease_owner',
+                'started_at',
+                'finished_at',
+                'updated_at',
+            ]
+        )
+
+    if queued_run_found:
+        work.fencing_token = queued_fencing_token
+
+
 def _resolve_work(
     work_id: uuid.UUID,
     *,
@@ -878,10 +940,40 @@ def _resolve_work(
         ):
             raise WorkflowWorkStateError('observation work cannot resolve as no input')
 
+        if work.execution_state == WorkflowWorkExecutionState.LEASED:
+            raise WorkflowWorkStateError('leased workflow work requires a claim to resolve')
+        if work.execution_state not in _DIRECT_SETTLEMENT_STATES:
+            raise WorkflowWorkStateError('workflow work is not directly resolvable in its execution state')
+
+        now = timezone.now()
+        _settle_direct_runs(work, now=now)
+
         work.disposition = disposition
         work.resolution_reason = reason
-        work.resolved_at = timezone.now()
-        work.save(update_fields=['disposition', 'resolution_reason', 'resolved_at', 'updated_at'])
+        work.resolved_at = now
+        work.execution_state = WorkflowWorkExecutionState.SETTLED
+        work.lease_owner = ''
+        work.lease_expires_at = None
+        work.heartbeat_at = None
+        work.next_retry_at = None
+        work.blocked_configuration_fingerprint = ''
+        work.failure_streak = 0
+        work.save(
+            update_fields=[
+                'disposition',
+                'resolution_reason',
+                'resolved_at',
+                'execution_state',
+                'fencing_token',
+                'lease_owner',
+                'lease_expires_at',
+                'heartbeat_at',
+                'next_retry_at',
+                'blocked_configuration_fingerprint',
+                'failure_streak',
+                'updated_at',
+            ]
+        )
 
         return work
 

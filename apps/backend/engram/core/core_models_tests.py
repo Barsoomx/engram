@@ -1315,6 +1315,7 @@ def test_workflow_work_clean_rejects_cross_organization_project_or_team() -> Non
         ('required', '', False),
         ('complete', 'succeeded', True),
         ('complete', 'no_signal', True),
+        ('complete', 'projection_superseded', True),
         ('no_op', 'no_input', True),
     ],
 )
