@@ -1212,23 +1212,35 @@ def projection_inconsistency_memory_ids(
     return tuple(sorted(memory_ids, key=lambda memory_id: memory_id.int))
 
 
-def _p7_v1_candidate_violations(project: Project, memory_transition: type) -> list[uuid.UUID]:
-    violations: list[uuid.UUID] = []
+def _p7_v1_candidate_violations(project: Project, memory_transition: type) -> list[str]:
+    violations: list[str] = []
     promoted_candidates = MemoryCandidate.objects.filter(
         organization_id=project.organization_id,
         project_id=project.id,
         status=CandidateStatus.PROMOTED,
-        decision_work_contract_version=1,
-    ).only('id', 'promoted_memory_id')
+    ).only('id', 'promoted_memory_id', 'decision_work_contract_version')
     for candidate in promoted_candidates:
+        candidate_sample = f'candidate:{candidate.id}'
+        if candidate.promoted_memory_id is None:
+            violations.append(candidate_sample)
+            continue
+        if not Memory.objects.filter(
+            id=candidate.promoted_memory_id,
+            organization_id=project.organization_id,
+            project_id=project.id,
+        ).exists():
+            violations.append(candidate_sample)
+            continue
+        if candidate.decision_work_contract_version == 0:
+            continue
         transitions = memory_transition.objects.filter(
             organization_id=project.organization_id,
             project_id=project.id,
             candidate_id=candidate.id,
             transition_type='promote',
         )
-        if transitions.count() != 1 or candidate.promoted_memory_id is None:
-            violations.append(candidate.id)
+        if transitions.count() != 1:
+            violations.append(candidate_sample)
             continue
         transition = transitions.first()
         decision_work_ok = WorkflowWork.objects.filter(
@@ -1240,7 +1252,7 @@ def _p7_v1_candidate_violations(project: Project, memory_transition: type) -> li
             resolved_at__isnull=False,
         ).exists()
         if transition is None or transition.result_memory_id != candidate.promoted_memory_id or not decision_work_ok:
-            violations.append(candidate.promoted_memory_id or candidate.id)
+            violations.append(candidate_sample)
 
     return violations
 
@@ -1343,13 +1355,13 @@ def _p7_v1_memory_violations(
     memories: list[Memory],
     memory_transition: type,
     memory_version_source: type,
-) -> list[uuid.UUID]:
-    violations: list[uuid.UUID] = []
+) -> list[str]:
+    violations: list[str] = []
     for memory in memories:
         if memory.transition_contract_version == 0:
             continue
         if not _p7_v1_memory_is_coherent(memory, memory_transition, memory_version_source):
-            violations.append(memory.id)
+            violations.append(f'memory:{memory.id}')
 
     return violations
 
@@ -1429,9 +1441,7 @@ def _evaluate_p7_v1(project: Project) -> InvariantResult:
             violation_count=0,
             target_checkpoint='CP4',
         )
-    sample_ids = tuple(
-        f'memory:{value}' for value in sorted(set(violations), key=lambda item: item.int)[:_SAMPLE_LIMIT]
-    )
+    sample_ids = tuple(sorted(set(violations))[:_SAMPLE_LIMIT])
     return InvariantResult(
         invariant_id=InvariantId.P7,
         state=InvariantState.VIOLATED,
