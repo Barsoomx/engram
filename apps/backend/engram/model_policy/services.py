@@ -978,12 +978,52 @@ def generated_curation_judgment_payload() -> str:
     return json.dumps({'decision': 'keep_both', 'reason': 'fake provider default judgment'})
 
 
+def generated_distill_extract_payload(prompt: str) -> str:
+    observation_ids: list[str] = []
+    seen_ids: set[str] = set()
+    for line in prompt.splitlines():
+        if not line.startswith('Observation: '):
+            continue
+        observation_id = line.removeprefix('Observation: ')
+        if re.fullmatch(
+            r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}',
+            observation_id,
+        ) is None:
+            continue
+        canonical_id = observation_id.lower()
+        if canonical_id in seen_ids:
+            continue
+        seen_ids.add(canonical_id)
+        observation_ids.append(canonical_id)
+
+    if not observation_ids:
+        return json.dumps({'memories': [], 'no_signal_observation_ids': []})
+
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    return json.dumps(
+        {
+            'memories': [
+                {
+                    'title': f'Provider-distilled memory {digest}',
+                    'body': f'Provider-distilled memory body {digest}',
+                    'confidence': 0.9,
+                    'supporting_observation_ids': observation_ids,
+                    'kind': 'gotcha',
+                },
+            ],
+            'no_signal_observation_ids': [],
+        },
+    )
+
+
 def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
     title, body = generated_candidate_content(prompt)
     if data.response_kind == 'candidates':
         return title, generated_candidates_payload(prompt)
     if data.response_kind == 'curation_judgment':
         return title, generated_curation_judgment_payload()
+    if data.response_kind == 'distill_extract.v1':
+        return title, generated_distill_extract_payload(prompt)
 
     return title, body
 
@@ -1009,7 +1049,7 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
     return {}
 
 
-_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment'})
+_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment', 'distill_extract.v1'})
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
 
@@ -1030,7 +1070,7 @@ def openai_json_mode_override(response_kind: str, policy: ModelPolicy) -> dict[s
 
 
 _DEFAULT_MAX_TOKENS = 1024
-_MAX_TOKENS_BY_KIND = {'candidates': 8192, 'curation_judgment': 1024}
+_MAX_TOKENS_BY_KIND = {'candidates': 8192, 'curation_judgment': 1024, 'distill_extract.v1': 8192}
 _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
     'candidates': {
         'name': 'emit_memories',
@@ -1070,6 +1110,46 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                 'reason': {'type': 'string'},
             },
             'required': ['decision', 'reason'],
+        },
+    },
+    'distill_extract.v1': {
+        'name': 'emit_distillation_extraction',
+        'description': 'Return the distillation extraction.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'memories': {
+                    'type': 'array',
+                    'maxItems': 12,
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
+                            'body': {'type': 'string', 'maxLength': 3000},
+                            'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                            'supporting_observation_ids': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'minItems': 1,
+                                'uniqueItems': True,
+                            },
+                            'kind': {
+                                'type': 'string',
+                                'enum': ['decision', 'convention', 'gotcha', 'architecture', 'incident'],
+                            },
+                        },
+                        'required': ['title', 'body', 'confidence', 'supporting_observation_ids'],
+                        'additionalProperties': False,
+                    },
+                },
+                'no_signal_observation_ids': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'uniqueItems': True,
+                },
+            },
+            'required': ['memories', 'no_signal_observation_ids'],
+            'additionalProperties': False,
         },
     },
 }

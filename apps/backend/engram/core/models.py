@@ -1897,7 +1897,7 @@ class DistillationStage(TimestampedModel):
                 name='core_distill_stage_key_uniq',
             ),
             models.UniqueConstraint(
-                fields=['window', 'stage_kind', 'level', 'ordinal', 'policy', 'policy_version'],
+                fields=['window', 'stage_kind', 'level', 'ordinal', 'policy', 'policy_version', 'policy_role'],
                 name='core_distill_stage_coord_uniq',
             ),
             models.UniqueConstraint(
