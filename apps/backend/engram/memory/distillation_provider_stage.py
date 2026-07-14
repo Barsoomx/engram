@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 from django.db import transaction
 from django.db.models import F
+from django.utils import timezone
 
 from engram.core.models import (
     AuditResult,
@@ -54,6 +56,7 @@ PROVIDER_OUTPUT_MALFORMED = 'provider_output_malformed'
 STAGE_COMPLETED = 'completed'
 STAGE_RETRY = 'retry'
 STAGE_BLOCKED = 'blocked'
+STAGE_CONTINUATION = 'continuation'
 
 _MAX_MEMORIES = 12
 _MAX_TITLE = 255
@@ -68,6 +71,7 @@ _FALLBACK_FAILURE_CODES = frozenset(
         'provider_unreachable',
     }
 )
+_LEASE_SAFE_MARGIN = timedelta(seconds=30)
 
 _TARGET_SCHEMA = 'distillation_stage_target/v1'
 _IDENTITY_SCHEMA = 'distillation_stage_identity/v1'
@@ -83,8 +87,40 @@ class ExtractionContractError(Exception):
     pass
 
 
+class ProviderStageOutputError(Exception):
+    pass
+
+
 class ProviderGateway(Protocol):
     def call(self, data: ProviderCallInput) -> ProviderCallResult: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderStageTarget:
+    window_id: uuid.UUID
+    chunk_id: uuid.UUID | None
+    stage_kind: str
+    level: int
+    ordinal: int
+    input_manifest: dict[str, object]
+    input_hash: str
+    prompt_contract: str
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedProviderStageCall:
+    prompt: str
+    system_prompt: str
+    response_kind: str
+
+
+class ProviderStageContract(Protocol):
+    stage_kind: str
+    prompt_contract: str
+
+    def prepare_call(self, stage: DistillationStage) -> PreparedProviderStageCall: ...
+
+    def normalize_output(self, raw_body: str, *, stage: DistillationStage) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,12 +145,14 @@ class StageExecutionResult:
     failure: ClassifiedWorkFailure | None = None
     fallback_used: bool = False
     provider_call_ids: tuple[str, ...] = field(default_factory=tuple)
+    started_provider_calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class _CompletedOutcome:
     stage: DistillationStage
     provider_call_ids: tuple[str, ...] = ()
+    started_calls: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,6 +168,14 @@ class _ProviderErrorOutcome:
     error: BaseException
     provider_call_ids: tuple[str, ...] = ()
     started_calls: int = 1
+
+
+def _fresh_now(initial: datetime) -> datetime:
+    return max(initial, timezone.now())
+
+
+def _lease_allows_provider_call(claim: WorkClaim, *, now: datetime) -> bool:
+    return now + _LEASE_SAFE_MARGIN < claim.lease_expires_at
 
 
 def stage_target_key(
@@ -360,25 +406,120 @@ def _refresh_live_policy(stage: DistillationStage) -> ModelPolicy:
     return policy
 
 
+def _validate_target_shape(target: ProviderStageTarget) -> None:
+    if target.stage_kind == DistillationStageKind.EXTRACT:
+        if target.chunk_id is None or target.level != 0:
+            raise ValueError('extraction stage target shape is invalid')
+    elif target.stage_kind == DistillationStageKind.REDUCE:
+        if target.chunk_id is not None or target.level <= 0:
+            raise ValueError('reduction stage target shape is invalid')
+    else:
+        raise ValueError('distillation stage target kind is invalid')
+    if target.ordinal < 0:
+        raise ValueError('distillation stage target ordinal is invalid')
+    if not isinstance(target.input_manifest, dict):
+        raise ValueError('distillation stage target manifest is invalid')
+    if len(target.input_hash) != 64:
+        raise ValueError('distillation stage target input hash is invalid')
+    if not target.prompt_contract:
+        raise ValueError('distillation stage prompt contract is required')
+
+
+def extraction_stage_target(chunk: DistillationChunk) -> ProviderStageTarget:
+    return ProviderStageTarget(
+        window_id=chunk.window_id,
+        chunk_id=chunk.id,
+        stage_kind=DistillationStageKind.EXTRACT,
+        level=0,
+        ordinal=chunk.ordinal,
+        input_manifest=chunk.input_manifest,
+        input_hash=chunk.input_hash,
+        prompt_contract=EXTRACT_PROMPT_CONTRACT,
+    )
+
+
+def _target_from_stage(stage: DistillationStage) -> ProviderStageTarget:
+    return ProviderStageTarget(
+        window_id=stage.window_id,
+        chunk_id=stage.chunk_id,
+        stage_kind=stage.stage_kind,
+        level=stage.level,
+        ordinal=stage.ordinal,
+        input_manifest=stage.input_manifest,
+        input_hash=stage.input_hash,
+        prompt_contract=stage.prompt_contract,
+    )
+
+
+def _target_chunk(target: ProviderStageTarget, window: DistillationWindow) -> DistillationChunk | None:
+    if target.chunk_id is None:
+        return None
+    try:
+        chunk = DistillationChunk.objects.get(
+            id=target.chunk_id,
+            window_id=window.id,
+            organization_id=window.organization_id,
+            project_id=window.project_id,
+            team_id=window.team_id,
+        )
+    except DistillationChunk.DoesNotExist as error:
+        raise ValueError('distillation stage chunk is outside the target scope') from error
+    if chunk.ordinal != target.ordinal:
+        raise ValueError('distillation stage chunk ordinal does not match the target')
+
+    return chunk
+
+
+def _stage_matches_target(
+    stage: DistillationStage,
+    *,
+    target: ProviderStageTarget,
+    window: DistillationWindow,
+    chunk: DistillationChunk | None,
+    target_key: str,
+    policy: ModelPolicy,
+    policy_role: str,
+) -> bool:
+    return (
+        stage.organization_id == window.organization_id
+        and stage.project_id == window.project_id
+        and stage.team_id == window.team_id
+        and stage.window_id == window.id
+        and stage.chunk_id == (chunk.id if chunk is not None else None)
+        and stage.stage_kind == target.stage_kind
+        and stage.level == target.level
+        and stage.ordinal == target.ordinal
+        and stage.target_key == target_key
+        and stage.input_hash == target.input_hash
+        and stage.input_manifest == target.input_manifest
+        and stage.prompt_contract == target.prompt_contract
+        and stage.policy_id == policy.id
+        and stage.policy_version == policy.version
+        and stage.policy_role == policy_role
+    )
+
+
 def _create_or_reuse_stage(
     *,
-    chunk: DistillationChunk,
+    target: ProviderStageTarget,
     window: DistillationWindow,
     work: WorkflowWork,
     policy: ModelPolicy,
     policy_role: str,
 ) -> DistillationStage:
+    _validate_target_shape(target)
+    chunk = _target_chunk(target, window)
     role_value = _role_value(policy_role)
     target_key = stage_target_key(
         work_id=str(work.id),
         work_input_fingerprint=work.input_fingerprint,
         window_input_hash=window.input_hash,
-        stage_kind=DistillationStageKind.EXTRACT.value,
-        level=0,
-        ordinal=chunk.ordinal,
-        chunk_ordinal=chunk.ordinal,
-        input_hash=chunk.input_hash,
-        prompt_contract=EXTRACT_PROMPT_CONTRACT,
+        stage_kind=target.stage_kind,
+        level=target.level,
+        ordinal=target.ordinal,
+        chunk_ordinal=chunk.ordinal if chunk is not None else None,
+        input_hash=target.input_hash,
+        prompt_contract=target.prompt_contract,
     )
     scoped_key = stage_key(
         target_key=target_key,
@@ -394,13 +535,13 @@ def _create_or_reuse_stage(
             'team_id': window.team_id,
             'window': window,
             'chunk': chunk,
-            'stage_kind': DistillationStageKind.EXTRACT,
-            'level': 0,
-            'ordinal': chunk.ordinal,
+            'stage_kind': target.stage_kind,
+            'level': target.level,
+            'ordinal': target.ordinal,
             'target_key': target_key,
-            'input_hash': chunk.input_hash,
-            'input_manifest': chunk.input_manifest,
-            'prompt_contract': EXTRACT_PROMPT_CONTRACT,
+            'input_hash': target.input_hash,
+            'input_manifest': target.input_manifest,
+            'prompt_contract': target.prompt_contract,
             'policy': policy,
             'policy_version': policy.version,
             'policy_role': role_value,
@@ -408,8 +549,88 @@ def _create_or_reuse_stage(
             'attempt_count': 0,
         },
     )
+    if not _stage_matches_target(
+        stage,
+        target=target,
+        window=window,
+        chunk=chunk,
+        target_key=target_key,
+        policy=policy,
+        policy_role=role_value,
+    ):
+        raise ValueError('existing distillation stage does not match the requested target')
 
     return stage
+
+
+def _failure_code_allows_fallback(code: str) -> bool:
+    return code == PROVIDER_OUTPUT_MALFORMED or code in _FALLBACK_FAILURE_CODES
+
+
+def _preferred_pending_stage(
+    primary_stage: DistillationStage,
+    *,
+    target: ProviderStageTarget,
+    window: DistillationWindow,
+    work: WorkflowWork,
+) -> DistillationStage:
+    if not _fallback_permitted(primary_stage) or not _failure_code_allows_fallback(primary_stage.last_failure_class):
+        return primary_stage
+    fallback_policy = _resolve_fallback_policy(primary_stage)
+    if fallback_policy is None or fallback_policy.id == primary_stage.policy_id:
+        return primary_stage
+    fallback_stage = _create_or_reuse_stage(
+        target=target,
+        window=window,
+        work=work,
+        policy=fallback_policy,
+        policy_role=DistillationStagePolicyRole.FALLBACK,
+    )
+    if fallback_stage.status == DistillationStageStatus.COMPLETE or fallback_stage.attempt_count == 0:
+        return fallback_stage
+    if fallback_stage.last_failure_at is None:
+        return fallback_stage
+    if primary_stage.last_failure_at is None:
+        return primary_stage
+    if fallback_stage.last_failure_at < primary_stage.last_failure_at:
+        return fallback_stage
+    if (
+        fallback_stage.last_failure_at == primary_stage.last_failure_at
+        and fallback_stage.attempt_count < primary_stage.attempt_count
+    ):
+        return fallback_stage
+
+    return primary_stage
+
+
+def resolve_provider_stage(
+    target: ProviderStageTarget,
+    claim: WorkClaim,
+    now: datetime,
+    policy_role: str = DistillationStagePolicyRole.PRIMARY,
+) -> DistillationStage:
+    with transaction.atomic():
+        work_execution.lock_work_fence(claim=claim, now=now)
+        try:
+            window = DistillationWindow.objects.select_related('work').get(id=target.window_id)
+        except DistillationWindow.DoesNotExist as error:
+            raise ValueError('distillation stage window does not exist') from error
+        work = window.work
+        if work.id != claim.work_id:
+            raise ValueError('distillation stage target is outside the claimed work scope')
+
+        policy = _resolve_primary_policy(window)
+        stage = _create_or_reuse_stage(
+            target=target,
+            window=window,
+            work=work,
+            policy=policy,
+            policy_role=policy_role,
+        )
+        if _role_value(policy_role) != DistillationStagePolicyRole.PRIMARY:
+            return stage
+
+        return _preferred_pending_stage(stage, target=target, window=window, work=work)
 
 
 def resolve_extraction_stage(
@@ -419,16 +640,9 @@ def resolve_extraction_stage(
     now: datetime,
     policy_role: str = DistillationStagePolicyRole.PRIMARY,
 ) -> DistillationStage:
-    with transaction.atomic():
-        work_execution.lock_work_fence(claim=claim, now=now)
-        window = chunk.window
-        work = window.work
-        if work.id != claim.work_id:
-            raise ValueError('chunk is outside the claimed work scope')
+    target = extraction_stage_target(chunk)
 
-        policy = _resolve_primary_policy(window)
-
-        return _create_or_reuse_stage(chunk=chunk, window=window, work=work, policy=policy, policy_role=policy_role)
+    return resolve_provider_stage(target, claim, now=now, policy_role=policy_role)
 
 
 def _stage_manifest_ids(chunk: DistillationChunk) -> tuple[list[str], dict[str, str]]:
@@ -501,6 +715,37 @@ def _normalize_output(output: ExtractionOutput) -> dict[str, object]:
         memories.append(entry)
 
     return {'memories': memories, 'no_signal_observation_ids': list(output.no_signal_observation_ids)}
+
+
+class _ExtractionStageContract:
+    stage_kind = DistillationStageKind.EXTRACT
+    prompt_contract = EXTRACT_PROMPT_CONTRACT
+
+    def prepare_call(self, stage: DistillationStage) -> PreparedProviderStageCall:
+        chunk = stage.chunk
+        if chunk is None:
+            raise ExtractionContractError('extraction stage has no chunk')
+
+        return PreparedProviderStageCall(
+            prompt=_render_stage_prompt(chunk, stage=stage),
+            system_prompt=_EXTRACT_SYSTEM_PROMPT,
+            response_kind=EXTRACT_PROMPT_CONTRACT,
+        )
+
+    def normalize_output(self, raw_body: str, *, stage: DistillationStage) -> dict[str, object]:
+        chunk = stage.chunk
+        if chunk is None:
+            raise ExtractionContractError('extraction stage has no chunk')
+        chunk_observation_ids = frozenset(entry['observation_id'] for entry in chunk.input_manifest['observations'])
+        try:
+            output = parse_extraction_output(raw_body, chunk_observation_ids=chunk_observation_ids)
+        except ExtractionContractError as error:
+            raise ProviderStageOutputError('extraction provider output is malformed') from error
+
+        return _normalize_output(output)
+
+
+_EXTRACTION_STAGE_CONTRACT = _ExtractionStageContract()
 
 
 def _provider_call_ids(*, stage: DistillationStage, request_id: str) -> tuple[str, ...]:
@@ -583,15 +828,19 @@ def _call_provider(
     return result
 
 
+def _validate_contract(stage: DistillationStage, contract: ProviderStageContract) -> None:
+    if stage.stage_kind != contract.stage_kind or stage.prompt_contract != contract.prompt_contract:
+        raise ValueError('provider stage contract does not match the persisted stage identity')
+
+
 def _attempt_stage(
     stage: DistillationStage,
     claim: WorkClaim,
+    contract: ProviderStageContract,
     *,
     now: datetime,
 ) -> _CompletedOutcome | _MalformedOutcome | _ProviderErrorOutcome:
-    chunk = stage.chunk
-    if chunk is None:
-        raise ExtractionContractError('extraction stage has no chunk')
+    _validate_contract(stage, contract)
     request_id = f'distill-stage:{stage.stage_key}'
     prior_call_ids = frozenset(_provider_call_ids(stage=stage, request_id=request_id))
     with transaction.atomic():
@@ -614,16 +863,15 @@ def _attempt_stage(
         if existing is not None:
             return _CompletedOutcome(existing)
 
-        prompt = _render_stage_prompt(chunk, stage=stage)
+        prepared = contract.prepare_call(stage)
         try:
             policy = _refresh_live_policy(stage)
         except (ModelPolicyError, ProviderSecretError) as error:
-            return _ProviderErrorOutcome(error)
+            return _ProviderErrorOutcome(error, started_calls=0)
         stage.policy = policy
 
         DistillationStage.objects.filter(id=stage.id).update(attempt_count=F('attempt_count') + 1)
 
-    chunk_observation_ids = frozenset(entry['observation_id'] for entry in chunk.input_manifest['observations'])
     data = ProviderCallInput(
         organization_id=stage.organization_id,
         project_id=stage.project_id,
@@ -631,9 +879,9 @@ def _attempt_stage(
         policy=stage.policy,
         request_id=request_id,
         trace_id='',
-        prompt=prompt,
-        system_prompt=_EXTRACT_SYSTEM_PROMPT,
-        response_kind=EXTRACT_PROMPT_CONTRACT,
+        prompt=prepared.prompt,
+        system_prompt=prepared.system_prompt,
+        response_kind=prepared.response_kind,
     )
     provider_result = _call_provider(
         stage=stage,
@@ -649,14 +897,14 @@ def _attempt_stage(
     response_hash = hashlib.sha256(response_bytes).hexdigest()
     response_size = len(response_bytes)
     try:
-        output = parse_extraction_output(result.generated_body, chunk_observation_ids=chunk_observation_ids)
-    except ExtractionContractError:
+        snapshot = contract.normalize_output(result.generated_body, stage=stage)
+    except ProviderStageOutputError:
         return _MalformedOutcome(response_hash, response_size, (str(result.call_record_id),))
 
-    snapshot = _normalize_output(output)
     output_hash = hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
+    commit_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=commit_now)
         locked = DistillationStage.objects.select_for_update().get(id=stage.id)
         existing = (
             DistillationStage.objects.select_for_update()
@@ -670,10 +918,10 @@ def _attempt_stage(
             .first()
         )
         if existing is not None:
-            return _CompletedOutcome(existing, (str(result.call_record_id),))
+            return _CompletedOutcome(existing, (str(result.call_record_id),), 1)
 
         if locked.status == DistillationStageStatus.COMPLETE:
-            return _CompletedOutcome(locked, (str(result.call_record_id),))
+            return _CompletedOutcome(locked, (str(result.call_record_id),), 1)
 
         locked.status = DistillationStageStatus.COMPLETE
         locked.accepted_provider_call_id = result.call_record_id
@@ -681,10 +929,10 @@ def _attempt_stage(
         locked.response_size = response_size
         locked.output_snapshot = snapshot
         locked.output_hash = output_hash
-        locked.completed_at = now
+        locked.completed_at = commit_now
         locked.save()
 
-        return _CompletedOutcome(locked, (str(result.call_record_id),))
+        return _CompletedOutcome(locked, (str(result.call_record_id),), 1)
 
 
 def _record_malformed(
@@ -780,52 +1028,71 @@ def _classify_provider_error(error: BaseException, stage: DistillationStage) -> 
 def _try_fallback(
     primary_stage: DistillationStage,
     claim: WorkClaim,
+    contract: ProviderStageContract,
     *,
     now: datetime,
     max_provider_calls: int,
     prior_provider_call_ids: tuple[str, ...],
     prior_started_calls: int,
+    prior_failure: ClassifiedWorkFailure,
 ) -> StageExecutionResult | None:
-    if prior_started_calls >= max_provider_calls:
-        return None
-
+    fallback_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=fallback_now)
         current = DistillationStage.objects.select_related('window', 'window__work', 'chunk').get(id=primary_stage.id)
         policy = _resolve_fallback_policy(current)
         if policy is None or policy.id == current.policy_id:
             return None
         fallback_stage = _create_or_reuse_stage(
-            chunk=current.chunk,
+            target=_target_from_stage(current),
             window=current.window,
             work=current.window.work,
             policy=policy,
             policy_role=DistillationStagePolicyRole.FALLBACK,
         )
+    if prior_started_calls >= max_provider_calls:
+        return StageExecutionResult(
+            STAGE_CONTINUATION,
+            fallback_stage,
+            failure=prior_failure,
+            provider_call_ids=prior_provider_call_ids,
+            started_provider_calls=prior_started_calls,
+        )
+
+    fallback_now = _fresh_now(fallback_now)
+    if not _lease_allows_provider_call(claim, now=fallback_now):
+        return StageExecutionResult(
+            STAGE_CONTINUATION,
+            fallback_stage,
+            failure=prior_failure,
+            provider_call_ids=prior_provider_call_ids,
+            started_provider_calls=prior_started_calls,
+        )
 
     result = _run_stage(
         fallback_stage,
         claim,
-        now=now,
+        contract,
+        now=fallback_now,
         allow_fallback=False,
         max_provider_calls=max_provider_calls,
         prior_provider_call_ids=prior_provider_call_ids,
         prior_started_calls=prior_started_calls,
     )
-    if result.status != STAGE_COMPLETED:
-        return result
-
     return StageExecutionResult(
-        STAGE_COMPLETED,
+        result.status,
         result.stage,
+        failure=result.failure,
         fallback_used=True,
         provider_call_ids=result.provider_call_ids,
+        started_provider_calls=result.started_provider_calls,
     )
 
 
 def _run_stage(
     stage: DistillationStage,
     claim: WorkClaim,
+    contract: ProviderStageContract,
     *,
     now: datetime,
     allow_fallback: bool,
@@ -833,85 +1100,108 @@ def _run_stage(
     prior_provider_call_ids: tuple[str, ...] = (),
     prior_started_calls: int = 0,
 ) -> StageExecutionResult:
-    outcome = _attempt_stage(stage, claim, now=now)
+    outcome = _attempt_stage(stage, claim, contract, now=now)
 
     if isinstance(outcome, _CompletedOutcome):
         return StageExecutionResult(
             STAGE_COMPLETED,
             outcome.stage,
             provider_call_ids=prior_provider_call_ids + outcome.provider_call_ids,
+            started_provider_calls=prior_started_calls + outcome.started_calls,
         )
 
     if isinstance(outcome, _MalformedOutcome):
+        malformed_now = _fresh_now(now)
         _record_malformed(
             stage,
             claim,
-            now=now,
+            now=malformed_now,
             response_hash=outcome.response_hash,
             response_size=outcome.response_size,
             provider_call_ids=outcome.provider_call_ids,
         )
         provider_call_ids = prior_provider_call_ids + outcome.provider_call_ids
+        started_calls = prior_started_calls + outcome.started_calls
+        failure = _malformed_failure()
         if allow_fallback and _fallback_permitted(stage):
             fallback = _try_fallback(
                 stage,
                 claim,
-                now=now,
+                contract,
+                now=malformed_now,
                 max_provider_calls=max_provider_calls,
                 prior_provider_call_ids=provider_call_ids,
-                prior_started_calls=prior_started_calls + outcome.started_calls,
+                prior_started_calls=started_calls,
+                prior_failure=failure,
             )
             if fallback is not None:
-                if fallback.status == STAGE_COMPLETED:
-                    return fallback
-                return StageExecutionResult(
-                    fallback.status,
-                    fallback.stage,
-                    failure=fallback.failure or _malformed_failure(),
-                    fallback_used=True,
-                    provider_call_ids=fallback.provider_call_ids,
-                )
+                return fallback
 
         return StageExecutionResult(
             STAGE_RETRY,
             stage,
-            failure=_malformed_failure(),
+            failure=failure,
             provider_call_ids=provider_call_ids,
+            started_provider_calls=started_calls,
         )
 
     provider_call_ids = prior_provider_call_ids + outcome.provider_call_ids
     started_calls = prior_started_calls + outcome.started_calls
+    failure_fence_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=failure_fence_now)
     failure = _classify_provider_error(outcome.error, stage)
-    _record_provider_failure(stage, claim, now=now, failure=failure)
+    failure_now = _fresh_now(failure_fence_now)
+    _record_provider_failure(stage, claim, now=failure_now, failure=failure)
     if _fallback_eligible(failure, outcome.error) and allow_fallback and _fallback_permitted(stage):
-        with transaction.atomic():
-            lock_work_fence(claim=claim, now=now)
         fallback = _try_fallback(
             stage,
             claim,
-            now=now,
+            contract,
+            now=failure_now,
             max_provider_calls=max_provider_calls,
             prior_provider_call_ids=provider_call_ids,
             prior_started_calls=started_calls,
+            prior_failure=failure,
         )
         if fallback is not None:
-            if fallback.status == STAGE_COMPLETED:
-                return fallback
-            return StageExecutionResult(
-                fallback.status,
-                fallback.stage,
-                failure=fallback.failure or failure,
-                fallback_used=True,
-                provider_call_ids=fallback.provider_call_ids,
-            )
+            return fallback
 
     return StageExecutionResult(
         _status_for_failure(failure),
         stage,
         failure=failure,
         provider_call_ids=provider_call_ids,
+        started_provider_calls=started_calls,
+    )
+
+
+def execute_provider_stage(
+    stage: DistillationStage,
+    claim: WorkClaim,
+    contract: ProviderStageContract,
+    *,
+    now: datetime,
+    max_provider_calls: int,
+) -> StageExecutionResult:
+    if type(max_provider_calls) is not int or max_provider_calls < 1:
+        raise ValueError('max_provider_calls must be a positive integer')
+    with transaction.atomic():
+        work_execution.lock_work_fence(claim=claim, now=now)
+        current = DistillationStage.objects.select_related('window', 'window__work', 'chunk').get(id=stage.id)
+        if current.window.work_id != claim.work_id:
+            raise ValueError('stage is outside the claimed work scope')
+        _validate_contract(current, contract)
+        if current.status == DistillationStageStatus.COMPLETE:
+            return StageExecutionResult(STAGE_COMPLETED, current)
+
+    return _run_stage(
+        current,
+        claim,
+        contract,
+        now=now,
+        allow_fallback=current.policy_role == DistillationStagePolicyRole.PRIMARY,
+        max_provider_calls=max_provider_calls,
     )
 
 
@@ -922,22 +1212,12 @@ def execute_distillation_stage(
     now: datetime,
     max_provider_calls: int | None = None,
 ) -> StageExecutionResult:
-    with transaction.atomic():
-        work_execution.lock_work_fence(claim=claim, now=now)
-        current = DistillationStage.objects.select_related('window', 'window__work', 'chunk').get(id=stage.id)
-        if current.window.work_id != claim.work_id:
-            raise ValueError('stage is outside the claimed work scope')
-        if current.status == DistillationStageStatus.COMPLETE:
-            return StageExecutionResult(STAGE_COMPLETED, current)
-
     budget = max_provider_calls if max_provider_calls is not None else max_provider_calls_per_attempt()
-    if type(budget) is not int or budget < 1:
-        raise ValueError('max_provider_calls must be a positive integer')
 
-    return _run_stage(
-        current,
+    return execute_provider_stage(
+        stage,
         claim,
+        _EXTRACTION_STAGE_CONTRACT,
         now=now,
-        allow_fallback=True,
         max_provider_calls=budget,
     )

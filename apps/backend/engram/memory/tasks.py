@@ -12,6 +12,8 @@ from django.utils import timezone
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import (
+    AgentSession,
+    MemoryCandidate,
     Observation,
     WorkflowRun,
     WorkflowRunOrigin,
@@ -19,14 +21,19 @@ from engram.core.models import (
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.memory.candidate_decision_work import (
+    build_candidate_decision_input,
+    candidate_decision_snapshot,
+)
 from engram.memory.candidate_ttl import ExpireStaleCandidates
+from engram.memory.candidate_work_reconciler import reconcile_scheduled_candidate_work
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import (
-    DistillSession,
-    DistillSessionInput,
-    run_session_distillation_with_tracking,
+    DistillationStageError,
+    run_complete_distillation_attempt,
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
@@ -47,7 +54,7 @@ from engram.memory.work_execution import (
     heartbeat_work,
     lock_work_fence,
 )
-from engram.memory.work_failures import translate_failure
+from engram.memory.work_failures import CONFIGURATION, ClassifiedWorkFailure, translate_failure
 from engram.memory.workflow_work import (
     observation_content_digest,
     resolve_work_no_signal,
@@ -71,6 +78,7 @@ _DIGEST_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_TIME_LIMIT', '210'))
 _OBSERVATION_LEASE = timedelta(seconds=120)
 _SESSION_LEASE = timedelta(seconds=720)
 _DIGEST_LEASE = timedelta(seconds=240)
+_CANDIDATE_DECISION_LEASE = timedelta(seconds=120)
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
 
@@ -79,6 +87,7 @@ LEASE_BY_WORK_TYPE = {
     WorkflowWorkType.SESSION_DISTILLATION: _SESSION_LEASE,
     WorkflowWorkType.DAILY_DIGEST: _DIGEST_LEASE,
     WorkflowWorkType.WEEKLY_DIGEST: _DIGEST_LEASE,
+    WorkflowWorkType.CANDIDATE_DECISION: _CANDIDATE_DECISION_LEASE,
 }
 
 
@@ -305,9 +314,13 @@ def _record_claim_failure(
     *,
     configuration_fingerprint: str,
 ) -> None:
-    failure = translate_failure(
-        _root_cause_error(error),
-        configuration_fingerprint=configuration_fingerprint,
+    failure = (
+        error.failure
+        if isinstance(error, DistillationStageError)
+        else translate_failure(
+            _root_cause_error(error),
+            configuration_fingerprint=configuration_fingerprint,
+        )
     )
     fail_work_claim(claim=claim, now=timezone.now(), failure=failure)
 
@@ -425,42 +438,6 @@ def _load_session_work_upper(work: WorkflowWork) -> int:
         raise MemoryWorkerError('workflow work subject type does not match session task')
 
     return work.input_snapshot['upper_sequence_inclusive']
-
-
-def _adopt_legacy_session_run(work: WorkflowWork) -> WorkflowRun | None:
-    return (
-        WorkflowRun.objects.filter(work_id=work.id, execution_contract_version=0).order_by('created_at', 'id').first()
-    )
-
-
-def _finish_session_claim(
-    work: WorkflowWork,
-    claim: object,
-    result: object,
-) -> None:
-    now = timezone.now()
-    with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
-        if result.truncated:
-            finish_work_claim(claim=claim, now=now, completion='continue_required')
-            queue_work_attempt(
-                work_id=work.id,
-                now=now,
-                origin=WorkflowRunOrigin.RECONCILIATION,
-            )
-
-            return
-
-        completion = 'product_succeeded' if result.auto_promoted or result.queued_for_review else 'product_no_signal'
-        result_memory_id = result.auto_promoted[0].id if result.auto_promoted else None
-        finish_work_claim(
-            claim=claim,
-            now=now,
-            completion=completion,
-            result_memory_id=result_memory_id,
-        )
-
-    return
 
 
 @app.task(
@@ -609,6 +586,73 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
     )
 
 
+def _validate_candidate_decision_subject(work: WorkflowWork) -> MemoryCandidate:
+    if work.subject_type != WorkflowSubjectType.MEMORY_CANDIDATE:
+        raise MemoryWorkerError(
+            'workflow work subject type does not match candidate task',
+            code='work_contract_invalid',
+        )
+    try:
+        candidate = MemoryCandidate.objects.get(
+            id=work.subject_id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+            team_id=work.team_id,
+        )
+    except MemoryCandidate.DoesNotExist as error:
+        raise MemoryWorkerError('candidate is outside workflow work scope', code='work_scope_invalid') from error
+    try:
+        current_snapshot = candidate_decision_snapshot(build_candidate_decision_input(candidate))
+    except (TypeError, ValueError) as error:
+        raise MemoryWorkerError('candidate decision evidence is invalid', code='work_fingerprint_mismatch') from error
+    if current_snapshot != work.input_snapshot:
+        raise MemoryWorkerError(
+            'candidate decision input no longer matches frozen work',
+            code='work_fingerprint_mismatch',
+        )
+
+    return candidate
+
+
+@app.task(
+    bind=True,
+    name='engram.memory.process_candidate_decision_work_v1',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def process_candidate_decision_work_v1(
+    self: object,
+    work_id: object,
+    workflow_run_id: object = None,
+) -> str:
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, WorkflowWorkType.CANDIDATE_DECISION)
+
+    def execute(claim: object) -> str:
+        _verify_work_fingerprint(work)
+        _validate_candidate_decision_subject(work)
+        failure = ClassifiedWorkFailure(
+            failure_class=CONFIGURATION,
+            code='candidate_decision_capability_unavailable',
+            redacted_detail='candidate decision capability unavailable',
+            configuration_fingerprint=execution_configuration_fingerprint(work),
+        )
+        fail_work_claim(claim=claim, now=timezone.now(), failure=failure)
+
+        return str(claim.workflow_run_id)
+
+    return _run_fenced_automatic(
+        self,
+        work,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_for=_CANDIDATE_DECISION_LEASE,
+        event_prefix='candidate_decision_work',
+        execute=execute,
+        workflow_run_id=parsed_run_id,
+    )
+
+
 @app.task(
     bind=True,
     name='engram.memory.distill_session',
@@ -621,33 +665,52 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
 def distill_session(self: object, session_id: object, workflow_run_id: object = None) -> str:
     try:
         parsed_session_id = uuid.UUID(str(session_id))
-        parsed_workflow_run_id = uuid.UUID(str(workflow_run_id)) if workflow_run_id is not None else None
+        if workflow_run_id is not None:
+            uuid.UUID(str(workflow_run_id))
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed session id') from error
 
-    correlation_id = f'distill-session:{parsed_session_id}'
-    request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        correlation_id=correlation_id,
-        request_id=request_id,
-    )
     try:
-        result = run_session_distillation_with_tracking(
-            session_id=parsed_session_id,
-            request_id=request_id,
-            correlation_id=correlation_id,
-            existing_run_id=parsed_workflow_run_id,
+        session = AgentSession.objects.get(
+            id=parsed_session_id,
+            end_work_contract_version=1,
         )
-    except MemoryWorkerError as exc:
-        if exc.retryable:
-            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
-            raise self.retry(exc=exc, countdown=countdown) from None
-        raise
-    finally:
-        structlog.contextvars.clear_contextvars()
+    except AgentSession.DoesNotExist as error:
+        raise MemoryWorkerError(
+            'legacy distillation delivery has no versioned session owner',
+            code='legacy_distillation_work_missing',
+        ) from error
+    work = (
+        WorkflowWork.objects.filter(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            team_id=session.team_id,
+            work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            subject_type=WorkflowSubjectType.AGENT_SESSION,
+            subject_id=session.id,
+            contract_version=1,
+            input_snapshot__schema='session_distillation_input/v1',
+            input_snapshot__session_id=str(session.id),
+        )
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if work is None:
+        raise MemoryWorkerError(
+            'legacy distillation delivery has no versioned session work',
+            code='legacy_distillation_work_missing',
+        )
+    if (
+        work.disposition == WorkflowWorkDisposition.REQUIRED
+        and work.execution_state == WorkflowWorkExecutionState.READY
+    ):
+        queue_work_attempt(
+            work_id=work.id,
+            now=timezone.now(),
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        )
 
-    return str(result.session.id)
+    return str(work.id)
 
 
 @app.task(
@@ -666,7 +729,7 @@ def distill_session_work_v1(
 ) -> str:
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, WorkflowWorkType.SESSION_DISTILLATION)
-    upper = _load_session_work_upper(work)
+    _load_session_work_upper(work)
     session_id = uuid.UUID(work.input_snapshot['session_id'])
 
     if parsed_run_id is None:
@@ -679,16 +742,6 @@ def distill_session_work_v1(
 
             return str(work.id)
 
-        legacy_run = _adopt_legacy_session_run(work)
-        if legacy_run is not None:
-            logger.info(
-                'distill_session_work_legacy_run_adopted',
-                work_id=str(work.id),
-                workflow_run_id=str(legacy_run.id),
-            )
-
-            return str(legacy_run.id)
-
     correlation_id = f'distill-session:{session_id}'
     request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
 
@@ -699,20 +752,15 @@ def distill_session_work_v1(
             request_id=request_id,
         )
         try:
-            heartbeat_work(claim=claim, now=timezone.now(), lease_for=_SESSION_LEASE)
-            result = DistillSession().execute(
-                DistillSessionInput(
-                    session_id=session_id,
-                    upper_sequence_inclusive=upper,
-                    request_id=request_id,
-                    correlation_id=correlation_id,
-                    run_id=str(claim.workflow_run_id),
-                ),
+            attempt_now = timezone.now()
+            claim = heartbeat_work(claim=claim, now=attempt_now, lease_for=_SESSION_LEASE)
+            run_complete_distillation_attempt(
+                work=work,
+                claim=claim,
+                now=attempt_now,
             )
         finally:
             structlog.contextvars.clear_contextvars()
-
-        _finish_session_claim(work, claim, result)
 
         return str(claim.workflow_run_id)
 
@@ -972,11 +1020,14 @@ def sweep_stale_sessions() -> dict[str, int]:
 @app.task(name='engram.memory.retry_failed_distillations')
 def retry_failed_distillations() -> dict[str, int]:
     legacy = RetryFailedDistillations().execute()
-    reconciled = reconcile_scheduled_session_work(as_of=timezone.now())
+    as_of = timezone.now()
+    reconciled = reconcile_scheduled_session_work(as_of=as_of)
+    candidate_reconciled = reconcile_scheduled_candidate_work(as_of=as_of)
 
     return {
         'retried': len(legacy.retried),
         'reconciled': reconciled,
+        'candidate_reconciled': candidate_reconciled,
         'unlinked': len(legacy.unlinked_run_ids),
     }
 

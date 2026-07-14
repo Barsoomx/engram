@@ -3,8 +3,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
 
+from django.db import transaction
 from django.db.models import CharField, Exists, OuterRef, Value
 from django.db.models.functions import Cast, Concat
 
@@ -12,14 +12,25 @@ from engram.core.models import (
     CandidateStatus,
     LinkType,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryLink,
-    WorkflowWork,
+    WorkflowRunOrigin,
     WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
 )
 from engram.memory.aware_time import require_aware
+from engram.memory.candidate_decision_work import (
+    CandidateDecisionWorkBuilder,
+    ensure_candidate_decision_work_locked,
+)
+from engram.memory.candidate_decision_work import (
+    CandidateDecisionWorkInput as _CandidateDecisionWorkInput,
+)
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
 from engram.memory.session_work_reconciler import SessionWorkFinding
+from engram.memory.work_dispatch import queue_work_attempt
+
+CandidateDecisionWorkInput = _CandidateDecisionWorkInput
 
 CANDIDATE_DECISION_BUILDER_UNAVAILABLE = 'candidate_decision_builder_unavailable'
 CANDIDATE_DECISION_WORK_MISSING = 'candidate_decision_work_missing'
@@ -35,23 +46,6 @@ _INACTIVE_EXECUTION_STATES = frozenset(
         WorkflowWorkExecutionState.TERMINAL_FAILURE,
     }
 )
-
-
-@dataclass(frozen=True, slots=True)
-class CandidateDecisionWorkInput:
-    candidate_id: uuid.UUID
-    candidate_content_hash: str
-    organization_id: uuid.UUID
-    project_id: uuid.UUID
-    team_id: uuid.UUID | None
-    evidence_manifest_hash: str
-    policy_version: int
-
-
-class CandidateDecisionWorkBuilder(Protocol):
-    def expected_input(self, *, candidate_id: uuid.UUID) -> CandidateDecisionWorkInput: ...
-
-    def exact_work(self, *, value: CandidateDecisionWorkInput) -> WorkflowWork | None: ...
 
 
 _BUILDER: CandidateDecisionWorkBuilder | None = None
@@ -138,6 +132,33 @@ def _proposed_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> l
     return list(candidates)
 
 
+def _cp3_repair_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> list[MemoryCandidate]:
+    conflict_links = MemoryLink.objects.filter(
+        organization_id=organization_id,
+        project_id=project_id,
+        memory__organization_id=organization_id,
+        memory__project_id=project_id,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=Concat(
+            Value(CONFLICT_CANDIDATE_TARGET_PREFIX),
+            Cast(OuterRef('id'), output_field=CharField()),
+        ),
+    )
+    return list(
+        MemoryCandidate.objects.filter(
+            organization_id=organization_id,
+            project_id=project_id,
+            status=CandidateStatus.PROPOSED,
+            decision_work_contract_version=1,
+            sources__isnull=False,
+        )
+        .annotate(has_canonical_conflict=Exists(conflict_links))
+        .only('id', 'organization_id', 'project_id', 'team_id', 'created_at')
+        .distinct()
+        .order_by('created_at', 'id')
+    )
+
+
 def inspect_candidate_work(
     *,
     organization_id: uuid.UUID,
@@ -161,3 +182,81 @@ def inspect_candidate_work(
             findings.append(finding)
 
     return tuple(findings)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateWorkReconciliation:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    as_of: datetime
+    queued: int
+    applied: tuple[str, ...]
+
+
+def reconcile_candidate_work(
+    *,
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    as_of: datetime,
+) -> CandidateWorkReconciliation:
+    require_aware(as_of)
+
+    applied: list[str] = []
+    for candidate in _cp3_repair_candidates(organization_id, project_id):
+        if candidate.has_canonical_conflict:
+            continue
+        with transaction.atomic():
+            try:
+                locked = MemoryCandidate.objects.select_for_update().get(
+                    id=candidate.id,
+                    organization_id=organization_id,
+                    project_id=project_id,
+                    status=CandidateStatus.PROPOSED,
+                    decision_work_contract_version=1,
+                )
+            except MemoryCandidate.DoesNotExist:
+                continue
+            if not MemoryCandidateSource.objects.filter(candidate_id=locked.id).exists():
+                continue
+            work, _created = ensure_candidate_decision_work_locked(locked)
+            if (
+                work.disposition != WorkflowWorkDisposition.REQUIRED
+                or work.execution_state != WorkflowWorkExecutionState.READY
+            ):
+                continue
+            run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+            if run.dispatched_at != as_of:
+                continue
+            applied.append(str(candidate.id))
+
+    return CandidateWorkReconciliation(
+        organization_id=organization_id,
+        project_id=project_id,
+        as_of=as_of,
+        queued=len(applied),
+        applied=tuple(applied),
+    )
+
+
+def reconcile_scheduled_candidate_work(*, as_of: datetime) -> int:
+    require_aware(as_of)
+    scopes = (
+        MemoryCandidateSource.objects.filter(
+            candidate__status=CandidateStatus.PROPOSED,
+            candidate__decision_work_contract_version=1,
+        )
+        .values_list('organization_id', 'project_id')
+        .distinct()
+        .order_by('organization_id', 'project_id')
+    )
+
+    total = 0
+    for organization_id, project_id in scopes:
+        result = reconcile_candidate_work(
+            organization_id=organization_id,
+            project_id=project_id,
+            as_of=as_of,
+        )
+        total += result.queued
+
+    return total

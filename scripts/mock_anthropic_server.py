@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,10 +30,51 @@ def deterministic_embedding(text: str) -> list[float]:
 
 
 SESSION_TITLE_PREFIX = 'E2E session memory'
+_OBSERVATION_ID = re.compile(r'^Observation: ([0-9a-fA-F-]{36})$', re.MULTILINE)
 
 
 def generation_content(system_prompt: str, prompt: str) -> str:
     digest_suffix = hashlib.sha256(prompt.encode()).hexdigest()[:10]
+    if 'distill_extract.v1' in system_prompt:
+        observation_ids = list(dict.fromkeys(_OBSERVATION_ID.findall(prompt)))
+        memories = []
+        if observation_ids:
+            memories.append(
+                {
+                    'title': f'{SESSION_TITLE_PREFIX} {digest_suffix}',
+                    'body': f'Fixed session-distilled memory produced by the mock provider for {digest_suffix}.',
+                    'confidence': 0.9,
+                    'supporting_observation_ids': observation_ids,
+                }
+            )
+        return json.dumps(
+            {
+                'memories': memories,
+                'no_signal_observation_ids': [],
+            }
+        )
+    if 'distill_reduce.v1' in system_prompt:
+        try:
+            payload = json.loads(prompt)
+        except json.JSONDecodeError:
+            payload = {}
+        drafts = payload.get('drafts') if isinstance(payload, dict) else None
+        source_ids = [
+            draft['id']
+            for draft in drafts or []
+            if isinstance(draft, dict) and isinstance(draft.get('id'), str) and draft['id']
+        ]
+        memories = []
+        if source_ids:
+            memories.append(
+                {
+                    'title': f'{SESSION_TITLE_PREFIX} {digest_suffix}',
+                    'body': f'Fixed reduced session memory produced by the mock provider for {digest_suffix}.',
+                    'confidence': 0.9,
+                    'source_ids': source_ids,
+                }
+            )
+        return json.dumps({'memories': memories})
     if 'session distillation engine' in system_prompt:
         return json.dumps(
             {

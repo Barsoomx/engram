@@ -33,7 +33,7 @@ from engram.memory import work_execution
 from engram.memory.distillation_window import materialize_distillation_window
 from engram.memory.work_execution import StaleWorkFenceError, WorkClaim, claim_work
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT
-from engram.memory.workflow_work import CreateWorkflowWorkInput, create_work
+from engram.memory.workflow_work import CreateWorkflowWorkInput, canonical_json_bytes, create_work
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import ProviderCallResult
@@ -252,6 +252,84 @@ def _install_gateways(m_monkeypatch: pytest.MonkeyPatch, by_policy_id: dict[uuid
     m_monkeypatch.setattr(_GATEWAY_TARGET, lambda policy, *_args, **_kwargs: by_policy_id[policy.id])
 
 
+def _synthetic_reduction_target(window: DistillationWindow) -> dps.ProviderStageTarget:
+    manifest: dict[str, object] = {
+        'schema': 'synthetic_distill_reduce.v1',
+        'window_input_hash': window.input_hash,
+        'level': 1,
+        'ordinal': 0,
+        'source_ids': ['draft-a', 'draft-b'],
+    }
+
+    return dps.ProviderStageTarget(
+        window_id=window.id,
+        chunk_id=None,
+        stage_kind='reduce',
+        level=1,
+        ordinal=0,
+        input_manifest=manifest,
+        input_hash=hashlib.sha256(canonical_json_bytes(manifest)).hexdigest(),
+        prompt_contract='distill_reduce.v1',
+    )
+
+
+def _valid_reduction_body() -> str:
+    return json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Consolidated durable fact',
+                    'body': 'A strict synthetic reduction result.',
+                    'confidence': 0.9,
+                    'source_ids': ['draft-a', 'draft-b'],
+                }
+            ]
+        }
+    )
+
+
+class _SyntheticReductionContract:
+    stage_kind = 'reduce'
+    prompt_contract = 'distill_reduce.v1'
+
+    def prepare_call(self, stage: DistillationStage) -> dps.PreparedProviderStageCall:
+        return dps.PreparedProviderStageCall(
+            prompt=json.dumps({'drafts': [{'id': item} for item in stage.input_manifest['source_ids']]}),
+            system_prompt='Return one strict synthetic reduction object.',
+            response_kind=self.prompt_contract,
+        )
+
+    def normalize_output(self, raw_body: str, *, stage: DistillationStage) -> dict[str, object]:
+        try:
+            parsed = json.loads(raw_body)
+        except json.JSONDecodeError as error:
+            raise dps.ProviderStageOutputError('synthetic reduction output is malformed') from error
+        if not isinstance(parsed, dict) or set(parsed) != {'memories'}:
+            raise dps.ProviderStageOutputError('synthetic reduction output is malformed')
+        memories = parsed['memories']
+        if not isinstance(memories, list) or len(memories) != 1:
+            raise dps.ProviderStageOutputError('synthetic reduction output is malformed')
+        memory = memories[0]
+        if not isinstance(memory, dict) or set(memory) != {'title', 'body', 'confidence', 'source_ids'}:
+            raise dps.ProviderStageOutputError('synthetic reduction output is malformed')
+        if memory['source_ids'] != stage.input_manifest['source_ids']:
+            raise dps.ProviderStageOutputError('synthetic reduction output is malformed')
+
+        return {
+            'memories': [
+                {
+                    'title': memory['title'],
+                    'body': memory['body'],
+                    'confidence': str(memory['confidence']),
+                    'source_ids': memory['source_ids'],
+                }
+            ]
+        }
+
+
+_SYNTHETIC_REDUCTION_CONTRACT = _SyntheticReductionContract()
+
+
 @pytest.mark.django_db
 def test_stage_key_binds_work_snapshot_kind_chunk_input_and_policy_version() -> None:
     base_target = {
@@ -294,6 +372,12 @@ def test_stage_key_binds_work_snapshot_kind_chunk_input_and_policy_version() -> 
     now = timezone.now()
     claim = _claim(work, now)
 
+    target = dps.extraction_stage_target(chunk)
+    assert target.window_id == window.id
+    assert target.chunk_id == chunk.id
+    assert target.stage_kind == 'extract'
+    assert target.prompt_contract == 'distill_extract.v1'
+
     stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
     replay = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
 
@@ -326,6 +410,174 @@ def test_stage_key_binds_work_snapshot_kind_chunk_input_and_policy_version() -> 
 
 
 @pytest.mark.django_db
+def test_generic_reduction_stage_reuses_identity_call_provenance_and_replay(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('generic-reduction-replay')
+    _curation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+    gateway = _StubGateway(body=_valid_reduction_body())
+    _install_gateway(m_monkeypatch, gateway)
+
+    stage = dps.resolve_provider_stage(target, claim, now=now)
+    first = dps.execute_provider_stage(
+        stage,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now,
+        max_provider_calls=1,
+    )
+    replay = dps.execute_provider_stage(
+        stage,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now + timedelta(seconds=1),
+        max_provider_calls=1,
+    )
+
+    assert stage.stage_kind == 'reduce'
+    assert stage.chunk_id is None
+    assert stage.level == 1
+    assert stage.prompt_contract == 'distill_reduce.v1'
+    assert first.status == 'completed'
+    assert first.started_provider_calls == 1
+    assert replay.status == 'completed'
+    assert replay.started_provider_calls == 0
+    assert len(gateway.calls) == 1
+    assert gateway.calls[0].response_kind == 'distill_reduce.v1'
+    completed = DistillationStage.objects.get(id=stage.id)
+    assert completed.accepted_provider_call_id is not None
+    assert completed.output_snapshot == {
+        'memories': [
+            {
+                'title': 'Consolidated durable fact',
+                'body': 'A strict synthetic reduction result.',
+                'confidence': '0.9',
+                'source_ids': ['draft-a', 'draft-b'],
+            }
+        ]
+    }
+    assert ProviderCallRecord.objects.filter(request_id=f'distill-stage:{stage.stage_key}').count() == 1
+
+
+@pytest.mark.django_db
+def test_generic_reduction_malformed_output_retains_diagnostics_without_completion(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('generic-reduction-malformed')
+    _curation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+    gateway = _StubGateway(body='not reduction json')
+    _install_gateway(m_monkeypatch, gateway)
+
+    stage = dps.resolve_provider_stage(target, claim, now=now)
+    result = dps.execute_provider_stage(
+        stage,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now,
+        max_provider_calls=1,
+    )
+
+    assert result.status == 'retry'
+    assert result.started_provider_calls == 1
+    required = DistillationStage.objects.get(id=stage.id)
+    assert required.status == 'required'
+    assert required.last_failure_class == dps.PROVIDER_OUTPUT_MALFORMED
+    record = ProviderCallRecord.objects.get(id=result.provider_call_ids[0])
+    assert record.metadata['response_hash'] == hashlib.sha256(b'not reduction json').hexdigest()
+    assert record.metadata['response_size'] == len(b'not reduction json')
+
+
+@pytest.mark.django_db
+def test_generic_reduction_one_call_budget_continues_to_durable_fallback(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('generic-reduction-fallback-budget')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+    primary_gateway = _StubGateway(body='malformed primary')
+    fallback_gateway = _StubGateway(body=_valid_reduction_body())
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+
+    primary_stage = dps.resolve_provider_stage(target, claim, now=now)
+    first = dps.execute_provider_stage(
+        primary_stage,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now,
+        max_provider_calls=1,
+    )
+
+    assert first.status == 'continuation'
+    assert first.started_provider_calls == 1
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+    pending_fallback = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert first.stage.id == pending_fallback.id
+    assert pending_fallback.policy_role == 'fallback'
+    assert pending_fallback.status == 'required'
+    assert pending_fallback.attempt_count == 0
+
+    resumed = dps.resolve_provider_stage(target, claim, now=now + timedelta(seconds=1))
+    assert resumed.id == pending_fallback.id
+    second = dps.execute_provider_stage(
+        resumed,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now + timedelta(seconds=1),
+        max_provider_calls=1,
+    )
+
+    assert second.status == 'completed'
+    assert second.started_provider_calls == 1
+    assert second.stage.policy_role == 'fallback'
+    assert len(fallback_gateway.calls) == 1
+
+
+@pytest.mark.django_db
+def test_generic_reduction_stale_fence_cannot_commit_provider_output(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('generic-reduction-stale')
+    _curation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+
+    def steal_fence() -> None:
+        WorkflowWork.objects.filter(id=work.id).update(fencing_token=F('fencing_token') + 1)
+
+    gateway = _StubGateway(body=_valid_reduction_body(), on_call=steal_fence)
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_provider_stage(target, claim, now=now)
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_provider_stage(
+            stage,
+            claim,
+            _SYNTHETIC_REDUCTION_CONTRACT,
+            now=now,
+            max_provider_calls=1,
+        )
+
+    required = DistillationStage.objects.get(id=stage.id)
+    assert required.status == 'required'
+    assert required.accepted_provider_call_id is None
+
+
+@pytest.mark.django_db
 def test_completed_stage_replay_uses_normalized_output_without_provider_call(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -341,6 +593,7 @@ def test_completed_stage_replay_uses_normalized_output_without_provider_call(
     first = dps.execute_distillation_stage(stage, claim, now=now)
 
     assert first.status == 'completed'
+    assert first.started_provider_calls == 1
     completed = DistillationStage.objects.get(id=stage.id)
     assert completed.status == 'complete'
     assert completed.output_snapshot is not None
@@ -354,6 +607,7 @@ def test_completed_stage_replay_uses_normalized_output_without_provider_call(
     later = dps.execute_distillation_stage(stage, claim, now=now + timedelta(seconds=30))
 
     assert later.status == 'completed'
+    assert later.started_provider_calls == 0
     replayed = DistillationStage.objects.get(id=stage.id)
     assert len(gateway.calls) == 1
     assert replayed.accepted_provider_call_id == accepted_call_id
@@ -508,6 +762,7 @@ def test_malformed_primary_uses_one_safe_fallback_with_distinct_stage_key(
 
     assert result.status == 'completed'
     assert result.fallback_used is True
+    assert result.started_provider_calls == 2
     assert len(primary_gateway.calls) == 1
     assert len(fallback_gateway.calls) == 1
 
@@ -644,6 +899,95 @@ def test_stale_fence_cannot_commit_returned_provider_output(m_monkeypatch: pytes
         status='complete',
     )
     assert complete_targets.count() == 0
+
+
+@pytest.mark.django_db
+def test_provider_output_uses_fresh_time_for_commit_fence(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-expired-provider-output')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def expire_lease() -> None:
+        clock.current = claim.lease_expires_at + timedelta(microseconds=1)
+
+    gateway = _StubGateway(body=_valid_body(chunk), on_call=expire_lease)
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_distillation_stage(stage, claim, now=now)
+
+    refreshed = DistillationStage.objects.get(id=stage.id)
+    assert refreshed.status == 'required'
+    assert refreshed.output_snapshot is None
+
+
+@pytest.mark.django_db
+def test_fallback_rechecks_remaining_lease_before_provider_call(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-fallback-lease-margin')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def consume_lease_margin() -> None:
+        clock.current = claim.lease_expires_at - timedelta(seconds=29)
+
+    primary_gateway = _StubGateway(
+        error=ModelPolicyError('provider_timeout', 'provider timed out', retryable=True),
+        on_call=consume_lease_margin,
+    )
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'continuation'
+    assert result.fallback_used is False
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+    fallback_stage = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert fallback_stage.attempt_count == 0
+
+
+@pytest.mark.django_db
+def test_fallback_output_uses_fresh_time_for_commit_fence(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-expired-fallback-output')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def expire_lease() -> None:
+        clock.current = claim.lease_expires_at + timedelta(microseconds=1)
+
+    primary_gateway = _StubGateway(
+        error=ModelPolicyError('provider_timeout', 'provider timed out', retryable=True),
+    )
+    fallback_gateway = _StubGateway(body=_valid_body(chunk), on_call=expire_lease)
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 1
+    fallback_stage = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert fallback_stage.status == 'required'
+    assert fallback_stage.output_snapshot is None
+    assert fallback_stage.accepted_provider_call_id is None
 
 
 @pytest.mark.django_db
@@ -794,6 +1138,7 @@ def test_policy_revalidation_blocks_call_when_policy_disabled(
     result = dps.execute_distillation_stage(stage, claim, now=now)
 
     assert result.status == 'blocked'
+    assert result.started_provider_calls == 0
     assert len(gateway.calls) == 0
 
 
@@ -952,10 +1297,28 @@ def test_provider_call_budget_covers_primary_and_fallback(
 
     result = dps.execute_distillation_stage(stage, claim, now=now, max_provider_calls=1)
 
-    assert result.status == 'retry'
+    assert result.status == 'continuation'
     assert result.fallback_used is False
+    assert result.started_provider_calls == 1
     assert len(primary_gateway.calls) == 1
     assert len(fallback_gateway.calls) == 0
+
+    fallback_stage = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert result.stage.id == fallback_stage.id
+    assert fallback_stage.policy_role == 'fallback'
+    assert fallback_stage.attempt_count == 0
+
+    resumed = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now + timedelta(seconds=1))
+    assert resumed.id == fallback_stage.id
+    completed = dps.execute_distillation_stage(
+        resumed,
+        claim,
+        now=now + timedelta(seconds=1),
+        max_provider_calls=1,
+    )
+    assert completed.status == 'completed'
+    assert completed.started_provider_calls == 1
+    assert len(fallback_gateway.calls) == 1
 
 
 @pytest.mark.django_db
