@@ -350,6 +350,7 @@ from engram.core.models import (
     AuditEvent,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     Observation,
     Project,
     RawEventEnvelope,
@@ -406,9 +407,9 @@ if 'succeeded' not in workflow_statuses:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + f': session distillation workflow {{workflow_statuses}}')
 
 session_candidate_titles = sorted(
-    c.title
-    for c in candidates
-    if c.evidence and isinstance(c.evidence[0], dict) and c.evidence[0].get('kind') == 'session_distillation'
+    MemoryCandidateSource.objects.filter(candidate__project=project)
+    .values_list('candidate__title', flat=True)
+    .distinct()
 )
 if not session_candidate_titles:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': no session-distilled candidates yet')
