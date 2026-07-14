@@ -1509,9 +1509,15 @@ def _evaluate_p7_v1(project: Project) -> InvariantResult:
         ).only('id', 'transition_contract_version', 'current_transition_id', 'current_version'),
     )
     legacy_count = sum(1 for memory in memories if memory.transition_contract_version == 0)
+    has_legacy_promoted_candidate = MemoryCandidate.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        status=CandidateStatus.PROMOTED,
+        decision_work_contract_version=0,
+    ).exists()
     violations = _p7_v1_candidate_violations(project)
     violations.extend(_p7_v1_memory_violations(memories))
-    if not violations and legacy_count:
+    if not violations and (legacy_count or has_legacy_promoted_candidate):
         return _p7_v1_legacy_result(project)
     if not violations and not memories:
         return _missing(InvariantId.P7, violation_count=0)
