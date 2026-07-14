@@ -513,6 +513,54 @@ def test_emit_memories_tool_schema_declares_kind_enum() -> None:
     assert kind_schema['enum'] == ['decision', 'convention', 'gotcha', 'architecture', 'incident']
 
 
+def test_distill_extract_tool_schema_matches_provider_contract() -> None:
+    assert 'distill_extract.v1' in _ANTHROPIC_STRUCTURED_TOOLS
+    tool = _ANTHROPIC_STRUCTURED_TOOLS['distill_extract.v1']
+
+    assert tool['name'] == 'emit_distillation_extraction'
+    schema = tool['input_schema']
+    assert schema['type'] == 'object'
+    assert set(schema['properties']) == {'memories', 'no_signal_observation_ids'}
+    assert set(schema['required']) == {'memories', 'no_signal_observation_ids'}
+    assert schema['additionalProperties'] is False
+
+    memories = schema['properties']['memories']
+    assert memories['type'] == 'array'
+    assert memories['maxItems'] == 12
+    memory = memories['items']
+    assert memory['type'] == 'object'
+    assert memory['additionalProperties'] is False
+    assert set(memory['required']) == {'title', 'body', 'confidence', 'supporting_observation_ids'}
+    assert set(memory['properties']) == {
+        'title',
+        'body',
+        'confidence',
+        'supporting_observation_ids',
+        'kind',
+    }
+    assert memory['properties']['title'] == {'type': 'string', 'minLength': 1, 'maxLength': 255}
+    assert memory['properties']['body'] == {'type': 'string', 'maxLength': 3000}
+    assert memory['properties']['confidence'] == {'type': 'number', 'minimum': 0, 'maximum': 1}
+    assert memory['properties']['supporting_observation_ids'] == {
+        'type': 'array',
+        'items': {'type': 'string'},
+        'minItems': 1,
+        'uniqueItems': True,
+    }
+    assert schema['properties']['no_signal_observation_ids'] == {
+        'type': 'array',
+        'items': {'type': 'string'},
+        'uniqueItems': True,
+    }
+    assert memory['properties']['kind']['enum'] == [
+        'decision',
+        'convention',
+        'gotcha',
+        'architecture',
+        'incident',
+    ]
+
+
 def test_generated_candidates_payload_first_memory_carries_kind() -> None:
     payload = json.loads(generated_candidates_payload('a prompt'))
 
