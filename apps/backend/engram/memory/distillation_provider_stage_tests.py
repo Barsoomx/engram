@@ -7,6 +7,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import pytest
+from django.db import DatabaseError
 from django.db.models import F
 from django.utils import timezone
 
@@ -344,6 +345,7 @@ def test_completed_stage_replay_uses_normalized_output_without_provider_call(
     assert completed.status == 'complete'
     assert completed.output_snapshot is not None
     assert len(gateway.calls) == 1
+    assert gateway.calls[0].response_kind == 'distill_extract.v1'
     accepted_call_id = completed.accepted_provider_call_id
     output_snapshot = completed.output_snapshot
     output_hash = completed.output_hash
@@ -680,7 +682,7 @@ def test_stage_audit_retains_hashes_not_prompt_or_response_content(m_monkeypatch
     work, _window, chunk = _single_chunk(scope, sequences=(1,), bodies=(f'observation body {prompt_marker}',))
     now = timezone.now()
     claim = _claim(work, now)
-    raw_body = '```json\n' + _valid_body(chunk) + '\n```'
+    raw_body = _valid_body(chunk)
     gateway = _StubGateway(body=raw_body)
     _install_gateway(m_monkeypatch, gateway)
     stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
@@ -707,3 +709,326 @@ def test_stage_audit_retains_hashes_not_prompt_or_response_content(m_monkeypatch
     assert prompt_marker not in serialized_stage
     assert '```' not in serialized_stage
     assert raw_body not in serialized_stage
+
+
+@pytest.mark.django_db
+def test_tampered_observation_digest_fails_before_attempt_or_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-digest-boundary')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    Observation.objects.filter(id=_chunk_observation_ids(chunk)[0]).update(body='tampered')
+
+    with pytest.raises(dps.ExtractionContractError):
+        dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert len(gateway.calls) == 0
+    assert DistillationStage.objects.get(id=stage.id).attempt_count == 0
+
+
+@pytest.mark.django_db
+def test_completed_replay_rechecks_claim_fence_before_returning(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-replay-fence')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    assert dps.execute_distillation_stage(stage, claim, now=now).status == 'completed'
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_distillation_stage(stage, claim, now=now + _LEASE + timedelta(seconds=1))
+
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.django_db
+def test_completed_target_replay_across_policy_stage_does_not_call_provider(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-target-replay')
+    policy = _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    first_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, first_gateway)
+    first_stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    assert dps.execute_distillation_stage(first_stage, claim, now=now).status == 'completed'
+
+    ModelPolicy.objects.filter(id=policy.id).update(version=policy.version + 1)
+    second_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, second_gateway)
+    second_stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    replay = dps.execute_distillation_stage(second_stage, claim, now=now)
+
+    assert replay.status == 'completed'
+    assert replay.stage.id == first_stage.id
+    assert len(second_gateway.calls) == 0
+
+
+@pytest.mark.django_db
+def test_policy_revalidation_blocks_call_when_policy_disabled(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-policy-revalidation')
+    policy = _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    ModelPolicy.objects.filter(id=policy.id).update(active=False)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'blocked'
+    assert len(gateway.calls) == 0
+
+
+@pytest.mark.parametrize('value', [True, float('nan'), float('inf'), float('-inf')])
+def test_parse_confidence_rejects_bool_and_non_finite_values(value: object) -> None:
+    with pytest.raises(dps.ExtractionContractError):
+        dps._parse_confidence(value)
+
+
+def test_parse_extraction_rejects_non_json_fence_wrappers() -> None:
+    body = json.dumps({'memories': [], 'no_signal_observation_ids': []})
+    with pytest.raises(dps.ExtractionContractError):
+        dps.parse_extraction_output(f'```json\n{body}\n```', chunk_observation_ids=frozenset())
+
+
+@pytest.mark.django_db
+def test_malformed_result_records_response_diagnostics_and_provider_call_id(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-malformed-diagnostics')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    raw_body = 'not valid extraction json'
+    gateway = _StubGateway(body=raw_body)
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.provider_call_ids
+    record = ProviderCallRecord.objects.get(id=result.provider_call_ids[0])
+    assert record.metadata['response_hash'] == hashlib.sha256(raw_body.encode()).hexdigest()
+    assert record.metadata['response_size'] == len(raw_body.encode())
+
+
+@pytest.mark.django_db
+def test_http_425_does_not_use_fallback(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-425')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    primary_gateway = _StubGateway(
+        error=ModelPolicyError('provider_http_error', 'provider returned 425', retryable=True, http_status=425)
+    )
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert len(fallback_gateway.calls) == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'label,error',
+    (
+        ('timeout', ModelPolicyError('provider_timeout', 'provider timed out', retryable=True)),
+        ('connection', ConnectionError('provider unreachable')),
+        (
+            'rate_limited',
+            ModelPolicyError('provider_http_error', 'provider returned 429', retryable=True, http_status=429),
+        ),
+        (
+            'server_error',
+            ModelPolicyError('provider_http_error', 'provider returned 503', retryable=True, http_status=503),
+        ),
+    ),
+)
+def test_only_explicit_safe_provider_failures_use_fallback(
+    m_monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    error: BaseException,
+) -> None:
+    scope = _scope(f'stage-safe-fallback-{label}')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    primary_gateway = _StubGateway(error=error)
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'completed'
+    assert result.fallback_used is True
+    assert len(result.provider_call_ids) == 2
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 1
+
+
+@pytest.mark.django_db
+def test_database_failure_never_uses_provider_fallback(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-database-no-fallback')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    primary_gateway = _StubGateway(error=DatabaseError('database unavailable'))
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.fallback_used is False
+    assert result.failure is not None
+    assert result.failure.code == 'database_unavailable'
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+
+
+@pytest.mark.django_db
+def test_gateway_factory_and_call_connection_errors_are_classified(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-typed-boundary')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    m_monkeypatch.setattr(_GATEWAY_TARGET, lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError('down')))
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.failure is not None
+    assert result.failure.code == 'dependency_unreachable'
+
+
+@pytest.mark.django_db
+def test_provider_call_budget_covers_primary_and_fallback(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-call-budget')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    primary_gateway = _StubGateway(body='invalid')
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now, max_provider_calls=1)
+
+    assert result.status == 'retry'
+    assert result.fallback_used is False
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+
+
+@pytest.mark.django_db
+def test_mismatched_provider_call_record_cannot_complete_stage(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-forged-provenance')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+
+    def forge_record() -> None:
+        record = ProviderCallRecord.objects.order_by('-created_at').first()
+        assert record is not None
+        ProviderCallRecord.objects.filter(id=record.id).update(policy_version=record.policy_version + 1)
+
+    _install_gateway(m_monkeypatch, _StubGateway(body=_valid_body(chunk), on_call=forge_record))
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.failure is not None
+    assert result.failure.code == 'unexpected_exception'
+    assert DistillationStage.objects.get(id=stage.id).status == 'required'
+
+
+@pytest.mark.django_db
+def test_failed_primary_and_fallback_preserve_ordered_provider_call_ids(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-fallback-failure-provenance')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    primary_gateway = _StubGateway(body='invalid primary')
+    fallback_gateway = _StubGateway(body='invalid fallback')
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.fallback_used is True
+    assert result.failure is not None
+    assert result.failure.code == dps.PROVIDER_OUTPUT_MALFORMED
+    assert len(result.provider_call_ids) == 2
+    records = list(
+        ProviderCallRecord.objects.filter(
+            request_id__in=[
+                f'distill-stage:{stage.stage_key}',
+                f'distill-stage:{DistillationStage.objects.get(policy_id=fallback_policy.id).stage_key}',
+            ]
+        ).order_by('created_at', 'id')
+    )
+    assert [str(record.id) for record in records] == list(result.provider_call_ids)
+
+
+@pytest.mark.django_db
+def test_real_factory_fake_gateway_reaches_strict_stage_and_replays_without_duplicate_call() -> None:
+    scope = _scope('stage-real-factory')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    first = dps.execute_distillation_stage(stage, claim, now=now)
+    replay = dps.execute_distillation_stage(stage, claim, now=now + timedelta(seconds=1))
+
+    assert first.status == 'completed'
+    assert replay.status == 'completed'
+    assert ProviderCallRecord.objects.filter(request_id=f'distill-stage:{stage.stage_key}').count() == 1
