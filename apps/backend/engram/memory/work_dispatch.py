@@ -23,6 +23,7 @@ _TASK_NAME_BY_WORK = {
     WorkflowWorkType.DAILY_DIGEST: 'engram.memory.generate_daily_digest_work_v1',
     WorkflowWorkType.WEEKLY_DIGEST: 'engram.memory.generate_weekly_digest_work_v1',
     WorkflowWorkType.CANDIDATE_DECISION: 'engram.memory.process_candidate_decision_work_v1',
+    WorkflowWorkType.MEMORY_EMBEDDING: 'engram.memory.embed_memory_projection_work_v1',
 }
 
 ALLOWED_TASK_NAMES = frozenset(_TASK_NAME_BY_WORK.values())

@@ -689,6 +689,60 @@ def redact_error(message: str) -> str:
 
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> PromoteMemoryCandidateResult:
+        candidate_contract_version = (
+            MemoryCandidate.objects.filter(id=data.candidate_id)
+            .values_list('decision_work_contract_version', flat=True)
+            .first()
+        )
+        if candidate_contract_version == 1:
+            from engram.memory.candidate_decision_work import evidence_manifest
+            from engram.memory.transitions import (
+                CandidateFence,
+                TransitionRequest,
+                TransitionScope,
+            )
+            from engram.memory.transitions import (
+                PromoteMemoryCandidate as AtomicPromoteMemoryCandidate,
+            )
+            from engram.memory.transitions import (
+                PromoteMemoryCandidateInput as AtomicPromoteMemoryCandidateInput,
+            )
+
+            candidate = MemoryCandidate.objects.get(id=data.candidate_id)
+            _entries, manifest_hash = evidence_manifest(candidate)
+            atomic_result = AtomicPromoteMemoryCandidate().execute(
+                AtomicPromoteMemoryCandidateInput(
+                    request=TransitionRequest(
+                        scope=TransitionScope(
+                            organization_id=candidate.organization_id,
+                            project_id=candidate.project_id,
+                            team_id=candidate.team_id,
+                        ),
+                        idempotency_key=f'candidate:{candidate.id}:settle:v1',
+                        actor_type='memory_worker',
+                        actor_id='memory-worker',
+                        capability='memories:write',
+                        request_id=f'legacy-promotion:{candidate.id}',
+                        correlation_id=f'legacy-promotion:{candidate.id}',
+                        reason='candidate promotion',
+                        origin='memory-worker',
+                    ),
+                    candidate_fence=CandidateFence(
+                        candidate_id=candidate.id,
+                        candidate_content_hash=candidate.content_hash,
+                        evidence_manifest_hash=manifest_hash,
+                    ),
+                ),
+            )
+            candidate.refresh_from_db()
+            return PromoteMemoryCandidateResult(
+                candidate=candidate,
+                memory=atomic_result.memory,
+                memory_version=atomic_result.memory_version,
+                retrieval_document=atomic_result.retrieval_document,
+                duplicate=atomic_result.duplicate,
+            )
+
         with transaction.atomic():
             candidate = self._lock_candidate(data.candidate_id)
             if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:

@@ -39,6 +39,7 @@ _TASK_TYPE_BY_WORK = {
     WorkflowWorkType.SESSION_DISTILLATION: 'generation',
     WorkflowWorkType.DAILY_DIGEST: 'digest',
     WorkflowWorkType.WEEKLY_DIGEST: 'digest',
+    WorkflowWorkType.MEMORY_EMBEDDING: 'embedding',
 }
 
 _TERMINAL_EXECUTION_STATES = frozenset(

@@ -16,6 +16,7 @@ from engram.core.models import (
     Observation,
     Project,
     ProjectTeam,
+    RetrievalDocument,
     Team,
     WorkflowSubjectType,
     WorkflowWork,
@@ -37,6 +38,7 @@ _WORK_SUBJECT_PAIRS = frozenset(
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.PROJECT),
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.TEAM),
         (WorkflowWorkType.CANDIDATE_DECISION, WorkflowSubjectType.MEMORY_CANDIDATE),
+        ('memory_embedding', 'retrieval_document'),
     }
 )
 _OBSERVATION_SNAPSHOT_KEYS = frozenset({'schema', 'observation_id', 'observation_digest', 'policy'})
@@ -87,6 +89,9 @@ _CANDIDATE_SNAPSHOT_KEYS = frozenset(
         'evidence_manifest_hash',
         'policy_version',
     }
+)
+_EMBEDDING_SNAPSHOT_KEYS = frozenset(
+    {'schema', 'retrieval_document_id', 'memory_id', 'memory_version_id', 'exact_projection_hash'}
 )
 
 
@@ -367,6 +372,97 @@ def _validate_candidate_snapshot(
         raise ValueError('unsupported candidate decision policy version')
 
 
+def _identity_input_for_observation(*, subject_id: uuid.UUID, input_snapshot: dict[str, object], **_: object) -> object:
+    return _observation_identity_input(subject_id=subject_id, input_snapshot=input_snapshot)
+
+
+def _identity_input_for_session(*, subject_id: uuid.UUID, input_snapshot: dict[str, object], **_: object) -> object:
+    _validate_session_snapshot(subject_id, input_snapshot)
+    return input_snapshot
+
+
+def _identity_input_for_daily(
+    *, subject_id: uuid.UUID, occurrence_key: str, input_snapshot: dict[str, object], **_: object
+) -> object:
+    _validate_daily_snapshot(
+        subject_id=subject_id,
+        occurrence_key=occurrence_key,
+        input_snapshot=input_snapshot,
+    )
+    return input_snapshot
+
+
+def _identity_input_for_candidate(*, subject_id: uuid.UUID, input_snapshot: dict[str, object], **_: object) -> object:
+    _require_exact_keys(input_snapshot, _CANDIDATE_SNAPSHOT_KEYS, 'candidate decision snapshot')
+    if input_snapshot.get('schema') != 'candidate_decision_input/v1':
+        raise ValueError('unsupported candidate decision work snapshot schema')
+    _require_sha256(input_snapshot.get('candidate_content_hash'), 'candidate snapshot content hash')
+    _require_sha256(input_snapshot.get('evidence_manifest_hash'), 'candidate evidence manifest hash')
+    if input_snapshot.get('candidate_id') != str(subject_id):
+        raise ValueError('candidate snapshot subject does not match work subject')
+    return input_snapshot
+
+
+def _identity_input_for_embedding(*, subject_id: uuid.UUID, input_snapshot: dict[str, object], **_: object) -> object:
+    _require_exact_keys(input_snapshot, _EMBEDDING_SNAPSHOT_KEYS, 'memory embedding snapshot')
+    if input_snapshot.get('schema') != 'memory_embedding/v1':
+        raise ValueError('unsupported memory embedding work snapshot schema')
+    if input_snapshot.get('retrieval_document_id') != str(subject_id):
+        raise ValueError('memory embedding snapshot subject does not match work subject')
+    for field in ('memory_id', 'memory_version_id'):
+        try:
+            uuid.UUID(str(input_snapshot.get(field)))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise ValueError(f'memory embedding snapshot {field} must be a UUID') from error
+    _require_sha256(input_snapshot.get('exact_projection_hash'), 'memory embedding projection hash')
+    return input_snapshot
+
+
+def _identity_input_for_weekly(
+    *,
+    subject_type: str,
+    subject_id: uuid.UUID,
+    occurrence_key: str,
+    input_snapshot: dict[str, object],
+    **_: object,
+) -> object:
+    _validate_weekly_snapshot(
+        subject_type=subject_type,
+        subject_id=subject_id,
+        occurrence_key=occurrence_key,
+        input_snapshot=input_snapshot,
+    )
+    return input_snapshot
+
+
+def _identity_input_for_work(
+    *,
+    work_type: str,
+    subject_type: str,
+    subject_id: uuid.UUID,
+    occurrence_key: str,
+    input_snapshot: dict[str, object],
+) -> object:
+    builders = (
+        (WorkflowWorkType.OBSERVATION_PROCESSING, _identity_input_for_observation),
+        (WorkflowWorkType.SESSION_DISTILLATION, _identity_input_for_session),
+        (WorkflowWorkType.DAILY_DIGEST, _identity_input_for_daily),
+        (WorkflowWorkType.CANDIDATE_DECISION, _identity_input_for_candidate),
+        ('memory_embedding', _identity_input_for_embedding),
+    )
+    builder = _identity_input_for_weekly
+    for known_work_type, known_builder in builders:
+        if work_type == known_work_type:
+            builder = known_builder
+            break
+    return builder(
+        subject_type=subject_type,
+        subject_id=subject_id,
+        occurrence_key=occurrence_key,
+        input_snapshot=input_snapshot,
+    )
+
+
 def _identity_projection(
     *,
     work_type: str,
@@ -387,38 +483,13 @@ def _identity_projection(
         contract_version=contract_version,
         occurrence_key=occurrence_key,
     )
-    if work_type == WorkflowWorkType.OBSERVATION_PROCESSING:
-        identity_input: object = _observation_identity_input(
-            subject_id=subject_id,
-            input_snapshot=input_snapshot,
-        )
-    elif work_type == WorkflowWorkType.SESSION_DISTILLATION:
-        _validate_session_snapshot(subject_id, input_snapshot)
-        identity_input = input_snapshot
-    elif work_type == WorkflowWorkType.DAILY_DIGEST:
-        _validate_daily_snapshot(
-            subject_id=subject_id,
-            occurrence_key=occurrence_key,
-            input_snapshot=input_snapshot,
-        )
-        identity_input = input_snapshot
-    elif work_type == WorkflowWorkType.CANDIDATE_DECISION:
-        _require_exact_keys(input_snapshot, _CANDIDATE_SNAPSHOT_KEYS, 'candidate decision snapshot')
-        if input_snapshot.get('schema') != 'candidate_decision_input/v1':
-            raise ValueError('unsupported candidate decision work snapshot schema')
-        _require_sha256(input_snapshot.get('candidate_content_hash'), 'candidate snapshot content hash')
-        _require_sha256(input_snapshot.get('evidence_manifest_hash'), 'candidate evidence manifest hash')
-        if input_snapshot.get('candidate_id') != str(subject_id):
-            raise ValueError('candidate snapshot subject does not match work subject')
-        identity_input = input_snapshot
-    else:
-        _validate_weekly_snapshot(
-            subject_type=subject_type,
-            subject_id=subject_id,
-            occurrence_key=occurrence_key,
-            input_snapshot=input_snapshot,
-        )
-        identity_input = input_snapshot
+    identity_input = _identity_input_for_work(
+        work_type=work_type,
+        subject_type=subject_type,
+        subject_id=subject_id,
+        occurrence_key=occurrence_key,
+        input_snapshot=input_snapshot,
+    )
 
     projection = {
         'contract_version': contract_version,
@@ -497,37 +568,65 @@ def _resolve_project_team(data: CreateWorkflowWorkInput, project: Project) -> tu
     return subject, subject.id
 
 
+def _resolve_observation_team(data: CreateWorkflowWorkInput, project: Project) -> tuple[Observation, uuid.UUID | None]:
+    try:
+        subject = Observation.objects.get(
+            id=data.subject_id,
+            organization_id=data.organization_id,
+            project_id=project.id,
+        )
+    except Observation.DoesNotExist as error:
+        raise WorkflowWorkScopeError('observation is outside the declared work scope') from error
+
+    _validate_derived_team(subject.team_id, data.organization_id)
+
+    return subject, subject.team_id
+
+
+def _resolve_session_team(data: CreateWorkflowWorkInput, project: Project) -> tuple[AgentSession, uuid.UUID | None]:
+    try:
+        subject = AgentSession.objects.get(
+            id=data.subject_id,
+            organization_id=data.organization_id,
+            project_id=project.id,
+        )
+    except AgentSession.DoesNotExist as error:
+        raise WorkflowWorkScopeError('session is outside the declared work scope') from error
+
+    _validate_derived_team(subject.team_id, data.organization_id)
+
+    return subject, subject.team_id
+
+
+def _resolve_retrieval_document_team(
+    data: CreateWorkflowWorkInput, project: Project
+) -> tuple[RetrievalDocument, uuid.UUID | None]:
+    try:
+        subject = RetrievalDocument.objects.select_related('team').get(
+            id=data.subject_id,
+            organization_id=data.organization_id,
+            project_id=project.id,
+        )
+    except RetrievalDocument.DoesNotExist as error:
+        raise WorkflowWorkScopeError('retrieval document is outside the declared work scope') from error
+
+    _validate_derived_team(subject.team_id, data.organization_id)
+
+    return subject, subject.team_id
+
+
 def _resolve_subject_team(data: CreateWorkflowWorkInput, project: Project) -> tuple[object, uuid.UUID | None]:
     if data.subject_type == WorkflowSubjectType.OBSERVATION:
-        try:
-            subject = Observation.objects.get(
-                id=data.subject_id,
-                organization_id=data.organization_id,
-                project_id=project.id,
-            )
-        except Observation.DoesNotExist as error:
-            raise WorkflowWorkScopeError('observation is outside the declared work scope') from error
-
-        _validate_derived_team(subject.team_id, data.organization_id)
-
-        return subject, subject.team_id
+        return _resolve_observation_team(data, project)
 
     if data.subject_type == WorkflowSubjectType.AGENT_SESSION:
-        try:
-            subject = AgentSession.objects.get(
-                id=data.subject_id,
-                organization_id=data.organization_id,
-                project_id=project.id,
-            )
-        except AgentSession.DoesNotExist as error:
-            raise WorkflowWorkScopeError('session is outside the declared work scope') from error
-
-        _validate_derived_team(subject.team_id, data.organization_id)
-
-        return subject, subject.team_id
+        return _resolve_session_team(data, project)
 
     if data.subject_type == WorkflowSubjectType.MEMORY_CANDIDATE:
         return _resolve_candidate_team(data, project)
+
+    if data.subject_type == 'retrieval_document':
+        return _resolve_retrieval_document_team(data, project)
 
     if data.subject_type == WorkflowSubjectType.PROJECT:
         if data.subject_id != project.id:
@@ -574,6 +673,16 @@ def _validate_subject_snapshot(
         _validate_observation_snapshot(subject, input_snapshot)
     elif isinstance(subject, MemoryCandidate):
         _validate_candidate_snapshot(subject_id=data.subject_id, subject=subject, input_snapshot=input_snapshot)
+    elif data.subject_type == 'retrieval_document':
+        _require_exact_keys(input_snapshot, _EMBEDDING_SNAPSHOT_KEYS, 'memory embedding snapshot')
+        if input_snapshot['retrieval_document_id'] != str(data.subject_id):
+            raise ValueError('memory embedding snapshot subject does not match work subject')
+        if input_snapshot['memory_id'] != str(subject.memory_id):
+            raise ValueError('memory embedding snapshot memory does not match document')
+        if input_snapshot['memory_version_id'] != str(subject.memory_version_id):
+            raise ValueError('memory embedding snapshot version does not match document')
+        if input_snapshot['exact_projection_hash'] != getattr(subject, 'exact_projection_hash', ''):
+            raise ValueError('memory embedding snapshot hash does not match document')
     elif data.subject_type == WorkflowSubjectType.TEAM:
         if input_snapshot['project_id'] != str(data.project_id):
             raise ValueError('digest snapshot project does not match work project')

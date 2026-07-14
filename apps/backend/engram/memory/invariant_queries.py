@@ -16,6 +16,7 @@ from django.utils import timezone
 
 from engram.core.models import (
     AgentSession,
+    AuditEvent,
     CandidateStatus,
     DistillationCoverageOutcome,
     DistillationObservationCoverage,
@@ -1211,7 +1212,241 @@ def projection_inconsistency_memory_ids(
     return tuple(sorted(memory_ids, key=lambda memory_id: memory_id.int))
 
 
+def _p7_v1_candidate_violations(project: Project, memory_transition: type) -> list[uuid.UUID]:
+    violations: list[uuid.UUID] = []
+    promoted_candidates = MemoryCandidate.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        status=CandidateStatus.PROMOTED,
+        decision_work_contract_version=1,
+    ).only('id', 'promoted_memory_id')
+    for candidate in promoted_candidates:
+        transitions = memory_transition.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            candidate_id=candidate.id,
+            transition_type='promote',
+        )
+        if transitions.count() != 1 or candidate.promoted_memory_id is None:
+            violations.append(candidate.id)
+            continue
+        transition = transitions.first()
+        decision_work_ok = WorkflowWork.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            work_type='candidate_decision',
+            subject_id=candidate.id,
+            disposition__in=('complete', 'no_op'),
+            resolved_at__isnull=False,
+        ).exists()
+        if transition is None or transition.result_memory_id != candidate.promoted_memory_id or not decision_work_ok:
+            violations.append(candidate.promoted_memory_id or candidate.id)
+
+    return violations
+
+
+def _p7_v1_pointer_is_valid(memory: Memory, transition: object, version: MemoryVersion) -> bool:
+    return all(
+        (
+            transition.organization_id == memory.organization_id,
+            transition.project_id == memory.project_id,
+            transition.memory_id == memory.id,
+            transition.result_memory_id == memory.id,
+            transition.to_version_id == version.id,
+            transition.result_version_id == version.id,
+            transition.exact_document_id is not None,
+            transition.result_exact_document_id is not None,
+            transition.embedding_work_id is not None,
+            transition.audit_event_id is not None,
+            version.body == memory.body,
+        ),
+    )
+
+
+def _p7_v1_document_is_valid(
+    memory: Memory,
+    transition: object,
+    version: MemoryVersion,
+    document: RetrievalDocument | None,
+) -> bool:
+    if document is None:
+        return False
+
+    return all(
+        (
+            getattr(document, 'projection_contract_version', 0) == 1,
+            bool(getattr(document, 'exact_projection_hash', '')),
+            document.memory_id == memory.id,
+            document.memory_version_id == version.id,
+            document.organization_id == memory.organization_id,
+            document.project_id == memory.project_id,
+            document.team_id == memory.team_id,
+            transition.exact_document_id == document.id,
+            transition.result_exact_document_id == document.id,
+            document.visibility_scope == memory.visibility_scope,
+            document.stale == memory.stale,
+            document.refuted == memory.refuted,
+        ),
+    )
+
+
+def _p7_v1_audit_is_valid(memory: Memory, transition: object) -> bool:
+    if not transition.audit_event_id:
+        return False
+
+    return AuditEvent.objects.filter(
+        id=transition.audit_event_id,
+        event_type='MemoryTransitionCommitted',
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        metadata__schema='memory_transition/v1',
+        metadata__transition_id=str(transition.id),
+    ).exists()
+
+
+def _p7_v1_work_is_valid(memory: Memory, transition: object, document: RetrievalDocument | None) -> bool:
+    return WorkflowWork.objects.filter(
+        id=transition.embedding_work_id,
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        work_type='memory_embedding',
+        subject_type='retrieval_document',
+        subject_id=document.id if document is not None else None,
+        input_snapshot__exact_projection_hash=document.exact_projection_hash if document is not None else '',
+    ).exists()
+
+
+def _p7_v1_memory_is_coherent(
+    memory: Memory,
+    memory_transition: type,
+    memory_version_source: type,
+) -> bool:
+    if memory.transition_contract_version != 1 or not memory.current_transition_id:
+        return False
+
+    transition = memory_transition.objects.filter(id=memory.current_transition_id).first()
+    version = MemoryVersion.objects.filter(memory_id=memory.id, version=memory.current_version).first()
+    if transition is None or version is None:
+        return False
+
+    valid_pointer = _p7_v1_pointer_is_valid(memory, transition, version)
+    source_ok = memory_version_source.objects.filter(memory_version_id=version.id).exists()
+    document = RetrievalDocument.objects.filter(memory_version_id=version.id).first()
+    document_ok = _p7_v1_document_is_valid(memory, transition, version, document)
+    audit_ok = _p7_v1_audit_is_valid(memory, transition)
+    work_ok = _p7_v1_work_is_valid(memory, transition, document)
+
+    return valid_pointer and source_ok and document_ok and audit_ok and work_ok
+
+
+def _p7_v1_memory_violations(
+    memories: list[Memory],
+    memory_transition: type,
+    memory_version_source: type,
+) -> list[uuid.UUID]:
+    violations: list[uuid.UUID] = []
+    for memory in memories:
+        if memory.transition_contract_version == 0:
+            continue
+        if not _p7_v1_memory_is_coherent(memory, memory_transition, memory_version_source):
+            violations.append(memory.id)
+
+    return violations
+
+
+def _p7_v1_legacy_result(project: Project) -> InvariantResult:
+    scoped_promoted_memory = Memory.objects.filter(
+        organization_id=project.organization_id,
+        project_id=project.id,
+        id=OuterRef('promoted_memory_id'),
+    )
+    legacy_orphans = (
+        MemoryCandidate.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            status=CandidateStatus.PROMOTED,
+        )
+        .annotate(has_scoped_promoted_memory=Exists(scoped_promoted_memory))
+        .filter(
+            has_scoped_promoted_memory=False,
+        )
+    )
+    missing_versions, mismatched_bodies, bad_documents = _p7_memory_projection_querysets(
+        organization_id=project.organization_id,
+        project_id=project.id,
+    )
+    legacy_violations = (
+        legacy_orphans.count() + missing_versions.count() + mismatched_bodies.count() + bad_documents.count()
+    )
+    if legacy_violations:
+        legacy_samples = _merge_samples(
+            _query_samples(legacy_orphans, 'candidate'),
+            _query_samples(missing_versions, 'memory'),
+            _query_samples(mismatched_bodies, 'memory'),
+            _query_samples(bad_documents, 'memory'),
+        )
+        return InvariantResult(
+            invariant_id=InvariantId.P7,
+            state=InvariantState.VIOLATED,
+            reason='promotion_chain_inconsistent',
+            violation_count=legacy_violations,
+            sample_ids=legacy_samples,
+            missing_evidence='relational promotion provenance and transition audit identity',
+            target_checkpoint='CP4',
+        )
+
+    return InvariantResult(
+        invariant_id=InvariantId.P7,
+        state=InvariantState.MISSING_OBSERVABILITY,
+        reason='legacy_transition_observability_missing',
+        violation_count=0,
+        missing_evidence='immutable transition history and authoritative current pointer',
+        target_checkpoint='CP4',
+    )
+
+
+def _evaluate_p7_v1(project: Project) -> InvariantResult:
+    from engram.core.models import MemoryTransition, MemoryVersionSource
+
+    memories = list(
+        Memory.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+        ).only('id', 'transition_contract_version', 'current_transition_id', 'current_version'),
+    )
+    legacy_count = sum(1 for memory in memories if memory.transition_contract_version == 0)
+    violations = _p7_v1_candidate_violations(project, MemoryTransition)
+    violations.extend(_p7_v1_memory_violations(memories, MemoryTransition, MemoryVersionSource))
+    if not violations and legacy_count:
+        return _p7_v1_legacy_result(project)
+    if not violations and not memories:
+        return _missing(InvariantId.P7, violation_count=0)
+    if not violations:
+        return InvariantResult(
+            invariant_id=InvariantId.P7,
+            state=InvariantState.HEALTHY,
+            reason='promotion_chain_coherent',
+            violation_count=0,
+            target_checkpoint='CP4',
+        )
+    sample_ids = tuple(
+        f'memory:{value}' for value in sorted(set(violations), key=lambda item: item.int)[:_SAMPLE_LIMIT]
+    )
+    return InvariantResult(
+        invariant_id=InvariantId.P7,
+        state=InvariantState.VIOLATED,
+        reason='promotion_chain_inconsistent',
+        violation_count=len(violations),
+        sample_ids=sample_ids,
+        missing_evidence='relational promotion provenance and transition audit identity',
+        target_checkpoint='CP4',
+    )
+
+
 def _evaluate_p7(project: Project) -> InvariantResult:
+    if hasattr(Memory, 'transition_contract_version'):
+        return _evaluate_p7_v1(project)
+
     scoped_promoted_memory = Memory.objects.filter(
         organization_id=project.organization_id,
         project_id=project.id,

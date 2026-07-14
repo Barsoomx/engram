@@ -161,7 +161,7 @@ def test_post_commit_activity_can_be_suppressed_without_losing_exact_recall(monk
     candidate, _source, _scope = _provenanced_candidate('suppressed-post-commit')
     transitions = _transitions()
     before_signals = CeleryOutbox.objects.count()
-    monkeypatch.setattr(transitions.transaction, 'on_commit', lambda _callback: None)
+    monkeypatch.setattr(transitions.transaction, 'on_commit', lambda _callback, **_kwargs: None)
 
     result = transitions.PromoteMemoryCandidate().execute(_request(candidate))
 

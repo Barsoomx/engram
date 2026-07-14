@@ -15,6 +15,7 @@ from engram.core.models import (
     AgentSession,
     MemoryCandidate,
     Observation,
+    RetrievalDocument,
     WorkflowRun,
     WorkflowRunOrigin,
     WorkflowRunStatus,
@@ -79,6 +80,7 @@ _OBSERVATION_LEASE = timedelta(seconds=120)
 _SESSION_LEASE = timedelta(seconds=720)
 _DIGEST_LEASE = timedelta(seconds=240)
 _CANDIDATE_DECISION_LEASE = timedelta(seconds=120)
+_EMBEDDING_LEASE = timedelta(seconds=300)
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
 
@@ -88,6 +90,7 @@ LEASE_BY_WORK_TYPE = {
     WorkflowWorkType.DAILY_DIGEST: _DIGEST_LEASE,
     WorkflowWorkType.WEEKLY_DIGEST: _DIGEST_LEASE,
     WorkflowWorkType.CANDIDATE_DECISION: _CANDIDATE_DECISION_LEASE,
+    WorkflowWorkType.MEMORY_EMBEDDING: _EMBEDDING_LEASE,
 }
 
 
@@ -440,6 +443,34 @@ def _load_session_work_upper(work: WorkflowWork) -> int:
     return work.input_snapshot['upper_sequence_inclusive']
 
 
+def _load_embedding_work_document(work: WorkflowWork) -> RetrievalDocument:
+    if work.subject_type != 'retrieval_document':
+        raise MemoryWorkerError(
+            'workflow work subject type does not match embedding task', code='work_contract_invalid'
+        )
+    try:
+        document = RetrievalDocument.objects.select_related('memory', 'memory_version').get(
+            id=work.subject_id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+            team_id=work.team_id,
+        )
+    except RetrievalDocument.DoesNotExist as error:
+        raise MemoryWorkerError(
+            'retrieval document is outside workflow work scope', code='work_scope_invalid'
+        ) from error
+    snapshot = work.input_snapshot
+    if snapshot.get('retrieval_document_id') != str(document.id) or snapshot.get('memory_id') != str(
+        document.memory_id
+    ):
+        raise MemoryWorkerError('embedding work snapshot does not match document', code='work_fingerprint_mismatch')
+    if snapshot.get('memory_version_id') != str(document.memory_version_id):
+        raise MemoryWorkerError(
+            'embedding work snapshot version does not match document', code='work_fingerprint_mismatch'
+        )
+    return document
+
+
 @app.task(
     bind=True,
     name='engram.memory.process_observation_recorded',
@@ -648,6 +679,74 @@ def process_candidate_decision_work_v1(
         work_type=WorkflowWorkType.CANDIDATE_DECISION,
         lease_for=_CANDIDATE_DECISION_LEASE,
         event_prefix='candidate_decision_work',
+        execute=execute,
+        workflow_run_id=parsed_run_id,
+    )
+
+
+@app.task(
+    bind=True,
+    name='engram.memory.embed_memory_projection_work_v1',
+    max_retries=_MAX_RETRIES,
+    acks_late=True,
+    reject_on_worker_lost=True,
+    soft_time_limit=_DIGEST_SOFT_TIME_LIMIT,
+    time_limit=_DIGEST_TIME_LIMIT,
+)
+def embed_memory_projection_work_v1(
+    self: object,
+    work_id: object,
+    workflow_run_id: object = None,
+) -> str:
+    from engram.memory.projections import complete_embedding_projection
+    from engram.model_policy.services import (
+        EmbeddingCallInput,
+        ResolveModelPolicy,
+        ResolveModelPolicyInput,
+        get_provider_gateway,
+    )
+
+    parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
+    work = _load_versioned_work(parsed_work_id, 'memory_embedding')
+    document = _load_embedding_work_document(work)
+
+    def execute(claim: object) -> str:
+        _verify_work_fingerprint(work)
+        resolved = ResolveModelPolicy().execute(
+            ResolveModelPolicyInput(
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                task_type='embedding',
+            )
+        )
+        result = get_provider_gateway(resolved.policy).embed(
+            EmbeddingCallInput(
+                organization_id=work.organization_id,
+                project_id=work.project_id,
+                team_id=work.team_id,
+                policy=resolved.policy,
+                request_id=f'memory-embedding:{document.id}:{claim.workflow_run_id}',
+                trace_id=f'memory-embedding:{document.id}',
+                text=document.full_text,
+            )
+        )
+        complete_embedding_projection(
+            claim=claim,
+            expected_projection_hash=work.input_snapshot['exact_projection_hash'],
+            embedding=result.embedding,
+            provider_call_id=result.call_record_id,
+            now=timezone.now(),
+        )
+
+        return str(claim.workflow_run_id)
+
+    return _run_fenced_automatic(
+        self,
+        work,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        lease_for=_EMBEDDING_LEASE,
+        event_prefix='memory_embedding_work',
         execute=execute,
         workflow_run_id=parsed_run_id,
     )

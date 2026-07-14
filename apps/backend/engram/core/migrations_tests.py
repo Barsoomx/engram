@@ -2645,6 +2645,8 @@ def test_0038_forward_preserves_legacy_rows_and_adds_complete_atomic_schema() ->
         organization_model = old_apps.get_model('core', 'Organization')
         project_model = old_apps.get_model('core', 'Project')
         memory_model = old_apps.get_model('core', 'Memory')
+        memory_version_model = old_apps.get_model('core', 'MemoryVersion')
+        retrieval_document_model = old_apps.get_model('core', 'RetrievalDocument')
         suffix = uuid.uuid4().hex
         organization = organization_model.objects.create(name=f'Legacy {suffix}', slug=f'legacy-{suffix}')
         project = project_model.objects.create(
@@ -2659,7 +2661,25 @@ def test_0038_forward_preserves_legacy_rows_and_adds_complete_atomic_schema() ->
             body='must survive expand',
             current_version=7,
         )
+        legacy_version = memory_version_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=legacy,
+            version=7,
+            body=legacy.body,
+            content_hash='f' * 64,
+        )
+        legacy_document = retrieval_document_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=legacy,
+            memory_version=legacy_version,
+            full_text=legacy.body,
+            embedding_reference='provider:legacy',
+            embedding_vector=[0.25],
+        )
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0038)
         new_apps = executor.loader.project_state(MIGRATE_0038).apps
         migrated = new_apps.get_model('core', 'Memory').objects.get(id=legacy.id)
@@ -2668,6 +2688,13 @@ def test_0038_forward_preserves_legacy_rows_and_adds_complete_atomic_schema() ->
         assert migrated.current_version == 7
         assert migrated.transition_contract_version == 0
         assert migrated.current_transition_id is None
+        migrated_document = new_apps.get_model('core', 'RetrievalDocument').objects.get(id=legacy_document.id)
+        assert migrated_document.projection_contract_version == 0
+        assert migrated_document.exact_projection_hash == ''
+        assert migrated_document.embedding_projection_hash == ''
+        assert migrated_document.embedding_projected_at is None
+        assert migrated_document.embedding_reference == 'provider:legacy'
+        assert migrated_document.embedding_vector == [0.25]
 
         expected_models = {
             'MemoryTransition',
@@ -2718,6 +2745,7 @@ def test_0038_reverse_removes_only_additive_schema_and_keeps_legacy_memory() -> 
             transition_contract_version=0,
         )
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0037)
         reversed_apps = executor.loader.project_state(MIGRATE_0037).apps
         reversed_memory = reversed_apps.get_model('core', 'Memory').objects.get(id=legacy.id)
@@ -2741,6 +2769,7 @@ def test_0038_fresh_apply_accepts_legacy_version_zero_memory() -> None:
 
     try:
         executor.migrate(root)
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0038)
         apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
         organization_model = apps_0038.get_model('core', 'Organization')

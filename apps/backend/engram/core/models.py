@@ -68,6 +68,28 @@ class MemoryStatus(models.TextChoices):
     CONFLICT = 'conflict', 'Conflict'
 
 
+class MemoryTransitionType(models.TextChoices):
+    PROMOTE = 'promote', 'Promote'
+    PUBLISH_DIGEST = 'publish_digest', 'Publish digest'
+    REVISE = 'revise', 'Revise'
+    ATTACH_SOURCE = 'attach_source', 'Attach source'
+    MERGE = 'merge', 'Merge'
+    SUPERSEDE = 'supersede', 'Supersede'
+    MARK_STALE = 'mark_stale', 'Mark stale'
+    REFUTE = 'refute', 'Refute'
+    RESTORE = 'restore', 'Restore'
+    ARCHIVE = 'archive', 'Archive'
+    CONFLICT_OPEN = 'conflict_open', 'Open conflict'
+    CONFLICT_RESOLVE = 'conflict_resolve', 'Resolve conflict'
+
+
+class MemoryConflictResolution(models.TextChoices):
+    PUBLISH_CANDIDATE = 'publish_candidate', 'Publish candidate'
+    MERGE_CANDIDATE = 'merge_candidate', 'Merge candidate'
+    SUPERSEDE_MEMORY = 'supersede_memory', 'Supersede memory'
+    REJECT_CANDIDATE = 'reject_candidate', 'Reject candidate'
+
+
 MEMORY_KINDS = ('decision', 'convention', 'gotcha', 'architecture', 'incident', 'digest')
 
 
@@ -665,6 +687,14 @@ class Memory(TimestampedModel):
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
     kind = models.CharField(max_length=40, blank=True, default='')
+    transition_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
+    current_transition = models.ForeignKey(
+        'MemoryTransition',
+        on_delete=models.PROTECT,
+        related_name='current_memories',
+        null=True,
+        blank=True,
+    )
 
     class Meta:
         indexes = [
@@ -681,6 +711,19 @@ class Memory(TimestampedModel):
             models.Index(
                 fields=['organization', 'project', 'kind'],
                 name='core_memory_kind_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'transition_contract_version'],
+                name='core_memory_transition_ver_idx',
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(transition_contract_version=0, current_transition__isnull=True)
+                    | models.Q(transition_contract_version=1, current_transition__isnull=False)
+                ),
+                name='core_memory_transition_pointer_ck',
             ),
         ]
         ordering = ['organization_id', 'project_id', 'title']
@@ -758,6 +801,25 @@ def retrieval_embedding_deferred_fields() -> tuple[str, ...]:
     return ('embedding_vector', 'embedding_pgvector')
 
 
+def retrieval_embedding_state_constraint() -> models.Q:
+    empty = models.Q(
+        embedding_projection_hash='',
+        embedding_projected_at__isnull=True,
+        embedding_reference='',
+        embedding_vector=[],
+    )
+    ready = models.Q(
+        embedding_projection_hash__regex=r'^[0-9a-f]{64}$',
+        embedding_projected_at__isnull=False,
+        embedding_reference__gt='',
+    ) & ~models.Q(embedding_vector=[])
+    if VectorField is not None:
+        empty &= models.Q(embedding_pgvector__isnull=True)
+        ready &= models.Q(embedding_pgvector__isnull=False)
+
+    return models.Q(projection_contract_version=0) | (models.Q(projection_contract_version=1) & (empty | ready))
+
+
 class RetrievalDocument(TimestampedModel):
     organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='retrieval_documents')
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='retrieval_documents')
@@ -790,8 +852,28 @@ class RetrievalDocument(TimestampedModel):
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
+    projection_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
+    exact_projection_hash = models.CharField(max_length=64, default='', blank=True)
+    embedding_projection_hash = models.CharField(max_length=64, default='', blank=True)
+    embedding_projected_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(projection_contract_version=0)
+                    | models.Q(
+                        projection_contract_version=1,
+                        exact_projection_hash__regex=r'^[0-9a-f]{64}$',
+                    )
+                ),
+                name='core_retrieval_document_projection_ck',
+            ),
+            models.CheckConstraint(
+                condition=retrieval_embedding_state_constraint(),
+                name='core_retrieval_document_embedding_state_ck',
+            ),
+        ]
         indexes = [
             models.Index(fields=['organization', 'project', 'visibility_scope']),
             models.Index(fields=['organization', 'project', 'stale', 'refuted']),
@@ -1057,6 +1139,7 @@ class WorkflowWorkType(models.TextChoices):
     DAILY_DIGEST = 'daily_digest', 'Daily Digest'
     WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
     CANDIDATE_DECISION = 'candidate_decision', 'Candidate Decision'
+    MEMORY_EMBEDDING = 'memory_embedding', 'Memory Embedding'
 
 
 class WorkflowSubjectType(models.TextChoices):
@@ -1065,6 +1148,7 @@ class WorkflowSubjectType(models.TextChoices):
     PROJECT = 'project', 'Project'
     TEAM = 'team', 'Team'
     MEMORY_CANDIDATE = 'memory_candidate', 'Memory Candidate'
+    RETRIEVAL_DOCUMENT = 'retrieval_document', 'Retrieval Document'
 
 
 class WorkflowWorkDisposition(models.TextChoices):
@@ -1222,6 +1306,11 @@ class WorkflowWork(TimestampedModel):
                         subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
                         occurrence_key='',
                     )
+                    | models.Q(
+                        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+                        subject_type=WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+                        occurrence_key='',
+                    )
                 ),
                 name='core_work_subject_scope_ck',
             ),
@@ -1373,6 +1462,7 @@ class WorkflowRunType(models.TextChoices):
     SESSION_DISTILLATION = 'session_distillation', 'Session Distillation'
     WEEKLY_DIGEST = 'weekly_digest', 'Weekly Digest'
     CANDIDATE_DECISION = 'candidate_decision', 'Candidate Decision'
+    MEMORY_EMBEDDING = 'memory_embedding', 'Memory Embedding'
 
 
 class WorkflowRunStatus(models.TextChoices):
@@ -1387,6 +1477,7 @@ class WorkflowRunOrigin(models.TextChoices):
     AUTOMATIC = 'automatic', 'Automatic'
     RECONCILIATION = 'reconciliation', 'Reconciliation'
     MANUAL = 'manual', 'Manual'
+    MEMORY_TRANSITION = 'memory_transition', 'Memory Transition'
 
 
 class WorkflowRunFailureClass(models.TextChoices):
@@ -2147,3 +2238,399 @@ class MemoryCandidateSource(TimestampedModel):
 
     def __str__(self) -> str:
         return f'source:{self.candidate_id}:{self.observation_id}'
+
+
+class ImmutableCreatedModel(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        abstract = True
+
+    def save(self, *args: object, **kwargs: object) -> None:
+        self.full_clean(validate_unique=False, validate_constraints=False)
+
+        super().save(*args, **kwargs)
+
+
+class MemoryTransition(ImmutableCreatedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, related_name='memory_transitions')
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='memory_transitions')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='memory_transitions',
+        null=True,
+        blank=True,
+    )
+    transition_type = models.CharField(max_length=40, choices=MemoryTransitionType.choices)
+    idempotency_key = models.CharField(max_length=255)
+    request_fingerprint = models.CharField(max_length=64)
+    candidate = models.ForeignKey(
+        MemoryCandidate,
+        on_delete=models.PROTECT,
+        related_name='memory_transitions',
+        null=True,
+        blank=True,
+    )
+    memory = models.ForeignKey(Memory, on_delete=models.PROTECT, related_name='memory_transitions')
+    from_version = models.ForeignKey(
+        MemoryVersion,
+        on_delete=models.PROTECT,
+        related_name='outgoing_memory_transitions',
+        null=True,
+        blank=True,
+    )
+    to_version = models.ForeignKey(
+        MemoryVersion,
+        on_delete=models.PROTECT,
+        related_name='incoming_memory_transitions',
+    )
+    result_memory = models.ForeignKey(
+        Memory,
+        on_delete=models.PROTECT,
+        related_name='result_memory_transitions',
+    )
+    result_version = models.ForeignKey(
+        MemoryVersion,
+        on_delete=models.PROTECT,
+        related_name='result_memory_transitions',
+    )
+    exact_document = models.ForeignKey(
+        RetrievalDocument,
+        on_delete=models.PROTECT,
+        related_name='memory_transitions',
+    )
+    result_exact_document = models.ForeignKey(
+        RetrievalDocument,
+        on_delete=models.PROTECT,
+        related_name='result_memory_transitions',
+    )
+    embedding_work = models.OneToOneField(
+        WorkflowWork,
+        on_delete=models.PROTECT,
+        related_name='embedding_transition',
+        null=True,
+        blank=True,
+    )
+    semantic_link = models.OneToOneField(
+        MemoryLink,
+        on_delete=models.PROTECT,
+        related_name='memory_transition',
+        null=True,
+        blank=True,
+    )
+    audit_event = models.OneToOneField(
+        AuditEvent,
+        on_delete=models.PROTECT,
+        related_name='memory_transition',
+    )
+    provenance_hash = models.CharField(max_length=64)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('transition_type', 'transition_type'),
+        ('idempotency_key', 'idempotency_key'),
+        ('request_fingerprint', 'request_fingerprint'),
+        ('candidate_id', 'candidate'),
+        ('memory_id', 'memory'),
+        ('from_version_id', 'from_version'),
+        ('to_version_id', 'to_version'),
+        ('result_memory_id', 'result_memory'),
+        ('result_version_id', 'result_version'),
+        ('exact_document_id', 'exact_document'),
+        ('result_exact_document_id', 'result_exact_document'),
+        ('embedding_work_id', 'embedding_work'),
+        ('semantic_link_id', 'semantic_link'),
+        ('audit_event_id', 'audit_event'),
+        ('provenance_hash', 'provenance_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['organization', 'project', 'idempotency_key'],
+                name='core_memory_transition_idempotency_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['candidate'],
+                condition=(
+                    models.Q(candidate__isnull=False)
+                    & models.Q(
+                        transition_type__in=(
+                            MemoryTransitionType.PROMOTE,
+                            MemoryTransitionType.CONFLICT_RESOLVE,
+                        )
+                    )
+                ),
+                name='core_memory_transition_candidate_terminal_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(request_fingerprint__regex=r'^[0-9a-f]{64}$'),
+                name='core_memory_transition_request_fingerprint_hex',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(provenance_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_memory_transition_provenance_hash_hex',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(
+                        transition_type__in=(
+                            MemoryTransitionType.PROMOTE,
+                            MemoryTransitionType.ATTACH_SOURCE,
+                            MemoryTransitionType.CONFLICT_OPEN,
+                            MemoryTransitionType.CONFLICT_RESOLVE,
+                        )
+                    )
+                    | models.Q(candidate__isnull=False)
+                ),
+                name='core_memory_transition_candidate_required_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'created_at'], name='core_memtrans_scope_time_idx'),
+            models.Index(
+                fields=['organization', 'project', 'transition_type', 'created_at'],
+                name='core_mtrans_scope_type_idx',
+            ),
+            models.Index(fields=['candidate'], name='core_memtrans_candidate_idx'),
+            models.Index(fields=['memory'], name='core_memtrans_memory_idx'),
+            models.Index(fields=['result_memory'], name='core_mtrans_result_mem_idx'),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        for field, related in (
+            ('candidate', self.candidate),
+            ('memory', self.memory),
+            ('from_version', self.from_version),
+            ('to_version', self.to_version),
+            ('result_memory', self.result_memory),
+            ('result_version', self.result_version),
+            ('exact_document', self.exact_document),
+            ('result_exact_document', self.result_exact_document),
+        ):
+            if related is not None:
+                check_project_scope(errors, field, related, self.organization_id, self.project_id)
+        if self.audit_event_id:
+            check_project_scope(errors, 'audit_event', self.audit_event, self.organization_id, self.project_id)
+        if self.semantic_link_id:
+            check_project_scope(errors, 'semantic_link', self.semantic_link, self.organization_id, self.project_id)
+        if self.embedding_work_id:
+            check_project_scope(errors, 'embedding_work', self.embedding_work, self.organization_id, self.project_id)
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+
+class MemoryVersionSource(ImmutableCreatedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, related_name='memory_version_sources')
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='memory_version_sources')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='memory_version_sources',
+        null=True,
+        blank=True,
+    )
+    memory_version = models.ForeignKey(MemoryVersion, on_delete=models.PROTECT, related_name='provenance_sources')
+    candidate_source = models.ForeignKey(
+        MemoryCandidateSource,
+        on_delete=models.PROTECT,
+        related_name='memory_version_sources',
+        null=True,
+        blank=True,
+    )
+    source_memory_version = models.ForeignKey(
+        MemoryVersion,
+        on_delete=models.PROTECT,
+        related_name='derived_provenance_sources',
+        null=True,
+        blank=True,
+    )
+    source_content_hash = models.CharField(max_length=64)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('memory_version_id', 'memory_version'),
+        ('candidate_source_id', 'candidate_source'),
+        ('source_memory_version_id', 'source_memory_version'),
+        ('source_content_hash', 'source_content_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['memory_version', 'candidate_source'],
+                condition=models.Q(candidate_source__isnull=False),
+                name='core_memory_version_source_candidate_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['memory_version', 'source_memory_version'],
+                condition=models.Q(source_memory_version__isnull=False),
+                name='core_memory_version_source_memory_uniq',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(candidate_source__isnull=False, source_memory_version__isnull=True)
+                    | models.Q(candidate_source__isnull=True, source_memory_version__isnull=False)
+                ),
+                name='core_memory_version_source_exactly_one_fk_ck',
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(memory_version_id=models.F('source_memory_version_id')),
+                name='core_memory_version_source_no_self_reference_ck',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(source_content_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_memory_version_source_hash_hex',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'memory_version'], name='core_memversource_scope_idx'),
+        ]
+        ordering = ['memory_version_id', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        if self.memory_version_id:
+            check_project_scope(errors, 'memory_version', self.memory_version, self.organization_id, self.project_id)
+        if self.candidate_source_id:
+            check_project_scope(
+                errors, 'candidate_source', self.candidate_source, self.organization_id, self.project_id
+            )
+        if self.source_memory_version_id:
+            check_project_scope(
+                errors,
+                'source_memory_version',
+                self.source_memory_version,
+                self.organization_id,
+                self.project_id,
+            )
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
+        raise_scope_errors(errors)
+
+
+class MemoryConflict(ImmutableCreatedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, related_name='memory_conflicts')
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='memory_conflicts')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='memory_conflicts',
+        null=True,
+        blank=True,
+    )
+    candidate = models.ForeignKey(MemoryCandidate, on_delete=models.PROTECT, related_name='memory_conflicts')
+    memory = models.ForeignKey(Memory, on_delete=models.PROTECT, related_name='memory_conflicts')
+    memory_version = models.ForeignKey(MemoryVersion, on_delete=models.PROTECT, related_name='memory_conflicts')
+    semantic_link = models.OneToOneField(MemoryLink, on_delete=models.PROTECT, related_name='memory_conflict')
+    opened_transition = models.OneToOneField(
+        MemoryTransition,
+        on_delete=models.PROTECT,
+        related_name='opened_memory_conflict',
+    )
+    evidence_hash = models.CharField(max_length=64)
+    resolved_transition = models.ForeignKey(
+        MemoryTransition,
+        on_delete=models.PROTECT,
+        related_name='resolved_memory_conflicts',
+        null=True,
+        blank=True,
+    )
+    resolution = models.CharField(
+        max_length=40,
+        choices=MemoryConflictResolution.choices,
+        blank=True,
+        default='',
+    )
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('candidate_id', 'candidate'),
+        ('memory_id', 'memory'),
+        ('memory_version_id', 'memory_version'),
+        ('semantic_link_id', 'semantic_link'),
+        ('opened_transition_id', 'opened_transition'),
+        ('evidence_hash', 'evidence_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['candidate', 'memory'],
+                name='core_memory_conflict_candidate_memory_uniq',
+            ),
+            models.CheckConstraint(
+                condition=models.Q(evidence_hash__regex=r'^[0-9a-f]{64}$'),
+                name='core_memory_conflict_evidence_hash_hex',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        resolved_transition__isnull=True,
+                        resolution='',
+                        resolved_at__isnull=True,
+                    )
+                    | models.Q(
+                        resolved_transition__isnull=False,
+                        resolution__in=MemoryConflictResolution.values,
+                        resolved_at__isnull=False,
+                    )
+                ),
+                name='core_memory_conflict_open_close_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'created_at'], name='core_memconf_scope_time_idx'),
+            models.Index(fields=['candidate'], name='core_memconf_candidate_idx'),
+            models.Index(fields=['memory'], name='core_memconf_memory_idx'),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        for field, related in (
+            ('candidate', self.candidate),
+            ('memory', self.memory),
+            ('memory_version', self.memory_version),
+            ('semantic_link', self.semantic_link),
+            ('opened_transition', self.opened_transition),
+            ('resolved_transition', self.resolved_transition),
+        ):
+            if related is not None:
+                check_project_scope(errors, field, related, self.organization_id, self.project_id)
+        persisted = enforce_immutable_fields(
+            self,
+            self._IMMUTABLE_FIELDS,
+            errors,
+            extra_fields=('resolved_transition_id', 'resolution', 'resolved_at'),
+        )
+        if persisted is not None and persisted['resolved_transition_id'] is not None:
+            if (
+                self.resolved_transition_id != persisted['resolved_transition_id']
+                or self.resolution != persisted['resolution']
+                or self.resolved_at != persisted['resolved_at']
+            ):
+                add_scope_error(errors, 'resolution', 'resolved conflict fields are immutable after close')
+        raise_scope_errors(errors)
