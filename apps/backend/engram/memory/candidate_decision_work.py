@@ -255,16 +255,5 @@ def ensure_candidate_decision_work(candidate_id: uuid.UUID) -> tuple[WorkflowWor
         return ensure_candidate_decision_work_locked(candidate)
 
 
-def register_candidate_decision_work_builder(
-    builder: CandidateDecisionWorkBuilder | None = None,
-) -> CandidateDecisionWorkBuilder:
-    from engram.memory.candidate_work_reconciler import set_candidate_decision_work_builder
-
-    selected = builder or _BUILDER
-    set_candidate_decision_work_builder(selected)
-
-    return selected
-
-
 create_or_reuse_candidate_decision_work = ensure_candidate_decision_work
 create_or_reuse_candidate_decision_work_locked = ensure_candidate_decision_work_locked

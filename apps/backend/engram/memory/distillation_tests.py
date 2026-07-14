@@ -6,6 +6,7 @@ import re
 import threading
 import urllib.error
 import uuid
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -1189,7 +1190,7 @@ def test_run_session_distillation_with_tracking_records_all_chunk_provider_call_
 
 
 @pytest.mark.django_db
-def test_distill_session_truncates_to_max_chunks_and_audits_when_chunk_count_exceeds_cap(
+def test_distill_session_ignores_removed_max_chunks_and_processes_every_chunk(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     organization, team, project, agent, session = create_session_scope()
@@ -1197,27 +1198,18 @@ def test_distill_session_truncates_to_max_chunks_and_audits_when_chunk_count_exc
     for index in range(1, 11):
         create_observation(organization, project, team, agent, session, index=index)
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '10')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_CHUNKS', '8')
     body = candidates_body([{'title': 't', 'body': 'b', 'confidence': 0.9, 'supporting_observation_ids': []}])
-    opener = sequenced_opener([body] * 8)
+    opener = sequenced_opener([body] * 10)
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
     m_monkeypatch.setattr('engram.memory.distillation.get_provider_gateway', lambda *_args, **_kwargs: gateway)
 
     run_session_distillation_with_tracking(session_id=session.id, request_id='cap-test-1')
 
-    assert len(opener.calls) == 8
-    audit = AuditEvent.objects.get(event_type='SessionDistillationTruncated')
-    assert audit.actor_type == 'system'
-    assert audit.target_type == 'agent_session'
-    assert audit.target_id == str(session.id)
-    assert audit.capability == 'memories:review'
-    assert audit.metadata == {
-        'chunks_total': 10,
-        'chunks_processed': 8,
-        'observation_count': 10,
-        'observations_distilled': 8,
-    }
+    assert len(opener.calls) == 10
+    assert not AuditEvent.objects.filter(event_type='SessionDistillationTruncated').exists()
     run = WorkflowRun.objects.get(run_type=WorkflowRunType.SESSION_DISTILLATION)
-    assert run.escalation is True
+    assert run.escalation is False
 
 
 @pytest.mark.django_db
@@ -1346,7 +1338,7 @@ def test_distill_chunk_char_budget_decoupled_from_provider_http_timeout(
 
 
 @pytest.mark.django_db
-def test_distill_session_known_model_yields_fewer_chunks_than_unknown_and_drops_truncation_audit(
+def test_distill_session_processes_every_chunk_for_known_and_unknown_models(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     m_monkeypatch.delenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', raising=False)
@@ -1395,10 +1387,10 @@ def test_distill_session_known_model_yields_fewer_chunks_than_unknown_and_drops_
     unknown_result = run_session_distillation_with_tracking(session_id=unknown_session.id, request_id='unknown-1')
     known_result = run_session_distillation_with_tracking(session_id=known_session.id, request_id='known-1')
 
-    assert len(unknown_result.provider_call_ids) == max_chunks
+    assert len(unknown_result.provider_call_ids) == len(unknown_chunks)
     assert len(known_result.provider_call_ids) == len(known_chunks)
     assert len(known_result.provider_call_ids) < len(unknown_result.provider_call_ids)
-    assert AuditEvent.objects.filter(
+    assert not AuditEvent.objects.filter(
         event_type='SessionDistillationTruncated',
         target_id=str(unknown_session.id),
     ).exists()
@@ -2776,6 +2768,62 @@ def test_candidate_and_decision_work_signal_commit_or_roll_back_together() -> No
         intent='signal',
         window_input_hash=window.input_hash,
     )
+    unrelated_call = ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        policy=policy,
+        secret=policy.secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type=policy.task_type,
+        policy_version=policy.version,
+        request_id=f'distill-stage:{uuid.uuid4()}',
+        redaction_state='redacted',
+    )
+    unrelated_prompt_contract = 'distill_extract.unrelated-v1'
+    unrelated_target_key = stage_target_key(
+        work_id=str(work.id),
+        work_input_fingerprint=work.input_fingerprint,
+        window_input_hash=window.input_hash,
+        stage_kind='extract',
+        level=0,
+        ordinal=0,
+        chunk_ordinal=0,
+        input_hash=chunk.input_hash,
+        prompt_contract=unrelated_prompt_contract,
+    )
+    unrelated_stage = DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        window=window,
+        chunk=chunk,
+        stage_kind='extract',
+        level=0,
+        ordinal=0,
+        target_key=unrelated_target_key,
+        stage_key=stage_key(
+            target_key=unrelated_target_key,
+            policy_id=str(policy.id),
+            policy_version=policy.version,
+            policy_role='fallback',
+        ),
+        input_hash=chunk.input_hash,
+        input_manifest=chunk.input_manifest,
+        prompt_contract=unrelated_prompt_contract,
+        policy=policy,
+        policy_version=policy.version,
+        policy_role='fallback',
+        status='complete',
+        attempt_count=1,
+        accepted_provider_call=unrelated_call,
+        response_hash='4' * 64,
+        response_size=32,
+        output_snapshot=stage_snapshot,
+        output_hash=hashlib.sha256(canonical_json_bytes(stage_snapshot)).hexdigest(),
+        completed_at=now,
+    )
     claim_result = claim_work(
         work_id=work.id,
         expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
@@ -2785,6 +2833,13 @@ def test_candidate_and_decision_work_signal_commit_or_roll_back_together() -> No
     )
     assert claim_result.claim is not None
     claim = claim_result.claim
+    unrelated_coverage_plan = replace(
+        plan,
+        coverage=(replace(plan.coverage[0], deciding_stage_key=unrelated_stage.stage_key),),
+    )
+    with pytest.raises(MemoryWorkerError, match='signal coverage deciding stage'):
+        finalize_distillation(window=window, claim=claim, plan=unrelated_coverage_plan, now=now)
+
     for fault_point in ('candidate', 'source', 'coverage', 'work', 'package', 'root'):
 
         def inject(point: str, *, expected: str = fault_point) -> None:

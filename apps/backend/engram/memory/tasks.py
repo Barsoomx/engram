@@ -12,13 +12,16 @@ from django.utils import timezone
 from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import (
+    AgentSession,
     MemoryCandidate,
     Observation,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory.candidate_decision_work import (
@@ -26,11 +29,11 @@ from engram.memory.candidate_decision_work import (
     candidate_decision_snapshot,
 )
 from engram.memory.candidate_ttl import ExpireStaleCandidates
+from engram.memory.candidate_work_reconciler import reconcile_scheduled_candidate_work
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import (
     DistillationStageError,
     run_complete_distillation_attempt,
-    run_session_distillation_with_tracking,
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
 from engram.memory.services import (
@@ -42,7 +45,7 @@ from engram.memory.services import (
 )
 from engram.memory.session_sweep import SweepStaleSessions
 from engram.memory.session_work_reconciler import reconcile_scheduled_session_work
-from engram.memory.work_dispatch import work_task_signature
+from engram.memory.work_dispatch import queue_work_attempt, work_task_signature
 from engram.memory.work_execution import (
     claim_work,
     execution_configuration_fingerprint,
@@ -662,33 +665,52 @@ def process_candidate_decision_work_v1(
 def distill_session(self: object, session_id: object, workflow_run_id: object = None) -> str:
     try:
         parsed_session_id = uuid.UUID(str(session_id))
-        parsed_workflow_run_id = uuid.UUID(str(workflow_run_id)) if workflow_run_id is not None else None
+        if workflow_run_id is not None:
+            uuid.UUID(str(workflow_run_id))
     except (AttributeError, TypeError, ValueError) as error:
         raise MemoryWorkerError('malformed session id') from error
 
-    correlation_id = f'distill-session:{parsed_session_id}'
-    request_id = f'{correlation_id}:{uuid.uuid4().hex[:8]}'
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(
-        correlation_id=correlation_id,
-        request_id=request_id,
-    )
     try:
-        result = run_session_distillation_with_tracking(
-            session_id=parsed_session_id,
-            request_id=request_id,
-            correlation_id=correlation_id,
-            existing_run_id=parsed_workflow_run_id,
+        session = AgentSession.objects.get(
+            id=parsed_session_id,
+            end_work_contract_version=1,
         )
-    except MemoryWorkerError as exc:
-        if exc.retryable:
-            countdown = _RETRY_BACKOFF_BASE ** (self.request.retries + 1)
-            raise self.retry(exc=exc, countdown=countdown) from None
-        raise
-    finally:
-        structlog.contextvars.clear_contextvars()
+    except AgentSession.DoesNotExist as error:
+        raise MemoryWorkerError(
+            'legacy distillation delivery has no versioned session owner',
+            code='legacy_distillation_work_missing',
+        ) from error
+    work = (
+        WorkflowWork.objects.filter(
+            organization_id=session.organization_id,
+            project_id=session.project_id,
+            team_id=session.team_id,
+            work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            subject_type=WorkflowSubjectType.AGENT_SESSION,
+            subject_id=session.id,
+            contract_version=1,
+            input_snapshot__schema='session_distillation_input/v1',
+            input_snapshot__session_id=str(session.id),
+        )
+        .order_by('-created_at', '-id')
+        .first()
+    )
+    if work is None:
+        raise MemoryWorkerError(
+            'legacy distillation delivery has no versioned session work',
+            code='legacy_distillation_work_missing',
+        )
+    if (
+        work.disposition == WorkflowWorkDisposition.REQUIRED
+        and work.execution_state == WorkflowWorkExecutionState.READY
+    ):
+        queue_work_attempt(
+            work_id=work.id,
+            now=timezone.now(),
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        )
 
-    return str(result.session.id)
+    return str(work.id)
 
 
 @app.task(
@@ -998,11 +1020,14 @@ def sweep_stale_sessions() -> dict[str, int]:
 @app.task(name='engram.memory.retry_failed_distillations')
 def retry_failed_distillations() -> dict[str, int]:
     legacy = RetryFailedDistillations().execute()
-    reconciled = reconcile_scheduled_session_work(as_of=timezone.now())
+    as_of = timezone.now()
+    reconciled = reconcile_scheduled_session_work(as_of=as_of)
+    candidate_reconciled = reconcile_scheduled_candidate_work(as_of=as_of)
 
     return {
         'retried': len(legacy.retried),
         'reconciled': reconciled,
+        'candidate_reconciled': candidate_reconciled,
         'unlinked': len(legacy.unlinked_run_ids),
     }
 

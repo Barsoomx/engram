@@ -225,13 +225,9 @@ def test_generated_env_forces_one_observation_chunks_two_calls_and_switchable_pr
 ) -> None:
     env_file = (tmp_path / "generated.env").resolve()
 
-    coverage.write_env_file(
-        env_file, provider_mode="fake", admin_password="disposable-admin"
-    )
+    coverage.write_env_file(env_file, provider_mode="fake")
     fake = env_file.read_text(encoding="utf-8")
-    coverage.write_env_file(
-        env_file, provider_mode="real", admin_password="disposable-admin"
-    )
+    coverage.write_env_file(env_file, provider_mode="real")
     real = env_file.read_text(encoding="utf-8")
 
     assert "ENGRAM_DISTILL_CHUNK_CHAR_BUDGET=8000\n" in fake
@@ -240,17 +236,12 @@ def test_generated_env_forces_one_observation_chunks_two_calls_and_switchable_pr
     assert "ENGRAM_DISTILL_REDUCE_TARGET=1\n" in fake
     assert "ENGRAM_PROVIDER_HTTP_TIMEOUT=3\n" in fake
     assert "ENGRAM_PROVIDER_MODE=fake\n" in fake
+    assert "PASSWORD" not in fake
     assert real == fake.replace(
         "ENGRAM_PROVIDER_MODE=fake\n", "ENGRAM_PROVIDER_MODE=real\n"
     )
     with pytest.raises(coverage.HarnessError, match="provider mode"):
-        coverage.write_env_file(
-            env_file, provider_mode="production", admin_password="disposable-admin"
-        )
-    with pytest.raises(coverage.HarnessError, match="single line"):
-        coverage.write_env_file(
-            env_file, provider_mode="fake", admin_password="bad\nvalue"
-        )
+        coverage.write_env_file(env_file, provider_mode="production")
 
 
 def test_generated_override_uses_unique_image_and_ephemeral_loopback_port(
@@ -319,6 +310,10 @@ def test_seed_and_state_queries_are_deterministic_and_scope_bound() -> None:
         assert "API key" not in code
     for code in generated_programs[1:3]:
         assert scope.session_id in code
+    reconcile = coverage.reconcile_code(scope)
+    assert "retry_failed_distillations" in reconcile
+    assert "register_default_candidate_decision_builder" not in reconcile
+    assert "reconcile_candidate_work(" not in reconcile
     with pytest.raises(coverage.HarnessError, match="unsafe run id"):
         coverage.seed_code(
             run_id="unsafe; import os",
@@ -465,7 +460,7 @@ def _break_invariant(payload: dict[str, object], invariant_id: str) -> None:
         (_drop_coverage, "exactly 101 coverage rows"),
         (_duplicate_coverage_sequence, "coverage rows do not match"),
         (_break_deciding_stage, "coverage deciding stage is incomplete"),
-        (_break_signal_source, "signal coverage must have exactly one source"),
+        (_break_signal_source, "signal coverage must have at least one source"),
         (_break_no_signal_source, "no-signal coverage must not have a source"),
         (_break_coverage_outcome, "Coverage outcome is invalid"),
         (
@@ -509,6 +504,13 @@ def test_final_assertions_fail_closed_for_each_acceptance_branch(
 
 def test_final_assertions_accept_the_complete_isolated_state() -> None:
     coverage.assert_final_state(_state())
+
+
+def test_final_assertions_accept_multiple_sources_for_one_signal_observation() -> None:
+    payload = _valid_payload()
+    payload["coverage"][0]["source_count"] = 2  # type: ignore[index]
+
+    coverage.assert_final_state(_state(payload))
 
 
 @pytest.mark.parametrize(

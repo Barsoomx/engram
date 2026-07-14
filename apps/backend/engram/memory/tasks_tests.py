@@ -114,7 +114,7 @@ _VERSIONED_WORK_CASES = (
     (
         'distill_session_work_v1',
         WorkflowWorkType.SESSION_DISTILLATION,
-        'engram.memory.tasks.run_session_distillation_with_tracking',
+        'engram.memory.tasks.run_complete_distillation_attempt',
     ),
     (
         'generate_daily_digest_work_v1',
@@ -494,7 +494,7 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 
     result = retry_failed_distillations()
 
-    assert result == {'retried': 1, 'reconciled': 0, 'unlinked': 0}
+    assert result == {'retried': 1, 'reconciled': 0, 'candidate_reconciled': 0, 'unlinked': 0}
 
     queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
     assert queued.count() == 1
@@ -511,74 +511,68 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible() -> None:
     result = retry_failed_distillations()
 
-    assert result == {'retried': 0, 'reconciled': 0, 'unlinked': 0}
+    assert result == {'retried': 0, 'reconciled': 0, 'candidate_reconciled': 0, 'unlinked': 0}
     assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
-def test_distill_session_uses_a_unique_request_id_but_stable_correlation_id_per_attempt() -> None:
-    session_id = uuid.uuid4()
+@pytest.mark.django_db
+def test_retry_failed_distillations_invokes_candidate_reconciliation() -> None:
+    with (
+        mock.patch('engram.memory.tasks.reconcile_scheduled_session_work', return_value=2),
+        mock.patch(
+            'engram.memory.tasks.reconcile_scheduled_candidate_work',
+            return_value=3,
+            create=True,
+        ) as candidate_reconcile,
+    ):
+        result = retry_failed_distillations()
 
-    def _run(**kwargs: object) -> object:
-        result = mock.Mock()
-        result.session.id = session_id
-
-        return result
-
-    with mock.patch(
-        'engram.memory.tasks.run_session_distillation_with_tracking',
-        side_effect=_run,
-    ) as m_run:
-        distill_session(str(session_id))
-        distill_session(str(session_id))
-
-    first_kwargs = m_run.call_args_list[0].kwargs
-    second_kwargs = m_run.call_args_list[1].kwargs
-
-    correlation_id = f'distill-session:{session_id}'
-
-    assert first_kwargs['correlation_id'] == correlation_id
-    assert second_kwargs['correlation_id'] == correlation_id
-    assert first_kwargs['request_id'] != second_kwargs['request_id']
-    assert first_kwargs['request_id'].startswith(f'{correlation_id}:')
-    assert second_kwargs['request_id'].startswith(f'{correlation_id}:')
+    candidate_reconcile.assert_called_once()
+    assert result == {
+        'retried': 0,
+        'reconciled': 2,
+        'candidate_reconciled': 3,
+        'unlinked': 0,
+    }
 
 
-def test_distill_session_passes_existing_run_id_when_workflow_run_id_given() -> None:
-    session_id = uuid.uuid4()
-    workflow_run_id = uuid.uuid4()
+@pytest.mark.django_db
+def test_legacy_distill_session_delivery_bridges_to_exact_v1_work(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    AgentSession.objects.filter(id=session.id).update(end_work_contract_version=1)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
 
-    def _run(**kwargs: object) -> object:
-        result = mock.Mock()
-        result.session.id = session_id
+    result = distill_session(str(session.id), workflow_run_id=str(uuid.uuid4()))
 
-        return result
-
-    with mock.patch(
-        'engram.memory.tasks.run_session_distillation_with_tracking',
-        side_effect=_run,
-    ) as m_run:
-        distill_session(str(session_id), workflow_run_id=str(workflow_run_id))
-
-    assert m_run.call_args.kwargs['existing_run_id'] == workflow_run_id
+    assert not hasattr(tasks_module, 'run_session_distillation_with_tracking')
+    assert result == str(work.id)
+    run = WorkflowRun.objects.get(work=work, execution_contract_version=1)
+    assert run.origin == WorkflowRunOrigin.RECONCILIATION
+    outbox = CeleryOutbox.objects.get(task_name='engram.memory.distill_session_work_v1')
+    assert outbox.args == [str(work.id), str(run.id)]
 
 
-def test_distill_session_passes_none_existing_run_id_when_no_workflow_run_id_given() -> None:
-    session_id = uuid.uuid4()
+@pytest.mark.django_db
+def test_legacy_distill_session_delivery_fails_closed_without_v1_work(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    AgentSession.objects.filter(id=session.id).update(end_work_contract_version=1)
 
-    def _run(**kwargs: object) -> object:
-        result = mock.Mock()
-        result.session.id = session_id
+    with pytest.raises(MemoryWorkerError, match='no versioned session work') as captured:
+        distill_session(str(session.id))
 
-        return result
-
-    with mock.patch(
-        'engram.memory.tasks.run_session_distillation_with_tracking',
-        side_effect=_run,
-    ) as m_run:
-        distill_session(str(session_id))
-
-    assert m_run.call_args.kwargs['existing_run_id'] is None
+    assert captured.value.retryable is False
+    assert captured.value.code == 'legacy_distillation_work_missing'
 
 
 @pytest.mark.django_db
@@ -696,7 +690,7 @@ def test_versioned_work_tasks_reject_malformed_ids_before_domain_access(
         (
             'distill_session_work_v1',
             WorkflowWorkType.OBSERVATION_PROCESSING,
-            'engram.memory.tasks.run_session_distillation_with_tracking',
+            'engram.memory.tasks.run_complete_distillation_attempt',
         ),
         (
             'generate_daily_digest_work_v1',
@@ -866,7 +860,7 @@ def test_digest_work_adapter_rejects_altered_snapshot_before_provider(
         (
             'distill_session_work_v1',
             WorkflowWorkType.SESSION_DISTILLATION,
-            'engram.memory.tasks.run_session_distillation_with_tracking',
+            'engram.memory.tasks.run_complete_distillation_attempt',
         ),
         (
             'generate_daily_digest_work_v1',
@@ -1003,10 +997,8 @@ def test_distill_session_work_rejects_altered_snapshot_before_run_or_provider(
     )
 
     with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_execute:
-        with mock.patch('engram.memory.tasks.run_session_distillation_with_tracking') as m_run:
-            result = tasks_module.distill_session_work_v1(str(work.id))
+        result = tasks_module.distill_session_work_v1(str(work.id))
 
-    m_run.assert_not_called()
     m_execute.assert_not_called()
     assert result == str(work.id)
     work.refresh_from_db()
@@ -1545,4 +1537,4 @@ def test_retry_failed_distillations_leaves_v1_retry_wait_work_to_reconciler() ->
     assert queued.get().execution_contract_version == 1
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=0).count() == 0
     assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
-    assert result == {'retried': 0, 'reconciled': 1, 'unlinked': 0}
+    assert result == {'retried': 0, 'reconciled': 1, 'candidate_reconciled': 0, 'unlinked': 0}

@@ -902,6 +902,95 @@ def test_stale_fence_cannot_commit_returned_provider_output(m_monkeypatch: pytes
 
 
 @pytest.mark.django_db
+def test_provider_output_uses_fresh_time_for_commit_fence(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-expired-provider-output')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def expire_lease() -> None:
+        clock.current = claim.lease_expires_at + timedelta(microseconds=1)
+
+    gateway = _StubGateway(body=_valid_body(chunk), on_call=expire_lease)
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_distillation_stage(stage, claim, now=now)
+
+    refreshed = DistillationStage.objects.get(id=stage.id)
+    assert refreshed.status == 'required'
+    assert refreshed.output_snapshot is None
+
+
+@pytest.mark.django_db
+def test_fallback_rechecks_remaining_lease_before_provider_call(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-fallback-lease-margin')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def consume_lease_margin() -> None:
+        clock.current = claim.lease_expires_at - timedelta(seconds=29)
+
+    primary_gateway = _StubGateway(
+        error=ModelPolicyError('provider_timeout', 'provider timed out', retryable=True),
+        on_call=consume_lease_margin,
+    )
+    fallback_gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'continuation'
+    assert result.fallback_used is False
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+    fallback_stage = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert fallback_stage.attempt_count == 0
+
+
+@pytest.mark.django_db
+def test_fallback_output_uses_fresh_time_for_commit_fence(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-expired-fallback-output')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    clock = type('Clock', (), {'current': now, 'now': lambda self: self.current})()
+    m_monkeypatch.setattr(dps, 'timezone', clock, raising=False)
+
+    def expire_lease() -> None:
+        clock.current = claim.lease_expires_at + timedelta(microseconds=1)
+
+    primary_gateway = _StubGateway(
+        error=ModelPolicyError('provider_timeout', 'provider timed out', retryable=True),
+    )
+    fallback_gateway = _StubGateway(body=_valid_body(chunk), on_call=expire_lease)
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    with pytest.raises(StaleWorkFenceError):
+        dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 1
+    fallback_stage = DistillationStage.objects.get(policy_id=fallback_policy.id)
+    assert fallback_stage.status == 'required'
+    assert fallback_stage.output_snapshot is None
+    assert fallback_stage.accepted_provider_call_id is None
+
+
+@pytest.mark.django_db
 def test_worker_rejects_cross_scope_subject_before_provider_call(m_monkeypatch: pytest.MonkeyPatch) -> None:
     scope = _scope('stage-scope-owner')
     _curation_policy(scope)

@@ -236,10 +236,6 @@ def _distill_chunk_char_budget(policy: ModelPolicy) -> int:
     return max(min(context_chars, ceiling), floor)
 
 
-def _distill_max_chunks() -> int:
-    return int(os.environ.get('ENGRAM_DISTILL_MAX_CHUNKS', '8'))
-
-
 def chunk_observations(observations: list[Observation], budget: int) -> list[list[Observation]]:
     chunks: list[list[Observation]] = []
     current: list[Observation] = []
@@ -344,19 +340,6 @@ class DistillSession:
         resolved, gateway = self._resolve_gateway(session)
         budget = _distill_chunk_char_budget(resolved.policy)
         chunks = chunk_observations(observations, budget)
-        max_chunks = _distill_max_chunks()
-        truncated = len(chunks) > max_chunks
-        if truncated:
-            chunks_total = len(chunks)
-            chunks = chunks[:max_chunks]
-            self._audit_truncated(
-                session,
-                data,
-                chunks_total=chunks_total,
-                chunks_processed=len(chunks),
-                observation_count=len(observations),
-                observations_distilled=sum(len(chunk) for chunk in chunks),
-            )
 
         active_resolved, active_gateway = resolved, gateway
         provider_results: list[ProviderCallResult] = []
@@ -424,7 +407,7 @@ class DistillSession:
             auto_promoted=tuple(auto_promoted),
             queued_for_review=tuple(queued),
             provider_call_ids=tuple(str(result.call_record_id) for result in provider_results),
-            truncated=truncated,
+            truncated=False,
         )
 
     def _load_session(self, session_id: uuid.UUID) -> AgentSession:
@@ -748,36 +731,6 @@ class DistillSession:
             ),
         )
 
-    def _audit_truncated(
-        self,
-        session: AgentSession,
-        data: DistillSessionInput,
-        *,
-        chunks_total: int,
-        chunks_processed: int,
-        observation_count: int,
-        observations_distilled: int,
-    ) -> None:
-        AuditEvent.objects.create(
-            organization=session.organization,
-            project=session.project,
-            team=session.team,
-            event_type='SessionDistillationTruncated',
-            actor_type='system',
-            target_type='agent_session',
-            target_id=str(session.id),
-            capability='memories:review',
-            result=AuditResult.RECORDED,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            metadata={
-                'chunks_total': chunks_total,
-                'chunks_processed': chunks_processed,
-                'observation_count': observation_count,
-                'observations_distilled': observations_distilled,
-            },
-        )
-
     def _audit_reduce_skipped(
         self,
         session: AgentSession,
@@ -1014,7 +967,7 @@ def _verify_finalization_plan(  # noqa: C901
     coverage_by_id = {coverage.observation_id: coverage for coverage in plan.coverage}
     if len(coverage_by_id) != len(plan.coverage) or set(coverage_by_id) != set(manifest_by_id):
         raise _finalization_error('finalization coverage is not exact')
-    signal_sources: dict[str, int] = {}
+    signal_source_stages: dict[str, set[str]] = {}
     for candidate in plan.candidates:
         expected_hash = session_candidate_content_hash(window.session_id, candidate.title, candidate.body)
         if candidate.content_hash not in (None, expected_hash):
@@ -1031,7 +984,7 @@ def _verify_finalization_plan(  # noqa: C901
                 or _sha256(dict(source.anchors)) != source.anchors_hash
             ):
                 raise _finalization_error('candidate source does not match the frozen window')
-            signal_sources[source.observation_id] = signal_sources.get(source.observation_id, 0) + 1
+            signal_source_stages.setdefault(source.observation_id, set()).add(source.lineage_stage_key)
     for observation_id, coverage in coverage_by_id.items():
         entry = manifest_by_id[observation_id]
         if (
@@ -1040,14 +993,19 @@ def _verify_finalization_plan(  # noqa: C901
             or coverage.deciding_stage_key not in complete_stages
         ):
             raise _finalization_error('coverage row does not match the frozen window')
-        has_source = signal_sources.get(observation_id, 0) > 0
+        source_stages = signal_source_stages.get(observation_id, set())
+        has_source = bool(source_stages)
         if coverage.outcome == DistillationCoverageOutcome.SIGNAL and not has_source:
             raise _finalization_error('signal coverage requires candidate provenance')
+        if coverage.outcome == DistillationCoverageOutcome.SIGNAL and coverage.deciding_stage_key not in source_stages:
+            raise _finalization_error('signal coverage deciding stage does not match candidate provenance')
         if coverage.outcome == DistillationCoverageOutcome.NO_SIGNAL and has_source:
             raise _finalization_error('no-signal coverage cannot have candidate provenance')
         if coverage.outcome not in (DistillationCoverageOutcome.SIGNAL, DistillationCoverageOutcome.NO_SIGNAL):
             raise _finalization_error('coverage outcome is invalid')
-    if plan.has_signal != bool(signal_sources) or plan.intent != ('signal' if signal_sources else 'no_signal'):
+    if plan.has_signal != bool(signal_source_stages) or plan.intent != (
+        'signal' if signal_source_stages else 'no_signal'
+    ):
         raise _finalization_error('finalization outcome does not match candidate provenance')
 
     return observations, complete_stages

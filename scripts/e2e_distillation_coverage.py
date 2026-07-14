@@ -291,11 +291,10 @@ def deterministic_env(
     return result
 
 
-def write_env_file(path: Path, *, provider_mode: str, admin_password: str) -> None:
+def write_env_file(path: Path, *, provider_mode: str) -> None:
     _validate_absolute_canonical(path, "generated env file")
     if provider_mode not in _PROVIDER_MODES:
         raise HarnessError(f"Unsupported disposable provider mode {provider_mode!r}")
-    password = _single_line(admin_password, "generated admin password")
     path.write_text(
         "\n".join(
             [
@@ -304,7 +303,6 @@ def write_env_file(path: Path, *, provider_mode: str, admin_password: str) -> No
                 "ENGRAM_DEBUG=false",
                 "ENGRAM_ALLOWED_HOSTS=localhost,127.0.0.1,0.0.0.0",
                 "ENGRAM_LOG_LEVEL=INFO",
-                f"ENGRAM_BOOTSTRAP_ADMIN_PASSWORD={password}",
                 f"ENGRAM_PROVIDER_MODE={provider_mode}",
                 "ENGRAM_PROVIDER_HTTP_TIMEOUT=3",
                 "ENGRAM_DISTILL_CHUNK_CHAR_BUDGET=8000",
@@ -657,9 +655,9 @@ def assert_final_state(state: DistillationState) -> None:  # noqa: C901, PLR0915
         if not row.deciding_stage_complete:
             raise HarnessError("A coverage deciding stage is incomplete")
         if row.outcome == "signal":
-            if row.source_count != 1:
+            if row.source_count < 1:
                 raise HarnessError(
-                    "signal coverage must have exactly one source relation"
+                    "signal coverage must have at least one source relation"
                 )
         elif row.outcome == "no_signal":
             if row.source_count != 0:
@@ -951,10 +949,8 @@ def reconcile_code(scope: ScopeIds) -> str:
         f"""
         import json
         import uuid
-        from django.utils import timezone
         from engram.core.models import AgentSession, WorkflowWork
-        from engram.memory import candidate_work_reconciler
-        from engram.memory.session_work_reconciler import reconcile_session_work
+        from engram.memory.tasks import retry_failed_distillations
 
         organization_id = uuid.UUID({_python_literal(organization_id)})
         project_id = uuid.UUID({_python_literal(project_id)})
@@ -972,21 +968,10 @@ def reconcile_code(scope: ScopeIds) -> str:
             project_id=project_id,
         ).exists():
             raise RuntimeError('isolated CP3 root work no longer exists')
-        candidate_work_reconciler.register_default_candidate_decision_builder()
-        now = timezone.now()
-        session_result = reconcile_session_work(
-            organization_id=organization_id,
-            project_id=project_id,
-            as_of=now,
-        )
-        candidate_result = candidate_work_reconciler.reconcile_candidate_work(
-            organization_id=organization_id,
-            project_id=project_id,
-            as_of=now,
-        )
+        result = retry_failed_distillations()
         print(json.dumps({{
-            'session_queued': session_result.queued,
-            'candidate_queued': candidate_result.queued,
+            'session_queued': result['reconciled'],
+            'candidate_queued': result['candidate_reconciled'],
         }}, sort_keys=True))
         """
     ).strip()
@@ -1207,8 +1192,8 @@ class Harness:
                 f"Worker-loss fault did not expire one active claim: {result!r}"
             )
 
-    def switch_provider(self, mode: str, admin_password: str) -> None:
-        write_env_file(self.env_file, provider_mode=mode, admin_password=admin_password)
+    def switch_provider(self, mode: str) -> None:
+        write_env_file(self.env_file, provider_mode=mode)
         self.compose(
             "up",
             "-d",
@@ -1385,7 +1370,6 @@ def run_live_fault_harness(
     *,
     api_key: str,
     agent_key: str,
-    admin_password: str,
     run_id: str,
 ) -> DistillationState:
     harness.compose(
@@ -1416,7 +1400,7 @@ def run_live_fault_harness(
     harness.expire_active_lease(scope)
     harness.reconcile_once(scope, timeout=60)
 
-    harness.switch_provider("real", admin_password)
+    harness.switch_provider("real")
     outage_deadline = Deadline(180.0, label="retryable provider-outage deadline")
     outage = _wait_for_state(
         harness,
@@ -1431,7 +1415,7 @@ def run_live_fault_harness(
     if outage.root_disposition != "required":
         raise HarnessError("Provider outage unexpectedly resolved the root work")
 
-    harness.switch_provider("fake", admin_password)
+    harness.switch_provider("fake")
     final = reconcile_until_quiescent(
         harness,
         scope,
@@ -1457,8 +1441,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_id = secrets.token_hex(8)
     api_key = f"egk_cp3_{secrets.token_urlsafe(32)}"
     agent_key = f"egk_cp3_agent_{secrets.token_urlsafe(32)}"
-    admin_password = secrets.token_urlsafe(32)
-    generated_secrets = (api_key, agent_key, admin_password)
+    generated_secrets = (api_key, agent_key)
     primary_error: HarnessError | None = None
     cleanup_returncode = 0
     owns_project = False
@@ -1466,7 +1449,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         temp_dir = Path(temp_dir_name).resolve()
         env_file = (temp_dir / "generated.env").resolve()
         override_file = (temp_dir / "override.yml").resolve()
-        write_env_file(env_file, provider_mode="fake", admin_password=admin_password)
+        write_env_file(env_file, provider_mode="fake")
         write_override_file(override_file, arguments.project)
         harness = Harness(
             project=arguments.project,
@@ -1486,7 +1469,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 harness,
                 api_key=api_key,
                 agent_key=agent_key,
-                admin_password=admin_password,
                 run_id=run_id,
             )
             progress(

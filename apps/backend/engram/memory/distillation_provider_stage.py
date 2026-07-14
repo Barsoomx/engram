@@ -4,12 +4,13 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 from django.db import transaction
 from django.db.models import F
+from django.utils import timezone
 
 from engram.core.models import (
     AuditResult,
@@ -70,6 +71,7 @@ _FALLBACK_FAILURE_CODES = frozenset(
         'provider_unreachable',
     }
 )
+_LEASE_SAFE_MARGIN = timedelta(seconds=30)
 
 _TARGET_SCHEMA = 'distillation_stage_target/v1'
 _IDENTITY_SCHEMA = 'distillation_stage_identity/v1'
@@ -166,6 +168,14 @@ class _ProviderErrorOutcome:
     error: BaseException
     provider_call_ids: tuple[str, ...] = ()
     started_calls: int = 1
+
+
+def _fresh_now(initial: datetime) -> datetime:
+    return max(initial, timezone.now())
+
+
+def _lease_allows_provider_call(claim: WorkClaim, *, now: datetime) -> bool:
+    return now + _LEASE_SAFE_MARGIN < claim.lease_expires_at
 
 
 def stage_target_key(
@@ -892,8 +902,9 @@ def _attempt_stage(
         return _MalformedOutcome(response_hash, response_size, (str(result.call_record_id),))
 
     output_hash = hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
+    commit_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=commit_now)
         locked = DistillationStage.objects.select_for_update().get(id=stage.id)
         existing = (
             DistillationStage.objects.select_for_update()
@@ -918,7 +929,7 @@ def _attempt_stage(
         locked.response_size = response_size
         locked.output_snapshot = snapshot
         locked.output_hash = output_hash
-        locked.completed_at = now
+        locked.completed_at = commit_now
         locked.save()
 
         return _CompletedOutcome(locked, (str(result.call_record_id),), 1)
@@ -1025,8 +1036,9 @@ def _try_fallback(
     prior_started_calls: int,
     prior_failure: ClassifiedWorkFailure,
 ) -> StageExecutionResult | None:
+    fallback_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=fallback_now)
         current = DistillationStage.objects.select_related('window', 'window__work', 'chunk').get(id=primary_stage.id)
         policy = _resolve_fallback_policy(current)
         if policy is None or policy.id == current.policy_id:
@@ -1047,11 +1059,21 @@ def _try_fallback(
             started_provider_calls=prior_started_calls,
         )
 
+    fallback_now = _fresh_now(fallback_now)
+    if not _lease_allows_provider_call(claim, now=fallback_now):
+        return StageExecutionResult(
+            STAGE_CONTINUATION,
+            fallback_stage,
+            failure=prior_failure,
+            provider_call_ids=prior_provider_call_ids,
+            started_provider_calls=prior_started_calls,
+        )
+
     result = _run_stage(
         fallback_stage,
         claim,
         contract,
-        now=now,
+        now=fallback_now,
         allow_fallback=False,
         max_provider_calls=max_provider_calls,
         prior_provider_call_ids=prior_provider_call_ids,
@@ -1089,10 +1111,11 @@ def _run_stage(
         )
 
     if isinstance(outcome, _MalformedOutcome):
+        malformed_now = _fresh_now(now)
         _record_malformed(
             stage,
             claim,
-            now=now,
+            now=malformed_now,
             response_hash=outcome.response_hash,
             response_size=outcome.response_size,
             provider_call_ids=outcome.provider_call_ids,
@@ -1105,7 +1128,7 @@ def _run_stage(
                 stage,
                 claim,
                 contract,
-                now=now,
+                now=malformed_now,
                 max_provider_calls=max_provider_calls,
                 prior_provider_call_ids=provider_call_ids,
                 prior_started_calls=started_calls,
@@ -1124,18 +1147,18 @@ def _run_stage(
 
     provider_call_ids = prior_provider_call_ids + outcome.provider_call_ids
     started_calls = prior_started_calls + outcome.started_calls
+    failure_fence_now = _fresh_now(now)
     with transaction.atomic():
-        lock_work_fence(claim=claim, now=now)
+        lock_work_fence(claim=claim, now=failure_fence_now)
     failure = _classify_provider_error(outcome.error, stage)
-    _record_provider_failure(stage, claim, now=now, failure=failure)
+    failure_now = _fresh_now(failure_fence_now)
+    _record_provider_failure(stage, claim, now=failure_now, failure=failure)
     if _fallback_eligible(failure, outcome.error) and allow_fallback and _fallback_permitted(stage):
-        with transaction.atomic():
-            lock_work_fence(claim=claim, now=now)
         fallback = _try_fallback(
             stage,
             claim,
             contract,
-            now=now,
+            now=failure_now,
             max_provider_calls=max_provider_calls,
             prior_provider_call_ids=provider_call_ids,
             prior_started_calls=started_calls,

@@ -17,9 +17,16 @@ from engram.core.models import (
     Agent,
     AgentSession,
     CandidateStatus,
+    DistillationCoverageOutcome,
+    DistillationObservationCoverage,
+    DistillationStage,
+    DistillationStageKind,
+    DistillationStageStatus,
+    DistillationWindow,
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryLink,
     MemoryStatus,
     MemoryVersion,
@@ -43,6 +50,9 @@ from engram.core.models import (
 from engram.memory import work_execution
 from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
+from engram.memory.distillation_provenance import candidate_source_anchors, canonical_source_manifest
+from engram.memory.distillation_provider_stage import stage_key as provider_stage_key
+from engram.memory.distillation_provider_stage import stage_target_key
 from engram.memory.distillation_window import materialize_distillation_window
 from engram.memory.invariant_queries import (
     InvariantId,
@@ -59,6 +69,7 @@ from engram.memory.workflow_work import (
     observation_content_digest,
     work_input_fingerprint,
 )
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
 EXPECTED_CASES = {
@@ -1940,6 +1951,122 @@ def _settle_session_work(work: WorkflowWork) -> None:
     work_execution.finish_work_claim(claim=claimed.claim, now=now, completion='product_succeeded')
 
 
+def _make_stage_policy(scope: tuple[Organization, Project, AgentSession], suffix: str) -> ModelPolicy:
+    organization, project, session = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=session.team,
+        name=f'Invariant {suffix} secret',
+        provider='openai',
+        scope='team',
+    )
+    return ModelPolicy.objects.create(
+        organization=organization,
+        team=session.team,
+        project=project,
+        name=f'Invariant {suffix} policy',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=1,
+    )
+
+
+def _make_stage_history(
+    scope: tuple[Organization, Project, AgentSession],
+    window: DistillationWindow,
+) -> tuple[DistillationStage, DistillationStage]:
+    organization, project, session = scope
+    chunk = window.chunks.get(ordinal=0)
+    primary_policy = _make_stage_policy(scope, 'primary')
+    fallback_policy = _make_stage_policy(scope, 'fallback')
+    target_key = stage_target_key(
+        work_id=str(window.work_id),
+        work_input_fingerprint=window.work.input_fingerprint,
+        window_input_hash=window.input_hash,
+        stage_kind=DistillationStageKind.EXTRACT,
+        level=0,
+        ordinal=chunk.ordinal,
+        chunk_ordinal=chunk.ordinal,
+        input_hash=chunk.input_hash,
+        prompt_contract='distill_extract.v1',
+    )
+    primary_stage = DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        window=window,
+        chunk=chunk,
+        stage_kind=DistillationStageKind.EXTRACT,
+        level=0,
+        ordinal=chunk.ordinal,
+        target_key=target_key,
+        stage_key=provider_stage_key(
+            target_key=target_key,
+            policy_id=str(primary_policy.id),
+            policy_version=primary_policy.version,
+            policy_role='primary',
+        ),
+        input_hash=chunk.input_hash,
+        input_manifest=chunk.input_manifest,
+        prompt_contract='distill_extract.v1',
+        policy=primary_policy,
+        policy_version=primary_policy.version,
+        policy_role='primary',
+        status=DistillationStageStatus.REQUIRED,
+        attempt_count=1,
+        last_failure_class='provider_timeout',
+        last_failure_at=timezone.now(),
+    )
+    call = ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        policy=fallback_policy,
+        secret=fallback_policy.secret,
+        provider=fallback_policy.provider,
+        model=fallback_policy.model,
+        task_type=fallback_policy.task_type,
+        policy_version=fallback_policy.version,
+        request_id=f'distill-stage:{uuid.uuid4()}',
+        redaction_state='redacted',
+    )
+    fallback_stage = DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        window=window,
+        chunk=chunk,
+        stage_kind=DistillationStageKind.EXTRACT,
+        level=0,
+        ordinal=chunk.ordinal,
+        target_key=target_key,
+        stage_key=provider_stage_key(
+            target_key=target_key,
+            policy_id=str(fallback_policy.id),
+            policy_version=fallback_policy.version,
+            policy_role='fallback',
+        ),
+        input_hash=chunk.input_hash,
+        input_manifest=chunk.input_manifest,
+        prompt_contract='distill_extract.v1',
+        policy=fallback_policy,
+        policy_version=fallback_policy.version,
+        policy_role='fallback',
+        status=DistillationStageStatus.COMPLETE,
+        attempt_count=1,
+        accepted_provider_call=call,
+        response_hash='a' * 64,
+        response_size=1,
+        output_snapshot={'memories': [], 'no_signal_observation_ids': []},
+        output_hash='b' * 64,
+        completed_at=timezone.now(),
+    )
+    return fallback_stage, primary_stage
+
+
 def _candidate_input(candidate: MemoryCandidate, *, manifest: str) -> CandidateDecisionWorkInput:
     return CandidateDecisionWorkInput(
         candidate_id=candidate.id,
@@ -2207,6 +2334,91 @@ def test_p3_v1_violation_wins_over_v0_residue() -> None:
 
     assert p3.state == InvariantState.VIOLATED
     assert any(str(base_session.id) in sample for sample in p3.sample_ids)
+
+
+@pytest.mark.django_db
+def test_p3_accepts_fallback_completion_after_failed_primary_history() -> None:
+    scope = create_scope('p3-fallback-history')
+    work = ended_session_work(scope, sequence=1)
+    window = materialize_distillation_window(work)
+    _make_stage_history(scope, window)
+    _settle_session_work(work)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.HEALTHY
+    assert p3.reason == 'latest_distillation_window_complete'
+
+
+@pytest.mark.django_db
+def test_p3_mixed_cp3_and_legacy_residue_stays_missing_after_proxy_success() -> None:
+    scope = create_scope('p3-mixed-legacy-success')
+    _v0_ended_session_with_useful_observation(scope, '1', with_successful_run=True)
+    work = ended_session_work(scope, sequence=1)
+    window = materialize_distillation_window(work)
+    _make_stage_history(scope, window)
+    _settle_session_work(work)
+
+    p3 = _exact_results(scope, timezone.now())['P3']
+
+    assert p3.state == InvariantState.MISSING_OBSERVABILITY
+    assert p3.reason == 'legacy_distillation_window_unobservable'
+    assert p3.proxy_count == 0
+    assert p3.sample_ids == ()
+
+
+@pytest.mark.django_db
+def test_p5_accepts_multiple_candidate_sources_for_signal_coverage() -> None:
+    scope = create_scope('p5-multi-source')
+    work = ended_session_work(scope, sequence=1)
+    window = materialize_distillation_window(work)
+    deciding_stage, _primary_stage = _make_stage_history(scope, window)
+    _settle_session_work(work)
+    observation = Observation.objects.get(session=scope[2], session_sequence=1)
+    digest = observation_content_digest(observation)
+    DistillationObservationCoverage.objects.create(
+        organization=scope[0],
+        project=scope[1],
+        team=scope[2].team,
+        window=window,
+        observation=observation,
+        session_sequence=observation.session_sequence,
+        observation_digest=digest,
+        outcome=DistillationCoverageOutcome.SIGNAL,
+        deciding_stage=deciding_stage,
+    )
+    for suffix in ('a', 'b'):
+        candidate = MemoryCandidate.objects.create(
+            organization=scope[0],
+            project=scope[1],
+            team=scope[2].team,
+            title=f'p5 source {suffix}',
+            body=f'p5 source body {suffix}',
+            status=CandidateStatus.PROPOSED,
+            content_hash=f'p5-source-{suffix}',
+            confidence=Decimal('0.900'),
+        )
+        anchors = candidate_source_anchors(
+            observation,
+            observation_id=str(observation.id),
+            observation_digest=digest,
+        )
+        MemoryCandidateSource.objects.create(
+            organization=scope[0],
+            project=scope[1],
+            team=scope[2].team,
+            candidate=candidate,
+            window=window,
+            observation=observation,
+            stage=deciding_stage,
+            anchors=anchors,
+            anchors_hash=canonical_source_manifest(anchors),
+        )
+
+    p5 = _exact_results(scope, timezone.now())['P5']
+
+    assert p5.state == InvariantState.HEALTHY
+    assert p5.reason == 'completed_window_observations_disposed'
 
 
 @pytest.mark.django_db

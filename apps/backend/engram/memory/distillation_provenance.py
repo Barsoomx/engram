@@ -15,7 +15,7 @@ class ProvenanceContractError(ValueError):
     pass
 
 
-_DIGEST_FIELDS = ('observation_digest', 'content_digest', 'digest')
+_DIGEST_FIELDS = ('observation_digest',)
 _ANCHOR_FIELDS = (
     'files',
     'file_paths',
@@ -125,11 +125,11 @@ def candidate_source_anchors(
     session_sequence: int | None = None,
     observation_digest: str | None = None,
 ) -> dict[str, object]:
-    oid = observation_id if observation_id is not None else _required(observation, 'observation_id', 'id')
+    oid = observation_id if observation_id is not None else _required(observation, 'observation_id')
     sequence = session_sequence if session_sequence is not None else _required(observation, 'session_sequence')
     digest = observation_digest
     if digest is None:
-        digest = _required(observation, *_DIGEST_FIELDS)
+        digest = _required(observation, 'observation_digest')
     oid = _canonical_id(oid, 'observation_id')
     if type(sequence) is not int or sequence <= 0:
         raise ProvenanceContractError('session_sequence must be positive')
@@ -243,17 +243,13 @@ class FinalizationPlan:
 
 def _stage_snapshot(stage: object) -> Mapping[str, object]:
     snapshot = _value(stage, 'output_snapshot')
-    if snapshot is None:
-        snapshot = _value(stage, 'outputs')
     if isinstance(snapshot, Mapping):
         return snapshot
-    if isinstance(snapshot, (list, tuple)):
-        return {'memories': list(snapshot)}
     raise ProvenanceContractError('accepted stage output snapshot is invalid')
 
 
 def _stage_key(stage: object) -> str:
-    key = _required(stage, 'stage_key', 'id')
+    key = _required(stage, 'stage_key')
     if not isinstance(key, str) or not key:
         raise ProvenanceContractError('stage key must be non-empty')
     return key
@@ -261,8 +257,17 @@ def _stage_key(stage: object) -> str:
 
 def _stage_outputs(stage: object) -> tuple[Mapping[str, object], ...]:
     snapshot = _stage_snapshot(stage)
-    values = snapshot.get('memories', snapshot.get('outputs', snapshot.get('drafts', [])))
-    if not isinstance(values, (list, tuple)):
+    stage_kind = _value(stage, 'stage_kind')
+    if stage_kind == 'extract':
+        expected_keys = {'memories', 'no_signal_observation_ids'}
+    elif stage_kind == 'reduce':
+        expected_keys = {'memories'}
+    else:
+        raise ProvenanceContractError('stage kind must be extract or reduce')
+    if set(snapshot) != expected_keys:
+        raise ProvenanceContractError('accepted stage output snapshot has invalid v1 keys')
+    values = snapshot['memories']
+    if not isinstance(values, list):
         raise ProvenanceContractError('stage memories must be a list')
     if any(not isinstance(value, Mapping) for value in values):
         raise ProvenanceContractError('stage memory must be an object')
@@ -277,7 +282,7 @@ def _output_id(
     target_key: str | None = None,
     output_hash: str | None = None,
 ) -> str:
-    value = _value(output, 'draft_id') or _value(output, 'id')
+    value = _value(output, 'draft_id')
     if value is None:
         if not target_key or not output_hash:
             raise ProvenanceContractError('stable draft identity requires stage target_key and output_hash')
@@ -289,8 +294,6 @@ def _output_id(
 
 def _source_ids(output: object) -> tuple[str, ...]:
     values = _value(output, 'source_ids')
-    if values is None:
-        values = _value(output, 'supporting_draft_ids')
     if values is None:
         return ()
     if not isinstance(values, (list, tuple)):
@@ -304,7 +307,7 @@ def _source_ids(output: object) -> tuple[str, ...]:
 def _support_ids(output: object) -> tuple[str, ...]:
     values = _value(output, 'supporting_observation_ids')
     if values is None:
-        values = _value(output, 'source_observation_ids', [])
+        values = []
     if not isinstance(values, (list, tuple)):
         raise ProvenanceContractError('supporting observation ids must be strings')
     values = tuple(_canonical_id(item, 'observation_id') for item in values)
@@ -347,7 +350,7 @@ def build_finalization_plan(  # noqa: C901
     obs_by_id: dict[str, object] = {}
     for observation in observation_rows:
         _scope_match(observation, scope)
-        oid = _canonical_id(_required(observation, 'observation_id', 'id'), 'observation_id')
+        oid = _canonical_id(_required(observation, 'observation_id'), 'observation_id')
         if oid in obs_by_id:
             raise ProvenanceContractError('observations must have unique ids')
         candidate_source_anchors(observation)
@@ -366,8 +369,8 @@ def build_finalization_plan(  # noqa: C901
     no_signal_stage: dict[str, str] = {}
     for stage in stages:
         _scope_match(stage, scope)
-        status = _value(stage, 'status', 'complete')
-        if status not in ('complete', 'completed'):
+        status = _value(stage, 'status')
+        if status != 'complete':
             raise ProvenanceContractError('all accepted stages must be complete')
         key = _stage_key(stage)
         if key in stage_map:
@@ -377,14 +380,14 @@ def build_finalization_plan(  # noqa: C901
             _check_digest(output_hash, 'stage output_hash')
         stage_map[key] = stage
         snapshot = _stage_snapshot(stage)
-        values = snapshot.get('no_signal_observation_ids', ())
+        values = snapshot.get('no_signal_observation_ids')
         if values is not None:
-            if not isinstance(values, (list, tuple)):
+            if not isinstance(values, list):
                 raise ProvenanceContractError('no-signal ids must be a list')
             if len(set(values)) != len(values):
                 raise ProvenanceContractError('no-signal ids must be duplicate-free strings')
-            stage_kind = _value(stage, 'stage_kind', 'extract')
-            if stage_kind not in ('extract', 'extraction') and values:
+            stage_kind = _value(stage, 'stage_kind')
+            if stage_kind != 'extract' and values:
                 raise ProvenanceContractError('no-signal declarations must come from extraction stages')
             for value in values:
                 observation_id = _canonical_id(value, 'observation_id')
@@ -408,10 +411,8 @@ def build_finalization_plan(  # noqa: C901
     if supplied_final:
         finals: list[tuple[object, str, int]] = []
         for index, output in enumerate(supplied_final):
-            did = _value(output, 'draft_id') or _value(output, 'id') or f'final:{index}'
-            source_stage = _value(output, 'source_stage_key') or _value(output, 'deciding_stage_key')
-            if not isinstance(source_stage, str):
-                source_stage = _value(output, 'stage_key')
+            did = _required(output, 'draft_id')
+            source_stage = _value(output, 'source_stage_key')
             if not isinstance(source_stage, str):
                 raise ProvenanceContractError('final draft lineage stage is required')
             finals.append((output, source_stage, index))
@@ -449,6 +450,7 @@ def build_finalization_plan(  # noqa: C901
 
     candidate_plans: list[CandidatePlan] = []
     signal_observation_ids: set[str] = set()
+    signal_stage_keys: dict[str, set[str]] = {}
     candidate_ids: set[str] = set()
     for _index, (output, deciding_stage, output_index) in enumerate(finals):
         if deciding_stage not in stage_map:
@@ -526,6 +528,7 @@ def build_finalization_plan(  # noqa: C901
             )
             sources.append(source)
             signal_observation_ids.add(oid)
+            signal_stage_keys.setdefault(oid, set()).add(lineage_stage)
         session_id = scope_view.get('session_id')
         content_hash = None
         if session_id is not None:
@@ -550,14 +553,22 @@ def build_finalization_plan(  # noqa: C901
         raise ProvenanceContractError('observation is both signal and no-signal')
     if signal_observation_ids | no_signal != set(obs_by_id):
         raise ProvenanceContractError('coverage does not equal observation manifest')
-    first_deciding_stage = candidate_plans[0].deciding_stage_key if candidate_plans else (next(iter(stage_map), ''))
+    signal_deciding_stages: dict[str, str] = {}
+    for oid in sorted(signal_observation_ids):
+        deciding_stages = signal_stage_keys.get(oid, set())
+        if not deciding_stages:
+            raise ProvenanceContractError('signal coverage has no source stage')
+        chosen_stage = sorted(deciding_stages)[0]
+        if chosen_stage not in stage_map:
+            raise ProvenanceContractError('signal coverage source stage is unknown')
+        signal_deciding_stages[oid] = chosen_stage
     coverage = tuple(
         CoveragePlan(
             observation_id=oid,
             session_sequence=_required(obs_by_id[oid], 'session_sequence'),
             observation_digest=_required(obs_by_id[oid], *_DIGEST_FIELDS),
             outcome='signal' if oid in signal_observation_ids else 'no_signal',
-            deciding_stage_key=(first_deciding_stage if oid in signal_observation_ids else no_signal_stage[oid]),
+            deciding_stage_key=(signal_deciding_stages[oid] if oid in signal_observation_ids else no_signal_stage[oid]),
         )
         for oid in sorted(obs_by_id, key=lambda value: (_value(obs_by_id[value], 'session_sequence'), value))
     )

@@ -690,7 +690,7 @@ def _evaluate_p3(project: Project, as_of: datetime) -> InvariantResult:
         unproven_legacy = legacy.annotate(has_successful_run=Exists(successful_runs)).filter(
             has_successful_run=False,
         )
-        if unproven_legacy.exists():
+        if legacy.exists():
             return InvariantResult(
                 invariant_id=InvariantId.P3,
                 state=InvariantState.MISSING_OBSERVABILITY,
@@ -788,13 +788,22 @@ def _cp3_work_complete(work: WorkflowWork, project: Project) -> bool:
             project_id=project.id,
         ).only('id', 'status', 'stage_kind', 'chunk_id')
     )
-    if not stages or any(stage.status != DistillationStageStatus.COMPLETE for stage in stages):
+    stages_by_target: dict[str, list[DistillationStage]] = defaultdict(list)
+    for stage in stages:
+        stages_by_target[stage.target_key].append(stage)
+    accepted_stages: list[DistillationStage] = []
+    for target_stages in stages_by_target.values():
+        accepted = [stage for stage in target_stages if stage.status == DistillationStageStatus.COMPLETE]
+        if len(accepted) != 1:
+            return False
+        accepted_stages.append(accepted[0])
+    if not stages:
         return False
 
     chunk_ids = set(window.chunks.values_list('id', flat=True))
     extract_chunk_ids = {
         stage.chunk_id
-        for stage in stages
+        for stage in accepted_stages
         if stage.stage_kind == DistillationStageKind.EXTRACT and stage.chunk_id is not None
     }
     return chunk_ids <= extract_chunk_ids
@@ -920,9 +929,11 @@ def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID
         .select_related('chunk')
         .order_by('stage_kind', 'level', 'ordinal', 'id')
     )
-    stage_by_id = {stage.id: stage for stage in stages}
+    stage_by_id: dict[uuid.UUID, DistillationStage] = {}
     stage_keys: set[str] = set()
-    target_keys: set[str] = set()
+    stages_by_target: dict[str, list[DistillationStage]] = defaultdict(list)
+    for stage in stages:
+        stages_by_target[stage.target_key].append(stage)
     extract_chunks: set[uuid.UUID] = set()
     for stage in stages:
         if (
@@ -930,13 +941,10 @@ def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID
             or stage.project_id != window.project_id
             or stage.team_id != window.team_id
             or stage.window_id != window.id
-            or stage.status != DistillationStageStatus.COMPLETE
             or stage.stage_key in stage_keys
-            or stage.target_key in target_keys
         ):
             findings.append(('stage', stage.id))
         stage_keys.add(stage.stage_key)
-        target_keys.add(stage.target_key)
         expected_target_key = stage_target_key(
             work_id=str(window.work_id),
             work_input_fingerprint=window.work.input_fingerprint,
@@ -950,6 +958,17 @@ def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID
         )
         if stage.target_key != expected_target_key:
             findings.append(('stage', stage.id))
+        if stage.status != DistillationStageStatus.COMPLETE:
+            continue
+        accepted_for_target = [
+            candidate
+            for candidate in stages_by_target[stage.target_key]
+            if candidate.status == DistillationStageStatus.COMPLETE
+        ]
+        if len(accepted_for_target) != 1:
+            findings.append(('window', window.id))
+            continue
+        stage_by_id[stage.id] = stage
         if stage.stage_kind == DistillationStageKind.EXTRACT:
             if stage.chunk_id is None or stage.chunk.window_id != window.id or stage.level != 0:
                 findings.append(('stage', stage.id))
@@ -959,7 +978,11 @@ def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID
                     findings.append(('stage', stage.id))
         elif stage.chunk_id is not None or stage.level <= 0:
             findings.append(('stage', stage.id))
-    if not stages or extract_chunks != {chunk.id for chunk in chunks}:
+    if (
+        not stages_by_target
+        or len(stage_by_id) != len(stages_by_target)
+        or extract_chunks != {chunk.id for chunk in chunks}
+    ):
         findings.append(('window', window.id))
 
     coverage = list(
@@ -1040,7 +1063,7 @@ def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID
     for observation_id, rows in coverage_by_observation.items():
         outcome = rows[0].outcome
         source_rows = sources_by_observation.get(observation_id, [])
-        if outcome == DistillationCoverageOutcome.SIGNAL and len(source_rows) != 1:
+        if outcome == DistillationCoverageOutcome.SIGNAL and not source_rows:
             findings.append(('window', window.id))
         if outcome == DistillationCoverageOutcome.NO_SIGNAL and source_rows:
             findings.append(('window', window.id))

@@ -12,6 +12,7 @@ from engram.core.models import (
     CandidateStatus,
     LinkType,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryLink,
     WorkflowRunOrigin,
     WorkflowWorkDisposition,
@@ -21,7 +22,6 @@ from engram.memory.aware_time import require_aware
 from engram.memory.candidate_decision_work import (
     CandidateDecisionWorkBuilder,
     ensure_candidate_decision_work_locked,
-    register_candidate_decision_work_builder,
 )
 from engram.memory.candidate_decision_work import (
     CandidateDecisionWorkInput as _CandidateDecisionWorkInput,
@@ -60,10 +60,6 @@ def set_candidate_decision_work_builder(builder: CandidateDecisionWorkBuilder | 
 
 def get_candidate_decision_work_builder() -> CandidateDecisionWorkBuilder | None:
     return _BUILDER
-
-
-def register_default_candidate_decision_builder() -> CandidateDecisionWorkBuilder:
-    return register_candidate_decision_work_builder()
 
 
 def _finding(
@@ -136,6 +132,33 @@ def _proposed_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> l
     return list(candidates)
 
 
+def _cp3_repair_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> list[MemoryCandidate]:
+    conflict_links = MemoryLink.objects.filter(
+        organization_id=organization_id,
+        project_id=project_id,
+        memory__organization_id=organization_id,
+        memory__project_id=project_id,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=Concat(
+            Value(CONFLICT_CANDIDATE_TARGET_PREFIX),
+            Cast(OuterRef('id'), output_field=CharField()),
+        ),
+    )
+    return list(
+        MemoryCandidate.objects.filter(
+            organization_id=organization_id,
+            project_id=project_id,
+            status=CandidateStatus.PROPOSED,
+            decision_work_contract_version=1,
+            sources__isnull=False,
+        )
+        .annotate(has_canonical_conflict=Exists(conflict_links))
+        .only('id', 'organization_id', 'project_id', 'team_id', 'created_at')
+        .distinct()
+        .order_by('created_at', 'id')
+    )
+
+
 def inspect_candidate_work(
     *,
     organization_id: uuid.UUID,
@@ -177,12 +200,9 @@ def reconcile_candidate_work(
     as_of: datetime,
 ) -> CandidateWorkReconciliation:
     require_aware(as_of)
-    builder = get_candidate_decision_work_builder()
-    if builder is None or not hasattr(builder, 'expected_input'):
-        return CandidateWorkReconciliation(organization_id, project_id, as_of, 0, ())
 
     applied: list[str] = []
-    for candidate in _proposed_candidates(organization_id, project_id):
+    for candidate in _cp3_repair_candidates(organization_id, project_id):
         if candidate.has_canonical_conflict:
             continue
         with transaction.atomic():
@@ -192,13 +212,21 @@ def reconcile_candidate_work(
                     organization_id=organization_id,
                     project_id=project_id,
                     status=CandidateStatus.PROPOSED,
+                    decision_work_contract_version=1,
                 )
             except MemoryCandidate.DoesNotExist:
                 continue
-            work, created = ensure_candidate_decision_work_locked(locked)
-            if not created:
+            if not MemoryCandidateSource.objects.filter(candidate_id=locked.id).exists():
                 continue
-            queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+            work, _created = ensure_candidate_decision_work_locked(locked)
+            if (
+                work.disposition != WorkflowWorkDisposition.REQUIRED
+                or work.execution_state != WorkflowWorkExecutionState.READY
+            ):
+                continue
+            run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+            if run.dispatched_at != as_of:
+                continue
             applied.append(str(candidate.id))
 
     return CandidateWorkReconciliation(
@@ -208,3 +236,27 @@ def reconcile_candidate_work(
         queued=len(applied),
         applied=tuple(applied),
     )
+
+
+def reconcile_scheduled_candidate_work(*, as_of: datetime) -> int:
+    require_aware(as_of)
+    scopes = (
+        MemoryCandidateSource.objects.filter(
+            candidate__status=CandidateStatus.PROPOSED,
+            candidate__decision_work_contract_version=1,
+        )
+        .values_list('organization_id', 'project_id')
+        .distinct()
+        .order_by('organization_id', 'project_id')
+    )
+
+    total = 0
+    for organization_id, project_id in scopes:
+        result = reconcile_candidate_work(
+            organization_id=organization_id,
+            project_id=project_id,
+            as_of=as_of,
+        )
+        total += result.queued
+
+    return total

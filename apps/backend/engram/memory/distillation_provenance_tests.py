@@ -43,16 +43,18 @@ def _extract_stage(
     output_hash: str,
     outputs: list[dict[str, object]],
     no_signal: list[str] = None,
+    stage_kind: str = 'extract',
 ) -> dict[str, object]:
+    snapshot: dict[str, object] = {'memories': outputs}
+    if stage_kind == 'extract':
+        snapshot['no_signal_observation_ids'] = no_signal or []
     return {
         'stage_key': stage_key,
         'target_key': target_key,
+        'stage_kind': stage_kind,
         'status': 'complete',
         'output_hash': output_hash,
-        'output_snapshot': {
-            'memories': outputs,
-            'no_signal_observation_ids': no_signal or [],
-        },
+        'output_snapshot': snapshot,
     }
 
 
@@ -112,6 +114,7 @@ def test_finalization_plan_recursively_unions_support_and_preserves_lineage() ->
     reduction = [
         {
             'stage_key': 'reduce-1',
+            'stage_kind': 'reduce',
             'status': 'complete',
             'output_hash': 'd' * 64,
             'output_snapshot': {
@@ -166,6 +169,7 @@ def test_shared_signal_uses_first_final_deciding_stage_for_coverage_but_source_k
     reduction = [
         {
             'stage_key': 'reduce-1',
+            'stage_kind': 'reduce',
             'status': 'complete',
             'output_hash': 'c' * 64,
             'output_snapshot': {
@@ -182,6 +186,7 @@ def test_shared_signal_uses_first_final_deciding_stage_for_coverage_but_source_k
         },
         {
             'stage_key': 'reduce-2',
+            'stage_kind': 'reduce',
             'status': 'complete',
             'output_hash': 'd' * 64,
             'output_snapshot': {
@@ -229,6 +234,91 @@ def test_shared_signal_uses_first_final_deciding_stage_for_coverage_but_source_k
         'reduce-1',
         'reduce-2',
     }
+
+
+def test_signal_coverage_deciding_stage_is_the_candidate_source_stage_for_each_observation() -> None:
+    observations = [_observation('obs-1', 1), _observation('obs-2', 2)]
+    stages = [
+        _extract_stage(
+            stage_key='extract-a',
+            target_key='target-a',
+            output_hash='b' * 64,
+            outputs=[],
+        ),
+        {
+            'stage_key': 'reduce-1',
+            'stage_kind': 'reduce',
+            'status': 'complete',
+            'output_hash': 'c' * 64,
+            'output_snapshot': {'memories': []},
+        },
+        {
+            'stage_key': 'reduce-2',
+            'stage_kind': 'reduce',
+            'status': 'complete',
+            'output_hash': 'd' * 64,
+            'output_snapshot': {'memories': []},
+        },
+    ]
+
+    plan = build_finalization_plan(
+        scope={'organization_id': 'org', 'project_id': 'project', 'team_id': None, 'session_id': 'session'},
+        window_input_hash=_DIGEST,
+        observations=observations,
+        accepted_stages=stages,
+        final_drafts=[
+            {
+                'draft_id': 'final-1',
+                'source_stage_key': 'reduce-1',
+                'title': 'One',
+                'body': 'One',
+                'confidence': '0.7',
+                'source_ids': ['obs-1'],
+            },
+            {
+                'draft_id': 'final-2',
+                'source_stage_key': 'reduce-2',
+                'title': 'Two',
+                'body': 'Two',
+                'confidence': '0.6',
+                'source_ids': ['obs-2'],
+            },
+        ],
+    )
+
+    assert [item.deciding_stage_key for item in plan.coverage] == ['reduce-1', 'reduce-2']
+
+
+def test_stage_status_must_use_exact_v1_complete_value() -> None:
+    with pytest.raises(ProvenanceContractError, match='all accepted stages must be complete'):
+        build_finalization_plan(
+            scope={'organization_id': 'org', 'project_id': 'project', 'team_id': None, 'session_id': 'session'},
+            window_input_hash=_DIGEST,
+            observations=[_observation('obs-1', 1)],
+            accepted_stages=[
+                {
+                    'stage_key': 'extract-a',
+                    'status': 'completed',
+                    'output_snapshot': {'memories': [], 'no_signal_observation_ids': ['obs-1']},
+                }
+            ],
+        )
+
+
+def test_stage_snapshot_must_use_exact_output_snapshot_v1_shape() -> None:
+    with pytest.raises(ProvenanceContractError, match='accepted stage output snapshot is invalid'):
+        build_finalization_plan(
+            scope={'organization_id': 'org', 'project_id': 'project', 'team_id': None, 'session_id': 'session'},
+            window_input_hash=_DIGEST,
+            observations=[_observation('obs-1', 1)],
+            accepted_stages=[
+                {
+                    'stage_key': 'extract-a',
+                    'status': 'complete',
+                    'outputs': [],
+                }
+            ],
+        )
 
 
 def test_plan_rejects_missing_coverage_and_provider_invented_anchor() -> None:
@@ -363,6 +453,7 @@ def test_missing_draft_ids_use_stable_stage_target_identity_recursively() -> Non
                     'source_ids': [stable_id],
                 }
             ],
+            stage_kind='reduce',
         )
     ]
 

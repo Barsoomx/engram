@@ -3,12 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from engram.memory.workflow_work import canonical_json_bytes
+
+if TYPE_CHECKING:
+    from engram.core.models import DistillationStage, DistillationWindow
 
 
 class ReductionContractError(ValueError):
@@ -88,10 +91,18 @@ class ReductionDraft:
             raise ReductionContractError('title is invalid')
         if not isinstance(self.body, str) or not self.body or len(self.body) > MAX_BODY:
             raise ReductionContractError('body is invalid')
+        if not isinstance(self.confidence, Decimal):
+            raise ReductionContractError('confidence must be Decimal')
         if not self.source_ids or len(set(self.source_ids)) != len(self.source_ids):
             raise ReductionContractError('source ids must be non-empty and duplicate-free')
         if any(not isinstance(item, str) or not item for item in self.source_ids):
             raise ReductionContractError('source ids must be strings')
+        for field_name, values in (
+            ('source_stage_ids', self.source_stage_ids),
+            ('anchor_ids', self.anchor_ids),
+        ):
+            if any(not isinstance(item, str) or not item for item in values):
+                raise ReductionContractError(f'{field_name} must contain strings')
         if not self.confidence.is_finite() or not Decimal('0') <= self.confidence <= Decimal('1'):
             raise ReductionContractError('confidence is outside [0, 1]')
 
@@ -340,143 +351,147 @@ def _materialize_reduced(batch: ReductionBatch, parsed: ReductionOutput) -> tupl
 def reduce_multilevel(
     drafts: Sequence[ReductionDraft], *, reduction_target: int, prompt_budget: int, provider: Provider
 ) -> tuple[ReductionDraft, ...]:
-    current = tuple(drafts)
-    level = 1
-    while len(current) > reduction_target:
-        next_level: list[ReductionDraft] = []
-        for batch in build_reduction_batches(
-            current, reduction_target=reduction_target, prompt_budget=prompt_budget, level=level
-        ):
-            if not batch.provider_required:
-                next_level.extend(batch.input_drafts)
-                continue
-            parsed = parse_reduction_output(provider(batch), batch.input_drafts, reduction_target=reduction_target)
-            next_level.extend(_materialize_reduced(batch, parsed))
-        if len(next_level) >= len(current):
-            raise ReductionContractError('reduction level did not shrink')
-        current = tuple(next_level)
-        level += 1
-    return current
-
-
-def _value(item: object, key: str, default: object = None) -> object:
-    if isinstance(item, Mapping):
-        return item.get(key, default)
-    return getattr(item, key, default)
-
-
-def _snapshot_drafts(snapshot: object) -> tuple[ReductionDraft, ...]:
-    outputs = _value(snapshot, 'outputs', _value(snapshot, 'drafts', None))
-    if outputs is None:
-        output_snapshot = _value(snapshot, 'output_snapshot', {})
-        outputs = _value(output_snapshot, 'memories', ())
-    if outputs is None:
-        return ()
-    target_key = str(_value(snapshot, 'target_key', _value(snapshot, 'stage_key', 'extraction')))
-    source_stage_key = str(_value(snapshot, 'stage_key', target_key))
-    output_hash = str(_value(snapshot, 'output_hash', ''))
-
-    def draft_hash(output: object) -> str:
-        value = {
-            'title': str(_value(output, 'title')),
-            'body': str(_value(output, 'body')),
-            'confidence': str(_value(output, 'confidence')),
-            'source_ids': list(_value(output, 'source_ids', _value(output, 'supporting_observation_ids', ()))),
-            'kind': str(_value(output, 'kind', '')),
-        }
-        return _hash(value)
-
-    return tuple(
-        output
-        if isinstance(output, ReductionDraft)
-        else ReductionDraft(
-            draft_id=str(
-                _value(output, 'draft_id')
-                or stable_draft_id(
-                    target_key,
-                    output_hash or draft_hash(output),
-                    int(_value(output, 'output_index', index)),
-                )
-            ),
-            title=str(_value(output, 'title')),
-            body=str(_value(output, 'body')),
-            confidence=_confidence(_value(output, 'confidence')),
-            source_ids=tuple(_value(output, 'source_ids', _value(output, 'supporting_observation_ids', ()))),
-            source_stage_ids=tuple(_value(output, 'source_stage_ids', ())),
-            anchor_ids=tuple(_value(output, 'anchor_ids', ())),
-            kind=str(_value(output, 'kind', '')),
-            source_stage_key=str(_value(output, 'source_stage_key', source_stage_key)),
-            source_output_hash=str(_value(output, 'source_output_hash', output_hash or draft_hash(output))),
-            output_index=int(_value(output, 'output_index', index)),
+    if any(not isinstance(draft, ReductionDraft) for draft in drafts):
+        raise ReductionContractError('reduction drafts must be typed ReductionDraft instances')
+    accepted: list[_AcceptedReduction] = []
+    while True:
+        state = _evaluate_draft_reduction_state(
+            tuple(drafts),
+            accepted,
+            reduction_target=reduction_target,
+            prompt_budget=prompt_budget,
         )
-        for index, output in enumerate(outputs)
-    )
+        if state.final is not None:
+            return state.final
+        if state.pending is None:
+            raise ReductionContractError('reduction state is incomplete')
+        parsed = parse_reduction_output(
+            provider(state.pending), state.pending.input_drafts, reduction_target=reduction_target
+        )
+        accepted.append(
+            _AcceptedReduction(
+                state.pending.level,
+                state.pending.ordinal,
+                state.pending.input_hash,
+                _materialize_reduced(state.pending, parsed),
+            )
+        )
 
 
-def _stage_rows(stage: object) -> tuple[object, ...]:
-    direct = _value(stage, 'source_stages', None)
-    if direct is not None:
-        return tuple(direct)
-    window = _value(stage, 'window', None)
-    if window is not None:
-        direct = _value(window, 'stages', None)
-        if direct is not None:
-            if hasattr(direct, 'all'):
-                return tuple(direct.all())
-            return tuple(direct)
-        direct = _value(window, 'accepted_stages', None)
-        if direct is not None:
-            return tuple(direct)
-    try:
-        from engram.core.models import DistillationStage
+def _require_stage(stage: DistillationStage) -> DistillationStage:
+    from engram.core.models import DistillationStage
 
-        window_id = _value(stage, 'window_id') or _value(window, 'id')
-        if window_id is None:
-            return ()
-        return tuple(DistillationStage.objects.filter(window_id=window_id, status='complete'))
-    except (ImportError, AttributeError):
-        return ()
+    if not isinstance(stage, DistillationStage):
+        raise ReductionContractError('reduction stages must be DistillationStage instances')
+    return stage
 
 
-def _hydrate_input_drafts(stage: object) -> tuple[ReductionDraft, ...]:  # noqa: C901
-    manifest = _value(stage, 'input_manifest', {})
-    if not isinstance(manifest, Mapping):
-        raise ReductionContractError('reduction input manifest is invalid')
-    refs = manifest.get('refs', ())
-    if not isinstance(refs, (list, tuple)) or not refs:
-        raise ReductionContractError('reduction input manifest refs are invalid')
-    candidates = _stage_rows(stage)
-    window_id = _value(stage, 'window_id') or _value(_value(stage, 'window', None), 'id')
-    scope_keys = ('organization_id', 'project_id', 'team_id')
+def _snapshot_drafts(stage: DistillationStage) -> tuple[ReductionDraft, ...]:  # noqa: C901
+    from engram.core.models import DistillationStageKind, DistillationStageStatus
+
+    stage = _require_stage(stage)
+    if stage.status != DistillationStageStatus.COMPLETE or stage.output_snapshot is None:
+        raise ReductionContractError('reduction input stage must be complete with an output snapshot')
+    if any(not isinstance(value, str) or not value for value in (stage.target_key, stage.stage_key, stage.output_hash)):
+        raise ReductionContractError('distillation stage identity is invalid')
+    snapshot = stage.output_snapshot
+    if not isinstance(snapshot, dict) or set(snapshot) != (
+        {'memories', 'no_signal_observation_ids'} if stage.stage_kind == DistillationStageKind.EXTRACT else {'memories'}
+    ):
+        raise ReductionContractError('distillation stage snapshot does not match its v1 contract')
+    outputs = snapshot['memories']
+    if not isinstance(outputs, list):
+        raise ReductionContractError('distillation stage memories must be a list')
+    if stage.stage_kind == DistillationStageKind.EXTRACT:
+        no_signal = snapshot['no_signal_observation_ids']
+        if (
+            not isinstance(no_signal, list)
+            or any(not isinstance(item, str) or not item for item in no_signal)
+            or len(set(no_signal)) != len(no_signal)
+        ):
+            raise ReductionContractError('distillation no-signal ids are invalid')
+    if stage.stage_kind not in (DistillationStageKind.EXTRACT, DistillationStageKind.REDUCE):
+        raise ReductionContractError('unsupported distillation stage kind')
+
     result: list[ReductionDraft] = []
+    for index, output in enumerate(outputs):
+        if not isinstance(output, dict):
+            raise ReductionContractError('distillation memory must be an object')
+        if stage.stage_kind == DistillationStageKind.EXTRACT:
+            allowed = {'title', 'body', 'confidence', 'supporting_observation_ids', 'kind'}
+            source_key = 'supporting_observation_ids'
+        else:
+            allowed = {'title', 'body', 'confidence', 'source_ids', 'kind'}
+            source_key = 'source_ids'
+        if not set(output).issubset(allowed) or not {'title', 'body', 'confidence', source_key} <= set(output):
+            raise ReductionContractError('distillation memory has malformed keys')
+        source_ids = output[source_key]
+        if not isinstance(source_ids, list) or any(not isinstance(item, str) or not item for item in source_ids):
+            raise ReductionContractError('distillation memory source ids are invalid')
+        if len(set(source_ids)) != len(source_ids):
+            raise ReductionContractError('distillation memory source ids are duplicate-free')
+        kind = output.get('kind', '')
+        if not isinstance(kind, str) or (
+            kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
+        ):
+            raise ReductionContractError('distillation memory kind is unknown')
+        output_hash = _hash(
+            {
+                'title': output['title'],
+                'body': output['body'],
+                'confidence': str(output['confidence']),
+                'source_ids': source_ids,
+                'kind': kind,
+            }
+        )
+        draft_id = stable_draft_id(stage.target_key, output_hash, index)
+        result.append(
+            ReductionDraft(
+                draft_id=draft_id,
+                title=output['title'],
+                body=output['body'],
+                confidence=_confidence(output['confidence']),
+                source_ids=tuple(source_ids),
+                source_stage_ids=(stage.stage_key,),
+                kind=kind,
+                source_stage_key=stage.stage_key,
+                source_output_hash=stage.output_hash,
+                output_index=index,
+            )
+        )
+    return tuple(result)
+
+
+def _hydrate_input_drafts(stage: DistillationStage) -> tuple[ReductionDraft, ...]:
+    from engram.core.models import DistillationStageKind, DistillationStageStatus
+
+    stage = _require_stage(stage)
+    if stage.stage_kind != DistillationStageKind.REDUCE:
+        raise ReductionContractError('reduction input hydration requires a reduce stage')
+    if stage.status not in (DistillationStageStatus.REQUIRED, DistillationStageStatus.COMPLETE):
+        raise ReductionContractError('reduction stage status is invalid')
+    manifest = stage.input_manifest
+    if not isinstance(manifest, dict) or set(manifest) != {'schema', 'level', 'ordinal', 'refs'}:
+        raise ReductionContractError('reduction input manifest is invalid')
+    refs = manifest['refs']
+    if not isinstance(refs, list) or not refs:
+        raise ReductionContractError('reduction input manifest refs are invalid')
+    result: list[ReductionDraft] = []
+    candidates = tuple(stage.window.stages.filter(status=DistillationStageStatus.COMPLETE))
     for ref in refs:
-        if not isinstance(ref, Mapping):
+        if not isinstance(ref, dict) or set(ref) != {
+            'draft_id',
+            'source_stage_key',
+            'source_output_hash',
+            'output_index',
+        }:
             raise ReductionContractError('reduction input ref is invalid')
-        required = ('draft_id', 'source_stage_key', 'source_output_hash', 'output_index')
-        if any(key not in ref for key in required):
-            raise ReductionContractError('reduction input ref is incomplete')
-        matches: list[ReductionDraft] = []
-        for source_stage in candidates:
-            if _value(source_stage, 'status', 'complete') not in ('complete', 'completed', 'accepted'):
-                continue
-            source_window_id = _value(source_stage, 'window_id') or _value(_value(source_stage, 'window', None), 'id')
-            if window_id is not None and source_window_id is not None and source_window_id != window_id:
-                continue
-            if any(
-                _value(source_stage, key) is not None
-                and _value(stage, key) is not None
-                and _value(source_stage, key) != _value(stage, key)
-                for key in scope_keys
-            ):
-                continue
-            for draft in _snapshot_drafts(source_stage):
-                if (
-                    draft.draft_id == ref['draft_id']
-                    and draft.source_stage_key == ref['source_stage_key']
-                    and draft.source_output_hash == ref['source_output_hash']
-                    and draft.output_index == ref['output_index']
-                ):
-                    matches.append(draft)
+        matches = [
+            draft
+            for source_stage in candidates
+            for draft in _snapshot_drafts(source_stage)
+            if draft.ref.as_manifest() == ref
+        ]
         if len(matches) != 1:
             raise ReductionContractError('reduction input ref is missing or ambiguous')
         result.append(matches[0])
@@ -512,115 +527,150 @@ def _expand_reduced_drafts(
     return tuple(expanded)
 
 
+@dataclass(frozen=True, slots=True)
+class _AcceptedReduction:
+    level: int
+    ordinal: int
+    input_hash: str
+    drafts: tuple[ReductionDraft, ...]
+
+    @property
+    def batch_key(self) -> str:
+        return reduction_batch_key(level=self.level, ordinal=self.ordinal, input_hash=self.input_hash)
+
+
+@dataclass(frozen=True, slots=True)
+class _ReductionState:
+    current: tuple[ReductionDraft, ...]
+    pending: ReductionBatch | None
+    final: tuple[ReductionDraft, ...] | None
+
+
+def _evaluate_draft_reduction_state(
+    initial_drafts: tuple[ReductionDraft, ...],
+    accepted_rows: Sequence[_AcceptedReduction],
+    *,
+    reduction_target: int,
+    prompt_budget: int,
+) -> _ReductionState:
+    if reduction_target <= 0 or prompt_budget <= 0:
+        return _ReductionState((), None, ())
+    if len({row.batch_key for row in accepted_rows}) != len(accepted_rows):
+        raise ReductionContractError('accepted reduction identities are duplicate')
+    accepted_by_key = {row.batch_key: row for row in accepted_rows}
+    current = initial_drafts
+    if len(current) <= reduction_target:
+        return _ReductionState(current, None, current)
+    level = 1
+    while len(current) > reduction_target:
+        batches = build_reduction_batches(
+            current,
+            reduction_target=reduction_target,
+            prompt_budget=prompt_budget,
+            level=level,
+        )
+        next_level: list[ReductionDraft] = []
+        for batch in batches:
+            if not batch.provider_required:
+                next_level.extend(batch.input_drafts)
+                continue
+            accepted = accepted_by_key.get(batch.batch_key)
+            if accepted is None:
+                return _ReductionState(current, batch, None)
+            next_level.extend(_expand_reduced_drafts(accepted.drafts, batch.input_drafts))
+        if len(next_level) >= len(current):
+            raise ReductionContractError('reduction level did not shrink')
+        current = tuple(next_level)
+        level += 1
+    return _ReductionState(current, None, current)
+
+
+def _accepted_reduction(stage: DistillationStage) -> _AcceptedReduction:
+    from engram.core.models import DistillationStageKind, DistillationStageStatus
+
+    stage = _require_stage(stage)
+    if stage.stage_kind != DistillationStageKind.REDUCE or stage.status != DistillationStageStatus.COMPLETE:
+        raise ReductionContractError('accepted reductions must be complete reduce stages')
+    if (
+        type(stage.level) is not int
+        or type(stage.ordinal) is not int
+        or not isinstance(stage.input_hash, str)
+        or not stage.input_hash
+    ):
+        raise ReductionContractError('accepted reduction identity is invalid')
+    return _AcceptedReduction(stage.level, stage.ordinal, stage.input_hash, _snapshot_drafts(stage))
+
+
+def _evaluate_reduction_state(
+    extraction_stages: Sequence[DistillationStage],
+    accepted_stages: Sequence[DistillationStage],
+    *,
+    reduction_target: int,
+    prompt_budget: int,
+) -> _ReductionState:
+    from engram.core.models import DistillationStageKind, DistillationStageStatus
+
+    extraction = tuple(_require_stage(stage) for stage in extraction_stages)
+    accepted_rows = tuple(_accepted_reduction(stage) for stage in accepted_stages)
+    if any(stage.stage_kind != DistillationStageKind.EXTRACT for stage in extraction):
+        raise ReductionContractError('reduction extraction inputs must be extract stages')
+    if any(stage.status != DistillationStageStatus.COMPLETE for stage in extraction):
+        return _ReductionState((), None, ())
+    if extraction:
+        window_id = extraction[0].window_id
+        scope = (extraction[0].organization_id, extraction[0].project_id, extraction[0].team_id)
+        if any(
+            stage.window_id != window_id or (stage.organization_id, stage.project_id, stage.team_id) != scope
+            for stage in extraction
+        ):
+            raise ReductionContractError('reduction extraction stages are out of scope')
+        if any(
+            stage.window_id != window_id or (stage.organization_id, stage.project_id, stage.team_id) != scope
+            for stage in accepted_stages
+        ):
+            raise ReductionContractError('reduction accepted stages are out of scope')
+    current = tuple(draft for stage in extraction for draft in _snapshot_drafts(stage))
+    return _evaluate_draft_reduction_state(
+        current,
+        accepted_rows,
+        reduction_target=reduction_target,
+        prompt_budget=prompt_budget,
+    )
+
+
 def derive_first_pending_reduction_target(
-    extraction_targets: Sequence[object],
-    accepted_targets: Sequence[object],
+    extraction_targets: Sequence[DistillationStage],
+    accepted_targets: Sequence[DistillationStage],
     *,
     reduction_target: int,
     prompt_budget: int,
 ) -> ReductionBatch | None:
-    if not extraction_targets or any(
-        _value(target, 'status') not in ('completed', 'accepted', 'complete') for target in extraction_targets
-    ):
-        return None
-    drafts = tuple(draft for target in extraction_targets for draft in _snapshot_drafts(target))
-    if len(drafts) <= reduction_target:
-        return None
-    accepted_keys = {
-        _accepted_batch_key(target)
-        for target in accepted_targets
-        if _value(target, 'status') in ('completed', 'accepted', 'complete')
-    }
-    current = drafts
-    level = 1
-    while len(current) > reduction_target:
-        batches = build_reduction_batches(
-            current, reduction_target=reduction_target, prompt_budget=prompt_budget, level=level
-        )
-        pending = next(
-            (batch for batch in batches if batch.provider_required and batch.target_key not in accepted_keys), None
-        )
-        if pending is not None:
-            return pending
-        completed = {
-            _accepted_batch_key(target): target
-            for target in accepted_targets
-            if int(_value(target, 'level', 0)) == level and _accepted_batch_key(target) in accepted_keys
-        }
-        if not completed and any(batch.provider_required for batch in batches):
-            return None
-        current = tuple(
-            draft
-            for batch in batches
-            for draft in (
-                _expand_reduced_drafts(_snapshot_drafts(completed[batch.target_key]), batch.input_drafts)
-                if batch.provider_required and batch.target_key in completed
-                else batch.input_drafts
-            )
-        )
-        level += 1
-    return None
+    return _evaluate_reduction_state(
+        extraction_targets,
+        accepted_targets,
+        reduction_target=reduction_target,
+        prompt_budget=prompt_budget,
+    ).pending
 
 
-def _accepted_batch_key(target: object) -> str:
-    level = _value(target, 'level')
-    ordinal = _value(target, 'ordinal')
-    input_hash = _value(target, 'input_hash')
-    if type(level) is not int or type(ordinal) is not int or not isinstance(input_hash, str) or not input_hash:
-        raise ReductionContractError('accepted reduction target identity is invalid')
-    return reduction_batch_key(level=level, ordinal=ordinal, input_hash=input_hash)
+def _accepted_batch_key(target: DistillationStage) -> str:
+    return _accepted_reduction(target).batch_key
 
 
-def derive_final_reduction_drafts(  # noqa: C901
-    extraction_targets: Sequence[object],
-    accepted_targets: Sequence[object] | None = None,
+def derive_final_reduction_drafts(
+    extraction_targets: Sequence[DistillationStage],
+    accepted_targets: Sequence[DistillationStage],
     *,
     reduction_target: int,
     prompt_budget: int = 120_000,
 ) -> tuple[ReductionDraft, ...]:
-    if accepted_targets is None:
-        accepted_targets = extraction_targets
-        extraction_targets = ()
-    if reduction_target <= 0 or prompt_budget <= 0:
-        return ()
-    if not accepted_targets and not extraction_targets:
-        return ()
-    accepted = tuple(
-        target for target in accepted_targets if _value(target, 'status') in ('completed', 'accepted', 'complete')
+    result = _evaluate_reduction_state(
+        extraction_targets,
+        accepted_targets,
+        reduction_target=reduction_target,
+        prompt_budget=prompt_budget,
     )
-    if len(accepted) != len(accepted_targets):
-        return ()
-    if not extraction_targets:
-        latest_level = max(int(_value(target, 'level', 0)) for target in accepted)
-        latest = [target for target in accepted if int(_value(target, 'level', 0)) == latest_level]
-        drafts = tuple(
-            draft
-            for target in sorted(latest, key=lambda item: int(_value(item, 'ordinal', 0)))
-            for draft in _snapshot_drafts(target)
-        )
-        return drafts if len(drafts) <= reduction_target else ()
-    if any(_value(target, 'status') not in ('completed', 'accepted', 'complete') for target in extraction_targets):
-        return ()
-    current = tuple(draft for target in extraction_targets for draft in _snapshot_drafts(target))
-    level = 1
-    by_batch = {_accepted_batch_key(target): target for target in accepted}
-    while len(current) > reduction_target:
-        next_level: list[ReductionDraft] = []
-        for batch in build_reduction_batches(
-            current, reduction_target=reduction_target, prompt_budget=prompt_budget, level=level
-        ):
-            if not batch.provider_required:
-                next_level.extend(batch.input_drafts)
-                continue
-            target = by_batch.get(batch.batch_key)
-            if target is None:
-                return ()
-            next_level.extend(_expand_reduced_drafts(_snapshot_drafts(target), batch.input_drafts))
-        if len(next_level) >= len(current):
-            return ()
-        current = tuple(next_level)
-        level += 1
-    return current
+    return result.final or ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -629,7 +679,7 @@ class ReductionStageContract:
     prompt_contract: str = 'distill_reduce.v1'
     response_kind: str = 'distill_reduce.v1'
 
-    def prepare_call(self, stage: object) -> object:
+    def prepare_call(self, stage: DistillationStage) -> object:
         from engram.memory.distillation_provider_stage import PreparedProviderStageCall
 
         inputs = _hydrate_input_drafts(stage)
@@ -655,14 +705,14 @@ class ReductionStageContract:
             response_kind=self.response_kind,
         )
 
-    def normalize_output(self, raw_body: str, *, stage: object) -> dict[str, object]:
+    def normalize_output(self, raw_body: str, *, stage: DistillationStage) -> dict[str, object]:
         from engram.memory.distillation_provider_stage import ProviderStageOutputError
 
         try:
             payload = json.loads(raw_body)
             inputs = _hydrate_input_drafts(stage)
-            window = _value(stage, 'window', None)
-            reduction_target = _value(window, 'reduction_target', _value(stage, 'reduction_target', None))
+            stage = _require_stage(stage)
+            reduction_target = stage.window.reduction_target
             parsed = parse_reduction_output(payload, inputs, reduction_target=reduction_target)
             memories: list[dict[str, object]] = []
             for memory in parsed.memories:
@@ -680,16 +730,16 @@ class ReductionStageContract:
             raise ProviderStageOutputError('reduction provider output is malformed') from error
 
 
-def provider_stage_target(window: object, batch: ReductionBatch) -> object:
+def provider_stage_target(window: DistillationWindow, batch: ReductionBatch) -> object:
+    from engram.core.models import DistillationWindow
     from engram.memory.distillation_provider_stage import ProviderStageTarget
 
     if not isinstance(batch, ReductionBatch) or batch.level < 1:
         raise ReductionContractError('reduction batch must have level >= 1')
-    window_id = _value(window, 'id', _value(window, 'window_id'))
-    if window_id is None:
-        raise ReductionContractError('reduction window id is required')
+    if not isinstance(window, DistillationWindow):
+        raise ReductionContractError('reduction window must be a DistillationWindow instance')
     return ProviderStageTarget(
-        window_id=window_id,
+        window_id=window.id,
         chunk_id=None,
         stage_kind='reduce',
         level=batch.level,
