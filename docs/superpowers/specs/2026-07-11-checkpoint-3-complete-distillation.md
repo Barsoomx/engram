@@ -208,7 +208,7 @@ A stage is one logical extraction or reduction target under one policy version. 
 Constraints and indexes:
 
 - unique scoped `stage_key`;
-- unique `(window, stage_kind, level, ordinal, policy, policy_version)`;
+- unique `(window, stage_kind, level, ordinal, policy, policy_version, policy_role)`;
 - partial unique `(window, target_key)` where `status=complete`, allowing many failed policy versions but exactly one accepted target result;
 - extraction requires chunk, level zero, and matching chunk/window;
 - reduction requires null chunk and positive level;
@@ -518,6 +518,21 @@ P14 has one focused negative control at the worker/provider boundary and one at 
 
 ## Serial Implementation Spine And File Ownership
 
+### C3.2 prerequisite: provider schema and stage-role coordinate
+
+One focused prerequisite owner edits:
+
+- `apps/backend/engram/model_policy/services.py` and focused gateway tests to
+  add the strict `distill_extract.v1` response kind without provider replay;
+- `apps/backend/engram/core/models.py`, new forward migration
+  `0037_distillation_stage_policy_role_coord.py`, and focused model/migration
+  tests to bind coordinate uniqueness to `policy_role`;
+- the focused prerequisite specification; its local implementation plan stays
+  under the repository-ignored `docs/superpowers/plans` path.
+
+This prerequisite is reviewed and merged before the C3.2 provider-stage owner
+resumes. It does not edit stage execution, parsing, reduction, or finalization.
+
 ### C3.1 schema, deterministic planner, and continuation
 
 One schema/planner owner edits:
@@ -541,7 +556,10 @@ One provider-stage owner edits:
 - `apps/backend/engram/memory/candidate_parsing_tests.py`;
 - provider fault fixtures, without changing gateway replay semantics.
 
-`apps/backend/engram/model_policy/services.py` is changed only if a typed error field required by the accepted CP2 failure contract is absent. No provider-body retention or gateway-level response replay is added.
+After the prerequisite slice, `apps/backend/engram/model_policy/services.py` is
+changed only if a typed error field required by the accepted CP2 failure
+contract is absent. No provider-body retention or gateway-level response replay
+is added.
 
 ### C3.3 reduction, provenance, candidate work, and integration
 
