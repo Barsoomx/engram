@@ -1225,6 +1225,8 @@ def _p7_v1_candidate_violations(project: Project) -> list[str]:
     ).only('id', 'promoted_memory_id', 'decision_work_contract_version')
     for candidate in promoted_candidates:
         candidate_sample = f'candidate:{candidate.id}'
+        if candidate.decision_work_contract_version == 0:
+            continue
         if candidate.promoted_memory_id is None:
             violations.append(candidate_sample)
             continue
@@ -1234,8 +1236,6 @@ def _p7_v1_candidate_violations(project: Project) -> list[str]:
             project_id=project.id,
         ).exists():
             violations.append(candidate_sample)
-            continue
-        if candidate.decision_work_contract_version == 0:
             continue
         transitions = MemoryTransition.objects.filter(
             organization_id=project.organization_id,
