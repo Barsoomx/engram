@@ -178,6 +178,16 @@ def test_queue_work_attempt_rejects_foreign_scope_work() -> None:
         module.queue_work_attempt(work_id=uuid.uuid4(), now=NOW, origin=WorkflowRunOrigin.RECONCILIATION)
 
 
+def test_memory_embedding_work_routes_to_batch_embedding_projection_task() -> None:
+    module = _wd()
+    embedding_type = getattr(WorkflowWorkType, 'MEMORY_EMBEDDING', 'memory_embedding')
+
+    task_name = module._TASK_NAME_BY_WORK[embedding_type]
+
+    assert task_name == 'engram.memory.embed_memory_projection_work_v1'
+    assert task_name in module.ALLOWED_TASK_NAMES
+
+
 def test_work_dispatch_never_reads_package_rows() -> None:
     tree = ast.parse(Path(__file__).with_name('work_dispatch.py').read_text())
     imported_modules: set[str] = set()

@@ -1,3 +1,4 @@
+import importlib
 import uuid
 
 import pytest
@@ -28,6 +29,18 @@ from engram.core.models import (
     WorkflowRun,
     clamp_memory_kind,
 )
+
+
+def get_c41_model(name: str) -> type[models.Model]:
+    model = getattr(importlib.import_module('engram.core.models'), name, None)
+    assert model is not None, f'C4.1 additive model {name} is not defined'
+    return model
+
+
+def get_c41_choice(name: str) -> type[models.TextChoices]:
+    choice = getattr(importlib.import_module('engram.core.models'), name, None)
+    assert choice is not None, f'C4.1 choice {name} is not defined'
+    return choice
 
 
 def create_scope() -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -1464,3 +1477,229 @@ def test_workflow_run_link_requires_matching_scope_team_and_type() -> None:
     assert work_field.default is models.NOT_PROVIDED
     assert work_field.remote_field.on_delete is models.PROTECT
     assert work_field.remote_field.related_name == 'attempts'
+
+
+def test_c41_additive_choices_and_memory_pointer_contract() -> None:
+    transition_type = get_c41_choice('MemoryTransitionType')
+    assert {value for value, _label in transition_type.choices} == {
+        'promote',
+        'publish_digest',
+        'revise',
+        'attach_source',
+        'merge',
+        'supersede',
+        'mark_stale',
+        'refute',
+        'restore',
+        'archive',
+        'conflict_open',
+        'conflict_resolve',
+    }
+
+    conflict_resolution = get_c41_choice('MemoryConflictResolution')
+    assert {value for value, _label in conflict_resolution.choices} == {
+        'publish_candidate',
+        'merge_candidate',
+        'supersede_memory',
+        'reject_candidate',
+    }
+
+    memory = Memory
+    contract_version = memory._meta.get_field('transition_contract_version')
+    current_transition = memory._meta.get_field('current_transition')
+    assert contract_version.default == 0
+    assert contract_version.db_default == 0
+    assert contract_version.__class__ is models.PositiveSmallIntegerField
+    assert current_transition.null is True
+    assert current_transition.remote_field.on_delete is models.PROTECT
+
+    constraint_names = {constraint.name for constraint in memory._meta.constraints}
+    assert 'core_memory_transition_pointer_ck' in constraint_names
+
+
+def test_c41_transition_source_and_conflict_models_expose_immutable_contracts() -> None:
+    transition = get_c41_model('MemoryTransition')
+    source = get_c41_model('MemoryVersionSource')
+    conflict = get_c41_model('MemoryConflict')
+
+    transition_fields = {field.name: field for field in transition._meta.fields}
+    assert transition_fields['id'].primary_key is True
+    assert transition_fields['organization'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['project'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['team'].null is True
+    assert transition_fields['candidate'].null is True
+    assert transition_fields['candidate'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['memory'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['from_version'].null is True
+    assert transition_fields['from_version'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['to_version'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['result_memory'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['result_version'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['exact_document'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['result_exact_document'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['embedding_work'].null is True
+    assert transition_fields['embedding_work'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['semantic_link'].null is True
+    assert transition_fields['semantic_link'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['audit_event'].remote_field.on_delete is models.PROTECT
+    assert transition_fields['request_fingerprint'].max_length == 64
+    assert transition_fields['provenance_hash'].max_length == 64
+    assert 'updated_at' not in transition_fields
+    assert transition_fields['created_at'].auto_now_add is True
+    assert not hasattr(transition_fields['created_at'], 'auto_now') or transition_fields['created_at'].auto_now is False
+    assert {
+        'organization_id',
+        'project_id',
+        'team_id',
+        'transition_type',
+        'idempotency_key',
+        'request_fingerprint',
+        'candidate_id',
+        'memory_id',
+        'from_version_id',
+        'to_version_id',
+        'result_memory_id',
+        'result_version_id',
+        'exact_document_id',
+        'result_exact_document_id',
+        'embedding_work_id',
+        'semantic_link_id',
+        'audit_event_id',
+        'provenance_hash',
+    } <= {field for field, _error in transition._IMMUTABLE_FIELDS}
+    transition_constraints = {constraint.name for constraint in transition._meta.constraints}
+    assert {
+        'core_memory_transition_idempotency_uniq',
+        'core_memory_transition_request_fingerprint_hex',
+        'core_memory_transition_provenance_hash_hex',
+        'core_memory_transition_candidate_required_ck',
+    } <= transition_constraints
+    assert any(
+        isinstance(constraint, models.UniqueConstraint)
+        and 'candidate' in tuple(constraint.fields)
+        and constraint.condition is not None
+        for constraint in transition._meta.constraints
+    )
+
+    source_fields = {field.name: field for field in source._meta.fields}
+    assert source_fields['organization'].remote_field.on_delete is models.PROTECT
+    assert source_fields['project'].remote_field.on_delete is models.PROTECT
+    assert source_fields['memory_version'].remote_field.on_delete is models.PROTECT
+    assert source_fields['candidate_source'].null is True
+    assert source_fields['candidate_source'].remote_field.on_delete is models.PROTECT
+    assert source_fields['source_memory_version'].null is True
+    assert source_fields['source_memory_version'].remote_field.on_delete is models.PROTECT
+    assert source_fields['source_content_hash'].max_length == 64
+    assert 'updated_at' not in source_fields
+    assert source_fields['created_at'].auto_now_add is True
+    source_constraints = {constraint.name for constraint in source._meta.constraints}
+    assert {
+        'core_memory_version_source_exactly_one_fk_ck',
+        'core_memory_version_source_no_self_reference_ck',
+        'core_memory_version_source_hash_hex',
+    } <= source_constraints
+    assert any(
+        isinstance(constraint, models.UniqueConstraint)
+        and tuple(constraint.fields) == ('memory_version', 'candidate_source')
+        for constraint in source._meta.constraints
+    )
+    assert {
+        'organization_id',
+        'project_id',
+        'team_id',
+        'memory_version_id',
+        'candidate_source_id',
+        'source_memory_version_id',
+        'source_content_hash',
+    } <= {field for field, _error in source._IMMUTABLE_FIELDS}
+
+    conflict_fields = {field.name: field for field in conflict._meta.fields}
+    assert conflict_fields['organization'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['project'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['candidate'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['memory'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['memory_version'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['semantic_link'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['opened_transition'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['resolved_transition'].null is True
+    assert conflict_fields['resolved_transition'].remote_field.on_delete is models.PROTECT
+    assert conflict_fields['resolution'].blank is True
+    assert conflict_fields['resolved_at'].null is True
+    assert conflict_fields['evidence_hash'].max_length == 64
+    assert 'updated_at' not in conflict_fields
+    assert conflict_fields['created_at'].auto_now_add is True
+    conflict_constraints = {constraint.name for constraint in conflict._meta.constraints}
+    assert {
+        'core_memory_conflict_open_close_ck',
+        'core_memory_conflict_evidence_hash_hex',
+    } <= conflict_constraints
+    assert {
+        'organization_id',
+        'project_id',
+        'team_id',
+        'candidate_id',
+        'memory_id',
+        'memory_version_id',
+        'semantic_link_id',
+        'opened_transition_id',
+        'evidence_hash',
+    } <= {field for field, _error in conflict._IMMUTABLE_FIELDS}
+    assert any(
+        isinstance(constraint, models.UniqueConstraint) and tuple(constraint.fields) == ('candidate', 'memory')
+        for constraint in conflict._meta.constraints
+    )
+
+
+def test_c41_retrieval_projection_and_embedding_state_contract() -> None:
+    document = RetrievalDocument
+    fields = {field.name: field for field in document._meta.fields}
+    assert fields['projection_contract_version'].default == 0
+    assert fields['projection_contract_version'].db_default == 0
+    assert fields['exact_projection_hash'].max_length == 64
+    assert fields['embedding_projection_hash'].max_length == 64
+    assert fields['embedding_projection_hash'].default == ''
+    assert fields['embedding_projected_at'].null is True
+    constraints = {constraint.name for constraint in document._meta.constraints}
+    assert 'core_retrieval_document_projection_ck' in constraints
+    assert 'core_retrieval_document_embedding_state_ck' in constraints
+
+
+def test_c41_workflow_embedding_subject_pair_is_a_fixed_choice() -> None:
+    work_type = get_c41_choice('WorkflowWorkType')
+    subject_type = get_c41_choice('WorkflowSubjectType')
+    run_type = get_c41_choice('WorkflowRunType')
+    assert work_type.MEMORY_EMBEDDING.value == 'memory_embedding'
+    assert subject_type.RETRIEVAL_DOCUMENT.value == 'retrieval_document'
+    assert run_type.MEMORY_EMBEDDING.value == 'memory_embedding'
+    workflow_work = get_c41_model('WorkflowWork')
+    pair_constraint = next(
+        constraint for constraint in workflow_work._meta.constraints if constraint.name == 'core_work_subject_scope_ck'
+    )
+    assert isinstance(pair_constraint, models.CheckConstraint)
+
+
+@pytest.mark.django_db
+def test_c41_v1_pointer_and_immutable_relations_reject_invalid_rows() -> None:
+    transition = get_c41_model('MemoryTransition')
+    source = get_c41_model('MemoryVersionSource')
+    conflict = get_c41_model('MemoryConflict')
+
+    scope = create_scope()
+    organization, team, project, _agent, _session = scope
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='C4.1 memory',
+        body='body',
+        transition_contract_version=0,
+    )
+    assert memory.current_transition_id is None
+
+    with pytest.raises(IntegrityError), transaction.atomic():
+        Memory.objects.filter(id=memory.id).update(transition_contract_version=1)
+
+    field_names = {field.name for field in transition._meta.fields}
+    assert {'idempotency_key', 'request_fingerprint', 'provenance_hash'} <= field_names
+    assert {'candidate_source', 'source_memory_version'} <= {field.name for field in source._meta.fields}
+    assert {'resolution', 'resolved_at', 'resolved_transition'} <= {field.name for field in conflict._meta.fields}
