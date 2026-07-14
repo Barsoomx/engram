@@ -75,7 +75,11 @@ def _opener_returning_sequence(bodies: list[bytes]) -> Any:
     return opener
 
 
-_ANTHROPIC_TOOL_NAME_BY_KIND = {'candidates': 'emit_memories', 'curation_judgment': 'emit_judgment'}
+_ANTHROPIC_TOOL_NAME_BY_KIND = {
+    'candidates': 'emit_memories',
+    'curation_judgment': 'emit_judgment',
+    'distill_extract.v1': 'emit_distillation_extraction',
+}
 
 
 def _response_bytes_for(gateway_cls: type, response_kind: str, label: str) -> tuple[bytes, str, str]:
@@ -98,6 +102,22 @@ def _response_bytes_for(gateway_cls: type, response_kind: str, label: str) -> tu
         content = json.dumps(payload)
         title = ''
         body = content
+    elif response_kind == 'distill_extract.v1':
+        suffix = '1' if label == 'A' else '2'
+        payload = {
+            'memories': [
+                {
+                    'title': f'Distilled title {label}',
+                    'body': f'Distilled body {label}',
+                    'confidence': 0.8,
+                    'supporting_observation_ids': [f'11111111-1111-4111-8111-11111111111{suffix}'],
+                },
+            ],
+            'no_signal_observation_ids': [],
+        }
+        content = json.dumps(payload)
+        title = ''
+        body = content
     else:
         payload = {'decision': 'reject', 'reason': f'reason {label}'}
         content = json.dumps(payload)
@@ -116,7 +136,7 @@ def _response_bytes_for(gateway_cls: type, response_kind: str, label: str) -> tu
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment'])
+@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment', 'distill_extract.v1'])
 @pytest.mark.parametrize('gateway_cls', [OpenAICompatibleGateway, AnthropicMessagesGateway])
 def test_gateway_call_never_echoes_prompt_on_repeated_request_id(
     gateway_cls: type,
@@ -979,6 +999,73 @@ def test_openai_gateway_sends_json_mode_for_curation_judgment() -> None:
 
 
 @pytest.mark.django_db
+def test_openai_gateway_sends_json_mode_for_distill_extract() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    completion = {
+        'choices': [
+            {
+                'message': {
+                    'content': '{"memories": [], "no_signal_observation_ids": []}',
+                },
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-distill-1',
+            trace_id='json-mode-distill-1',
+            prompt='prompt text',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'response_format' in sent_body
+    assert sent_body['response_format'] == {'type': 'json_object'}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_omits_json_mode_for_distill_extract_when_policy_disables_it() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation', metadata={'json_mode': False})
+    completion = {
+        'choices': [
+            {
+                'message': {
+                    'content': '{"memories": [], "no_signal_observation_ids": []}',
+                },
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(completion).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='json-mode-distill-2',
+            trace_id='json-mode-distill-2',
+            prompt='prompt text',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'response_format' not in sent_body
+
+
+@pytest.mark.django_db
 def test_openai_gateway_disables_thinking_but_omits_json_mode_for_deepseek_candidates() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, provider='deepseek', task_type='curation')
@@ -1126,6 +1213,62 @@ def test_anthropic_gateway_forces_tool_for_candidates() -> None:
     assert sent_body['tools'][0]['input_schema']['required'] == ['memories']
     assert sent_body['max_tokens'] == 8192
     assert json.loads(result.generated_body) == {'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9}]}
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_forces_tool_for_distill_extract_and_returns_tool_input() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    expected = {
+        'memories': [
+            {
+                'title': 'T',
+                'body': 'B',
+                'confidence': 0.9,
+                'supporting_observation_ids': ['11111111-1111-4111-8111-111111111111'],
+            },
+        ],
+        'no_signal_observation_ids': [],
+    }
+    message = {
+        'content': [
+            {
+                'type': 'tool_use',
+                'name': 'emit_distillation_extraction',
+                'input': expected,
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(message).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='anthropic-distill-1',
+            trace_id='anthropic-distill-1',
+            prompt='prompt text',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert 'tool_choice' in sent_body
+    assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_distillation_extraction'}
+    assert 'tools' in sent_body
+    assert sent_body['tools'][0]['name'] == 'emit_distillation_extraction'
+    assert sent_body['tools'][0]['input_schema']['required'] == ['memories', 'no_signal_observation_ids']
+    assert sent_body['max_tokens'] == 8192
+    assert json.loads(result.generated_body) == expected
 
 
 @pytest.mark.django_db
@@ -1572,7 +1715,7 @@ def test_openai_gateway_constructor_timeout_overrides_env(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment'])
+@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment', 'distill_extract.v1'])
 def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation')
@@ -1595,6 +1738,42 @@ def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str) -> 
 
     sent_body = json.loads(opener.requests[0].data)
     assert sent_body['max_tokens'] == resolve_max_tokens(policy, response_kind)
+
+
+@pytest.mark.django_db
+def test_openai_gateway_distill_extract_payload_uses_8192_max_tokens() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    opener = _opener_returning(
+        json.dumps(
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'content': '{"memories": [], "no_signal_observation_ids": []}',
+                        },
+                    },
+                ],
+            },
+        ).encode(),
+    )
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='max-tokens-distill-1',
+            trace_id='max-tokens-distill-1',
+            prompt='prompt text',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['max_tokens'] == 8192
 
 
 @pytest.mark.django_db

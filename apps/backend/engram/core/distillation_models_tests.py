@@ -402,6 +402,57 @@ def test_stage_is_unique_per_coordinate_and_policy_version() -> None:
 
 
 @pytest.mark.django_db
+def test_stage_coordinate_constraint_includes_policy_role() -> None:
+    constraint = next(
+        constraint
+        for constraint in DistillationStage._meta.constraints
+        if constraint.name == 'core_distill_stage_coord_uniq'
+    )
+
+    assert tuple(constraint.fields) == (
+        'window',
+        'stage_kind',
+        'level',
+        'ordinal',
+        'policy',
+        'policy_version',
+        'policy_role',
+    )
+
+
+@pytest.mark.django_db
+def test_stage_allows_distinct_policy_roles_at_same_coordinate() -> None:
+    deps = _deps('stage-policy-role')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    _stage(deps, window, chunk, stage_key=_HEX_D, policy_role='primary')
+
+    with transaction.atomic():
+        fallback = _stage(
+            deps,
+            window,
+            chunk,
+            stage_key=_HEX_F,
+            target_key=_HEX_C,
+            input_hash=_HEX_E,
+            policy_role='fallback',
+        )
+
+    assert fallback.policy_role == 'fallback'
+
+    with transaction.atomic(), pytest.raises(IntegrityError):
+        _stage(
+            deps,
+            window,
+            chunk,
+            stage_key='c' * 64,
+            target_key='b' * 64,
+            input_hash='a' * 64,
+            policy_role='primary',
+        )
+
+
+@pytest.mark.django_db
 def test_stage_allows_one_completed_target_per_window() -> None:
     deps = _deps('stage-target')
     window = _window(deps)

@@ -2188,6 +2188,8 @@ def test_0035_creates_execution_indexes() -> None:
 
 MIGRATE_0036 = [('core', '0036_distillation_coverage')]
 MIGRATION_0036_NODE = ('core', '0036_distillation_coverage')
+MIGRATE_0037 = [('core', '0037_distillation_stage_policy_role_coord')]
+MIGRATION_0037_NODE = ('core', '0037_distillation_stage_policy_role_coord')
 
 _DISTILLATION_TABLES = (
     'core_distillationwindow',
@@ -2273,6 +2275,98 @@ def _pg_column(table: str, column: str) -> tuple[str | None, str] | None:
         row = cursor.fetchone()
 
     return (row[0], row[1]) if row is not None else None
+
+
+def _create_historical_0036_stage_fixture(
+    historical_apps: Apps,
+    suffix: str,
+    *,
+    policy_role: str = 'primary',
+    stage_key: str | None = None,
+) -> tuple[type[models.Model], models.Model]:
+    scope = _create_historical_0032b_scope(historical_apps)
+    session = _create_historical_session(historical_apps, scope, f'distill-stage-{suffix}')
+    work = _create_historical_work(
+        historical_apps,
+        scope,
+        work_type='session_distillation',
+        subject_type='agent_session',
+        subject_id=session.id,
+    )
+    secret_model = historical_apps.get_model('model_policy', 'ProviderSecret')
+    policy_model = historical_apps.get_model('model_policy', 'ModelPolicy')
+    secret = secret_model.objects.create(
+        organization=scope['organization'],
+        team=scope['team'],
+        name=f'distill-secret-{suffix}',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    policy = policy_model.objects.create(
+        organization=scope['organization'],
+        team=scope['team'],
+        project=scope['project'],
+        name=f'distill-policy-{suffix}',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=2,
+    )
+    window_model = historical_apps.get_model('core', 'DistillationWindow')
+    window = window_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        work=work,
+        session=session,
+        contract_version=1,
+        lower_sequence_exclusive=0,
+        upper_sequence_inclusive=1,
+        observation_count=1,
+        input_hash=('a' * 63) + suffix[-1],
+        chunk_char_budget=8000,
+        reduction_target=12,
+        chunk_contract_version=1,
+    )
+    chunk_model = historical_apps.get_model('core', 'DistillationChunk')
+    chunk = chunk_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        window=window,
+        ordinal=0,
+        first_sequence=1,
+        last_sequence=1,
+        observation_count=1,
+        input_manifest={'schema': 'distillation_chunk_manifest.v1', 'ordinal': 0, 'observations': []},
+        input_hash=('b' * 63) + suffix[-1],
+    )
+    stage_model = historical_apps.get_model('core', 'DistillationStage')
+    stage = stage_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        window=window,
+        chunk=chunk,
+        stage_kind='extract',
+        level=0,
+        ordinal=0,
+        target_key=('c' * 63) + suffix[-1],
+        stage_key=stage_key or (uuid.uuid4().hex * 2),
+        input_hash=('d' * 63) + suffix[-1],
+        input_manifest={'chunk_ordinal': 0},
+        prompt_contract='distill_extract.v1',
+        policy=policy,
+        policy_version=2,
+        policy_role=policy_role,
+        status='required',
+        attempt_count=0,
+    )
+
+    return stage_model, stage
 
 
 @pytest.mark.django_db(transaction=True)
@@ -2397,6 +2491,120 @@ def test_0036_fresh_database_accepts_window_and_chunk_insert() -> None:
 
         assert window_model.objects.filter(work=work).count() == 1
         assert chunk_model.objects.filter(window=window).count() == 1
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0037_policy_role_coordinate_constraint_round_trip() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    assert MIGRATION_0037_NODE in executor.loader.graph.nodes
+
+    migration = executor.loader.graph.nodes[MIGRATION_0037_NODE]
+    assert MIGRATION_0036_NODE in migration.dependencies
+
+    def create_variant(
+        stage_model: type[models.Model],
+        base: models.Model,
+        *,
+        policy_role: str,
+        stage_key: str,
+        suffix: str,
+    ) -> models.Model:
+        return stage_model.objects.create(
+            organization_id=base.organization_id,
+            project_id=base.project_id,
+            team_id=base.team_id,
+            window_id=base.window_id,
+            chunk_id=base.chunk_id,
+            stage_kind=base.stage_kind,
+            level=base.level,
+            ordinal=base.ordinal,
+            target_key=('e' * 63) + suffix,
+            stage_key=stage_key,
+            input_hash=('f' * 63) + suffix,
+            input_manifest=base.input_manifest,
+            prompt_contract=base.prompt_contract,
+            policy_id=base.policy_id,
+            policy_version=base.policy_version,
+            policy_role=policy_role,
+            status='required',
+            attempt_count=0,
+        )
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        apps_0036 = executor.loader.project_state(MIGRATE_0036).apps
+        stage_model_0036, primary = _create_historical_0036_stage_fixture(
+            apps_0036,
+            uuid.uuid4().hex,
+            stage_key='1' * 64,
+        )
+
+        with transaction.atomic(), pytest.raises(IntegrityError):
+            create_variant(
+                stage_model_0036,
+                primary,
+                policy_role='fallback',
+                stage_key='2' * 64,
+                suffix='0',
+            )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0037)
+        apps_0037 = executor.loader.project_state(MIGRATE_0037).apps
+        stage_model_0037 = apps_0037.get_model('core', 'DistillationStage')
+        primary_0037 = stage_model_0037.objects.get(id=primary.id)
+        fallback = create_variant(
+            stage_model_0037,
+            primary_0037,
+            policy_role='fallback',
+            stage_key='2' * 64,
+            suffix='1',
+        )
+
+        with transaction.atomic(), pytest.raises(IntegrityError):
+            create_variant(
+                stage_model_0037,
+                primary_0037,
+                policy_role='primary',
+                stage_key='3' * 64,
+                suffix='2',
+            )
+
+        stage_model_0037.objects.filter(id=fallback.id).delete()
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0036)
+        apps_reversed = executor.loader.project_state(MIGRATE_0036).apps
+        stage_model_reversed = apps_reversed.get_model('core', 'DistillationStage')
+        primary_reversed = stage_model_reversed.objects.get(id=primary.id)
+
+        with transaction.atomic(), pytest.raises(IntegrityError):
+            create_variant(
+                stage_model_reversed,
+                primary_reversed,
+                policy_role='fallback',
+                stage_key='4' * 64,
+                suffix='3',
+            )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0037)
+        apps_reapplied = executor.loader.project_state(MIGRATE_0037).apps
+        stage_model_reapplied = apps_reapplied.get_model('core', 'DistillationStage')
+        primary_reapplied = stage_model_reapplied.objects.get(id=primary.id)
+        fallback_reapplied = create_variant(
+            stage_model_reapplied,
+            primary_reapplied,
+            policy_role='fallback',
+            stage_key='5' * 64,
+            suffix='4',
+        )
+
+        assert stage_model_reapplied.objects.filter(id__in=[primary.id, fallback_reapplied.id]).count() == 2
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
