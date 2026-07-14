@@ -829,7 +829,7 @@ def test_fake_provider_gateway_returns_deterministic_memories_object_for_candida
 
 
 @pytest.mark.django_db
-def test_fake_provider_gateway_distill_extract_uses_unique_observation_ids_in_first_seen_order() -> None:
+def test_fake_provider_distill_extract_is_strict_deterministic_and_near_miss_safe() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     secret = ProviderSecret.objects.create(
         organization=organization,
@@ -872,10 +872,7 @@ def test_fake_provider_gateway_distill_extract_uses_unique_observation_ids_in_fi
         request_id='distill-extract:session-1',
         trace_id='trace-distill-extract-1',
         prompt=(
-            f'Observation: {second_id}\n'
-            f'Observation: {first_id}\n'
-            f'Observation: {second_id}\n'
-            f'Observation: {third_id}'
+            f'Observation: {second_id}\nObservation: {first_id}\nObservation: {second_id}\nObservation: {third_id}'
         ),
         response_kind='distill_extract.v1',
     )
@@ -883,7 +880,6 @@ def test_fake_provider_gateway_distill_extract_uses_unique_observation_ids_in_fi
     result = FakeProviderGateway().call(data)
     replay = FakeProviderGateway().call(data)
 
-    assert result.generated_body.startswith('{')
     payload = json.loads(result.generated_body)
     assert set(payload) == {'memories', 'no_signal_observation_ids'}
     assert payload['no_signal_observation_ids'] == []
@@ -892,53 +888,18 @@ def test_fake_provider_gateway_distill_extract_uses_unique_observation_ids_in_fi
     assert set(memory) == {'title', 'body', 'confidence', 'supporting_observation_ids', 'kind'}
     assert memory['supporting_observation_ids'] == [second_id, first_id.lower(), third_id]
     assert memory['kind'] == 'gotcha'
-    assert 'source_ids' not in memory
     assert replay.generated_body == result.generated_body
     assert replay.call_record_id != result.call_record_id
     assert ProviderCallRecord.objects.filter(request_id='distill-extract:session-1').count() == 2
 
-
-@pytest.mark.django_db
-def test_fake_provider_gateway_distill_extract_without_observation_ids_returns_empty_arrays() -> None:
-    organization, team, project, _owner, _api_key = create_project_scope()
-    secret = ProviderSecret.objects.create(
-        organization=organization,
-        team=team,
-        name='Team OpenAI Distill Empty',
-        provider='openai',
-        scope='team',
-        current_version=1,
-    )
-    ProviderSecretEnvelope.objects.create(
-        organization=organization,
-        team=team,
-        secret=secret,
-        version=1,
-        key_version='v1',
-        ciphertext='encrypted-secret',
-        hmac_digest='secret-hmac',
-        active=True,
-    )
-    policy = ModelPolicy.objects.create(
-        organization=organization,
-        team=team,
-        project=project,
-        name='Distill empty policy',
-        scope='project',
-        task_type='curation',
-        provider='openai',
-        model='gpt-4.1-mini',
-        secret=secret,
-        version=1,
-    )
     result = FakeProviderGateway().call(
         ProviderCallInput(
             organization_id=organization.id,
             project_id=project.id,
             team_id=team.id,
             policy=policy,
-            request_id='distill-extract:empty',
-            trace_id='trace-distill-extract-empty',
+            request_id='distill-extract:near-miss',
+            trace_id='trace-distill-extract-near-miss',
             prompt=(
                 'Observation id: 11111111-1111-4111-8111-111111111111\n'
                 'observation: 22222222-2222-4222-8222-222222222222\n'
@@ -949,7 +910,6 @@ def test_fake_provider_gateway_distill_extract_without_observation_ids_returns_e
         ),
     )
 
-    assert result.generated_body.startswith('{')
     assert json.loads(result.generated_body) == {
         'memories': [],
         'no_signal_observation_ids': [],

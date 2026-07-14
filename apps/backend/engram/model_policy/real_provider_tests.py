@@ -25,7 +25,6 @@ from engram.model_policy.services import (
     get_provider_gateway,
     policy_supports_json_object,
     resolve_context_window_tokens,
-    resolve_max_tokens,
 )
 
 
@@ -949,10 +948,17 @@ def test_get_provider_gateway_anthropic_returns_anthropic_host_with_blank_metada
 
 
 @pytest.mark.django_db
-def test_openai_gateway_sends_json_mode_for_candidates() -> None:
+@pytest.mark.parametrize('response_kind', ['candidates', 'curation_judgment', 'distill_extract.v1'])
+def test_openai_gateway_sends_json_mode_for_structured_kinds(response_kind: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation')
-    completion = {'choices': [{'message': {'content': '{"memories": []}'}}]}
+    if response_kind == 'curation_judgment':
+        content = '{"decision": "keep_both"}'
+    elif response_kind == 'distill_extract.v1':
+        content = '{"memories": [], "no_signal_observation_ids": []}'
+    else:
+        content = '{"memories": []}'
+    completion = {'choices': [{'message': {'content': content}}]}
     opener = _opener_returning(json.dumps(completion).encode())
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
@@ -962,10 +968,10 @@ def test_openai_gateway_sends_json_mode_for_candidates() -> None:
             project_id=project.id,
             team_id=None,
             policy=policy,
-            request_id='json-mode-1',
-            trace_id='json-mode-1',
+            request_id=f'json-mode-{response_kind}',
+            trace_id=f'json-mode-{response_kind}',
             prompt='prompt text',
-            response_kind='candidates',
+            response_kind=response_kind,
         ),
     )
 
@@ -974,77 +980,16 @@ def test_openai_gateway_sends_json_mode_for_candidates() -> None:
 
 
 @pytest.mark.django_db
-def test_openai_gateway_sends_json_mode_for_curation_judgment() -> None:
-    organization, _team, project, _owner, _api_key = create_project_scope()
-    policy = make_real_policy(organization, project, task_type='curation')
-    completion = {'choices': [{'message': {'content': '{"decision": "keep_both"}'}}]}
-    opener = _opener_returning(json.dumps(completion).encode())
-    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
-
-    gateway.call(
-        ProviderCallInput(
-            organization_id=organization.id,
-            project_id=project.id,
-            team_id=None,
-            policy=policy,
-            request_id='json-mode-2',
-            trace_id='json-mode-2',
-            prompt='prompt text',
-            response_kind='curation_judgment',
-        ),
-    )
-
-    sent_body = json.loads(opener.requests[0].data)
-    assert sent_body['response_format'] == {'type': 'json_object'}
-
-
-@pytest.mark.django_db
-def test_openai_gateway_sends_json_mode_for_distill_extract() -> None:
-    organization, _team, project, _owner, _api_key = create_project_scope()
-    policy = make_real_policy(organization, project, task_type='curation')
-    completion = {
-        'choices': [
-            {
-                'message': {
-                    'content': '{"memories": [], "no_signal_observation_ids": []}',
-                },
-            },
-        ],
-    }
-    opener = _opener_returning(json.dumps(completion).encode())
-    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
-
-    gateway.call(
-        ProviderCallInput(
-            organization_id=organization.id,
-            project_id=project.id,
-            team_id=None,
-            policy=policy,
-            request_id='json-mode-distill-1',
-            trace_id='json-mode-distill-1',
-            prompt='prompt text',
-            response_kind='distill_extract.v1',
-        ),
-    )
-
-    sent_body = json.loads(opener.requests[0].data)
-    assert 'response_format' in sent_body
-    assert sent_body['response_format'] == {'type': 'json_object'}
-
-
-@pytest.mark.django_db
-def test_openai_gateway_omits_json_mode_for_distill_extract_when_policy_disables_it() -> None:
+@pytest.mark.parametrize('response_kind', ['candidates', 'distill_extract.v1'])
+def test_openai_gateway_omits_json_mode_when_policy_disables_it(response_kind: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation', metadata={'json_mode': False})
-    completion = {
-        'choices': [
-            {
-                'message': {
-                    'content': '{"memories": [], "no_signal_observation_ids": []}',
-                },
-            },
-        ],
-    }
+    content = (
+        '{"memories": [], "no_signal_observation_ids": []}'
+        if response_kind == 'distill_extract.v1'
+        else '{"memories": []}'
+    )
+    completion = {'choices': [{'message': {'content': content}}]}
     opener = _opener_returning(json.dumps(completion).encode())
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
@@ -1054,10 +999,10 @@ def test_openai_gateway_omits_json_mode_for_distill_extract_when_policy_disables
             project_id=project.id,
             team_id=None,
             policy=policy,
-            request_id='json-mode-distill-2',
-            trace_id='json-mode-distill-2',
+            request_id=f'json-mode-opt-out-{response_kind}',
+            trace_id=f'json-mode-opt-out-{response_kind}',
             prompt='prompt text',
-            response_kind='distill_extract.v1',
+            response_kind=response_kind,
         ),
     )
 
@@ -1347,7 +1292,19 @@ def test_anthropic_gateway_single_kind_has_no_tools_and_default_budget() -> None
 
 
 @pytest.mark.django_db
-def test_anthropic_gateway_max_tokens_metadata_override() -> None:
+@pytest.mark.parametrize(
+    ('response_kind', 'metadata_max_tokens', 'expected_max_tokens'),
+    [
+        ('candidates', 2048, 2048),
+        ('distill_extract.v1', 2048, 8192),
+        ('distill_extract.v1', 20000, 8192),
+    ],
+)
+def test_anthropic_gateway_max_tokens_metadata_override(
+    response_kind: str,
+    metadata_max_tokens: int,
+    expected_max_tokens: int,
+) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(
         organization,
@@ -1356,9 +1313,15 @@ def test_anthropic_gateway_max_tokens_metadata_override() -> None:
         provider='anthropic',
         base_url='https://api.anthropic.example',
     )
-    policy.metadata = {**policy.metadata, 'max_tokens': 2048}
+    policy.metadata = {**policy.metadata, 'max_tokens': metadata_max_tokens}
     policy.save(update_fields=['metadata'])
-    message = {'content': [{'type': 'tool_use', 'name': 'emit_memories', 'input': {'memories': []}}]}
+    if response_kind == 'distill_extract.v1':
+        tool_name = 'emit_distillation_extraction'
+        tool_input = {'memories': [], 'no_signal_observation_ids': []}
+    else:
+        tool_name = 'emit_memories'
+        tool_input = {'memories': []}
+    message = {'content': [{'type': 'tool_use', 'name': tool_name, 'input': tool_input}]}
     opener = _opener_returning(json.dumps(message).encode())
     gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
 
@@ -1368,15 +1331,15 @@ def test_anthropic_gateway_max_tokens_metadata_override() -> None:
             project_id=project.id,
             team_id=None,
             policy=policy,
-            request_id='anthropic-tool-4',
-            trace_id='anthropic-tool-4',
+            request_id=f'anthropic-tool-4-{response_kind}-{metadata_max_tokens}',
+            trace_id=f'anthropic-tool-4-{response_kind}-{metadata_max_tokens}',
             prompt='prompt text',
-            response_kind='candidates',
+            response_kind=response_kind,
         ),
     )
 
     sent_body = json.loads(opener.requests[0].data)
-    assert sent_body['max_tokens'] == 2048
+    assert sent_body['max_tokens'] == expected_max_tokens
 
 
 @pytest.mark.django_db
@@ -1715,11 +1678,24 @@ def test_openai_gateway_constructor_timeout_overrides_env(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('response_kind', ['single', 'candidates', 'curation_judgment', 'distill_extract.v1'])
-def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str) -> None:
+@pytest.mark.parametrize(
+    ('response_kind', 'expected_max_tokens'),
+    [
+        ('single', 1024),
+        ('candidates', 8192),
+        ('curation_judgment', 1024),
+        ('distill_extract.v1', 8192),
+    ],
+)
+def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str, expected_max_tokens: int) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation')
-    content = '{"memories": []}' if response_kind != 'single' else 'Title\nBody'
+    if response_kind == 'single':
+        content = 'Title\nBody'
+    elif response_kind == 'distill_extract.v1':
+        content = '{"memories": [], "no_signal_observation_ids": []}'
+    else:
+        content = '{"memories": []}'
     opener = _opener_returning(json.dumps({'choices': [{'message': {'content': content}}]}).encode())
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
@@ -1737,26 +1713,36 @@ def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str) -> 
     )
 
     sent_body = json.loads(opener.requests[0].data)
-    assert sent_body['max_tokens'] == resolve_max_tokens(policy, response_kind)
+    assert sent_body['max_tokens'] == expected_max_tokens
 
 
 @pytest.mark.django_db
-def test_openai_gateway_distill_extract_payload_uses_8192_max_tokens() -> None:
+@pytest.mark.parametrize(
+    ('response_kind', 'metadata_max_tokens', 'expected_max_tokens'),
+    [
+        ('candidates', 2048, 2048),
+        ('distill_extract.v1', 2048, 8192),
+        ('distill_extract.v1', 20000, 8192),
+    ],
+)
+def test_openai_gateway_chat_payload_max_tokens_metadata_override_respected(
+    response_kind: str,
+    metadata_max_tokens: int,
+    expected_max_tokens: int,
+) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
-    policy = make_real_policy(organization, project, task_type='curation')
-    opener = _opener_returning(
-        json.dumps(
-            {
-                'choices': [
-                    {
-                        'message': {
-                            'content': '{"memories": [], "no_signal_observation_ids": []}',
-                        },
-                    },
-                ],
-            },
-        ).encode(),
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        metadata={'max_tokens': metadata_max_tokens},
     )
+    content = (
+        '{"memories": [], "no_signal_observation_ids": []}'
+        if response_kind == 'distill_extract.v1'
+        else '{"memories": []}'
+    )
+    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': content}}]}).encode())
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
     gateway.call(
@@ -1765,39 +1751,15 @@ def test_openai_gateway_distill_extract_payload_uses_8192_max_tokens() -> None:
             project_id=project.id,
             team_id=None,
             policy=policy,
-            request_id='max-tokens-distill-1',
-            trace_id='max-tokens-distill-1',
+            request_id=f'max-tokens-override-{response_kind}-{metadata_max_tokens}',
+            trace_id=f'max-tokens-override-{response_kind}-{metadata_max_tokens}',
             prompt='prompt text',
-            response_kind='distill_extract.v1',
+            response_kind=response_kind,
         ),
     )
 
     sent_body = json.loads(opener.requests[0].data)
-    assert sent_body['max_tokens'] == 8192
-
-
-@pytest.mark.django_db
-def test_openai_gateway_chat_payload_max_tokens_metadata_override_respected() -> None:
-    organization, _team, project, _owner, _api_key = create_project_scope()
-    policy = make_real_policy(organization, project, task_type='curation', metadata={'max_tokens': 2048})
-    opener = _opener_returning(json.dumps({'choices': [{'message': {'content': '{"memories": []}'}}]}).encode())
-    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
-
-    gateway.call(
-        ProviderCallInput(
-            organization_id=organization.id,
-            project_id=project.id,
-            team_id=None,
-            policy=policy,
-            request_id='max-tokens-override-1',
-            trace_id='max-tokens-override-1',
-            prompt='prompt text',
-            response_kind='candidates',
-        ),
-    )
-
-    sent_body = json.loads(opener.requests[0].data)
-    assert sent_body['max_tokens'] == 2048
+    assert sent_body['max_tokens'] == expected_max_tokens
 
 
 @pytest.mark.django_db

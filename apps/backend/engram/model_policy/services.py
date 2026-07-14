@@ -985,10 +985,13 @@ def generated_distill_extract_payload(prompt: str) -> str:
         if not line.startswith('Observation: '):
             continue
         observation_id = line.removeprefix('Observation: ')
-        if re.fullmatch(
-            r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}',
-            observation_id,
-        ) is None:
+        if (
+            re.fullmatch(
+                r'[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}',
+                observation_id,
+            )
+            is None
+        ):
             continue
         canonical_id = observation_id.lower()
         if canonical_id in seen_ids:
@@ -1156,6 +1159,9 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
 
 
 def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
+    if response_kind == 'distill_extract.v1':
+        return _MAX_TOKENS_BY_KIND[response_kind]
+
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     raw = metadata.get('max_tokens')
     if isinstance(raw, bool):

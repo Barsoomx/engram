@@ -2575,6 +2575,15 @@ def test_0037_policy_role_coordinate_constraint_round_trip() -> None:
                 suffix='2',
             )
 
+        with transaction.atomic(), pytest.raises(IntegrityError):
+            create_variant(
+                stage_model_0037,
+                primary_0037,
+                policy_role='fallback',
+                stage_key='6' * 64,
+                suffix='5',
+            )
+
         stage_model_0037.objects.filter(id=fallback.id).delete()
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0036)
@@ -2603,6 +2612,15 @@ def test_0037_policy_role_coordinate_constraint_round_trip() -> None:
             stage_key='5' * 64,
             suffix='4',
         )
+
+        with transaction.atomic(), pytest.raises(IntegrityError):
+            create_variant(
+                stage_model_reapplied,
+                primary_reapplied,
+                policy_role='fallback',
+                stage_key='7' * 64,
+                suffix='6',
+            )
 
         assert stage_model_reapplied.objects.filter(id__in=[primary.id, fallback_reapplied.id]).count() == 2
     finally:
