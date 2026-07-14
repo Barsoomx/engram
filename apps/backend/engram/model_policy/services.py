@@ -858,6 +858,18 @@ def _build_cost_metadata(
     return {'estimated': False, 'cost_usd': str(total), 'pricing_source': 'policy'}
 
 
+def _apply_fake_provider_delay() -> None:
+    raw_delay = os.environ.get('ENGRAM_FAKE_PROVIDER_DELAY_MS', '0')
+    try:
+        delay_ms = int(raw_delay)
+    except ValueError as error:
+        raise ImproperlyConfigured('ENGRAM_FAKE_PROVIDER_DELAY_MS must be an integer from 0 to 5000') from error
+    if not 0 <= delay_ms <= 5000:
+        raise ImproperlyConfigured('ENGRAM_FAKE_PROVIDER_DELAY_MS must be an integer from 0 to 5000')
+    if delay_ms:
+        time.sleep(delay_ms / 1000)
+
+
 class FakeProviderGateway:
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -867,6 +879,7 @@ class FakeProviderGateway:
         if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
             raise ProviderSecretError('provider secret has no active envelope')
 
+        _apply_fake_provider_delay()
         _log_repeat_attempt(data)
 
         redacted_prompt = redact_value(data.prompt)

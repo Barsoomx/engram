@@ -55,6 +55,21 @@ def expected_generated_body(prompt: str) -> str:
     return f'Provider-generated candidate body {digest}'
 
 
+def test_fake_provider_delay_uses_bounded_milliseconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setenv('ENGRAM_FAKE_PROVIDER_DELAY_MS', '2500')
+    monkeypatch.setattr(services.time, 'sleep', sleeps.append)
+
+    services._apply_fake_provider_delay()
+
+    assert sleeps == [2.5]
+    monkeypatch.setenv('ENGRAM_FAKE_PROVIDER_DELAY_MS', '5001')
+    with pytest.raises(ImproperlyConfigured, match='ENGRAM_FAKE_PROVIDER_DELAY_MS'):
+        services._apply_fake_provider_delay()
+
+
 def create_policy_admin_key(project_team_scope: tuple[object, Team, object, object, object]) -> None:
     organization, team, project, _owner, _api_key = project_team_scope
     admin = Identity.objects.create(

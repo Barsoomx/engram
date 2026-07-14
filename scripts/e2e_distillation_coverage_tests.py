@@ -249,10 +249,15 @@ def test_generated_override_uses_unique_image_and_ephemeral_loopback_port(
 ) -> None:
     override_file = (tmp_path / "override.yml").resolve()
 
-    coverage.write_override_file(override_file, SAFE_PROJECT)
+    coverage.write_override_file(
+        override_file,
+        SAFE_PROJECT,
+        fake_provider_delay_ms=2500,
+    )
 
     rendered = override_file.read_text(encoding="utf-8")
     assert rendered.count(f"image: {SAFE_PROJECT}-backend:cp3") == 3
+    assert 'ENGRAM_FAKE_PROVIDER_DELAY_MS: "2500"' in rendered
     assert "127.0.0.1::8000" in rendered
     assert "8000:8000" not in rendered
     assert set(
@@ -264,6 +269,26 @@ def test_generated_override_uses_unique_image_and_ephemeral_loopback_port(
         "worker-batch:",
         "relay:",
     }
+    with pytest.raises(coverage.HarnessError, match="fake provider delay"):
+        coverage.write_override_file(
+            override_file,
+            SAFE_PROJECT,
+            fake_provider_delay_ms=5001,
+        )
+
+
+def test_worker_loss_fault_window_requires_exactly_one_accepted_stage_and_active_attempt() -> (
+    None
+):
+    payload = _valid_payload()
+    payload["extract_complete_target_count"] = 1
+    payload["reduce_complete_target_count"] = 0
+    payload["active_attempt_count"] = 1
+
+    assert coverage.worker_loss_fault_window(_state(payload)) is True
+
+    payload["extract_complete_target_count"] = 2
+    assert coverage.worker_loss_fault_window(_state(payload)) is False
 
 
 def test_seed_and_state_queries_are_deterministic_and_scope_bound() -> None:

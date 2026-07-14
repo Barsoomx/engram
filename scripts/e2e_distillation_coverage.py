@@ -28,6 +28,8 @@ POLL_INTERVAL = 0.5
 FAULT_POLL_ITERATIONS = 240
 QUIESCENCE_ITERATIONS = 480
 OUTPUT_LIMIT = 4000
+MAX_FAKE_PROVIDER_DELAY_MS = 5000
+FAULT_FAKE_PROVIDER_DELAY_MS = 2500
 
 PROJECT_PATTERN = re.compile(r"engram-cp3-coverage-[0-9a-f]{16}\Z")
 RUN_ID_PATTERN = re.compile(r"[0-9a-f]{16}\Z")
@@ -320,9 +322,21 @@ def write_env_file(path: Path, *, provider_mode: str) -> None:
     )
 
 
-def write_override_file(path: Path, project: str) -> None:
+def write_override_file(
+    path: Path,
+    project: str,
+    *,
+    fake_provider_delay_ms: int = 0,
+) -> None:
     _validate_absolute_canonical(path, "generated Compose override")
     validate_project_name(project)
+    if (
+        type(fake_provider_delay_ms) is not int
+        or not 0 <= fake_provider_delay_ms <= MAX_FAKE_PROVIDER_DELAY_MS
+    ):
+        raise HarnessError(
+            "fake provider delay must be an integer from 0 to 5000 milliseconds"
+        )
     image = f"{project}-backend:cp3"
     path.write_text(
         "services:\n"
@@ -332,6 +346,8 @@ def write_override_file(path: Path, project: str) -> None:
         '      - "127.0.0.1::8000"\n'
         "  worker-batch:\n"
         f"    image: {image}\n"
+        "    environment:\n"
+        f'      ENGRAM_FAKE_PROVIDER_DELAY_MS: "{fake_provider_delay_ms}"\n'
         "  relay:\n"
         f"    image: {image}\n",
         encoding="utf-8",
@@ -571,6 +587,14 @@ def state_is_quiescent(state: DistillationState) -> bool:
         and state.pending_target_count == 0
         and state.pending_outbox_count == 0
     )
+
+
+def worker_loss_fault_window(state: DistillationState) -> bool:
+    accepted_stage_count = (
+        state.extract_complete_target_count + state.reduce_complete_target_count
+    )
+
+    return accepted_stage_count == 1 and state.active_attempt_count == 1
 
 
 def assert_final_state(state: DistillationState) -> None:  # noqa: C901, PLR0915
@@ -1194,6 +1218,7 @@ class Harness:
 
     def switch_provider(self, mode: str) -> None:
         write_env_file(self.env_file, provider_mode=mode)
+        write_override_file(self.override_file, self.project)
         self.compose(
             "up",
             "-d",
@@ -1388,11 +1413,7 @@ def run_live_fault_harness(
         harness,
         scope,
         label="one accepted stage in an active attempt",
-        predicate=lambda state: (
-            state.extract_complete_target_count + state.reduce_complete_target_count
-            >= 1
-            and state.active_attempt_count >= 1
-        ),
+        predicate=worker_loss_fault_window,
         deadline=accepted_deadline,
     )
     harness.compose("kill", "-s", "SIGKILL", "worker-batch", timeout=30)
@@ -1450,7 +1471,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         env_file = (temp_dir / "generated.env").resolve()
         override_file = (temp_dir / "override.yml").resolve()
         write_env_file(env_file, provider_mode="fake")
-        write_override_file(override_file, arguments.project)
+        write_override_file(
+            override_file,
+            arguments.project,
+            fake_provider_delay_ms=FAULT_FAKE_PROVIDER_DELAY_MS,
+        )
         harness = Harness(
             project=arguments.project,
             compose_file=COMPOSE_FILE,
