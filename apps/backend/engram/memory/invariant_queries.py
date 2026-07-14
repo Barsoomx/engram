@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import uuid
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from django.db.models import CharField, Count, Exists, F, OuterRef, Prefetch, Q, QuerySet, Value
+from django.db.models import CharField, Count, Exists, F, Max, OuterRef, Prefetch, Q, QuerySet, Value
 from django.db.models.fields.json import KeyTextTransform
 from django.db.models.functions import Cast, Coalesce, Concat
 from django.utils import timezone
@@ -15,9 +17,16 @@ from django.utils import timezone
 from engram.core.models import (
     AgentSession,
     CandidateStatus,
+    DistillationCoverageOutcome,
+    DistillationObservationCoverage,
+    DistillationStage,
+    DistillationStageKind,
+    DistillationStageStatus,
+    DistillationWindow,
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryLink,
     MemoryStatus,
     MemoryVersion,
@@ -33,13 +42,21 @@ from engram.core.models import (
     WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory import candidate_work_reconciler
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
+from engram.memory.distillation_provenance import (
+    ProvenanceContractError,
+    candidate_source_anchors,
+    canonical_source_manifest,
+)
+from engram.memory.distillation_provider_stage import stage_target_key
 from engram.memory.session_work_reconciler import inspect_session_work
-from engram.memory.workflow_work import observation_content_digest, work_input_fingerprint
+from engram.memory.work_execution import fingerprint_matches
+from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest, work_input_fingerprint
 
 _SAMPLE_LIMIT = 20
 _POST_CUTOVER_BATCH_SIZE = 100
@@ -91,8 +108,8 @@ _MISSING_CATALOG = {
         'CP1',
     ),
     InvariantId.P3: (
-        'latest_input_watermark_missing',
-        'exact latest and completed input watermarks',
+        'legacy_distillation_window_unobservable',
+        'exact latest and completed input watermarks for legacy sessions',
         'CP2/CP3',
     ),
     InvariantId.P4: (
@@ -101,8 +118,8 @@ _MISSING_CATALOG = {
         'CP2',
     ),
     InvariantId.P5: (
-        'observation_coverage_relation_missing',
-        'observation-to-window disposition coverage relation',
+        'legacy_observation_coverage_unobservable',
+        'completed CP3 observation coverage and source relations for legacy cohorts',
         'CP3',
     ),
     InvariantId.P6: (
@@ -173,7 +190,7 @@ def evaluate_invariants(
         _missing(InvariantId.P2),
         _evaluate_p3(project, effective_as_of),
         _evaluate_p4(project, effective_as_of),
-        _missing(InvariantId.P5),
+        _evaluate_p5(project),
         _evaluate_p6(project, effective_as_of),
         _evaluate_p7(project),
         _missing(InvariantId.P8),
@@ -598,6 +615,100 @@ def _pre_cutover_residue_sessions(project: Project) -> QuerySet:
 
 
 def _evaluate_p3(project: Project, as_of: datetime) -> InvariantResult:
+    cp3_sessions = (
+        AgentSession.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            status=SessionStatus.ENDED,
+            end_work_contract_version=1,
+        )
+        .annotate(
+            latest_useful_sequence=Max(
+                'observations__session_sequence',
+                filter=Q(observations__organization_id=project.organization_id)
+                & Q(observations__project_id=project.id)
+                & (
+                    Q(observations__source_metadata__event_type__isnull=True)
+                    | ~Q(observations__source_metadata__event_type__in=_LIFECYCLE_OBSERVATION_TYPES)
+                ),
+            ),
+        )
+        .filter(latest_useful_sequence__gt=0)
+        .order_by('id')
+    )
+    if cp3_sessions.exists():
+        violation_ids: set[str] = set()
+        violation_count = 0
+        for session in cp3_sessions.iterator(chunk_size=_POST_CUTOVER_BATCH_SIZE):
+            upper = session.latest_useful_sequence
+            work = WorkflowWork.objects.filter(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                team_id=session.team_id,
+                work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                subject_type=WorkflowSubjectType.AGENT_SESSION,
+                subject_id=session.id,
+                contract_version=1,
+            ).order_by('created_at', 'id')
+            exact_work = next(
+                (
+                    candidate
+                    for candidate in work
+                    if isinstance(candidate.input_snapshot, dict)
+                    and candidate.input_snapshot.get('lower_sequence_exclusive') == 0
+                    and candidate.input_snapshot.get('upper_sequence_inclusive') == upper
+                    and fingerprint_matches(candidate)
+                ),
+                None,
+            )
+            complete = exact_work is not None and _cp3_work_complete(exact_work, project)
+            if not complete:
+                violation_count += 1
+                _record_bounded_sample(violation_ids, f'session:{session.id}')
+
+        if violation_count:
+            return InvariantResult(
+                invariant_id=InvariantId.P3,
+                state=InvariantState.VIOLATED,
+                reason='latest_distillation_window_incomplete',
+                violation_count=violation_count,
+                sample_ids=tuple(sorted(violation_ids, key=_sample_sort_key)),
+                target_checkpoint='CP3',
+            )
+
+        legacy = _pre_cutover_residue_sessions(project)
+        successful_runs = (
+            WorkflowRun.objects.filter(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                run_type=WorkflowRunType.SESSION_DISTILLATION,
+                status=WorkflowRunStatus.SUCCEEDED,
+            )
+            .annotate(session_id_text=KeyTextTransform('session_id', 'input_snapshot'))
+            .filter(session_id_text=Cast(OuterRef('id'), output_field=CharField()))
+        )
+        unproven_legacy = legacy.annotate(has_successful_run=Exists(successful_runs)).filter(
+            has_successful_run=False,
+        )
+        if unproven_legacy.exists():
+            return InvariantResult(
+                invariant_id=InvariantId.P3,
+                state=InvariantState.MISSING_OBSERVABILITY,
+                reason='legacy_distillation_window_unobservable',
+                proxy_count=unproven_legacy.count(),
+                sample_ids=_query_samples(unproven_legacy, 'session'),
+                missing_evidence='exact latest and completed input watermarks for legacy sessions',
+                target_checkpoint='CP2/CP3',
+            )
+
+        return InvariantResult(
+            invariant_id=InvariantId.P3,
+            state=InvariantState.HEALTHY,
+            reason='latest_distillation_window_complete',
+            violation_count=0,
+            target_checkpoint='CP3',
+        )
+
     inspection = inspect_session_work(
         organization_id=project.organization_id,
         project_id=project.id,
@@ -645,12 +756,296 @@ def _evaluate_p3(project: Project, as_of: datetime) -> InvariantResult:
     return InvariantResult(
         invariant_id=InvariantId.P3,
         state=InvariantState.MISSING_OBSERVABILITY,
-        reason='pre_cutover_session_distillation_unproven',
+        reason='legacy_distillation_window_unobservable',
         proxy_count=unproven.count(),
         sample_ids=_query_samples(unproven, 'session'),
-        missing_evidence='exact latest and completed input watermarks',
+        missing_evidence='exact latest and completed input watermarks for legacy sessions',
         target_checkpoint='CP2/CP3',
     )
+
+
+def _cp3_work_complete(work: WorkflowWork, project: Project) -> bool:
+    if (
+        work.disposition != WorkflowWorkDisposition.COMPLETE
+        or work.execution_state != WorkflowWorkExecutionState.SETTLED
+    ):
+        return False
+
+    try:
+        window = DistillationWindow.objects.get(
+            work_id=work.id,
+            organization_id=project.organization_id,
+            project_id=project.id,
+            session_id=work.subject_id,
+        )
+    except DistillationWindow.DoesNotExist:
+        return False
+
+    stages = list(
+        DistillationStage.objects.filter(
+            window_id=window.id,
+            organization_id=project.organization_id,
+            project_id=project.id,
+        ).only('id', 'status', 'stage_kind', 'chunk_id')
+    )
+    if not stages or any(stage.status != DistillationStageStatus.COMPLETE for stage in stages):
+        return False
+
+    chunk_ids = set(window.chunks.values_list('id', flat=True))
+    extract_chunk_ids = {
+        stage.chunk_id
+        for stage in stages
+        if stage.stage_kind == DistillationStageKind.EXTRACT and stage.chunk_id is not None
+    }
+    return chunk_ids <= extract_chunk_ids
+
+
+def _evaluate_p5(project: Project) -> InvariantResult:
+    windows = (
+        DistillationWindow.objects.filter(
+            organization_id=project.organization_id,
+            project_id=project.id,
+            work__organization_id=project.organization_id,
+            work__project_id=project.id,
+            work__disposition=WorkflowWorkDisposition.COMPLETE,
+        )
+        .select_related('work')
+        .order_by('id')
+    )
+    if not windows.exists():
+        legacy = _pre_cutover_residue_sessions(project)
+        legacy_count = legacy.count()
+        return InvariantResult(
+            invariant_id=InvariantId.P5,
+            state=InvariantState.MISSING_OBSERVABILITY,
+            reason='legacy_observation_coverage_unobservable',
+            proxy_count=legacy_count or None,
+            sample_ids=_query_samples(legacy, 'session'),
+            missing_evidence='completed CP3 observation coverage and source relations',
+            target_checkpoint='CP3',
+        )
+
+    violation_count = 0
+    sample_ids: set[str] = set()
+    for window in windows.iterator(chunk_size=_POST_CUTOVER_BATCH_SIZE):
+        findings = _p5_window_findings(window)
+        violation_count += len(findings)
+        for prefix, entity_id in findings:
+            _record_bounded_sample(sample_ids, f'{prefix}:{entity_id}')
+
+    if violation_count:
+        return InvariantResult(
+            invariant_id=InvariantId.P5,
+            state=InvariantState.VIOLATED,
+            reason='completed_window_coverage_invalid',
+            violation_count=violation_count,
+            sample_ids=tuple(sorted(sample_ids, key=_sample_sort_key)),
+            target_checkpoint='CP3',
+        )
+
+    legacy = _pre_cutover_residue_sessions(project)
+    if legacy.exists():
+        return InvariantResult(
+            invariant_id=InvariantId.P5,
+            state=InvariantState.MISSING_OBSERVABILITY,
+            reason='legacy_observation_coverage_unobservable',
+            proxy_count=legacy.count(),
+            sample_ids=_query_samples(legacy, 'session'),
+            missing_evidence='completed CP3 observation coverage and source relations',
+            target_checkpoint='CP3',
+        )
+
+    return InvariantResult(
+        invariant_id=InvariantId.P5,
+        state=InvariantState.HEALTHY,
+        reason='completed_window_observations_disposed',
+        violation_count=0,
+        target_checkpoint='CP3',
+    )
+
+
+def _p5_window_findings(window: DistillationWindow) -> list[tuple[str, uuid.UUID]]:  # noqa: C901
+    findings: list[tuple[str, uuid.UUID]] = []
+    if not _cp3_work_complete(window.work, window.project):
+        findings.append(('window', window.id))
+
+    chunks = list(
+        window.chunks.filter(
+            organization_id=window.organization_id,
+            project_id=window.project_id,
+        ).order_by('ordinal', 'id')
+    )
+    expected: dict[uuid.UUID, tuple[int, str]] = {}
+    expected_sequences: set[int] = set()
+    for chunk in chunks:
+        observations = chunk.input_manifest.get('observations') if isinstance(chunk.input_manifest, dict) else None
+        if not isinstance(observations, list):
+            findings.append(('chunk', chunk.id))
+            continue
+        if (
+            chunk.input_manifest.get('schema') != 'distillation_chunk_manifest.v1'
+            or chunk.input_manifest.get('window_input_hash') != window.input_hash
+            or chunk.input_manifest.get('ordinal') != chunk.ordinal
+            or chunk.observation_count != len(observations)
+            or hashlib.sha256(canonical_json_bytes(chunk.input_manifest)).hexdigest() != chunk.input_hash
+        ):
+            findings.append(('chunk', chunk.id))
+        if observations:
+            sequences = [entry.get('session_sequence') for entry in observations if isinstance(entry, dict)]
+            if sequences and (chunk.first_sequence != min(sequences) or chunk.last_sequence != max(sequences)):
+                findings.append(('chunk', chunk.id))
+        for entry in observations:
+            if not isinstance(entry, dict):
+                findings.append(('chunk', chunk.id))
+                continue
+            try:
+                observation_id = uuid.UUID(str(entry['observation_id']))
+                sequence = entry['session_sequence']
+                digest = entry['content_digest']
+            except (KeyError, TypeError, ValueError):
+                findings.append(('chunk', chunk.id))
+                continue
+            if type(sequence) is not int or sequence <= 0 or not isinstance(digest, str):
+                findings.append(('chunk', chunk.id))
+                continue
+            if observation_id in expected or sequence in expected_sequences:
+                findings.append(('chunk', chunk.id))
+            expected[observation_id] = (sequence, digest)
+            expected_sequences.add(sequence)
+    if window.observation_count != len(expected):
+        findings.append(('window', window.id))
+
+    stages = list(
+        DistillationStage.objects.filter(window_id=window.id)
+        .select_related('chunk')
+        .order_by('stage_kind', 'level', 'ordinal', 'id')
+    )
+    stage_by_id = {stage.id: stage for stage in stages}
+    stage_keys: set[str] = set()
+    target_keys: set[str] = set()
+    extract_chunks: set[uuid.UUID] = set()
+    for stage in stages:
+        if (
+            stage.organization_id != window.organization_id
+            or stage.project_id != window.project_id
+            or stage.team_id != window.team_id
+            or stage.window_id != window.id
+            or stage.status != DistillationStageStatus.COMPLETE
+            or stage.stage_key in stage_keys
+            or stage.target_key in target_keys
+        ):
+            findings.append(('stage', stage.id))
+        stage_keys.add(stage.stage_key)
+        target_keys.add(stage.target_key)
+        expected_target_key = stage_target_key(
+            work_id=str(window.work_id),
+            work_input_fingerprint=window.work.input_fingerprint,
+            window_input_hash=window.input_hash,
+            stage_kind=stage.stage_kind,
+            level=stage.level,
+            ordinal=stage.ordinal,
+            chunk_ordinal=stage.chunk.ordinal if stage.chunk_id is not None else None,
+            input_hash=stage.input_hash,
+            prompt_contract=stage.prompt_contract,
+        )
+        if stage.target_key != expected_target_key:
+            findings.append(('stage', stage.id))
+        if stage.stage_kind == DistillationStageKind.EXTRACT:
+            if stage.chunk_id is None or stage.chunk.window_id != window.id or stage.level != 0:
+                findings.append(('stage', stage.id))
+            else:
+                extract_chunks.add(stage.chunk_id)
+                if stage.input_hash != stage.chunk.input_hash or stage.input_manifest != stage.chunk.input_manifest:
+                    findings.append(('stage', stage.id))
+        elif stage.chunk_id is not None or stage.level <= 0:
+            findings.append(('stage', stage.id))
+    if not stages or extract_chunks != {chunk.id for chunk in chunks}:
+        findings.append(('window', window.id))
+
+    coverage = list(
+        DistillationObservationCoverage.objects.filter(window_id=window.id)
+        .select_related('observation', 'deciding_stage')
+        .order_by('session_sequence', 'id')
+    )
+    coverage_by_observation: dict[uuid.UUID, list[DistillationObservationCoverage]] = defaultdict(list)
+    coverage_by_sequence: dict[int, list[DistillationObservationCoverage]] = defaultdict(list)
+    for row in coverage:
+        coverage_by_observation[row.observation_id].append(row)
+        coverage_by_sequence[row.session_sequence].append(row)
+        stage = row.deciding_stage
+        valid_scope = (
+            row.organization_id == window.organization_id
+            and row.project_id == window.project_id
+            and row.team_id == window.team_id
+            and row.observation.organization_id == window.organization_id
+            and row.observation.project_id == window.project_id
+            and row.observation.session_id == window.session_id
+            and stage.id in stage_by_id
+            and stage.organization_id == window.organization_id
+            and stage.project_id == window.project_id
+            and stage.team_id == window.team_id
+            and stage.status == DistillationStageStatus.COMPLETE
+        )
+        expected_value = expected.get(row.observation_id)
+        if not valid_scope or expected_value != (row.session_sequence, row.observation_digest):
+            findings.append(('coverage', row.id))
+        if row.outcome not in (DistillationCoverageOutcome.SIGNAL, DistillationCoverageOutcome.NO_SIGNAL):
+            findings.append(('coverage', row.id))
+    for observation_id, value in expected.items():
+        rows = coverage_by_observation.get(observation_id, [])
+        if len(rows) != 1:
+            findings.append(('window', window.id))
+        if len(coverage_by_sequence.get(value[0], [])) != 1:
+            findings.append(('window', window.id))
+
+    sources = list(
+        MemoryCandidateSource.objects.filter(window_id=window.id)
+        .select_related('candidate', 'observation', 'stage')
+        .order_by('id')
+    )
+    sources_by_observation: dict[uuid.UUID, list[MemoryCandidateSource]] = defaultdict(list)
+    for source in sources:
+        sources_by_observation[source.observation_id].append(source)
+        stage = source.stage
+        if (
+            source.organization_id != window.organization_id
+            or source.project_id != window.project_id
+            or source.team_id != window.team_id
+            or source.candidate.organization_id != window.organization_id
+            or source.candidate.project_id != window.project_id
+            or source.observation.organization_id != window.organization_id
+            or source.observation.project_id != window.project_id
+            or source.observation.session_id != window.session_id
+            or stage.id not in stage_by_id
+            or stage.organization_id != window.organization_id
+            or stage.project_id != window.project_id
+            or stage.team_id != window.team_id
+            or stage.status != DistillationStageStatus.COMPLETE
+        ):
+            findings.append(('candidate_source', source.id))
+        else:
+            try:
+                expected_anchors_hash = canonical_source_manifest(
+                    candidate_source_anchors(
+                        source.observation,
+                        observation_id=str(source.observation_id),
+                        observation_digest=observation_content_digest(source.observation),
+                    )
+                )
+            except (ProvenanceContractError, TypeError, ValueError):
+                findings.append(('candidate_source', source.id))
+            else:
+                if source.anchors_hash != expected_anchors_hash:
+                    findings.append(('candidate_source', source.id))
+    for observation_id, rows in coverage_by_observation.items():
+        outcome = rows[0].outcome
+        source_rows = sources_by_observation.get(observation_id, [])
+        if outcome == DistillationCoverageOutcome.SIGNAL and len(source_rows) != 1:
+            findings.append(('window', window.id))
+        if outcome == DistillationCoverageOutcome.NO_SIGNAL and source_rows:
+            findings.append(('window', window.id))
+
+    return findings
 
 
 def _evaluate_p4(project: Project, as_of: datetime) -> InvariantResult:

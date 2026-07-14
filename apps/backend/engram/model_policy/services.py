@@ -1019,6 +1019,44 @@ def generated_distill_extract_payload(prompt: str) -> str:
     )
 
 
+def generated_distill_reduce_payload(prompt: str) -> str:
+    try:
+        parsed = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    source_ids: list[str] = []
+    seen_ids: set[str] = set()
+    drafts = parsed.get('drafts') if isinstance(parsed, dict) else None
+    if isinstance(drafts, list):
+        for draft in drafts:
+            if not isinstance(draft, dict):
+                continue
+            source_id = draft.get('id')
+            if not isinstance(source_id, str) or not source_id or source_id in seen_ids:
+                continue
+            seen_ids.add(source_id)
+            source_ids.append(source_id)
+
+    if not source_ids:
+        return json.dumps({'memories': []})
+
+    digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    return json.dumps(
+        {
+            'memories': [
+                {
+                    'title': f'Provider-reduced memory {digest}',
+                    'body': f'Provider-reduced memory body {digest}',
+                    'confidence': 0.9,
+                    'source_ids': source_ids,
+                    'kind': 'gotcha',
+                },
+            ],
+        },
+    )
+
+
 def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
     title, body = generated_candidate_content(prompt)
     if data.response_kind == 'candidates':
@@ -1027,6 +1065,8 @@ def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, s
         return title, generated_curation_judgment_payload()
     if data.response_kind == 'distill_extract.v1':
         return title, generated_distill_extract_payload(prompt)
+    if data.response_kind == 'distill_reduce.v1':
+        return title, generated_distill_reduce_payload(prompt)
 
     return title, body
 
@@ -1052,7 +1092,7 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
     return {}
 
 
-_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment', 'distill_extract.v1'})
+_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1'})
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
 
@@ -1073,7 +1113,13 @@ def openai_json_mode_override(response_kind: str, policy: ModelPolicy) -> dict[s
 
 
 _DEFAULT_MAX_TOKENS = 1024
-_MAX_TOKENS_BY_KIND = {'candidates': 8192, 'curation_judgment': 1024, 'distill_extract.v1': 8192}
+_MAX_TOKENS_BY_KIND = {
+    'candidates': 8192,
+    'curation_judgment': 1024,
+    'distill_extract.v1': 8192,
+    'distill_reduce.v1': 8192,
+}
+_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1'})
 _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
     'candidates': {
         'name': 'emit_memories',
@@ -1155,11 +1201,46 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'additionalProperties': False,
         },
     },
+    'distill_reduce.v1': {
+        'name': 'emit_distillation_reduction',
+        'description': 'Return the distillation reduction.',
+        'input_schema': {
+            'type': 'object',
+            'properties': {
+                'memories': {
+                    'type': 'array',
+                    'maxItems': 12,
+                    'items': {
+                        'type': 'object',
+                        'properties': {
+                            'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
+                            'body': {'type': 'string', 'maxLength': 3000},
+                            'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
+                            'source_ids': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'minItems': 1,
+                                'uniqueItems': True,
+                            },
+                            'kind': {
+                                'type': 'string',
+                                'enum': ['decision', 'convention', 'gotcha', 'architecture', 'incident'],
+                            },
+                        },
+                        'required': ['title', 'body', 'confidence', 'source_ids'],
+                        'additionalProperties': False,
+                    },
+                },
+            },
+            'required': ['memories'],
+            'additionalProperties': False,
+        },
+    },
 }
 
 
 def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
-    if response_kind == 'distill_extract.v1':
+    if response_kind in _FIXED_MAX_TOKEN_KINDS:
         return _MAX_TOKENS_BY_KIND[response_kind]
 
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}

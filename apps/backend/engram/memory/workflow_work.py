@@ -12,6 +12,7 @@ from django.utils import timezone
 
 from engram.core.models import (
     AgentSession,
+    MemoryCandidate,
     Observation,
     Project,
     ProjectTeam,
@@ -35,6 +36,7 @@ _WORK_SUBJECT_PAIRS = frozenset(
         (WorkflowWorkType.DAILY_DIGEST, WorkflowSubjectType.PROJECT),
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.PROJECT),
         (WorkflowWorkType.WEEKLY_DIGEST, WorkflowSubjectType.TEAM),
+        (WorkflowWorkType.CANDIDATE_DECISION, WorkflowSubjectType.MEMORY_CANDIDATE),
     }
 )
 _OBSERVATION_SNAPSHOT_KEYS = frozenset({'schema', 'observation_id', 'observation_digest', 'policy'})
@@ -72,6 +74,18 @@ _WEEKLY_SNAPSHOT_KEYS = frozenset(
         'output_team_id',
         'changes',
         'input_digest',
+    }
+)
+_CANDIDATE_SNAPSHOT_KEYS = frozenset(
+    {
+        'schema',
+        'candidate_id',
+        'candidate_content_hash',
+        'organization_id',
+        'project_id',
+        'team_id',
+        'evidence_manifest_hash',
+        'policy_version',
     }
 )
 
@@ -327,6 +341,32 @@ def _validate_weekly_snapshot(
             raise ValueError('team weekly digest output must remain team-visible')
 
 
+def _validate_candidate_snapshot(
+    *,
+    subject_id: uuid.UUID,
+    subject: MemoryCandidate,
+    input_snapshot: dict[str, object],
+) -> None:
+    _require_exact_keys(input_snapshot, _CANDIDATE_SNAPSHOT_KEYS, 'candidate decision snapshot')
+    if input_snapshot['schema'] != 'candidate_decision_input/v1':
+        raise ValueError('unsupported candidate decision work snapshot schema')
+    if input_snapshot['candidate_id'] != str(subject_id):
+        raise ValueError('candidate snapshot subject does not match work subject')
+    if input_snapshot['candidate_content_hash'] != subject.content_hash:
+        raise ValueError('candidate snapshot content hash does not match persisted candidate')
+    _require_sha256(input_snapshot['candidate_content_hash'], 'candidate snapshot content hash')
+    if input_snapshot['organization_id'] != str(subject.organization_id):
+        raise ValueError('candidate snapshot organization does not match work scope')
+    if input_snapshot['project_id'] != str(subject.project_id):
+        raise ValueError('candidate snapshot project does not match work scope')
+    expected_team_id = str(subject.team_id) if subject.team_id is not None else None
+    if input_snapshot['team_id'] != expected_team_id:
+        raise ValueError('candidate snapshot team does not match work scope')
+    _require_sha256(input_snapshot['evidence_manifest_hash'], 'candidate evidence manifest hash')
+    if type(input_snapshot['policy_version']) is not int or input_snapshot['policy_version'] != 1:
+        raise ValueError('unsupported candidate decision policy version')
+
+
 def _identity_projection(
     *,
     work_type: str,
@@ -361,6 +401,15 @@ def _identity_projection(
             occurrence_key=occurrence_key,
             input_snapshot=input_snapshot,
         )
+        identity_input = input_snapshot
+    elif work_type == WorkflowWorkType.CANDIDATE_DECISION:
+        _require_exact_keys(input_snapshot, _CANDIDATE_SNAPSHOT_KEYS, 'candidate decision snapshot')
+        if input_snapshot.get('schema') != 'candidate_decision_input/v1':
+            raise ValueError('unsupported candidate decision work snapshot schema')
+        _require_sha256(input_snapshot.get('candidate_content_hash'), 'candidate snapshot content hash')
+        _require_sha256(input_snapshot.get('evidence_manifest_hash'), 'candidate evidence manifest hash')
+        if input_snapshot.get('candidate_id') != str(subject_id):
+            raise ValueError('candidate snapshot subject does not match work subject')
         identity_input = input_snapshot
     else:
         _validate_weekly_snapshot(
@@ -415,6 +464,39 @@ def _validate_derived_team(team_id: uuid.UUID | None, organization_id: uuid.UUID
         raise WorkflowWorkScopeError('derived team is outside the declared organization scope')
 
 
+def _resolve_candidate_team(
+    data: CreateWorkflowWorkInput,
+    project: Project,
+) -> tuple[MemoryCandidate, uuid.UUID | None]:
+    try:
+        subject = MemoryCandidate.objects.get(
+            id=data.subject_id,
+            organization_id=data.organization_id,
+            project_id=project.id,
+        )
+    except MemoryCandidate.DoesNotExist as error:
+        raise WorkflowWorkScopeError('candidate is outside the declared work scope') from error
+
+    _validate_derived_team(subject.team_id, data.organization_id)
+
+    return subject, subject.team_id
+
+
+def _resolve_project_team(data: CreateWorkflowWorkInput, project: Project) -> tuple[Team, uuid.UUID | None]:
+    try:
+        subject = Team.objects.get(id=data.subject_id, organization_id=data.organization_id)
+    except Team.DoesNotExist as error:
+        raise WorkflowWorkScopeError('team is outside the declared organization scope') from error
+    if not ProjectTeam.objects.filter(
+        organization_id=data.organization_id,
+        project_id=project.id,
+        team_id=subject.id,
+    ).exists():
+        raise WorkflowWorkScopeError('team is not linked to the declared project')
+
+    return subject, subject.id
+
+
 def _resolve_subject_team(data: CreateWorkflowWorkInput, project: Project) -> tuple[object, uuid.UUID | None]:
     if data.subject_type == WorkflowSubjectType.OBSERVATION:
         try:
@@ -444,6 +526,9 @@ def _resolve_subject_team(data: CreateWorkflowWorkInput, project: Project) -> tu
 
         return subject, subject.team_id
 
+    if data.subject_type == WorkflowSubjectType.MEMORY_CANDIDATE:
+        return _resolve_candidate_team(data, project)
+
     if data.subject_type == WorkflowSubjectType.PROJECT:
         if data.subject_id != project.id:
             raise WorkflowWorkScopeError('project subject does not match work project')
@@ -451,18 +536,7 @@ def _resolve_subject_team(data: CreateWorkflowWorkInput, project: Project) -> tu
         return project, None
 
     if data.subject_type == WorkflowSubjectType.TEAM:
-        try:
-            subject = Team.objects.get(id=data.subject_id, organization_id=data.organization_id)
-        except Team.DoesNotExist as error:
-            raise WorkflowWorkScopeError('team is outside the declared organization scope') from error
-        if not ProjectTeam.objects.filter(
-            organization_id=data.organization_id,
-            project_id=project.id,
-            team_id=subject.id,
-        ).exists():
-            raise WorkflowWorkScopeError('team is not linked to the declared project')
-
-        return subject, subject.id
+        return _resolve_project_team(data, project)
 
     raise ValueError('unsupported workflow subject type')
 
@@ -498,6 +572,8 @@ def _validate_subject_snapshot(
 ) -> None:
     if isinstance(subject, Observation):
         _validate_observation_snapshot(subject, input_snapshot)
+    elif isinstance(subject, MemoryCandidate):
+        _validate_candidate_snapshot(subject_id=data.subject_id, subject=subject, input_snapshot=input_snapshot)
     elif data.subject_type == WorkflowSubjectType.TEAM:
         if input_snapshot['project_id'] != str(data.project_id):
             raise ValueError('digest snapshot project does not match work project')

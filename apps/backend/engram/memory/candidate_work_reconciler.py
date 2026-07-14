@@ -3,8 +3,8 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
 
+from django.db import transaction
 from django.db.models import CharField, Exists, OuterRef, Value
 from django.db.models.functions import Cast, Concat
 
@@ -13,13 +13,24 @@ from engram.core.models import (
     LinkType,
     MemoryCandidate,
     MemoryLink,
-    WorkflowWork,
+    WorkflowRunOrigin,
     WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
 )
 from engram.memory.aware_time import require_aware
+from engram.memory.candidate_decision_work import (
+    CandidateDecisionWorkBuilder,
+    ensure_candidate_decision_work_locked,
+    register_candidate_decision_work_builder,
+)
+from engram.memory.candidate_decision_work import (
+    CandidateDecisionWorkInput as _CandidateDecisionWorkInput,
+)
 from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
 from engram.memory.session_work_reconciler import SessionWorkFinding
+from engram.memory.work_dispatch import queue_work_attempt
+
+CandidateDecisionWorkInput = _CandidateDecisionWorkInput
 
 CANDIDATE_DECISION_BUILDER_UNAVAILABLE = 'candidate_decision_builder_unavailable'
 CANDIDATE_DECISION_WORK_MISSING = 'candidate_decision_work_missing'
@@ -37,23 +48,6 @@ _INACTIVE_EXECUTION_STATES = frozenset(
 )
 
 
-@dataclass(frozen=True, slots=True)
-class CandidateDecisionWorkInput:
-    candidate_id: uuid.UUID
-    candidate_content_hash: str
-    organization_id: uuid.UUID
-    project_id: uuid.UUID
-    team_id: uuid.UUID | None
-    evidence_manifest_hash: str
-    policy_version: int
-
-
-class CandidateDecisionWorkBuilder(Protocol):
-    def expected_input(self, *, candidate_id: uuid.UUID) -> CandidateDecisionWorkInput: ...
-
-    def exact_work(self, *, value: CandidateDecisionWorkInput) -> WorkflowWork | None: ...
-
-
 _BUILDER: CandidateDecisionWorkBuilder | None = None
 
 
@@ -66,6 +60,10 @@ def set_candidate_decision_work_builder(builder: CandidateDecisionWorkBuilder | 
 
 def get_candidate_decision_work_builder() -> CandidateDecisionWorkBuilder | None:
     return _BUILDER
+
+
+def register_default_candidate_decision_builder() -> CandidateDecisionWorkBuilder:
+    return register_candidate_decision_work_builder()
 
 
 def _finding(
@@ -161,3 +159,52 @@ def inspect_candidate_work(
             findings.append(finding)
 
     return tuple(findings)
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateWorkReconciliation:
+    organization_id: uuid.UUID
+    project_id: uuid.UUID
+    as_of: datetime
+    queued: int
+    applied: tuple[str, ...]
+
+
+def reconcile_candidate_work(
+    *,
+    organization_id: uuid.UUID,
+    project_id: uuid.UUID,
+    as_of: datetime,
+) -> CandidateWorkReconciliation:
+    require_aware(as_of)
+    builder = get_candidate_decision_work_builder()
+    if builder is None or not hasattr(builder, 'expected_input'):
+        return CandidateWorkReconciliation(organization_id, project_id, as_of, 0, ())
+
+    applied: list[str] = []
+    for candidate in _proposed_candidates(organization_id, project_id):
+        if candidate.has_canonical_conflict:
+            continue
+        with transaction.atomic():
+            try:
+                locked = MemoryCandidate.objects.select_for_update().get(
+                    id=candidate.id,
+                    organization_id=organization_id,
+                    project_id=project_id,
+                    status=CandidateStatus.PROPOSED,
+                )
+            except MemoryCandidate.DoesNotExist:
+                continue
+            work, created = ensure_candidate_decision_work_locked(locked)
+            if not created:
+                continue
+            queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+            applied.append(str(candidate.id))
+
+    return CandidateWorkReconciliation(
+        organization_id=organization_id,
+        project_id=project_id,
+        as_of=as_of,
+        queued=len(applied),
+        applied=tuple(applied),
+    )
