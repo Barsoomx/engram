@@ -1103,6 +1103,61 @@ def test_fake_provider_gateway_embed_redacts_input_and_records_fresh_call() -> N
 
 
 @pytest.mark.django_db
+def test_fake_provider_gateway_embed_honors_configured_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Team OpenAI',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    ProviderSecretEnvelope.objects.create(
+        organization=organization,
+        team=team,
+        secret=secret,
+        version=1,
+        key_version='v1',
+        ciphertext='encrypted-secret',
+        hmac_digest='secret-hmac',
+        active=True,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        name='Embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
+    data = EmbeddingCallInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        team_id=team.id,
+        policy=policy,
+        request_id='memory-indexer:embedding-delay:embedding',
+        trace_id='trace-embedding-delay',
+        text='embedding delay test text',
+    )
+    sleeps: list[float] = []
+    monkeypatch.setenv('ENGRAM_FAKE_PROVIDER_DELAY_MS', '2500')
+    monkeypatch.setattr(services.time, 'sleep', sleeps.append)
+
+    FakeProviderGateway().embed(data)
+
+    assert sleeps == [2.5]
+    assert ProviderCallRecord.objects.filter(request_id=data.request_id, task_type='embedding').count() == 1
+
+
+@pytest.mark.django_db
 def test_fake_provider_gateway_embed_refuses_disabled_secret() -> None:
     scope = create_project_scope()
     organization, team, project, _owner, _api_key = scope
