@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+from pathlib import Path
 
 import pytest
 
@@ -145,3 +146,21 @@ def test_validators_reject_cross_id_or_duplicate_rows(field: str, value: object,
 
     with pytest.raises(ValueError, match=message):
         atomic.validate_recovered(snapshot, baseline)
+
+
+def test_deterministic_env_preserves_windows_docker_plugin_discovery() -> None:
+    source = {
+        'PATH': 'docker-bin',
+        'APPDATA': 'app-data',
+        'LOCALAPPDATA': 'local-app-data',
+        'XDG_RUNTIME_DIR': 'runtime-dir',
+        'UNRELATED_SECRET': 'must-not-leak',
+    }
+
+    result = atomic.deterministic_env(Path.cwd() / 'c43.env', source=source)
+
+    assert result['PATH'] == 'docker-bin'
+    assert result['APPDATA'] == 'app-data'
+    assert result['LOCALAPPDATA'] == 'local-app-data'
+    assert result['XDG_RUNTIME_DIR'] == 'runtime-dir'
+    assert 'UNRELATED_SECRET' not in result
