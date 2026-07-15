@@ -25,6 +25,9 @@ POLL_INTERVAL = 1.0
 POLL_TIMEOUT = 5 * 60.0
 OUTPUT_LIMIT = 4000
 MAX_FAKE_PROVIDER_DELAY_MS = 5000
+FAILURE_LOG_SERVICES = ('api', 'relay', 'worker-batch', 'rabbitmq')
+FAILURE_LOG_TAIL = 200
+FAILURE_LOG_TIMEOUT = 30
 
 
 class HarnessError(RuntimeError):
@@ -166,7 +169,11 @@ def validate_active_claim(snapshot: MemorySnapshot, baseline: MemorySnapshot) ->
     _check_chain(snapshot)
     _check_same_identity(snapshot, baseline)
     if snapshot.work_execution_state != 'leased' or snapshot.active_run_count != 1:
-        raise ValueError('work must have exactly one active lease')
+        raise ValueError(
+            'work must have exactly one active lease '
+            f'(observed work_execution_state={snapshot.work_execution_state!r}, '
+            f'active_run_count={snapshot.active_run_count})'
+        )
     if snapshot.embedding_projection_hash or snapshot.embedding_reference:
         raise ValueError('embedding projection must remain blank while leased')
     if snapshot.embedding_vector_count != 0 or not snapshot.embedding_pgvector_is_null:
@@ -426,6 +433,32 @@ class ComposeHarness:
                 time.sleep(min(POLL_INTERVAL, deadline.remaining()))
             except HarnessError as error:
                 raise HarnessError(f'Timed out waiting for {label}: {last_error}') from error
+
+
+def collect_failure_logs(
+    harness: ComposeHarness,
+    secrets_to_redact: Sequence[str] | None = None,
+) -> str:
+    redactions = harness.secrets_to_redact if secrets_to_redact is None else tuple(secrets_to_redact)
+    sections: list[str] = []
+    for service in FAILURE_LOG_SERVICES:
+        try:
+            result = harness.compose(
+                'logs',
+                '--no-color',
+                f'--tail={FAILURE_LOG_TAIL}',
+                service,
+                timeout=FAILURE_LOG_TIMEOUT,
+                check=False,
+            )
+            output = redact_diagnostics(result.stdout + result.stderr, redactions)
+            if not output:
+                output = f'Compose logs exited with status {result.returncode}'
+        except HarnessError as error:
+            output = redact_diagnostics(str(error), redactions)
+        sections.append(f'[{service}]\n{output}')
+
+    return '\n'.join(sections)
 
 
 def emit(message: str) -> None:
@@ -738,22 +771,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             primary_error = HarnessError(redact_diagnostics(str(error), generated_secrets))
             emit(f'failure: {primary_error}')
             if owns_project:
-                try:
-                    logs = harness.compose(
-                        'logs',
-                        '--no-color',
-                        '--tail=120',
-                        'api',
-                        'relay',
-                        'worker-batch',
-                        timeout=30,
-                        check=False,
-                    )
-                    diagnostic = redact_diagnostics(logs.stdout + logs.stderr, generated_secrets)
-                    if diagnostic:
-                        emit(f'failure logs tail:\n{diagnostic}')
-                except HarnessError as log_error:
-                    emit(f'failure logs unavailable: {redact_diagnostics(str(log_error), generated_secrets)}')
+                diagnostic = collect_failure_logs(harness, generated_secrets)
+                if diagnostic:
+                    emit(f'failure logs tail:\n{diagnostic}')
         finally:
             if owns_project:
                 cleanup_returncode = cleanup_compose(harness)
