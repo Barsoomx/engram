@@ -552,7 +552,7 @@ candidate = (
         project=project,
         status='proposed',
         decision_work_contract_version=1,
-        title__startswith={json.dumps(GENERATION_TITLE_PREFIX)},
+        title__startswith={json.dumps(SESSION_TITLE_PREFIX)},
         sources__source_kind='distillation',
         sources__window__isnull=False,
     ).distinct().order_by('-created_at').first()
