@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from django.db import transaction
 from django.utils import timezone
@@ -101,6 +103,8 @@ class PublishDigestMemoryInput:
     title: str
     body: str
     work_claim: WorkClaim | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    visibility_scope: str = VisibilityScope.PROJECT
 
 
 @dataclass(frozen=True, slots=True)
@@ -869,13 +873,34 @@ def _create_revision_version(
     return version, version_sources
 
 
+def _canonical_digest_metadata(
+    metadata: Mapping[str, object],
+    *,
+    title: str,
+    body: str,
+) -> dict[str, object]:
+    canonical_metadata = json.loads(canonical_json_bytes(dict(metadata)))
+    canonical_metadata.update(
+        {
+            'kind': 'digest',
+            'source': 'digest_work',
+            'full_text': f'{title}\n\n{body}'.strip(),
+        }
+    )
+
+    return canonical_metadata
+
+
 def _create_digest_memory(
     request: TransitionRequest,
     *,
     title: str,
     body: str,
     source_versions: list[MemoryVersion],
+    metadata: Mapping[str, object],
+    visibility_scope: str,
 ) -> tuple[Memory, MemoryVersion, list[MemoryVersionSource]]:
+    canonical_metadata = _canonical_digest_metadata(metadata, title=title, body=body)
     memory = Memory.objects.create(
         organization_id=request.scope.organization_id,
         project_id=request.scope.project_id,
@@ -883,10 +908,10 @@ def _create_digest_memory(
         title=title,
         body=body,
         status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         current_version=0,
         transition_contract_version=0,
-        metadata={'kind': 'digest', 'source': 'digest_work', 'full_text': f'{title}\n\n{body}'.strip()},
+        metadata=canonical_metadata,
     )
     _fault_boundary('memory')
     version = MemoryVersion.objects.create(
@@ -896,7 +921,7 @@ def _create_digest_memory(
         version=1,
         body=body,
         content_hash=_content_hash(memory_id=memory.id, version=1, title=title, body=body),
-        source_metadata={'kind': 'digest', 'full_text': f'{title}\n\n{body}'.strip()},
+        source_metadata=dict(canonical_metadata),
     )
     _fault_boundary('version')
     version_sources = _create_version_sources(version, memory_versions=source_versions)
@@ -1352,6 +1377,7 @@ class PublishDigestMemory:
     def execute(self, data: PublishDigestMemoryInput) -> MemoryTransitionResult:
         request = data.request
         fences = tuple(data.source_memory_fences)
+        metadata = _canonical_digest_metadata(data.metadata, title=data.title, body=data.body)
         fingerprint = _request_fingerprint(
             request,
             action='publish_digest',
@@ -1362,6 +1388,8 @@ class PublishDigestMemory:
                 ],
                 'title': data.title,
                 'body': data.body,
+                'metadata': metadata,
+                'visibility_scope': data.visibility_scope,
                 'work_claim': _work_claim_value(data.work_claim),
             },
         )
@@ -1381,6 +1409,8 @@ class PublishDigestMemory:
                 title=data.title,
                 body=data.body,
                 source_versions=source_versions,
+                metadata=metadata,
+                visibility_scope=data.visibility_scope,
             )
             transition_id = uuid.uuid4()
             document = _write_exact(

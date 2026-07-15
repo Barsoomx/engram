@@ -18,9 +18,6 @@ from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
     AgentSession,
-    CandidateStatus,
-    Memory,
-    MemoryCandidate,
     Observation,
     ObservationSource,
     Organization,
@@ -32,11 +29,9 @@ from engram.core.models import (
     Runtime,
     SessionStatus,
     Team,
-    VisibilityScope,
 )
 from engram.core.redaction import RedactionResult, redact_value
 from engram.memory.observation_work import allocate_observation_sequence, lock_session_for_observation
-from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
 
 ImportReport = dict[str, object]
 
@@ -1237,22 +1232,16 @@ class ClaudeMemImporter:
                 'metadata': {'event_type': event_type},
             },
         )
-        memory_result = self._promote_imported_observation(
-            context,
-            observation,
-            source_id,
-            event_type,
-            confidence,
-            defer_embedding,
+        memory_result = self._empty_memory_result(payload_redacted or observation_redacted)
+        memory_result.update(
+            {
+                'truncated': truncated,
+                'raw_event_created': raw_created,
+                'observation_created': observation_created,
+            },
         )
 
-        return {
-            'redacted': payload_redacted or observation_redacted,
-            'truncated': truncated,
-            'raw_event_created': raw_created,
-            'observation_created': observation_created,
-            **memory_result,
-        }
+        return memory_result
 
     def _existing_import_observation(
         self,
@@ -1686,73 +1675,6 @@ class ClaudeMemImporter:
             )
         ):
             raise ValueError('import raw event identity collision')
-
-    def _promote_imported_observation(
-        self,
-        context: ImportContext,
-        observation: Observation,
-        source_id: str,
-        event_type: str,
-        confidence: Decimal,
-        defer_embedding: bool,
-    ) -> dict[str, bool]:
-        candidate_hash = self._content_hash('memory-candidate', source_id, observation.content_hash)
-        candidate, candidate_created = MemoryCandidate.objects.get_or_create(
-            organization=observation.organization,
-            project=observation.project,
-            content_hash=candidate_hash,
-            defaults={
-                'team': observation.team,
-                'source_observation': observation,
-                'title': observation.title,
-                'body': observation.body or observation.title,
-                'status': CandidateStatus.PROPOSED,
-                'visibility_scope': VisibilityScope.PROJECT,
-                'confidence': confidence,
-                'evidence': [
-                    {
-                        'source': 'claude_mem_import',
-                        'source_id': source_id,
-                        'event_type': event_type,
-                        'observation_id': str(observation.id),
-                        'raw_event_id': str(observation.raw_event_id) if observation.raw_event_id else '',
-                    },
-                ],
-            },
-        )
-        promoted = PromoteMemoryCandidate().execute(
-            PromoteMemoryCandidateInput(candidate_id=candidate.id, defer_embedding=defer_embedding),
-        )
-        self._mark_imported_memory(promoted.memory, context, source_id, event_type)
-
-        return {
-            'candidate_created': candidate_created,
-            'memory_created': not promoted.duplicate,
-            'version_created': not promoted.duplicate,
-            'retrieval_document_created': not promoted.duplicate,
-        }
-
-    def _mark_imported_memory(
-        self,
-        memory: Memory,
-        context: ImportContext,
-        source_id: str,
-        event_type: str,
-    ) -> None:
-        metadata = dict(memory.metadata)
-        metadata.update(
-            {
-                'source': 'claude_mem_import',
-                'source_store_id': context.source_store_id,
-                'source_id': source_id,
-                'event_type': event_type,
-            },
-        )
-        if metadata == memory.metadata:
-            return
-
-        memory.metadata = metadata
-        memory.save(update_fields=['metadata', 'updated_at'])
 
     def _record_memory_result(self, report: ImportReport, result: dict[str, object]) -> None:
         unsupported = result.get('unsupported')

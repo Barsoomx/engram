@@ -17,7 +17,6 @@ from django.utils import timezone
 from rest_framework import status as drf_status
 
 from engram.access.services import AccessDeniedError, EffectiveScope
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
@@ -46,7 +45,6 @@ from engram.memory.candidate_parsing import (
     parse_synthesized_candidates,
     truncate_with_marker,
 )
-from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.model_policy.services import (
     AnthropicMessagesGateway,
     FakeProviderGateway,
@@ -64,6 +62,7 @@ from engram.model_policy.services import (
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from engram.memory.transitions import MemoryFence
     from engram.memory.work_execution import WorkClaim
 
 _ProviderGateway = FakeProviderGateway | OpenAICompatibleGateway | AnthropicMessagesGateway
@@ -227,9 +226,11 @@ class RecordMemoryFeedback:
             memory = self._lock_memory(data, scope)
             self._ensure_team_scope(memory, scope)
             already_applied = self._already_applied(memory, data.action)
-            self._apply(memory, data.action)
-            updated = self._sync_retrieval_documents(memory, data.action)
-            self._audit(memory, scope, data, updated, already_applied)
+            if already_applied:
+                updated = self._matching_retrieval_documents(memory, data.action)
+            else:
+                memory, updated = self._apply_transition(memory, scope, data)
+            self._log(memory, data.action, updated, already_applied)
 
         return MemoryFeedbackResult(
             memory=memory,
@@ -247,60 +248,64 @@ class RecordMemoryFeedback:
     def _already_applied(self, memory: Memory, action: str) -> bool:
         return bool(getattr(memory, action))
 
-    def _apply(self, memory: Memory, action: str) -> None:
-        if getattr(memory, action):
-            return
-
-        setattr(memory, action, True)
-        memory.save(update_fields=[action, 'updated_at'])
-
-    def _sync_retrieval_documents(self, memory: Memory, action: str) -> int:
+    def _matching_retrieval_documents(self, memory: Memory, action: str) -> int:
         return RetrievalDocument.objects.filter(
             organization=memory.organization,
             project=memory.project,
             memory=memory,
-        ).update(**{action: True})
+            **{action: True},
+        ).count()
 
-    def _audit(
+    def _apply_transition(
         self,
         memory: Memory,
         scope: EffectiveScope,
         data: MemoryFeedbackInput,
-        updated: int,
-        already_applied: bool,
-    ) -> None:
-        AuditEvent.objects.create(
-            organization=memory.organization,
-            project=memory.project,
-            team=memory.team,
-            event_type='MemoryFeedbackRecorded',
-            actor_type=scope.actor_type,
-            actor_id=scope.actor_id,
-            target_type='memory',
-            target_id=str(memory.id),
-            capability='memories:review',
-            result=AuditResult.ALLOWED,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            metadata={
-                'action': data.action,
-                'reason': redact_text(data.reason),
-                'retrieval_documents_updated': updated,
-                'already_applied': already_applied,
-                'scope_filters': {
-                    'organization_id': str(scope.organization_id),
-                    'project_ids': [str(project_id) for project_id in scope.project_ids],
-                    'team_ids': [str(team_id) for team_id in scope.team_ids],
-                },
-            },
+    ) -> tuple[Memory, int]:
+        from engram.memory.transitions import (
+            MarkMemoryStale,
+            MemoryStateInput,
+            MemoryTransitionError,
+            RefuteMemory,
+            TransitionRequest,
+            TransitionScope,
+            build_memory_fence,
         )
 
+        transition = MarkMemoryStale() if data.action == 'stale' else RefuteMemory()
+        try:
+            result = transition.execute(
+                MemoryStateInput(
+                    request=TransitionRequest(
+                        scope=TransitionScope(
+                            organization_id=memory.organization_id,
+                            project_id=memory.project_id,
+                            team_id=memory.team_id,
+                        ),
+                        idempotency_key=f'memory-feedback:{memory.id}:{data.action}:{data.request_id}:v1',
+                        actor_type=scope.actor_type,
+                        actor_id=scope.actor_id,
+                        capability='memories:review',
+                        request_id=data.request_id,
+                        correlation_id=data.correlation_id,
+                        reason=data.reason,
+                        origin='memory-feedback',
+                    ),
+                    memory_fence=build_memory_fence(memory),
+                ),
+            )
+        except MemoryTransitionError as error:
+            raise MemoryFeedbackError(error.code, str(error)) from error
+
+        return result.memory, int(bool(getattr(result.retrieval_document, data.action)))
+
+    def _log(self, memory: Memory, action: str, updated: int, already_applied: bool) -> None:
         logger.info(
             'memory_feedback_recorded',
             organization_id=str(memory.organization_id),
             project_id=str(memory.project_id),
             memory_id=str(memory.id),
-            action=data.action,
+            action=action,
             already_applied=already_applied,
             retrieval_documents_updated=updated,
         )
@@ -704,230 +709,65 @@ def redact_error(message: str) -> str:
 
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> PromoteMemoryCandidateResult:
-        candidate_contract_version = (
-            MemoryCandidate.objects.filter(id=data.candidate_id)
-            .values_list('decision_work_contract_version', flat=True)
-            .first()
+        from engram.memory.candidate_decision_work import evidence_manifest
+        from engram.memory.transitions import (
+            CandidateFence,
+            TransitionRequest,
+            TransitionScope,
         )
-        if candidate_contract_version == 1:
-            from engram.memory.candidate_decision_work import evidence_manifest
-            from engram.memory.transitions import (
-                CandidateFence,
-                TransitionRequest,
-                TransitionScope,
-            )
-            from engram.memory.transitions import (
-                PromoteMemoryCandidate as AtomicPromoteMemoryCandidate,
-            )
-            from engram.memory.transitions import (
-                PromoteMemoryCandidateInput as AtomicPromoteMemoryCandidateInput,
-            )
+        from engram.memory.transitions import (
+            PromoteMemoryCandidate as AtomicPromoteMemoryCandidate,
+        )
+        from engram.memory.transitions import (
+            PromoteMemoryCandidateInput as AtomicPromoteMemoryCandidateInput,
+        )
 
+        try:
             candidate = MemoryCandidate.objects.get(id=data.candidate_id)
-            _entries, manifest_hash = evidence_manifest(candidate)
-            atomic_result = AtomicPromoteMemoryCandidate().execute(
-                AtomicPromoteMemoryCandidateInput(
-                    request=TransitionRequest(
-                        scope=TransitionScope(
-                            organization_id=candidate.organization_id,
-                            project_id=candidate.project_id,
-                            team_id=candidate.team_id,
-                        ),
-                        idempotency_key=f'candidate:{candidate.id}:settle:v1',
-                        actor_type=data.actor_type,
-                        actor_id=data.actor_id,
-                        capability=data.capability,
-                        request_id=data.request_id or f'legacy-promotion:{candidate.id}',
-                        correlation_id=data.correlation_id or f'legacy-promotion:{candidate.id}',
-                        reason=data.reason,
-                        origin=data.origin,
+        except MemoryCandidate.DoesNotExist as error:
+            raise MemoryWorkerError('memory candidate not found') from error
+        if candidate.decision_work_contract_version != 1:
+            raise MemoryWorkerError(
+                'legacy v0 memory candidate promotion is disabled; '
+                'typed promotion requires decision work contract version 1',
+                code='legacy_candidate_contract',
+            )
+
+        _entries, manifest_hash = evidence_manifest(candidate)
+        atomic_result = AtomicPromoteMemoryCandidate().execute(
+            AtomicPromoteMemoryCandidateInput(
+                request=TransitionRequest(
+                    scope=TransitionScope(
+                        organization_id=candidate.organization_id,
+                        project_id=candidate.project_id,
+                        team_id=candidate.team_id,
                     ),
-                    candidate_fence=CandidateFence(
-                        candidate_id=candidate.id,
-                        candidate_content_hash=candidate.content_hash,
-                        evidence_manifest_hash=manifest_hash,
-                    ),
-                    work_claim=data.work_claim,
+                    idempotency_key=f'candidate:{candidate.id}:settle:v1',
+                    actor_type=data.actor_type,
+                    actor_id=data.actor_id,
+                    capability=data.capability,
+                    request_id=data.request_id or f'typed-promotion:{candidate.id}',
+                    correlation_id=data.correlation_id or f'typed-promotion:{candidate.id}',
+                    reason=data.reason,
+                    origin=data.origin,
                 ),
-            )
-            candidate.refresh_from_db()
-            return PromoteMemoryCandidateResult(
-                candidate=candidate,
-                memory=atomic_result.memory,
-                memory_version=atomic_result.memory_version,
-                retrieval_document=atomic_result.retrieval_document,
-                duplicate=atomic_result.duplicate,
-            )
-
-        with transaction.atomic():
-            candidate = self._lock_candidate(data.candidate_id)
-            if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
-                memory, version, needs_index, duplicate = self._replay_state(candidate)
-            elif candidate.status != CandidateStatus.PROPOSED:
-                raise MemoryWorkerError('Only proposed memory candidates can be promoted')
-            else:
-                memory, version = self._create_memory_and_version(candidate)
-                needs_index, duplicate = True, False
-
-        retrieval_document = self._resolve_retrieval_document(
-            candidate,
-            version,
-            needs_index,
-            data.defer_embedding,
+                candidate_fence=CandidateFence(
+                    candidate_id=candidate.id,
+                    candidate_content_hash=candidate.content_hash,
+                    evidence_manifest_hash=manifest_hash,
+                ),
+                work_claim=data.work_claim,
+            ),
         )
+        candidate.refresh_from_db()
 
         return PromoteMemoryCandidateResult(
             candidate=candidate,
-            memory=memory,
-            memory_version=version,
-            retrieval_document=retrieval_document,
-            duplicate=duplicate,
+            memory=atomic_result.memory,
+            memory_version=atomic_result.memory_version,
+            retrieval_document=atomic_result.retrieval_document,
+            duplicate=atomic_result.duplicate,
         )
-
-    def _lock_candidate(self, candidate_id: uuid.UUID) -> MemoryCandidate:
-        try:
-            return MemoryCandidate.objects.select_for_update().get(id=candidate_id)
-        except MemoryCandidate.DoesNotExist as error:
-            raise MemoryWorkerError('memory candidate not found') from error
-
-    def _replay_state(self, candidate: MemoryCandidate) -> tuple[Memory, MemoryVersion, bool, bool]:
-        memory = candidate.promoted_memory
-        version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
-        needs_index = not (memory.stale or memory.refuted)
-
-        return memory, version, needs_index, True
-
-    def _create_memory_and_version(self, candidate: MemoryCandidate) -> tuple[Memory, MemoryVersion]:
-        memory = Memory.objects.create(
-            organization=candidate.organization,
-            project=candidate.project,
-            team=candidate.team,
-            title=candidate.title,
-            body=candidate.body,
-            status=MemoryStatus.APPROVED,
-            visibility_scope=candidate.visibility_scope,
-            confidence=candidate.confidence,
-            metadata=self._memory_metadata(candidate),
-        )
-        version = MemoryVersion.objects.create(
-            organization=candidate.organization,
-            project=candidate.project,
-            memory=memory,
-            source_observation=candidate.source_observation,
-            version=1,
-            body=candidate.body,
-            content_hash=candidate.content_hash,
-        )
-        candidate.status = CandidateStatus.PROMOTED
-        candidate.promoted_memory = memory
-        candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
-        clear_candidate_conflict_links(candidate)
-
-        return memory, version
-
-    def _resolve_retrieval_document(
-        self,
-        candidate: MemoryCandidate,
-        version: MemoryVersion,
-        needs_index: bool,
-        defer_embedding: bool = False,
-    ) -> RetrievalDocument:
-        if needs_index:
-            return self._index_memory_version(candidate, version, defer_embedding)
-
-        return self._existing_retrieval_document(version)
-
-    def _existing_retrieval_document(self, version: MemoryVersion) -> RetrievalDocument:
-        document = RetrievalDocument.objects.filter(memory_version=version).first()
-        if document is None:
-            raise MemoryWorkerError(
-                'memory version has no retrieval document and cannot be reindexed while stale or refuted',
-            )
-
-        return document
-
-    def _index_memory_version(
-        self,
-        candidate: MemoryCandidate,
-        version: MemoryVersion,
-        defer_embedding: bool = False,
-    ) -> RetrievalDocument:
-        index_result = IndexMemoryVersion().execute(
-            IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=defer_embedding),
-        )
-        document = index_result.retrieval_document
-        file_paths = self._candidate_file_paths(candidate)
-        if document.file_paths == file_paths:
-            return document
-
-        document.file_paths = file_paths
-        document.save(update_fields=['file_paths', 'updated_at'])
-
-        return document
-
-    def _memory_metadata(self, candidate: MemoryCandidate) -> dict[str, object]:
-        metadata: dict[str, object] = {
-            'source': 'memory_candidate',
-            'memory_candidate_id': str(candidate.id),
-            'evidence': candidate.evidence,
-            'file_paths': self._candidate_file_paths(candidate),
-        }
-        metadata.update(self._provider_provenance(candidate))
-        captured_by = self._captured_by(candidate)
-        if captured_by is not None:
-            metadata['captured_by'] = captured_by
-        if candidate.kind:
-            metadata['kind'] = candidate.kind
-
-        return metadata
-
-    def _captured_by(self, candidate: MemoryCandidate) -> dict[str, object] | None:
-        observation = candidate.source_observation
-        if observation is None:
-            return None
-
-        agent = observation.agent
-        if agent is None:
-            return None
-
-        return {
-            'agent_runtime': agent.runtime,
-            'agent_external_id': redact_text(agent.external_id),
-        }
-
-    def _provider_provenance(self, candidate: MemoryCandidate) -> dict[str, object]:
-        if not candidate.evidence:
-            return {}
-        evidence = candidate.evidence[0]
-        if not isinstance(evidence, dict) or 'provider_call_id' not in evidence:
-            return {}
-
-        return {
-            key: evidence[key]
-            for key in (
-                'provider_call_id',
-                'provider',
-                'model',
-                'policy_id',
-                'policy_version',
-                'task_type',
-                'redaction_state',
-            )
-            if key in evidence
-        }
-
-    def _candidate_file_paths(self, candidate: MemoryCandidate) -> list[str]:
-        observation = candidate.source_observation
-        if observation is None:
-            return []
-
-        return [
-            redact_text(file_path)
-            for file_path in [
-                *observation.files_read,
-                *observation.files_modified,
-            ]
-        ]
 
 
 @dataclass(frozen=True)
@@ -974,12 +814,6 @@ class MemoryVersionError(DomainError):
         self.code = code
 
 
-def memory_body_content_hash(memory: Memory, next_version: int, body: str) -> str:
-    source = f'{memory.id}:{next_version}:{body}'
-
-    return hashlib.sha256(source.encode()).hexdigest()
-
-
 def lock_memory_for_update(
     scope: EffectiveScope,
     project_id: uuid.UUID,
@@ -1012,6 +846,15 @@ def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
 
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
+        from engram.memory.transitions import (
+            MemoryTransitionError,
+            ReviseMemory,
+            ReviseMemoryInput,
+            TransitionRequest,
+            TransitionScope,
+            build_memory_fence,
+        )
+
         scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryVersionError)
@@ -1021,74 +864,52 @@ class UpdateMemoryBody:
 
             latest_version = memory.versions.order_by('-version').first()
             if latest_version is not None and latest_version.body == data.body:
-                retrieval_document = self._index_version(latest_version)
+                retrieval_document = RetrievalDocument.objects.filter(memory_version=latest_version).first()
+                if retrieval_document is None:
+                    raise MemoryVersionError(
+                        'projection_missing',
+                        'Memory version has no exact retrieval document',
+                    )
 
                 return UpdateMemoryBodyResult(
                     memory=memory,
                     memory_version=latest_version,
                     retrieval_document=retrieval_document,
                 )
-            version = self._create_version(memory, data)
-            memory.body = data.body
-            memory.current_version = version.version
-            memory.save(update_fields=['body', 'current_version', 'updated_at'])
-            retrieval_document = self._index_version(version)
-            self._audit(memory, version, scope, data)
 
+            try:
+                result = ReviseMemory().execute(
+                    ReviseMemoryInput(
+                        request=TransitionRequest(
+                            scope=TransitionScope(
+                                organization_id=memory.organization_id,
+                                project_id=memory.project_id,
+                                team_id=memory.team_id,
+                            ),
+                            idempotency_key=f'memory-version:{memory.id}:{data.request_id}:v1',
+                            actor_type=scope.actor_type,
+                            actor_id=scope.actor_id,
+                            capability='memories:review',
+                            request_id=data.request_id,
+                            correlation_id=data.correlation_id,
+                            reason=data.reason,
+                            origin='memory-version',
+                        ),
+                        memory_fence=build_memory_fence(memory),
+                        title=memory.title,
+                        body=data.body,
+                    ),
+                )
+            except MemoryTransitionError as error:
+                raise MemoryVersionError(error.code, str(error)) from error
+
+        memory = result.memory
         memory.refresh_from_db()
 
         return UpdateMemoryBodyResult(
             memory=memory,
-            memory_version=version,
-            retrieval_document=retrieval_document,
-        )
-
-    def _create_version(self, memory: Memory, data: UpdateMemoryBodyInput) -> MemoryVersion:
-        next_version = memory.current_version + 1
-
-        return MemoryVersion.objects.create(
-            organization=memory.organization,
-            project=memory.project,
-            memory=memory,
-            version=next_version,
-            body=data.body,
-            content_hash=memory_body_content_hash(memory, next_version, data.body),
-        )
-
-    def _index_version(self, version: MemoryVersion) -> RetrievalDocument:
-        result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
-
-        return result.retrieval_document
-
-    def _audit(
-        self,
-        memory: Memory,
-        version: MemoryVersion,
-        scope: EffectiveScope,
-        data: UpdateMemoryBodyInput,
-    ) -> None:
-        AuditEvent.objects.create(
-            organization=memory.organization,
-            project=memory.project,
-            team=memory.team,
-            event_type='MemoryVersionCreated',
-            actor_type=scope.actor_type,
-            actor_id=scope.actor_id,
-            target_type='memory',
-            target_id=str(memory.id),
-            capability='memories:review',
-            result=AuditResult.ALLOWED,
-            request_id=data.request_id,
-            correlation_id=data.correlation_id,
-            metadata={
-                'version': version.version,
-                'reason': redact_text(data.reason),
-                'scope_filters': {
-                    'organization_id': str(scope.organization_id),
-                    'project_ids': [str(project_id) for project_id in scope.project_ids],
-                    'team_ids': [str(team_id) for team_id in scope.team_ids],
-                },
-            },
+            memory_version=result.memory_version,
+            retrieval_document=result.retrieval_document,
         )
 
 
@@ -1446,6 +1267,33 @@ def digest_content_hash(project_id: uuid.UUID, memory_ids: tuple[uuid.UUID, ...]
     return hashlib.sha256(material.encode()).hexdigest()
 
 
+def _frozen_digest_source_fences(
+    sources: tuple[Memory, ...],
+    *,
+    team_id: uuid.UUID | None,
+) -> tuple[MemoryFence, ...]:
+    from engram.memory.transitions import build_memory_fence
+
+    legacy_ids = [
+        str(source.id)
+        for source in sources
+        if source.transition_contract_version != 1 or source.current_transition_id is None
+    ]
+    if legacy_ids:
+        raise MemoryWorkerError(
+            f'digest sources are not owned by the v1 transition contract: {", ".join(sorted(legacy_ids))}',
+            code='legacy_source_contract',
+        )
+    foreign_team_ids = [str(source.id) for source in sources if source.team_id != team_id]
+    if foreign_team_ids:
+        raise MemoryWorkerError(
+            f'digest sources are outside the exact team scope: {", ".join(sorted(foreign_team_ids))}',
+            code='work_scope_invalid',
+        )
+
+    return tuple(build_memory_fence(source) for source in sorted(sources, key=lambda item: str(item.id)))
+
+
 def render_frozen_daily_digest_provider_result(
     *,
     project: Project,
@@ -1488,6 +1336,14 @@ def render_frozen_daily_digest_provider_result(
 
 class GenerateDigest:
     def execute(self, data: DigestInput) -> DigestResult:
+        from engram.memory.transitions import (
+            MemoryTransitionError,
+            PublishDigestMemory,
+            PublishDigestMemoryInput,
+            TransitionRequest,
+            TransitionScope,
+        )
+
         project = Project.objects.get(id=data.project_id)
         base_sources = Memory.objects.filter(
             id__in=data.memory_ids,
@@ -1506,6 +1362,7 @@ class GenerateDigest:
         existing = self._find_existing(project, content_hash)
         if existing is not None:
             return existing
+        source_fences = _frozen_digest_source_fences(sources, team_id=None)
         if total_sources > len(sources):
             self._audit_sources_truncated(
                 project,
@@ -1542,62 +1399,50 @@ class GenerateDigest:
                 f'digest provider unavailable: {error}',
                 retryable=getattr(error, 'retryable', False),
             ) from error
-        with transaction.atomic():
-            memory = Memory.objects.create(
-                organization=project.organization,
-                project=project,
-                title=f'Digest {provider_result.generated_title}',
-                body=provider_result.generated_body,
-                status=MemoryStatus.APPROVED,
-                visibility_scope=VisibilityScope.PROJECT,
-                metadata={
-                    'kind': 'digest',
-                    'digest_kind': 'daily_structured',
-                    'source_memory_ids': [str(source.id) for source in sources],
-                    'content_hash': content_hash,
-                    'provider_call_id': str(provider_result.call_record_id),
-                    'provider': provider_result.provider,
-                    'model': provider_result.model,
-                },
+        try:
+            transition_result = PublishDigestMemory().execute(
+                PublishDigestMemoryInput(
+                    request=TransitionRequest(
+                        scope=TransitionScope(
+                            organization_id=project.organization_id,
+                            project_id=project.id,
+                            team_id=None,
+                        ),
+                        idempotency_key=f'daily-digest:{project.id}:{content_hash}:publish:v1',
+                        actor_type='api_key',
+                        actor_id='digest-generator',
+                        capability='memories:review',
+                        request_id=data.request_id,
+                        correlation_id=data.correlation_id,
+                        reason='publish daily structured digest',
+                        origin='memory-services-daily-digest',
+                    ),
+                    source_memory_fences=source_fences,
+                    title=f'Digest {provider_result.generated_title}',
+                    body=provider_result.generated_body,
+                    metadata={
+                        'kind': 'digest',
+                        'digest_kind': 'daily_structured',
+                        'source_memory_ids': [str(source.id) for source in sources],
+                        'content_hash': content_hash,
+                        'provider_call_id': str(provider_result.call_record_id),
+                        'provider': provider_result.provider,
+                        'model': provider_result.model,
+                    },
+                    visibility_scope=VisibilityScope.PROJECT,
+                ),
             )
-            version = MemoryVersion.objects.create(
-                organization=memory.organization,
-                project=memory.project,
-                memory=memory,
-                version=1,
-                body=memory.body,
-                content_hash=content_hash,
-                source_metadata={'kind': 'digest'},
-            )
-            retrieval_document = (
-                IndexMemoryVersion()
-                .execute(
-                    IndexMemoryVersionInput(memory_version_id=version.id),
-                )
-                .retrieval_document
-            )
-            AuditEvent.objects.create(
-                organization=memory.organization,
-                project=memory.project,
-                event_type='DigestGenerated',
-                actor_type='api_key',
-                target_type='memory',
-                target_id=str(memory.id),
-                capability='memories:review',
-                result=AuditResult.RECORDED,
-                request_id=data.request_id,
-                correlation_id=data.correlation_id,
-                metadata={
-                    'source_memory_ids': [str(source.id) for source in sources],
-                    'provider_call_id': str(provider_result.call_record_id),
-                    'memory_version_id': str(version.id),
-                },
-            )
+        except MemoryTransitionError as error:
+            raise MemoryWorkerError(
+                f'digest publication failed: {error}',
+                retryable=error.retryable,
+                code=error.code,
+            ) from error
 
         return DigestResult(
-            memory=memory,
-            memory_version=version,
-            retrieval_document=retrieval_document,
+            memory=transition_result.memory,
+            memory_version=transition_result.memory_version,
+            retrieval_document=transition_result.retrieval_document,
             provider_call_id=provider_result.call_record_id,
         )
 
@@ -1841,6 +1686,14 @@ def render_weekly_digest_body(
 
 class BuildWeeklyStructuredDigest:
     def execute(self, data: WeeklyDigestInput) -> WeeklyDigestResult:
+        from engram.memory.transitions import (
+            MemoryTransitionError,
+            PublishDigestMemory,
+            PublishDigestMemoryInput,
+            TransitionRequest,
+            TransitionScope,
+        )
+
         project, window_start, window_end, content_hash = self._resolve_window(data)
 
         existing = self._find_existing(project, content_hash)
@@ -1849,63 +1702,71 @@ class BuildWeeklyStructuredDigest:
             return existing
 
         memory_changes, counts = self._build_buckets(project, window_start, window_end, data.team_id)
-
-        with transaction.atomic():
-            digest_memory = Memory.objects.create(
+        source_ids = {uuid.UUID(str(item['id'])) for items in memory_changes.values() for item in items}
+        if not source_ids:
+            raise MemoryWorkerError(
+                'weekly digest publication requires transition-owned source memories',
+                code='provenance',
+            )
+        source_memories = tuple(
+            Memory.objects.filter(
                 organization=project.organization,
                 project=project,
-                title=f'Weekly Structured Digest {window_start.date()} to {window_end.date()}',
-                body=render_weekly_digest_body(memory_changes, window_end, data.window_days),
-                status=MemoryStatus.APPROVED,
-                visibility_scope=VisibilityScope.PROJECT,
-                metadata={
-                    'kind': 'digest',
-                    'digest_kind': 'weekly_structured',
-                    'window_start': window_start.isoformat(),
-                    'window_end': window_end.isoformat(),
-                    'window_days': data.window_days,
-                    'memory_changes': memory_changes,
-                    'counts': counts,
-                    'content_hash': content_hash,
-                    'ready': False,
-                    'reviewed_at': None,
-                },
+                id__in=source_ids,
             )
-
-            version = MemoryVersion.objects.create(
-                organization=digest_memory.organization,
-                project=digest_memory.project,
-                memory=digest_memory,
-                version=1,
-                body=digest_memory.body,
-                content_hash=content_hash,
-                source_metadata={'kind': 'digest'},
+        )
+        if len(source_memories) != len(source_ids):
+            raise MemoryWorkerError('weekly digest source memory is outside project scope', code='work_scope_invalid')
+        source_fences = _frozen_digest_source_fences(source_memories, team_id=data.team_id)
+        visibility_scope = VisibilityScope.TEAM if data.team_id else VisibilityScope.PROJECT
+        title = f'Weekly Structured Digest {window_start.date()} to {window_end.date()}'
+        body = render_weekly_digest_body(memory_changes, window_end, data.window_days)
+        metadata = {
+            'kind': 'digest',
+            'digest_kind': 'weekly_structured',
+            'window_start': window_start.isoformat(),
+            'window_end': window_end.isoformat(),
+            'window_days': data.window_days,
+            'memory_changes': memory_changes,
+            'counts': counts,
+            'content_hash': content_hash,
+            'ready': False,
+            'reviewed_at': None,
+        }
+        try:
+            transition_result = PublishDigestMemory().execute(
+                PublishDigestMemoryInput(
+                    request=TransitionRequest(
+                        scope=TransitionScope(
+                            organization_id=project.organization_id,
+                            project_id=project.id,
+                            team_id=data.team_id,
+                        ),
+                        idempotency_key=f'weekly-digest:{project.id}:{content_hash}:publish:v1',
+                        actor_type='system',
+                        actor_id='weekly-digest-builder',
+                        capability='memories:review',
+                        request_id=data.request_id,
+                        correlation_id=data.correlation_id,
+                        reason='publish weekly structured digest',
+                        origin='memory-services-weekly-digest',
+                    ),
+                    source_memory_fences=source_fences,
+                    title=title,
+                    body=body,
+                    metadata=metadata,
+                    visibility_scope=visibility_scope,
+                ),
             )
-
-            IndexMemoryVersion().execute(
-                IndexMemoryVersionInput(memory_version_id=version.id),
-            )
-
-            AuditEvent.objects.create(
-                organization=digest_memory.organization,
-                project=digest_memory.project,
-                event_type='DigestGenerated',
-                actor_type='system',
-                target_type='memory',
-                target_id=str(digest_memory.id),
-                capability='memories:review',
-                result=AuditResult.RECORDED,
-                request_id=data.request_id,
-                correlation_id=data.correlation_id,
-                metadata={
-                    'digest_kind': 'weekly_structured',
-                    'memory_version_id': str(version.id),
-                    'counts': counts,
-                },
-            )
+        except MemoryTransitionError as error:
+            raise MemoryWorkerError(
+                f'weekly digest publication failed: {error}',
+                retryable=error.retryable,
+                code=error.code,
+            ) from error
 
         return WeeklyDigestResult(
-            digest_memory=digest_memory,
+            digest_memory=transition_result.memory,
             counts=counts,
             memory_changes=memory_changes,
             ready=False,

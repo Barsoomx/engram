@@ -208,6 +208,7 @@ def _transition_matches_projection(
     document: RetrievalDocument,
     version: MemoryVersion,
     work: WorkflowWork,
+    expected_hash: str,
 ) -> bool:
     affected_projection = all(
         (
@@ -223,10 +224,28 @@ def _transition_matches_projection(
             transition.result_exact_document_id == document.id,
         )
     )
-    work_matches = (result_projection and transition.embedding_work_id == work.id) or (
-        affected_projection
-        and transition.memory_id != transition.result_memory_id
-        and transition.embedding_work_id != work.id
+    snapshot = work.input_snapshot if isinstance(work.input_snapshot, dict) else {}
+    current_hash_work = all(
+        (
+            work.organization_id == document.organization_id,
+            work.project_id == document.project_id,
+            work.team_id == document.team_id,
+            work.work_type == WorkflowWorkType.MEMORY_EMBEDDING,
+            work.subject_type == WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+            work.subject_id == document.id,
+            snapshot.get('retrieval_document_id') == str(document.id),
+            snapshot.get('memory_id') == str(document.memory_id),
+            snapshot.get('memory_version_id') == str(version.id),
+            snapshot.get('exact_projection_hash') == expected_hash,
+        )
+    )
+    audit_metadata = transition.audit_event.metadata if isinstance(transition.audit_event.metadata, dict) else {}
+    affected_work_id = audit_metadata.get('affected_embedding_work_id')
+    result_work_matches = transition.embedding_work_id == work.id or work.created_at >= transition.created_at
+    affected_work_matches = affected_work_id == str(work.id) or work.created_at >= transition.created_at
+    work_matches = current_hash_work and (
+        (result_projection and result_work_matches)
+        or (affected_projection and transition.memory_id != transition.result_memory_id and affected_work_matches)
     )
     return all(
         (
@@ -260,7 +279,13 @@ def _projection_is_current(
     if transition_id is None:
         return False
     transition = _load_current_transition(memory, transition_id)
-    if transition is None or not _transition_matches_projection(transition, document, version, work):
+    if transition is None or not _transition_matches_projection(
+        transition,
+        document,
+        version,
+        work,
+        expected_hash,
+    ):
         return False
     if not _memory_version_matches_projection(memory, version):
         return False

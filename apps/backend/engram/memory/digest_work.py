@@ -9,7 +9,6 @@ from uuid import UUID
 from django.db import transaction
 from django.db.models import Q, QuerySet
 
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     LinkType,
     Memory,
@@ -682,43 +681,58 @@ def _publish(
         metadata['provider'] = provider_result.provider
         metadata['model'] = provider_result.model
 
-    memory = Memory.objects.create(
+    from engram.memory.transitions import (
+        PublishDigestMemory,
+        PublishDigestMemoryInput,
+        TransitionRequest,
+        TransitionScope,
+        build_memory_fence,
+    )
+
+    source_ids = {UUID(str(ref['memory_id'])) for ref in refs}
+    source_memories = Memory.objects.filter(
+        id__in=source_ids,
         organization_id=work.organization_id,
         project_id=work.project_id,
-        team=team,
-        title=title,
-        body=body,
-        status=MemoryStatus.APPROVED,
-        visibility_scope=visibility,
-        metadata=metadata,
     )
-    version = MemoryVersion.objects.create(
-        organization_id=work.organization_id,
-        project_id=work.project_id,
-        memory=memory,
-        version=1,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-        source_metadata={'kind': 'digest'},
+    fences = tuple(build_memory_fence(memory) for memory in sorted(source_memories, key=lambda item: str(item.id)))
+    if len(fences) != len(source_ids):
+        raise MemoryWorkerError('digest source memory is missing from the frozen scope', code='work_scope_invalid')
+
+    request_id = f'digest-work:{work.id}:publish'
+    result = PublishDigestMemory().execute(
+        PublishDigestMemoryInput(
+            request=TransitionRequest(
+                scope=TransitionScope(
+                    organization_id=work.organization_id,
+                    project_id=work.project_id,
+                    team_id=work.team_id,
+                ),
+                idempotency_key=f'digest-work:{work.id}:publish:v1',
+                actor_type='system',
+                actor_id='digest-work',
+                capability='memories:write',
+                request_id=request_id,
+                correlation_id=f'digest-work:{work.id}',
+                reason='publish digest memory',
+                origin='digest-work',
+            ),
+            source_memory_fences=fences,
+            title=title,
+            body=body,
+            metadata=metadata,
+            visibility_scope=visibility,
+            work_claim=claim,
+        ),
     )
-    IndexMemoryVersion().execute(
-        IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=True),
-    )
-    if claim is not None:
-        finish_work_claim(
-            claim=claim,
-            now=datetime.now(UTC),
-            completion='product_succeeded',
-            result_memory_id=memory.id,
-        )
-    else:
+    if claim is None:
         resolve_work_succeeded(
             work.id,
             organization_id=work.organization_id,
             project_id=work.project_id,
         )
 
-    return memory.id
+    return result.memory.id
 
 
 def _finish_reused_claim(claim: WorkClaim | None, memory_id: UUID | None) -> None:

@@ -9,7 +9,6 @@ from decimal import Decimal
 import structlog
 from django.conf import settings
 from django.db import transaction
-from django.utils import timezone
 
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents, cosine_similarity
@@ -17,18 +16,16 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
-    LinkType,
     Memory,
     MemoryCandidate,
     MemoryConflict,
-    MemoryLink,
     MemoryVersion,
     Organization,
     OrganizationSettings,
     RetrievalDocument,
 )
 from engram.memory.candidate_parsing import strip_json_fence
-from engram.memory.conflict_links import clear_candidate_conflict_links, conflict_candidate_target
+from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.memory.escalation import escalation_reason
 from engram.memory.services import (
     MemoryWorkerError,
@@ -385,39 +382,42 @@ def supersede_memory_system(
     judge_context: dict[str, object] | None = None,
     request_id: str = '',
     correlation_id: str = '',
-) -> MemoryLink | None:
-    loser = Memory.objects.select_for_update().get(id=loser.id)
-    if loser.stale:
-        return None
+) -> object | None:
+    if candidate.decision_work_contract_version != 1:
+        raise MemoryWorkerError('legacy supersede path is disabled; transition contract v1 is required')
 
-    loser.stale = True
-    loser.save(update_fields=['stale', 'updated_at'])
-    RetrievalDocument.objects.filter(memory=loser).update(stale=True, updated_at=timezone.now())
-    link, _created = MemoryLink.objects.get_or_create(
-        memory=loser,
-        link_type=LinkType.SUPERSEDED_BY,
-        target=str(winner.id),
-        defaults={
-            'organization': loser.organization,
-            'project': loser.project,
-            'label': '',
-        },
-    )
-    _audit_curator_action(
-        candidate=candidate,
-        event_type='MemorySuperseded',
-        decision='superseded',
-        near_dup_score=score,
-        threshold=threshold,
-        judge_context=judge_context,
-        target_type='memory',
-        target_id=str(loser.id),
-        request_id=request_id,
-        correlation_id=correlation_id,
-        extra={'winner_memory_id': str(winner.id), 'loser_memory_id': str(loser.id)},
+    from engram.memory.transitions import (
+        SupersedeMemories,
+        SupersedeMemoriesInput,
+        TransitionRequest,
+        TransitionScope,
+        build_memory_fence,
     )
 
-    return link
+    idempotency_key = f'request:curator:{candidate.id}:supersede:{loser.id}:v1'
+    result = SupersedeMemories().execute(
+        SupersedeMemoriesInput(
+            request=TransitionRequest(
+                scope=TransitionScope(
+                    organization_id=candidate.organization_id,
+                    project_id=candidate.project_id,
+                    team_id=candidate.team_id,
+                ),
+                idempotency_key=idempotency_key,
+                actor_type='system',
+                actor_id='curator',
+                capability='memories:review',
+                request_id=request_id or idempotency_key,
+                correlation_id=correlation_id,
+                reason='curator:supersede',
+                origin='curator',
+            ),
+            source_memory_fence=build_memory_fence(loser),
+            result_memory_fence=build_memory_fence(winner),
+        ),
+    )
+
+    return result.transition.semantic_link
 
 
 class CurateMemoryCandidate:
@@ -831,16 +831,6 @@ class CurateMemoryCandidate:
                     and entry.get('memory_id') == str(existing_memory.id)
                     for entry in locked.evidence
                 )
-                MemoryLink.objects.get_or_create(
-                    memory=existing_memory,
-                    link_type=LinkType.CONFLICTS_WITH,
-                    target=conflict_candidate_target(locked.id),
-                    defaults={
-                        'organization': existing_memory.organization,
-                        'project': existing_memory.project,
-                        'label': 'contradiction claim',
-                    },
-                )
                 if not has_conflict_entry:
                     locked.evidence = [
                         *locked.evidence,
@@ -909,39 +899,7 @@ class CurateMemoryCandidate:
                 near_dup_score=score,
             )
 
-        promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
-        if promotion.duplicate or loser.id == promotion.memory.id:
-            return CurateMemoryCandidateResult(
-                decision='promoted',
-                candidate=promotion.candidate,
-                memory=promotion.memory,
-                memory_version=promotion.memory_version,
-                retrieval_document=promotion.retrieval_document,
-                duplicate=True,
-            )
-
-        with transaction.atomic():
-            supersede_memory_system(
-                loser,
-                promotion.memory,
-                promotion.candidate,
-                score=score,
-                threshold=threshold,
-                judge_context=judge_context,
-                request_id=f'curator:{candidate.id}',
-                correlation_id=data.correlation_id,
-            )
-
-        return CurateMemoryCandidateResult(
-            decision='superseded',
-            candidate=promotion.candidate,
-            memory=promotion.memory,
-            memory_version=promotion.memory_version,
-            retrieval_document=promotion.retrieval_document,
-            superseded_memory=loser,
-            duplicate=True,
-            near_dup_score=score,
-        )
+        raise MemoryWorkerError('legacy supersede path is disabled; transition contract v1 is required')
 
     def _authorized_documents(self, candidate: MemoryCandidate) -> tuple[RetrievalDocument, ...]:
         scope = EffectiveScope(

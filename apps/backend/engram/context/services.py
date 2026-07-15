@@ -31,7 +31,9 @@ from engram.core.models import (
     ContextBundleStatus,
     Memory,
     MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     OrganizationSettings,
     Project,
@@ -45,6 +47,7 @@ from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
 from engram.memory.digest_visibility import unproven_digest_memory_ids
 from engram.memory.observation_work import lock_session_for_observation, session_has_observation_history
+from engram.memory.projections import create_embedding_work_and_signal, write_exact_memory_projection
 from engram.model_policy.services import (
     EmbeddingCallInput,
     EmbeddingCallResult,
@@ -858,90 +861,35 @@ class IndexMemoryVersion:
         if memory.status != MemoryStatus.APPROVED or memory.stale or memory.refuted:
             raise ContextIndexError('Only approved memory can be indexed')
 
-        observation = version.source_observation
-        metadata = memory.metadata if isinstance(memory.metadata, dict) else {}
-        file_paths = unique_text_values(
-            metadata.get('file_paths', []),
-            observation.files_read if observation is not None else [],
-            observation.files_modified if observation is not None else [],
-        )
-        symbols, exact_terms = derive_retrieval_terms(metadata, memory.title, version.body)
-        full_text = f'{memory.title}\n\n{version.body}'.strip()
-
-        retrieval_document, created = RetrievalDocument.objects.update_or_create(
-            memory_version=version,
-            defaults={
-                'organization': memory.organization,
-                'project': memory.project,
-                'team': memory.team,
-                'memory': memory,
-                'visibility_scope': memory.visibility_scope,
-                'source_observation_ids': [str(observation.id)] if observation is not None else [],
-                'file_paths': file_paths,
-                'symbols': symbols,
-                'exact_terms': exact_terms,
-                'full_text': full_text,
-                'embedding_reference': '',
-                'stale': memory.stale,
-                'refuted': memory.refuted,
-                'metadata': {},
-            },
-        )
-        RetrievalDocument.objects.filter(memory=memory).exclude(memory_version=version).update(
-            stale=True,
-            updated_at=timezone.now(),
-        )
-        if not data.defer_embedding:
-            self._embed_document(retrieval_document, memory, version)
-
-        return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=created)
-
-    def _embed_document(
-        self,
-        document: RetrievalDocument,
-        memory: Memory,
-        version: MemoryVersion,
-    ) -> None:
-        try:
-            resolved = ResolveModelPolicy().execute(
-                ResolveModelPolicyInput(
-                    organization_id=memory.organization_id,
-                    project_id=memory.project_id,
-                    team_id=memory.team_id,
-                    task_type='embedding',
-                ),
+        if memory.transition_contract_version != 1 or memory.current_transition_id is None:
+            raise ContextIndexError('Only transition-owned memory can be indexed')
+        if version.version != memory.current_version:
+            raise ContextIndexError('Only the current memory version can be indexed')
+        transition = (
+            MemoryTransition.objects.filter(
+                id=memory.current_transition_id,
             )
-            result = get_provider_gateway(resolved.policy).embed(
-                EmbeddingCallInput(
-                    organization_id=memory.organization_id,
-                    project_id=memory.project_id,
-                    team_id=memory.team_id,
-                    policy=resolved.policy,
-                    request_id=f'memory-indexer:{version.id}:embedding',
-                    trace_id=f'memory-indexer:{version.id}',
-                    text=document.full_text,
-                ),
+            .filter(
+                Q(memory_id=memory.id) | Q(result_memory_id=memory.id),
             )
-        except ModelPolicyError:
-            return
-        except ProviderSecretError as error:
-            logger.warning(
-                'context_embedding_skipped',
-                organization_id=str(memory.organization_id),
-                project_id=str(memory.project_id),
-                memory_version_id=str(version.id),
-                error=str(error),
+            .first()
+        )
+        if transition is None or version.id not in (transition.to_version_id, transition.result_version_id):
+            raise ContextIndexError('Memory version has no owning transition projection')
+
+        sources = tuple(MemoryVersionSource.objects.filter(memory_version_id=version.id).order_by('id'))
+        with transaction.atomic():
+            existing = RetrievalDocument.objects.filter(memory_version_id=version.id).exists()
+            retrieval_document = write_exact_memory_projection(
+                memory=memory,
+                version=version,
+                transition_id=memory.current_transition_id,
+                sources=sources,
             )
+            if not data.defer_embedding:
+                create_embedding_work_and_signal(document=retrieval_document)
 
-            return
-
-        document.embedding_vector = list(result.embedding)
-        document.embedding_reference = f'provider:{result.call_record_id}'
-        update_fields = ['embedding_vector', 'embedding_reference', 'updated_at']
-        if VectorField is not None:
-            document.embedding_pgvector = list(result.embedding)
-            update_fields.append('embedding_pgvector')
-        document.save(update_fields=update_fields)
+        return IndexMemoryVersionResult(retrieval_document=retrieval_document, created=not existing)
 
 
 @dataclass(frozen=True)
@@ -960,62 +908,27 @@ class ReembedMissingEmbeddings:
             RetrievalDocument.objects.select_related('memory')
             .filter(
                 embedding_pgvector__isnull=True,
-                projection_contract_version=0,
+                projection_contract_version=1,
                 stale=False,
                 refuted=False,
+                memory__transition_contract_version=1,
+                memory__current_transition_id__isnull=False,
             )
             .order_by('updated_at')[: max(1, batch_size)],
         )
         embedded = 0
         failed = 0
         for document in documents:
-            if self._embed(document):
+            try:
+                _work, created = create_embedding_work_and_signal(document=document)
+            except (ContextIndexError, ValueError):
+                created = False
+            if created:
                 embedded += 1
             else:
                 failed += 1
 
         return ReembedResult(scanned=len(documents), embedded=embedded, failed=failed)
-
-    def _embed(self, document: RetrievalDocument) -> bool:
-        memory = document.memory
-        attempt_id = uuid.uuid4()
-        try:
-            resolved = ResolveModelPolicy().execute(
-                ResolveModelPolicyInput(
-                    organization_id=memory.organization_id,
-                    project_id=memory.project_id,
-                    team_id=memory.team_id,
-                    task_type='embedding',
-                ),
-            )
-            result = get_provider_gateway(resolved.policy).embed(
-                EmbeddingCallInput(
-                    organization_id=memory.organization_id,
-                    project_id=memory.project_id,
-                    team_id=memory.team_id,
-                    policy=resolved.policy,
-                    request_id=f'memory-reembed:{document.id}:{attempt_id}',
-                    trace_id=f'memory-reembed:{document.id}',
-                    text=document.full_text,
-                ),
-            )
-        except (ModelPolicyError, ProviderSecretError) as error:
-            logger.warning(
-                'context_reembed_failed',
-                organization_id=str(memory.organization_id),
-                project_id=str(memory.project_id),
-                retrieval_document_id=str(document.id),
-                error=str(error),
-            )
-
-            return False
-
-        document.embedding_vector = list(result.embedding)
-        document.embedding_pgvector = list(result.embedding)
-        document.embedding_reference = f'provider:{result.call_record_id}'
-        document.save(update_fields=['embedding_vector', 'embedding_pgvector', 'embedding_reference', 'updated_at'])
-
-        return True
 
 
 class BuildContextBundle:
