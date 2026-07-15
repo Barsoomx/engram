@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import hashlib
-from decimal import Decimal
 from datetime import timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -19,10 +19,11 @@ from engram.core.models import (
     MemoryVersionSource,
     Organization,
     Project,
+    VisibilityScope,
     WorkflowRun,
     WorkflowWork,
-    VisibilityScope,
 )
+from engram.core.redaction import REDACTED_VALUE, RedactionResult
 from engram.memory.candidate_decision_work import ensure_candidate_decision_work
 from engram.memory.deterministic_gates import (
     DETERMINISTIC_POLICY_VERSION,
@@ -33,13 +34,12 @@ from engram.memory.deterministic_gates import (
     EvaluateDeterministicCandidateGates,
     SanitizedCandidateView,
 )
-from engram.core.redaction import REDACTED_VALUE, RedactionResult
 from engram.memory.escalation import escalation_reason
 from engram.memory.transitions_test_support import provenanced_candidate
 from engram.model_policy.models import ProviderCallRecord
 
 
-def _work_for(candidate: MemoryCandidate):
+def _work_for(candidate: MemoryCandidate) -> WorkflowWork:
     work, _created = ensure_candidate_decision_work(candidate.id)
     return work
 
@@ -209,7 +209,16 @@ def test_team_scope_without_durable_sources_rejects_unsupported_provenance() -> 
     candidate.body = 'Durable claim without source'
     candidate.content_hash = hashlib.sha256(uuid4().bytes).hexdigest()
     candidate.decision_work_contract_version = 1
-    candidate.save(update_fields=['visibility_scope', 'title', 'body', 'content_hash', 'decision_work_contract_version', 'updated_at'])
+    candidate.save(
+        update_fields=[
+            'visibility_scope',
+            'title',
+            'body',
+            'content_hash',
+            'decision_work_contract_version',
+            'updated_at',
+        ]
+    )
     candidate.sources.all().delete()
 
     result = EvaluateDeterministicCandidateGates().execute(_work_for(candidate).id)

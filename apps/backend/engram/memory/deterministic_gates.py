@@ -4,9 +4,9 @@ import hashlib
 import re
 import unicodedata
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
-from typing import Iterable
+from enum import StrEnum
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import DatabaseError
@@ -33,7 +33,6 @@ from engram.memory.candidate_decision_work import (
 )
 from engram.memory.workflow_work import canonical_json_bytes, work_input_fingerprint
 
-
 DETERMINISTIC_POLICY_VERSION = 'deterministic_policy.v1'
 _SNAPSHOT_KEYS = frozenset(
     {
@@ -51,13 +50,13 @@ _LIFECYCLE_TYPES = frozenset({'session_start', 'session_end', 'session_lifecycle
 _WHITESPACE_RE = re.compile(r'\s+')
 
 
-class DeterministicGateDisposition(str, Enum):
+class DeterministicGateDisposition(StrEnum):
     CONTINUE = 'continue'
     TERMINAL = 'terminal'
     RETRY = 'retry'
 
 
-class DeterministicTerminalOutcome(str, Enum):
+class DeterministicTerminalOutcome(StrEnum):
     MERGE_EVIDENCE = 'merge_evidence'
     REJECT_CANDIDATE = 'reject_candidate'
 
@@ -90,7 +89,7 @@ class DeterministicGateResult:
     target_memory_version_id: uuid.UUID | None = None
     requires_transition: bool | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901
         if self.policy_version != DETERMINISTIC_POLICY_VERSION:
             raise ValueError('unsupported deterministic policy version')
         if self.disposition == DeterministicGateDisposition.CONTINUE:
@@ -254,10 +253,13 @@ def _scope_for(candidate: MemoryCandidate, sources: list[MemoryCandidateSource])
     raise CandidateDecisionWorkScopeError('unsupported candidate visibility scope')
 
 
-def _validate_sources(candidate: MemoryCandidate, sources: list[MemoryCandidateSource]) -> None:
+def _validate_sources(candidate: MemoryCandidate, sources: list[MemoryCandidateSource]) -> None:  # noqa: C901
     expected_scope = (candidate.organization_id, candidate.project_id, candidate.team_id)
     for source in sources:
-        if source.candidate_id != candidate.id or (source.organization_id, source.project_id, source.team_id) != expected_scope:
+        if (
+            source.candidate_id != candidate.id
+            or (source.organization_id, source.project_id, source.team_id) != expected_scope
+        ):
             raise CandidateDecisionWorkScopeError('candidate source has foreign scope')
         observation = source.observation
         if (observation.organization_id, observation.project_id, observation.team_id) != expected_scope:
@@ -346,7 +348,7 @@ def _active_versions(candidate: MemoryCandidate, scope: EffectiveCandidateScope)
 
 
 class EvaluateDeterministicCandidateGates:
-    def execute(self, work_id: uuid.UUID) -> DeterministicGateResult:
+    def execute(self, work_id: uuid.UUID) -> DeterministicGateResult:  # noqa: C901
         try:
             work = WorkflowWork.objects.get(id=work_id)
         except WorkflowWork.DoesNotExist:
@@ -398,12 +400,15 @@ class EvaluateDeterministicCandidateGates:
                 )
             target = matches[0]
             attached = set(
-                MemoryVersionSource.objects.filter(memory_version_id=target.id, candidate_source__isnull=False).values_list(
-                    'candidate_source_id', flat=True
-                )
+                MemoryVersionSource.objects.filter(
+                    memory_version_id=target.id,
+                    candidate_source__isnull=False,
+                ).values_list('candidate_source_id', flat=True)
             )
             missing = {source.id for source in sources} - attached
-            reason = CurationReasonCode.EXACT_IDENTITY if missing else CurationReasonCode.EXACT_DUPLICATE_NO_NEW_EVIDENCE
+            reason = (
+                CurationReasonCode.EXACT_IDENTITY if missing else CurationReasonCode.EXACT_DUPLICATE_NO_NEW_EVIDENCE
+            )
             return self._merge(view, scope, reason, target.id, bool(missing))
         except DatabaseError:
             return _retry('evidence_unavailable')
@@ -417,7 +422,7 @@ class EvaluateDeterministicCandidateGates:
         ):
             return _retry('stale_decision')
 
-    def _load_candidate(
+    def _load_candidate(  # noqa: C901
         self, work: WorkflowWork
     ) -> tuple[MemoryCandidate, list[MemoryCandidateSource], EffectiveCandidateScope]:
         if (
@@ -435,16 +440,23 @@ class EvaluateDeterministicCandidateGates:
         candidate_id = uuid.UUID(str(snapshot['candidate_id']))
         if candidate_id != work.subject_id:
             raise CandidateDecisionWorkScopeError('work candidate does not match snapshot')
-        if snapshot.get('organization_id') != str(work.organization_id) or snapshot.get('project_id') != str(work.project_id):
+        if snapshot.get('organization_id') != str(work.organization_id) or snapshot.get('project_id') != str(
+            work.project_id
+        ):
             raise CandidateDecisionWorkScopeError('work scope does not match snapshot')
         candidate = MemoryCandidate.objects.get(
             id=candidate_id,
             organization_id=work.organization_id,
             project_id=work.project_id,
         )
-        if candidate.decision_work_contract_version != 1 or candidate.content_hash != snapshot.get('candidate_content_hash'):
+        if candidate.decision_work_contract_version != 1 or candidate.content_hash != snapshot.get(
+            'candidate_content_hash'
+        ):
             raise CandidateDecisionWorkScopeError('candidate snapshot is stale')
-        if snapshot.get('team_id') != (str(candidate.team_id) if candidate.team_id else None) or work.team_id != candidate.team_id:
+        if (
+            snapshot.get('team_id') != (str(candidate.team_id) if candidate.team_id else None)
+            or work.team_id != candidate.team_id
+        ):
             raise CandidateDecisionWorkScopeError('candidate team does not match work')
         sources = list(
             MemoryCandidateSource.objects.filter(candidate_id=candidate.id).select_related(
@@ -513,7 +525,9 @@ class EvaluateDeterministicCandidateGates:
             return self._reject(view, scope, CurationReasonCode.NOISE_LIFECYCLE_ONLY)
         return None
 
-    def _reject(self, view: SanitizedCandidateView, scope: EffectiveCandidateScope, reason: str) -> DeterministicGateResult:
+    def _reject(
+        self, view: SanitizedCandidateView, scope: EffectiveCandidateScope, reason: str
+    ) -> DeterministicGateResult:
         return DeterministicGateResult(
             disposition=DeterministicGateDisposition.TERMINAL,
             policy_version=DETERMINISTIC_POLICY_VERSION,

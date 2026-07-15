@@ -27,7 +27,6 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 
-
 HEX64 = 'a' * 64
 
 

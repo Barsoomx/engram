@@ -2881,7 +2881,7 @@ class CurationDecision(ImmutableCreatedModel):
         ]
         ordering = ['organization_id', 'project_id', 'created_at']
 
-    def clean(self) -> None:
+    def clean(self) -> None:  # noqa: C901
         errors: dict[str, list[str]] = {}
         if self.project_id:
             check_project_organization(errors, 'project', self.project, self.organization_id)
@@ -2914,7 +2914,11 @@ class CurationDecision(ImmutableCreatedModel):
 
         references = (self.provider_call_record_id, self.policy_id, self.policy_version)
         if any(value is not None for value in references) and not all(value is not None for value in references):
-            add_scope_error(errors, 'provider_call_record', 'provider call, policy, and policy version must be set together')
+            add_scope_error(
+                errors,
+                'provider_call_record',
+                'provider call, policy, and policy version must be set together',
+            )
         elif all(value is not None for value in references):
             if self.policy.project_id:
                 check_project_scope(errors, 'policy', self.policy, self.organization_id, self.project_id)
