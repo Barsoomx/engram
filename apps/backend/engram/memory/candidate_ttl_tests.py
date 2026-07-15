@@ -21,8 +21,8 @@ from engram.core.models import (
 from engram.memory.candidate_decision_work import evidence_manifest
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
-from engram.memory.curation_tests import (
-    _JudgeGatewayStub,
+from engram.memory.curation_test_support import (
+    JudgeGatewayStub,
     create_curation_policy,
     patch_atomic_near_duplicate,
     patch_judge_gateway,
@@ -252,7 +252,7 @@ def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confiden
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
-    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    patch_judge_gateway(monkeypatch, JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     opened = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
     MemoryCandidate.objects.filter(id=candidate.id).update(
         created_at=timezone.now() - timedelta(days=30),
@@ -282,7 +282,7 @@ def test_ttl_locked_recheck_skips_candidate_with_conflict(
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
-    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    patch_judge_gateway(monkeypatch, JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
 
     rejected = ExpireStaleCandidates()._reject_batch([candidate.id])
@@ -305,7 +305,7 @@ def test_resolved_conflict_allows_later_ttl_noop_without_erasing_history(
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
-    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    patch_judge_gateway(monkeypatch, JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
     conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
     _entries, manifest_hash = evidence_manifest(candidate)
