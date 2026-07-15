@@ -213,6 +213,7 @@ def test_feedback_preserves_response_keys_and_commits_uniform_stale_chain() -> N
     }
     transition = MemoryTransition.objects.get(memory=memory, transition_type='mark_stale')
     document = RetrievalDocument.objects.get(id=transition.result_exact_document_id)
+    memory.refresh_from_db()
 
     assert required_keys <= response.keys()
     assert response['memory_id'] == str(memory.id)
