@@ -330,7 +330,7 @@ def drive_mcp_stdio(
         {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
         {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
         _tool_call(
-            3, 'engram_search', {'query': 'Provider-synthesized memory', 'file_paths': [MEMORY_FILE]}
+            3, 'engram_search', {'query': 'Provider-distilled memory', 'file_paths': [MEMORY_FILE]}
         ),
         _tool_call(4, 'engram_context', {'session_id': f'mcp-{run_id}'}),
         _tool_call(5, 'engram_observations', {'limit': 5}),
@@ -795,10 +795,10 @@ def assert_context_response(response: dict[str, object], worker_memory: dict[str
     assert_equal(first_item.get('citation'), 'M1', 'first context citation')
     title = required_string(worker_memory, 'memory_title')
     body = required_string(worker_memory, 'memory_body')
-    if not title.startswith('Provider-synthesized memory '):
-        raise E2EError(f'Expected provider-synthesized memory title, got {title!r}')
-    if not body.startswith('Provider-synthesized candidate body '):
-        raise E2EError(f'Expected provider-synthesized memory body, got {body!r}')
+    if not title.startswith('Provider-distilled memory '):
+        raise E2EError(f'Expected provider-distilled memory title, got {title!r}')
+    if not body.startswith('Provider-distilled memory body '):
+        raise E2EError(f'Expected provider-distilled memory body, got {body!r}')
     assert_equal(first_item.get('title'), title, 'memory title')
     assert_equal(first_item.get('body'), body, 'memory body')
     rendered_context = required_string(response, 'rendered_context')
