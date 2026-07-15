@@ -7,13 +7,13 @@ import pytest
 from django.db import transaction
 from django.utils import timezone
 
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     Memory,
     MemoryStatus,
     MemoryVersion,
     Organization,
     Project,
+    RetrievalDocument,
     VisibilityScope,
     WorkflowRun,
     WorkflowSubjectType,
@@ -21,6 +21,8 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.memory.workflow_work import CreateWorkflowWorkInput
 
 _UNPROVEN = 'digest_visibility_unproven'
@@ -44,25 +46,16 @@ def make_org_project(suffix: str) -> tuple[Organization, Project]:
 
 
 def make_source_memory(organization: Organization, project: Project, *, title: str, body: str) -> Memory:
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix='digest-source',
         title=title,
         body=body,
-        status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
-        metadata={},
     )
-    MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-    )
-
-    return memory
+    return PromoteMemoryCandidate().execute(transition_request(candidate)).memory
 
 
 def build_proven_weekly_digest(
@@ -128,7 +121,14 @@ def build_legacy_digest(
         body=body,
         content_hash=hashlib.sha256(body.encode()).hexdigest(),
     )
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=True))
+    RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        memory_version=version,
+        visibility_scope=VisibilityScope.PROJECT,
+        full_text=f'{title}\n\n{body}',
+    )
 
     return memory
 

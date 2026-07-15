@@ -57,7 +57,15 @@ def _create_scope(suffix: str) -> tuple[Organization, Project, AgentSession]:
     return organization, project, session
 
 
-def _ended_session_work(scope: tuple[Organization, Project, AgentSession]) -> Any:
+def _ended_session_work(
+    scope: tuple[Organization, Project, AgentSession],
+    *,
+    observation_title: str = 'observation 1',
+    observation_body: str = '',
+    files_read: list[str] | None = None,
+    files_modified: list[str] | None = None,
+    source_metadata: dict[str, object] | None = None,
+) -> Any:
     organization, project, session = scope
     Observation.objects.create(
         organization=organization,
@@ -66,10 +74,13 @@ def _ended_session_work(scope: tuple[Organization, Project, AgentSession]) -> An
         agent=session.agent,
         session=session,
         observation_type='tool_use',
-        title='observation 1',
+        title=observation_title,
+        body=observation_body,
+        files_read=files_read or [],
+        files_modified=files_modified or [],
         content_hash=f'content-{session.id}-1',
         session_sequence=1,
-        source_metadata={'event_type': 'post_tool_use'},
+        source_metadata=source_metadata or {'event_type': 'post_tool_use'},
     )
     result = EndSession().execute(
         organization_id=organization.id,
@@ -90,7 +101,7 @@ def _stage_policy(scope: tuple[Organization, Project, AgentSession], suffix: str
         team=session.team,
         name=f'Transition support {suffix} secret',
         provider='openai',
-        scope='team',
+        scope='team' if session.team_id is not None else 'organization',
     )
     return ModelPolicy.objects.create(
         organization=organization,
@@ -199,14 +210,32 @@ def _stage_history(
     return fallback_stage, primary_stage
 
 
-def provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, Any, Any]:
-    organization, project, session = _create_scope(suffix)
-    work = _ended_session_work((organization, project, session))
+def _provenanced_candidate_for_session(
+    organization: Organization,
+    project: Project,
+    session: AgentSession,
+    *,
+    suffix: str,
+    title: str,
+    body: str,
+    visibility_scope: str,
+    confidence: Decimal | None,
+    kind: str,
+    files_read: list[str] | None = None,
+    files_modified: list[str] | None = None,
+    source_metadata: dict[str, object] | None = None,
+) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    work = _ended_session_work(
+        (organization, project, session),
+        observation_title=f'Observation {suffix}',
+        observation_body=body,
+        files_read=files_read,
+        files_modified=files_modified,
+        source_metadata=source_metadata,
+    )
     window = materialize_distillation_window(work)
     stage, _primary = _stage_history((organization, project, session), window)
     observation = Observation.objects.get(session=session, session_sequence=1)
-    title = f'Promotion candidate {suffix}'
-    body = f'Promotion body {suffix}'
     candidate = MemoryCandidate.objects.create(
         organization=organization,
         project=project,
@@ -215,10 +244,11 @@ def provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, A
         title=title,
         body=body,
         status=CandidateStatus.PROPOSED,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         evidence=[{'observation_id': str(observation.id)}],
         content_hash=session_candidate_content_hash(session.id, title, body),
-        confidence=Decimal('0.900'),
+        confidence=confidence,
+        kind=kind,
         decision_work_contract_version=1,
     )
     anchors = candidate_source_anchors(
@@ -238,7 +268,72 @@ def provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, A
         anchors=anchors,
         anchors_hash=canonical_source_manifest(anchors),
     )
+
+    return candidate, source
+
+
+def provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, Any, Any]:
+    organization, project, session = _create_scope(suffix)
+    candidate, source = _provenanced_candidate_for_session(
+        organization,
+        project,
+        session,
+        suffix=suffix,
+        title=f'Promotion candidate {suffix}',
+        body=f'Promotion body {suffix}',
+        visibility_scope=VisibilityScope.PROJECT,
+        confidence=Decimal('0.900'),
+        kind='',
+    )
     return candidate, source, (organization, project, session)
+
+
+def provenanced_candidate_in_scope(
+    organization: Organization,
+    project: Project,
+    team: Team | None,
+    *,
+    suffix: str,
+    title: str,
+    body: str,
+    visibility_scope: str = VisibilityScope.PROJECT,
+    confidence: Decimal | None = Decimal('0.900'),
+    kind: str = '',
+    files_read: list[str] | None = None,
+    files_modified: list[str] | None = None,
+    source_metadata: dict[str, object] | None = None,
+) -> tuple[MemoryCandidate, MemoryCandidateSource, AgentSession]:
+    token = uuid.uuid4().hex
+    agent = Agent.objects.create(
+        organization=organization,
+        runtime='codex',
+        external_id=f'agent-{suffix}-{token}',
+    )
+    session = AgentSession.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        external_session_id=f'session-{suffix}-{token}',
+        runtime='codex',
+        observation_sequence_cursor=0,
+    )
+    candidate, source = _provenanced_candidate_for_session(
+        organization,
+        project,
+        session,
+        suffix=f'{suffix}-{token}',
+        title=title,
+        body=body,
+        visibility_scope=visibility_scope,
+        confidence=confidence,
+        kind=kind,
+        files_read=files_read,
+        files_modified=files_modified,
+        source_metadata=source_metadata,
+    )
+
+    return candidate, source, session
 
 
 def transition_request(candidate: MemoryCandidate, *, key: str | None = None, reason: str = 'test promotion') -> Any:

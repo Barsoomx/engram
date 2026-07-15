@@ -52,8 +52,6 @@ from engram.memory.services import (
     MemoryCandidateWorkerResult,
     MemoryWorkerError,
     ProcessObservationRecorded,
-    PromoteMemoryCandidate,
-    PromoteMemoryCandidateInput,
     digest_prompt,
     digest_system_prompt,
     distillation_system_prompt,
@@ -61,6 +59,12 @@ from engram.memory.services import (
     provider_prompt,
 )
 from engram.memory.tasks import process_observation_recorded
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import (
+    provenanced_candidate_in_scope,
+    transition_request,
+    transitions_module,
+)
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     create_work,
@@ -375,6 +379,38 @@ def create_memory_candidate(observation: Observation) -> MemoryCandidate:
     )
 
 
+def create_provenanced_memory_candidate(observation: Observation) -> MemoryCandidate:
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        observation.organization,
+        observation.project,
+        observation.team,
+        suffix=f'typed-promotion-{observation.id}',
+        title=observation.title,
+        body=observation.body,
+        confidence=Decimal('0.500'),
+        files_read=observation.files_read,
+        files_modified=observation.files_modified,
+        source_metadata=observation.source_metadata,
+    )
+
+    return candidate
+
+
+def promote_provenanced_memory_candidate(observation: Observation) -> Any:
+    candidate = create_provenanced_memory_candidate(observation)
+
+    return PromoteMemoryCandidate().execute(transition_request(candidate))
+
+
+def embedding_work_for(document: RetrievalDocument) -> WorkflowWork:
+    return WorkflowWork.objects.get(
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        subject_type=WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+        subject_id=document.id,
+        input_snapshot__exact_projection_hash=document.exact_projection_hash,
+    )
+
+
 @pytest.mark.django_db
 def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() -> None:
     organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
@@ -434,7 +470,7 @@ def test_observation_recorded_worker_creates_candidate_with_redacted_evidence() 
 
 
 @pytest.mark.django_db
-def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval() -> None:
+def test_observation_recorded_worker_holds_unproven_candidate_instead_of_publishing() -> None:
     organization, team, project, _session, raw_event, observation = create_observation_recorded_scope()
     policy = create_generation_policy(organization, team, project)
     enable_auto_promote(organization)
@@ -442,39 +478,22 @@ def test_observation_recorded_worker_auto_promotes_memory_and_indexes_retrieval(
     result = execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    memory = Memory.objects.get()
-    version = MemoryVersion.objects.get()
-    document = RetrievalDocument.objects.get()
     provider_call = ProviderCallRecord.objects.get()
 
     assert result.duplicate is False
-    assert result.curated_decision == 'promoted'
+    assert result.held_for_review is True
+    assert result.curated_decision == ''
     assert result.candidate.id == candidate.id
-    assert result.memory.id == memory.id
-    assert result.memory_version.id == version.id
-    assert result.retrieval_document.id == document.id
-    assert candidate.status == CandidateStatus.PROMOTED
-    assert candidate.promoted_memory_id == memory.id
-    assert memory.organization_id == project.organization_id
-    assert memory.project_id == project.id
-    assert memory.team_id == team.id
-    assert memory.status == MemoryStatus.APPROVED
-    assert memory.title == candidate.title
-    assert memory.body == candidate.body
-    assert observation.body not in memory.body
-    assert memory.metadata['provider_call_id'] == str(provider_call.id)
-    assert memory.metadata['provider'] == 'openai'
-    assert memory.metadata['model'] == 'gpt-4.1-mini'
-    assert memory.metadata['policy_id'] == str(policy.id)
-    assert memory.metadata['policy_version'] == 3
-    assert memory.metadata['task_type'] == 'generation'
-    assert memory.metadata['redaction_state'] == 'clean'
-    assert version.memory_id == memory.id
-    assert version.source_observation_id == observation.id
-    assert document.memory_id == memory.id
-    assert document.memory_version_id == version.id
-    assert document.file_paths == observation.files_read + observation.files_modified
-    assert RAW_KEY not in f'{candidate.evidence} {memory.title} {memory.body} {document.full_text}'
+    assert result.memory is None
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.decision_work_contract_version == 0
+    assert candidate.promoted_memory_id is None
+    assert candidate.evidence[0]['provider_call_id'] == str(provider_call.id)
+    assert candidate.evidence[0]['policy_id'] == str(policy.id)
+    assert Memory.objects.count() == 0
+    assert MemoryVersion.objects.count() == 0
+    assert RetrievalDocument.objects.count() == 0
+    assert RAW_KEY not in f'{candidate.evidence} {candidate.title} {candidate.body}'
 
 
 @pytest.mark.django_db
@@ -491,19 +510,14 @@ def test_observation_recorded_worker_redacts_candidate_content_and_evidence() ->
     execute_worker(observation)
 
     candidate = MemoryCandidate.objects.get()
-    memory = Memory.objects.get()
-    document = RetrievalDocument.objects.get()
     provider_call = ProviderCallRecord.objects.get()
-    persisted = (
-        f'{candidate.title} {candidate.body} {candidate.evidence} {memory.body} '
-        f'{memory.metadata} {document.file_paths} {provider_call.__dict__}'
-    )
+    persisted = f'{candidate.title} {candidate.body} {candidate.evidence} {provider_call.__dict__}'
 
     assert RAW_KEY not in persisted
     assert RAW_SLACK_TOKEN not in persisted
     assert '[REDACTED]' in str(candidate.evidence)
-    assert '[REDACTED]' in str(memory.metadata['file_paths'])
-    assert '[REDACTED]' in str(document.file_paths)
+    assert Memory.objects.count() == 0
+    assert RetrievalDocument.objects.count() == 0
     assert provider_call.redaction_state == 'redacted'
 
 
@@ -538,13 +552,12 @@ def test_observation_recorded_worker_is_idempotent_for_duplicate_delivery() -> N
 
     assert second.duplicate is True
     assert second.candidate.id == first.candidate.id
-    assert second.memory.id == first.memory.id
-    assert second.memory_version.id == first.memory_version.id
-    assert second.retrieval_document.id == first.retrieval_document.id
+    assert second.held_for_review is True
+    assert second.memory is None
     assert MemoryCandidate.objects.count() == 1
-    assert Memory.objects.count() == 1
-    assert MemoryVersion.objects.count() == 1
-    assert RetrievalDocument.objects.count() == 1
+    assert Memory.objects.count() == 0
+    assert MemoryVersion.objects.count() == 0
+    assert RetrievalDocument.objects.count() == 0
     assert ProviderCallRecord.objects.count() == 2
 
 
@@ -583,9 +596,8 @@ def test_observation_recorded_worker_reuses_existing_candidate() -> None:
 
     assert result.duplicate is True
     assert result.candidate.id == candidate.id
-    assert result.memory.title == expected_generated_title(observation)
-    assert result.memory.body == expected_generated_body(observation)
-    assert result.memory.metadata['provider_call_id'] == str(provider_call.id)
+    assert result.held_for_review is True
+    assert result.memory is None
     assert candidate.title == expected_generated_title(observation)
     assert candidate.body == expected_generated_body(observation)
     assert candidate.evidence[0]['provider_call_id'] == str(provider_call.id)
@@ -595,7 +607,8 @@ def test_observation_recorded_worker_reuses_existing_candidate() -> None:
     second = execute_worker(observation)
 
     assert second.duplicate is True
-    assert second.memory.id == result.memory.id
+    assert second.candidate.id == result.candidate.id
+    assert second.memory is None
     assert ProviderCallRecord.objects.count() == 2
 
 
@@ -649,12 +662,14 @@ def test_process_observation_recorded_task_delegates_by_observation_id() -> None
     create_generation_policy(organization, team, project)
     enable_auto_promote(organization)
 
-    memory_id = process_observation_recorded.run(str(observation.id))
+    candidate_id = process_observation_recorded.run(str(observation.id))
 
-    memory = Memory.objects.get()
+    candidate = MemoryCandidate.objects.get()
 
-    assert memory_id == str(memory.id)
-    assert RetrievalDocument.objects.get().memory_id == memory.id
+    assert candidate_id == str(candidate.id)
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert not Memory.objects.exists()
+    assert not RetrievalDocument.objects.exists()
 
 
 @pytest.mark.django_db
@@ -669,12 +684,13 @@ def test_process_observation_recorded_task_rejects_malformed_observation_id(
 
 
 @pytest.mark.django_db
-def test_promote_memory_candidate_lock_query_locks_candidate_row_without_related_joins() -> None:
+def test_typed_candidate_lock_query_locks_candidate_row_without_related_joins() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
+    promotion = transition_request(candidate)
 
     with CaptureQueriesContext(connection) as queries:
-        locked = PromoteMemoryCandidate()._lock_candidate(candidate.id)
+        locked = transitions_module()._lock_candidate(promotion.request, promotion.candidate_fence)
 
     lock_sql = next(
         query['sql'] for query in queries.captured_queries if 'core_memorycandidate' in query['sql'].lower()
@@ -687,17 +703,19 @@ def test_promote_memory_candidate_lock_query_locks_candidate_row_without_related
 @pytest.mark.django_db
 def test_promote_memory_candidate_creates_memory_version_and_retrieval_document() -> None:
     _organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
 
-    result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
 
     candidate.refresh_from_db()
+    source_observation = candidate.source_observation
+    assert source_observation is not None
     memory = Memory.objects.get()
     version = MemoryVersion.objects.get()
     document = RetrievalDocument.objects.get()
 
     assert result.duplicate is False
-    assert result.candidate.id == candidate.id
+    assert result.transition.candidate_id == candidate.id
     assert result.memory.id == memory.id
     assert result.memory_version.id == version.id
     assert result.retrieval_document.id == document.id
@@ -715,29 +733,28 @@ def test_promote_memory_candidate_creates_memory_version_and_retrieval_document(
         'source': 'memory_candidate',
         'memory_candidate_id': str(candidate.id),
         'evidence': candidate.evidence,
-        'file_paths': observation.files_read + observation.files_modified,
-        'captured_by': {
-            'agent_runtime': observation.agent.runtime,
-            'agent_external_id': observation.agent.external_id,
-        },
+        'full_text': f'{candidate.title}\n\n{candidate.body}',
+        'file_paths': source_observation.files_read + source_observation.files_modified,
+        'source_observation_ids': [str(source_observation.id)],
     }
     assert version.memory_id == memory.id
     assert version.version == 1
     assert version.body == candidate.body
     assert version.content_hash == candidate.content_hash
-    assert version.source_observation_id == observation.id
+    assert version.source_observation_id == source_observation.id
     assert document.memory_id == memory.id
     assert document.memory_version_id == version.id
-    assert document.file_paths == observation.files_read + observation.files_modified
+    assert document.file_paths == source_observation.files_read + source_observation.files_modified
 
 
 @pytest.mark.django_db
 def test_promote_memory_candidate_is_idempotent() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
-    first = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+    candidate = create_provenanced_memory_candidate(observation)
+    promotion = transition_request(candidate)
+    first = PromoteMemoryCandidate().execute(promotion)
 
-    second = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+    second = PromoteMemoryCandidate().execute(promotion)
 
     assert second.duplicate is True
     assert second.memory.id == first.memory.id
@@ -751,13 +768,11 @@ def test_promote_memory_candidate_is_idempotent() -> None:
 @pytest.mark.django_db
 def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
-    enable_auto_promote(organization)
+    result = promote_provenanced_memory_candidate(observation)
+    tasks_module.embed_memory_projection_work_v1(str(embedding_work_for(result.retrieval_document).id))
 
-    execute_worker(observation)
-
-    document = RetrievalDocument.objects.get()
+    document = RetrievalDocument.objects.get(id=result.retrieval_document.id)
     assert len(document.embedding_vector) == EMBEDDING_DIMENSION
     assert document.embedding_reference.startswith('provider:')
     assert document.embedding_vector == document.embedding_vector
@@ -766,12 +781,10 @@ def test_index_memory_version_writes_embedding_vector_and_reference() -> None:
 @pytest.mark.django_db
 def test_index_memory_version_embedding_reindex_makes_fresh_call_with_stable_vector() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
-    enable_auto_promote(organization)
-
-    execute_worker(observation)
-    first_document = RetrievalDocument.objects.get()
+    result = promote_provenanced_memory_candidate(observation)
+    tasks_module.embed_memory_projection_work_v1(str(embedding_work_for(result.retrieval_document).id))
+    first_document = RetrievalDocument.objects.get(id=result.retrieval_document.id)
     first_vector = list(first_document.embedding_vector)
     first_reference = first_document.embedding_reference
 
@@ -779,41 +792,33 @@ def test_index_memory_version_embedding_reindex_makes_fresh_call_with_stable_vec
 
     second_document = RetrievalDocument.objects.get()
     assert second_document.embedding_vector == first_vector
-    assert second_document.embedding_reference != first_reference
-    indexer_calls = ProviderCallRecord.objects.filter(
-        task_type='embedding',
-        request_id=f'memory-indexer:{first_document.memory_version_id}:embedding',
-    )
-    assert indexer_calls.count() == 2
+    assert second_document.embedding_reference == first_reference
+    assert ProviderCallRecord.objects.filter(task_type='embedding').count() == 1
 
 
 @pytest.mark.django_db
 def test_index_memory_version_skips_embedding_without_policy() -> None:
-    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
-    enable_auto_promote(organization)
+    _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
+    result = promote_provenanced_memory_candidate(observation)
 
-    execute_worker(observation)
-
-    document = RetrievalDocument.objects.get()
+    document = RetrievalDocument.objects.get(id=result.retrieval_document.id)
     assert document.embedding_vector == []
     assert document.embedding_reference == ''
+    assert embedding_work_for(document).disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
 def test_index_memory_version_skips_embedding_when_secret_disabled() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
-    create_generation_policy(organization, team, project)
     embedding_policy = create_embedding_policy(organization, team, project)
     embedding_policy.secret.active = False
     embedding_policy.secret.save(update_fields=['active'])
-    enable_auto_promote(organization)
+    result = promote_provenanced_memory_candidate(observation)
 
-    execute_worker(observation)
-
-    document = RetrievalDocument.objects.get()
+    document = RetrievalDocument.objects.get(id=result.retrieval_document.id)
     assert document.embedding_vector == []
     assert document.embedding_reference == ''
+    assert embedding_work_for(document).disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
@@ -874,13 +879,14 @@ def test_observation_recorded_worker_dedupes_memory_for_same_content_across_sess
     result = execute_worker(second_observation)
 
     assert result.duplicate is True
-    assert Memory.objects.count() == 1
+    assert result.held_for_review is True
+    assert Memory.objects.count() == 0
     assert MemoryCandidate.objects.count() == 1
-    assert MemoryVersion.objects.count() == 1
+    assert MemoryVersion.objects.count() == 0
 
 
 @pytest.mark.django_db
-def test_observation_recorded_worker_auto_rejects_low_signal_candidate() -> None:
+def test_observation_recorded_worker_holds_unproven_low_signal_candidate() -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     enable_auto_promote(organization)
@@ -889,18 +895,17 @@ def test_observation_recorded_worker_auto_rejects_low_signal_candidate() -> None
     result = execute_worker(observation)
 
     candidate.refresh_from_db()
-    assert result.curated_decision == 'rejected'
+    assert result.curated_decision == ''
+    assert result.held_for_review is True
     assert result.memory is None
-    assert candidate.status == CandidateStatus.REJECTED
+    assert candidate.status == CandidateStatus.PROPOSED
     assert Memory.objects.count() == 0
     assert RetrievalDocument.objects.count() == 0
-    reject_audit = AuditEvent.objects.get(event_type='MemoryAutoRejected')
-    assert reject_audit.actor_type == 'system'
-    assert reject_audit.target_id == str(candidate.id)
+    assert not AuditEvent.objects.filter(event_type='MemoryAutoRejected').exists()
 
 
 @pytest.mark.django_db
-def test_observation_recorded_worker_supersedes_semantic_near_duplicate() -> None:
+def test_observation_recorded_worker_does_not_semantically_merge_unproven_candidates() -> None:
     organization, team, project, _session, _raw_event, first_observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     create_embedding_policy(organization, team, project)
@@ -915,16 +920,13 @@ def test_observation_recorded_worker_supersedes_semantic_near_duplicate() -> Non
 
     second_result = execute_worker(second_observation)
 
-    first_result.memory.refresh_from_db()
-    assert first_result.curated_decision == 'promoted'
-    assert second_result.curated_decision == 'superseded'
-    assert second_result.memory.id != first_result.memory.id
-    assert first_result.memory.stale is True
-    link = MemoryLink.objects.get(link_type=LinkType.SUPERSEDED_BY)
-    assert link.memory_id == first_result.memory.id
-    assert link.target == str(second_result.memory.id)
-    assert AuditEvent.objects.filter(event_type='MemorySuperseded').count() == 1
-    assert Memory.objects.filter(stale=False).count() == 1
+    assert first_result.held_for_review is True
+    assert second_result.held_for_review is True
+    assert first_result.memory is None
+    assert second_result.memory is None
+    assert Memory.objects.count() == 0
+    assert MemoryLink.objects.count() == 0
+    assert AuditEvent.objects.filter(event_type='MemorySuperseded').count() == 0
 
 
 @pytest.mark.django_db
@@ -1089,9 +1091,9 @@ def test_rich_observation_auto_promotes_at_default_threshold() -> None:
 
     candidate = MemoryCandidate.objects.get()
     assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
-    assert result.held_for_review is False
-    assert result.curated_decision is not None
-    assert result.memory is not None
+    assert result.held_for_review is True
+    assert result.curated_decision == ''
+    assert result.memory is None
 
 
 @pytest.mark.django_db
@@ -1106,9 +1108,9 @@ def test_model_confidence_auto_promotes_at_default_threshold() -> None:
 
     candidate = MemoryCandidate.objects.get()
     assert candidate.confidence == EXPECTED_GENERATED_CONFIDENCE
-    assert result.held_for_review is False
-    assert result.curated_decision is not None
-    assert result.memory is not None
+    assert result.held_for_review is True
+    assert result.curated_decision == ''
+    assert result.memory is None
 
 
 @pytest.mark.django_db

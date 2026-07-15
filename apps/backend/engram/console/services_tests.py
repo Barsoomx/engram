@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+from decimal import Decimal
 from unittest import mock
 
 import pytest
@@ -41,8 +42,6 @@ from engram.console.services import (
 )
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
-    Agent,
-    AgentSession,
     AuditEvent,
     AuditResult,
     CandidateStatus,
@@ -53,13 +52,12 @@ from engram.core.models import (
     MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
-    Observation,
     Organization,
     Project,
     RetrievalDocument,
-    Runtime,
     VisibilityScope,
 )
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope
 
 postgres_only = pytest.mark.skipif(
     connection.vendor != 'postgresql',
@@ -107,7 +105,6 @@ def _make_candidate(
     kind: str = '',
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
-
     return MemoryCandidate.objects.create(
         organization=organization,
         project=project,
@@ -119,6 +116,28 @@ def _make_candidate(
         confidence='0.500',
         kind=kind,
     )
+
+
+def _make_typed_candidate(
+    organization: Organization,
+    project: Project,
+    *,
+    kind: str = '',
+) -> MemoryCandidate:
+    counter = MemoryCandidate.objects.count()
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix=f'console-candidate-{counter}',
+        title=f'Candidate {counter}',
+        body=f'Body {counter}',
+        visibility_scope=VisibilityScope.PROJECT,
+        confidence=Decimal('0.500'),
+        kind=kind,
+    )
+
+    return candidate
 
 
 def _make_memory(
@@ -146,10 +165,19 @@ def _make_approved_memory(
     organization: Organization,
     project: Project,
     actor_identity: Identity,
+    *,
+    kind: str = '',
+    status: str = MemoryStatus.APPROVED,
 ) -> Memory:
-    candidate = _make_candidate(organization, project)
+    candidate = _make_typed_candidate(organization, project, kind=kind)
 
-    return approve_memory_candidate(organization, actor_identity, candidate, 'reason')
+    memory = approve_memory_candidate(organization, actor_identity, candidate, 'reason')
+
+    if status != MemoryStatus.APPROVED:
+        memory.status = status
+        memory.save(update_fields=['status', 'updated_at'])
+
+    return memory
 
 
 def _read_scope(organization: Organization, project: Project) -> EffectiveScope:
@@ -262,7 +290,7 @@ def test_approve_memory_candidate_promotes_candidate(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
@@ -293,8 +321,19 @@ def test_v1_console_approval_records_the_human_transition_actor_and_reason() -> 
     assert audit.actor_id == str(actor.id)
     assert audit.capability == 'memories:review'
     assert audit.metadata['reason'] == 'verified by a human reviewer'
+    assert audit.metadata['schema'] == 'memory_transition/v1'
     assert audit.metadata['exact_document_id'] == str(transition.result_exact_document_id)
     assert audit.metadata['exact_projection_hash'] == transition.result_exact_document.exact_projection_hash
+    assert transition.embedding_work_id is not None
+    assert transition.result_exact_document.embedding_reference == ''
+    assert transition.result_exact_document.embedding_vector == []
+    assert (
+        AuditEvent.objects.filter(
+            project=transition.result_memory.project,
+            event_type='MemoryTransitionCommitted',
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -303,7 +342,7 @@ def test_approve_memory_candidate_carries_kind_into_memory_metadata_and_column(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project, kind='gotcha')
+    candidate = _make_typed_candidate(f_organization, f_project, kind='gotcha')
 
     memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
@@ -318,7 +357,7 @@ def test_approve_memory_candidate_omits_kind_from_memory_metadata_when_unset(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
@@ -333,7 +372,7 @@ def test_approve_memory_candidate_creates_indexed_retrieval_document(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
@@ -347,12 +386,12 @@ def test_approve_memory_candidate_creates_indexed_retrieval_document(
 
 
 @pytest.mark.django_db
-def test_approve_memory_candidate_clears_conflict_links(
+def test_approve_memory_candidate_preserves_supplemental_conflict_links(
     f_organization: Organization,
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     other_candidate = _make_candidate(f_organization, f_project)
 
@@ -378,8 +417,7 @@ def test_approve_memory_candidate_clears_conflict_links(
 
     approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
-    assert not MemoryLink.objects.filter(id=conflict_link.id).exists()
-
+    assert MemoryLink.objects.filter(id=conflict_link.id).exists()
     assert MemoryLink.objects.filter(id=survivor_link.id).exists()
 
 
@@ -389,7 +427,7 @@ def test_edit_memory_body_creates_new_version(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     version = edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
 
@@ -406,7 +444,7 @@ def test_edit_memory_body_reindexes_retrieval_document(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project, status=MemoryStatus.APPROVED)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     version = edit_memory_body(f_organization, f_actor_identity, memory, 'updated body text', 'reason')
 
@@ -421,7 +459,7 @@ def test_edit_memory_body_rejects_digest_memory(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project, kind='digest')
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity, kind='digest')
 
     with pytest.raises(MemoryReviewError) as error:
         edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
@@ -439,9 +477,9 @@ def test_narrow_memory_creates_link(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     link = narrow_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
 
@@ -454,9 +492,9 @@ def test_supersede_memory_marks_stale_and_creates_link(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     link = supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
 
@@ -473,9 +511,19 @@ def test_supersede_memory_marks_loser_retrieval_document_stale(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+    memory = approve_memory_candidate(
+        f_organization,
+        f_actor_identity,
+        _make_typed_candidate(f_organization, f_project),
+        'r',
+    )
 
-    target = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+    target = approve_memory_candidate(
+        f_organization,
+        f_actor_identity,
+        _make_typed_candidate(f_organization, f_project),
+        'r',
+    )
 
     supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
 
@@ -542,7 +590,7 @@ def test_reject_review_item_refutes_memory(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     reject_review_item(f_organization, f_actor_identity, memory, 'reason')
 
@@ -557,7 +605,12 @@ def test_reject_review_item_refutes_memory_and_syncs_retrieval_document(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = approve_memory_candidate(f_organization, f_actor_identity, _make_candidate(f_organization, f_project), 'r')
+    memory = approve_memory_candidate(
+        f_organization,
+        f_actor_identity,
+        _make_typed_candidate(f_organization, f_project),
+        'r',
+    )
 
     reject_review_item(f_organization, f_actor_identity, memory, 'reason')
 
@@ -580,7 +633,7 @@ def test_archive_memory_sets_archived(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     archive_memory(f_organization, f_actor_identity, memory, 'reason')
 
@@ -596,7 +649,7 @@ def test_approve_memory_candidate_locks_candidate_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     with CaptureQueriesContext(connection) as queries:
         approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
@@ -613,7 +666,7 @@ def test_edit_memory_body_locks_memory_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     with CaptureQueriesContext(connection) as queries:
         edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
@@ -630,9 +683,9 @@ def test_narrow_memory_locks_memory_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     with CaptureQueriesContext(connection) as queries:
         narrow_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
@@ -649,9 +702,9 @@ def test_supersede_memory_locks_memory_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     with CaptureQueriesContext(connection) as queries:
         supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
@@ -685,7 +738,7 @@ def test_reject_review_item_locks_memory_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     with CaptureQueriesContext(connection) as queries:
         reject_review_item(f_organization, f_actor_identity, memory, 'reason')
@@ -702,7 +755,7 @@ def test_archive_memory_locks_memory_row_for_update(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     with CaptureQueriesContext(connection) as queries:
         archive_memory(f_organization, f_actor_identity, memory, 'reason')
@@ -891,7 +944,7 @@ def test_concurrent_approve_and_reject_on_same_candidate_serializes_transition(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     candidate_id = candidate.id
 
@@ -981,7 +1034,7 @@ def test_approve_memory_candidate_records_review_example(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project, kind='gotcha')
+    candidate = _make_typed_candidate(f_organization, f_project, kind='gotcha')
 
     approve_memory_candidate(f_organization, f_actor_identity, candidate, 'looks solid')
 
@@ -1018,7 +1071,7 @@ def test_approve_memory_candidate_review_example_captures_conflict_curator_conte
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     existing_memory = _make_memory(f_organization, f_project)
 
@@ -1039,7 +1092,7 @@ def test_approve_memory_candidate_review_example_captures_held_reason(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     AuditEvent.objects.create(
         organization=f_organization,
@@ -1066,7 +1119,7 @@ def test_approve_memory_candidate_does_not_record_review_example_on_invalid_stat
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     approve_memory_candidate(f_organization, f_actor_identity, candidate, 'first')
 
@@ -1084,7 +1137,7 @@ def test_edit_memory_body_records_review_example_with_pre_mutation_body(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     old_body = memory.body
 
@@ -1109,7 +1162,7 @@ def test_edit_memory_body_review_example_redacts_secret_shaped_old_body(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     memory.body = 'token egk_abcdefghijklmnopqrstuvwxyz0123456789'
 
@@ -1130,7 +1183,7 @@ def test_edit_memory_body_review_example_redacts_secret_shaped_title(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     memory.title = 'token egk_abcdefghijklmnopqrstuvwxyz0123456789'
 
@@ -1151,7 +1204,7 @@ def test_edit_memory_body_does_not_record_review_example_when_digest(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project, kind='digest')
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity, kind='digest')
 
     with pytest.raises(MemoryReviewError):
         edit_memory_body(f_organization, f_actor_identity, memory, 'new body', 'reason')
@@ -1165,9 +1218,9 @@ def test_narrow_memory_records_review_example(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     narrow_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
 
@@ -1184,15 +1237,15 @@ def test_supersede_memory_records_review_example(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     supersede_memory(f_organization, f_actor_identity, memory, target.id, 'reason')
 
     example = MemoryReviewExample.objects.get(item_type='memory', item_id=str(memory.id), action='supersede')
 
-    assert example.snapshot['status'] == MemoryStatus.CONFLICT
+    assert example.snapshot['status'] == MemoryStatus.APPROVED
 
 
 @pytest.mark.django_db
@@ -1218,7 +1271,7 @@ def test_reject_review_item_records_review_example_for_memory_with_pre_mutation_
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity, status=MemoryStatus.CONFLICT)
 
     reject_review_item(f_organization, f_actor_identity, memory, 'reason')
 
@@ -1241,7 +1294,7 @@ def test_reject_review_item_does_not_record_review_example_on_invalid_state(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_typed_candidate(f_organization, f_project)
 
     approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
 
@@ -1259,7 +1312,7 @@ def test_archive_memory_records_review_example(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     archive_memory(f_organization, f_actor_identity, memory, 'reason')
 
@@ -1276,7 +1329,7 @@ def test_archive_memory_does_not_record_review_example_when_already_archived(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_approved_memory(f_organization, f_project, f_actor_identity)
 
     archive_memory(f_organization, f_actor_identity, memory, 'first')
 
@@ -1583,56 +1636,18 @@ def _make_provenanced_candidate(
     organization: Organization,
     project: Project,
 ) -> MemoryCandidate:
-    agent = Agent.objects.create(
-        organization=organization,
-        runtime=Runtime.CODEX,
-        external_id='codex-local',
-    )
-
-    session = AgentSession.objects.create(
-        organization=organization,
-        project=project,
-        agent=agent,
-        external_session_id='session-provenance',
-    )
-
-    observation = Observation.objects.create(
-        organization=organization,
-        project=project,
-        agent=agent,
-        session=session,
-        observation_type='tool_use',
-        title='pytest failure fixed',
-        body='pytest failed then exits 0',
-        files_read=['apps/backend/engram/core/models.py'],
-        files_modified=['apps/backend/engram/memory/services.py'],
-        content_hash='hash-obs-provenance',
-        session_sequence=1,
-    )
-
-    return MemoryCandidate.objects.create(
-        organization=organization,
-        project=project,
-        source_observation=observation,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix='console-metadata',
         title='Provenanced candidate',
         body='Provenanced body',
-        status=CandidateStatus.PROPOSED,
-        visibility_scope=VisibilityScope.PROJECT,
-        evidence=[
-            {
-                'observation_id': str(observation.id),
-                'provider_call_id': 'pc-1',
-                'provider': 'openai',
-                'model': 'gpt-x',
-                'policy_id': 'pol-1',
-                'policy_version': 2,
-                'task_type': 'generation',
-                'redaction_state': 'redacted',
-            },
-        ],
-        content_hash='hash-c-provenance',
-        confidence='0.900',
+        files_read=['apps/backend/engram/core/models.py'],
+        files_modified=['apps/backend/engram/memory/services.py'],
     )
+
+    return candidate
 
 
 @pytest.mark.django_db
@@ -1645,24 +1660,13 @@ def test_approve_memory_candidate_metadata_matches_curator_promotion(
 
     observation = candidate.source_observation
 
-    agent = observation.agent
-
     expected_metadata = {
         'source': 'memory_candidate',
         'memory_candidate_id': str(candidate.id),
         'evidence': candidate.evidence,
+        'full_text': f'{candidate.title}\n\n{candidate.body}',
         'file_paths': observation.files_read + observation.files_modified,
-        'provider_call_id': 'pc-1',
-        'provider': 'openai',
-        'model': 'gpt-x',
-        'policy_id': 'pol-1',
-        'policy_version': 2,
-        'task_type': 'generation',
-        'redaction_state': 'redacted',
-        'captured_by': {
-            'agent_runtime': agent.runtime,
-            'agent_external_id': agent.external_id,
-        },
+        'source_observation_ids': [str(observation.id)],
     }
 
     memory = approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')

@@ -12,6 +12,7 @@ from engram.context.context_api_tests import (
     OTHER_RAW_KEY,
     RAW_KEY,
     auth_headers,
+    complete_transition_embedding,
     create_approved_memory_document,
     create_embedding_policy,
     create_project_scope,
@@ -23,16 +24,15 @@ from engram.core.models import (
     AuditResult,
     CandidateStatus,
     LinkType,
-    Memory,
     MemoryCandidate,
     MemoryLink,
-    MemoryStatus,
-    MemoryVersion,
     Project,
     RetrievalDocument,
     Team,
     VisibilityScope,
 )
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 
 def search_payload(project: Project, **overrides: object) -> dict[str, object]:
@@ -241,24 +241,20 @@ def test_search_returns_semantic_match_when_exact_misses() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     grant_search_capability(RAW_KEY)
     create_embedding_policy(organization, team, project)
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='search-semantic',
         title='Colour behaviour optimisation',
         body='Colour behaviour optimisation',
-        status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='search-semantic-1',
-    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    memory = result.memory
+    version = result.memory_version
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+    complete_transition_embedding(result.retrieval_document)
     client = APIClient()
 
     response = client.post(

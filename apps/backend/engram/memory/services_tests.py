@@ -7,12 +7,21 @@ from decimal import Decimal
 import pytest
 from django.db import connection
 
-from engram.core.models import AuditEvent, MemoryCandidate, Observation, Organization, Project, RetrievalDocument, Team
+from engram.core.models import (
+    AuditEvent,
+    CandidateStatus,
+    MemoryCandidate,
+    Observation,
+    Organization,
+    Project,
+    RetrievalDocument,
+    Team,
+)
 from engram.memory.memory_worker_tests import (
     create_embedding_policy,
     create_generation_policy,
-    create_memory_candidate,
     create_observation_recorded_scope,
+    create_provenanced_memory_candidate,
     enable_auto_promote,
     execute_worker,
 )
@@ -40,7 +49,7 @@ from engram.model_policy.services import (
 @pytest.mark.django_db
 def test_promote_memory_candidate_existing_result_skips_reindex_for_stale_memory() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
     first = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
     first.memory.stale = True
     first.memory.save(update_fields=['stale', 'updated_at'])
@@ -56,7 +65,7 @@ def test_promote_memory_candidate_existing_result_skips_reindex_for_stale_memory
 @pytest.mark.django_db
 def test_promote_memory_candidate_writes_kind_into_memory_metadata_when_set() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
     candidate.kind = 'gotcha'
     candidate.save(update_fields=['kind', 'updated_at'])
 
@@ -69,7 +78,7 @@ def test_promote_memory_candidate_writes_kind_into_memory_metadata_when_set() ->
 @pytest.mark.django_db
 def test_promote_memory_candidate_omits_kind_from_memory_metadata_when_unset() -> None:
     _organization, _team, _project, _session, _raw_event, observation = create_observation_recorded_scope()
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
 
     result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
@@ -146,10 +155,10 @@ def test_process_observation_generation_uses_fresh_provider_response_on_repeated
 
 
 @pytest.mark.django_db(transaction=True)
-def test_promote_memory_candidate_index_embed_has_no_open_transaction(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_promote_memory_candidate_defers_embedding_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_embedding_policy(organization, team, project)
-    candidate = create_memory_candidate(observation)
+    candidate = create_provenanced_memory_candidate(observation)
     observed_in_atomic: list[bool] = []
     real_gateway = FakeProviderGateway()
 
@@ -163,7 +172,7 @@ def test_promote_memory_candidate_index_embed_has_no_open_transaction(monkeypatc
 
     PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
-    assert observed_in_atomic == [False]
+    assert observed_in_atomic == []
 
 
 def test_provider_prompt_includes_facts_narrative_concepts() -> None:
@@ -326,7 +335,7 @@ def test_process_observation_uses_model_confidence_and_kind(monkeypatch: pytest.
 
 
 @pytest.mark.django_db
-def test_process_observation_high_model_confidence_auto_promotes(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_process_observation_high_model_confidence_holds_legacy_candidate(monkeypatch: pytest.MonkeyPatch) -> None:
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     create_generation_policy(organization, team, project)
     enable_auto_promote(organization, threshold='0.700')
@@ -345,9 +354,10 @@ def test_process_observation_high_model_confidence_auto_promotes(monkeypatch: py
 
     candidate = MemoryCandidate.objects.get(source_observation=observation)
     assert candidate.confidence == Decimal('0.900')
-    assert result.held_for_review is False
-    assert result.memory is not None
-    assert result.memory.kind == 'gotcha'
+    assert candidate.decision_work_contract_version == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert result.held_for_review is True
+    assert result.memory is None
 
 
 @pytest.mark.django_db

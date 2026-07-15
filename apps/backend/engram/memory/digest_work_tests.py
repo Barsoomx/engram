@@ -35,6 +35,8 @@ from engram.core.models import (
 )
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.memory.work_execution import execution_configuration_fingerprint
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
 from engram.memory.workflow_work import CreateWorkflowWorkInput
@@ -45,6 +47,20 @@ from engram.model_policy.services import FakeProviderGateway, ProviderCallInput,
 _DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
+
+
+def _digest_works() -> object:
+    return WorkflowWork.objects.filter(
+        work_type__in=(WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST),
+    )
+
+
+def _digest_outbox() -> object:
+    return CeleryOutbox.objects.filter(task_name__in=(_DAILY_TASK_NAME, _WEEKLY_TASK_NAME))
+
+
+def _digest_runs() -> object:
+    return WorkflowRun.objects.filter(run_type__in=(WorkflowRunType.DAILY_DIGEST, WorkflowRunType.WEEKLY_DIGEST))
 
 
 def _load_digest_work() -> object:
@@ -86,25 +102,22 @@ def _make_memory(
     status: str = MemoryStatus.APPROVED,
     kind: str = '',
 ) -> tuple[Memory, MemoryVersion]:
-    metadata = {'kind': kind} if kind else {}
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='digest-source',
         title=title,
         body=body,
-        status=status,
         visibility_scope=visibility,
-        metadata=metadata,
+        kind=kind,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    memory = result.memory
+    version = result.memory_version
+    if status != MemoryStatus.APPROVED:
+        Memory.objects.filter(id=memory.id).update(status=status)
+        memory.refresh_from_db()
 
     return memory, version
 
@@ -214,9 +227,9 @@ def test_concurrent_daily_creates_leave_one_immutable_snapshot() -> None:
 
     created_flags = [created for created, _snapshot in results]
     assert sum(1 for flag in created_flags if flag) == 1
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    frozen = WorkflowWork.objects.get()
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
+    frozen = _digest_works().get()
     original_snapshot = frozen.input_snapshot
 
     Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
@@ -263,9 +276,9 @@ def test_concurrent_weekly_creates_leave_one_immutable_snapshot() -> None:
         created_flags = [future.result(timeout=15) for future in futures]
 
     assert sum(1 for flag in created_flags if flag) == 1
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    frozen = WorkflowWork.objects.get()
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
+    frozen = _digest_works().get()
     original_snapshot = frozen.input_snapshot
 
     Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
@@ -317,8 +330,8 @@ def test_daily_source_change_after_create_does_not_rewrite_snapshot() -> None:
 
     assert reused.id == work.id
     assert created_again is False
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
     assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
 
 
@@ -367,8 +380,8 @@ def test_weekly_source_change_after_create_does_not_rewrite_snapshot() -> None:
 
     assert reused.id == work.id
     assert created_again is False
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
     assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
 
 
@@ -584,8 +597,8 @@ def test_daily_rejects_cross_project_source_reference() -> None:
                 signal_task=generate_daily_digest_work_v1,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 @pytest.mark.django_db
@@ -709,8 +722,8 @@ def test_empty_authorized_daily_input_resolves_no_input_without_package_or_outbo
     assert created is True
     assert work.disposition == WorkflowWorkDisposition.NO_OP
     assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
-    assert CeleryOutbox.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
+    assert _digest_outbox().count() == 0
+    assert _digest_runs().count() == 0
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
 
 
@@ -739,8 +752,8 @@ def test_empty_authorized_weekly_input_resolves_no_input_without_outbox() -> Non
     assert created is True
     assert work.disposition == WorkflowWorkDisposition.NO_OP
     assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
-    assert CeleryOutbox.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
+    assert _digest_outbox().count() == 0
+    assert _digest_runs().count() == 0
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
 
 
@@ -779,9 +792,9 @@ def test_signal_failure_rolls_back_daily_work_run_and_outbox(monkeypatch: pytest
                 workflow_run=run,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_runs().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 @pytest.mark.django_db
@@ -812,9 +825,9 @@ def test_signal_failure_rolls_back_weekly_work_and_outbox(monkeypatch: pytest.Mo
                 signal_task=generate_weekly_digest_work_v1,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_runs().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 def _create_digest_policy(organization: Organization, project: Project) -> ModelPolicy:
@@ -1077,28 +1090,18 @@ def test_daily_work_discards_provider_result_when_source_invalidated_after_preca
     assert len(calls) == 1
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
     assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
-    assert RetrievalDocument.objects.filter(project=project).count() == 0
+    assert RetrievalDocument.objects.filter(project=project, memory__kind='digest').count() == 0
 
 
 @pytest.mark.django_db
-def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_daily_work_publishes_output_atomically_without_embedding_under_locks() -> None:
     organization, project = _make_scope('daily-publish')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
 
-    embed_atomic_flags: list[bool] = []
-
-    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
-        embed_atomic_flags.append(connection.in_atomic_block)
-
-    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
-
     result = generate_daily_digest_work_v1(str(work.id))
 
-    assert not any(embed_atomic_flags)
     assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
@@ -1109,29 +1112,26 @@ def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
     document = RetrievalDocument.objects.get(memory=digest_memory)
     assert not document.embedding_vector
     assert document.embedding_reference == ''
+    assert (
+        WorkflowWork.objects.filter(
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            subject_id=document.id,
+        ).count()
+        == 1
+    )
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
 
 @pytest.mark.django_db
-def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_weekly_work_publishes_output_atomically_without_embedding_under_locks() -> None:
     organization, project = _make_scope('weekly-publish')
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_weekly_work(organization, project)
 
-    embed_atomic_flags: list[bool] = []
-
-    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
-        embed_atomic_flags.append(connection.in_atomic_block)
-
-    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
-
     result = generate_weekly_digest_work_v1(str(work.id))
 
-    assert not any(embed_atomic_flags)
     assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
@@ -1142,6 +1142,13 @@ def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
     document = RetrievalDocument.objects.get(memory=digest_memory)
     assert not document.embedding_vector
     assert document.embedding_reference == ''
+    assert (
+        WorkflowWork.objects.filter(
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            subject_id=document.id,
+        ).count()
+        == 1
+    )
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED

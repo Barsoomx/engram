@@ -31,7 +31,6 @@ from engram.context.services import (
     _semantic_retrieval_matches_python,
     authorized_retrieval_documents,
     contains_match_query_terms,
-    derive_retrieval_terms,
     estimate_tokens,
     fuse_retrieval_legs,
     fuse_semantic_lexical,
@@ -46,6 +45,7 @@ from engram.context.services import (
     semantic_retrieval_matches,
     semantic_retrieval_matches_pgvector,
 )
+from engram.context.term_extraction import derive_retrieval_terms
 from engram.core.models import (
     Agent,
     AgentSession,
@@ -66,6 +66,8 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import EMBEDDING_DIMENSION, generated_embedding
 
@@ -734,21 +736,16 @@ def test_index_memory_version_merges_extracted_symbols_and_exact_terms(
     f_scope: tuple[Organization, Project],
 ) -> None:
     organization, project = f_scope
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix='index-terms',
         title='Scope resolver gotcha',
         body='`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.',
-        status=MemoryStatus.APPROVED,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='hash-resolve-scope',
-    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    version = result.memory_version
 
     result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
