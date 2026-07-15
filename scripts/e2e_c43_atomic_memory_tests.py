@@ -153,6 +153,7 @@ def test_deterministic_env_preserves_windows_docker_plugin_discovery() -> None:
         'PATH': 'docker-bin',
         'APPDATA': 'app-data',
         'LOCALAPPDATA': 'local-app-data',
+        'ProgramFiles': 'program-files',
         'XDG_RUNTIME_DIR': 'runtime-dir',
         'UNRELATED_SECRET': 'must-not-leak',
     }
@@ -162,5 +163,6 @@ def test_deterministic_env_preserves_windows_docker_plugin_discovery() -> None:
     assert result['PATH'] == 'docker-bin'
     assert result['APPDATA'] == 'app-data'
     assert result['LOCALAPPDATA'] == 'local-app-data'
+    assert result['ProgramFiles'] == 'program-files'
     assert result['XDG_RUNTIME_DIR'] == 'runtime-dir'
     assert 'UNRELATED_SECRET' not in result
