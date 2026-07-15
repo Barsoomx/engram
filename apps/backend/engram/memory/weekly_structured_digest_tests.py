@@ -10,11 +10,11 @@ from django.utils import timezone
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
-    AuditEvent,
     LinkType,
     Memory,
     MemoryLink,
     MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
     Organization,
     Project,
@@ -659,11 +659,11 @@ def test_team_id_restricts_added_bucket_to_that_team(
 
     mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
 
-    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_out_of_window())
 
     mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
 
-    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_out_of_window())
 
     result = _run(f_org, f_project, team_id=team_a.id)
 
@@ -880,9 +880,7 @@ def test_weekly_digest_emits_digest_generated_audit(
 
     result = _run(f_org, f_project)
 
-    audit = AuditEvent.objects.get(
-        event_type='DigestGenerated',
-        target_id=str(result.digest_memory.id),
-    )
-
-    assert audit.metadata['digest_kind'] == 'weekly_structured'
+    transition = MemoryTransition.objects.get(result_memory=result.digest_memory)
+    assert transition.audit_event.event_type == 'MemoryTransitionCommitted'
+    assert transition.audit_event.metadata['schema'] == 'memory_transition/v1'
+    assert transition.audit_event.metadata['transition_type'] == 'publish_digest'

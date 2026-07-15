@@ -12,6 +12,8 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     Memory,
+    MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
     Organization,
     Project,
@@ -145,7 +147,10 @@ def test_generate_digest_creates_memory_from_sources() -> None:
     assert RetrievalDocument.objects.filter(memory=result.memory).count() == 1
     provider_call = ProviderCallRecord.objects.get(id=result.provider_call_id)
     assert provider_call.task_type == 'digest'
-    assert AuditEvent.objects.filter(event_type='DigestGenerated', target_id=str(result.memory.id)).exists()
+    transition = MemoryTransition.objects.get(result_memory=result.memory)
+    assert transition.audit_event.event_type == 'MemoryTransitionCommitted'
+    assert transition.audit_event.metadata['schema'] == 'memory_transition/v1'
+    assert transition.audit_event.metadata['transition_type'] == 'publish_digest'
 
 
 @pytest.mark.django_db
@@ -215,15 +220,25 @@ def test_legacy_orphan_without_version_or_document_is_not_reused_or_reduplicated
         request_id='digest-orphan-regress',
     )
 
-    seed_result = GenerateDigest().execute(digest_input)
-    orphan_id = seed_result.memory.id
-    MemoryVersion.objects.filter(memory_id=orphan_id).delete()
+    orphan = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Digest orphan',
+        body='legacy orphan digest',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        metadata={
+            'kind': 'digest',
+            'digest_kind': 'daily_structured',
+            'content_hash': digest_content_hash(project.id, (source.id,)),
+        },
+    )
 
     result1 = GenerateDigest().execute(digest_input)
     result2 = GenerateDigest().execute(digest_input)
 
     assert result1.memory.id == result2.memory.id
-    assert result1.memory.id != orphan_id
+    assert result1.memory.id != orphan.id
     assert Memory.objects.filter(metadata__kind='digest', project=project).count() == 2
     assert MemoryVersion.objects.filter(memory=result1.memory).count() == 1
     assert RetrievalDocument.objects.filter(memory=result1.memory).count() == 1
