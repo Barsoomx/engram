@@ -12,6 +12,7 @@ import structlog
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import Q, QuerySet
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 from rest_framework import status as drf_status
 
@@ -25,8 +26,10 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryConflict,
     MemoryLink,
     MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
     Observation,
     Organization,
@@ -1172,7 +1175,17 @@ class MemoryLinkResult:
 MEMORY_LINK_STATUS = {
     'memory_not_found': drf_status.HTTP_404_NOT_FOUND,
     'link_not_found': drf_status.HTTP_404_NOT_FOUND,
+    'semantic_link_protected': drf_status.HTTP_409_CONFLICT,
 }
+
+GENERIC_MEMORY_LINK_TYPES = frozenset(
+    {
+        LinkType.FILE,
+        LinkType.SYMBOL,
+        LinkType.COMMIT,
+        LinkType.ISSUE,
+    },
+)
 
 
 class MemoryLinkError(DomainError):
@@ -1187,6 +1200,12 @@ class MemoryLinkError(DomainError):
 
 class RecordMemoryLink:
     def execute(self, data: MemoryLinkInput) -> MemoryLinkResult:
+        if data.link_type not in GENERIC_MEMORY_LINK_TYPES:
+            raise MemoryLinkError(
+                'semantic_link_requires_transition',
+                'Semantic links must be created by a memory transition',
+            )
+
         scope = data.scope
         with transaction.atomic():
             memory = lock_memory_for_update(scope, data.project_id, data.memory_id, MemoryLinkError)
@@ -1294,7 +1313,27 @@ class RemoveMemoryLink:
 
             link_type = link.link_type
             target = link.target
-            link.delete()
+            if (
+                MemoryTransition.objects.filter(semantic_link_id=link.id).exists()
+                or MemoryConflict.objects.filter(semantic_link_id=link.id).exists()
+            ):
+                raise MemoryLinkError(
+                    'semantic_link_protected',
+                    'Memory link is protected by a memory transition or conflict',
+                )
+            if link_type not in GENERIC_MEMORY_LINK_TYPES:
+                raise MemoryLinkError(
+                    'semantic_link_requires_transition',
+                    'Semantic links must be removed by a memory transition',
+                )
+            try:
+                link.delete()
+            except ProtectedError as error:
+                raise MemoryLinkError(
+                    'semantic_link_protected',
+                    'Memory link is protected by a memory transition or conflict',
+                ) from error
+
             self._audit(memory, scope, data, link_type, target)
 
         return RemoveMemoryLinkResult(memory=memory, link_id=data.link_id, link_type=link_type)

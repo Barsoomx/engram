@@ -11,15 +11,20 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryConflict,
+    MemoryConflictResolution,
+    MemoryLink,
     MemoryStatus,
     MemoryTransition,
     MemoryTransitionType,
     MemoryVersion,
     MemoryVersionSource,
     RetrievalDocument,
+    VisibilityScope,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
@@ -35,7 +40,7 @@ from engram.memory.candidate_decision_work import (
 from engram.memory.distillation_provenance import session_candidate_content_hash
 from engram.memory.projections import create_embedding_work_and_signal, write_exact_memory_projection
 from engram.memory.work_execution import WorkClaim, finish_work_claim, lock_work_fence
-from engram.memory.workflow_work import canonical_json_bytes, resolve_work_succeeded
+from engram.memory.workflow_work import canonical_json_bytes, resolve_work_no_signal, resolve_work_succeeded
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +91,100 @@ class AttachPromotedCandidateSourceInput:
     candidate_fence: CandidateFence
     memory_fence: MemoryFence
     candidate_source_id: uuid.UUID
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PublishDigestMemoryInput:
+    request: TransitionRequest
+    source_memory_fences: tuple[MemoryFence, ...]
+    title: str
+    body: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseMemoryInput:
+    request: TransitionRequest
+    memory_fence: MemoryFence
+    title: str
+    body: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReviseMemoryFromCandidateInput:
+    request: TransitionRequest
+    candidate_fence: CandidateFence
+    memory_fence: MemoryFence
+    title: str
+    body: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergeMemoryCandidateInput:
+    request: TransitionRequest
+    candidate_fence: CandidateFence
+    memory_fence: MemoryFence
+    title: str
+    body: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergeMemoriesInput:
+    request: TransitionRequest
+    source_memory_fence: MemoryFence
+    result_memory_fence: MemoryFence
+    title: str
+    body: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SupersedeMemoryWithCandidateInput:
+    request: TransitionRequest
+    candidate_fence: CandidateFence
+    loser_memory_fence: MemoryFence
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SupersedeMemoriesInput:
+    request: TransitionRequest
+    source_memory_fence: MemoryFence
+    result_memory_fence: MemoryFence
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryStateInput:
+    request: TransitionRequest
+    memory_fence: MemoryFence
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenMemoryConflictInput:
+    request: TransitionRequest
+    candidate_fence: CandidateFence
+    memory_fence: MemoryFence
+    evidence_hash: str
+    redacted_reason: str
+    work_claim: WorkClaim | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ResolveMemoryConflictInput:
+    request: TransitionRequest
+    candidate_fence: CandidateFence
+    conflict_ids: tuple[uuid.UUID, ...]
+    conflict_memory_fences: tuple[MemoryFence, ...]
+    resolution: str
+    selected_memory_fence: MemoryFence | None = None
+    title: str | None = None
+    body: str | None = None
     work_claim: WorkClaim | None = None
 
 
@@ -180,7 +279,37 @@ def _candidate_fence(candidate: MemoryCandidate, fence: CandidateFence) -> None:
         raise MemoryTransitionError('stale_decision', 'candidate fence no longer matches', retryable=True)
 
 
-def _request_fingerprint(request: TransitionRequest, *, action: str, subject_id: uuid.UUID) -> str:
+def _candidate_fence_value(fence: CandidateFence) -> dict[str, object]:
+    return {
+        'candidate_id': str(fence.candidate_id),
+        'candidate_content_hash': fence.candidate_content_hash,
+        'evidence_manifest_hash': fence.evidence_manifest_hash,
+    }
+
+
+def _memory_fence_value(fence: MemoryFence) -> dict[str, object]:
+    return {
+        'memory_id': str(fence.memory_id),
+        'current_transition_id': str(fence.current_transition_id) if fence.current_transition_id else None,
+        'current_version_id': str(fence.current_version_id) if fence.current_version_id else None,
+        'state_hash': fence.state_hash,
+    }
+
+
+def _work_claim_value(claim: WorkClaim | None) -> dict[str, object] | None:
+    if claim is None:
+        return None
+
+    return {'work_id': str(claim.work_id)}
+
+
+def _request_fingerprint(
+    request: TransitionRequest,
+    *,
+    action: str,
+    subject_id: uuid.UUID,
+    command: dict[str, object],
+) -> str:
     value = {
         'schema': 'memory_transition_request/v1',
         'action': action,
@@ -195,6 +324,7 @@ def _request_fingerprint(request: TransitionRequest, *, action: str, subject_id:
         'capability': request.capability,
         'reason': request.reason,
         'origin': request.origin,
+        'command': command,
     }
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -333,7 +463,7 @@ def _finish_candidate_work(
     *,
     claim: WorkClaim | None,
     claimed_work: WorkflowWork | None,
-    result_memory_id: uuid.UUID,
+    result_memory_id: uuid.UUID | None,
 ) -> None:
     decision_work, _created = ensure_candidate_decision_work_locked(candidate)
     if claim is not None:
@@ -342,21 +472,510 @@ def _finish_candidate_work(
         finish_work_claim(
             claim=claim,
             now=timezone.now(),
-            completion='product_succeeded',
+            completion='product_succeeded' if result_memory_id is not None else 'product_no_signal',
             result_memory_id=result_memory_id,
         )
         return
-    resolve_work_succeeded(
-        decision_work.id,
+    if decision_work.disposition != WorkflowWorkDisposition.REQUIRED:
+        return
+    resolver = resolve_work_succeeded if result_memory_id is not None else resolve_work_no_signal
+    resolver(decision_work.id, organization_id=candidate.organization_id, project_id=candidate.project_id)
+
+
+def _lock_optional_work(claim: WorkClaim | None, request: TransitionRequest) -> WorkflowWork | None:
+    if claim is None:
+        return None
+    work, _run = lock_work_fence(claim=claim, now=timezone.now())
+    if not _scope_matches(work, request.scope):
+        raise MemoryTransitionError('scope', 'owning work is outside the declared scope')
+
+    return work
+
+
+def _finish_optional_work(claim: WorkClaim | None, *, result_memory_id: uuid.UUID | None) -> None:
+    if claim is None:
+        return
+    finish_work_claim(
+        claim=claim,
+        now=timezone.now(),
+        completion='product_succeeded' if result_memory_id is not None else 'product_no_signal',
+        result_memory_id=result_memory_id,
+    )
+
+
+def _lock_candidate(request: TransitionRequest, fence: CandidateFence) -> MemoryCandidate:
+    try:
+        candidate = MemoryCandidate.objects.select_for_update().get(id=fence.candidate_id)
+    except MemoryCandidate.DoesNotExist as error:
+        raise MemoryTransitionError('scope', 'candidate is outside the declared scope') from error
+    if not _scope_matches(candidate, request.scope):
+        raise MemoryTransitionError('scope', 'candidate is outside the declared scope')
+
+    return candidate
+
+
+def _declared_fence_ids(fences: tuple[MemoryFence, ...]) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
+    if not fences:
+        raise MemoryTransitionError('memory_state', 'at least one memory fence is required')
+    memory_ids = [fence.memory_id for fence in fences]
+    if len(set(memory_ids)) != len(memory_ids):
+        raise MemoryTransitionError('memory_state', 'memory fences must identify distinct memories')
+    version_ids: list[uuid.UUID] = []
+    for fence in fences:
+        if fence.current_version_id is None:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'memory fence has no declared current version',
+                retryable=True,
+            )
+        version_ids.append(fence.current_version_id)
+
+    return memory_ids, version_ids
+
+
+def _locked_memory_map(
+    request: TransitionRequest,
+    locked_memories: list[Memory],
+    *,
+    expected_count: int,
+) -> dict[uuid.UUID, Memory]:
+    if len(locked_memories) != expected_count:
+        raise MemoryTransitionError('scope', 'a declared memory is outside the available scope')
+    memories = {memory.id: memory for memory in locked_memories}
+    for memory in locked_memories:
+        if not _scope_matches(memory, request.scope):
+            raise MemoryTransitionError('scope', 'memory is outside the declared scope')
+        if memory.transition_contract_version != 1 or memory.current_transition_id is None:
+            raise MemoryTransitionError('memory_state', 'memory is not owned by the transition contract')
+
+    return memories
+
+
+def _locked_version_map(
+    request: TransitionRequest,
+    fences: tuple[MemoryFence, ...],
+    locked_versions: list[MemoryVersion],
+    *,
+    expected_count: int,
+) -> dict[uuid.UUID, MemoryVersion]:
+    if len(locked_versions) != expected_count:
+        raise MemoryTransitionError('stale_decision', 'a declared memory version no longer exists', retryable=True)
+    versions = {version.memory_id: version for version in locked_versions}
+    for fence in fences:
+        version = versions.get(fence.memory_id)
+        if version is None or version.id != fence.current_version_id:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'memory version fence does not match its memory',
+                retryable=True,
+            )
+        if not _scope_matches(version.memory, request.scope):
+            raise MemoryTransitionError('scope', 'memory version is outside the declared scope')
+
+    return versions
+
+
+def _lock_declared_memories(
+    request: TransitionRequest,
+    fences: tuple[MemoryFence, ...],
+) -> tuple[dict[uuid.UUID, Memory], dict[uuid.UUID, MemoryVersion]]:
+    memory_ids, version_ids = _declared_fence_ids(fences)
+
+    locked_memories = list(
+        Memory.objects.select_for_update().filter(id__in=memory_ids).order_by('id')
+    )
+    memories = _locked_memory_map(request, locked_memories, expected_count=len(memory_ids))
+    locked_versions = list(
+        MemoryVersion.objects.select_for_update().filter(id__in=version_ids).order_by('id')
+    )
+    versions = _locked_version_map(request, fences, locked_versions, expected_count=len(version_ids))
+
+    return memories, versions
+
+
+def _lock_exact_documents(versions: dict[uuid.UUID, MemoryVersion]) -> dict[uuid.UUID, RetrievalDocument]:
+    version_ids = [version.id for version in versions.values()]
+    documents = list(
+        RetrievalDocument.objects.select_for_update().filter(memory_version_id__in=version_ids).order_by('id')
+    )
+    if len(documents) != len(version_ids):
+        raise MemoryTransitionError('projection', 'a declared current version has no exact retrieval document')
+
+    return {document.memory_id: document for document in documents}
+
+
+def _verify_memory_fences(memories: dict[uuid.UUID, Memory], fences: tuple[MemoryFence, ...]) -> None:
+    for fence in fences:
+        if build_memory_fence(memories[fence.memory_id]) != fence:
+            raise MemoryTransitionError('stale_decision', 'memory fence no longer matches', retryable=True)
+
+
+def _require_active_memory(memory: Memory) -> None:
+    if memory.status != MemoryStatus.APPROVED or memory.stale or memory.refuted:
+        raise MemoryTransitionError('memory_state', 'memory is not active')
+
+
+def _require_proposed_candidate(candidate: MemoryCandidate) -> None:
+    if candidate.status != CandidateStatus.PROPOSED or candidate.promoted_memory_id is not None:
+        raise MemoryTransitionError('candidate_state', 'only proposed candidates can be settled')
+
+
+def _require_no_open_conflict(candidate: MemoryCandidate) -> None:
+    if MemoryConflict.objects.filter(candidate_id=candidate.id, resolved_transition__isnull=True).exists():
+        raise MemoryTransitionError('unresolved_conflict', 'candidate has unresolved memory conflicts')
+
+
+def _require_sha256(value: str, *, field: str) -> None:
+    if len(value) != 64 or value.lower() != value or any(character not in '0123456789abcdef' for character in value):
+        raise MemoryTransitionError('command', f'{field} must be a lowercase SHA-256 digest')
+
+
+def _content_hash(*, memory_id: uuid.UUID, version: int, title: str, body: str) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                'schema': 'memory_content/v1',
+                'memory_id': str(memory_id),
+                'version': version,
+                'title': title,
+                'body': body,
+            }
+        )
+    ).hexdigest()
+
+
+def _version_source_hash(version: MemoryVersion) -> str:
+    value = version.content_hash
+    if len(value) == 64 and value.lower() == value and all(character in '0123456789abcdef' for character in value):
+        return value
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            {
+                'memory_version_id': str(version.id),
+                'content_hash': value,
+                'body': version.body,
+            }
+        )
+    ).hexdigest()
+
+
+def _create_version_sources(
+    version: MemoryVersion,
+    *,
+    candidate_sources: list[MemoryCandidateSource] | tuple[MemoryCandidateSource, ...] = (),
+    memory_versions: list[MemoryVersion] | tuple[MemoryVersion, ...] = (),
+) -> list[MemoryVersionSource]:
+    if not candidate_sources and not memory_versions:
+        raise MemoryTransitionError('provenance', 'memory version requires non-empty provenance')
+    for source in candidate_sources:
+        MemoryVersionSource.objects.create(
+            organization_id=version.organization_id,
+            project_id=version.project_id,
+            team_id=version.memory.team_id,
+            memory_version=version,
+            candidate_source=source,
+            source_content_hash=source.anchors_hash,
+        )
+    for source_version in memory_versions:
+        MemoryVersionSource.objects.create(
+            organization_id=version.organization_id,
+            project_id=version.project_id,
+            team_id=version.memory.team_id,
+            memory_version=version,
+            source_memory_version=source_version,
+            source_content_hash=_version_source_hash(source_version),
+        )
+    _fault_boundary('source')
+
+    return _version_sources(version)
+
+
+def _current_version_sources(version: MemoryVersion) -> list[MemoryVersionSource]:
+    sources = _version_sources(version)
+    if not sources:
+        raise MemoryTransitionError('provenance', 'current memory version has no transition provenance')
+
+    return sources
+
+
+def _candidate_memory_metadata(candidate: MemoryCandidate, *, title: str, body: str) -> dict[str, object]:
+    observation = candidate.source_observation
+    return {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+        'full_text': f'{title}\n\n{body}'.strip(),
+        'file_paths': [
+            *(observation.files_read if observation else []),
+            *(observation.files_modified if observation else []),
+        ],
+        'source_observation_ids': [str(candidate.source_observation_id)] if candidate.source_observation_id else [],
+        **({'kind': candidate.kind} if candidate.kind else {}),
+    }
+
+
+def _create_candidate_memory(
+    candidate: MemoryCandidate,
+    sources: list[MemoryCandidateSource],
+    *,
+    title: str | None = None,
+    body: str | None = None,
+) -> tuple[Memory, MemoryVersion, list[MemoryVersionSource]]:
+    result_title = title if title is not None else candidate.title
+    result_body = body if body is not None else candidate.body
+    memory = Memory.objects.create(
         organization_id=candidate.organization_id,
         project_id=candidate.project_id,
+        team_id=candidate.team_id,
+        title=result_title,
+        body=result_body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=candidate.visibility_scope,
+        current_version=0,
+        transition_contract_version=0,
+        confidence=candidate.confidence,
+        metadata=_candidate_memory_metadata(candidate, title=result_title, body=result_body),
+    )
+    _fault_boundary('memory')
+    content_hash = (
+        candidate.content_hash
+        if result_title == candidate.title and result_body == candidate.body
+        else _content_hash(memory_id=memory.id, version=1, title=result_title, body=result_body)
+    )
+    version = MemoryVersion.objects.create(
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        memory=memory,
+        source_observation=candidate.source_observation,
+        version=1,
+        body=result_body,
+        content_hash=content_hash,
+        source_metadata={'full_text': f'{result_title}\n\n{result_body}'.strip()},
+    )
+    _fault_boundary('version')
+    version_sources = _create_version_sources(version, candidate_sources=sources)
+
+    return memory, version, version_sources
+
+
+def _revision_metadata(memory: Memory, version: MemoryVersion, *, title: str, body: str) -> dict[str, object]:
+    metadata = dict(memory.metadata) if isinstance(memory.metadata, dict) else {}
+    version_metadata = dict(version.source_metadata) if isinstance(version.source_metadata, dict) else {}
+    metadata.update(version_metadata)
+    metadata['full_text'] = f'{title}\n\n{body}'.strip()
+
+    return metadata
+
+
+def _create_revision_version(
+    memory: Memory,
+    prior_version: MemoryVersion,
+    *,
+    title: str,
+    body: str,
+    candidate_sources: list[MemoryCandidateSource] | tuple[MemoryCandidateSource, ...] = (),
+    extra_source_versions: list[MemoryVersion] | tuple[MemoryVersion, ...] = (),
+) -> tuple[MemoryVersion, list[MemoryVersionSource]]:
+    next_version = memory.current_version + 1
+    metadata = _revision_metadata(memory, prior_version, title=title, body=body)
+    version = MemoryVersion.objects.create(
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        memory=memory,
+        version=next_version,
+        body=body,
+        content_hash=_content_hash(memory_id=memory.id, version=next_version, title=title, body=body),
+        source_metadata=metadata,
+    )
+    _fault_boundary('version')
+    memory.title = title
+    memory.body = body
+    memory.metadata = metadata
+    source_versions = [prior_version, *extra_source_versions]
+    version_sources = _create_version_sources(
+        version,
+        candidate_sources=candidate_sources,
+        memory_versions=source_versions,
+    )
+
+    return version, version_sources
+
+
+def _create_digest_memory(
+    request: TransitionRequest,
+    *,
+    title: str,
+    body: str,
+    source_versions: list[MemoryVersion],
+) -> tuple[Memory, MemoryVersion, list[MemoryVersionSource]]:
+    memory = Memory.objects.create(
+        organization_id=request.scope.organization_id,
+        project_id=request.scope.project_id,
+        team_id=request.scope.team_id,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        current_version=0,
+        transition_contract_version=0,
+        metadata={'kind': 'digest', 'source': 'digest_work', 'full_text': f'{title}\n\n{body}'.strip()},
+    )
+    _fault_boundary('memory')
+    version = MemoryVersion.objects.create(
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        memory=memory,
+        version=1,
+        body=body,
+        content_hash=_content_hash(memory_id=memory.id, version=1, title=title, body=body),
+        source_metadata={'kind': 'digest', 'full_text': f'{title}\n\n{body}'.strip()},
+    )
+    _fault_boundary('version')
+    version_sources = _create_version_sources(version, memory_versions=source_versions)
+
+    return memory, version, version_sources
+
+
+def _create_semantic_link(*, source: Memory, result: Memory, link_type: str) -> MemoryLink:
+    link = MemoryLink.objects.create(
+        organization_id=source.organization_id,
+        project_id=source.project_id,
+        memory=source,
+        link_type=link_type,
+        target=str(result.id),
+        label='',
+    )
+    _fault_boundary('link')
+
+    return link
+
+
+def _create_conflict_link(*, candidate: MemoryCandidate, memory: Memory) -> MemoryLink:
+    link = MemoryLink.objects.create(
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        memory=memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=f'candidate:{candidate.id}',
+        label='',
+    )
+    _fault_boundary('link')
+
+    return link
+
+
+def _commit_transition(
+    *,
+    request: TransitionRequest,
+    transition_id: uuid.UUID,
+    transition_type: str,
+    fingerprint: str,
+    memory: Memory,
+    from_version: MemoryVersion | None,
+    to_version: MemoryVersion,
+    result_memory: Memory,
+    result_version: MemoryVersion,
+    exact_document: RetrievalDocument,
+    result_exact_document: RetrievalDocument,
+    provenance_hash: str,
+    candidate: MemoryCandidate | None = None,
+    embedding_work: WorkflowWork | None = None,
+    semantic_link: MemoryLink | None = None,
+    audit_ids: dict[str, object] | None = None,
+) -> MemoryTransition:
+    ids = {
+        'candidate_id': candidate.id if candidate else None,
+        'memory_id': memory.id,
+        'from_version_id': from_version.id if from_version else None,
+        'to_version_id': to_version.id,
+        'result_memory_id': result_memory.id,
+        'result_version_id': result_version.id,
+        'exact_document_id': exact_document.id,
+        'result_exact_document_id': result_exact_document.id,
+        'exact_projection_hash': exact_document.exact_projection_hash,
+        'result_exact_projection_hash': result_exact_document.exact_projection_hash,
+        'work_id': embedding_work.id if embedding_work else None,
+        'semantic_link_id': semantic_link.id if semantic_link else None,
+        'request_fingerprint': fingerprint,
+        'provenance_hash': provenance_hash,
+        **(audit_ids or {}),
+    }
+    audit = AuditEvent.objects.create(
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        team_id=memory.team_id,
+        event_type='MemoryTransitionCommitted',
+        actor_type=request.actor_type,
+        actor_id=request.actor_id,
+        target_type='memory',
+        target_id=str(memory.id),
+        capability=request.capability,
+        result=AuditResult.RECORDED,
+        request_id=request.request_id,
+        correlation_id=request.correlation_id,
+        metadata=_audit_metadata(request, transition_id, action=transition_type, ids=ids),
+    )
+    _fault_boundary('audit')
+    transition_row = MemoryTransition.objects.create(
+        id=transition_id,
+        organization_id=memory.organization_id,
+        project_id=memory.project_id,
+        team_id=memory.team_id,
+        transition_type=transition_type,
+        idempotency_key=request.idempotency_key,
+        request_fingerprint=fingerprint,
+        candidate=candidate,
+        memory=memory,
+        from_version=from_version,
+        to_version=to_version,
+        result_memory=result_memory,
+        result_version=result_version,
+        exact_document=exact_document,
+        result_exact_document=result_exact_document,
+        embedding_work=embedding_work,
+        semantic_link=semantic_link,
+        audit_event=audit,
+        provenance_hash=provenance_hash,
+    )
+    _fault_boundary('transition')
+
+    return transition_row
+
+
+def _advance_memory_pointer(memory: Memory, transition_row: MemoryTransition, version: MemoryVersion) -> None:
+    memory.body = version.body
+    memory.current_version = version.version
+    memory.transition_contract_version = 1
+    memory.current_transition_id = transition_row.id
+    memory.save(
+        update_fields=[
+            'title',
+            'body',
+            'status',
+            'stale',
+            'refuted',
+            'metadata',
+            'current_version',
+            'transition_contract_version',
+            'current_transition',
+            'updated_at',
+        ]
     )
 
 
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> MemoryTransitionResult:
         request = data.request
-        fingerprint = _request_fingerprint(request, action='promote', subject_id=data.candidate_fence.candidate_id)
+        fingerprint = _request_fingerprint(
+            request,
+            action='promote',
+            subject_id=data.candidate_fence.candidate_id,
+            command={
+                'candidate_fence': _candidate_fence_value(data.candidate_fence),
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
         with transaction.atomic():
             claimed_work = None
             if data.work_claim is not None:
@@ -372,6 +991,7 @@ class PromoteMemoryCandidate:
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
             _candidate_fence(candidate, data.candidate_fence)
+            _require_no_open_conflict(candidate)
             if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
                 raise MemoryTransitionError(
                     'idempotency_collision', 'candidate was already promoted by another request'
@@ -512,7 +1132,17 @@ class PromoteMemoryCandidate:
 class AttachPromotedCandidateSource:
     def execute(self, data: AttachPromotedCandidateSourceInput) -> MemoryTransitionResult:
         request = data.request
-        fingerprint = _request_fingerprint(request, action='attach_source', subject_id=data.candidate_source_id)
+        fingerprint = _request_fingerprint(
+            request,
+            action='attach_source',
+            subject_id=data.candidate_source_id,
+            command={
+                'candidate_fence': _candidate_fence_value(data.candidate_fence),
+                'memory_fence': _memory_fence_value(data.memory_fence),
+                'candidate_source_id': str(data.candidate_source_id),
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
         with transaction.atomic():
             claimed_work = None
             if data.work_claim is not None:
@@ -620,3 +1250,1136 @@ class AttachPromotedCandidateSource:
                 result_memory_id=memory.id,
             )
             return _transition_result(transition)
+
+
+def _write_exact(
+    *,
+    memory: Memory,
+    version: MemoryVersion,
+    transition_id: uuid.UUID,
+    sources: list[MemoryVersionSource],
+) -> RetrievalDocument:
+    return write_exact_memory_projection(
+        memory=memory,
+        version=version,
+        transition_id=transition_id,
+        sources=sources,
+    )
+
+
+def _embedding_for_active_result(memory: Memory, document: RetrievalDocument) -> WorkflowWork | None:
+    if memory.status != MemoryStatus.APPROVED or memory.stale or memory.refuted:
+        return None
+    work, _created = _create_embedding(document)
+    _fault_boundary('work_package')
+
+    return work
+
+
+class PublishDigestMemory:
+    def execute(self, data: PublishDigestMemoryInput) -> MemoryTransitionResult:
+        request = data.request
+        fences = tuple(data.source_memory_fences)
+        fingerprint = _request_fingerprint(
+            request,
+            action='publish_digest',
+            subject_id=data.work_claim.work_id if data.work_claim else request.scope.project_id,
+            command={
+                'source_memory_fences': [
+                    _memory_fence_value(fence) for fence in sorted(fences, key=lambda item: str(item.memory_id))
+                ],
+                'title': data.title,
+                'body': data.body,
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        with transaction.atomic():
+            claimed_work = _lock_optional_work(data.work_claim, request)
+            if claimed_work is not None and claimed_work.work_type not in (
+                WorkflowWorkType.DAILY_DIGEST,
+                WorkflowWorkType.WEEKLY_DIGEST,
+            ):
+                raise MemoryTransitionError('stale_decision', 'owning work is not digest work', retryable=True)
+            memories, versions = _lock_declared_memories(request, fences)
+            _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint)
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            _verify_memory_fences(memories, fences)
+            source_versions = sorted(versions.values(), key=lambda version: str(version.id))
+            memory, version, version_sources = _create_digest_memory(
+                request,
+                title=data.title,
+                body=data.body,
+                source_versions=source_versions,
+            )
+            transition_id = uuid.uuid4()
+            document = _write_exact(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=version_sources,
+            )
+            _fault_boundary('exact_document')
+            embedding_work = _embedding_for_active_result(memory, document)
+            provenance_hash = memory_version_provenance_hash(version_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.PUBLISH_DIGEST,
+                fingerprint=fingerprint,
+                memory=memory,
+                from_version=None,
+                to_version=version,
+                result_memory=memory,
+                result_version=version,
+                exact_document=document,
+                result_exact_document=document,
+                embedding_work=embedding_work,
+                provenance_hash=provenance_hash,
+                audit_ids={'source_version_ids': ','.join(str(item.id) for item in source_versions)},
+            )
+            _advance_memory_pointer(memory, transition_row, version)
+            _fault_boundary('candidate_pointer')
+            _finish_optional_work(data.work_claim, result_memory_id=memory.id)
+
+            return _transition_result(transition_row)
+
+
+class ReviseMemory:
+    def execute(self, data: ReviseMemoryInput) -> MemoryTransitionResult:
+        request = data.request
+        fingerprint = _request_fingerprint(
+            request,
+            action='revise',
+            subject_id=data.memory_fence.memory_id,
+            command={
+                'memory_fence': _memory_fence_value(data.memory_fence),
+                'title': data.title,
+                'body': data.body,
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        fences = (data.memory_fence,)
+        with transaction.atomic():
+            _lock_optional_work(data.work_claim, request)
+            memories, versions = _lock_declared_memories(request, fences)
+            _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint)
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            _verify_memory_fences(memories, fences)
+            memory = memories[data.memory_fence.memory_id]
+            prior_version = versions[memory.id]
+            _require_active_memory(memory)
+            version, version_sources = _create_revision_version(
+                memory,
+                prior_version,
+                title=data.title,
+                body=data.body,
+            )
+            transition_id = uuid.uuid4()
+            document = _write_exact(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=version_sources,
+            )
+            _fault_boundary('exact_document')
+            embedding_work = _embedding_for_active_result(memory, document)
+            provenance_hash = memory_version_provenance_hash(version_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.REVISE,
+                fingerprint=fingerprint,
+                memory=memory,
+                from_version=prior_version,
+                to_version=version,
+                result_memory=memory,
+                result_version=version,
+                exact_document=document,
+                result_exact_document=document,
+                embedding_work=embedding_work,
+                provenance_hash=provenance_hash,
+            )
+            _advance_memory_pointer(memory, transition_row, version)
+            _fault_boundary('candidate_pointer')
+            _finish_optional_work(data.work_claim, result_memory_id=memory.id)
+
+            return _transition_result(transition_row)
+
+
+def _candidate_revision_fingerprint(
+    data: ReviseMemoryFromCandidateInput | MergeMemoryCandidateInput,
+    *,
+    action: str,
+) -> str:
+    return _request_fingerprint(
+        data.request,
+        action=action,
+        subject_id=data.candidate_fence.candidate_id,
+        command={
+            'candidate_fence': _candidate_fence_value(data.candidate_fence),
+            'memory_fence': _memory_fence_value(data.memory_fence),
+            'title': data.title,
+            'body': data.body,
+            'work_claim': _work_claim_value(data.work_claim),
+        },
+    )
+
+
+def _execute_candidate_revision(
+    data: ReviseMemoryFromCandidateInput | MergeMemoryCandidateInput,
+    *,
+    transition_type: str,
+) -> MemoryTransitionResult:
+    request = data.request
+    fingerprint = _candidate_revision_fingerprint(data, action=transition_type)
+    with transaction.atomic():
+        claimed_work = _lock_optional_work(data.work_claim, request)
+        if data.work_claim is None:
+            _lock_unclaimed_candidate_work(request, data.candidate_fence.candidate_id)
+        candidate = _lock_candidate(request, data.candidate_fence)
+        if claimed_work is not None:
+            _require_claimed_candidate_work(claimed_work, candidate)
+        candidate_sources = _source_rows(candidate)
+        fences = (data.memory_fence,)
+        memories, versions = _lock_declared_memories(request, fences)
+        _lock_exact_documents(versions)
+        existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
+        if existing is not None:
+            return _transition_result(existing, duplicate=True)
+        _candidate_fence(candidate, data.candidate_fence)
+        _require_no_open_conflict(candidate)
+        _require_proposed_candidate(candidate)
+        if not candidate_sources:
+            raise MemoryTransitionError('provenance', 'candidate transition requires non-empty provenance')
+        _verify_memory_fences(memories, fences)
+        memory = memories[data.memory_fence.memory_id]
+        prior_version = versions[memory.id]
+        _require_active_memory(memory)
+        version, version_sources = _create_revision_version(
+            memory,
+            prior_version,
+            title=data.title,
+            body=data.body,
+            candidate_sources=candidate_sources,
+        )
+        transition_id = uuid.uuid4()
+        document = _write_exact(
+            memory=memory,
+            version=version,
+            transition_id=transition_id,
+            sources=version_sources,
+        )
+        _fault_boundary('exact_document')
+        embedding_work = _embedding_for_active_result(memory, document)
+        provenance_hash = memory_version_provenance_hash(version_sources)
+        transition_row = _commit_transition(
+            request=request,
+            transition_id=transition_id,
+            transition_type=transition_type,
+            fingerprint=fingerprint,
+            candidate=candidate,
+            memory=memory,
+            from_version=prior_version,
+            to_version=version,
+            result_memory=memory,
+            result_version=version,
+            exact_document=document,
+            result_exact_document=document,
+            embedding_work=embedding_work,
+            provenance_hash=provenance_hash,
+        )
+        _advance_memory_pointer(memory, transition_row, version)
+        candidate.status = CandidateStatus.PROMOTED
+        candidate.promoted_memory_id = memory.id
+        candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+        _fault_boundary('candidate_pointer')
+        _finish_candidate_work(
+            candidate,
+            claim=data.work_claim,
+            claimed_work=claimed_work,
+            result_memory_id=memory.id,
+        )
+
+        return _transition_result(transition_row)
+
+
+class ReviseMemoryFromCandidate:
+    def execute(self, data: ReviseMemoryFromCandidateInput) -> MemoryTransitionResult:
+        return _execute_candidate_revision(data, transition_type=MemoryTransitionType.REVISE)
+
+
+class MergeMemoryCandidate:
+    def execute(self, data: MergeMemoryCandidateInput) -> MemoryTransitionResult:
+        return _execute_candidate_revision(data, transition_type=MemoryTransitionType.MERGE)
+
+
+class MergeMemories:
+    def execute(self, data: MergeMemoriesInput) -> MemoryTransitionResult:
+        request = data.request
+        if data.source_memory_fence.memory_id == data.result_memory_fence.memory_id:
+            raise MemoryTransitionError('memory_state', 'merge requires two distinct memories')
+        fences = (data.source_memory_fence, data.result_memory_fence)
+        fingerprint = _request_fingerprint(
+            request,
+            action='merge',
+            subject_id=data.source_memory_fence.memory_id,
+            command={
+                'source_memory_fence': _memory_fence_value(data.source_memory_fence),
+                'result_memory_fence': _memory_fence_value(data.result_memory_fence),
+                'title': data.title,
+                'body': data.body,
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        with transaction.atomic():
+            _lock_optional_work(data.work_claim, request)
+            memories, versions = _lock_declared_memories(request, fences)
+            _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint)
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            _verify_memory_fences(memories, fences)
+            source = memories[data.source_memory_fence.memory_id]
+            result = memories[data.result_memory_fence.memory_id]
+            source_version = versions[source.id]
+            prior_result_version = versions[result.id]
+            _require_active_memory(source)
+            _require_active_memory(result)
+            version, version_sources = _create_revision_version(
+                result,
+                prior_result_version,
+                title=data.title,
+                body=data.body,
+                extra_source_versions=(source_version,),
+            )
+            source_sources = _current_version_sources(source_version)
+            transition_id = uuid.uuid4()
+            source_document = _write_exact(
+                memory=source,
+                version=source_version,
+                transition_id=transition_id,
+                sources=source_sources,
+            )
+            result_document = _write_exact(
+                memory=result,
+                version=version,
+                transition_id=transition_id,
+                sources=version_sources,
+            )
+            _fault_boundary('exact_document')
+            source_embedding_work, _source_work_created = _create_embedding(source_document)
+            embedding_work = _embedding_for_active_result(result, result_document)
+            link = _create_semantic_link(source=source, result=result, link_type=LinkType.NARROWED_BY)
+            provenance_hash = memory_version_provenance_hash(version_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.MERGE,
+                fingerprint=fingerprint,
+                memory=source,
+                from_version=source_version,
+                to_version=source_version,
+                result_memory=result,
+                result_version=version,
+                exact_document=source_document,
+                result_exact_document=result_document,
+                embedding_work=embedding_work,
+                semantic_link=link,
+                provenance_hash=provenance_hash,
+                audit_ids={'affected_embedding_work_id': source_embedding_work.id},
+            )
+            _advance_memory_pointer(source, transition_row, source_version)
+            _advance_memory_pointer(result, transition_row, version)
+            _fault_boundary('candidate_pointer')
+            _finish_optional_work(data.work_claim, result_memory_id=result.id)
+
+            return _transition_result(transition_row)
+
+
+class SupersedeMemoryWithCandidate:
+    def execute(self, data: SupersedeMemoryWithCandidateInput) -> MemoryTransitionResult:
+        request = data.request
+        fingerprint = _request_fingerprint(
+            request,
+            action='supersede',
+            subject_id=data.candidate_fence.candidate_id,
+            command={
+                'candidate_fence': _candidate_fence_value(data.candidate_fence),
+                'loser_memory_fence': _memory_fence_value(data.loser_memory_fence),
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        with transaction.atomic():
+            claimed_work = _lock_optional_work(data.work_claim, request)
+            if data.work_claim is None:
+                _lock_unclaimed_candidate_work(request, data.candidate_fence.candidate_id)
+            candidate = _lock_candidate(request, data.candidate_fence)
+            if claimed_work is not None:
+                _require_claimed_candidate_work(claimed_work, candidate)
+            candidate_sources = _source_rows(candidate)
+            fences = (data.loser_memory_fence,)
+            memories, versions = _lock_declared_memories(request, fences)
+            _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            _candidate_fence(candidate, data.candidate_fence)
+            _require_no_open_conflict(candidate)
+            _require_proposed_candidate(candidate)
+            if not candidate_sources:
+                raise MemoryTransitionError('provenance', 'candidate supersession requires non-empty provenance')
+            _verify_memory_fences(memories, fences)
+            loser = memories[data.loser_memory_fence.memory_id]
+            loser_version = versions[loser.id]
+            _require_active_memory(loser)
+            result, result_version, result_sources = _create_candidate_memory(candidate, candidate_sources)
+            loser.stale = True
+            loser_sources = _current_version_sources(loser_version)
+            transition_id = uuid.uuid4()
+            loser_document = _write_exact(
+                memory=loser,
+                version=loser_version,
+                transition_id=transition_id,
+                sources=loser_sources,
+            )
+            result_document = _write_exact(
+                memory=result,
+                version=result_version,
+                transition_id=transition_id,
+                sources=result_sources,
+            )
+            _fault_boundary('exact_document')
+            embedding_work = _embedding_for_active_result(result, result_document)
+            link = _create_semantic_link(source=loser, result=result, link_type=LinkType.SUPERSEDED_BY)
+            provenance_hash = memory_version_provenance_hash(result_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.SUPERSEDE,
+                fingerprint=fingerprint,
+                candidate=candidate,
+                memory=loser,
+                from_version=loser_version,
+                to_version=loser_version,
+                result_memory=result,
+                result_version=result_version,
+                exact_document=loser_document,
+                result_exact_document=result_document,
+                embedding_work=embedding_work,
+                semantic_link=link,
+                provenance_hash=provenance_hash,
+            )
+            _advance_memory_pointer(loser, transition_row, loser_version)
+            _advance_memory_pointer(result, transition_row, result_version)
+            candidate.status = CandidateStatus.PROMOTED
+            candidate.promoted_memory_id = result.id
+            candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+            _fault_boundary('candidate_pointer')
+            _finish_candidate_work(
+                candidate,
+                claim=data.work_claim,
+                claimed_work=claimed_work,
+                result_memory_id=result.id,
+            )
+
+            return _transition_result(transition_row)
+
+
+class SupersedeMemories:
+    def execute(self, data: SupersedeMemoriesInput) -> MemoryTransitionResult:
+        request = data.request
+        if data.source_memory_fence.memory_id == data.result_memory_fence.memory_id:
+            raise MemoryTransitionError('memory_state', 'supersession requires two distinct memories')
+        fences = (data.source_memory_fence, data.result_memory_fence)
+        fingerprint = _request_fingerprint(
+            request,
+            action='supersede',
+            subject_id=data.source_memory_fence.memory_id,
+            command={
+                'source_memory_fence': _memory_fence_value(data.source_memory_fence),
+                'result_memory_fence': _memory_fence_value(data.result_memory_fence),
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        with transaction.atomic():
+            _lock_optional_work(data.work_claim, request)
+            memories, versions = _lock_declared_memories(request, fences)
+            _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint)
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            _verify_memory_fences(memories, fences)
+            source = memories[data.source_memory_fence.memory_id]
+            result = memories[data.result_memory_fence.memory_id]
+            source_version = versions[source.id]
+            result_version = versions[result.id]
+            _require_active_memory(source)
+            _require_active_memory(result)
+            source.stale = True
+            source_sources = _current_version_sources(source_version)
+            result_sources = _current_version_sources(result_version)
+            transition_id = uuid.uuid4()
+            source_document = _write_exact(
+                memory=source,
+                version=source_version,
+                transition_id=transition_id,
+                sources=source_sources,
+            )
+            result_document = _write_exact(
+                memory=result,
+                version=result_version,
+                transition_id=transition_id,
+                sources=result_sources,
+            )
+            _fault_boundary('exact_document')
+            embedding_work = _embedding_for_active_result(result, result_document)
+            link = _create_semantic_link(source=source, result=result, link_type=LinkType.SUPERSEDED_BY)
+            provenance_hash = memory_version_provenance_hash(result_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.SUPERSEDE,
+                fingerprint=fingerprint,
+                memory=source,
+                from_version=source_version,
+                to_version=source_version,
+                result_memory=result,
+                result_version=result_version,
+                exact_document=source_document,
+                result_exact_document=result_document,
+                embedding_work=embedding_work,
+                semantic_link=link,
+                provenance_hash=provenance_hash,
+            )
+            _advance_memory_pointer(source, transition_row, source_version)
+            _advance_memory_pointer(result, transition_row, result_version)
+            _fault_boundary('candidate_pointer')
+            _finish_optional_work(data.work_claim, result_memory_id=result.id)
+
+            return _transition_result(transition_row)
+
+
+def _apply_memory_state(memory: Memory, transition_type: str) -> None:
+    if transition_type == MemoryTransitionType.MARK_STALE:
+        _require_active_memory(memory)
+        memory.stale = True
+        return
+    if transition_type == MemoryTransitionType.REFUTE:
+        if memory.status == MemoryStatus.ARCHIVED or memory.refuted:
+            raise MemoryTransitionError('memory_state', 'memory cannot be refuted from its current state')
+        memory.status = MemoryStatus.REFUTED
+        memory.refuted = True
+        return
+    if transition_type == MemoryTransitionType.RESTORE:
+        if memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted:
+            raise MemoryTransitionError('memory_state', 'active memory does not require restoration')
+        memory.status = MemoryStatus.APPROVED
+        memory.stale = False
+        memory.refuted = False
+        return
+    if transition_type == MemoryTransitionType.ARCHIVE:
+        if memory.status == MemoryStatus.ARCHIVED:
+            raise MemoryTransitionError('memory_state', 'memory is already archived')
+        memory.status = MemoryStatus.ARCHIVED
+        memory.stale = True
+        return
+    raise MemoryTransitionError('command', f'unsupported memory state transition {transition_type}')
+
+
+def _execute_memory_state(data: MemoryStateInput, *, transition_type: str) -> MemoryTransitionResult:
+    request = data.request
+    fingerprint = _request_fingerprint(
+        request,
+        action=transition_type,
+        subject_id=data.memory_fence.memory_id,
+        command={
+            'memory_fence': _memory_fence_value(data.memory_fence),
+            'work_claim': _work_claim_value(data.work_claim),
+        },
+    )
+    fences = (data.memory_fence,)
+    with transaction.atomic():
+        _lock_optional_work(data.work_claim, request)
+        memories, versions = _lock_declared_memories(request, fences)
+        _lock_exact_documents(versions)
+        existing = _existing_transition(request, fingerprint=fingerprint)
+        if existing is not None:
+            return _transition_result(existing, duplicate=True)
+        _verify_memory_fences(memories, fences)
+        memory = memories[data.memory_fence.memory_id]
+        version = versions[memory.id]
+        _apply_memory_state(memory, transition_type)
+        version_sources = _current_version_sources(version)
+        transition_id = uuid.uuid4()
+        document = _write_exact(
+            memory=memory,
+            version=version,
+            transition_id=transition_id,
+            sources=version_sources,
+        )
+        _fault_boundary('exact_document')
+        embedding_work = _embedding_for_active_result(memory, document)
+        provenance_hash = memory_version_provenance_hash(version_sources)
+        transition_row = _commit_transition(
+            request=request,
+            transition_id=transition_id,
+            transition_type=transition_type,
+            fingerprint=fingerprint,
+            memory=memory,
+            from_version=version,
+            to_version=version,
+            result_memory=memory,
+            result_version=version,
+            exact_document=document,
+            result_exact_document=document,
+            embedding_work=embedding_work,
+            provenance_hash=provenance_hash,
+        )
+        _advance_memory_pointer(memory, transition_row, version)
+        _fault_boundary('candidate_pointer')
+        _finish_optional_work(data.work_claim, result_memory_id=memory.id)
+
+        return _transition_result(transition_row)
+
+
+class MarkMemoryStale:
+    def execute(self, data: MemoryStateInput) -> MemoryTransitionResult:
+        return _execute_memory_state(data, transition_type=MemoryTransitionType.MARK_STALE)
+
+
+class RefuteMemory:
+    def execute(self, data: MemoryStateInput) -> MemoryTransitionResult:
+        return _execute_memory_state(data, transition_type=MemoryTransitionType.REFUTE)
+
+
+class RestoreMemory:
+    def execute(self, data: MemoryStateInput) -> MemoryTransitionResult:
+        return _execute_memory_state(data, transition_type=MemoryTransitionType.RESTORE)
+
+
+class ArchiveMemory:
+    def execute(self, data: MemoryStateInput) -> MemoryTransitionResult:
+        return _execute_memory_state(data, transition_type=MemoryTransitionType.ARCHIVE)
+
+
+class OpenMemoryConflict:
+    def execute(self, data: OpenMemoryConflictInput) -> MemoryConflict:
+        request = data.request
+        fingerprint = _request_fingerprint(
+            request,
+            action='conflict_open',
+            subject_id=data.candidate_fence.candidate_id,
+            command={
+                'candidate_fence': _candidate_fence_value(data.candidate_fence),
+                'memory_fence': _memory_fence_value(data.memory_fence),
+                'evidence_hash': data.evidence_hash,
+                'redacted_reason': data.redacted_reason,
+                'work_claim': _work_claim_value(data.work_claim),
+            },
+        )
+        with transaction.atomic():
+            claimed_work = _lock_optional_work(data.work_claim, request)
+            if data.work_claim is None:
+                _lock_unclaimed_candidate_work(request, data.candidate_fence.candidate_id)
+            candidate = _lock_candidate(request, data.candidate_fence)
+            if claimed_work is not None:
+                _require_claimed_candidate_work(claimed_work, candidate)
+            candidate_sources = _source_rows(candidate)
+            fences = (data.memory_fence,)
+            memories, versions = _lock_declared_memories(request, fences)
+            memory = memories[data.memory_fence.memory_id]
+            locked_conflicts = list(
+                MemoryConflict.objects.select_for_update()
+                .filter(candidate_id=candidate.id, memory_id=memory.id)
+                .order_by('id')
+            )
+            documents = _lock_exact_documents(versions)
+            existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
+            if existing is not None:
+                try:
+                    return MemoryConflict.objects.get(opened_transition_id=existing.id)
+                except MemoryConflict.DoesNotExist as error:
+                    raise MemoryTransitionError(
+                        'conflict_state',
+                        'conflict transition has no durable conflict',
+                    ) from error
+            _candidate_fence(candidate, data.candidate_fence)
+            _require_proposed_candidate(candidate)
+            if not candidate_sources:
+                raise MemoryTransitionError('provenance', 'conflict candidate requires non-empty provenance')
+            _verify_memory_fences(memories, fences)
+            _require_active_memory(memory)
+            _require_sha256(data.evidence_hash, field='conflict evidence hash')
+            if locked_conflicts:
+                raise MemoryTransitionError('conflict_exists', 'candidate and memory already have conflict evidence')
+            version = versions[memory.id]
+            version_sources = _current_version_sources(version)
+            document = documents[memory.id]
+            link = _create_conflict_link(candidate=candidate, memory=memory)
+            transition_id = uuid.uuid4()
+            provenance_hash = memory_version_provenance_hash(version_sources)
+            transition_row = _commit_transition(
+                request=request,
+                transition_id=transition_id,
+                transition_type=MemoryTransitionType.CONFLICT_OPEN,
+                fingerprint=fingerprint,
+                candidate=candidate,
+                memory=memory,
+                from_version=version,
+                to_version=version,
+                result_memory=memory,
+                result_version=version,
+                exact_document=document,
+                result_exact_document=document,
+                semantic_link=link,
+                provenance_hash=provenance_hash,
+                audit_ids={
+                    'conflict_evidence_hash': data.evidence_hash,
+                    'conflict_reason': data.redacted_reason,
+                },
+            )
+            conflict = MemoryConflict.objects.create(
+                organization_id=memory.organization_id,
+                project_id=memory.project_id,
+                team_id=memory.team_id,
+                candidate=candidate,
+                memory=memory,
+                memory_version=version,
+                semantic_link=link,
+                opened_transition=transition_row,
+                evidence_hash=data.evidence_hash,
+            )
+            _fault_boundary('conflict')
+            _finish_candidate_work(
+                candidate,
+                claim=data.work_claim,
+                claimed_work=claimed_work,
+                result_memory_id=None,
+            )
+
+            return conflict
+
+
+@dataclass(slots=True)
+class _ConflictResolutionLocks:
+    claimed_work: WorkflowWork | None
+    candidate: MemoryCandidate
+    candidate_sources: list[MemoryCandidateSource]
+    memories: dict[uuid.UUID, Memory]
+    versions: dict[uuid.UUID, MemoryVersion]
+    conflicts: list[MemoryConflict]
+    documents: dict[uuid.UUID, RetrievalDocument]
+
+
+@dataclass(slots=True)
+class _ConflictResolutionOutcome:
+    affected_memory: Memory
+    affected_version: MemoryVersion
+    affected_document: RetrievalDocument
+    result_memory: Memory
+    result_version: MemoryVersion
+    result_document: RetrievalDocument
+    embedding_work: WorkflowWork | None
+    semantic_link: MemoryLink | None
+    provenance_hash: str
+    pointer_memories: tuple[tuple[Memory, MemoryVersion], ...]
+
+
+def _normalize_conflict_resolution(
+    data: ResolveMemoryConflictInput,
+) -> tuple[tuple[uuid.UUID, ...], tuple[MemoryFence, ...]]:
+    if data.resolution not in MemoryConflictResolution.values:
+        raise MemoryTransitionError('command', 'unsupported conflict resolution')
+    if not data.conflict_ids or len(set(data.conflict_ids)) != len(data.conflict_ids):
+        raise MemoryTransitionError('stale_decision', 'conflict resolution requires a distinct non-empty set')
+    if len(data.conflict_memory_fences) != len(data.conflict_ids):
+        raise MemoryTransitionError('stale_decision', 'conflict ids and memory fences must be complete')
+
+    return (
+        tuple(sorted(data.conflict_ids, key=str)),
+        tuple(sorted(data.conflict_memory_fences, key=lambda fence: str(fence.memory_id))),
+    )
+
+
+def _conflict_resolution_fingerprint(
+    data: ResolveMemoryConflictInput,
+    conflict_ids: tuple[uuid.UUID, ...],
+    fences: tuple[MemoryFence, ...],
+) -> str:
+    return _request_fingerprint(
+        data.request,
+        action='conflict_resolve',
+        subject_id=data.candidate_fence.candidate_id,
+        command={
+            'candidate_fence': _candidate_fence_value(data.candidate_fence),
+            'conflict_ids': [str(conflict_id) for conflict_id in conflict_ids],
+            'conflict_memory_fences': [_memory_fence_value(fence) for fence in fences],
+            'resolution': data.resolution,
+            'selected_memory_fence': (
+                _memory_fence_value(data.selected_memory_fence) if data.selected_memory_fence else None
+            ),
+            'title': data.title,
+            'body': data.body,
+            'work_claim': _work_claim_value(data.work_claim),
+        },
+    )
+
+
+def _lock_conflict_resolution_rows(
+    data: ResolveMemoryConflictInput,
+    conflict_ids: tuple[uuid.UUID, ...],
+    fences: tuple[MemoryFence, ...],
+) -> _ConflictResolutionLocks:
+    request = data.request
+    claimed_work = _lock_optional_work(data.work_claim, request)
+    if data.work_claim is None:
+        _lock_unclaimed_candidate_work(request, data.candidate_fence.candidate_id)
+    candidate = _lock_candidate(request, data.candidate_fence)
+    if claimed_work is not None:
+        _require_claimed_candidate_work(claimed_work, candidate)
+    candidate_sources = _source_rows(candidate)
+    memories, versions = _lock_declared_memories(request, fences)
+    conflicts = list(MemoryConflict.objects.select_for_update().filter(id__in=conflict_ids).order_by('id'))
+    documents = _lock_exact_documents(versions)
+
+    return _ConflictResolutionLocks(
+        claimed_work=claimed_work,
+        candidate=candidate,
+        candidate_sources=candidate_sources,
+        memories=memories,
+        versions=versions,
+        conflicts=conflicts,
+        documents=documents,
+    )
+
+
+def _validate_conflict_resolution_rows(
+    data: ResolveMemoryConflictInput,
+    conflict_ids: tuple[uuid.UUID, ...],
+    fences: tuple[MemoryFence, ...],
+    locked: _ConflictResolutionLocks,
+) -> dict[uuid.UUID, MemoryFence]:
+    _candidate_fence(locked.candidate, data.candidate_fence)
+    _require_proposed_candidate(locked.candidate)
+    if not locked.candidate_sources:
+        raise MemoryTransitionError('provenance', 'conflict candidate requires non-empty provenance')
+    _verify_memory_fences(locked.memories, fences)
+    if len(locked.conflicts) != len(conflict_ids):
+        raise MemoryTransitionError('stale_decision', 'declared conflict set no longer exists', retryable=True)
+    current_open_ids = tuple(
+        MemoryConflict.objects.filter(candidate_id=locked.candidate.id, resolved_transition__isnull=True)
+        .order_by('id')
+        .values_list('id', flat=True)
+    )
+    if current_open_ids != conflict_ids:
+        raise MemoryTransitionError(
+            'stale_decision',
+            'declared conflicts are not the complete open set',
+            retryable=True,
+        )
+    fence_by_memory = {fence.memory_id: fence for fence in fences}
+    if len(fence_by_memory) != len(fences):
+        raise MemoryTransitionError(
+            'stale_decision',
+            'conflict memory fences must be distinct',
+            retryable=True,
+        )
+    for conflict in locked.conflicts:
+        if not _scope_matches(conflict, data.request.scope) or conflict.candidate_id != locked.candidate.id:
+            raise MemoryTransitionError('scope', 'conflict is outside the declared scope')
+        fence = fence_by_memory.get(conflict.memory_id)
+        if fence is None or conflict.memory_version_id != fence.current_version_id:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'conflict memory version has drifted',
+                retryable=True,
+            )
+
+    return fence_by_memory
+
+
+def _selected_conflict_target(
+    data: ResolveMemoryConflictInput,
+    locked: _ConflictResolutionLocks,
+    fence_by_memory: dict[uuid.UUID, MemoryFence],
+) -> tuple[Memory | None, MemoryVersion | None]:
+    requires_selected = data.resolution in (
+        MemoryConflictResolution.MERGE_CANDIDATE,
+        MemoryConflictResolution.SUPERSEDE_MEMORY,
+    )
+    if requires_selected:
+        if data.selected_memory_fence is None:
+            raise MemoryTransitionError('command', 'selected memory is required for this resolution')
+        declared_selected = fence_by_memory.get(data.selected_memory_fence.memory_id)
+        if declared_selected != data.selected_memory_fence:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'selected memory is not in the conflict set',
+                retryable=True,
+            )
+        memory = locked.memories[data.selected_memory_fence.memory_id]
+        _require_active_memory(memory)
+        return memory, locked.versions[memory.id]
+    if data.selected_memory_fence is not None:
+        raise MemoryTransitionError('command', 'selected memory is not allowed for this resolution')
+
+    return None, None
+
+
+def _validate_conflict_resolution_content(data: ResolveMemoryConflictInput) -> None:
+    if data.resolution != MemoryConflictResolution.REJECT_CANDIDATE and (not data.title or not data.body):
+        raise MemoryTransitionError('command', 'published conflict outcomes require title and body')
+
+
+def _publish_conflict_outcome(
+    data: ResolveMemoryConflictInput,
+    locked: _ConflictResolutionLocks,
+    transition_id: uuid.UUID,
+    base: _ConflictResolutionOutcome,
+) -> _ConflictResolutionOutcome:
+    memory, version, sources = _create_candidate_memory(
+        locked.candidate,
+        locked.candidate_sources,
+        title=data.title,
+        body=data.body,
+    )
+    document = _write_exact(memory=memory, version=version, transition_id=transition_id, sources=sources)
+    _fault_boundary('exact_document')
+    embedding_work = _embedding_for_active_result(memory, document)
+
+    return _ConflictResolutionOutcome(
+        affected_memory=base.affected_memory,
+        affected_version=base.affected_version,
+        affected_document=base.affected_document,
+        result_memory=memory,
+        result_version=version,
+        result_document=document,
+        embedding_work=embedding_work,
+        semantic_link=None,
+        provenance_hash=memory_version_provenance_hash(sources),
+        pointer_memories=((memory, version),),
+    )
+
+
+def _merge_conflict_outcome(
+    data: ResolveMemoryConflictInput,
+    locked: _ConflictResolutionLocks,
+    transition_id: uuid.UUID,
+    selected_memory: Memory,
+    selected_version: MemoryVersion,
+) -> _ConflictResolutionOutcome:
+    version, sources = _create_revision_version(
+        selected_memory,
+        selected_version,
+        title=data.title or '',
+        body=data.body or '',
+        candidate_sources=locked.candidate_sources,
+    )
+    document = _write_exact(memory=selected_memory, version=version, transition_id=transition_id, sources=sources)
+    _fault_boundary('exact_document')
+    embedding_work = _embedding_for_active_result(selected_memory, document)
+
+    return _ConflictResolutionOutcome(
+        affected_memory=selected_memory,
+        affected_version=selected_version,
+        affected_document=document,
+        result_memory=selected_memory,
+        result_version=version,
+        result_document=document,
+        embedding_work=embedding_work,
+        semantic_link=None,
+        provenance_hash=memory_version_provenance_hash(sources),
+        pointer_memories=((selected_memory, version),),
+    )
+
+
+def _supersede_conflict_outcome(
+    data: ResolveMemoryConflictInput,
+    locked: _ConflictResolutionLocks,
+    transition_id: uuid.UUID,
+    selected_memory: Memory,
+    selected_version: MemoryVersion,
+) -> _ConflictResolutionOutcome:
+    selected_memory.stale = True
+    loser_sources = _current_version_sources(selected_version)
+    result_memory, result_version, result_sources = _create_candidate_memory(
+        locked.candidate,
+        locked.candidate_sources,
+        title=data.title,
+        body=data.body,
+    )
+    affected_document = _write_exact(
+        memory=selected_memory,
+        version=selected_version,
+        transition_id=transition_id,
+        sources=loser_sources,
+    )
+    result_document = _write_exact(
+        memory=result_memory,
+        version=result_version,
+        transition_id=transition_id,
+        sources=result_sources,
+    )
+    _fault_boundary('exact_document')
+    embedding_work = _embedding_for_active_result(result_memory, result_document)
+    link = _create_semantic_link(
+        source=selected_memory,
+        result=result_memory,
+        link_type=LinkType.SUPERSEDED_BY,
+    )
+
+    return _ConflictResolutionOutcome(
+        affected_memory=selected_memory,
+        affected_version=selected_version,
+        affected_document=affected_document,
+        result_memory=result_memory,
+        result_version=result_version,
+        result_document=result_document,
+        embedding_work=embedding_work,
+        semantic_link=link,
+        provenance_hash=memory_version_provenance_hash(result_sources),
+        pointer_memories=((selected_memory, selected_version), (result_memory, result_version)),
+    )
+
+
+def _reject_conflict_outcome(locked: _ConflictResolutionLocks) -> _ConflictResolutionOutcome:
+    first_conflict = locked.conflicts[0]
+    memory = locked.memories[first_conflict.memory_id]
+    version = locked.versions[memory.id]
+    document = locked.documents[memory.id]
+    sources = _current_version_sources(version)
+
+    return _ConflictResolutionOutcome(
+        affected_memory=memory,
+        affected_version=version,
+        affected_document=document,
+        result_memory=memory,
+        result_version=version,
+        result_document=document,
+        embedding_work=None,
+        semantic_link=None,
+        provenance_hash=memory_version_provenance_hash(sources),
+        pointer_memories=(),
+    )
+
+
+def _build_conflict_resolution_outcome(
+    data: ResolveMemoryConflictInput,
+    locked: _ConflictResolutionLocks,
+    transition_id: uuid.UUID,
+    selected_memory: Memory | None,
+    selected_version: MemoryVersion | None,
+) -> _ConflictResolutionOutcome:
+    base = _reject_conflict_outcome(locked)
+    if data.resolution == MemoryConflictResolution.PUBLISH_CANDIDATE:
+        return _publish_conflict_outcome(data, locked, transition_id, base)
+    if data.resolution == MemoryConflictResolution.MERGE_CANDIDATE:
+        if selected_memory is None or selected_version is None:
+            raise MemoryTransitionError('command', 'selected merge memory is missing')
+        return _merge_conflict_outcome(data, locked, transition_id, selected_memory, selected_version)
+    if data.resolution == MemoryConflictResolution.SUPERSEDE_MEMORY:
+        if selected_memory is None or selected_version is None:
+            raise MemoryTransitionError('command', 'selected superseded memory is missing')
+        return _supersede_conflict_outcome(data, locked, transition_id, selected_memory, selected_version)
+
+    return base
+
+
+def _commit_conflict_resolution(
+    data: ResolveMemoryConflictInput,
+    conflict_ids: tuple[uuid.UUID, ...],
+    fingerprint: str,
+    transition_id: uuid.UUID,
+    locked: _ConflictResolutionLocks,
+    outcome: _ConflictResolutionOutcome,
+) -> MemoryTransitionResult:
+    to_version = (
+        outcome.result_version
+        if outcome.affected_memory.id == outcome.result_memory.id
+        else outcome.affected_version
+    )
+    transition_row = _commit_transition(
+        request=data.request,
+        transition_id=transition_id,
+        transition_type=MemoryTransitionType.CONFLICT_RESOLVE,
+        fingerprint=fingerprint,
+        candidate=locked.candidate,
+        memory=outcome.affected_memory,
+        from_version=outcome.affected_version,
+        to_version=to_version,
+        result_memory=outcome.result_memory,
+        result_version=outcome.result_version,
+        exact_document=outcome.affected_document,
+        result_exact_document=outcome.result_document,
+        embedding_work=outcome.embedding_work,
+        semantic_link=outcome.semantic_link,
+        provenance_hash=outcome.provenance_hash,
+        audit_ids={
+            'conflict_ids': ','.join(str(conflict_id) for conflict_id in conflict_ids),
+            'resolution': data.resolution,
+        },
+    )
+    for memory, version in outcome.pointer_memories:
+        _advance_memory_pointer(memory, transition_row, version)
+    rejected = data.resolution == MemoryConflictResolution.REJECT_CANDIDATE
+    locked.candidate.status = CandidateStatus.REJECTED if rejected else CandidateStatus.PROMOTED
+    locked.candidate.promoted_memory_id = None if rejected else outcome.result_memory.id
+    locked.candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+    _fault_boundary('resolution')
+    closed = MemoryConflict.objects.filter(
+        id__in=conflict_ids,
+        resolved_transition__isnull=True,
+    ).update(
+        resolved_transition=transition_row,
+        resolution=data.resolution,
+        resolved_at=timezone.now(),
+    )
+    if closed != len(conflict_ids):
+        raise MemoryTransitionError('stale_decision', 'conflict set changed while resolving', retryable=True)
+    _fault_boundary('conflict')
+    _finish_candidate_work(
+        locked.candidate,
+        claim=data.work_claim,
+        claimed_work=locked.claimed_work,
+        result_memory_id=None if rejected else outcome.result_memory.id,
+    )
+
+    return _transition_result(transition_row)
+
+
+class ResolveMemoryConflict:
+    def execute(self, data: ResolveMemoryConflictInput) -> MemoryTransitionResult:
+        conflict_ids, fences = _normalize_conflict_resolution(data)
+        fingerprint = _conflict_resolution_fingerprint(data, conflict_ids, fences)
+        with transaction.atomic():
+            locked = _lock_conflict_resolution_rows(data, conflict_ids, fences)
+            existing = _existing_transition(
+                data.request,
+                fingerprint=fingerprint,
+                subject_id=locked.candidate.id,
+            )
+            if existing is not None:
+                return _transition_result(existing, duplicate=True)
+            fence_by_memory = _validate_conflict_resolution_rows(data, conflict_ids, fences, locked)
+            selected_memory, selected_version = _selected_conflict_target(data, locked, fence_by_memory)
+            _validate_conflict_resolution_content(data)
+            transition_id = uuid.uuid4()
+            outcome = _build_conflict_resolution_outcome(
+                data,
+                locked,
+                transition_id,
+                selected_memory,
+                selected_version,
+            )
+            return _commit_conflict_resolution(
+                data,
+                conflict_ids,
+                fingerprint,
+                transition_id,
+                locked,
+                outcome,
+            )

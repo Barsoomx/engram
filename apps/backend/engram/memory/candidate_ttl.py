@@ -7,10 +7,10 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q, QuerySet
+from django.db.models import Exists, OuterRef, Q, QuerySet
 from django.utils import timezone
 
-from engram.core.models import CandidateStatus, MemoryCandidate, Organization
+from engram.core.models import CandidateStatus, MemoryCandidate, MemoryConflict, Organization
 from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.memory.curation import _audit_curator_action
 from engram.memory.services import redact_text, resolve_auto_approve_threshold
@@ -28,10 +28,14 @@ class ExpireStaleCandidates:
     def execute(self) -> ExpireStaleCandidatesResult:
         cutoff = timezone.now() - timedelta(days=settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS)
 
+        unresolved_conflicts = MemoryConflict.objects.filter(
+            candidate_id=OuterRef('pk'),
+            resolved_transition__isnull=True,
+        )
         stale = MemoryCandidate.objects.filter(
             status=CandidateStatus.PROPOSED,
             created_at__lt=cutoff,
-        )
+        ).filter(~Exists(unresolved_conflicts))
         thresholds = self._resolve_thresholds(stale)
         if not thresholds:
             return ExpireStaleCandidatesResult(scanned=0, rejected=0)
@@ -71,6 +75,11 @@ class ExpireStaleCandidates:
                 .select_related('organization', 'project', 'team', 'source_observation')
             )
             for candidate in locked:
+                if MemoryConflict.objects.filter(
+                    candidate_id=candidate.id,
+                    resolved_transition__isnull=True,
+                ).exists():
+                    continue
                 candidate.status = CandidateStatus.REJECTED
                 candidate.save(update_fields=['status', 'updated_at'])
                 clear_candidate_conflict_links(candidate)
