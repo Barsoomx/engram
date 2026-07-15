@@ -1297,8 +1297,9 @@ def test_import_materializes_v1_observation_sequences_and_prompt_no_op(
     assert observation_raw_events.filter(normalization_reason__isnull=True).count() == 2
     assert observation_raw_events.filter(sequence_number__in=[1, 2]).count() == 2
     assert ObservationSource.objects.filter(observation__session=session).count() == 2
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 2
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 2
 
     prompt_raw_event = RawEventEnvelope.objects.get(event_type='claude_mem.user_prompt')
     assert prompt_raw_event.normalization_contract_version == 1
@@ -1441,8 +1442,9 @@ def test_import_binds_session_scoped_legacy_observation_and_reuses_sequence(
     assert Observation.objects.count() == 1
     assert session.observation_sequence_cursor == 7
     assert Observation.objects.filter(id=observation.id, session_sequence=7).count() == 1
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 1
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 1
 
 
 @pytest.mark.django_db
