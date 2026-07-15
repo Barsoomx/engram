@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import uuid
 from collections import Counter
 from dataclasses import dataclass
@@ -623,6 +624,13 @@ def _vector_values(value: object) -> list[float] | None:
         return None
 
 
+def _vectors_match(left: list[float], right: list[float]) -> bool:
+    return len(left) == len(right) and all(
+        math.isclose(left_value, right_value, rel_tol=1e-6, abs_tol=1e-6)
+        for left_value, right_value in zip(left, right, strict=True)
+    )
+
+
 def _embedding_issue(document: RetrievalDocument) -> str | None:
     json_vector = _vector_values(document.embedding_vector) or []
     pgvector = _vector_values(getattr(document, 'embedding_pgvector', None))
@@ -644,7 +652,7 @@ def _embedding_issue(document: RetrievalDocument) -> str | None:
             json_vector != [],
             document.embedding_projection_hash == document.exact_projection_hash,
             document.embedding_projected_at is not None,
-            VectorField is None or (pgvector is not None and pgvector == json_vector),
+            VectorField is None or (pgvector is not None and _vectors_match(pgvector, json_vector)),
         )
     )
 
