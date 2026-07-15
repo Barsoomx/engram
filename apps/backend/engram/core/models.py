@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import uuid
 from decimal import Decimal
 
@@ -53,6 +54,41 @@ class VisibilityScope(models.TextChoices):
     PROJECT = 'project', 'Project'
     TEAM = 'team', 'Team'
     ORGANIZATION = 'organization', 'Organization'
+
+
+class CurationOutcome(models.TextChoices):
+    PUBLISH_NEW = 'publish_new', 'Publish new'
+    MERGE_EVIDENCE = 'merge_evidence', 'Merge evidence'
+    REVISE_MEMORY = 'revise_memory', 'Revise memory'
+    SUPERSEDE_MEMORY = 'supersede_memory', 'Supersede memory'
+    REJECT_CANDIDATE = 'reject_candidate', 'Reject candidate'
+    OPEN_CONFLICT = 'open_conflict', 'Open conflict'
+
+
+class CurationReasonCode(models.TextChoices):
+    NOISE_EMPTY = 'noise_empty', 'Noise: empty'
+    NOISE_TITLE_ECHO = 'noise_title_echo', 'Noise: title echo'
+    NOISE_REDACTION_ONLY = 'noise_redaction_only', 'Noise: redaction only'
+    NOISE_PARSE_WRAPPER = 'noise_parse_wrapper', 'Noise: parse wrapper'
+    NOISE_LIFECYCLE_ONLY = 'noise_lifecycle_only', 'Noise: lifecycle only'
+    UNSUPPORTED_PROVENANCE = 'unsupported_provenance', 'Unsupported provenance'
+    UNSAFE_CONTENT_AFTER_REDACTION = 'unsafe_content_after_redaction', 'Unsafe content after redaction'
+    NON_DURABLE_SESSION_SCOPE = 'non_durable_session_scope', 'Non-durable session scope'
+    EXACT_IDENTITY = 'exact_identity', 'Exact identity'
+    EXACT_DUPLICATE_NO_NEW_EVIDENCE = 'exact_duplicate_no_new_evidence', 'Exact duplicate without new evidence'
+    DISTINCT_CLAIM = 'distinct_claim', 'Distinct claim'
+    EQUIVALENT_CLAIM = 'equivalent_claim', 'Equivalent claim'
+    SAME_SUBJECT_REVISION = 'same_subject_revision', 'Same subject revision'
+    ORDERED_REPLACEMENT = 'ordered_replacement', 'Ordered replacement'
+    REDUNDANT_CLAIM = 'redundant_claim', 'Redundant claim'
+    UNSUPPORTED_CLAIM = 'unsupported_claim', 'Unsupported claim'
+    SAME_SCOPE_CONTRADICTION = 'same_scope_contradiction', 'Same-scope contradiction'
+
+
+class EvidenceTier(models.TextChoices):
+    NONE = 'none', 'None'
+    SUPPORTED = 'supported', 'Supported'
+    CORROBORATED = 'corroborated', 'Corroborated'
 
 
 class CandidateStatus(models.TextChoices):
@@ -2731,4 +2767,167 @@ class MemoryConflict(ImmutableCreatedModel):
                 or self.resolved_at != persisted['resolved_at']
             ):
                 add_scope_error(errors, 'resolution', 'resolved conflict fields are immutable after close')
+        raise_scope_errors(errors)
+
+
+class CurationDecision(ImmutableCreatedModel):
+    organization = models.ForeignKey(Organization, on_delete=models.PROTECT, related_name='curation_decisions')
+    project = models.ForeignKey(Project, on_delete=models.PROTECT, related_name='curation_decisions')
+    team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='curation_decisions',
+        null=True,
+        blank=True,
+    )
+    work = models.OneToOneField(WorkflowWork, on_delete=models.PROTECT, related_name='curation_decision')
+    candidate = models.ForeignKey(MemoryCandidate, on_delete=models.PROTECT, related_name='curation_decisions')
+    contract_version = models.PositiveSmallIntegerField(default=1)
+    input_fingerprint = models.CharField(max_length=64)
+    evidence_manifest_hash = models.CharField(max_length=64)
+    comparison_manifest_hash = models.CharField(max_length=64)
+    outcome = models.CharField(max_length=40, choices=CurationOutcome.choices)
+    reason_code = models.CharField(max_length=64, choices=CurationReasonCode.choices)
+    redacted_reason = models.CharField(max_length=500, blank=True, default='')
+    effective_visibility_scope = models.CharField(max_length=40, choices=VisibilityScope.choices)
+    effective_team = models.ForeignKey(
+        Team,
+        on_delete=models.PROTECT,
+        related_name='effective_curation_decisions',
+        null=True,
+        blank=True,
+    )
+    target_memory_version = models.ForeignKey(
+        MemoryVersion,
+        on_delete=models.PROTECT,
+        related_name='target_curation_decisions',
+        null=True,
+        blank=True,
+    )
+    evidence_tier = models.CharField(max_length=20, choices=EvidenceTier.choices)
+    provider_call_record = models.ForeignKey(
+        'model_policy.ProviderCallRecord',
+        on_delete=models.PROTECT,
+        related_name='curation_decisions',
+        null=True,
+        blank=True,
+    )
+    policy = models.ForeignKey(
+        'model_policy.ModelPolicy',
+        on_delete=models.PROTECT,
+        related_name='curation_decisions',
+        null=True,
+        blank=True,
+    )
+    policy_version = models.PositiveIntegerField(null=True, blank=True)
+    transition = models.OneToOneField(
+        MemoryTransition,
+        on_delete=models.PROTECT,
+        related_name='curation_decision',
+        null=True,
+        blank=True,
+    )
+    conflict = models.ForeignKey(
+        MemoryConflict,
+        on_delete=models.PROTECT,
+        related_name='curation_decisions',
+        null=True,
+        blank=True,
+    )
+    payload_hash = models.CharField(max_length=64)
+
+    _IMMUTABLE_FIELDS = (
+        ('organization_id', 'organization'),
+        ('project_id', 'project'),
+        ('team_id', 'team'),
+        ('work_id', 'work'),
+        ('candidate_id', 'candidate'),
+        ('contract_version', 'contract_version'),
+        ('input_fingerprint', 'input_fingerprint'),
+        ('evidence_manifest_hash', 'evidence_manifest_hash'),
+        ('comparison_manifest_hash', 'comparison_manifest_hash'),
+        ('outcome', 'outcome'),
+        ('reason_code', 'reason_code'),
+        ('redacted_reason', 'redacted_reason'),
+        ('effective_visibility_scope', 'effective_visibility_scope'),
+        ('effective_team_id', 'effective_team'),
+        ('target_memory_version_id', 'target_memory_version'),
+        ('evidence_tier', 'evidence_tier'),
+        ('provider_call_record_id', 'provider_call_record'),
+        ('policy_id', 'policy'),
+        ('policy_version', 'policy_version'),
+        ('transition_id', 'transition'),
+        ('conflict_id', 'conflict'),
+        ('payload_hash', 'payload_hash'),
+    )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(contract_version=1),
+                name='core_curation_decision_contract_ck',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(effective_visibility_scope=VisibilityScope.PROJECT, effective_team__isnull=True)
+                    | models.Q(effective_visibility_scope=VisibilityScope.TEAM, effective_team__isnull=False)
+                ),
+                name='core_curation_decision_effective_scope_ck',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['organization', 'project', 'created_at'], name='core_curdec_scope_time_idx'),
+            models.Index(fields=['candidate'], name='core_curdec_candidate_idx'),
+        ]
+        ordering = ['organization_id', 'project_id', 'created_at']
+
+    def clean(self) -> None:
+        errors: dict[str, list[str]] = {}
+        if self.project_id:
+            check_project_organization(errors, 'project', self.project, self.organization_id)
+        if self.team_id:
+            check_organization_scope(errors, 'team', self.team, self.organization_id)
+        for field, related in (
+            ('candidate', self.candidate),
+            ('work', self.work),
+            ('target_memory_version', self.target_memory_version),
+            ('transition', self.transition),
+            ('conflict', self.conflict),
+            ('provider_call_record', self.provider_call_record),
+        ):
+            if related is not None:
+                check_project_scope(errors, field, related, self.organization_id, self.project_id)
+        if self.effective_team_id:
+            check_organization_scope(errors, 'effective_team', self.effective_team, self.organization_id)
+        if self.effective_visibility_scope not in (VisibilityScope.PROJECT, VisibilityScope.TEAM):
+            add_scope_error(errors, 'effective_visibility_scope', 'curation decisions require project or team scope')
+        elif self.effective_visibility_scope == VisibilityScope.PROJECT and self.effective_team_id:
+            add_scope_error(errors, 'effective_team', 'project scope cannot include effective team')
+        elif self.effective_visibility_scope == VisibilityScope.TEAM and not self.effective_team_id:
+            add_scope_error(errors, 'effective_team', 'team scope requires effective team')
+
+        if self.contract_version != 1:
+            add_scope_error(errors, 'contract_version', 'curation decision contract version must be 1')
+        for field in ('input_fingerprint', 'evidence_manifest_hash', 'comparison_manifest_hash', 'payload_hash'):
+            if re.fullmatch(r'[0-9a-f]{64}', getattr(self, field, '')) is None:
+                add_scope_error(errors, field, f'{field} must be a lowercase SHA-256 hash')
+
+        references = (self.provider_call_record_id, self.policy_id, self.policy_version)
+        if any(value is not None for value in references) and not all(value is not None for value in references):
+            add_scope_error(errors, 'provider_call_record', 'provider call, policy, and policy version must be set together')
+        elif all(value is not None for value in references):
+            if self.policy.project_id:
+                check_project_scope(errors, 'policy', self.policy, self.organization_id, self.project_id)
+            else:
+                check_organization_scope(errors, 'policy', self.policy, self.organization_id)
+            if self.policy.team_id:
+                check_organization_scope(errors, 'policy', self.policy.team, self.organization_id)
+            if self.provider_call_record.policy_id != self.policy_id:
+                add_scope_error(errors, 'policy', 'provider call policy must match policy')
+            if self.provider_call_record.policy_version != self.policy_version:
+                add_scope_error(errors, 'policy_version', 'provider call policy version must match policy version')
+            if self.policy.version != self.policy_version:
+                add_scope_error(errors, 'policy_version', 'policy version must match policy version')
+
+        enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
