@@ -61,6 +61,7 @@ from engram.memory.distillation_provenance import candidate_source_anchors, cano
 from engram.memory.distillation_provider_stage import stage_key as provider_stage_key
 from engram.memory.distillation_provider_stage import stage_target_key
 from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.import_provenance import candidate_evidence_manifest
 from engram.memory.invariant_queries import (
     InvariantId,
     InvariantResult,
@@ -73,6 +74,7 @@ from engram.memory.reconciler_test_support import StubBuilder, ended_session_wor
 from engram.memory.transitions_test_support import (
     candidate_fence_for,
     candidate_in_scope,
+    import_provenanced_candidate,
     open_single_conflict,
     promoted_pair,
     provenanced_candidate,
@@ -2545,6 +2547,53 @@ def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -
         work_type=WorkflowWorkType.CANDIDATE_DECISION,
         subject_id=candidate.id,
     ).exists()
+
+
+@pytest.mark.django_db
+def test_p7_marks_import_candidate_with_non_promote_transition_violated() -> None:
+    candidate, _source, (organization, project, session) = import_provenanced_candidate('p7-import-transition')
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    MemoryTransition.objects.filter(id=result.transition.id).update(transition_type=MemoryTransitionType.MERGE)
+
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+
+    assert p7.state == InvariantState.VIOLATED
+    assert p7.violation_count is not None and p7.violation_count >= 1
+    assert f'candidate:{candidate.id}' in p7.sample_ids
+
+
+@pytest.mark.django_db
+def test_p7_marks_import_candidate_with_any_candidate_decision_work_violated() -> None:
+    candidate, _source, (organization, project, session) = import_provenanced_candidate('p7-import-work')
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
+    create_work(
+        CreateWorkflowWorkInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+            subject_id=candidate.id,
+            input_snapshot={
+                'schema': 'candidate_decision_input/v1',
+                'candidate_id': str(candidate.id),
+                'candidate_content_hash': candidate.content_hash,
+                'organization_id': str(organization.id),
+                'project_id': str(project.id),
+                'team_id': str(session.team.id),
+                'evidence_manifest_hash': manifest_hash,
+                'policy_version': 1,
+            },
+        ),
+    )
+
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+
+    candidate.refresh_from_db()
+    assert result.memory.id == candidate.promoted_memory_id
+    assert p7.state == InvariantState.VIOLATED
+    assert p7.violation_count is not None and p7.violation_count >= 1
+    assert f'candidate:{candidate.id}' in p7.sample_ids
 
 
 @pytest.mark.django_db
