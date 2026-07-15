@@ -654,6 +654,10 @@ def test_refute_restore_concurrency_serializes_to_one_coherent_state() -> None:
         request=_request_for(candidate, key=f'request:{uuid.uuid4()}:restore:{promoted.memory.id}:v1'),
         memory_fence=_transitions().build_memory_fence(promoted.memory),
     )
+    stale_refute = replace(
+        refute,
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:refute:{promoted.memory.id}:v1'),
+    )
     barrier = threading.Barrier(2)
 
     def worker(command: object, payload: MemoryStateInput) -> tuple[object | None, BaseException | None]:
@@ -667,7 +671,7 @@ def test_refute_restore_concurrency_serializes_to_one_coherent_state() -> None:
             close_old_connections()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(worker, (RestoreMemory(), RefuteMemory()), (restore, refute)))
+        results = list(executor.map(worker, (RestoreMemory(), RefuteMemory()), (restore, stale_refute)))
     assert sum(result is not None for result, _error in results) == 1
     assert sum(getattr(error, 'code', None) == 'stale_decision' for _result, error in results) == 1
     promoted.memory.refresh_from_db()
