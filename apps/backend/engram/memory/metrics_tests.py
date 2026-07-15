@@ -68,13 +68,15 @@ def test_consistency_reporter_counts_issues_by_bounded_code_and_classification()
     report = consistency.MemoryConsistencyReporter().execute(_report_input(scope))
 
     assert any(issue.code == 'exact_projection_missing_or_mismatched' for issue in report.issues)
-    assert metrics.consistency_issues_total.value(
-        code='exact_projection_missing_or_mismatched',
-        classification='rebuild_exact',
-    ) == 1.0
+    assert (
+        metrics.consistency_issues_total.value(
+            code='exact_projection_missing_or_mismatched',
+            classification='rebuild_exact',
+        )
+        == 1.0
+    )
     assert all(
-        set(labels) == {'code', 'classification'}
-        for labels, _value in metrics.consistency_issues_total.samples()
+        set(labels) == {'code', 'classification'} for labels, _value in metrics.consistency_issues_total.samples()
     )
 
 
@@ -96,6 +98,5 @@ def test_projection_rebuild_counts_kind_mode_and_outcome_only() -> None:
     assert metrics.projection_rebuilds_total.value(kind='exact', mode='apply', outcome='changed') == 1.0
     assert metrics.projection_rebuilds_total.value(kind='embedding', mode='dry_run', outcome='skipped') == 1.0
     assert all(
-        set(labels) == {'kind', 'mode', 'outcome'}
-        for labels, _value in metrics.projection_rebuilds_total.samples()
+        set(labels) == {'kind', 'mode', 'outcome'} for labels, _value in metrics.projection_rebuilds_total.samples()
     )
