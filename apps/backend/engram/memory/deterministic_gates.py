@@ -118,6 +118,8 @@ class DeterministicGateResult:
             elif self.terminal_outcome == DeterministicTerminalOutcome.MERGE_EVIDENCE:
                 if self.target_memory_version_id is None or self.requires_transition is None:
                     raise ValueError('merge requires target and transition flag')
+            else:
+                raise ValueError('unsupported deterministic terminal outcome')
         elif self.disposition == DeterministicGateDisposition.RETRY:
             if not self.operational_reason or any(
                 value is not None
@@ -240,6 +242,8 @@ def _scope_for(candidate: MemoryCandidate, sources: list[MemoryCandidateSource])
     if candidate.visibility_scope == VisibilityScope.PROJECT:
         return EffectiveCandidateScope(VisibilityScope.PROJECT, None)
     if candidate.visibility_scope == VisibilityScope.TEAM:
+        if not sources and candidate.team_id is not None:
+            return EffectiveCandidateScope(VisibilityScope.TEAM, candidate.team_id)
         if candidate.team_id is None or source_teams != {candidate.team_id}:
             raise CandidateDecisionWorkScopeError('team scope is not preserved by evidence')
         return EffectiveCandidateScope(VisibilityScope.TEAM, candidate.team_id)
@@ -324,11 +328,14 @@ class EvaluateDeterministicCandidateGates:
                 return self._reject(view, scope, CurationReasonCode.NON_DURABLE_SESSION_SCOPE)
             if not sources:
                 return self._reject(view, scope, CurationReasonCode.UNSUPPORTED_PROVENANCE)
+            if any(
+                SECRET_STRING_RE.search(item)
+                for item in _strings({'title': view.title, 'body': view.body, 'evidence': view.evidence})
+            ):
+                return self._reject(view, scope, CurationReasonCode.UNSAFE_CONTENT_AFTER_REDACTION)
             result = self._evaluate_noise(candidate, sources, view, scope)
             if result is not None:
                 return result
-            if any(SECRET_STRING_RE.search(item) for item in _strings({'title': view.title, 'body': view.body, 'evidence': view.evidence})):
-                return self._reject(view, scope, CurationReasonCode.UNSAFE_CONTENT_AFTER_REDACTION)
             claim = _claim_bytes(view, scope)
             claim_hash = hashlib.sha256(claim).hexdigest()
             matches: list[MemoryVersion] = []
@@ -457,22 +464,14 @@ class EvaluateDeterministicCandidateGates:
         if title and title == body:
             return self._reject(view, scope, CurationReasonCode.NOISE_TITLE_ECHO)
         entries = _evidence_entries(candidate.evidence)
-        if any(isinstance(entry, dict) and entry.get('parse_fallback') is True for entry in entries):
-            matching = any(
-                isinstance(entry, dict)
-                and any(
-                    str(item) == str(source.observation_id)
-                    for item in (
-                        [entry.get('supporting_observation_ids')]
-                        if isinstance(entry.get('supporting_observation_ids'), str)
-                        else entry.get('supporting_observation_ids', [])
-                    )
-                )
-                for entry in entries
-                for source in sources
-            )
-            if not matching:
-                return self._reject(view, scope, CurationReasonCode.NOISE_PARSE_WRAPPER)
+        for entry in entries:
+            if isinstance(entry, dict) and entry.get('parse_fallback') is True:
+                values = entry.get('supporting_observation_ids', [])
+                if isinstance(values, str):
+                    values = [values]
+                matching = any(str(item) == str(source.observation_id) for item in values for source in sources)
+                if not matching:
+                    return self._reject(view, scope, CurationReasonCode.NOISE_PARSE_WRAPPER)
         if sources and all(
             source.observation.observation_type in _LIFECYCLE_TYPES
             or source.observation.source_metadata.get('event_type') in _LIFECYCLE_TYPES
