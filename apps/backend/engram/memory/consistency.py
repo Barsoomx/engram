@@ -27,6 +27,7 @@ from engram.core.models import (
     VectorField,
 )
 from engram.memory.aware_time import require_aware
+from engram.memory.metrics import consistency_issues_total, projection_rebuilds_total
 from engram.memory.projections import (
     ExactMemoryProjection,
     build_exact_memory_projection,
@@ -845,6 +846,24 @@ def _apply_exact_projection(document: RetrievalDocument, projection: ExactMemory
     return
 
 
+def _record_projection_rebuild_metrics(
+    *,
+    kind: str,
+    apply: bool,
+    changed: int,
+    skipped: int,
+) -> None:
+    mode = 'apply' if apply else 'dry_run'
+    for outcome, value in (('changed', changed), ('skipped', skipped)):
+        if value:
+            projection_rebuilds_total.inc(
+                value=value,
+                kind=kind,
+                mode=mode,
+                outcome=outcome,
+            )
+
+
 class MemoryConsistencyReporter:
     def execute(self, data: ConsistencyReportInput) -> ConsistencyReport:
         organization_id, project_id, after_id = _validate_scope_input(
@@ -866,6 +885,11 @@ class MemoryConsistencyReporter:
         for memory in Memory.objects.filter(id__in=memory_ids).order_by('id'):
             issues.extend(_issues(_evaluate_memory(memory, lock_related=False)))
         counts = Counter(issue.code for issue in issues)
+        for issue in issues:
+            consistency_issues_total.inc(
+                code=issue.code,
+                classification=issue.classification,
+            )
 
         return ConsistencyReport(
             organization_id=organization_id,
@@ -940,6 +964,13 @@ class RebuildMemoryProjections:
                     continue
                 create_embedding_work_and_signal(document=evaluation.document)
                 changed += 1
+
+        _record_projection_rebuild_metrics(
+            kind=data.kind,
+            apply=data.apply,
+            changed=changed,
+            skipped=skipped,
+        )
 
         return RebuildProjectionResult(
             organization_id=organization_id,
