@@ -2953,6 +2953,7 @@ def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance(
         migration = executor.loader.graph.nodes[MIGRATION_0039_NODE]
         assert migration.operations[-1].__class__.__name__ == 'RunPython'
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0038)
         apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
         assert 'source_kind' not in {
