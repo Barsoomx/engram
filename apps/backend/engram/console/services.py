@@ -980,12 +980,7 @@ def bulk_archive_memories(
 
     if ids is not None:
         memories = list(
-            Memory.objects.filter(
-                organization=organization,
-                id__in=ids,
-                transition_contract_version=1,
-                current_transition__isnull=False,
-            ),
+            Memory.objects.filter(organization=organization, id__in=ids),
         )
 
     else:

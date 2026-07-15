@@ -1326,6 +1326,27 @@ def test_bulk_archive_by_ids(
 
 
 @pytest.mark.django_db
+def test_bulk_archive_by_ids_rejects_legacy_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    legacy = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-archive/',
+        {'ids': [str(legacy.id)], 'reason': 'legacy cleanup'},
+    )
+
+    assert response.status_code == 400
+    assert response.data['code'] == 'invalid_state'
+    legacy.refresh_from_db()
+    assert legacy.status == MemoryStatus.CONFLICT
+
+
+@pytest.mark.django_db
 def test_bulk_archive_by_confidence_threshold(
     f_admin_token: str,
     f_admin_org: Organization,
