@@ -508,7 +508,7 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
     if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in candidate_titles):
         failures.append(f'no candidate generated from the mock provider: {candidate_titles}')
     memory_titles = [str(title) for title in state.get('memory_titles') or []]
-    if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in memory_titles):
+    if not any(title.startswith(SESSION_TITLE_PREFIX) for title in memory_titles):
         failures.append(f'no mock-generated memory approved through typed review: {memory_titles}')
     if state.get('embedding_dims') != [EMBEDDING_DIMENSION]:
         failures.append(f'unexpected embedding dims: {state.get("embedding_dims")}')
@@ -734,7 +734,7 @@ print(json.dumps({{'held_candidate': str(candidate.id), 'promoted': candidate.pr
 
 def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
     result = run_json(
-        [sys.executable, '-m', 'engram_cli', 'search', '--query', GENERATION_TITLE_PREFIX, '--json'],
+        [sys.executable, '-m', 'engram_cli', 'search', '--query', SESSION_TITLE_PREFIX, '--json'],
         cwd=repo,
         env=cli_hook_env(home),
         secret='',
@@ -743,7 +743,7 @@ def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
     if not isinstance(items, list) or not items:
         raise E2EError(f'search returned no items: {result}')
     titles = [str(item.get('title') or '') for item in items]
-    if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in titles):
+    if not any(title.startswith(SESSION_TITLE_PREFIX) for title in titles):
         raise E2EError(f'search did not return the promoted mock memory: {titles}')
 
     return {'search_items': len(items)}
@@ -857,7 +857,7 @@ from engram.core.models import Memory, Project
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
 memory = (
-    Memory.objects.filter(project=project, title__startswith={json.dumps(GENERATION_TITLE_PREFIX)}, stale=False)
+    Memory.objects.filter(project=project, title__startswith={json.dumps(SESSION_TITLE_PREFIX)}, stale=False)
     .order_by('created_at')
     .first()
 )
@@ -1022,7 +1022,7 @@ def verify_session_start_context(home: Path, repo: Path) -> dict[str, object]:
         'session_id': 'e2e-context-check',
         'repository_root': str(repo),
         'cwd': str(repo),
-        'query': GENERATION_TITLE_PREFIX,
+        'query': SESSION_TITLE_PREFIX,
     }
     result = run_json(
         [sys.executable, '-m', 'engram_cli', 'hook', 'session-start', '--agent', 'claude-code'],
@@ -1033,7 +1033,7 @@ def verify_session_start_context(home: Path, repo: Path) -> dict[str, object]:
     )
     rendered = str(result.get('rendered_context') or '')
     items = result.get('items')
-    if GENERATION_TITLE_PREFIX not in rendered:
+    if SESSION_TITLE_PREFIX not in rendered:
         raise E2EError(f'session-start context does not include the promoted mock memory:\n{rendered[:1500]}')
     if not isinstance(items, list) or not items:
         raise E2EError('session-start context returned no items')
