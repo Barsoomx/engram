@@ -550,8 +550,10 @@ candidate = (
     MemoryCandidate.objects.filter(
         project=project,
         status='proposed',
+        decision_work_contract_version=1,
         title__startswith={json.dumps(GENERATION_TITLE_PREFIX)},
-    ).order_by('-created_at').first()
+        sources__observation__raw_event__event_type='session_end',
+    ).distinct().order_by('-created_at').first()
 )
 if candidate is None:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': generated CP3 candidate not ready')
@@ -559,6 +561,7 @@ work = WorkflowWork.objects.filter(
     project=project,
     subject_id=candidate.id,
     work_type='candidate_decision',
+    execution_state='blocked',
 ).first()
 if work is None:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate-decision work missing')

@@ -546,15 +546,19 @@ def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[st
 def approve_cp3_candidate(project_id: str, run_id: str, secret: str) -> dict[str, object]:
     query = f"""
 import json
-from engram.core.models import Identity, MemoryCandidate, Organization, WorkflowRun, WorkflowWork
+from engram.core.models import Identity, MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
 project_id = {json.dumps(project_id)}
+project = Project.objects.get(id=project_id)
 client_event_id = {json.dumps(f'e2e-hook-event-{run_id}')}
+request_id = {json.dumps(f'e2e-hook-request-{run_id}')}
 candidate = (
     MemoryCandidate.objects.filter(
         project_id=project_id,
-        source_observation__raw_event__client_event_id=client_event_id,
+        decision_work_contract_version=1,
+        sources__observation__raw_event__client_event_id=client_event_id,
+        sources__observation__raw_event__request_id=request_id,
         status='proposed',
-    ).order_by('-created_at').first()
+    ).distinct().order_by('-created_at').first()
 )
 if candidate is None:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': CP3 candidate not ready')
@@ -562,6 +566,7 @@ work = WorkflowWork.objects.filter(
     project_id=project_id,
     subject_id=candidate.id,
     work_type='candidate_decision',
+    execution_state='blocked',
 ).first()
 if work is None:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision work missing')
