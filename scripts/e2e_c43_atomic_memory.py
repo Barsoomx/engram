@@ -614,7 +614,7 @@ def seed_code(suffix: str, search_key: str) -> str:
             ),
         ))
         search = SearchMemories().execute(SearchInput(
-            raw_key={_literal(search_key)}, project_id=project.id, team_id=team.id,
+            raw_key={_literal(search_key)}, project_id=project.id, team_id=None,
             query='C4.3 exact recall marker', file_paths=(), symbols=(), limit=1,
             request_id=f'c43-search:{{candidate.id}}', correlation_id=f'c43-search:{{candidate.id}}',
         ))
