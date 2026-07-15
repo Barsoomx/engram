@@ -134,7 +134,11 @@ def _admitted(queryset: QuerySet[Memory], team_id: UUID | None) -> QuerySet[Memo
     if team_id is not None:
         admission = admission | Q(visibility_scope=VisibilityScope.TEAM, team_id=team_id)
 
-    return queryset.filter(admission).exclude(kind='digest')
+    return queryset.filter(
+        admission,
+        transition_contract_version=1,
+        current_transition__isnull=False,
+    ).exclude(kind='digest')
 
 
 def freeze_daily_digest_input(
