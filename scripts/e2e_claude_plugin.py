@@ -541,7 +541,8 @@ def approve_cp3_candidate(*, secret: str) -> dict[str, object]:
         f"""
 import json
 from engram.console.services import approve_memory_candidate
-from engram.core.models import Identity, MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+from engram.access.models import Identity
+from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
 if project is None:

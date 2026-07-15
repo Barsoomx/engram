@@ -546,7 +546,8 @@ def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[st
 def approve_cp3_candidate(project_id: str, run_id: str, secret: str) -> dict[str, object]:
     query = f"""
 import json
-from engram.core.models import Identity, MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+from engram.access.models import Identity
+from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
 project_id = {json.dumps(project_id)}
 project = Project.objects.get(id=project_id)
 client_event_id = {json.dumps(f'e2e-hook-event-{run_id}')}
