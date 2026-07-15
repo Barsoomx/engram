@@ -12,9 +12,13 @@ from engram.core.models import (
     CurationDecision,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryConflict,
     MemoryTransition,
     MemoryVersion,
+    MemoryVersionSource,
+    Organization,
+    Project,
     WorkflowRun,
     WorkflowWork,
     VisibilityScope,
@@ -47,6 +51,31 @@ def _rewrite_candidate(candidate: MemoryCandidate, *, title: str | None = None, 
         candidate.body = body
     candidate.content_hash = hashlib.sha256(f'{candidate.title}\n{candidate.body}'.encode()).hexdigest()
     candidate.save(update_fields=['title', 'body', 'content_hash', 'updated_at'])
+
+
+def _retry_snapshot() -> dict[str, object]:
+    models = (
+        MemoryCandidate,
+        MemoryCandidateSource,
+        Memory,
+        MemoryVersion,
+        MemoryVersionSource,
+        WorkflowWork,
+        WorkflowRun,
+        CurationDecision,
+        MemoryTransition,
+        MemoryConflict,
+        ProviderCallRecord,
+    )
+    snapshot: dict[str, object] = {}
+    for model in models:
+        fields = tuple(field.attname for field in model._meta.concrete_fields)
+        rows = tuple(
+            tuple(row[field] for field in fields)
+            for row in model.objects.order_by('pk').values(*fields)
+        )
+        snapshot[model._meta.label] = {'count': len(rows), 'fields': fields, 'rows': rows}
+    return snapshot
 
 
 @pytest.mark.django_db
@@ -131,34 +160,13 @@ def test_cross_scope_evidence_calls_no_provider_and_mutates_nothing() -> None:
     candidate, source, _scope = provenanced_candidate('cross-scope')
     work, _created = ensure_candidate_decision_work(candidate.id)
     type(source).objects.filter(id=source.id).update(team_id=None)
-    before = {
-        'candidate': MemoryCandidate.objects.count(),
-        'memory': Memory.objects.count(),
-        'version': MemoryVersion.objects.count(),
-        'conflict': MemoryConflict.objects.count(),
-        'transition': MemoryTransition.objects.count(),
-        'decision': CurationDecision.objects.count(),
-        'work': WorkflowWork.objects.count(),
-        'run': WorkflowRun.objects.count(),
-        'provider': ProviderCallRecord.objects.count(),
-    }
+    before = _retry_snapshot()
 
     result = EvaluateDeterministicCandidateGates().execute(work.id)
 
     assert result.disposition == DeterministicGateDisposition.RETRY
     assert result.operational_reason == 'stale_decision'
-    after = {
-        'candidate': MemoryCandidate.objects.count(),
-        'memory': Memory.objects.count(),
-        'version': MemoryVersion.objects.count(),
-        'conflict': MemoryConflict.objects.count(),
-        'transition': MemoryTransition.objects.count(),
-        'decision': CurationDecision.objects.count(),
-        'work': WorkflowWork.objects.count(),
-        'run': WorkflowRun.objects.count(),
-        'provider': ProviderCallRecord.objects.count(),
-    }
-    assert before == after
+    assert before == _retry_snapshot()
 
 
 @pytest.mark.django_db
@@ -308,8 +316,6 @@ def test_exact_duplicate_without_new_evidence_requires_no_transition() -> None:
         body=candidate.body,
         content_hash='a' * 64,
     )
-    from engram.core.models import MemoryVersionSource
-
     MemoryVersionSource.objects.create(
         organization_id=candidate.organization_id,
         project_id=candidate.project_id,
@@ -353,6 +359,7 @@ def test_same_text_in_another_scope_continues() -> None:
 @pytest.mark.django_db
 def test_multiple_exact_current_matches_retry_stale_decision() -> None:
     candidate, _source, _scope = provenanced_candidate('multiple-matches')
+    work = _work_for(candidate)
     for _index in range(2):
         memory = Memory.objects.create(
             organization_id=candidate.organization_id,
@@ -370,10 +377,53 @@ def test_multiple_exact_current_matches_retry_stale_decision() -> None:
             content_hash='a' * 64,
         )
 
-    result = EvaluateDeterministicCandidateGates().execute(_work_for(candidate).id)
+    before = _retry_snapshot()
+    result = EvaluateDeterministicCandidateGates().execute(work.id)
 
     assert result.disposition == DeterministicGateDisposition.RETRY
     assert result.operational_reason == 'stale_decision'
+    assert result.sanitized_candidate is None
+    assert _retry_snapshot() == before
+
+
+@pytest.mark.django_db
+def test_foreign_current_memory_scope_retries_without_writes() -> None:
+    candidate, _source, _scope = provenanced_candidate('foreign-target')
+    work = _work_for(candidate)
+    memory = Memory.objects.create(
+        organization_id=candidate.organization_id,
+        project_id=candidate.project_id,
+        title=candidate.title,
+        body=candidate.body,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    MemoryVersion.objects.create(
+        organization_id=candidate.organization_id,
+        project_id=candidate.project_id,
+        memory=memory,
+        version=1,
+        body=candidate.body,
+        content_hash='a' * 64,
+    )
+    foreign_organization = Organization.objects.create(name='Foreign', slug='foreign-target')
+    foreign_project = Project.objects.create(
+        organization=foreign_organization,
+        name='Foreign project',
+        slug='foreign-target',
+    )
+    Memory.objects.filter(id=memory.id).update(
+        organization_id=foreign_organization.id,
+        project_id=foreign_project.id,
+    )
+
+    before = _retry_snapshot()
+    result = EvaluateDeterministicCandidateGates().execute(work.id)
+
+    assert result.disposition == DeterministicGateDisposition.RETRY
+    assert result.operational_reason == 'stale_decision'
+    assert result.sanitized_candidate is None
+    assert result.effective_scope is None
+    assert _retry_snapshot() == before
 
 
 @pytest.mark.django_db

@@ -295,14 +295,47 @@ def _claim_bytes(view: SanitizedCandidateView, scope: EffectiveCandidateScope) -
 
 
 def _active_versions(candidate: MemoryCandidate, scope: EffectiveCandidateScope) -> list[MemoryVersion]:
-    query = MemoryVersion.objects.filter(
-        organization_id=candidate.organization_id,
-        project_id=candidate.project_id,
+    active = MemoryVersion.objects.filter(
         memory__current_version=F('version'),
         memory__status__in=(MemoryStatus.APPROVED, MemoryStatus.CONFLICT),
         memory__stale=False,
         memory__refuted=False,
-    ).select_related('memory')
+    ).select_related('memory', 'memory__team')
+    version_scoped = list(
+        active.filter(
+            organization_id=candidate.organization_id,
+            project_id=candidate.project_id,
+        )
+    )
+    for version in version_scoped:
+        if (
+            version.memory.organization_id != candidate.organization_id
+            or version.memory.project_id != candidate.project_id
+            or (
+                version.memory.team_id is not None
+                and version.memory.team.organization_id != candidate.organization_id
+            )
+        ):
+            raise CandidateDecisionWorkScopeError('current memory version has foreign scope')
+
+    memory_scoped = list(
+        active.filter(
+            memory__organization_id=candidate.organization_id,
+            memory__project_id=candidate.project_id,
+        )
+    )
+    if any(
+        version.organization_id != candidate.organization_id or version.project_id != candidate.project_id
+        for version in memory_scoped
+    ):
+        raise CandidateDecisionWorkScopeError('current memory version scope disagrees with memory scope')
+
+    query = active.filter(
+        organization_id=candidate.organization_id,
+        project_id=candidate.project_id,
+        memory__organization_id=candidate.organization_id,
+        memory__project_id=candidate.project_id,
+    )
     if scope.visibility_scope == VisibilityScope.PROJECT:
         query = query.filter(memory__visibility_scope=VisibilityScope.PROJECT, memory__team_id__isnull=True)
     elif scope.visibility_scope == VisibilityScope.TEAM:
