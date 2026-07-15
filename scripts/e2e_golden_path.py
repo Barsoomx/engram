@@ -579,7 +579,36 @@ from engram.console.services import approve_memory_candidate
 memory = approve_memory_candidate(organization, actor, candidate, 'CP3 golden-path typed approval')
 print(json.dumps({'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}))
 """
-    return wait_for_db_state(query, secret=secret)
+    return wait_for_golden_db_state(query, secret)
+
+
+def wait_for_golden_db_state(query: str, secret: str) -> dict[str, object]:
+    deadline = time.monotonic() + WORKER_MEMORY_TIMEOUT_SECONDS
+    last_error = WORKER_MEMORY_NOT_READY_ERROR
+    while time.monotonic() < deadline:
+        try:
+            return run_json(
+                [
+                    'docker',
+                    'compose',
+                    'exec',
+                    '-T',
+                    'api',
+                    'python',
+                    'manage.py',
+                    'shell',
+                    '-c',
+                    query,
+                ],
+                cwd=COMPOSE_DIR,
+                secret=secret,
+            )
+        except E2EError as error:
+            last_error = str(error)
+            if WORKER_MEMORY_NOT_READY_ERROR not in last_error:
+                raise
+            time.sleep(WORKER_MEMORY_POLL_INTERVAL_SECONDS)
+    raise E2EError(f'Timed out waiting for golden-path backend state. Last error: {last_error}')
 
 
 def worker_memory_query(project_id: str, run_id: str) -> str:
