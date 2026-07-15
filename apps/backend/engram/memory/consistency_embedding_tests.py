@@ -209,7 +209,8 @@ def test_embedding_json_pgvector_mismatch_is_reported_and_repaired_once() -> Non
     repaired = RebuildMemoryProjections().execute(
         _rebuild_input(document.organization_id, document.project_id, apply=True)
     )
-    assert repaired.changed == 1
+    assert repaired.changed == 0
+    assert repaired.skipped == 1
     assert current_work.count() == before_work_count == 1
     assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == before_signal_count == 1
 
@@ -240,4 +241,34 @@ def test_embedding_json_pgvector_mismatch_is_reported_and_repaired_once() -> Non
     assert rerun.changed == 0
     assert rerun.skipped == 0
     assert WorkflowWork.objects.filter(subject_id=document.id, work_type=WorkflowWorkType.MEMORY_EMBEDDING).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == 1
+
+
+@pytest.mark.transactional
+@pytest.mark.django_db(transaction=True)
+def test_embedding_rebuild_missing_work_creates_one_work_and_signal() -> None:
+    document = _missing_embedding_fixture('consistency-missing-work')
+    assert (
+        WorkflowWork.objects.filter(
+            subject_id=document.id,
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        ).count()
+        == 1
+    )
+    assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == 0
+
+    repaired = RebuildMemoryProjections().execute(
+        _rebuild_input(document.organization_id, document.project_id, apply=True)
+    )
+
+    assert repaired.changed == 1
+    assert repaired.skipped == 0
+    assert (
+        WorkflowWork.objects.filter(
+            subject_id=document.id,
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            input_snapshot__exact_projection_hash=document.exact_projection_hash,
+        ).count()
+        == 1
+    )
     assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == 1

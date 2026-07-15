@@ -160,7 +160,8 @@ def test_exact_rebuild_dry_run_is_inert_and_apply_changes_only_exact_fields() ->
     dry_run = consistency.RebuildMemoryProjections().execute(_rebuild_input(scope))
 
     document.refresh_from_db()
-    assert dry_run.changed == 0
+    assert dry_run.changed == 1
+    assert dry_run.skipped == 0
     assert {
         field.attname: getattr(document, field.attname)
         for field in document._meta.get_fields()

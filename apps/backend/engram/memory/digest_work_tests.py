@@ -16,6 +16,7 @@ from engram.core.models import (
     Memory,
     MemoryStatus,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     Project,
     ProjectTeam,
@@ -35,7 +36,14 @@ from engram.core.models import (
 )
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
-from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions import (
+    PromoteMemoryCandidate,
+    ReviseMemory,
+    ReviseMemoryInput,
+    TransitionRequest,
+    TransitionScope,
+    build_memory_fence,
+)
 from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.memory.work_execution import execution_configuration_fingerprint
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
@@ -552,6 +560,32 @@ def test_daily_project_output_excludes_team_private_session_org_and_digest_sourc
 
 
 @pytest.mark.django_db
+def test_daily_project_digest_admits_project_visible_source_from_associated_team() -> None:
+    organization, project = _make_scope('daily-project-team-source')
+    team = _make_team(organization, project, 'daily-project-team-source')
+    _create_digest_policy(organization, project)
+    source_memory, source_version = _make_memory(
+        organization,
+        project,
+        title='Project-visible team source',
+        body='project-visible team body',
+        team=team,
+        visibility=VisibilityScope.PROJECT,
+    )
+    work, _snapshot = _make_daily_work(organization, project)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    digest_version = MemoryVersion.objects.get(memory=digest)
+    provenance = MemoryVersionSource.objects.get(memory_version=digest_version)
+    assert result == str(_v1_runs(work).get().id)
+    assert digest.team_id is None
+    assert digest.metadata['source_memory_ids'] == [str(source_memory.id)]
+    assert provenance.source_memory_version_id == source_version.id
+
+
+@pytest.mark.django_db
 def test_daily_caps_sources_and_marks_truncated_by_updated_order() -> None:
     digest_work = _load_digest_work()
     organization, project = _make_scope('daily-cap')
@@ -1028,6 +1062,51 @@ class _MutatingDigestGateway:
         return self._delegate.embed(data)
 
 
+class _AdvancingDigestGateway:
+    def __init__(self, memory: Memory, calls: list[ProviderCallInput]) -> None:
+        self._memory = memory
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+        self._memory.refresh_from_db()
+        ReviseMemory().execute(
+            ReviseMemoryInput(
+                request=TransitionRequest(
+                    scope=TransitionScope(
+                        organization_id=self._memory.organization_id,
+                        project_id=self._memory.project_id,
+                        team_id=self._memory.team_id,
+                    ),
+                    idempotency_key=f'test:digest-source-advance:{self._memory.id}:v2',
+                    actor_type='system',
+                    actor_id='digest-work-test',
+                    capability='memories:write',
+                    request_id=f'test:digest-source-advance:{self._memory.id}',
+                    correlation_id=f'test:digest-source-advance:{self._memory.id}',
+                    reason='advance source during digest provider call',
+                    origin='digest-work-test',
+                ),
+                memory_fence=build_memory_fence(self._memory),
+                title=self._memory.title,
+                body='body-a-v2',
+            )
+        )
+
+        return ProviderCallResult(
+            provider='openai',
+            model='gpt-4.1-mini',
+            call_record_id=self._memory.id,
+            redaction_state='clean',
+            generated_title='Frozen V1 digest',
+            generated_body='Digest body rendered from frozen V1',
+        )
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
 def _make_daily_work(
     organization: Organization,
     project: Project,
@@ -1218,6 +1297,39 @@ def test_daily_work_discards_provider_result_when_source_invalidated_after_preca
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
     assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
     assert RetrievalDocument.objects.filter(project=project, memory__kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_work_publishes_frozen_v1_body_and_provenance_when_source_advances_during_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-frozen-v1')
+    _create_digest_policy(organization, project)
+    source_memory, source_v1 = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    calls: list[ProviderCallInput] = []
+
+    def stub(policy: object, **_kwargs: object) -> object:
+        if getattr(policy, 'task_type', None) == 'digest':
+            return _AdvancingDigestGateway(source_memory, calls)
+
+        return FakeProviderGateway()
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', stub)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    digest_version = MemoryVersion.objects.get(memory=digest)
+    provenance = MemoryVersionSource.objects.get(memory_version=digest_version)
+    assert result == str(_v1_runs(work).get().id)
+    assert len(calls) == 1
+    assert 'body-a' in calls[0].prompt
+    assert 'body-a-v2' not in calls[0].prompt
+    assert digest.title == 'Digest Frozen V1 digest'
+    assert digest.body == 'Digest body rendered from frozen V1'
+    assert digest.metadata['source_memory_ids'] == [str(source_memory.id)]
+    assert provenance.source_memory_version_id == source_v1.id
 
 
 @pytest.mark.django_db
