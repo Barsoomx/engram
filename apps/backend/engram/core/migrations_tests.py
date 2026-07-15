@@ -2903,28 +2903,28 @@ def test_0039_forward_preserves_distillation_sources_and_adds_import_shape() -> 
 
         observation_source_model = new_apps.get_model('core', 'ObservationSource')
         import_source = observation_source_model.objects.create(
-            organization=scope['organization'],
-            project=scope['project'],
-            observation=observation,
+            organization_id=scope['organization'].id,
+            project_id=scope['project'].id,
+            observation_id=observation.id,
             source_type='claude_mem',
             source_id='migration-0039:1',
         )
         import_candidate = new_apps.get_model('core', 'MemoryCandidate').objects.create(
-            organization=scope['organization'],
-            project=scope['project'],
-            team=scope['team'],
-            source_observation=observation,
+            organization_id=scope['organization'].id,
+            project_id=scope['project'].id,
+            team_id=scope['team'].id,
+            source_observation_id=observation.id,
             title='Import candidate',
             body='Import body',
             content_hash='d' * 64,
             decision_work_contract_version=1,
         )
         new_apps.get_model('core', 'MemoryCandidateSource').objects.create(
-            organization=scope['organization'],
-            project=scope['project'],
-            team=scope['team'],
+            organization_id=scope['organization'].id,
+            project_id=scope['project'].id,
+            team_id=scope['team'].id,
             candidate=import_candidate,
-            observation=observation,
+            observation_id=observation.id,
             source_kind='import',
             import_source=import_source,
             anchors={'schema': 'import_candidate_source.v1'},
