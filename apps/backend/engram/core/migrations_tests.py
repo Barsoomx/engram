@@ -2891,6 +2891,7 @@ def test_0039_forward_preserves_distillation_sources_and_adds_import_shape() -> 
             anchors_hash='c' * 64,
         )
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0039)
         new_apps = executor.loader.project_state(MIGRATE_0039).apps
         migrated_source = new_apps.get_model('core', 'MemoryCandidateSource').objects.get(id=legacy_source.id)
@@ -2939,6 +2940,7 @@ def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance(
     leaf_nodes = executor.loader.graph.leaf_nodes()
     assert MIGRATION_0039_NODE in executor.loader.graph.nodes
     try:
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0039)
         apps_0039 = executor.loader.project_state(MIGRATE_0039).apps
         source_model = apps_0039.get_model('core', 'MemoryCandidateSource')
@@ -2952,6 +2954,7 @@ def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance(
             field.name for field in apps_0038.get_model('core', 'MemoryCandidateSource')._meta.fields
         }
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0039)
         apps_0039 = executor.loader.project_state(MIGRATE_0039).apps
         source_model = apps_0039.get_model('core', 'MemoryCandidateSource')
