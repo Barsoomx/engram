@@ -42,6 +42,7 @@ from engram.core.models import (
 from engram.memory import tasks as tasks_module
 from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
+from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWorkResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
 from engram.memory.services import MemoryCandidateWorkerResult, MemoryWorkerError
 from engram.memory.tasks import (
@@ -53,6 +54,7 @@ from engram.memory.tasks import (
     process_observation_recorded,
     process_observation_work_v1,
     retry_failed_distillations,
+    reconcile_candidate_decision_work,
 )
 from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import (
@@ -525,7 +527,7 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 
     result = retry_failed_distillations()
 
-    assert result == {'retried': 1, 'reconciled': 0, 'candidate_reconciled': 0, 'unlinked': 0}
+    assert result == {'retried': 1, 'reconciled': 0, 'unlinked': 0}
 
     queued = WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED)
     assert queued.count() == 1
@@ -542,28 +544,22 @@ def test_retry_failed_distillations_signals_versioned_work_retry(
 def test_retry_failed_distillations_is_a_no_op_when_nothing_is_eligible() -> None:
     result = retry_failed_distillations()
 
-    assert result == {'retried': 0, 'reconciled': 0, 'candidate_reconciled': 0, 'unlinked': 0}
+    assert result == {'retried': 0, 'reconciled': 0, 'unlinked': 0}
     assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
     assert CeleryOutbox.objects.count() == 0
 
 
 @pytest.mark.django_db
-def test_retry_failed_distillations_invokes_candidate_reconciliation() -> None:
+def test_retry_failed_distillations_does_not_invoke_candidate_reconciliation() -> None:
     with (
         mock.patch('engram.memory.tasks.reconcile_scheduled_session_work', return_value=2),
-        mock.patch(
-            'engram.memory.tasks.reconcile_scheduled_candidate_work',
-            return_value=3,
-            create=True,
-        ) as candidate_reconcile,
     ):
         result = retry_failed_distillations()
 
-    candidate_reconcile.assert_called_once()
+    assert not hasattr(tasks_module, 'reconcile_scheduled_candidate_work')
     assert result == {
         'retried': 0,
         'reconciled': 2,
-        'candidate_reconciled': 3,
         'unlinked': 0,
     }
 
@@ -637,23 +633,38 @@ def test_task_routes_send_expire_stale_candidates_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.expire_stale_candidates']['queue'] == celeryconfig.QUEUE_BATCH
 
 
-def test_beat_schedule_registers_expire_stale_candidates() -> None:
-    assert 'expire-stale-candidates' in celeryconfig.beat_schedule
+def test_task_routes_send_candidate_reconciliation_to_batch_queue() -> None:
+    assert celeryconfig.task_routes['engram.memory.reconcile_candidate_decision_work']['queue'] == celeryconfig.QUEUE_BATCH
 
-    entry = celeryconfig.beat_schedule['expire-stale-candidates']
 
-    assert entry['task'] == 'engram.memory.expire_stale_candidates'
+def test_beat_schedule_registers_reconcile_candidate_decision_work() -> None:
+    assert 'reconcile-candidate-decision-work' in celeryconfig.beat_schedule
+    assert 'expire-stale-candidates' not in celeryconfig.beat_schedule
+
+    entry = celeryconfig.beat_schedule['reconcile-candidate-decision-work']
+
+    assert entry['task'] == 'engram.memory.reconcile_candidate_decision_work'
     assert entry['schedule'] == timedelta(minutes=30)
 
 
 def test_expire_stale_candidates_invokes_the_service() -> None:
-    m_result = ExpireStaleCandidatesResult(scanned=7, rejected=4)
+    m_result = ExpireStaleCandidatesResult(scanned=7, queued=4)
 
     with mock.patch('engram.memory.tasks.ExpireStaleCandidates.execute', return_value=m_result) as m_execute:
         result = expire_stale_candidates()
 
     m_execute.assert_called_once_with()
-    assert result == {'scanned': 7, 'rejected': 4}
+    assert result == {'scanned': 7, 'queued': 4}
+
+
+def test_reconcile_candidate_decision_work_invokes_the_service() -> None:
+    m_result = ReconcileCandidateDecisionWorkResult(scanned=7, queued=4)
+
+    with mock.patch('engram.memory.tasks.ReconcileCandidateDecisionWork.execute', return_value=m_result) as m_execute:
+        result = reconcile_candidate_decision_work()
+
+    m_execute.assert_called_once()
+    assert result == {'scanned': 7, 'queued': 4}
 
 
 @pytest.mark.parametrize(
@@ -1568,7 +1579,7 @@ def test_retry_failed_distillations_leaves_v1_retry_wait_work_to_reconciler() ->
     assert queued.get().execution_contract_version == 1
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=0).count() == 0
     assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
-    assert result == {'retried': 0, 'reconciled': 1, 'candidate_reconciled': 0, 'unlinked': 0}
+    assert result == {'retried': 0, 'reconciled': 1, 'unlinked': 0}
 
 
 def _embedding_source(version: MemoryVersion) -> SimpleNamespace:

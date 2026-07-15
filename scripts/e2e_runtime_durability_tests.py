@@ -729,6 +729,11 @@ def test_beat_snapshot_helper_shares_deadline_across_create_and_start(
     assert cleanup_timeouts == [2.0]
 
 
+def test_expected_beat_entries_use_candidate_reconciliation() -> None:
+    assert 'reconcile-candidate-decision-work' in EXPECTED_BEAT_ENTRIES
+    assert 'expire-stale-candidates' not in EXPECTED_BEAT_ENTRIES
+
+
 def test_compose_environment_is_allowlisted_and_generated(tmp_path: Path) -> None:
     env_file = (tmp_path / "generated.env").resolve()
     env = deterministic_env(
