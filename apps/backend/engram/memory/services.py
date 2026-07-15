@@ -361,9 +361,25 @@ class ProcessObservationRecorded:
             threshold = resolve_auto_approve_threshold(observation.organization)
             already_promoted = candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id is not None
             promotable = is_auto_promotable(candidate.confidence, threshold) and not self._is_parse_fallback(candidate)
-            should_promote = already_promoted or promotable
+            should_promote = already_promoted or (candidate.decision_work_contract_version == 1 and promotable)
             if not should_promote and candidate_created:
                 self._audit_held(observation, candidate, threshold)
+
+        if already_promoted and candidate.decision_work_contract_version != 1:
+            memory = candidate.promoted_memory
+            if memory is None:
+                raise MemoryWorkerError('legacy promoted candidate has no memory pointer')
+            version = MemoryVersion.objects.filter(memory=memory, version=memory.current_version).first()
+            document = RetrievalDocument.objects.filter(memory=memory, memory_version=version).first()
+
+            return MemoryCandidateWorkerResult(
+                candidate=candidate,
+                duplicate=True,
+                memory=memory,
+                memory_version=version,
+                retrieval_document=document,
+                curated_decision='legacy_replay',
+            )
 
         if should_promote:
             from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput

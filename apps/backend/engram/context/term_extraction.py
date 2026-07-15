@@ -62,3 +62,70 @@ def extract_exact_terms(title: str, body: str) -> tuple[str, ...]:
         if ' ' in candidate and not _IDENTIFIER_RE.match(candidate):
             found.append(candidate)
     return _appearance_ordered(found, minimum_length=_MIN_EXACT_TERM_LENGTH)
+
+
+def normalize_lookup_value(value: object) -> str:
+    return str(value).strip().casefold()
+
+
+def normalize_lookup_values(values: object) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        raw_values: tuple[object, ...] = (values,)
+    elif isinstance(values, list | tuple | set):
+        raw_values = tuple(values)
+    else:
+        raw_values = (values,)
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in raw_values:
+        item = normalize_lookup_value(value)
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+
+    return tuple(normalized)
+
+
+def unique_text_values(*groups: object) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if group is None:
+            continue
+        if isinstance(group, str):
+            raw_values: tuple[object, ...] = (group,)
+        elif isinstance(group, list | tuple | set):
+            raw_values = tuple(group)
+        else:
+            raw_values = (group,)
+        for raw_value in raw_values:
+            item = str(raw_value).strip()
+            key = item.casefold()
+            if not item or key in seen:
+                continue
+            seen.add(key)
+            values.append(item)
+
+    return values
+
+
+def derive_retrieval_terms(metadata: dict[str, object], title: str, body: str) -> tuple[list[str], list[str]]:
+    symbols = unique_text_values(
+        metadata.get('symbols', []),
+        extract_symbols(title, body),
+    )
+    exact_terms = list(
+        normalize_lookup_values(
+            [
+                *metadata.get('exact_terms', []),
+                title,
+                *extract_exact_terms(title, body),
+            ],
+        ),
+    )
+
+    return symbols, exact_terms

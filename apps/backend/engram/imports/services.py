@@ -378,7 +378,7 @@ class ClaudeMemImporter:
             self._record_memory_result(report, result)
             if result.get('count_result') is False:
                 skipped += 1
-            elif result.get('memory_created'):
+            elif result.get('observation_created'):
                 created += 1
             else:
                 duplicates += 1
@@ -1697,7 +1697,7 @@ class ClaudeMemImporter:
             report['created']['memories'] += 1
             report['created']['memory_versions'] += 1
             report['created']['retrieval_documents'] += 1
-        else:
+        elif result['candidate_created']:
             report['duplicates']['memories'] += 1
 
     def _session_source_id(self, context: ImportContext, content_session_id: object) -> str:

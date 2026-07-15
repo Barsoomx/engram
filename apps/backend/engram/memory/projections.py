@@ -9,6 +9,7 @@ from django.db import models, transaction
 from django.db.transaction import TransactionManagementError
 from django.utils import timezone
 
+from engram.context.term_extraction import derive_retrieval_terms
 from engram.core.models import (
     Memory,
     MemoryTransition,
@@ -67,8 +68,14 @@ def build_exact_memory_projection(
     title = memory.title
     body = version.body
     file_paths = metadata_value('file_paths', []) or []
-    symbols = metadata_value('symbols', []) or []
-    exact_terms = metadata_value('exact_terms', []) or []
+    symbols, exact_terms = derive_retrieval_terms(
+        {
+            'symbols': metadata_value('symbols', []) or [],
+            'exact_terms': metadata_value('exact_terms', []) or [],
+        },
+        title,
+        body,
+    )
     source_observation_ids = metadata_value('source_observation_ids', []) or []
     full_text = metadata_value('full_text', '') or f'{title}\n\n{body}'.strip()
     source_values = [
@@ -137,6 +144,7 @@ def write_exact_memory_projection(
     values = projection.document_values
     documents = RetrievalDocument.objects.select_for_update().filter(memory_version_id=version.id)
     document = documents.first()
+    previous_hash = document.exact_projection_hash if document is not None else ''
     if document is None:
         document = RetrievalDocument(
             organization_id=memory.organization_id,
@@ -161,11 +169,12 @@ def write_exact_memory_projection(
     document.metadata = {'projection': values}
     document.projection_contract_version = 1
     document.exact_projection_hash = projection.exact_projection_hash
-    document.embedding_reference = ''
-    document.embedding_vector = []
-    document.embedding_pgvector = None
-    document.embedding_projection_hash = ''
-    document.embedding_projected_at = None
+    if previous_hash != projection.exact_projection_hash:
+        document.embedding_reference = ''
+        document.embedding_vector = []
+        document.embedding_pgvector = None
+        document.embedding_projection_hash = ''
+        document.embedding_projected_at = None
     document.save()
     RetrievalDocument.objects.filter(memory_id=memory.id).exclude(id=document.id).update(stale=True)
 

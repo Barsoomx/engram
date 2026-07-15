@@ -19,7 +19,10 @@ from engram.context.retrieval_warnings import (
     compute_retrieval_warnings,
     semantic_retrieval_gap,
 )
-from engram.context.term_extraction import extract_exact_terms, extract_symbols
+from engram.context.term_extraction import (
+    normalize_lookup_value,
+    normalize_lookup_values,
+)
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     Agent,
@@ -198,55 +201,6 @@ class ContextBundleResult:
                 return dict(item.scope_evidence)
 
         return scope_evidence(document)
-
-
-def normalize_lookup_value(value: object) -> str:
-    return str(value).strip().casefold()
-
-
-def normalize_lookup_values(values: object) -> tuple[str, ...]:
-    if values is None:
-        return ()
-    if isinstance(values, str):
-        raw_values: tuple[object, ...] = (values,)
-    elif isinstance(values, list | tuple | set):
-        raw_values = tuple(values)
-    else:
-        raw_values = (values,)
-
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in raw_values:
-        item = normalize_lookup_value(value)
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        normalized.append(item)
-
-    return tuple(normalized)
-
-
-def unique_text_values(*groups: object) -> list[str]:
-    values: list[str] = []
-    seen: set[str] = set()
-    for group in groups:
-        if group is None:
-            continue
-        if isinstance(group, str):
-            raw_values: tuple[object, ...] = (group,)
-        elif isinstance(group, list | tuple | set):
-            raw_values = tuple(group)
-        else:
-            raw_values = (group,)
-        for raw_value in raw_values:
-            item = str(raw_value).strip()
-            key = item.casefold()
-            if not item or key in seen:
-                continue
-            seen.add(key)
-            values.append(item)
-
-    return values
 
 
 def redact_text(value: object) -> str:
@@ -829,24 +783,6 @@ def resolve_query_embedding(
         return None
 
     return result
-
-
-def derive_retrieval_terms(metadata: dict[str, object], title: str, body: str) -> tuple[list[str], list[str]]:
-    symbols = unique_text_values(
-        metadata.get('symbols', []),
-        extract_symbols(title, body),
-    )
-    exact_terms = list(
-        normalize_lookup_values(
-            [
-                *metadata.get('exact_terms', []),
-                title,
-                *extract_exact_terms(title, body),
-            ],
-        ),
-    )
-
-    return symbols, exact_terms
 
 
 class IndexMemoryVersion:

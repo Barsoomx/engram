@@ -7,7 +7,7 @@ import structlog
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandParser
 
-from engram.context.services import derive_retrieval_terms
+from engram.context.term_extraction import derive_retrieval_terms
 from engram.core.models import RetrievalDocument
 
 logger = structlog.get_logger(__name__)
