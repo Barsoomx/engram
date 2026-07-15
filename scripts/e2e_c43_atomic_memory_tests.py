@@ -5,7 +5,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from scripts import e2e_c43_atomic_memory as atomic
 
 IDS = {
@@ -79,6 +78,34 @@ def test_active_claim_preserves_semantic_identity_and_has_one_running_lease() ->
     cross_id_payload['memory_id'] = IDS['candidate_id']
     with pytest.raises(ValueError, match='memory'):
         atomic.validate_active_claim(_snapshot(cross_id_payload), baseline)
+
+
+@pytest.mark.parametrize(
+    ('work_execution_state', 'active_run_count'),
+    (
+        ('ready', 0),
+        ('leased', 2),
+    ),
+)
+def test_active_claim_failure_reports_observed_lease_state(
+    work_execution_state: str,
+    active_run_count: int,
+) -> None:
+    baseline = _snapshot()
+    payload = _payload()
+    payload.update(
+        {
+            'work_execution_state': work_execution_state,
+            'active_run_count': active_run_count,
+        }
+    )
+
+    with pytest.raises(ValueError) as error:
+        atomic.validate_active_claim(_snapshot(payload), baseline)
+
+    message = str(error.value)
+    assert f'work_execution_state={work_execution_state!r}' in message
+    assert f'active_run_count={active_run_count}' in message
 
 
 def test_recovered_snapshot_proves_same_chain_and_one_current_vector() -> None:
@@ -166,3 +193,64 @@ def test_deterministic_env_preserves_windows_docker_plugin_discovery() -> None:
     assert result['ProgramFiles'] == 'program-files'
     assert result['XDG_RUNTIME_DIR'] == 'runtime-dir'
     assert 'UNRELATED_SECRET' not in result
+
+
+class _FailureLogHarness:
+    def __init__(self, results: dict[str, atomic.CommandResult | BaseException]) -> None:
+        self.results = results
+        self.calls: list[tuple[str, ...]] = []
+
+    def compose(self, *args: str, **kwargs: object) -> atomic.CommandResult:
+        del kwargs
+        self.calls.append(args)
+        service = args[-1]
+        result = self.results[service]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+def test_collect_failure_logs_fetches_redacts_and_caps_each_service_independently() -> None:
+    secret = 'egk_c43_secret'
+    harness = _FailureLogHarness(
+        {
+            'api': atomic.CommandResult(
+                ('docker', 'compose', 'logs', 'api'),
+                0,
+                'api ' + ('a' * (atomic.OUTPUT_LIMIT + 200)) + f' {secret}',
+                '',
+            ),
+            'relay': atomic.CommandResult(
+                ('docker', 'compose', 'logs', 'relay'),
+                0,
+                'relay ' + ('b' * (atomic.OUTPUT_LIMIT + 200)),
+                '',
+            ),
+            'worker-batch': atomic.CommandResult(
+                ('docker', 'compose', 'logs', 'worker-batch'),
+                0,
+                'worker-batch ' + ('c' * (atomic.OUTPUT_LIMIT + 200)),
+                '',
+            ),
+            'rabbitmq': atomic.HarnessError('rabbitmq logs unavailable'),
+        }
+    )
+
+    logs = atomic.collect_failure_logs(harness, secrets_to_redact=(secret,))
+
+    assert [call[-1] for call in harness.calls] == ['api', 'relay', 'worker-batch', 'rabbitmq']
+    assert all(call[0:3] == ('logs', '--no-color', '--tail=200') for call in harness.calls)
+    assert '[api]' in logs
+    assert '[relay]' in logs
+    assert '[worker-batch]' in logs
+    assert '[rabbitmq]' in logs
+    assert secret not in logs
+    assert '[REDACTED]' in logs
+    for service, marker in (
+        ('api', 'a'),
+        ('relay', 'b'),
+        ('worker-batch', 'c'),
+    ):
+        section = logs.split(f'[{service}]', 1)[1].split('\n[', 1)[0]
+        assert len(section) <= atomic.OUTPUT_LIMIT + 1
+        assert marker * (atomic.OUTPUT_LIMIT + 200) not in section
