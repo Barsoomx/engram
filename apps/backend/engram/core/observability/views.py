@@ -7,7 +7,6 @@ from django.views.decorators.http import require_GET
 
 from engram.core.middlewares.metrics import http_requests_total
 from engram.core.observability.metrics import render_prometheus
-from engram.memory.metrics import consistency_issues_total, projection_rebuilds_total
 
 CONTENT_TYPE = 'text/plain; version=0.0.4; charset=utf-8'
 
@@ -20,13 +19,7 @@ def metrics(request: HttpRequest) -> HttpResponse:
         if auth_header != f'Bearer {expected_token}':
             return HttpResponseForbidden('Forbidden')
 
-    body = render_prometheus(
-        [
-            http_requests_total,
-            consistency_issues_total,
-            projection_rebuilds_total,
-        ]
-    )
+    body = render_prometheus([http_requests_total])
 
     return HttpResponse(
         body,

@@ -665,7 +665,7 @@ def seed_code(suffix: str, search_key: str) -> str:
     """).strip()
 
 
-def expire_code(work_id: str) -> str:
+def force_reconciliation_code(work_id: str) -> str:
     return dedent(f"""
         import json, uuid
         from datetime import timedelta
@@ -687,7 +687,13 @@ def expire_code(work_id: str) -> str:
             heartbeat_at=heartbeat,
         )
         queued = queue_work_attempt(work_id=work.id, now=now, origin='reconciliation')
-        print(json.dumps({{'expired': 1, 'queued_run_id': str(queued.id), 'work_id': str(work.id)}}))
+        print(json.dumps({{
+            'expired': 1,
+            'recovery_mode': 'forced_reconciliation',
+            'requeue_origin': 'reconciliation',
+            'requeued_run_id': str(queued.id),
+            'work_id': str(work.id),
+        }}, sort_keys=True))
     """).strip()
 
 
@@ -742,7 +748,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             harness.poll('one active embedding lease', active_probe, timeout=POLL_TIMEOUT)
             harness.compose('kill', '-s', 'SIGKILL', 'worker-batch', timeout=30)
             harness.compose('stop', '-t', '2', 'worker-batch', timeout=30, check=False)
-            harness.shell_json(expire_code(ids['work_id']), timeout=60)
+            reconciliation = harness.shell_json(force_reconciliation_code(ids['work_id']), timeout=60)
             harness.compose('up', '-d', '--no-deps', 'worker-batch', timeout=60)
 
             def recovered_probe() -> MemorySnapshot:
@@ -765,6 +771,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 'document_count': recovered.document_count,
                 'work_count': recovered.work_count,
                 'embedding_vector_count': recovered.embedding_vector_count,
+                'recovery_mode': reconciliation['recovery_mode'],
+                'requeue_origin': reconciliation['requeue_origin'],
+                'requeued_run_id': reconciliation['requeued_run_id'],
             }
             emit(json.dumps({'evidence': evidence, 'status': 'passed'}, sort_keys=True))
         except (HarnessError, ValueError, RuntimeError) as error:

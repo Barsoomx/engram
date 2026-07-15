@@ -1300,10 +1300,17 @@ def _frozen_digest_source_fences(
             f'digest sources are not owned by the v1 transition contract: {", ".join(sorted(legacy_ids))}',
             code='legacy_source_contract',
         )
-    foreign_team_ids = [str(source.id) for source in sources if source.team_id != team_id]
-    if foreign_team_ids:
+    invalid_visibility_ids = [
+        str(source.id)
+        for source in sources
+        if not (
+            source.visibility_scope == VisibilityScope.PROJECT
+            or (team_id is not None and source.visibility_scope == VisibilityScope.TEAM and source.team_id == team_id)
+        )
+    ]
+    if invalid_visibility_ids:
         raise MemoryWorkerError(
-            f'digest sources are outside the exact team scope: {", ".join(sorted(foreign_team_ids))}',
+            f'digest sources are outside the declared visibility scope: {", ".join(sorted(invalid_visibility_ids))}',
             code='work_scope_invalid',
         )
 

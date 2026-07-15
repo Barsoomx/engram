@@ -9,20 +9,15 @@ from engram.core.middlewares.metrics import (
     status_class,
 )
 from engram.core.observability.metrics import Counter, render_prometheus
-from engram.memory.metrics import consistency_issues_total, projection_rebuilds_total
 
 
 @pytest.fixture(autouse=True)
 def f_reset_counters() -> None:
     http_requests_total.reset()
-    consistency_issues_total.reset()
-    projection_rebuilds_total.reset()
 
     yield
 
     http_requests_total.reset()
-    consistency_issues_total.reset()
-    projection_rebuilds_total.reset()
 
 
 def test_counter_inc_accumulates_per_label_set() -> None:
@@ -124,28 +119,6 @@ def test_metrics_endpoint_includes_http_requests_total_help_line(client: Client)
 
     assert '# HELP engram_http_requests_total' in body
     assert 'engram_http_requests_total{' in body
-
-
-def test_metrics_endpoint_exposes_c43_memory_counters(client: Client) -> None:
-    consistency_issues_total.inc(
-        code='exact_projection_missing_or_mismatched',
-        classification='rebuild_exact',
-    )
-    projection_rebuilds_total.inc(kind='exact', mode='apply', outcome='changed')
-
-    response = client.get('/-/metrics')
-
-    body = response.content.decode('utf-8')
-
-    assert '# HELP engram_memory_consistency_issues_total' in body
-    assert '# TYPE engram_memory_consistency_issues_total counter' in body
-    assert (
-        'engram_memory_consistency_issues_total{classification="rebuild_exact",'
-        'code="exact_projection_missing_or_mismatched"} 1.0'
-    ) in body
-    assert '# HELP engram_memory_projection_rebuilds_total' in body
-    assert '# TYPE engram_memory_projection_rebuilds_total counter' in body
-    assert 'engram_memory_projection_rebuilds_total{kind="exact",mode="apply",outcome="changed"} 1.0' in body
 
 
 @pytest.mark.django_db

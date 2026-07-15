@@ -34,6 +34,7 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory.invariant_queries import InvariantId, InvariantState, evaluate_invariants
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
 from engram.memory.transitions import (
@@ -583,6 +584,12 @@ def test_daily_project_digest_admits_project_visible_source_from_associated_team
     assert digest.team_id is None
     assert digest.metadata['source_memory_ids'] == [str(source_memory.id)]
     assert provenance.source_memory_version_id == source_version.id
+    p7 = next(
+        result
+        for result in evaluate_invariants(organization_id=organization.id, project_id=project.id)
+        if result.invariant_id == InvariantId.P7
+    )
+    assert p7.state == InvariantState.HEALTHY
 
 
 @pytest.mark.django_db

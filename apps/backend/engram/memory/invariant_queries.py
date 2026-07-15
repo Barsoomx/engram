@@ -43,6 +43,7 @@ from engram.core.models import (
     RetrievalDocument,
     Runtime,
     SessionStatus,
+    VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowRunType,
@@ -1456,6 +1457,17 @@ def _p7_v1_work_is_valid(memory: Memory, transition: MemoryTransition, document:
     ).exists()
 
 
+def _p7_source_memory_scope_is_valid(memory: Memory, source: Memory) -> bool:
+    if memory.kind != 'digest':
+        return source.team_id == memory.team_id
+    if memory.visibility_scope == VisibilityScope.PROJECT:
+        return source.visibility_scope == VisibilityScope.PROJECT
+    return memory.visibility_scope == VisibilityScope.TEAM and (
+        source.visibility_scope == VisibilityScope.PROJECT
+        or (source.visibility_scope == VisibilityScope.TEAM and source.team_id == memory.team_id)
+    )
+
+
 def _p7_v1_sources_are_valid(memory: Memory, version: MemoryVersion, sources: list[MemoryVersionSource]) -> bool:
     if not sources:
         return False
@@ -1478,12 +1490,13 @@ def _p7_v1_sources_are_valid(memory: Memory, version: MemoryVersion, sources: li
                 return False
         elif source.source_memory_version_id is not None:
             source_memory_version = source.source_memory_version
+            source_memory = source_memory_version.memory
             if (
                 source_memory_version.organization_id != memory.organization_id
                 or source_memory_version.project_id != memory.project_id
-                or source_memory_version.memory.organization_id != memory.organization_id
-                or source_memory_version.memory.project_id != memory.project_id
-                or source_memory_version.memory.team_id != memory.team_id
+                or source_memory.organization_id != memory.organization_id
+                or source_memory.project_id != memory.project_id
+                or not _p7_source_memory_scope_is_valid(memory, source_memory)
                 or source.source_content_hash != source_memory_version.content_hash
             ):
                 return False
