@@ -12,7 +12,6 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     Memory,
-    MemoryStatus,
     MemoryVersion,
     Organization,
     Project,
@@ -31,6 +30,8 @@ from engram.memory.services import (
     digest_prompt,
     run_daily_digest_with_tracking,
 )
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import FakeProviderGateway, ModelPolicyError, ProviderCallInput, ProviderCallResult
@@ -109,16 +110,18 @@ def create_digest_generation_policy(organization: Organization, project: Project
     )
 
 
-def create_source_memory(organization: Organization, team: Team | None, project: Project, *, title: str) -> Memory:
-    return Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+def create_source_memory(organization: Organization, _team: Team | None, project: Project, *, title: str) -> Memory:
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix='digest-source',
         title=title,
         body=f'{title} body detail.',
-        status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
+
+    return PromoteMemoryCandidate().execute(transition_request(candidate)).memory
 
 
 @pytest.mark.django_db
