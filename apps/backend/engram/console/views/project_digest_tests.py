@@ -23,7 +23,6 @@ from engram.access.models import (
 from engram.core.models import (
     AuditEvent,
     Memory,
-    MemoryStatus,
     Organization,
     Project,
     VisibilityScope,
