@@ -67,13 +67,13 @@ jobs:
 
       - name: Run upstream import tests
         working-directory: apps/backend
-        run: poetry run pytest engram/imports/upstream_import_tests.py -v
+        run: poetry run pytest engram/imports/upstream_import_tests.py -m "not transactional" -v
 
       - name: Run backend tests with coverage
         working-directory: apps/backend
         run: |
           poetry run pip install coverage
-          poetry run coverage run --source=engram --omit='*/*_tests.py,*/migrations/*' -m pytest -v --junitxml=junit.xml -o junit_family=legacy
+          poetry run coverage run --source=engram --omit='*/*_tests.py,*/migrations/*' -m pytest -m "not transactional" -v --junitxml=junit.xml -o junit_family=legacy
 
       - name: Generate coverage report
         working-directory: apps/backend
@@ -108,3 +108,52 @@ jobs:
 
       - name: Run Codex plugin contract tests
         run: PYTHONPATH=packages/codex-plugin python3 -m unittest discover -s packages/codex-plugin -p '*_tests.py' -v
+
+  backend-transactional:
+    name: Backend transactional
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_DB: engram
+          POSTGRES_USER: engram
+          POSTGRES_PASSWORD: engram
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U engram -d engram"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ENGRAM_DATABASE_URL: postgresql://engram:engram@localhost:5432/engram
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install Poetry
+        run: python3 -m pip install poetry==1.8.2
+
+      - name: Install backend dependencies
+        working-directory: apps/backend
+        run: poetry install --no-interaction
+
+      - name: Run transactional backend tests
+        working-directory: apps/backend
+        run: poetry run pytest -p no:xdist -p no:randomly -m transactional -v --junitxml=transactional-junit.xml -o junit_family=legacy
+
+      - name: Upload transactional test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: apps/backend/transactional-junit.xml
+          disable_search: true
+          report_type: test_results
+          fail_ci_if_error: true
