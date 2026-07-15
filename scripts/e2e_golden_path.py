@@ -577,7 +577,7 @@ organization = Organization.objects.get(id=project.organization_id)
 actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
 from engram.console.services import approve_memory_candidate
 memory = approve_memory_candidate(organization, actor, candidate, 'CP3 golden-path typed approval')
-print(json.dumps({'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}))
+print(json.dumps({{'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}}))
 """
     return wait_for_golden_db_state(query, secret)
 
