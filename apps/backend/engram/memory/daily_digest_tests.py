@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import uuid
 from datetime import timedelta
 
 import pytest
@@ -12,7 +12,6 @@ from engram.celeryconfig import beat_schedule, task_routes
 from engram.core.models import (
     Memory,
     MemoryStatus,
-    MemoryVersion,
     Organization,
     Project,
     Team,
@@ -22,6 +21,8 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.tasks import run_scheduled_digests
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 _DAILY_WORK_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 
@@ -49,23 +50,16 @@ def create_approved_memory(
     in_window: bool = True,
 ) -> Memory:
     body = f'{title} body detail.'
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix=f'daily-digest-{title.lower().replace(" ", "-")}-{uuid.uuid4().hex}',
         title=title,
         body=body,
-        status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
-    MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-    )
+    memory = PromoteMemoryCandidate().execute(transition_request(candidate)).memory
     if in_window:
         Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(days=1))
 
@@ -91,7 +85,7 @@ def test_run_scheduled_digests_returns_producer_aggregate_and_id_only_signal() -
     assert result['scheduled_projects'] == 1
     assert result['task_enqueued'] == 1
     work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
-    queued = CeleryOutbox.objects.get()
+    queued = CeleryOutbox.objects.get(task_name=_DAILY_WORK_TASK_NAME)
     assert queued.task_name == _DAILY_WORK_TASK_NAME
     assert queued.args == [str(work.id)]
     assert queued.kwargs == {}
@@ -135,11 +129,18 @@ def test_run_scheduled_digests_excludes_digest_kind_memories() -> None:
 
     assert result['required_work'] == 1
     assert result['no_input_projects'] == 1
-    work = WorkflowWork.objects.get(project=project_b, disposition=WorkflowWorkDisposition.REQUIRED)
-    queued = CeleryOutbox.objects.get()
+    work = WorkflowWork.objects.get(
+        project=project_b,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+        disposition=WorkflowWorkDisposition.REQUIRED,
+    )
+    queued = CeleryOutbox.objects.get(task_name=_DAILY_WORK_TASK_NAME)
     assert queued.args == [str(work.id)]
     assert str(normal_memory.id) not in repr(queued.args)
-    assert WorkflowWork.objects.get(project=project_a).disposition == WorkflowWorkDisposition.NO_OP
+    assert (
+        WorkflowWork.objects.get(project=project_a, work_type=WorkflowWorkType.DAILY_DIGEST).disposition
+        == WorkflowWorkDisposition.NO_OP
+    )
 
 
 @pytest.mark.django_db
@@ -148,14 +149,14 @@ def test_run_scheduled_digests_second_run_reuses_occurrence_without_second_signa
     create_approved_memory(organization, project, team, title='Theta source')
 
     run_scheduled_digests()
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).count() == 1
 
     second = run_scheduled_digests()
 
     assert second['task_enqueued'] == 0
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).count() == 1
 
 
 def test_daily_beat_and_work_routing_registered_once() -> None:

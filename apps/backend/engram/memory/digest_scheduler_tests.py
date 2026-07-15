@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from datetime import timezone as datetime_timezone
@@ -38,6 +39,12 @@ from engram.memory.digest_scheduler import (
     weekly_bucket,
 )
 from engram.memory.services import MemoryWorkerError
+from engram.memory.transitions import MemoryStateInput, PromoteMemoryCandidate, RefuteMemory, build_memory_fence
+from engram.memory.transitions_test_support import (
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
+)
 from engram.memory.workflow_work import WorkflowWorkScopeError
 
 
@@ -59,23 +66,37 @@ def _make_memory(
     kind: str = '',
 ) -> tuple[Memory, MemoryVersion]:
     metadata = {'kind': kind} if kind else {}
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        None,
+        suffix=f'digest-scheduler-{title.lower().replace(" ", "-")}-{uuid.uuid4().hex}',
         title=title,
         body=body,
-        status=status,
         visibility_scope=visibility,
-        metadata=metadata,
+        kind=kind,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    memory = result.memory
+    version = result.memory_version
+    if metadata:
+        memory_metadata = dict(memory.metadata)
+        memory_metadata.update(metadata)
+        memory.metadata = memory_metadata
+        memory.save(update_fields=['metadata', 'updated_at'])
+    if status == MemoryStatus.REFUTED:
+        RefuteMemory().execute(
+            MemoryStateInput(
+                request=transition_request_for(
+                    candidate,
+                    key=f'memory:{memory.id}:refute:{uuid.uuid4().hex}:v1',
+                    reason='fixture refutation',
+                ),
+                memory_fence=build_memory_fence(memory),
+            )
+        )
+    elif status != MemoryStatus.APPROVED:
+        raise ValueError(f'unsupported fixture status: {status}')
 
     return memory, version
 
@@ -219,9 +240,9 @@ def test_concurrent_daily_schedule_converges_on_one_work_and_signal() -> None:
         results = [future.result(timeout=15) for future in futures]
 
     assert sum(1 for created, _disposition in results if created) == 1
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    frozen = WorkflowWork.objects.get()
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest_work_v1').count() == 1
+    frozen = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
     original_snapshot = frozen.input_snapshot
 
     Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
@@ -247,8 +268,8 @@ def test_daily_schedule_duplicate_with_changed_sources_keeps_winner_and_no_secon
     assert second.created is False
     assert second.work_id == first.work_id
     assert second.task_enqueued is False
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.generate_daily_digest_work_v1').count() == 1
     assert WorkflowWork.objects.get(id=first.work_id).input_snapshot == original_snapshot
 
 
@@ -296,8 +317,8 @@ def test_run_daily_schedule_isolates_failing_project_and_counts_failure(
 
     assert result['failed_projects'] == 1
     assert result['scheduled_projects'] == 1
-    assert WorkflowWork.objects.filter(project=healthy).count() == 1
-    assert WorkflowWork.objects.filter(project=failing).count() == 0
+    assert WorkflowWork.objects.filter(project=healthy, work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert WorkflowWork.objects.filter(project=failing, work_type=WorkflowWorkType.DAILY_DIGEST).count() == 0
 
 
 @pytest.mark.django_db
@@ -367,8 +388,8 @@ def test_weekly_schedule_rejects_unlinked_team_before_work_creation() -> None:
             team_id=unlinked_team.id,
         )
 
-    assert WorkflowWork.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert WorkflowWork.objects.filter(project=project, work_type=WorkflowWorkType.WEEKLY_DIGEST).count() == 0
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.generate_weekly_digest_work_v1').count() == 0
 
 
 @pytest.mark.django_db
@@ -400,8 +421,14 @@ def test_project_wide_schedule_rejects_foreign_scope_run_before_work_creation(wo
                 workflow_run_id=foreign_run.id,
             )
 
-    assert WorkflowWork.objects.filter(project=project).count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    expected_work_type = WorkflowWorkType.DAILY_DIGEST if work_kind == 'daily' else WorkflowWorkType.WEEKLY_DIGEST
+    expected_task_name = (
+        'engram.memory.generate_daily_digest_work_v1'
+        if work_kind == 'daily'
+        else 'engram.memory.generate_weekly_digest_work_v1'
+    )
+    assert WorkflowWork.objects.filter(project=project, work_type=expected_work_type).count() == 0
+    assert CeleryOutbox.objects.filter(task_name=expected_task_name).count() == 0
 
 
 @pytest.mark.django_db
@@ -413,7 +440,7 @@ def test_daily_schedule_signal_payload_contains_only_work_id_and_no_source_body(
     result = schedule_daily_project(project_id=project.id, bucket=_daily_bucket(), max_sources=10)
 
     assert result.task_enqueued is True
-    queued = CeleryOutbox.objects.get()
+    queued = CeleryOutbox.objects.get(task_name='engram.memory.generate_daily_digest_work_v1')
     assert queued.task_name == 'engram.memory.generate_daily_digest_work_v1'
     assert queued.args == [str(result.work_id)]
     assert queued.kwargs == {}

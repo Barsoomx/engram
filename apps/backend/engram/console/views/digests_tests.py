@@ -420,7 +420,7 @@ def test_get_weekly_current_enqueues_work_and_initial_signal_built_false(
     f_project: Project,
 ) -> None:
     window_start, _window_end = _current_weekly_window(0)
-    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1), typed=True)
 
     response = f_read_client.get(
         '/v1/admin/digests/weekly',
@@ -443,7 +443,7 @@ def test_get_weekly_current_enqueues_work_and_initial_signal_built_false(
 
     assert WorkflowRun.objects.filter(run_type=WorkflowRunType.WEEKLY_DIGEST).count() == 0
 
-    outbox = CeleryOutbox.objects.get()
+    outbox = CeleryOutbox.objects.get(task_name=_WEEKLY_TASK_NAME)
 
     assert outbox.task_name == _WEEKLY_TASK_NAME
 
