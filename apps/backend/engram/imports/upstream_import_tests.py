@@ -15,6 +15,7 @@ from engram.core.models import (
     CandidateStatus,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryStatus,
     MemoryVersion,
     Observation,
@@ -349,6 +350,9 @@ def test_claude_mem_importer_imports_observations_and_summaries_as_approved_memo
     assert Observation.objects.count() == 2
     assert ObservationSource.objects.count() == 2
     assert MemoryCandidate.objects.filter(status=CandidateStatus.PROMOTED).count() == 2
+    assert MemoryCandidate.objects.filter(decision_work_contract_version=1).count() == 2
+    assert MemoryCandidateSource.objects.filter(source_kind='import').count() == 2
+    assert MemoryCandidateSource.objects.filter(window__isnull=True, stage__isnull=True).count() == 2
     assert Memory.objects.filter(status=MemoryStatus.APPROVED).count() == 2
     assert MemoryVersion.objects.count() == 2
     assert RetrievalDocument.objects.count() == 2
@@ -362,6 +366,14 @@ def test_claude_mem_importer_imports_observations_and_summaries_as_approved_memo
         'claude-mem:fixture-store:session_summary:memory-session-fixture-001:1',
     }
     assert set(Memory.objects.values_list('metadata__source', flat=True)) == {'claude_mem_import'}
+    assert set(Memory.objects.values_list('metadata__source_store_id', flat=True)) == {'fixture-store'}
+    assert set(Memory.objects.values_list('metadata__event_type', flat=True)) == {
+        'claude_mem.observation',
+        'claude_mem.session_summary',
+    }
+    assert set(Memory.objects.values_list('metadata__source_id', flat=True)) == set(
+        ObservationSource.objects.values_list('source_id', flat=True)
+    )
     assert all(document.full_text for document in RetrievalDocument.objects.all())
 
 

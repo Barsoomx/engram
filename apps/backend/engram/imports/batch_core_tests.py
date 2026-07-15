@@ -6,7 +6,23 @@ from typing import Any
 
 import pytest
 
-from engram.core.models import AgentSession, Memory, Observation, Organization, Project
+from engram.core.models import (
+    AgentSession,
+    AuditEvent,
+    Memory,
+    MemoryCandidate,
+    MemoryCandidateSource,
+    MemoryTransition,
+    MemoryVersion,
+    MemoryVersionSource,
+    Observation,
+    ObservationSource,
+    Organization,
+    Project,
+    RawEventEnvelope,
+    RetrievalDocument,
+    WorkflowWork,
+)
 from engram.imports.services import ClaudeMemImporter, ImportContext
 
 
@@ -105,6 +121,71 @@ def test_import_batch_promotes_with_explicit_confidence(f_core_scope: CoreScope)
 
     assert observation_memory.confidence == Decimal('0.700')
     assert summary_memory.confidence == Decimal('0.800')
+    assert observation_memory.metadata['source'] == 'claude_mem_import'
+    assert observation_memory.metadata['source_store_id'] == 'core-store'
+    assert observation_memory.metadata['event_type'] == 'claude_mem.observation'
+    assert summary_memory.metadata['source'] == 'claude_mem_import'
+    assert summary_memory.metadata['source_store_id'] == 'core-store'
+    assert summary_memory.metadata['event_type'] == 'claude_mem.session_summary'
+
+
+@pytest.mark.django_db
+def test_import_batch_publishes_v1_provenance_without_candidate_decision_work(f_core_scope: CoreScope) -> None:
+    importer = ClaudeMemImporter()
+    importer.import_batch(f_core_scope.context, 'sdk_sessions', [_session_row()])
+    result = importer.import_batch(f_core_scope.context, 'observations', [_observation_row()])
+
+    assert result.created == 1
+    candidate = MemoryCandidate.objects.get(organization=f_core_scope.organization)
+    candidate_source = MemoryCandidateSource.objects.get(candidate=candidate)
+    assert candidate.decision_work_contract_version == 1
+    assert candidate_source.source_kind == 'import'
+    assert candidate_source.window_id is None
+    assert candidate_source.stage_id is None
+    observation_source = ObservationSource.objects.get(observation=candidate.source_observation_id)
+    assert candidate_source.import_source_id == observation_source.id
+
+    memory = Memory.objects.get(source_candidates=candidate)
+    version = MemoryVersion.objects.get(memory=memory)
+    assert version.version == 1
+    assert MemoryVersionSource.objects.filter(memory_version=version, candidate_source=candidate_source).count() == 1
+    document = RetrievalDocument.objects.get(memory_version=version)
+    assert document.full_text == version.body
+    transition = MemoryTransition.objects.get(candidate=candidate)
+    assert transition.embedding_work_id is not None
+    assert AuditEvent.objects.filter(memory_transition__candidate=candidate).count() == 1
+    assert WorkflowWork.objects.filter(id=transition.embedding_work_id, work_type='memory_embedding').count() == 1
+    assert WorkflowWork.objects.filter(work_type='candidate_decision', subject_id=candidate.id).count() == 0
+
+
+@pytest.mark.django_db
+def test_import_batch_promotion_fault_rolls_back_import_row_and_semantics(
+    f_core_scope: CoreScope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    importer = ClaudeMemImporter()
+    importer.import_batch(f_core_scope.context, 'sdk_sessions', [_session_row()])
+
+    class ImportPromotionError(RuntimeError):
+        pass
+
+    from engram.memory import transitions
+
+    def fail_after_transition_write(point: str) -> None:
+        if point == 'transition':
+            raise ImportPromotionError('typed import promotion fault')
+
+    monkeypatch.setattr(transitions, '_fault_boundary', fail_after_transition_write)
+    with pytest.raises(ImportPromotionError):
+        importer.import_batch(f_core_scope.context, 'observations', [_observation_row()])
+
+    assert not RawEventEnvelope.objects.filter(organization=f_core_scope.organization).exists()
+    assert not Observation.objects.filter(organization=f_core_scope.organization).exists()
+    assert not ObservationSource.objects.filter(organization=f_core_scope.organization).exists()
+    assert not MemoryCandidate.objects.filter(organization=f_core_scope.organization).exists()
+    assert not Memory.objects.filter(organization=f_core_scope.organization).exists()
+    assert not MemoryVersion.objects.filter(organization=f_core_scope.organization).exists()
+    assert not MemoryTransition.objects.filter(organization=f_core_scope.organization).exists()
 
 
 @pytest.mark.django_db
@@ -199,3 +280,23 @@ def test_import_batch_row_replay_is_idempotent(f_core_scope: CoreScope) -> None:
     assert replay.created == 0
     assert replay.duplicates == 1
     assert Memory.objects.filter(organization=f_core_scope.organization).count() == 1
+    before = {
+        'candidate_sources': MemoryCandidateSource.objects.count(),
+        'version_sources': MemoryVersionSource.objects.count(),
+        'transitions': MemoryTransition.objects.count(),
+        'audits': AuditEvent.objects.count(),
+        'documents': RetrievalDocument.objects.count(),
+        'embedding_work': WorkflowWork.objects.filter(work_type='memory_embedding').count(),
+    }
+    replay_again = importer.import_batch(f_core_scope.context, 'observations', [_observation_row()])
+    after = {
+        'candidate_sources': MemoryCandidateSource.objects.count(),
+        'version_sources': MemoryVersionSource.objects.count(),
+        'transitions': MemoryTransition.objects.count(),
+        'audits': AuditEvent.objects.count(),
+        'documents': RetrievalDocument.objects.count(),
+        'embedding_work': WorkflowWork.objects.filter(work_type='memory_embedding').count(),
+    }
+    assert replay_again.created == 0
+    assert replay_again.duplicates == 1
+    assert after == before

@@ -21,6 +21,9 @@ MIGRATE_0037 = [('core', '0037_distillation_stage_policy_role_coord')]
 MIGRATE_0038 = [('core', '0038_atomic_memory_transitions')]
 MIGRATION_0038_NODE = ('core', '0038_atomic_memory_transitions')
 MIGRATION_0038_MODULE = 'engram.core.migrations.0038_atomic_memory_transitions'
+MIGRATE_0039 = [('core', '0039_import_provenance')]
+MIGRATION_0039_NODE = ('core', '0039_import_provenance')
+MIGRATION_0039_MODULE = 'engram.core.migrations.0039_import_provenance'
 
 
 def _end_work_contract_column() -> tuple[str | None, str]:
@@ -2843,3 +2846,154 @@ def test_0038_reverse_guard_is_last_and_refuses_transition_history() -> None:
     assert operation.reverse_code is not None
     with pytest.raises(RuntimeError, match='cannot reverse 0038'):
         operation.reverse_code(_Apps(), None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0039_forward_preserves_distillation_sources_and_adds_import_shape() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0039_NODE in executor.loader.graph.nodes
+    try:
+        executor.migrate(MIGRATE_0038)
+        old_apps = executor.loader.project_state(MIGRATE_0038).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'migration-0039-session')
+        observation = _create_historical_observation(
+            old_apps,
+            scope,
+            session,
+            'a' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        candidate_model = old_apps.get_model('core', 'MemoryCandidate')
+        candidate = candidate_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Legacy candidate',
+            body='Legacy body',
+            content_hash='b' * 64,
+            decision_work_contract_version=1,
+        )
+        stage_model, stage = _create_historical_0036_stage_fixture(old_apps, '0039')
+        source_model = old_apps.get_model('core', 'MemoryCandidateSource')
+        legacy_source = source_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=candidate,
+            window=stage.window,
+            observation=observation,
+            stage=stage,
+            anchors={'schema': 'distillation'},
+            anchors_hash='c' * 64,
+        )
+
+        executor.migrate(MIGRATE_0039)
+        new_apps = executor.loader.project_state(MIGRATE_0039).apps
+        migrated_source = new_apps.get_model('core', 'MemoryCandidateSource').objects.get(id=legacy_source.id)
+        assert migrated_source.source_kind == 'distillation'
+        assert migrated_source.window_id == stage.window_id
+        assert migrated_source.stage_id == stage.id
+        fields = {field.name for field in migrated_source._meta.fields}
+        assert {'source_kind', 'import_source'} <= fields
+
+        observation_source_model = new_apps.get_model('core', 'ObservationSource')
+        import_source = observation_source_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            observation=observation,
+            source_type='claude_mem',
+            source_id='migration-0039:1',
+        )
+        import_candidate = new_apps.get_model('core', 'MemoryCandidate').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Import candidate',
+            body='Import body',
+            content_hash='d' * 64,
+            decision_work_contract_version=1,
+        )
+        new_apps.get_model('core', 'MemoryCandidateSource').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=import_candidate,
+            observation=observation,
+            source_kind='import',
+            import_source=import_source,
+            anchors={'schema': 'import_candidate_source.v1'},
+            anchors_hash='e' * 64,
+        )
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0039_NODE in executor.loader.graph.nodes
+    try:
+        executor.migrate(MIGRATE_0039)
+        apps_0039 = executor.loader.project_state(MIGRATE_0039).apps
+        source_model = apps_0039.get_model('core', 'MemoryCandidateSource')
+        assert source_model.objects.filter(source_kind='distillation').count() >= 0
+        migration = executor.loader.graph.nodes[MIGRATION_0039_NODE]
+        assert migration.operations[-1].__class__.__name__ == 'RunPython'
+
+        executor.migrate(MIGRATE_0038)
+        apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
+        assert 'source_kind' not in {
+            field.name for field in apps_0038.get_model('core', 'MemoryCandidateSource')._meta.fields
+        }
+
+        executor.migrate(MIGRATE_0039)
+        apps_0039 = executor.loader.project_state(MIGRATE_0039).apps
+        source_model = apps_0039.get_model('core', 'MemoryCandidateSource')
+        scope = _create_historical_0032b_scope(apps_0039)
+        session = _create_historical_session(apps_0039, scope, 'migration-0039-reverse-session')
+        observation = _create_historical_observation(
+            apps_0039,
+            scope,
+            session,
+            'f' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        observation_source = apps_0039.get_model('core', 'ObservationSource').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            observation=observation,
+            source_type='claude_mem',
+            source_id='migration-0039:reverse',
+        )
+        candidate = apps_0039.get_model('core', 'MemoryCandidate').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Reverse import candidate',
+            body='Reverse import body',
+            content_hash='1' * 64,
+            decision_work_contract_version=1,
+        )
+        source_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=candidate,
+            observation=observation,
+            source_kind='import',
+            import_source=observation_source,
+            anchors={'schema': 'import_candidate_source.v1'},
+            anchors_hash='2' * 64,
+        )
+        with pytest.raises(RuntimeError, match='0039|import'):
+            MigrationExecutor(connection).migrate(MIGRATE_0038)
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)

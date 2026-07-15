@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import importlib
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +52,7 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkType,
 )
+from engram.imports.services import ClaudeMemImporter
 from engram.memory import work_execution
 from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
@@ -2464,6 +2466,77 @@ def test_p7_version_one_promotion_chain_is_healthy() -> None:
     assert result.memory_version.version == 1
     assert p7.state == InvariantState.HEALTHY
     assert p7.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -> None:
+    provenance = importlib.import_module('engram.memory.import_provenance')
+    candidate, source, (organization, project, session) = provenanced_candidate('import-p7')
+    fields = {field.name for field in type(source)._meta.fields}
+    assert {'source_kind', 'import_source'} <= fields
+    import_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=source.observation,
+        source_type='claude_mem',
+        source_id='claude-mem:import-p7:1',
+    )
+    source.source_kind = 'import'
+    source.window = None
+    source.stage = None
+    source.import_source = import_source
+    source.anchors = {
+        'schema': 'import_candidate_source.v1',
+        'observation_id': str(source.observation.id),
+        'session_sequence': source.observation.session_sequence,
+        'observation_digest': source.observation.content_hash,
+        'source_type': 'claude_mem',
+        'source_id': import_source.source_id,
+        'source_store_id': 'import-p7-store',
+        'event_type': 'claude_mem.observation',
+        'raw_event_id': None,
+    }
+    source.anchors_hash = canonical_source_manifest(source.anchors)
+    source.save(update_fields=['source_kind', 'window', 'stage', 'import_source', 'anchors', 'anchors_hash'])
+    candidate.title = source.observation.title
+    candidate.body = source.observation.body
+    candidate.content_hash = provenance.import_candidate_content_hash(
+        import_source.source_id,
+        source.observation.content_hash,
+    )
+    candidate.decision_work_contract_version = 1
+    candidate.save(update_fields=['title', 'body', 'content_hash', 'decision_work_contract_version'])
+
+    expected_hash = ClaudeMemImporter()._content_hash(
+        'memory-candidate',
+        import_source.source_id,
+        source.observation.content_hash,
+    )
+    assert candidate.content_hash == expected_hash
+    manifest_entries, manifest_hash = provenance.candidate_evidence_manifest(candidate)
+    assert manifest_entries
+    assert manifest_hash == provenance.candidate_evidence_manifest(candidate)[1]
+
+    base_request = transition_request(candidate)
+    import_request = replace(
+        base_request,
+        candidate_fence=replace(base_request.candidate_fence, evidence_manifest_hash=manifest_hash),
+    )
+    MemoryCandidate.objects.filter(id=candidate.id).update(content_hash='f' * 64)
+    with pytest.raises(ValueError, match='stale_decision'):
+        transitions_module().PromoteMemoryCandidate().execute(import_request)
+    assert not Memory.objects.filter(organization=organization).exists()
+    MemoryCandidate.objects.filter(id=candidate.id).update(content_hash=expected_hash)
+    candidate.refresh_from_db()
+    result = transitions_module().PromoteMemoryCandidate().execute(import_request)
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+    assert result.memory.transition_contract_version == 1
+    assert p7.state == InvariantState.HEALTHY
+    assert p7.violation_count == 0
+    assert not WorkflowWork.objects.filter(
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_id=candidate.id,
+    ).exists()
 
 
 @pytest.mark.django_db
