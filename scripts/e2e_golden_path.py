@@ -156,6 +156,17 @@ def main() -> int:
             assert_equal(post_tool_use.get('status'), 'accepted', 'post-tool-use status')
             assert_secret_absent('post-tool-use response', json.dumps(post_tool_use), api_key)
 
+            progress('Ending the same session to trigger CP3 distillation')
+            session_end = run_json(
+                [sys.executable, '-m', 'engram_cli', 'hook', 'session-end', '--config-dir', config_dir],
+                cwd=ROOT,
+                env=cli_env,
+                input_text=json.dumps(session_end_payload(run_id)),
+                secret=api_key,
+            )
+            assert_equal(session_end.get('status'), 'accepted', 'session-end status')
+            approve_cp3_candidate(project_id, run_id, agent_key)
+
             progress('Waiting for worker-created retrieval document')
             worker_memory = wait_for_worker_memory(project_id, run_id, api_key)
             required_string(worker_memory, 'memory_id')
@@ -220,6 +231,17 @@ def main() -> int:
             )
             assert_equal(post_tool_use_repo_url.get('status'), 'accepted', 'post-tool-use (repo-url) status')
             assert_secret_absent('post-tool-use (repo-url) response', json.dumps(post_tool_use_repo_url), api_key)
+
+            progress('Ending the same repo-url session to trigger CP3 distillation')
+            session_end_repo_url = run_json(
+                [sys.executable, '-m', 'engram_cli', 'hook', 'session-end', '--config-dir', config_dir],
+                cwd=ROOT,
+                env=cli_env,
+                input_text=json.dumps(session_end_payload(run_id_repo_url)),
+                secret=api_key,
+            )
+            assert_equal(session_end_repo_url.get('status'), 'accepted', 'session-end (repo-url) status')
+            approve_cp3_candidate(project_id, run_id_repo_url, agent_key)
 
             progress('Waiting for second worker-created retrieval document')
             worker_memory_repo_url = wait_for_worker_memory(project_id, run_id_repo_url, api_key)
@@ -308,7 +330,7 @@ def drive_mcp_stdio(
         {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
         {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list'},
         _tool_call(
-            3, 'engram_search', {'query': 'Provider-synthesized memory', 'file_paths': [MEMORY_FILE]}
+            3, 'engram_search', {'query': 'Provider-distilled memory', 'file_paths': [MEMORY_FILE]}
         ),
         _tool_call(4, 'engram_context', {'session_id': f'mcp-{run_id}'}),
         _tool_call(5, 'engram_observations', {'limit': 5}),
@@ -464,6 +486,23 @@ def session_start_payload(run_id: str) -> dict[str, object]:
     }
 
 
+def session_end_payload(run_id: str) -> dict[str, object]:
+    return {
+        'session_id': f'e2e-session-observation-{run_id}',
+        'event_id': f'e2e-session-end-event-{run_id}',
+        'idempotency_key': f'e2e-session-end-idempotency-{run_id}',
+        'request_id': f'e2e-session-end-request-{run_id}',
+        'observation': {
+            'type': 'session_end',
+            'title': f'E2E session ended {run_id}',
+            'body': 'Golden path CP3 session end',
+        },
+        'repository_root': '/workspace/engram',
+        'branch': 'master',
+        'cwd': '/workspace/engram',
+    }
+
+
 def pythonpath_env() -> dict[str, str]:
     env = dict(os.environ)
     env['PYTHONPATH'] = str(ROOT / 'packages/cli')
@@ -502,6 +541,75 @@ def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[st
     raise E2EError(
         f'Timed out waiting for worker-created approved memory and retrieval document. Last error: {last_error}'
     )
+
+
+def approve_cp3_candidate(project_id: str, run_id: str, secret: str) -> dict[str, object]:
+    query = f"""
+import json
+from engram.access.models import Identity
+from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+project_id = {json.dumps(project_id)}
+project = Project.objects.get(id=project_id)
+client_event_id = {json.dumps(f'e2e-hook-event-{run_id}')}
+request_id = {json.dumps(f'e2e-hook-request-{run_id}')}
+candidate = (
+    MemoryCandidate.objects.filter(
+        project_id=project_id,
+        decision_work_contract_version=1,
+        sources__observation__raw_event__client_event_id=client_event_id,
+        sources__observation__raw_event__request_id=request_id,
+        status='proposed',
+    ).distinct().order_by('-created_at').first()
+)
+if candidate is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': CP3 candidate not ready')
+work = WorkflowWork.objects.filter(
+    project_id=project_id,
+    subject_id=candidate.id,
+    work_type='candidate_decision',
+    execution_state='blocked',
+).first()
+if work is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision work missing')
+run = WorkflowRun.objects.filter(work=work, status='failed', failure_code='candidate_decision_capability_unavailable').first()
+if run is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
+organization = Organization.objects.get(id=project.organization_id)
+actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
+from engram.console.services import approve_memory_candidate
+memory = approve_memory_candidate(organization, actor, candidate, 'CP3 golden-path typed approval')
+print(json.dumps({{'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}}))
+"""
+    return wait_for_golden_db_state(query, secret)
+
+
+def wait_for_golden_db_state(query: str, secret: str) -> dict[str, object]:
+    deadline = time.monotonic() + WORKER_MEMORY_TIMEOUT_SECONDS
+    last_error = WORKER_MEMORY_NOT_READY_ERROR
+    while time.monotonic() < deadline:
+        try:
+            return run_json(
+                [
+                    'docker',
+                    'compose',
+                    'exec',
+                    '-T',
+                    'api',
+                    'python',
+                    'manage.py',
+                    'shell',
+                    '-c',
+                    query,
+                ],
+                cwd=COMPOSE_DIR,
+                secret=secret,
+            )
+        except E2EError as error:
+            last_error = str(error)
+            if WORKER_MEMORY_NOT_READY_ERROR not in last_error:
+                raise
+            time.sleep(WORKER_MEMORY_POLL_INTERVAL_SECONDS)
+    raise E2EError(f'Timed out waiting for golden-path backend state. Last error: {last_error}')
 
 
 def worker_memory_query(project_id: str, run_id: str) -> str:
@@ -687,10 +795,10 @@ def assert_context_response(response: dict[str, object], worker_memory: dict[str
     assert_equal(first_item.get('citation'), 'M1', 'first context citation')
     title = required_string(worker_memory, 'memory_title')
     body = required_string(worker_memory, 'memory_body')
-    if not title.startswith('Provider-synthesized memory '):
-        raise E2EError(f'Expected provider-synthesized memory title, got {title!r}')
-    if not body.startswith('Provider-synthesized candidate body '):
-        raise E2EError(f'Expected provider-synthesized memory body, got {body!r}')
+    if not title.startswith('Provider-distilled memory '):
+        raise E2EError(f'Expected provider-distilled memory title, got {title!r}')
+    if not body.startswith('Provider-distilled memory body '):
+        raise E2EError(f'Expected provider-distilled memory body, got {body!r}')
     assert_equal(first_item.get('title'), title, 'memory title')
     assert_equal(first_item.get('body'), body, 'memory body')
     rendered_context = required_string(response, 'rendered_context')

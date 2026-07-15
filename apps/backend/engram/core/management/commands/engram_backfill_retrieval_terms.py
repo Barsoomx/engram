@@ -7,14 +7,17 @@ import structlog
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandParser
 
-from engram.context.services import derive_retrieval_terms
+from engram.context.term_extraction import derive_retrieval_terms
 from engram.core.models import RetrievalDocument
 
 logger = structlog.get_logger(__name__)
 
 
 class Command(BaseCommand):
-    help = 'Recompute retrieval symbols/exact_terms for existing RetrievalDocument rows (operator tool).'
+    help = (
+        'Backfill legacy retrieval symbols/exact_terms for RetrievalDocument rows with '
+        'projection_contract_version=0; v1 canonical projections are not mutated.'
+    )
 
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument('--organization', type=str, default=None, dest='organization_id')
@@ -22,7 +25,11 @@ class Command(BaseCommand):
         parser.add_argument('--dry-run', action='store_true', dest='dry_run')
 
     def handle(self, *args: Any, **options: Any) -> None:
-        queryset = RetrievalDocument.objects.select_related('memory', 'memory_version').order_by('id')
+        queryset = (
+            RetrievalDocument.objects.filter(projection_contract_version=0)
+            .select_related('memory', 'memory_version')
+            .order_by('id')
+        )
 
         if options['organization_id']:
             queryset = queryset.filter(organization_id=uuid.UUID(options['organization_id']))

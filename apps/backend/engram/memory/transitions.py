@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import uuid
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 
 from django.db import transaction
 from django.utils import timezone
@@ -107,7 +109,10 @@ class PublishDigestMemoryInput:
     source_memory_fences: tuple[MemoryFence, ...]
     title: str
     body: str
+    source_memory_version_ids: tuple[uuid.UUID, ...] = ()
     work_claim: WorkClaim | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
+    visibility_scope: str = VisibilityScope.PROJECT
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,7 +593,7 @@ def _digest_snapshot_source_set(work: WorkflowWork) -> set[tuple[str, str]]:
 def _validate_digest_work_claim(
     work: WorkflowWork,
     request: TransitionRequest,
-    fences: tuple[MemoryFence, ...],
+    source_pairs: set[tuple[str, str]],
 ) -> None:
     if work.work_type not in (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST):
         raise MemoryTransitionError('stale_decision', 'owning work is not digest work', retryable=True)
@@ -613,8 +618,7 @@ def _validate_digest_work_claim(
     else:
         raise MemoryTransitionError('stale_decision', 'digest work subject type is invalid', retryable=True)
 
-    declared_sources = {(str(fence.memory_id), str(fence.current_version_id)) for fence in fences}
-    if _digest_snapshot_source_set(work) != declared_sources:
+    if _digest_snapshot_source_set(work) != source_pairs:
         raise MemoryTransitionError('stale_decision', 'digest source snapshot no longer matches', retryable=True)
 
 
@@ -704,13 +708,137 @@ def _lock_declared_memories(
     return memories, versions
 
 
+def _digest_source_scope_matches(memory: Memory, request: TransitionRequest, visibility_scope: str) -> bool:
+    if memory.organization_id != request.scope.organization_id or memory.project_id != request.scope.project_id:
+        return False
+    if visibility_scope == VisibilityScope.PROJECT:
+        return memory.visibility_scope == VisibilityScope.PROJECT
+    if visibility_scope == VisibilityScope.TEAM:
+        return memory.visibility_scope == VisibilityScope.PROJECT or (
+            memory.visibility_scope == VisibilityScope.TEAM
+            and request.scope.team_id is not None
+            and memory.team_id == request.scope.team_id
+        )
+    return False
+
+
+def _validate_digest_source_scope(
+    memories: Mapping[uuid.UUID, Memory], request: TransitionRequest, visibility_scope: str
+) -> None:
+    if not memories:
+        raise MemoryTransitionError('memory_state', 'at least one digest source memory is required')
+    for memory in memories.values():
+        if memory.transition_contract_version != 1 or memory.current_transition_id is None:
+            raise MemoryTransitionError('memory_state', 'digest source is not owned by the transition contract')
+        if not _digest_source_scope_matches(memory, request, visibility_scope):
+            raise MemoryTransitionError('scope', 'digest source is outside the declared visibility scope')
+
+
+def _validate_digest_output_scope(request: TransitionRequest, visibility_scope: str) -> None:
+    if visibility_scope == VisibilityScope.PROJECT:
+        return
+    if visibility_scope == VisibilityScope.TEAM and request.scope.team_id is not None:
+        return
+    raise MemoryTransitionError('scope', 'digest output visibility does not match the declared scope')
+
+
+def _lock_digest_sources_from_fences(
+    request: TransitionRequest,
+    fences: tuple[MemoryFence, ...],
+    visibility_scope: str,
+) -> tuple[dict[uuid.UUID, Memory], dict[uuid.UUID, MemoryVersion]]:
+    memory_ids, version_ids = _declared_fence_ids(fences)
+    locked_memories = list(
+        Memory.objects.select_for_update()
+        .filter(id__in=memory_ids, organization_id=request.scope.organization_id, project_id=request.scope.project_id)
+        .order_by('id')
+    )
+    if len(locked_memories) != len(memory_ids):
+        raise MemoryTransitionError('scope', 'a declared memory is outside the available scope')
+    memories = {memory.id: memory for memory in locked_memories}
+    _validate_digest_source_scope(memories, request, visibility_scope)
+
+    locked_versions = list(
+        MemoryVersion.objects.select_for_update()
+        .filter(id__in=version_ids, organization_id=request.scope.organization_id, project_id=request.scope.project_id)
+        .order_by('id')
+    )
+    if len(locked_versions) != len(version_ids):
+        raise MemoryTransitionError('stale_decision', 'a declared memory version no longer exists', retryable=True)
+    versions = {version.memory_id: version for version in locked_versions}
+    if set(versions) != set(memory_ids):
+        raise MemoryTransitionError('stale_decision', 'memory version fence does not match its memory', retryable=True)
+    for fence in fences:
+        version = versions.get(fence.memory_id)
+        if version is None or version.id != fence.current_version_id:
+            raise MemoryTransitionError(
+                'stale_decision', 'memory version fence does not match its memory', retryable=True
+            )
+
+    return memories, versions
+
+
+def _normalise_digest_version_ids(version_ids: tuple[uuid.UUID, ...] | None) -> tuple[uuid.UUID, ...]:
+    if not version_ids:
+        raise MemoryTransitionError('memory_state', 'at least one digest source version is required')
+    try:
+        normalised = tuple(uuid.UUID(str(version_id)) for version_id in version_ids)
+    except (TypeError, ValueError, AttributeError) as error:
+        raise MemoryTransitionError('memory_state', 'digest source version ids are malformed') from error
+    if len(set(normalised)) != len(normalised):
+        raise MemoryTransitionError('memory_state', 'digest source versions must be distinct')
+    return normalised
+
+
+def _lock_digest_sources_from_versions(
+    request: TransitionRequest,
+    version_ids: tuple[uuid.UUID, ...],
+    visibility_scope: str,
+) -> tuple[dict[uuid.UUID, Memory], dict[uuid.UUID, MemoryVersion]]:
+    # Read the immutable rows only to discover their parent memories, then lock
+    # memories before taking the version locks to preserve the transition lock order.
+    declared_memory_ids = list(MemoryVersion.objects.filter(id__in=version_ids).values_list('memory_id', flat=True))
+    if len(declared_memory_ids) != len(version_ids) or len(set(declared_memory_ids)) != len(declared_memory_ids):
+        raise MemoryTransitionError('stale_decision', 'a declared digest source version is invalid', retryable=True)
+    locked_memories = list(
+        Memory.objects.select_for_update()
+        .filter(
+            id__in=declared_memory_ids,
+            organization_id=request.scope.organization_id,
+            project_id=request.scope.project_id,
+        )
+        .order_by('id')
+    )
+    if len(locked_memories) != len(declared_memory_ids):
+        raise MemoryTransitionError('scope', 'a declared memory is outside the available scope')
+    memories = {memory.id: memory for memory in locked_memories}
+    _validate_digest_source_scope(memories, request, visibility_scope)
+
+    locked_versions = list(
+        MemoryVersion.objects.select_for_update()
+        .filter(
+            id__in=version_ids,
+            organization_id=request.scope.organization_id,
+            project_id=request.scope.project_id,
+        )
+        .order_by('id')
+    )
+    if len(locked_versions) != len(version_ids):
+        raise MemoryTransitionError('stale_decision', 'a declared digest source version is invalid', retryable=True)
+    versions = {version.memory_id: version for version in locked_versions}
+    if set(versions) != set(memories):
+        raise MemoryTransitionError('stale_decision', 'digest source version does not match its memory', retryable=True)
+
+    return memories, versions
+
+
 def _lock_exact_documents(versions: dict[uuid.UUID, MemoryVersion]) -> dict[uuid.UUID, RetrievalDocument]:
     version_ids = [version.id for version in versions.values()]
     documents = list(
         RetrievalDocument.objects.select_for_update().filter(memory_version_id__in=version_ids).order_by('id')
     )
     if len(documents) != len(version_ids):
-        raise MemoryTransitionError('projection', 'a declared current version has no exact retrieval document')
+        raise MemoryTransitionError('projection', 'a declared source version has no exact retrieval document')
 
     return {document.memory_id: document for document in documents}
 
@@ -913,13 +1041,34 @@ def _create_revision_version(
     return version, version_sources
 
 
+def _canonical_digest_metadata(
+    metadata: Mapping[str, object],
+    *,
+    title: str,
+    body: str,
+) -> dict[str, object]:
+    canonical_metadata = json.loads(canonical_json_bytes(dict(metadata)))
+    canonical_metadata.update(
+        {
+            'kind': 'digest',
+            'source': 'digest_work',
+            'full_text': f'{title}\n\n{body}'.strip(),
+        }
+    )
+
+    return canonical_metadata
+
+
 def _create_digest_memory(
     request: TransitionRequest,
     *,
     title: str,
     body: str,
     source_versions: list[MemoryVersion],
+    metadata: Mapping[str, object],
+    visibility_scope: str,
 ) -> tuple[Memory, MemoryVersion, list[MemoryVersionSource]]:
+    canonical_metadata = _canonical_digest_metadata(metadata, title=title, body=body)
     memory = Memory.objects.create(
         organization_id=request.scope.organization_id,
         project_id=request.scope.project_id,
@@ -927,10 +1076,10 @@ def _create_digest_memory(
         title=title,
         body=body,
         status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
+        visibility_scope=visibility_scope,
         current_version=0,
         transition_contract_version=0,
-        metadata={'kind': 'digest', 'source': 'digest_work', 'full_text': f'{title}\n\n{body}'.strip()},
+        metadata=canonical_metadata,
     )
     _fault_boundary('memory')
     version = MemoryVersion.objects.create(
@@ -940,7 +1089,7 @@ def _create_digest_memory(
         version=1,
         body=body,
         content_hash=_content_hash(memory_id=memory.id, version=1, title=title, body=body),
-        source_metadata={'kind': 'digest', 'full_text': f'{title}\n\n{body}'.strip()},
+        source_metadata=dict(canonical_metadata),
     )
     _fault_boundary('version')
     version_sources = _create_version_sources(version, memory_versions=source_versions)
@@ -1470,35 +1619,61 @@ class PublishDigestMemory:
     def execute(self, data: PublishDigestMemoryInput) -> MemoryTransitionResult:
         request = data.request
         fences = tuple(data.source_memory_fences)
+        version_ids = (
+            _normalise_digest_version_ids(data.source_memory_version_ids) if data.source_memory_version_ids else ()
+        )
+        if bool(fences) == bool(version_ids):
+            raise MemoryTransitionError(
+                'command', 'exactly one of source_memory_fences or source_memory_version_ids is required'
+            )
+        _validate_digest_output_scope(request, data.visibility_scope)
+        metadata = _canonical_digest_metadata(data.metadata, title=data.title, body=data.body)
+        source_command = (
+            {
+                'source_memory_fences': [
+                    _memory_fence_value(fence) for fence in sorted(fences, key=lambda item: str(item.memory_id))
+                ]
+            }
+            if fences
+            else {'source_memory_version_ids': [str(version_id) for version_id in sorted(version_ids, key=str)]}
+        )
         fingerprint = _request_fingerprint(
             request,
             action='publish_digest',
             subject_id=data.work_claim.work_id if data.work_claim else request.scope.project_id,
             command={
-                'source_memory_fences': [
-                    _memory_fence_value(fence) for fence in sorted(fences, key=lambda item: str(item.memory_id))
-                ],
+                **source_command,
                 'title': data.title,
                 'body': data.body,
+                'metadata': metadata,
+                'visibility_scope': data.visibility_scope,
                 'work_claim': _work_claim_value(data.work_claim),
             },
         )
         with transaction.atomic():
             claimed_work = _lock_optional_work(data.work_claim, request)
-            memories, versions = _lock_declared_memories(request, fences)
+            if fences:
+                memories, versions = _lock_digest_sources_from_fences(request, fences, data.visibility_scope)
+                source_pairs = {(str(fence.memory_id), str(fence.current_version_id)) for fence in fences}
+            else:
+                memories, versions = _lock_digest_sources_from_versions(request, version_ids, data.visibility_scope)
+                source_pairs = {(str(memory_id), str(version.id)) for memory_id, version in versions.items()}
             _lock_exact_documents(versions)
             if claimed_work is not None:
-                _validate_digest_work_claim(claimed_work, request, fences)
+                _validate_digest_work_claim(claimed_work, request, source_pairs)
             existing = _existing_transition(request, fingerprint=fingerprint)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
-            _verify_memory_fences(memories, fences)
+            if fences:
+                _verify_memory_fences(memories, fences)
             source_versions = sorted(versions.values(), key=lambda version: str(version.id))
             memory, version, version_sources = _create_digest_memory(
                 request,
                 title=data.title,
                 body=data.body,
                 source_versions=source_versions,
+                metadata=metadata,
+                visibility_scope=data.visibility_scope,
             )
             transition_id = uuid.uuid4()
             document = _write_exact(

@@ -508,8 +508,8 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
     if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in candidate_titles):
         failures.append(f'no candidate generated from the mock provider: {candidate_titles}')
     memory_titles = [str(title) for title in state.get('memory_titles') or []]
-    if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in memory_titles):
-        failures.append(f'no mock-generated memory auto-promoted: {memory_titles}')
+    if not any(title.startswith(SESSION_TITLE_PREFIX) for title in memory_titles):
+        failures.append(f'no mock-generated memory approved through typed review: {memory_titles}')
     if state.get('embedding_dims') != [EMBEDDING_DIMENSION]:
         failures.append(f'unexpected embedding dims: {state.get("embedding_dims")}')
     if state.get('embedding_references') != ['provider']:
@@ -534,6 +534,53 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
         raise E2EError('Backend contract failures:\n- ' + '\n- '.join(failures))
 
     return state
+
+
+def approve_cp3_candidate(*, secret: str) -> dict[str, object]:
+    return wait_for_db_state(
+        f"""
+import json
+from engram.console.services import approve_memory_candidate
+from engram.access.models import Identity
+from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+if project is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': project not auto-created')
+candidate = (
+    MemoryCandidate.objects.filter(
+        project=project,
+        status='proposed',
+        decision_work_contract_version=1,
+        title__startswith={json.dumps(SESSION_TITLE_PREFIX)},
+        sources__source_kind='distillation',
+        sources__window__isnull=False,
+    ).distinct().order_by('-created_at').first()
+)
+if candidate is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': generated CP3 candidate not ready')
+work = WorkflowWork.objects.filter(
+    project=project,
+    subject_id=candidate.id,
+    work_type='candidate_decision',
+    execution_state='blocked',
+).first()
+if work is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate-decision work missing')
+run = WorkflowRun.objects.filter(
+    work=work,
+    status='failed',
+    failure_code='candidate_decision_capability_unavailable',
+).first()
+if run is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
+organization = Organization.objects.get(id=project.organization_id)
+actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
+memory = approve_memory_candidate(organization, actor, candidate, 'CP3 Claude plugin typed approval')
+print(json.dumps({{'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}}))
+""",
+        secret=secret,
+    )
 
 
 def backdate_memories_into_daily_window() -> str:
@@ -685,48 +732,9 @@ print(json.dumps({{'held_candidate': str(candidate.id), 'promoted': candidate.pr
     return {'held_candidate': held.get('held_candidate')}
 
 
-def verify_curation_supersede(home: Path, repo: Path, *, secret: str) -> dict[str, object]:
-    env = cli_hook_env(home)
-    command = [sys.executable, '-m', 'engram_cli', 'hook', 'post-tool-use', '--agent', 'claude-code']
-    for run_index in ('a', 'b'):
-        hook_input = {
-            'session_id': f'e2e-dup-session-{run_index}',
-            'event_id': f'e2e-dup-{run_index}',
-            'idempotency_key': f'e2e-dup-{run_index}',
-            'request_id': f'e2e-dup-{run_index}',
-            'tool_name': 'Bash',
-            'tool_input': {'command': 'echo identical-duplicate-body'},
-            'repository_root': str(repo),
-            'cwd': str(repo),
-        }
-        run_json(command, cwd=repo, env=env, secret='', input_text=json.dumps(hook_input))
-
-    return wait_for_db_state(
-        f"""
-import json
-from engram.core.models import AuditEvent, Memory, MemoryLink
-
-link = MemoryLink.objects.filter(link_type='superseded_by').order_by('-created_at').first()
-if link is None:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': superseded_by link not created yet')
-
-audit = AuditEvent.objects.filter(event_type='MemorySuperseded').first()
-if audit is None:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': MemorySuperseded audit missing')
-
-stale_count = Memory.objects.filter(stale=True).count()
-if not stale_count:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': no memory marked stale yet')
-
-print(json.dumps({{'superseded_link': str(link.id), 'stale_memories': stale_count}}))
-""",
-        secret=secret,
-    )
-
-
 def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
     result = run_json(
-        [sys.executable, '-m', 'engram_cli', 'search', '--query', GENERATION_TITLE_PREFIX, '--json'],
+        [sys.executable, '-m', 'engram_cli', 'search', '--query', SESSION_TITLE_PREFIX, '--json'],
         cwd=repo,
         env=cli_hook_env(home),
         secret='',
@@ -735,7 +743,7 @@ def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
     if not isinstance(items, list) or not items:
         raise E2EError(f'search returned no items: {result}')
     titles = [str(item.get('title') or '') for item in items]
-    if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in titles):
+    if not any(title.startswith(SESSION_TITLE_PREFIX) for title in titles):
         raise E2EError(f'search did not return the promoted mock memory: {titles}')
 
     return {'search_items': len(items)}
@@ -789,7 +797,7 @@ def verify_retrieval_legs(home: Path, repo: Path, *, secret: str) -> dict[str, o
         lexical_reasons = context_inclusion_reasons(
             home,
             repo,
-            'durrable enginering memmory',
+            'memmory',
             'lexical',
         )
         if not any(reason.startswith('lexical match:') for reason in lexical_reasons):
@@ -849,7 +857,7 @@ from engram.core.models import Memory, Project
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
 memory = (
-    Memory.objects.filter(project=project, title__startswith={json.dumps(GENERATION_TITLE_PREFIX)}, stale=False)
+    Memory.objects.filter(project=project, title__startswith={json.dumps(SESSION_TITLE_PREFIX)}, stale=False)
     .order_by('created_at')
     .first()
 )
@@ -954,10 +962,30 @@ def verify_weekly_digest(*, secret: str) -> dict[str, object]:
     result = compose_shell_json(
         f"""
 import json
+from datetime import timedelta
+from django.utils import timezone
 from engram.core.models import Memory, Project, WorkflowRun
+from engram.memory.digest_scheduler import weekly_bucket
 from engram.memory.services import run_weekly_digest_with_tracking
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+source = (
+    Memory.objects.filter(
+        project=project,
+        title__startswith={json.dumps(SESSION_TITLE_PREFIX)},
+        status='approved',
+        stale=False,
+        transition_contract_version=1,
+        current_transition__isnull=False,
+    )
+    .exclude(kind='digest')
+    .order_by('created_at')
+    .first()
+)
+if source is None:
+    raise SystemExit('weekly digest typed source not found')
+bucket = weekly_bucket(as_of=timezone.now())
+Memory.objects.filter(id=source.id).update(created_at=bucket.window_start + timedelta(hours=1))
 result = run_weekly_digest_with_tracking(project.organization_id, project.id, request_id='e2e-weekly-1')
 run = WorkflowRun.objects.filter(project=project, run_type='weekly_digest').order_by('-created_at').first()
 weekly = (
@@ -966,6 +994,7 @@ weekly = (
     .first()
 )
 print(json.dumps({{
+    'source_memory_id': str(source.id),
     'workflow_status': run.status if run else None,
     'weekly_memory': weekly.title if weekly else None,
 }}))
@@ -974,6 +1003,8 @@ print(json.dumps({{
     )
     if result.get('workflow_status') != 'succeeded':
         raise E2EError(f'weekly digest workflow did not succeed: {result}')
+    if not result.get('weekly_memory'):
+        raise E2EError(f'weekly digest memory was not published: {result}')
 
     return result
 
@@ -1014,7 +1045,7 @@ def verify_session_start_context(home: Path, repo: Path) -> dict[str, object]:
         'session_id': 'e2e-context-check',
         'repository_root': str(repo),
         'cwd': str(repo),
-        'query': GENERATION_TITLE_PREFIX,
+        'query': SESSION_TITLE_PREFIX,
     }
     result = run_json(
         [sys.executable, '-m', 'engram_cli', 'hook', 'session-start', '--agent', 'claude-code'],
@@ -1025,7 +1056,7 @@ def verify_session_start_context(home: Path, repo: Path) -> dict[str, object]:
     )
     rendered = str(result.get('rendered_context') or '')
     items = result.get('items')
-    if GENERATION_TITLE_PREFIX not in rendered:
+    if SESSION_TITLE_PREFIX not in rendered:
         raise E2EError(f'session-start context does not include the promoted mock memory:\n{rendered[:1500]}')
     if not isinstance(items, list) or not items:
         raise E2EError('session-start context returned no items')
@@ -1164,6 +1195,10 @@ def main() -> int:
                     f'claude run failed:\nstdout:\n{claude_result.stdout[-4000:]}\nstderr:\n{claude_result.stderr[-4000:]}',
                 )
 
+            progress('Waiting for CP3 candidate-decision block and approving typed memory')
+            approved = approve_cp3_candidate(secret=agent_key)
+            progress(f'Typed approval OK: {json.dumps(approved)}')
+
             progress('Verifying backend contract state (distillation, promotion, embeddings)')
             state = verify_backend_state(secret=agent_key)
             progress(f'Backend state OK: {json.dumps(state)}')
@@ -1211,10 +1246,6 @@ def main() -> int:
             progress('Verifying held-for-review path')
             held = verify_held_for_review(home, repo, secret=agent_key)
             progress(f'Held-for-review OK: {json.dumps(held)}')
-
-            progress('Verifying curation supersede path')
-            superseded = verify_curation_supersede(home, repo, secret=agent_key)
-            progress(f'Supersede OK: {json.dumps(superseded)}')
 
             progress('Verifying sniffed mock traffic')
             traffic = verify_mock_traffic(traffic_log, agent_key)

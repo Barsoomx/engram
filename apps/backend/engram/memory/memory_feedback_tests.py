@@ -18,8 +18,20 @@ from engram.access.models import (
     RoleCapability,
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
-from engram.context.context_api_tests import create_approved_memory_document, valid_context_payload
-from engram.core.models import AuditEvent, Organization, Project, ProjectTeam, Team, VisibilityScope
+from engram.context.context_api_tests import valid_context_payload
+from engram.core.models import (
+    AuditEvent,
+    Memory,
+    MemoryVersion,
+    Organization,
+    Project,
+    ProjectTeam,
+    RetrievalDocument,
+    Team,
+    VisibilityScope,
+)
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 RAW_KEY = 'egk_test_memory_feedback_0123456789abcdefghijklmnopqrstuvwxyz'
 READ_ONLY_RAW_KEY = 'egk_test_memory_feedback_read_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -134,6 +146,29 @@ def valid_feedback_payload(project: Project, team: Team, **overrides: Any) -> di
     return payload
 
 
+def create_approved_memory_document(
+    organization: Organization,
+    team: Team | None,
+    project: Project,
+    *,
+    title: str = 'Authorization before ranking',
+    body: str = 'Authorization before ranking protects context bundles.',
+    visibility_scope: str = VisibilityScope.PROJECT,
+) -> tuple[Memory, MemoryVersion, RetrievalDocument]:
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='memory-feedback',
+        title=title,
+        body=body,
+        visibility_scope=visibility_scope,
+    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+
+    return result.memory, result.memory_version, result.retrieval_document
+
+
 @pytest.mark.django_db
 def test_memory_feedback_stale_updates_memory_documents_and_audit() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
@@ -154,11 +189,14 @@ def test_memory_feedback_stale_updates_memory_documents_and_audit() -> None:
     assert memory.refuted is False
     assert document.stale is True
     assert document.refuted is False
-    audit = AuditEvent.objects.get(event_type='MemoryFeedbackRecorded')
+    audit = AuditEvent.objects.get(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-1',
+    )
     assert audit.capability == 'memories:review'
     assert audit.target_type == 'memory'
     assert audit.target_id == str(memory.id)
-    assert audit.metadata['action'] == 'stale'
+    assert audit.metadata['transition_type'] == 'mark_stale'
     assert RAW_KEY not in str(response.json())
     assert RAW_KEY not in str(audit.metadata)
 
@@ -256,7 +294,10 @@ def test_memory_feedback_requires_memories_review_capability() -> None:
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-missing-review',
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -333,7 +374,10 @@ def test_memory_feedback_denies_wrong_project_without_mutating_memory() -> None:
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-wrong-project',
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -368,7 +412,10 @@ def test_memory_feedback_denies_team_visible_memory_outside_reviewer_team() -> N
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-wrong-team',
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -396,7 +443,10 @@ def test_memory_feedback_rejects_oversized_reason_before_mutating_memory() -> No
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-oversized',
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -423,7 +473,10 @@ def test_memory_feedback_rejects_oversized_request_id_before_mutating_memory() -
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='r' * 256,
+    ).exists()
 
 
 @pytest.mark.django_db
@@ -618,7 +671,13 @@ def test_memory_feedback_repeated_request_id_in_repository_url_mode_is_idempoten
     assert first.json()['already_applied'] is False
     assert second.json()['already_applied'] is True
     assert memory.stale is True
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 2
+    assert (
+        AuditEvent.objects.filter(
+            event_type='MemoryTransitionCommitted',
+            request_id='request-memory-feedback-repo-url-replay',
+        ).count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -646,4 +705,7 @@ def test_memory_feedback_rejects_oversized_correlation_id_before_mutating_memory
     assert memory.refuted is False
     assert document.stale is False
     assert document.refuted is False
-    assert AuditEvent.objects.filter(event_type='MemoryFeedbackRecorded').count() == 0
+    assert not AuditEvent.objects.filter(
+        event_type='MemoryTransitionCommitted',
+        request_id='request-memory-feedback-oversized-correlation',
+    ).exists()

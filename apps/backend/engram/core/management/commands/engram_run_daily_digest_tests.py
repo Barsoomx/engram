@@ -54,8 +54,8 @@ def test_command_and_scheduled_task_converge_in_either_order(order: str) -> None
         run_scheduled_digests()
         call_command('engram_run_daily_digest')
 
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).count() == 1
 
 
 @pytest.mark.django_db
@@ -64,13 +64,13 @@ def test_command_window_days_override_cannot_rewrite_frozen_winner() -> None:
     create_approved_memory(organization, project, team, title='Window source')
 
     call_command('engram_run_daily_digest', '--window-days', '1')
-    original_snapshot = WorkflowWork.objects.get().input_snapshot
+    original_snapshot = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST).input_snapshot
 
     call_command('engram_run_daily_digest', '--window-days', '3')
 
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    assert WorkflowWork.objects.get().input_snapshot == original_snapshot
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_WORK_TASK_NAME).count() == 1
+    assert WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST).input_snapshot == original_snapshot
 
 
 @pytest.mark.django_db
@@ -105,5 +105,5 @@ def test_command_isolates_failing_project_and_reports_failure_count(
 
     assert 'failed_projects=1' in out.getvalue()
     assert 'scheduled_projects=1' in out.getvalue()
-    assert WorkflowWork.objects.filter(project=healthy).exists()
-    assert not WorkflowWork.objects.filter(project=failing).exists()
+    assert WorkflowWork.objects.filter(project=healthy, work_type=WorkflowWorkType.DAILY_DIGEST).exists()
+    assert not WorkflowWork.objects.filter(project=failing, work_type=WorkflowWorkType.DAILY_DIGEST).exists()

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import secrets
 import uuid
 from collections.abc import Iterable
@@ -32,13 +31,11 @@ from engram.console.exceptions import (
     ProjectSlugTakenError,
     TeamSlugTakenError,
 )
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.domain.usecases.errors import DomainError
 from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
-    LinkType,
     Memory,
     MemoryCandidate,
     MemoryLink,
@@ -47,7 +44,6 @@ from engram.core.models import (
     MemoryVersion,
     Organization,
     Project,
-    RetrievalDocument,
     Team,
 )
 from engram.core.redaction import redact_value as core_redact_value
@@ -56,6 +52,22 @@ from engram.memory.conflict_links import clear_candidate_conflict_links
 from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
+)
+from engram.memory.transitions import (
+    ArchiveMemory,
+    MemoryStateInput,
+    MemoryTransitionError,
+    MergeMemories,
+    MergeMemoriesInput,
+    RefuteMemory,
+    RestoreMemory,
+    ReviseMemory,
+    ReviseMemoryInput,
+    SupersedeMemories,
+    SupersedeMemoriesInput,
+    TransitionRequest,
+    TransitionScope,
+    build_memory_fence,
 )
 
 logger = structlog.get_logger(__name__)
@@ -548,6 +560,48 @@ def _record_review_example(
     )
 
 
+def _memory_transition_request(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    review_example: MemoryReviewExample,
+    action: str,
+    reason: str,
+) -> TransitionRequest:
+    operation_id = f'console-memory-review:{review_example.id}:{action}:v1'
+
+    return TransitionRequest(
+        scope=TransitionScope(
+            organization_id=organization.id,
+            project_id=review_example.project_id,
+            team_id=review_example.team_id,
+        ),
+        idempotency_key=operation_id,
+        actor_type='user',
+        actor_id=str(actor_identity.id),
+        capability='memories:review',
+        request_id=operation_id,
+        correlation_id=operation_id,
+        reason=reason,
+        origin='console',
+    )
+
+
+def _execute_memory_transition(call: Any) -> Any:
+    try:
+        return call()
+    except MemoryTransitionError as error:
+        code = {
+            'scope': 'not_found',
+            'memory_state': 'invalid_state',
+            'stale_decision': 'invalid_state',
+            'projection': 'invalid_state',
+            'idempotency_collision': 'invalid_state',
+        }.get(error.code, error.code)
+        status_code = 404 if code == 'not_found' else 400
+        raise MemoryReviewError(code, str(error), status=status_code) from error
+
+
 @transaction.atomic
 def approve_memory_candidate(
     organization: Organization,
@@ -561,6 +615,11 @@ def approve_memory_candidate(
         raise MemoryReviewError(
             'invalid_state',
             'only proposed candidates can be approved',
+        )
+    if candidate.decision_work_contract_version != 1:
+        raise MemoryReviewError(
+            'invalid_state',
+            'legacy memory candidate promotion is disabled; typed promotion requires decision work contract version 1',
         )
 
     review_example = _record_review_example(
@@ -614,44 +673,31 @@ def edit_memory_body(
     if memory.kind == 'digest':
         raise MemoryReviewError('invalid_state', 'digest memories cannot be edited')
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=memory,
         action='edit',
         reason=reason,
     )
-
-    next_version = memory.current_version + 1
-
-    version = MemoryVersion.objects.create(
-        organization=memory.organization,
-        project=memory.project,
-        memory=memory,
-        version=next_version,
-        body=body,
-        content_hash=_memory_body_hash(memory.id, next_version, body),
+    result = _execute_memory_transition(
+        lambda: ReviseMemory().execute(
+            ReviseMemoryInput(
+                request=_memory_transition_request(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    review_example=review_example,
+                    action='edit',
+                    reason=reason,
+                ),
+                memory_fence=build_memory_fence(memory),
+                title=memory.title,
+                body=body,
+            )
+        )
     )
 
-    memory.body = body
-
-    memory.current_version = next_version
-
-    memory.save(update_fields=['body', 'current_version', 'updated_at'])
-
-    if memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted:
-        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
-
-    audit_admin_action(
-        organization=organization,
-        actor_identity=actor_identity,
-        event_type='MemoryReviewed',
-        target_type='memory',
-        target_id=str(memory.id),
-        metadata={'action': 'edit', 'reason': reason, 'version': next_version},
-    )
-
-    return version
+    return result.memory_version
 
 
 def _resolve_link_target_or_404(
@@ -681,9 +727,9 @@ def narrow_memory(
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
 
-    _resolve_link_target_or_404(organization, memory, target_memory_id)
+    target = _resolve_link_target_or_404(organization, memory, target_memory_id)
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=memory,
@@ -691,15 +737,25 @@ def narrow_memory(
         reason=reason,
     )
 
-    return _record_memory_link(
-        organization=organization,
-        actor_identity=actor_identity,
-        memory=memory,
-        link_type=LinkType.NARROWED_BY,
-        target_id=target_memory_id,
-        action='narrow',
-        reason=reason,
+    result = _execute_memory_transition(
+        lambda: MergeMemories().execute(
+            MergeMemoriesInput(
+                request=_memory_transition_request(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    review_example=review_example,
+                    action='narrow',
+                    reason=reason,
+                ),
+                source_memory_fence=build_memory_fence(memory),
+                result_memory_fence=build_memory_fence(target),
+                title=target.title,
+                body=target.body,
+            )
+        )
     )
+
+    return result.transition.semantic_link
 
 
 @transaction.atomic
@@ -712,9 +768,9 @@ def supersede_memory(
 ) -> MemoryLink:
     memory = _lock_memory_or_404(organization, memory.id)
 
-    _resolve_link_target_or_404(organization, memory, target_memory_id)
+    target = _resolve_link_target_or_404(organization, memory, target_memory_id)
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=memory,
@@ -722,63 +778,23 @@ def supersede_memory(
         reason=reason,
     )
 
-    memory.stale = True
-
-    memory.save(update_fields=['stale', 'updated_at'])
-
-    RetrievalDocument.objects.filter(memory=memory).update(stale=True, updated_at=timezone.now())
-
-    return _record_memory_link(
-        organization=organization,
-        actor_identity=actor_identity,
-        memory=memory,
-        link_type=LinkType.SUPERSEDED_BY,
-        target_id=target_memory_id,
-        action='supersede',
-        reason=reason,
+    result = _execute_memory_transition(
+        lambda: SupersedeMemories().execute(
+            SupersedeMemoriesInput(
+                request=_memory_transition_request(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    review_example=review_example,
+                    action='supersede',
+                    reason=reason,
+                ),
+                source_memory_fence=build_memory_fence(memory),
+                result_memory_fence=build_memory_fence(target),
+            )
+        )
     )
 
-
-def _record_memory_link(
-    organization: Organization,
-    actor_identity: Identity,
-    memory: Memory,
-    link_type: str,
-    target_id: uuid.UUID,
-    action: str,
-    reason: str,
-) -> MemoryLink:
-    if memory.organization_id != organization.id:
-        raise MemoryReviewError('not_found', 'memory not found', status=404)
-
-    target = str(target_id)
-
-    link, _created = MemoryLink.objects.get_or_create(
-        memory=memory,
-        link_type=link_type,
-        target=target,
-        defaults={
-            'organization': memory.organization,
-            'project': memory.project,
-            'label': '',
-        },
-    )
-
-    audit_admin_action(
-        organization=organization,
-        actor_identity=actor_identity,
-        event_type='MemoryReviewed',
-        target_type='memory',
-        target_id=str(memory.id),
-        metadata={
-            'action': action,
-            'reason': reason,
-            'link_id': str(link.id),
-            'target_memory_id': target,
-        },
-    )
-
-    return link
+    return result.transition.semantic_link
 
 
 @transaction.atomic
@@ -814,37 +830,41 @@ def reject_review_item(
 
         clear_candidate_conflict_links(item)
 
-        target_type = 'memory_candidate'
-
     else:
         item = _lock_memory_or_404(organization, item.id)
 
         if item.status == MemoryStatus.REFUTED:
             return
 
-        _record_review_example(
+        review_example = _record_review_example(
             organization=organization,
             actor_identity=actor_identity,
             item=item,
             action='reject',
             reason=reason,
         )
+        _execute_memory_transition(
+            lambda: RefuteMemory().execute(
+                MemoryStateInput(
+                    request=_memory_transition_request(
+                        organization=organization,
+                        actor_identity=actor_identity,
+                        review_example=review_example,
+                        action='reject',
+                        reason=reason,
+                    ),
+                    memory_fence=build_memory_fence(item),
+                )
+            )
+        )
 
-        item.status = MemoryStatus.REFUTED
-
-        item.refuted = True
-
-        item.save(update_fields=['status', 'refuted', 'updated_at'])
-
-        RetrievalDocument.objects.filter(memory=item).update(refuted=True, updated_at=timezone.now())
-
-        target_type = 'memory'
+        return
 
     audit_admin_action(
         organization=organization,
         actor_identity=actor_identity,
         event_type='MemoryReviewed',
-        target_type=target_type,
+        target_type='memory_candidate',
         target_id=str(item.id),
         metadata={'action': 'reject', 'reason': reason},
     )
@@ -862,7 +882,7 @@ def archive_memory(
     if memory.status == MemoryStatus.ARCHIVED:
         return memory
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=memory,
@@ -870,20 +890,22 @@ def archive_memory(
         reason=reason,
     )
 
-    memory.status = MemoryStatus.ARCHIVED
-
-    memory.save(update_fields=['status', 'updated_at'])
-
-    audit_admin_action(
-        organization=organization,
-        actor_identity=actor_identity,
-        event_type='MemoryReviewed',
-        target_type='memory',
-        target_id=str(memory.id),
-        metadata={'action': 'archive', 'reason': reason},
+    result = _execute_memory_transition(
+        lambda: ArchiveMemory().execute(
+            MemoryStateInput(
+                request=_memory_transition_request(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    review_example=review_example,
+                    action='archive',
+                    reason=reason,
+                ),
+                memory_fence=build_memory_fence(memory),
+            )
+        )
     )
 
-    return memory
+    return result.memory
 
 
 @transaction.atomic
@@ -898,12 +920,10 @@ def restore_memory(
     if memory.status == MemoryStatus.APPROVED and not memory.refuted and not memory.stale:
         raise MemoryReviewError('invalid_state', 'memory is already active')
 
-    version = memory.versions.order_by('-version').first()
-
-    if version is None:
+    if not memory.versions.filter(version=memory.current_version).exists():
         raise MemoryReviewError('invalid_state', 'memory has no version to restore')
 
-    _record_review_example(
+    review_example = _record_review_example(
         organization=organization,
         actor_identity=actor_identity,
         item=memory,
@@ -911,32 +931,22 @@ def restore_memory(
         reason=reason,
     )
 
-    memory.status = MemoryStatus.APPROVED
-
-    memory.refuted = False
-
-    memory.stale = False
-
-    memory.save(update_fields=['status', 'refuted', 'stale', 'updated_at'])
-
-    RetrievalDocument.objects.filter(memory=memory, memory_version=version).update(
-        refuted=False,
-        stale=False,
-        updated_at=timezone.now(),
+    result = _execute_memory_transition(
+        lambda: RestoreMemory().execute(
+            MemoryStateInput(
+                request=_memory_transition_request(
+                    organization=organization,
+                    actor_identity=actor_identity,
+                    review_example=review_example,
+                    action='restore',
+                    reason=reason,
+                ),
+                memory_fence=build_memory_fence(memory),
+            )
+        )
     )
 
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
-
-    audit_admin_action(
-        organization=organization,
-        actor_identity=actor_identity,
-        event_type='MemoryReviewed',
-        target_type='memory',
-        target_id=str(memory.id),
-        metadata={'action': 'restore', 'reason': reason},
-    )
-
-    return memory
+    return result.memory
 
 
 REVIEW_MEMORY_STATUSES = (
@@ -977,6 +987,8 @@ def bulk_archive_memories(
         queryset = Memory.objects.filter(
             organization=organization,
             confidence__lte=confidence_lte,
+            transition_contract_version=1,
+            current_transition__isnull=False,
         ).filter(reviewable_memory_filter())
 
         if project_id is not None:
@@ -993,9 +1005,3 @@ def bulk_archive_memories(
         archived_ids.append(memory.id)
 
     return archived_ids
-
-
-def _memory_body_hash(memory_id: uuid.UUID, version: int, body: str) -> str:
-    source = f'{memory_id}:{version}:{body}'
-
-    return hashlib.sha256(source.encode()).hexdigest()

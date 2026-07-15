@@ -12,7 +12,7 @@ import structlog
 from django.db import connection
 
 from engram.access.services import EffectiveScope
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput, authorized_retrieval_documents
+from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
     AuditEvent,
     CandidateStatus,
@@ -29,6 +29,9 @@ from engram.core.models import (
     RetrievalDocument,
     Team,
     VisibilityScope,
+    WorkflowSubjectType,
+    WorkflowWork,
+    WorkflowWorkType,
 )
 from engram.memory.curation import (
     CurateMemoryCandidate,
@@ -50,8 +53,9 @@ from engram.memory.curation_test_support import (
     seed_atomic_existing_and_duplicate,
     set_curator_settings,
 )
-from engram.memory.services import PromoteMemoryCandidate, PromoteMemoryCandidateInput
-from engram.memory.transitions import MemoryTransitionError
+from engram.memory.tasks import embed_memory_projection_work_v1
+from engram.memory.transitions import MemoryTransitionError, PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
@@ -131,25 +135,52 @@ def create_candidate(
     visibility_scope: str = VisibilityScope.PROJECT,
     evidence: list[dict[str, object]] | None = None,
 ) -> MemoryCandidate:
-    return MemoryCandidate.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        source_observation=None,
+    existing_curation_policy_ids = tuple(
+        ModelPolicy.objects.filter(
+            organization=organization,
+            project=project,
+            task_type='curation',
+        ).values_list('id', flat=True)
+    )
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix=content_hash,
         title=title,
         body=body,
-        status=CandidateStatus.PROPOSED,
         visibility_scope=visibility_scope,
-        evidence=evidence if evidence is not None else [{'kind': 'test'}],
-        content_hash=content_hash,
         confidence=Decimal(confidence),
     )
+    ModelPolicy.objects.filter(
+        organization=organization,
+        project=project,
+        task_type='curation',
+    ).exclude(id__in=existing_curation_policy_ids).update(active=False)
+    if evidence is not None:
+        candidate.evidence = evidence
+        candidate.save(update_fields=['evidence', 'updated_at'])
+
+    return candidate
 
 
 def promote_candidate(candidate: MemoryCandidate) -> Memory:
-    result = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
 
     return result.memory
+
+
+def complete_memory_embedding(memory: Memory) -> RetrievalDocument:
+    document = RetrievalDocument.objects.get(memory=memory)
+    work = WorkflowWork.objects.get(
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        subject_type=WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+        subject_id=document.id,
+        input_snapshot__exact_projection_hash=document.exact_projection_hash,
+    )
+    embed_memory_projection_work_v1(str(work.id))
+
+    return RetrievalDocument.objects.get(id=document.id)
 
 
 def seed_existing_and_duplicate(
@@ -167,6 +198,7 @@ def seed_existing_and_duplicate(
             content_hash='hash-existing',
         ),
     )
+    complete_memory_embedding(existing)
     duplicate = create_candidate(
         organization,
         team,
@@ -567,7 +599,7 @@ def test_curate_replays_already_promoted_candidate_as_duplicate() -> None:
 
 
 @pytest.mark.django_db
-def test_curate_reindexes_existing_memory_embedding_for_dedup() -> None:
+def test_embedding_work_materializes_existing_memory_for_dedup() -> None:
     organization, team, project = create_scope()
     create_embedding_policy(organization, team, project)
     set_curator_settings(organization)
@@ -581,10 +613,9 @@ def test_curate_reindexes_existing_memory_embedding_for_dedup() -> None:
             content_hash='hash-existing',
         ),
     )
-    document = RetrievalDocument.objects.get(memory=existing)
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=document.memory_version_id))
+    document = complete_memory_embedding(existing)
 
-    assert len(RetrievalDocument.objects.get(memory=existing).embedding_vector) == EMBEDDING_DIMENSION
+    assert len(document.embedding_vector) == EMBEDDING_DIMENSION
 
 
 @pytest.mark.django_db
@@ -1109,6 +1140,7 @@ def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatc
         content_hash='hash-escalation-sensitive',
     )
     patch_judge_gateway(monkeypatch, _ExplodingGateway())
+    provider_call_count = ProviderCallRecord.objects.count()
 
     result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
 
@@ -1117,7 +1149,7 @@ def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatc
     assert result.memory is None
     assert candidate.status == CandidateStatus.PROPOSED
     assert Memory.objects.count() == 0
-    assert ProviderCallRecord.objects.count() == 0
+    assert ProviderCallRecord.objects.count() == provider_call_count
     audit = AuditEvent.objects.get(event_type='MemoryCandidateHeldForReview')
     assert audit.actor_type == 'system'
     assert audit.capability == 'memories:review'
@@ -1233,7 +1265,7 @@ def test_plain_promotion_cannot_bypass_open_conflict(monkeypatch: pytest.MonkeyP
     conflict = MemoryConflict.objects.get(candidate=duplicate, resolved_transition__isnull=True)
 
     with pytest.raises(MemoryTransitionError) as error:
-        PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=duplicate.id))
+        PromoteMemoryCandidate().execute(transition_request(duplicate))
 
     duplicate.refresh_from_db()
     conflict.refresh_from_db()
@@ -1387,7 +1419,7 @@ def test_curate_redacts_secret_from_all_audit_metadata(monkeypatch: pytest.Monke
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     secret_body = f'{_LONG_BODY} Token sk-abcdef0123456789 is embedded here.'
-    promote_candidate(
+    existing = promote_candidate(
         create_candidate(
             organization,
             team,
@@ -1397,6 +1429,7 @@ def test_curate_redacts_secret_from_all_audit_metadata(monkeypatch: pytest.Monke
             content_hash='hash-existing-secret',
         ),
     )
+    complete_memory_embedding(existing)
     duplicate = create_candidate(
         organization,
         team,

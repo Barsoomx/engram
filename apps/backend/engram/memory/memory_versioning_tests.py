@@ -22,19 +22,20 @@ from engram.context.context_api_tests import (
     OTHER_RAW_KEY,
     RAW_KEY,
     auth_headers,
-    create_approved_memory_document,
     create_project_scope,
     create_scoped_api_key,
+    create_transition_memory,
 )
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
-    AuditEvent,
     Memory,
     MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
     Organization,
     Project,
     RetrievalDocument,
+    Team,
     VisibilityScope,
     WorkflowSubjectType,
     WorkflowWork,
@@ -103,6 +104,25 @@ def version_payload(project: Project, **overrides: object) -> dict[str, object]:
     return payload
 
 
+def create_approved_memory_document(
+    organization: Organization,
+    team: Team | None,
+    project: Project,
+    *,
+    title: str = 'Authorization before ranking',
+    body: str = 'Authorization before ranking protects context bundles.',
+    visibility_scope: str = VisibilityScope.PROJECT,
+) -> tuple[Memory, MemoryVersion, RetrievalDocument]:
+    return create_transition_memory(
+        organization,
+        team,
+        project,
+        title=title,
+        body=body,
+        visibility_scope=visibility_scope,
+    )
+
+
 @pytest.mark.django_db
 def test_update_memory_body_creates_version_and_reindexes() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
@@ -131,9 +151,13 @@ def test_update_memory_body_creates_version_and_reindexes() -> None:
     new_document = RetrievalDocument.objects.get(id=body['retrieval_document_id'])
     assert new_document.memory_version_id == new_version.id
     assert new_document.id != document.id
-    audit = AuditEvent.objects.get(event_type='MemoryVersionCreated', target_id=str(memory.id))
+    transition = MemoryTransition.objects.get(memory=memory, to_version=new_version)
+    audit = transition.audit_event
+    assert audit.event_type == 'MemoryTransitionCommitted'
     assert audit.capability == 'memories:review'
-    assert audit.metadata['version'] == 2
+    assert audit.metadata['schema'] == 'memory_transition/v1'
+    assert audit.metadata['transition_type'] == 'revise'
+    assert audit.metadata['transition_id'] == str(transition.id)
     assert RAW_KEY not in str(body)
     assert RAW_KEY not in str(audit.metadata)
 

@@ -30,9 +30,12 @@ from engram.core.models import (
     RawEventEnvelope,
     RetrievalDocument,
     Team,
+    WorkflowWork,
+    WorkflowWorkType,
 )
 from engram.imports.models import ImportJob, ImportJobStatus
 from engram.imports.services import ClaudeMemImporter, ClaudeMemImportError
+from engram.model_policy.models import ProviderCallRecord
 
 RAW_KEY = 'egk_test_m1_import_0123456789abcdefghijklmnopqrstuvwxyz'
 OTHER_RAW_KEY = 'egk_test_m1_other0_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -603,23 +606,27 @@ def test_key_from_other_org_cannot_apply_foreign_batch(f_scope: ImportScope) -> 
 
 
 @pytest.mark.django_db
-def test_deferred_embedding_skips_provider_call(f_scope: ImportScope, m_monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[Any] = []
-
-    from engram.context.services import IndexMemoryVersion
-
-    def m_embed(self: Any, document: Any, memory: Any, version: Any) -> None:
-        calls.append(document)
-
-    m_monkeypatch.setattr(IndexMemoryVersion, '_embed_document', m_embed)
-
+def test_deferred_embedding_skips_provider_call(f_scope: ImportScope) -> None:
     import_id = _create_job(f_scope)
     _apply_batch(f_scope, import_id, 0, 'sdk_sessions', [session_row()])
     _apply_batch(f_scope, import_id, 1, 'observations', [observation_row()])
 
-    assert calls == []
     document = RetrievalDocument.objects.get(organization=f_scope.organization)
     assert document.embedding_reference == ''
+    assert document.embedding_pgvector is None
+    work = WorkflowWork.objects.get(
+        organization=f_scope.organization,
+        project=f_scope.project,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        subject_id=document.id,
+    )
+    assert work.input_snapshot['retrieval_document_id'] == str(document.id)
+    assert work.input_snapshot['exact_projection_hash'] == document.exact_projection_hash
+    assert not ProviderCallRecord.objects.filter(
+        organization=f_scope.organization,
+        project=f_scope.project,
+        task_type='embedding',
+    ).exists()
 
 
 @pytest.mark.django_db

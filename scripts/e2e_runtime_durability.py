@@ -20,6 +20,7 @@ COMPOSE_FILE = (ROOT / "deploy/compose/docker-compose.yml").resolve()
 ENV_EXAMPLE = (ROOT / "deploy/compose/.env.example").resolve()
 TARGET_QUEUE = "engram-near-realtime"
 TARGET_TASK = "engram.memory.process_observation_work_v1"
+TARGET_CANDIDATE_DECISION_TASK = "engram.memory.process_candidate_decision_work_v1"
 GLOBAL_TIMEOUT = 25 * 60.0
 FAILURE_LOG_SERVICES = (
     "api",
@@ -637,12 +638,20 @@ class Harness:
         outbox: int,
         versions: int,
         documents: int,
+        candidates: int = 0,
+        candidate_held_audits: int = 0,
+        candidate_decision_work: int = 0,
+        candidate_decision_outbox: int = 0,
         timeout: float = COMMAND_TIMEOUT,
     ) -> dict[str, object]:
         state = self.exact_state(project_id, run_id, timeout=timeout)
         expected = {
             "observations": observations,
             "outbox": outbox,
+            "candidates": candidates,
+            "candidate_held_audits": candidate_held_audits,
+            "candidate_decision_work": candidate_decision_work,
+            "candidate_decision_outbox": candidate_decision_outbox,
             "memories": versions,
             "versions": versions,
             "documents": documents,
@@ -1075,7 +1084,9 @@ import json
 from django.db.models import F
 from django_celery_outbox.models import CeleryOutbox
 from engram.core.models import (
+    AuditEvent,
     Memory,
+    MemoryCandidate,
     MemoryStatus,
     MemoryVersion,
     Observation,
@@ -1107,6 +1118,39 @@ outbox = sum(
     1
     for row in CeleryOutbox.objects.filter(task_name={json.dumps(TARGET_TASK)}).only('args')
     if row.args in ([work_id] for work_id in work_ids)
+)
+candidates = MemoryCandidate.objects.filter(
+    project_id=project_id,
+    source_observation__raw_event__client_event_id=client_event_id,
+    source_observation__raw_event__request_id=request_id,
+    status='proposed',
+    decision_work_contract_version=0,
+    promoted_memory__isnull=True,
+)
+candidate_ids = [str(value) for value in candidates.values_list('id', flat=True)]
+candidate_held_audits = AuditEvent.objects.filter(
+    project_id=project_id,
+    event_type='MemoryCandidateHeldForReview',
+    target_type='memory_candidate',
+    target_id__in=candidate_ids,
+    result='recorded',
+)
+candidate_decision_work = WorkflowWork.objects.filter(
+    project_id=project_id,
+    work_type=WorkflowWorkType.CANDIDATE_DECISION,
+    subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+    subject_id__in=candidate_ids,
+)
+candidate_decision_work_ids = [
+    str(value)
+    for value in candidate_decision_work.values_list('id', flat=True)
+]
+candidate_decision_outbox = sum(
+    1
+    for row in CeleryOutbox.objects.filter(
+        task_name={json.dumps(TARGET_CANDIDATE_DECISION_TASK)}
+    ).only('args')
+    if row.args in ([work_id] for work_id in candidate_decision_work_ids)
 )
 versions = MemoryVersion.objects.select_related('memory', 'source_observation__raw_event').filter(
     project_id=project_id,
@@ -1140,6 +1184,10 @@ linked_documents = sum(
 print(json.dumps({{
     'observations': observations.count(),
     'outbox': outbox,
+    'candidates': candidates.count(),
+    'candidate_held_audits': candidate_held_audits.count(),
+    'candidate_decision_work': candidate_decision_work.count(),
+    'candidate_decision_outbox': candidate_decision_outbox,
     'memories': memories.count(),
     'versions': versions.count(),
     'documents': documents.count(),
@@ -1302,7 +1350,11 @@ def wait_exact(
     outbox: int,
     versions: int,
     documents: int,
-    timeout: float,
+    candidates: int = 0,
+    candidate_held_audits: int = 0,
+    candidate_decision_work: int = 0,
+    candidate_decision_outbox: int = 0,
+    timeout: float = COMMAND_TIMEOUT,
 ) -> dict[str, object]:
     return dict(
         harness.poll(
@@ -1315,6 +1367,10 @@ def wait_exact(
                 outbox=outbox,
                 versions=versions,
                 documents=documents,
+                candidates=candidates,
+                candidate_held_audits=candidate_held_audits,
+                candidate_decision_work=candidate_decision_work,
+                candidate_decision_outbox=candidate_decision_outbox,
                 timeout=remaining,
             ),
         )
@@ -1423,8 +1479,11 @@ def fault_a(harness: Harness, config_dir: Path, project_id: str, run_id: str) ->
         run_id,
         observations=1,
         outbox=0,
-        versions=1,
-        documents=1,
+        versions=0,
+        documents=0,
+        candidates=1,
+        candidate_held_audits=1,
+        candidate_decision_outbox=0,
         timeout=result_deadline.remaining(),
     )
     wait_queue(harness, ready=0, unacknowledged=0, timeout=result_deadline.remaining())
@@ -1503,8 +1562,11 @@ def fault_b(harness: Harness, config_dir: Path, project_id: str, run_id: str) ->
         run_id,
         observations=1,
         outbox=0,
-        versions=1,
-        documents=1,
+        versions=0,
+        documents=0,
+        candidates=1,
+        candidate_held_audits=1,
+        candidate_decision_outbox=0,
         timeout=recovery_deadline.remaining(),
     )
     wait_queue(
@@ -1856,8 +1918,11 @@ def fault_d(
                 relay_run_id,
                 observations=1,
                 outbox=0,
-                versions=1,
-                documents=1,
+                versions=0,
+                documents=0,
+                candidates=1,
+                candidate_held_audits=1,
+                candidate_decision_outbox=0,
                 timeout=relay_deadline.remaining(),
             )
             wait_queue(

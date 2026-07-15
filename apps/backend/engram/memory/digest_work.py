@@ -9,7 +9,6 @@ from uuid import UUID
 from django.db import transaction
 from django.db.models import Q, QuerySet
 
-from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
     LinkType,
     Memory,
@@ -135,7 +134,11 @@ def _admitted(queryset: QuerySet[Memory], team_id: UUID | None) -> QuerySet[Memo
     if team_id is not None:
         admission = admission | Q(visibility_scope=VisibilityScope.TEAM, team_id=team_id)
 
-    return queryset.filter(admission).exclude(kind='digest')
+    return queryset.filter(
+        admission,
+        transition_contract_version=1,
+        current_transition__isnull=False,
+    ).exclude(kind='digest')
 
 
 def freeze_daily_digest_input(
@@ -512,6 +515,29 @@ def _load_output_team(work: WorkflowWork) -> Team | None:
         raise MemoryWorkerError('digest output team is outside work scope', code='work_scope_invalid') from error
 
 
+def _validate_frozen_source(
+    ref: dict[str, object], version: MemoryVersion, locked_memories: list[Memory], work: WorkflowWork
+) -> None:
+    if str(version.memory_id) != str(ref.get('memory_id')) or version.version != ref.get('version'):
+        raise MemoryWorkerError('digest source version does not match frozen input', code='work_scope_invalid')
+    if _server_body_digest(version) != ref.get('server_body_digest'):
+        raise MemoryWorkerError(
+            'digest source body digest does not match frozen input',
+            code='work_scope_invalid',
+        )
+    memory = next((item for item in locked_memories if item.id == version.memory_id), None)
+    if memory is None or memory.transition_contract_version != 1 or memory.current_transition_id is None:
+        raise MemoryWorkerError('digest source is not owned by the transition contract', code='work_scope_invalid')
+    if work.team_id is None:
+        allowed = memory.visibility_scope == VisibilityScope.PROJECT
+    else:
+        allowed = memory.visibility_scope == VisibilityScope.PROJECT or (
+            memory.visibility_scope == VisibilityScope.TEAM and memory.team_id == work.team_id
+        )
+    if not allowed:
+        raise MemoryWorkerError('digest source is outside the frozen visibility scope', code='work_scope_invalid')
+
+
 def _visibility_block_matches(block: object, expected: dict[str, object]) -> bool:
     if not isinstance(block, dict):
         return False
@@ -557,11 +583,13 @@ def _lock_and_revalidate(
     memory_ids = sorted({UUID(str(ref['memory_id'])) for ref in refs})
     version_ids = sorted({UUID(str(ref['memory_version_id'])) for ref in refs})
 
-    list(
+    locked_memories = list(
         Memory.objects.select_for_update()
         .filter(id__in=memory_ids, organization_id=work.organization_id, project_id=work.project_id)
         .order_by('id')
     )
+    if len(locked_memories) != len(memory_ids):
+        raise MemoryWorkerError('digest source is outside the frozen scope', code='work_scope_invalid')
     locked_versions = list(
         MemoryVersion.objects.select_for_update()
         .filter(id__in=version_ids, organization_id=work.organization_id, project_id=work.project_id)
@@ -584,11 +612,7 @@ def _lock_and_revalidate(
         version = versions.get(UUID(str(ref['memory_version_id'])))
         if version is None:
             raise MemoryWorkerError('digest source is missing its frozen version', code='work_scope_invalid')
-        if _server_body_digest(version) != ref.get('server_body_digest'):
-            raise MemoryWorkerError(
-                'digest source body digest does not match frozen input',
-                code='work_scope_invalid',
-            )
+        _validate_frozen_source(ref, version, locked_memories, work)
 
     return versions
 
@@ -682,43 +706,52 @@ def _publish(
         metadata['provider'] = provider_result.provider
         metadata['model'] = provider_result.model
 
-    memory = Memory.objects.create(
-        organization_id=work.organization_id,
-        project_id=work.project_id,
-        team=team,
-        title=title,
-        body=body,
-        status=MemoryStatus.APPROVED,
-        visibility_scope=visibility,
-        metadata=metadata,
+    from engram.memory.transitions import (
+        PublishDigestMemory,
+        PublishDigestMemoryInput,
+        TransitionRequest,
+        TransitionScope,
     )
-    version = MemoryVersion.objects.create(
-        organization_id=work.organization_id,
-        project_id=work.project_id,
-        memory=memory,
-        version=1,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-        source_metadata={'kind': 'digest'},
+
+    source_version_ids = tuple(
+        UUID(str(ref['memory_version_id'])) for ref in sorted(refs, key=lambda item: str(item['memory_id']))
     )
-    IndexMemoryVersion().execute(
-        IndexMemoryVersionInput(memory_version_id=version.id, defer_embedding=True),
+
+    request_id = f'digest-work:{work.id}:publish'
+    result = PublishDigestMemory().execute(
+        PublishDigestMemoryInput(
+            request=TransitionRequest(
+                scope=TransitionScope(
+                    organization_id=work.organization_id,
+                    project_id=work.project_id,
+                    team_id=work.team_id,
+                ),
+                idempotency_key=f'digest-work:{work.id}:publish:v1',
+                actor_type='system',
+                actor_id='digest-work',
+                capability='memories:write',
+                request_id=request_id,
+                correlation_id=f'digest-work:{work.id}',
+                reason='publish digest memory',
+                origin='digest-work',
+            ),
+            source_memory_fences=(),
+            title=title,
+            body=body,
+            source_memory_version_ids=source_version_ids,
+            metadata=metadata,
+            visibility_scope=visibility,
+            work_claim=claim,
+        ),
     )
-    if claim is not None:
-        finish_work_claim(
-            claim=claim,
-            now=datetime.now(UTC),
-            completion='product_succeeded',
-            result_memory_id=memory.id,
-        )
-    else:
+    if claim is None:
         resolve_work_succeeded(
             work.id,
             organization_id=work.organization_id,
             project_id=work.project_id,
         )
 
-    return memory.id
+    return result.memory.id
 
 
 def _finish_reused_claim(claim: WorkClaim | None, memory_id: UUID | None) -> None:

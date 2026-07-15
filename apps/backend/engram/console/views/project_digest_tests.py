@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import uuid
 from datetime import timedelta
 
@@ -24,8 +23,6 @@ from engram.access.models import (
 from engram.core.models import (
     AuditEvent,
     Memory,
-    MemoryStatus,
-    MemoryVersion,
     Organization,
     Project,
     VisibilityScope,
@@ -37,6 +34,8 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 _DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 
@@ -87,22 +86,16 @@ def _make_client(token: str, organization: Organization) -> APIClient:
 
 
 def _make_approved_memory(org: Organization, project: Project) -> Memory:
-    memory = Memory.objects.create(
-        organization=org,
-        project=project,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        org,
+        project,
+        None,
+        suffix=f'project-digest-{project.id}-{uuid.uuid4().hex}',
         title='recent approved memory',
         body='body',
-        status=MemoryStatus.APPROVED,
         visibility_scope=VisibilityScope.PROJECT,
     )
-    MemoryVersion.objects.create(
-        organization=org,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body='body',
-        content_hash=hashlib.sha256(b'body').hexdigest(),
-    )
+    memory = PromoteMemoryCandidate().execute(transition_request(candidate)).memory
     Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(hours=1))
 
     return memory
@@ -193,7 +186,7 @@ def test_post_digest_run_creates_work_linked_run_and_composite_package(
 
     assert run.run_type == WorkflowRunType.DAILY_DIGEST
 
-    outbox = CeleryOutbox.objects.get()
+    outbox = CeleryOutbox.objects.get(task_name=_DAILY_TASK_NAME)
 
     assert outbox.task_name == _DAILY_TASK_NAME
 
@@ -260,7 +253,7 @@ def test_post_digest_run_reuses_work_across_manual_requests_with_distinct_runs(
 
     assert run_two.id != run_one.id
 
-    assert CeleryOutbox.objects.count() == 2
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_TASK_NAME).count() == 2
 
     outbox_two = CeleryOutbox.objects.get(task_id=f'workflow-work:{work.id}:run:{run_two.id}')
 
@@ -293,7 +286,7 @@ def test_post_digest_run_active_run_conflict_creates_no_rows(
 
     assert WorkflowRun.objects.filter(work=work).count() == 1
 
-    assert CeleryOutbox.objects.count() == 1
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_TASK_NAME).count() == 1
 
 
 @pytest.mark.django_db
@@ -321,7 +314,7 @@ def test_post_digest_run_conflicts_with_preexisting_active_run(
 
     assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 0
 
-    assert CeleryOutbox.objects.count() == 0
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_TASK_NAME).count() == 0
 
 
 @pytest.mark.django_db
@@ -371,7 +364,7 @@ def test_post_digest_run_empty_input_creates_terminal_no_input_work_without_pack
 
     assert WorkflowRun.objects.filter(run_type=WorkflowRunType.DAILY_DIGEST).count() == 0
 
-    assert CeleryOutbox.objects.count() == 0
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_TASK_NAME).count() == 0
 
     assert not AuditEvent.objects.filter(
         organization=f_org,
@@ -422,9 +415,9 @@ def test_post_digest_run_tenant_isolation(
 
     assert response.status_code == 404
 
-    assert WorkflowWork.objects.count() == 0
+    assert WorkflowWork.objects.filter(project=f_other_project, work_type=WorkflowWorkType.DAILY_DIGEST).count() == 0
 
-    assert CeleryOutbox.objects.count() == 0
+    assert CeleryOutbox.objects.filter(task_name=_DAILY_TASK_NAME).count() == 0
 
 
 @pytest.mark.django_db

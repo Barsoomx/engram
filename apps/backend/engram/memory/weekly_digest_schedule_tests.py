@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from datetime import timedelta
 
 import pytest
@@ -12,7 +11,6 @@ from engram.celeryconfig import beat_schedule, task_routes
 from engram.core.models import (
     Memory,
     MemoryStatus,
-    MemoryVersion,
     Organization,
     Project,
     VisibilityScope,
@@ -23,6 +21,7 @@ from engram.core.models import (
     WorkflowWorkDisposition,
     WorkflowWorkType,
 )
+from engram.memory.digest_visibility_tests import make_source_memory
 from engram.memory.tasks import generate_weekly_digest, run_scheduled_weekly_digests
 
 _WEEKLY_WORK_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
@@ -51,23 +50,7 @@ def f_org() -> Organization:
 @pytest.fixture
 def f_weekly_source_project(f_org: Organization) -> Project:
     project = Project.objects.create(organization=f_org, name='weekly-source', slug='weekly-source')
-    body = 'body'
-    memory = Memory.objects.create(
-        organization=f_org,
-        project=project,
-        title='approved-mem',
-        body=body,
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
-    )
-    MemoryVersion.objects.create(
-        organization=f_org,
-        project=project,
-        memory=memory,
-        version=memory.current_version,
-        body=body,
-        content_hash=hashlib.sha256(body.encode()).hexdigest(),
-    )
+    memory = make_source_memory(f_org, project, title='approved-mem', body='body')
     Memory.objects.filter(id=memory.id).update(created_at=timezone.now() - timedelta(days=7))
 
     return project
@@ -116,7 +99,7 @@ def test_run_scheduled_weekly_digests_returns_aggregate_and_id_only_signal(
         work_type=WorkflowWorkType.WEEKLY_DIGEST,
         disposition=WorkflowWorkDisposition.REQUIRED,
     )
-    queued = CeleryOutbox.objects.get()
+    queued = CeleryOutbox.objects.get(task_name=_WEEKLY_WORK_TASK_NAME)
     assert queued.task_name == _WEEKLY_WORK_TASK_NAME
     assert queued.args == [str(work.id)]
     assert queued.kwargs == {}
@@ -131,8 +114,12 @@ def test_run_scheduled_weekly_digests_excludes_digest_only_project(
 
     assert result['required_work'] == 1
     assert result['no_input_projects'] >= 1
-    work = WorkflowWork.objects.get(project=f_weekly_source_project, disposition=WorkflowWorkDisposition.REQUIRED)
-    queued = CeleryOutbox.objects.get()
+    work = WorkflowWork.objects.get(
+        project=f_weekly_source_project,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        disposition=WorkflowWorkDisposition.REQUIRED,
+    )
+    queued = CeleryOutbox.objects.get(task_name=_WEEKLY_WORK_TASK_NAME)
     assert queued.args == [str(work.id)]
     assert WorkflowWork.objects.get(project=f_project_digest_only).disposition == WorkflowWorkDisposition.NO_OP
 

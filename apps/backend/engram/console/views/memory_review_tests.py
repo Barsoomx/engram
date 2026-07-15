@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from django.contrib.auth.models import User
@@ -17,6 +18,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
+from engram.console.services import approve_memory_candidate, reject_review_item
 from engram.console.views.memory_review import PAGE_SIZE
 from engram.core.models import (
     AuditEvent,
@@ -34,6 +36,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -182,8 +185,28 @@ def _make_candidate(
     evidence: list | None = None,
     source_observation: Observation | None = None,
     created_at: datetime | None = None,
+    typed: bool = False,
+    candidate_title: str | None = None,
+    candidate_body: str | None = None,
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
+
+    if typed:
+        candidate, _source, _session = provenanced_candidate_in_scope(
+            organization,
+            project,
+            team,
+            suffix=f'console-memory-review-{counter}',
+            title=candidate_title or f'Candidate {counter}',
+            body=candidate_body or f'Body {counter}',
+            visibility_scope=visibility_scope,
+            confidence=Decimal(confidence),
+        )
+        if created_at is not None:
+            MemoryCandidate.objects.filter(id=candidate.id).update(created_at=created_at)
+            candidate.refresh_from_db()
+
+        return candidate
 
     candidate = MemoryCandidate.objects.create(
         organization=organization,
@@ -218,8 +241,39 @@ def _make_memory(
     body: str = 'memory body',
     title: str = 'memory',
     created_at: datetime | None = None,
+    typed: bool = False,
 ) -> Memory:
     counter = Memory.objects.count()
+
+    if typed:
+        actor = Identity.objects.create(
+            organization=organization,
+            identity_type=IdentityType.USER,
+            external_id=f'fixture-memory-review-{uuid.uuid4()}',
+            display_name='Fixture memory review actor',
+        )
+        effective_title = title if title != 'memory' else f'Memory {counter}'
+        candidate = _make_candidate(
+            organization,
+            project,
+            team=team,
+            confidence=confidence,
+            visibility_scope=visibility_scope,
+            typed=True,
+            candidate_title=effective_title,
+            candidate_body=body,
+        )
+        memory = approve_memory_candidate(organization, actor, candidate, 'fixture setup')
+        if status == MemoryStatus.REFUTED:
+            reject_review_item(organization, actor, memory, 'fixture setup')
+            memory.refresh_from_db()
+        elif status != MemoryStatus.APPROVED:
+            raise ValueError(f'unsupported typed memory status {status}')
+        if created_at is not None:
+            Memory.objects.filter(id=memory.id).update(created_at=created_at)
+            memory.refresh_from_db()
+
+        return memory
 
     memory = Memory.objects.create(
         organization=organization,
@@ -259,13 +313,13 @@ def test_queue_returns_proposed_candidates_and_reviewable_memories(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED)
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -285,6 +339,35 @@ def test_queue_returns_proposed_candidates_and_reviewable_memories(
 
 
 @pytest.mark.django_db
+def test_queue_excludes_legacy_rows_but_lists_typed_rows(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    legacy_candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    typed_candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
+    legacy_memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    typed_memory = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.APPROVED,
+        confidence='0.100',
+        typed=True,
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+    ids = {item['id'] for item in response.data['results']}
+    assert str(legacy_candidate.id) not in ids
+    assert str(legacy_memory.id) not in ids
+    assert str(typed_candidate.id) in ids
+    assert str(typed_memory.id) in ids
+
+
+@pytest.mark.django_db
 def test_queue_orders_mixed_items_by_created_at_desc(
     f_admin_token: str,
     f_admin_org: Organization,
@@ -297,13 +380,15 @@ def test_queue_orders_mixed_items_by_created_at_desc(
         f_project,
         status=CandidateStatus.PROPOSED,
         created_at=now - timedelta(days=3),
+        typed=True,
     )
 
     middle = _make_memory(
         f_admin_org,
         f_project,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         created_at=now - timedelta(days=2),
+        typed=True,
     )
 
     newest = _make_candidate(
@@ -311,6 +396,7 @@ def test_queue_orders_mixed_items_by_created_at_desc(
         f_project,
         status=CandidateStatus.PROPOSED,
         created_at=now - timedelta(days=1),
+        typed=True,
     )
 
     client = _auth_client(f_admin_token, f_admin_org)
@@ -340,6 +426,7 @@ def test_queue_paginates_across_pages_by_created_at(
             f_project,
             status=CandidateStatus.PROPOSED,
             created_at=now - timedelta(minutes=index),
+            typed=True,
         )
         for index in range(PAGE_SIZE + 5)
     ]
@@ -374,7 +461,7 @@ def test_queue_issues_bounded_queries_for_large_backlog(
     from django.test.utils import CaptureQueriesContext
 
     for _ in range(PAGE_SIZE * 2 + 10):
-        _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+        _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -431,11 +518,29 @@ def test_queue_filters_by_confidence_range(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.100',
+        typed=True,
+    )
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.500')
+    _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.500',
+        typed=True,
+    )
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.950')
+    _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.950',
+        typed=True,
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -456,11 +561,29 @@ def test_queue_ordering_by_confidence(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    low = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    low = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.100',
+        typed=True,
+    )
 
-    mid = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.500')
+    mid = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.500',
+        typed=True,
+    )
 
-    high = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.900')
+    high = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        confidence='0.900',
+        typed=True,
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -480,9 +603,19 @@ def test_queue_ordering_by_created_at_ascending(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    older = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    older = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        typed=True,
+    )
 
-    newer = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    newer = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        typed=True,
+    )
 
     Memory.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
 
@@ -508,15 +641,17 @@ def test_queue_filters_by_visibility_scope(
         f_admin_org,
         f_project,
         team=f_team,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         visibility_scope=VisibilityScope.TEAM,
+        typed=True,
     )
 
     _make_memory(
         f_admin_org,
         f_project,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         visibility_scope=VisibilityScope.PROJECT,
+        typed=True,
     )
 
     client = _auth_client(f_admin_token, f_admin_org)
@@ -538,15 +673,13 @@ def test_queue_filters_by_status(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED)
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.get('/v1/admin/memory-review/?status=conflict')
+    response = client.get('/v1/admin/memory-review/?status=refuted')
 
     assert response.status_code == 200
 
@@ -554,7 +687,7 @@ def test_queue_filters_by_status(
 
     assert len(items) == 1
 
-    assert items[0]['status'] == 'conflict'
+    assert items[0]['status'] == 'refuted'
 
 
 @pytest.mark.django_db
@@ -568,11 +701,17 @@ def test_queue_filters_by_age_days(
     _make_memory(
         f_admin_org,
         f_project,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         created_at=old_created,
+        typed=True,
     )
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.REFUTED,
+        typed=True,
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -602,10 +741,16 @@ def test_queue_filters_by_team_and_project(
         f_admin_org,
         f_project,
         team=f_team,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
+        typed=True,
     )
 
-    _make_memory(f_admin_org, other_project, status=MemoryStatus.CONFLICT)
+    _make_memory(
+        f_admin_org,
+        other_project,
+        status=MemoryStatus.REFUTED,
+        typed=True,
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -664,22 +809,24 @@ def test_queue_filters_by_search_matches_title_and_body(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     target = _make_memory(
         f_admin_org,
         f_project,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         title='Authentication flow notes',
         body='describes the login handshake',
+        typed=True,
     )
 
     _make_memory(
         f_admin_org,
         f_project,
-        status=MemoryStatus.CONFLICT,
+        status=MemoryStatus.REFUTED,
         title='Billing notes',
         body='unrelated billing details',
+        typed=True,
     )
 
     client = _auth_client(f_admin_token, f_admin_org)
@@ -701,38 +848,32 @@ def test_queue_filters_by_source_type(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    file_observation = _make_observation(f_admin_org, f_project)
-
-    ObservationSource.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        observation=file_observation,
-        source_type='file',
-        source_id='src/app.py',
-    )
-
-    web_observation = _make_observation(f_admin_org, f_project)
-
-    ObservationSource.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        observation=web_observation,
-        source_type='web',
-        source_id='https://example.com',
-    )
-
     file_candidate = _make_candidate(
         f_admin_org,
         f_project,
         status=CandidateStatus.PROPOSED,
-        source_observation=file_observation,
+        typed=True,
+    )
+    ObservationSource.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        observation=file_candidate.source_observation,
+        source_type='file',
+        source_id='src/app.py',
     )
 
-    _make_candidate(
+    web_candidate = _make_candidate(
         f_admin_org,
         f_project,
         status=CandidateStatus.PROPOSED,
-        source_observation=web_observation,
+        typed=True,
+    )
+    ObservationSource.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        observation=web_candidate.source_observation,
+        source_type='web',
+        source_id='https://example.com',
     )
 
     client = _auth_client(f_admin_token, f_admin_org)
@@ -754,8 +895,17 @@ def test_queue_serializer_includes_provenance_and_citations(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    observation = _make_observation(f_admin_org, f_project)
-
+    candidate = _make_candidate(
+        f_admin_org,
+        f_project,
+        status=CandidateStatus.PROPOSED,
+        typed=True,
+    )
+    candidate.evidence = [{'provider_call_id': 'pc-1', 'provider': 'anthropic', 'model': 'claude-x'}]
+    candidate.save(update_fields=['evidence', 'updated_at'])
+    observation = candidate.source_observation
+    observation.title = 'Obs title'
+    observation.save(update_fields=['title', 'updated_at'])
     ObservationSource.objects.create(
         organization=f_admin_org,
         project=f_project,
@@ -765,15 +915,7 @@ def test_queue_serializer_includes_provenance_and_citations(
         citation='L10',
     )
 
-    candidate = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        evidence=[{'provider_call_id': 'pc-1', 'provider': 'anthropic', 'model': 'claude-x'}],
-        source_observation=observation,
-    )
-
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     MemoryLink.objects.create(
         organization=f_admin_org,
@@ -817,7 +959,7 @@ def test_queue_serializer_includes_current_version_for_memory(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     Memory.objects.filter(id=memory.id).update(current_version=3)
 
@@ -887,7 +1029,7 @@ def test_action_approve_promotes_candidate(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -918,9 +1060,7 @@ def test_action_edit_creates_new_version(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
-
-    _make_version(memory, 1, 'original')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -946,9 +1086,9 @@ def test_action_narrow_creates_narrowed_by_link(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    target = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='general')
+    target = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='general', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -976,9 +1116,9 @@ def test_action_supersede_creates_link_and_marks_stale(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    replacement = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='new')
+    replacement = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='new', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1032,7 +1172,7 @@ def test_action_reject_memory_sets_refuted(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1054,7 +1194,7 @@ def test_action_archive_sets_archived(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1150,9 +1290,9 @@ def test_bulk_archive_by_ids(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
 
-    m2 = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED)
+    m2 = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1178,11 +1318,32 @@ def test_bulk_archive_by_ids(
     assert (
         AuditEvent.objects.filter(
             organization=f_admin_org,
-            event_type='MemoryReviewed',
-            metadata__action='archive',
+            event_type='MemoryTransitionCommitted',
+            metadata__transition_type='archive',
         ).count()
         == 2
     )
+
+
+@pytest.mark.django_db
+def test_bulk_archive_by_ids_rejects_legacy_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    legacy = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-archive/',
+        {'ids': [str(legacy.id)], 'reason': 'legacy cleanup'},
+    )
+
+    assert response.status_code == 400
+    assert response.data['code'] == 'invalid_state'
+    legacy.refresh_from_db()
+    assert legacy.status == MemoryStatus.CONFLICT
 
 
 @pytest.mark.django_db
@@ -1191,9 +1352,9 @@ def test_bulk_archive_by_confidence_threshold(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.900')
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1214,6 +1375,36 @@ def test_bulk_archive_by_confidence_threshold(
 
 
 @pytest.mark.django_db
+def test_bulk_archive_by_confidence_threshold_excludes_legacy_memory(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    legacy = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    typed = _make_memory(
+        f_admin_org,
+        f_project,
+        status=MemoryStatus.APPROVED,
+        confidence='0.100',
+        typed=True,
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-archive/',
+        {'confidence__lte': '0.300', 'reason': 'legacy-safe cleanup'},
+    )
+
+    assert response.status_code == 200
+    assert response.data['archived_ids'] == [str(typed.id)]
+    legacy.refresh_from_db()
+    typed.refresh_from_db()
+    assert legacy.status == MemoryStatus.CONFLICT
+    assert typed.status == MemoryStatus.ARCHIVED
+
+
+@pytest.mark.django_db
 def test_bulk_archive_by_confidence_threshold_scopes_to_project(
     f_admin_token: str,
     f_admin_org: Organization,
@@ -1221,9 +1412,15 @@ def test_bulk_archive_by_confidence_threshold_scopes_to_project(
 ) -> None:
     other_project = Project.objects.create(organization=f_admin_org, name='Other', slug='other')
 
-    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200', typed=True)
 
-    out_of_scope = _make_memory(f_admin_org, other_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+    out_of_scope = _make_memory(
+        f_admin_org,
+        other_project,
+        status=MemoryStatus.APPROVED,
+        confidence='0.200',
+        typed=True,
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1242,7 +1439,7 @@ def test_bulk_archive_by_confidence_threshold_scopes_to_project(
 
     assert in_scope.status == MemoryStatus.ARCHIVED
 
-    assert out_of_scope.status == MemoryStatus.CONFLICT
+    assert out_of_scope.status == MemoryStatus.APPROVED
 
 
 @pytest.mark.django_db
@@ -1251,9 +1448,9 @@ def test_bulk_archive_by_confidence_threshold_skips_approved_above_review_thresh
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200')
+    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200', typed=True)
 
-    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450')
+    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1458,7 +1655,7 @@ def test_queue_includes_agent_refuted_approved_memory(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900', typed=True)
 
     memory.refuted = True
 
@@ -1506,13 +1703,7 @@ def test_action_restore_reactivates_agent_refuted_memory(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
-
-    _make_version(memory, 1, 'body')
-
-    memory.refuted = True
-
-    memory.save(update_fields=['refuted', 'updated_at'])
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, confidence='0.900', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1536,9 +1727,9 @@ def test_bulk_action_approve_promotes_candidates(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
-    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1580,6 +1771,34 @@ def test_bulk_action_approve_promotes_candidates(
 
 
 @pytest.mark.django_db
+def test_bulk_action_reports_legacy_candidate_invalid_state_and_approves_typed_sibling(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    legacy = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    typed = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.post(
+        '/v1/admin/memory-review/bulk-action/',
+        {'ids': [str(legacy.id), str(typed.id)], 'action': 'approve', 'reason': 'mixed approve'},
+    )
+
+    assert response.status_code == 200
+    assert response.data['done_count'] == 1
+    assert response.data['skipped_count'] == 1
+    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
+    assert outcomes[str(legacy.id)] == 'invalid_state'
+    assert outcomes[str(typed.id)] == 'done'
+    legacy.refresh_from_db()
+    typed.refresh_from_db()
+    assert legacy.status == CandidateStatus.PROPOSED
+    assert typed.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
 def test_bulk_action_reject_handles_candidate_and_memory(
     f_admin_token: str,
     f_admin_org: Organization,
@@ -1587,7 +1806,7 @@ def test_bulk_action_reject_handles_candidate_and_memory(
 ) -> None:
     candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
 
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1615,7 +1834,7 @@ def test_bulk_action_partial_failure_reports_per_item_outcome(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     already_promoted = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROMOTED)
 

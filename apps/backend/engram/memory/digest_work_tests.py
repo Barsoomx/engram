@@ -16,6 +16,7 @@ from engram.core.models import (
     Memory,
     MemoryStatus,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     Project,
     ProjectTeam,
@@ -33,8 +34,18 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory.invariant_queries import InvariantId, InvariantState, evaluate_invariants
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
+from engram.memory.transitions import (
+    PromoteMemoryCandidate,
+    ReviseMemory,
+    ReviseMemoryInput,
+    TransitionRequest,
+    TransitionScope,
+    build_memory_fence,
+)
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.memory.work_execution import execution_configuration_fingerprint
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
 from engram.memory.workflow_work import CreateWorkflowWorkInput
@@ -45,6 +56,20 @@ from engram.model_policy.services import FakeProviderGateway, ProviderCallInput,
 _DAILY_TASK_NAME = 'engram.memory.generate_daily_digest_work_v1'
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
+
+
+def _digest_works() -> object:
+    return WorkflowWork.objects.filter(
+        work_type__in=(WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST),
+    )
+
+
+def _digest_outbox() -> object:
+    return CeleryOutbox.objects.filter(task_name__in=(_DAILY_TASK_NAME, _WEEKLY_TASK_NAME))
+
+
+def _digest_runs() -> object:
+    return WorkflowRun.objects.filter(run_type__in=(WorkflowRunType.DAILY_DIGEST, WorkflowRunType.WEEKLY_DIGEST))
 
 
 def _load_digest_work() -> object:
@@ -86,16 +111,40 @@ def _make_memory(
     status: str = MemoryStatus.APPROVED,
     kind: str = '',
 ) -> tuple[Memory, MemoryVersion]:
-    metadata = {'kind': kind} if kind else {}
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='digest-source',
+        title=title,
+        body=body,
+        visibility_scope=visibility,
+        kind=kind,
+    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    memory = result.memory
+    version = result.memory_version
+    if status != MemoryStatus.APPROVED:
+        Memory.objects.filter(id=memory.id).update(status=status)
+        memory.refresh_from_db()
+
+    return memory, version
+
+
+def _make_legacy_memory(
+    organization: Organization,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+) -> tuple[Memory, MemoryVersion]:
     memory = Memory.objects.create(
         organization=organization,
         project=project,
-        team=team,
         title=title,
         body=body,
-        status=status,
-        visibility_scope=visibility,
-        metadata=metadata,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
     )
     version = MemoryVersion.objects.create(
         organization=organization,
@@ -214,9 +263,9 @@ def test_concurrent_daily_creates_leave_one_immutable_snapshot() -> None:
 
     created_flags = [created for created, _snapshot in results]
     assert sum(1 for flag in created_flags if flag) == 1
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    frozen = WorkflowWork.objects.get()
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
+    frozen = _digest_works().get()
     original_snapshot = frozen.input_snapshot
 
     Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
@@ -263,9 +312,9 @@ def test_concurrent_weekly_creates_leave_one_immutable_snapshot() -> None:
         created_flags = [future.result(timeout=15) for future in futures]
 
     assert sum(1 for flag in created_flags if flag) == 1
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
-    frozen = WorkflowWork.objects.get()
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
+    frozen = _digest_works().get()
     original_snapshot = frozen.input_snapshot
 
     Memory.objects.filter(id=memory.id).update(title='Alpha changed', body='body-a changed')
@@ -317,8 +366,8 @@ def test_daily_source_change_after_create_does_not_rewrite_snapshot() -> None:
 
     assert reused.id == work.id
     assert created_again is False
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
     assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
 
 
@@ -367,8 +416,8 @@ def test_weekly_source_change_after_create_does_not_rewrite_snapshot() -> None:
 
     assert reused.id == work.id
     assert created_again is False
-    assert WorkflowWork.objects.count() == 1
-    assert CeleryOutbox.objects.count() == 1
+    assert _digest_works().count() == 1
+    assert _digest_outbox().count() == 1
     assert WorkflowWork.objects.get(id=work.id).input_snapshot == original_snapshot
 
 
@@ -512,6 +561,38 @@ def test_daily_project_output_excludes_team_private_session_org_and_digest_sourc
 
 
 @pytest.mark.django_db
+def test_daily_project_digest_admits_project_visible_source_from_associated_team() -> None:
+    organization, project = _make_scope('daily-project-team-source')
+    team = _make_team(organization, project, 'daily-project-team-source')
+    _create_digest_policy(organization, project)
+    source_memory, source_version = _make_memory(
+        organization,
+        project,
+        title='Project-visible team source',
+        body='project-visible team body',
+        team=team,
+        visibility=VisibilityScope.PROJECT,
+    )
+    work, _snapshot = _make_daily_work(organization, project)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    digest_version = MemoryVersion.objects.get(memory=digest)
+    provenance = MemoryVersionSource.objects.get(memory_version=digest_version)
+    assert result == str(_v1_runs(work).get().id)
+    assert digest.team_id is None
+    assert digest.metadata['source_memory_ids'] == [str(source_memory.id)]
+    assert provenance.source_memory_version_id == source_version.id
+    p7 = next(
+        result
+        for result in evaluate_invariants(organization_id=organization.id, project_id=project.id)
+        if result.invariant_id == InvariantId.P7
+    )
+    assert p7.state == InvariantState.HEALTHY
+
+
+@pytest.mark.django_db
 def test_daily_caps_sources_and_marks_truncated_by_updated_order() -> None:
     digest_work = _load_digest_work()
     organization, project = _make_scope('daily-cap')
@@ -584,8 +665,8 @@ def test_daily_rejects_cross_project_source_reference() -> None:
                 signal_task=generate_daily_digest_work_v1,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 @pytest.mark.django_db
@@ -663,6 +744,106 @@ def test_weekly_project_output_excludes_team_private_sources() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize('work_type', (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST))
+def test_digest_snapshot_admits_only_transition_owned_sources(work_type: str) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope(f'{work_type}-typed-admission')
+    legacy_memory, _legacy_version = _make_legacy_memory(
+        organization,
+        project,
+        title='Legacy source',
+        body='legacy body',
+    )
+    typed_memory, _typed_version = _make_memory(
+        organization,
+        project,
+        title='Typed source',
+        body='typed body',
+    )
+    window_start, window_end = _daily_window() if work_type == WorkflowWorkType.DAILY_DIGEST else _weekly_window()
+
+    if work_type == WorkflowWorkType.DAILY_DIGEST:
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='daily:typed-admission',
+            max_sources=10,
+        )
+        refs = snapshot['sources']
+        assert snapshot['eligible_source_count'] == 1
+    else:
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='weekly:typed-admission',
+        )
+        refs = snapshot['changes']
+
+    assert {ref['memory_id'] for ref in refs} == {str(typed_memory.id)}
+    legacy_memory.refresh_from_db()
+    assert legacy_memory.transition_contract_version == 0
+    assert legacy_memory.current_transition_id is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('work_type', (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST))
+def test_all_legacy_digest_input_resolves_no_input_without_publication(work_type: str) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope(f'{work_type}-legacy-no-input')
+    legacy_memory, _legacy_version = _make_legacy_memory(
+        organization,
+        project,
+        title='Legacy source',
+        body='legacy body',
+    )
+    schedule_key = f'{work_type}:legacy-no-input'
+    window_start, window_end = _daily_window() if work_type == WorkflowWorkType.DAILY_DIGEST else _weekly_window()
+
+    with transaction.atomic():
+        if work_type == WorkflowWorkType.DAILY_DIGEST:
+            snapshot = digest_work.freeze_daily_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+                max_sources=10,
+            )
+            refs = snapshot['sources']
+            data = _daily_data(organization, project, snapshot, schedule_key)
+            signal_task = generate_daily_digest_work_v1
+        else:
+            snapshot = digest_work.freeze_weekly_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+            )
+            refs = snapshot['changes']
+            data = _weekly_data(organization, project, None, snapshot, schedule_key)
+            signal_task = generate_weekly_digest_work_v1
+
+        work, created = digest_work.create_digest_work_and_signal(data=data, signal_task=signal_task)
+
+    assert refs == []
+    assert created is True
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert _digest_outbox().count() == 0
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    legacy_memory.refresh_from_db()
+    assert legacy_memory.transition_contract_version == 0
+    assert legacy_memory.current_transition_id is None
+
+
+@pytest.mark.django_db
 def test_weekly_rejects_team_not_linked_to_project() -> None:
     digest_work = _load_digest_work()
     organization, project = _make_scope('weekly-unlinked-team')
@@ -709,8 +890,8 @@ def test_empty_authorized_daily_input_resolves_no_input_without_package_or_outbo
     assert created is True
     assert work.disposition == WorkflowWorkDisposition.NO_OP
     assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
-    assert CeleryOutbox.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
+    assert _digest_outbox().count() == 0
+    assert _digest_runs().count() == 0
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
 
 
@@ -739,8 +920,8 @@ def test_empty_authorized_weekly_input_resolves_no_input_without_outbox() -> Non
     assert created is True
     assert work.disposition == WorkflowWorkDisposition.NO_OP
     assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
-    assert CeleryOutbox.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
+    assert _digest_outbox().count() == 0
+    assert _digest_runs().count() == 0
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
 
 
@@ -779,9 +960,9 @@ def test_signal_failure_rolls_back_daily_work_run_and_outbox(monkeypatch: pytest
                 workflow_run=run,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_runs().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 @pytest.mark.django_db
@@ -812,9 +993,9 @@ def test_signal_failure_rolls_back_weekly_work_and_outbox(monkeypatch: pytest.Mo
                 signal_task=generate_weekly_digest_work_v1,
             )
 
-    assert WorkflowWork.objects.count() == 0
-    assert WorkflowRun.objects.count() == 0
-    assert CeleryOutbox.objects.count() == 0
+    assert _digest_works().count() == 0
+    assert _digest_runs().count() == 0
+    assert _digest_outbox().count() == 0
 
 
 def _create_digest_policy(organization: Organization, project: Project) -> ModelPolicy:
@@ -883,6 +1064,51 @@ class _MutatingDigestGateway:
         MemoryVersion.objects.filter(id=self._version.id).update(body='body mutated mid-provider-call')
 
         return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+class _AdvancingDigestGateway:
+    def __init__(self, memory: Memory, calls: list[ProviderCallInput]) -> None:
+        self._memory = memory
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+        self._memory.refresh_from_db()
+        ReviseMemory().execute(
+            ReviseMemoryInput(
+                request=TransitionRequest(
+                    scope=TransitionScope(
+                        organization_id=self._memory.organization_id,
+                        project_id=self._memory.project_id,
+                        team_id=self._memory.team_id,
+                    ),
+                    idempotency_key=f'test:digest-source-advance:{self._memory.id}:v2',
+                    actor_type='system',
+                    actor_id='digest-work-test',
+                    capability='memories:write',
+                    request_id=f'test:digest-source-advance:{self._memory.id}',
+                    correlation_id=f'test:digest-source-advance:{self._memory.id}',
+                    reason='advance source during digest provider call',
+                    origin='digest-work-test',
+                ),
+                memory_fence=build_memory_fence(self._memory),
+                title=self._memory.title,
+                body='body-a-v2',
+            )
+        )
+
+        return ProviderCallResult(
+            provider='openai',
+            model='gpt-4.1-mini',
+            call_record_id=self._memory.id,
+            redaction_state='clean',
+            generated_title='Frozen V1 digest',
+            generated_body='Digest body rendered from frozen V1',
+        )
 
     def embed(self, data: object) -> object:
         return self._delegate.embed(data)
@@ -1077,28 +1303,51 @@ def test_daily_work_discards_provider_result_when_source_invalidated_after_preca
     assert len(calls) == 1
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
     assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
-    assert RetrievalDocument.objects.filter(project=project).count() == 0
+    assert RetrievalDocument.objects.filter(project=project, memory__kind='digest').count() == 0
 
 
 @pytest.mark.django_db
-def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
+def test_daily_work_publishes_frozen_v1_body_and_provenance_when_source_advances_during_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    organization, project = _make_scope('daily-frozen-v1')
+    _create_digest_policy(organization, project)
+    source_memory, source_v1 = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    calls: list[ProviderCallInput] = []
+
+    def stub(policy: object, **_kwargs: object) -> object:
+        if getattr(policy, 'task_type', None) == 'digest':
+            return _AdvancingDigestGateway(source_memory, calls)
+
+        return FakeProviderGateway()
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', stub)
+
+    result = generate_daily_digest_work_v1(str(work.id))
+
+    digest = Memory.objects.get(project=project, kind='digest')
+    digest_version = MemoryVersion.objects.get(memory=digest)
+    provenance = MemoryVersionSource.objects.get(memory_version=digest_version)
+    assert result == str(_v1_runs(work).get().id)
+    assert len(calls) == 1
+    assert 'body-a' in calls[0].prompt
+    assert 'body-a-v2' not in calls[0].prompt
+    assert digest.title == 'Digest Frozen V1 digest'
+    assert digest.body == 'Digest body rendered from frozen V1'
+    assert digest.metadata['source_memory_ids'] == [str(source_memory.id)]
+    assert provenance.source_memory_version_id == source_v1.id
+
+
+@pytest.mark.django_db
+def test_daily_work_publishes_output_atomically_without_embedding_under_locks() -> None:
     organization, project = _make_scope('daily-publish')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
 
-    embed_atomic_flags: list[bool] = []
-
-    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
-        embed_atomic_flags.append(connection.in_atomic_block)
-
-    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
-
     result = generate_daily_digest_work_v1(str(work.id))
 
-    assert not any(embed_atomic_flags)
     assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
@@ -1109,29 +1358,26 @@ def test_daily_work_publishes_output_atomically_without_embedding_under_locks(
     document = RetrievalDocument.objects.get(memory=digest_memory)
     assert not document.embedding_vector
     assert document.embedding_reference == ''
+    assert (
+        WorkflowWork.objects.filter(
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            subject_id=document.id,
+        ).count()
+        == 1
+    )
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
 
 @pytest.mark.django_db
-def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_weekly_work_publishes_output_atomically_without_embedding_under_locks() -> None:
     organization, project = _make_scope('weekly-publish')
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_weekly_work(organization, project)
 
-    embed_atomic_flags: list[bool] = []
-
-    def _spy_embed(self: object, document: object, memory: object, version: object) -> None:
-        embed_atomic_flags.append(connection.in_atomic_block)
-
-    monkeypatch.setattr('engram.context.services.IndexMemoryVersion._embed_document', _spy_embed)
-
     result = generate_weekly_digest_work_v1(str(work.id))
 
-    assert not any(embed_atomic_flags)
     assert result == str(_v1_runs(work).get().id)
     digests = Memory.objects.filter(project=project, kind='digest')
     assert digests.count() == 1
@@ -1142,6 +1388,13 @@ def test_weekly_work_publishes_output_atomically_without_embedding_under_locks(
     document = RetrievalDocument.objects.get(memory=digest_memory)
     assert not document.embedding_vector
     assert document.embedding_reference == ''
+    assert (
+        WorkflowWork.objects.filter(
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            subject_id=document.id,
+        ).count()
+        == 1
+    )
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED

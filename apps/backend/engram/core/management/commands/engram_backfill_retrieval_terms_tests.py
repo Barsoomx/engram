@@ -13,6 +13,8 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
 )
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate, transition_request
 
 _TITLE = 'Scope resolver gotcha'
 _BODY = '`resolve_scope()` raises AccessDeniedError when ENGRAM_MODE is unset.'
@@ -92,6 +94,43 @@ def test_backfill_second_run_reports_no_changes(
     assert 'changed=0' in out.getvalue()
     assert 'failed=0' in out.getvalue()
     assert 'scanned=1' in out.getvalue()
+
+
+@pytest.mark.django_db
+def test_backfill_skips_version_one_projection_with_stale_legacy_terms() -> None:
+    candidate, _source, scope = provenanced_candidate('backfill-version-one')
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    document = result.retrieval_document
+    organization, project, _session = scope
+    RetrievalDocument.objects.filter(id=document.id).update(symbols=[], exact_terms=[])
+    document.refresh_from_db()
+    before = {
+        'symbols': document.symbols,
+        'exact_terms': document.exact_terms,
+        'projection_contract_version': document.projection_contract_version,
+        'exact_projection_hash': document.exact_projection_hash,
+    }
+
+    out = StringIO()
+    call_command(
+        'engram_backfill_retrieval_terms',
+        '--organization',
+        str(organization.id),
+        '--project',
+        str(project.id),
+        stdout=out,
+    )
+
+    document.refresh_from_db()
+    assert {
+        'symbols': document.symbols,
+        'exact_terms': document.exact_terms,
+        'projection_contract_version': document.projection_contract_version,
+        'exact_projection_hash': document.exact_projection_hash,
+    } == before
+    assert 'changed=0' in out.getvalue()
+    assert 'failed=0' in out.getvalue()
+    assert 'scanned=0' in out.getvalue()
 
 
 @pytest.mark.django_db

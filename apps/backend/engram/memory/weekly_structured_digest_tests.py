@@ -10,11 +10,11 @@ from django.utils import timezone
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
-    AuditEvent,
     LinkType,
     Memory,
     MemoryLink,
     MemoryStatus,
+    MemoryTransition,
     MemoryVersion,
     Organization,
     Project,
@@ -32,6 +32,8 @@ from engram.memory.services import (
     run_weekly_digest_with_tracking,
     weekly_digest_content_hash,
 )
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 
 @pytest.fixture
@@ -56,15 +58,28 @@ def _make_memory(
     refuted: bool = False,
     team: Team | None = None,
 ) -> Memory:
-    return Memory.objects.create(
-        organization=org,
-        project=project,
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        org,
+        project,
+        team,
+        suffix='weekly-digest',
         title=title,
         body='body',
-        status=status,
-        refuted=refuted,
-        team=team,
+        visibility_scope=VisibilityScope.PROJECT,
     )
+    memory = PromoteMemoryCandidate().execute(transition_request(candidate)).memory
+    update_fields: list[str] = []
+    if status != MemoryStatus.APPROVED:
+        memory.status = status
+        update_fields.append('status')
+    if refuted:
+        memory.refuted = True
+        update_fields.append('refuted')
+    if update_fields:
+        update_fields.append('updated_at')
+        memory.save(update_fields=update_fields)
+
+    return memory
 
 
 def _make_link(
@@ -257,11 +272,13 @@ def test_memory_outside_window_not_in_any_bucket(
     f_project: Project,
 ) -> None:
     old_mem = _make_memory(f_org, f_project, title='old-mem')
+    current_mem = _make_memory(f_org, f_project, title='current-mem')
 
     Memory.objects.filter(id=old_mem.id).update(
         created_at=_out_of_window(),
         updated_at=_out_of_window(),
     )
+    Memory.objects.filter(id=current_mem.id).update(created_at=_in_window())
 
     result = _run(f_org, f_project)
 
@@ -352,6 +369,9 @@ def test_ready_is_false_initially(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='ready-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result = _run(f_org, f_project)
 
     assert result.ready is False
@@ -426,6 +446,7 @@ def test_rerun_in_different_iso_week_creates_new_digest(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='rerun-source')
     monday_this_week = _iso_week_monday(timezone.now().date())
 
     first_instant = timezone.make_aware(datetime.datetime.combine(monday_this_week, datetime.time(10, 0)))
@@ -433,9 +454,12 @@ def test_rerun_in_different_iso_week_creates_new_digest(
     next_week_instant = timezone.make_aware(
         datetime.datetime.combine(monday_this_week + datetime.timedelta(days=7), datetime.time(10, 0)),
     )
+    Memory.objects.filter(id=mem.id).update(created_at=first_instant - datetime.timedelta(days=1))
 
     with mock.patch('engram.memory.services.timezone.now', return_value=first_instant):
         result1 = _run(f_org, f_project)
+
+    Memory.objects.filter(id=mem.id).update(created_at=next_week_instant - datetime.timedelta(days=1))
 
     with mock.patch('engram.memory.services.timezone.now', return_value=next_week_instant):
         result2 = _run(f_org, f_project)
@@ -458,6 +482,9 @@ def test_window_covers_monday_to_monday_boundary_of_completed_week(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='boundary-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result = _run(f_org, f_project)
 
     window_start = datetime.datetime.fromisoformat(result.digest_memory.metadata['window_start'])
@@ -480,6 +507,13 @@ def test_weeks_back_shifts_window_to_earlier_week(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    current_mem = _make_memory(f_org, f_project, title='current-source')
+    previous_mem = _make_memory(f_org, f_project, title='previous-source')
+    Memory.objects.filter(id=current_mem.id).update(created_at=_in_window())
+    Memory.objects.filter(id=previous_mem.id).update(
+        created_at=_window_start() - datetime.timedelta(days=1),
+    )
+
     current = _run(f_org, f_project)
 
     previous = BuildWeeklyStructuredDigest().execute(
@@ -523,6 +557,9 @@ def test_run_weekly_digest_with_tracking_creates_succeeded_workflow_run(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='tracking-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result = run_weekly_digest_with_tracking(
         organization_id=f_org.id,
         project_id=f_project.id,
@@ -547,6 +584,9 @@ def test_run_weekly_digest_with_tracking_adopts_existing_queued_run(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='adopt-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     queued = WorkflowRun.objects.create(
         organization=f_org,
         project=f_project,
@@ -635,7 +675,7 @@ def test_team_id_restricts_added_bucket_to_that_team(
 
 
 @pytest.mark.django_db
-def test_without_team_id_all_project_memories_considered(
+def test_without_team_id_excludes_team_owned_memories(
     f_org: Organization,
     f_project: Project,
 ) -> None:
@@ -645,19 +685,24 @@ def test_without_team_id_all_project_memories_considered(
 
     mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
 
-    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_out_of_window())
 
     mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
 
-    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_out_of_window())
+
+    mem_no_team = _make_memory(f_org, f_project, title='no-team-mem')
+    Memory.objects.filter(id=mem_no_team.id).update(created_at=_in_window())
 
     result = _run(f_org, f_project)
 
     all_ids = [item['id'] for items in result.memory_changes.values() for item in items]
 
-    assert str(mem_team_a.id) in all_ids
+    assert str(mem_team_a.id) not in all_ids
 
-    assert str(mem_team_b.id) in all_ids
+    assert str(mem_team_b.id) not in all_ids
+
+    assert str(mem_no_team.id) in all_ids
 
 
 @pytest.mark.django_db
@@ -668,14 +713,15 @@ def test_team_scoped_digest_has_independent_content_hash_from_unscoped(
     team_a = Team.objects.create(organization=f_org, name='Team A', slug='team-a')
 
     mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
-
-    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_out_of_window())
 
     mem_no_team = _make_memory(f_org, f_project, title='no-team-mem')
 
     Memory.objects.filter(id=mem_no_team.id).update(created_at=_in_window())
 
     unscoped_result = _run(f_org, f_project)
+
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
 
     team_scoped_result = _run(f_org, f_project, team_id=team_a.id)
 
@@ -691,6 +737,9 @@ def test_weekly_digest_output_is_quarantined_from_retrieval_until_proven(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='quarantine-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result = _run(f_org, f_project)
 
     version = MemoryVersion.objects.get(memory=result.digest_memory)
@@ -709,6 +758,9 @@ def test_idempotent_rerun_does_not_duplicate_version_or_document(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='idempotent-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result1 = _run(f_org, f_project)
 
     result2 = _run(f_org, f_project)
@@ -727,6 +779,9 @@ def test_legacy_orphan_without_version_or_document_is_not_reused_or_reduplicated
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    source = _make_memory(f_org, f_project, title='orphan-source')
+    Memory.objects.filter(id=source.id).update(created_at=_in_window())
+
     window_start = _window_start()
 
     window_end = _window_end()
@@ -820,11 +875,12 @@ def test_weekly_digest_emits_digest_generated_audit(
     f_org: Organization,
     f_project: Project,
 ) -> None:
+    mem = _make_memory(f_org, f_project, title='audit-source')
+    Memory.objects.filter(id=mem.id).update(created_at=_in_window())
+
     result = _run(f_org, f_project)
 
-    audit = AuditEvent.objects.get(
-        event_type='DigestGenerated',
-        target_id=str(result.digest_memory.id),
-    )
-
-    assert audit.metadata['digest_kind'] == 'weekly_structured'
+    transition = MemoryTransition.objects.get(result_memory=result.digest_memory)
+    assert transition.audit_event.event_type == 'MemoryTransitionCommitted'
+    assert transition.audit_event.metadata['schema'] == 'memory_transition/v1'
+    assert transition.audit_event.metadata['transition_type'] == 'publish_digest'

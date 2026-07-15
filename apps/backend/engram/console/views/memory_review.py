@@ -339,6 +339,7 @@ class MemoryReviewViewSet(
         queryset = MemoryCandidate.objects.filter(
             organization=organization,
             status=CandidateStatus.PROPOSED,
+            decision_work_contract_version=1,
         ).select_related('source_observation', 'project', 'team')
 
         queryset = self._apply_common_filters(request, queryset, candidate=True)
@@ -348,6 +349,7 @@ class MemoryReviewViewSet(
     def _filtered_memories(self, request: Request, organization: Any) -> Any:
         queryset = (
             Memory.objects.filter(organization=organization)
+            .filter(transition_contract_version=1, current_transition__isnull=False)
             .filter(reviewable_memory_filter())
             .select_related('project', 'team')
         )

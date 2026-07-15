@@ -23,6 +23,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
+from engram.console.services import approve_memory_candidate
 from engram.core.models import (
     AuditEvent,
     Memory,
@@ -50,6 +51,7 @@ from engram.memory.digest_work import (
 )
 from engram.memory.services import weekly_digest_content_hash
 from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope
 from engram.memory.workflow_work import CreateWorkflowWorkInput, WorkflowWorkScopeError
 
 _WEEKLY_TASK_NAME = 'engram.memory.generate_weekly_digest_work_v1'
@@ -151,7 +153,36 @@ def _current_weekly_window(weeks_back: int) -> tuple[datetime.datetime, datetime
     return window_start, window_end
 
 
-def _make_source_memory(org: Organization, project: Project, created_at: datetime.datetime) -> Memory:
+def _make_source_memory(
+    org: Organization,
+    project: Project,
+    created_at: datetime.datetime,
+    *,
+    team: Team | None = None,
+    typed: bool = False,
+) -> Memory:
+    if typed:
+        actor = Identity.objects.create(
+            organization=org,
+            identity_type=IdentityType.USER,
+            external_id=f'fixture-digest-{uuid.uuid4()}',
+            display_name='Fixture digest actor',
+        )
+        candidate, _source, _session = provenanced_candidate_in_scope(
+            org,
+            project,
+            team,
+            suffix=f'digest-source-{uuid.uuid4().hex}',
+            title='weekly source memory',
+            body='source body',
+            visibility_scope=VisibilityScope.TEAM if team is not None else VisibilityScope.PROJECT,
+        )
+        memory = approve_memory_candidate(org, actor, candidate, 'fixture setup')
+        Memory.objects.filter(id=memory.id).update(created_at=created_at, updated_at=created_at)
+        memory.refresh_from_db()
+
+        return memory
+
     memory = Memory.objects.create(
         organization=org,
         project=project,
@@ -389,7 +420,7 @@ def test_get_weekly_current_enqueues_work_and_initial_signal_built_false(
     f_project: Project,
 ) -> None:
     window_start, _window_end = _current_weekly_window(0)
-    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1), typed=True)
 
     response = f_read_client.get(
         '/v1/admin/digests/weekly',
@@ -412,7 +443,7 @@ def test_get_weekly_current_enqueues_work_and_initial_signal_built_false(
 
     assert WorkflowRun.objects.filter(run_type=WorkflowRunType.WEEKLY_DIGEST).count() == 0
 
-    outbox = CeleryOutbox.objects.get()
+    outbox = CeleryOutbox.objects.get(task_name=_WEEKLY_TASK_NAME)
 
     assert outbox.task_name == _WEEKLY_TASK_NAME
 
@@ -851,7 +882,7 @@ def test_get_weekly_current_built_true_payload_carries_window_and_changelog(
     f_project: Project,
 ) -> None:
     window_start, _window_end = _current_weekly_window(0)
-    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1), typed=True)
 
     first = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
 
@@ -878,7 +909,7 @@ def test_get_weekly_weeks_back_one_finds_new_format_digest(
     f_project: Project,
 ) -> None:
     window_start, window_end = _current_weekly_window(1)
-    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1), typed=True)
 
     work = _publish_weekly_digest(f_org, f_project, window_start, window_end)
     published = Memory.objects.get(project=f_project, kind='digest')
@@ -923,8 +954,7 @@ def test_post_digest_review_team_bound_digest_outside_team_scope_not_found(
     team = Team.objects.create(organization=f_org, name='Squad', slug='squad')
     ProjectTeam.objects.create(organization=f_org, project=f_project, team=team)
     window_start, window_end = _current_weekly_window(1)
-    source = _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1))
-    Memory.objects.filter(id=source.id).update(team=team, visibility_scope=VisibilityScope.TEAM)
+    _make_source_memory(f_org, f_project, window_start + datetime.timedelta(days=1), team=team, typed=True)
 
     _publish_weekly_digest(f_org, f_project, window_start, window_end, team=team)
     digest = Memory.objects.get(project=f_project, kind='digest', team=team)

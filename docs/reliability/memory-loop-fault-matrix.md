@@ -1,17 +1,18 @@
 # Autonomous Memory Loop Fault Matrix
 
-Date: 2026-07-10
+Date: 2026-07-15
 
-Status: Checkpoint 0 characterization and future-test contract
+Status: C4.3 current behavior and evidence contract
 
 Authority: [Checkpoint 0 reliability contract](../superpowers/specs/2026-07-10-checkpoint-0-reliability-contract.md)
 
 ## Reading The Matrix
 
-Checkpoint 0 documents current behavior and adds synthetic characterization
-evidence only. It does not implement recovery or run dynamic crash tests. The
-named future test in each row belongs to the checkpoint that introduces the
-corresponding recovery mechanism.
+C4.3 documents the current typed-writer and projection-repair behavior plus
+the available characterization tests. A named unit test is implementation
+evidence, not a claim that this docs-only slice executed it. Dynamic Compose
+kill/forced-reconciliation/restart evidence is called out explicitly where it
+was executed.
 
 Acceptable recovery outcomes are complete rollback, durable retryable work,
 idempotent convergence to one durable effect, or automatic rebuild of a
@@ -39,10 +40,10 @@ with never-created or incomplete work and is not proof of product progress.
 | F11 | Provider returns a response, then the worker dies before durable semantic output | Evidence, claimed logical work, and provider-call provenance available up to the durable stage boundary | The returned result may be lost; replay can repeat the call and current rows cannot prove one durable output/disposition for the covered input. | The work remains incomplete and retryable; replay converges to one candidate, memory, or explicit no-signal disposition with durable stage provenance. | P5, P6 | CP3 | `test_crash_after_provider_response_replays_to_one_durable_decision` injects the fault, retries the same work, and asserts one covered disposition. |
 | F12 | Oversized session stops after a partial chunk or maximum-chunk cutoff | Session observations and any already committed derived outputs | No coverage ledger proves which observations were processed, so partial output can be mistaken for complete session distillation. | Deterministic chunks are subranges of one immutable generation; only fully covered input can complete, and uncovered chunks resume automatically. | P3, P5 | CP3 | `test_partial_oversized_session_resumes_uncovered_chunks` faults after the first chunk of 101 observations and asserts complete, non-overlapping coverage after resume. |
 | F13 | Candidate is committed before durable automatic decision work | Proposed candidate and source evidence | An ordinary proposed candidate can remain orphaned; current proposed count is only a proxy for missing decision work. | Candidate creation and decision-work identity are linked durably; reconciliation restores missing decision work, and only genuine conflicts enter the human inbox. | P6, P12 | CP3 | `test_orphan_candidate_gets_decision_work_and_terminal_disposition` faults before decision enqueue, reconciles, and asserts automatic completion with no ordinary inbox item. |
-| F14 | Transaction fails between candidate promotion, memory creation, and version creation | Proposed candidate and source evidence | The main promotion service currently groups candidate, memory, and version writes in one transaction, but CP0 has no uniform transition identity/provenance contract or fault evidence for every promotion path. | Candidate status, memory, current version, provenance, and transition identity commit atomically or all roll back. | P7, P8 | CP4 | `test_promotion_fault_rolls_back_candidate_memory_and_version` injects a failure at each write boundary and asserts no partial promoted chain survives. |
-| F15 | Semantic state commits before its exact retrieval representation or audit transition | Candidate/memory/version state may already be durable | A promoted memory can lack its current retrieval document or auditable transition and therefore be inconsistent or invisible to retrieval. | The semantic transition, exact retrieval representation, and audit identity share an atomic boundary; no current pointer advances alone. | P7, P8 | CP4 | `test_projection_or_audit_fault_cannot_advance_current_memory` injects each failure and asserts either the prior state or one complete new transition. |
-| F16 | Embedding generation fails after the exact retrieval document exists | Coherent memory/version and exact same-scope retrieval document | Projection embedding can remain missing or stale; current flags are observable but not a durable automatic recovery contract. | Exact text projection remains rebuildable; embedding failure records retryable projection work and cannot corrupt or repromote semantic state. | P7 | CP4 | `test_embedding_failure_preserves_exact_document_and_retries_projection` restores embedding generation and asserts one current document without a second promotion. |
-| F17 | Process dies between promotion and merge/supersession writes | Existing source memories, versions, and candidate evidence | Split semantic writes can leave successor and predecessor current-state or lineage pointers inconsistent. | One immutable transition identity atomically preserves source history, successor state, and authoritative current pointers. | P8 | CP4 | `test_supersession_fault_preserves_one_coherent_lineage_transition` injects every boundary and asserts either the old state or the complete linked transition. |
+| F14 | Transaction fails between candidate promotion, memory creation, and version creation | Proposed candidate and source evidence | `PromoteMemoryCandidate` now writes candidate disposition, memory/version, typed provenance, exact document, audit, embedding work/package, transition, and current pointer in one transaction. A fault rolls the whole chain back; the candidate remains proposed. | Candidate status, memory, current version, provenance, exact projection, embedding intent, audit, and transition identity commit atomically or all roll back. | P7, P8 | CP4 | Characterization: `test_promote_rolls_back_at_every_named_boundary` covers memory/version/source/exact-document/audit/work-package/transition/pointer. Execution status is not asserted by this docs-only update. |
+| F15 | Semantic state commits before its exact retrieval representation or audit transition | Candidate/source evidence and pre-existing semantic state | Typed transitions and converged console/feedback adapters share the outer transaction. Faults at exact-document or audit boundaries leave the prior semantic state and chain counts unchanged; exact retrieval is present at a successful semantic commit. | The semantic transition, exact retrieval representation, audit identity, and current-pointer update share an atomic boundary; no pointer advances alone. | P7, P8 | CP4 | Characterization: `test_post_commit_activity_can_be_suppressed_without_losing_exact_recall`, `test_console_edit_outer_transaction_rolls_back_typed_chain_faults`, and `test_feedback_outer_transaction_rolls_back_typed_chain_faults`. Execution status is not asserted by this docs-only update. |
+| F16 | Embedding generation fails after the exact retrieval document exists | Coherent version-1 memory/version, exact document, and embedding work identity | Embedding is outside the semantic transaction. A provider failure leaves exact retrieval and semantic state intact, marks the same work retryable, and hash-fenced stale results are discarded without re-promotion; consistency repair reuses one work/signal. | Exact text projection remains rebuildable and immediately recallable; embedding failure records retryable projection work and cannot corrupt or repromote semantic state. | P7 | CP4 | Unit characterization exists in `test_embedding_completion_recovers_after_failure_without_repromotion`, `test_stale_embedding_completion_is_discarded_without_vector_or_repromotion`, and the consistency-embedding tests. **Compose forced-reconciliation gate: PASSED** in [CI run 29420441028, job 87369221264](https://github.com/Barsoomx/engram/actions/runs/29420441028/job/87369221264); it proves durable retryability and idempotent manual recovery, not automatic lease-expiry discovery. Detailed evidence follows below. |
+| F17 | Process dies between promotion and merge/supersession writes | Existing source memories, versions, and candidate evidence | Merge/supersede/refute/restore paths now use one immutable typed transition and ordered fences. Fault injection leaves either the old lineage or one complete linked transition; source history and authoritative current pointers remain coherent. | One immutable transition identity atomically preserves source history, successor state, protected lineage/conflict links, and authoritative current pointers. | P8 | CP4 | Characterization: `test_supersession_fault_preserves_one_coherent_lineage_transition`, reverse-order concurrency, and merge/history invariant tests. Execution status is not asserted by this docs-only update. |
 | F18 | Process dies or mutable state changes during context snapshot/replay | Authorized retrieval inputs and any partially assembled context | No immutable request fingerprint, rendered-byte hash, authorization snapshot, or strict-budget evidence proves compatible replay. | Snapshot creation is immutable and authorized; a compatible replay is byte-stable and within the declared budget, while incompatible state creates a distinct identity. | P10, P14 | CP6 | `test_context_replay_is_byte_stable_authorized_and_budget_exact` faults during packing, retries, and compares identity, bytes, authorization, and byte budget. |
 | F19 | Temporal revalidation fails after repository state advances | Durable memory and evidence anchors for an older repository revision | Semantic similarity can still shortlist the memory, while current schema cannot prove its temporal eligibility for the new revision. | Validity becomes unknown/revalidating or stale, the memory is withheld as current knowledge, and automatic revalidation resumes when dependencies recover. | P11, P15 | CP8 | `test_failed_temporal_revalidation_withholds_memory_at_new_revision` advances the revision, fails revalidation, and proves context exclusion until impact coverage and validation succeed. |
 
@@ -72,4 +73,23 @@ worker kill:
 - CP6 owns F18 immutable context snapshot and replay.
 - CP8 owns F19 temporal revalidation and repository-impact coverage.
 
-No production fault was injected and no repair was run in CP0.
+## C4.3 F16 Compose Evidence
+
+The `Run C4.3 atomic memory restart` step in
+[CI run 29420441028, job 87369221264](https://github.com/Barsoomx/engram/actions/runs/29420441028/job/87369221264)
+ran `python3 scripts/e2e_c43_atomic_memory.py` successfully on 2026-07-15.
+The disposable stack committed one typed promotion and exact document, proved
+that exact search found it before embedding, observed one active embedding
+lease, killed `worker-batch` with `SIGKILL`, manually expired the work and run
+leases, explicitly queued one `origin=reconciliation` attempt, restarted the
+worker, and observed recovery of the same embedding work identity.
+
+The final evidence was one transition, audit, document, and embedding work;
+one 1,536-component current vector; and exact projection hash
+`3c7857e12cffcae19181f1743ab8732ee10def44ebf88b35d3f9d6945226341b`.
+No second promotion or projection identity appeared. The same green Compose
+job also passed runtime-durability Faults A-D and completed disposable cleanup.
+The emitted evidence identifies the recovery mode, requeue origin, and queued
+run. No automatic lease-expiry owner or scheduler was exercised, so autonomous
+recovery remains unproved by this gate. No production system was modified or
+faulted.

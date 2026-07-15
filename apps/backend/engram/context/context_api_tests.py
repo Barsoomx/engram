@@ -34,7 +34,6 @@ from engram.core.models import (
     MemoryLink,
     MemoryStatus,
     MemoryVersion,
-    Observation,
     Organization,
     OrganizationSettings,
     Project,
@@ -44,10 +43,13 @@ from engram.core.models import (
     VectorField,
     VisibilityScope,
     WorkflowSubjectType,
+    WorkflowWork,
     WorkflowWorkType,
 )
 from engram.memory.digest_visibility_tests import make_source_memory
-from engram.memory.tasks import generate_weekly_digest_work_v1
+from engram.memory.tasks import embed_memory_projection_work_v1, generate_weekly_digest_work_v1
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 from engram.memory.workflow_work import CreateWorkflowWorkInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 
@@ -239,10 +241,58 @@ def create_approved_memory_document(
     return memory, version, document
 
 
+def create_transition_memory(
+    organization: Organization,
+    team: Team | None,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+    visibility_scope: str = VisibilityScope.PROJECT,
+    files_read: list[str] | None = None,
+    files_modified: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> tuple[Memory, MemoryVersion, RetrievalDocument]:
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='context-writer',
+        title=title,
+        body=body,
+        visibility_scope=visibility_scope,
+        files_read=files_read,
+        files_modified=files_modified,
+    )
+    result = PromoteMemoryCandidate().execute(transition_request(candidate))
+    if metadata:
+        memory_metadata = dict(result.memory.metadata)
+        memory_metadata.update(metadata)
+        result.memory.metadata = memory_metadata
+        result.memory.save(update_fields=['metadata', 'updated_at'])
+
+    return result.memory, result.memory_version, result.retrieval_document
+
+
+def complete_transition_embedding(document: RetrievalDocument) -> None:
+    work = WorkflowWork.objects.get(
+        subject_type=WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+        subject_id=document.id,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        input_snapshot__exact_projection_hash=document.exact_projection_hash,
+    )
+    embed_memory_projection_work_v1(str(work.id))
+
+
 def build_ordered_proven_digest(organization: Organization, project: Project, *, schedule_key: str) -> Memory:
     import engram.memory.digest_work as digest_work
 
-    make_source_memory(organization, project, title=f'Source {schedule_key}', body=f'source body {schedule_key}')
+    source = make_source_memory(
+        organization,
+        project,
+        title=f'Source {schedule_key}',
+        body=f'source body {schedule_key}',
+    )
     now = timezone.now()
     with transaction.atomic():
         snapshot = digest_work.freeze_weekly_digest_input(
@@ -266,6 +316,8 @@ def build_ordered_proven_digest(organization: Organization, project: Project, *,
             signal_task=generate_weekly_digest_work_v1,
         )
     generate_weekly_digest_work_v1(str(work.id))
+    Memory.objects.filter(id=source.id).update(status=MemoryStatus.ARCHIVED)
+    RetrievalDocument.objects.filter(memory_id=source.id).update(stale=True)
 
     return Memory.objects.get(
         organization=organization,
@@ -1123,57 +1175,29 @@ def test_task_context_endpoint_uses_task_purpose() -> None:
 @pytest.mark.django_db
 def test_index_memory_version_creates_retrieval_document_for_approved_memory() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
-    agent = Agent.objects.create(organization=organization, runtime='codex', external_id='agent-index')
-    session = AgentSession.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        agent=agent,
-        external_session_id='session-index',
-        runtime='codex',
-        observation_sequence_cursor=1,
-    )
-    observation = Observation.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
-        agent=agent,
-        session=session,
-        observation_type='decision',
-        title='Index source files',
-        files_read=['apps/backend/engram/context/views.py'],
-        files_modified=['apps/backend/engram/context/services.py'],
-        content_hash='observation-index-hash',
-        session_sequence=1,
-    )
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    memory, version, _document = create_transition_memory(
+        organization,
+        team,
+        project,
         title='Index approved memory',
         body='Approved memory should become exact searchable context.',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
+        files_read=['apps/backend/engram/context/views.py'],
+        files_modified=['apps/backend/engram/context/services.py'],
         metadata={
-            'file_paths': ['docs/search-and-retrieval.md'],
+            'file_paths': [
+                'docs/search-and-retrieval.md',
+                'apps/backend/engram/context/views.py',
+                'apps/backend/engram/context/services.py',
+            ],
             'symbols': ['IndexMemoryVersion'],
             'exact_terms': ['exact searchable context'],
         },
-    )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        source_observation=observation,
-        version=1,
-        body=memory.body,
-        content_hash='memory-index-version-hash',
     )
 
     result = IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     document = result.retrieval_document
-    assert result.created is True
+    assert result.created is False
     assert document.organization_id == organization.id
     assert document.project_id == project.id
     assert document.team_id == team.id
@@ -1250,24 +1274,14 @@ def test_index_memory_version_rejects_refuted_memory() -> None:
 def test_context_bundle_returns_semantic_fallback_when_exact_misses() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_embedding_policy(organization, team, project)
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    memory, _version, document = create_transition_memory(
+        organization,
+        team,
+        project,
         title='Colour behaviour optimisation',
         body='Colour behaviour optimisation',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='hash-semantic-1',
-    )
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+    complete_transition_embedding(document)
 
     client = APIClient()
     response = client.post(
@@ -1304,31 +1318,18 @@ def test_context_bundle_applies_lexical_fusion_when_enabled() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_embedding_policy(organization, team, project)
     OrganizationSettings.objects.create(organization=organization, lexical_fusion_enabled=True)
-    for index, (title, body) in enumerate(
-        (
-            ('Colour behaviour optimisation', 'Colour behaviour optimisation'),
-            ('Behaviour optimisation colour', 'Behaviour optimisation colour'),
-        ),
-        start=1,
+    for title, body in (
+        ('Colour behaviour optimisation', 'Colour behaviour optimisation'),
+        ('Behaviour optimisation colour', 'Behaviour optimisation colour'),
     ):
-        memory = Memory.objects.create(
-            organization=organization,
-            project=project,
-            team=team,
+        _memory, _version, document = create_transition_memory(
+            organization,
+            team,
+            project,
             title=title,
             body=body,
-            status=MemoryStatus.APPROVED,
-            visibility_scope=VisibilityScope.PROJECT,
         )
-        version = MemoryVersion.objects.create(
-            organization=organization,
-            project=project,
-            memory=memory,
-            version=1,
-            body=body,
-            content_hash=f'hash-fusion-{index}',
-        )
-        IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
+        complete_transition_embedding(document)
 
     client = APIClient()
     response = client.post(
@@ -1473,57 +1474,40 @@ def test_context_bundle_flag_on_surfaces_fuzzy_lexical_only_document() -> None:
 
 @pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
 @pytest.mark.django_db
-def test_index_memory_version_populates_embedding_pgvector() -> None:
+def test_index_memory_version_defers_embedding_to_async_work() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_embedding_policy(organization, team, project)
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    _memory, version, _document = create_transition_memory(
+        organization,
+        team,
+        project,
         title='Colour behaviour optimisation',
         body='Colour behaviour optimisation',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
-    )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='hash-pgvector-1',
     )
 
     IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     document = RetrievalDocument.objects.get(memory_version=version)
-    assert document.embedding_vector
-    assert document.embedding_pgvector is not None
-    assert list(document.embedding_pgvector) == pytest.approx(document.embedding_vector, abs=1e-5)
+    assert document.embedding_vector == []
+    assert document.embedding_pgvector is None
+    assert WorkflowWork.objects.filter(
+        subject_type=WorkflowSubjectType.RETRIEVAL_DOCUMENT,
+        subject_id=document.id,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+    ).exists()
 
 
 @pytest.mark.django_db
 def test_context_bundle_keeps_exact_strategy_when_limit_filled() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_embedding_policy(organization, team, project)
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    _memory, version, _document = create_transition_memory(
+        organization,
+        team,
+        project,
         title='Colour behaviour optimisation',
         body='Colour behaviour optimisation pattern for retrieval fallback.',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='hash-exact-1',
-    )
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
     document = RetrievalDocument.objects.get(memory_version=version)
 
     client = APIClient()
@@ -1684,24 +1668,13 @@ def test_bundle_none_token_budget_metadata_present() -> None:
 @pytest.mark.django_db
 def test_context_bundle_skips_semantic_fallback_without_embedding_policy() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
-    memory = Memory.objects.create(
-        organization=organization,
-        project=project,
-        team=team,
+    _memory, _version, _document = create_transition_memory(
+        organization,
+        team,
+        project,
         title='Colour behaviour optimisation',
         body='Colour behaviour optimisation pattern for retrieval fallback.',
-        status=MemoryStatus.APPROVED,
-        visibility_scope=VisibilityScope.PROJECT,
     )
-    version = MemoryVersion.objects.create(
-        organization=organization,
-        project=project,
-        memory=memory,
-        version=1,
-        body=memory.body,
-        content_hash='hash-no-embedding-policy-1',
-    )
-    IndexMemoryVersion().execute(IndexMemoryVersionInput(memory_version_id=version.id))
 
     client = APIClient()
     response = client.post(
