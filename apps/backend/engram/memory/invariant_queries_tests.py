@@ -16,6 +16,7 @@ from django.utils import timezone
 from engram.core.models import (
     Agent,
     AgentSession,
+    AuditEvent,
     CandidateStatus,
     DistillationCoverageOutcome,
     DistillationObservationCoverage,
@@ -27,8 +28,12 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryConflict,
+    MemoryConflictResolution,
     MemoryLink,
     MemoryStatus,
+    MemoryTransition,
+    MemoryTransitionType,
     MemoryVersion,
     Observation,
     ObservationSource,
@@ -2514,3 +2519,249 @@ def test_p7_version_zero_rows_remain_missing_observability() -> None:
     p7 = _result_by_id(scope)['P7']
 
     assert p7.state == InvariantState.MISSING_OBSERVABILITY
+
+
+def _make_open_v1_conflict(suffix: str) -> tuple[ScopeFixture, MemoryCandidate, MemoryConflict, Any]:
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    source_candidate, _source, (organization, project, session) = _provenanced_candidate(suffix)
+    result = _transitions().PromoteMemoryCandidate().execute(_request(source_candidate))
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        title=f'Conflict candidate {suffix}',
+        body=f'Conflict candidate body {suffix}',
+        status=CandidateStatus.PROPOSED,
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=f'conflict-candidate-{suffix}'.encode().hex()[:64].ljust(64, '0'),
+        confidence=Decimal('0.800'),
+    )
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=result.memory,
+        link_type=LinkType.CONFLICTS_WITH,
+        target=conflict_candidate_target(candidate.id),
+    )
+    opened_transition_id = uuid.uuid4()
+    audit = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        event_type='MemoryTransitionCommitted',
+        actor_type='test',
+        actor_id='invariant-tests',
+        metadata={
+            'schema': 'memory_transition/v1',
+            'transition_type': MemoryTransitionType.CONFLICT_OPEN,
+            'transition_id': str(opened_transition_id),
+            'candidate_id': str(candidate.id),
+            'memory_id': str(result.memory.id),
+            'semantic_link_id': str(link.id),
+        },
+    )
+    opened_transition = MemoryTransition.objects.create(
+        id=opened_transition_id,
+        organization=organization,
+        project=project,
+        team=session.team,
+        transition_type=MemoryTransitionType.CONFLICT_OPEN,
+        idempotency_key=f'conflict-open:{candidate.id}:{result.memory.id}',
+        request_fingerprint='d' * 64,
+        candidate=candidate,
+        memory=result.memory,
+        from_version=result.memory_version,
+        to_version=result.memory_version,
+        result_memory=result.memory,
+        result_version=result.memory_version,
+        exact_document=result.retrieval_document,
+        result_exact_document=result.retrieval_document,
+        semantic_link=link,
+        audit_event=audit,
+        provenance_hash=result.transition.provenance_hash,
+    )
+    conflict = MemoryConflict.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        memory=result.memory,
+        memory_version=result.memory_version,
+        semantic_link=link,
+        opened_transition=opened_transition,
+        evidence_hash='f' * 64,
+    )
+    return ScopeFixture(organization, project, session.team, session.agent), candidate, conflict, result
+
+
+def _make_conflict_resolution_transition(conflict: MemoryConflict, result: Any) -> MemoryTransition:
+    resolution_transition_id = uuid.uuid4()
+    audit = AuditEvent.objects.create(
+        organization=conflict.organization,
+        project=conflict.project,
+        team=conflict.team,
+        event_type='MemoryTransitionCommitted',
+        actor_type='test',
+        actor_id='invariant-tests',
+        metadata={
+            'schema': 'memory_transition/v1',
+            'transition_type': MemoryTransitionType.CONFLICT_RESOLVE,
+            'transition_id': str(resolution_transition_id),
+            'candidate_id': str(conflict.candidate_id),
+            'memory_id': str(conflict.memory_id),
+            'semantic_link_id': str(conflict.semantic_link_id),
+        },
+    )
+    return MemoryTransition.objects.create(
+        id=resolution_transition_id,
+        organization=conflict.organization,
+        project=conflict.project,
+        team=conflict.team,
+        transition_type=MemoryTransitionType.CONFLICT_RESOLVE,
+        idempotency_key=f'conflict-resolution:{conflict.id}',
+        request_fingerprint='f' * 64,
+        candidate=conflict.candidate,
+        memory=conflict.memory,
+        from_version=conflict.memory_version,
+        to_version=conflict.memory_version,
+        result_memory=conflict.memory,
+        result_version=conflict.memory_version,
+        exact_document=result.retrieval_document,
+        result_exact_document=result.retrieval_document,
+        audit_event=audit,
+        provenance_hash=result.transition.provenance_hash,
+    )
+
+
+@pytest.mark.django_db
+def test_p8_version_one_transition_lineage_fixture_is_healthy() -> None:
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    candidate, _source, (organization, project, session) = _provenanced_candidate('p8-v1-healthy')
+    result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    scope = ScopeFixture(organization, project, session.team, session.agent)
+
+    p8 = _result_by_id(scope)['P8']
+
+    assert result.memory.transition_contract_version == 1
+    assert p8.state == InvariantState.HEALTHY
+    assert p8.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_p8_rejects_cross_scope_result_version_corruption() -> None:
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    candidate, _source, (organization, project, session) = _provenanced_candidate('p8-v1-target-corrupt')
+    result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    foreign_candidate, _foreign_source, (foreign_org, foreign_project, foreign_session) = _provenanced_candidate(
+        'p8-v1-foreign-result'
+    )
+    foreign_result = _transitions().PromoteMemoryCandidate().execute(_request(foreign_candidate))
+    MemoryTransition.objects.filter(id=result.transition.id).update(result_version_id=foreign_result.memory_version.id)
+    scope = ScopeFixture(organization, project, session.team, session.agent)
+
+    p8 = _result_by_id(scope)['P8']
+
+    assert p8.state == InvariantState.VIOLATED
+    assert p8.violation_count is not None and p8.violation_count >= 1
+    assert f'memory:{result.memory.id}' in p8.sample_ids
+    assert foreign_org.id != organization.id
+    assert foreign_project.id != project.id
+    assert foreign_session.project_id == foreign_project.id
+
+
+@pytest.mark.django_db
+def test_p8_rejects_foreign_transition_pointing_at_owned_memory() -> None:
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    candidate, _source, (organization, project, session) = _provenanced_candidate('p8-v1-owned')
+    owned_result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    foreign_candidate, _foreign_source, (foreign_org, foreign_project, foreign_session) = _provenanced_candidate(
+        'p8-v1-foreign-only'
+    )
+    foreign_result = _transitions().PromoteMemoryCandidate().execute(_request(foreign_candidate))
+    MemoryTransition.objects.filter(id=foreign_result.transition.id).update(result_memory_id=owned_result.memory.id)
+    scope = ScopeFixture(organization, project, session.team, session.agent)
+
+    p8 = _result_by_id(scope)['P8']
+
+    assert p8.state == InvariantState.VIOLATED
+    assert p8.violation_count is not None and p8.violation_count >= 1
+    assert f'memory:{owned_result.memory.id}' in p8.sample_ids
+    assert foreign_org.id != organization.id
+    assert foreign_project.id != project.id
+    assert foreign_session.project_id == foreign_project.id
+
+
+@pytest.mark.django_db
+def test_p8_ignores_unrelated_foreign_scope_transition() -> None:
+    from engram.memory.transitions_tests import _provenanced_candidate, _request, _transitions
+
+    candidate, _source, (organization, project, session) = _provenanced_candidate('p8-v1-owned-only')
+    _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    foreign_candidate, _foreign_source, (foreign_org, foreign_project, foreign_session) = _provenanced_candidate(
+        'p8-v1-foreign-unrelated'
+    )
+    _transitions().PromoteMemoryCandidate().execute(_request(foreign_candidate))
+    scope = ScopeFixture(organization, project, session.team, session.agent)
+
+    p8 = _result_by_id(scope)['P8']
+
+    assert p8.state == InvariantState.HEALTHY
+    assert p8.violation_count == 0
+    assert foreign_org.id != organization.id
+    assert foreign_project.id != project.id
+    assert foreign_session.project_id == foreign_project.id
+
+
+@pytest.mark.django_db
+def test_p9_open_conflict_fixture_is_healthy_and_protected() -> None:
+    scope, _candidate, conflict, result = _make_open_v1_conflict('p9-open-healthy')
+
+    p9 = _result_by_id(scope)['P9']
+
+    assert conflict.resolved_transition_id is None
+    assert conflict.opened_transition.semantic_link_id == conflict.semantic_link_id
+    assert conflict.memory.current_transition_id == result.transition.id
+    assert p9.state == InvariantState.HEALTHY
+    assert p9.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_p9_resolved_conflict_has_one_terminal_resolution_outcome() -> None:
+    scope, _candidate, conflict, result = _make_open_v1_conflict('p9-resolved')
+    resolution = _make_conflict_resolution_transition(conflict, result)
+    conflict.candidate.status = CandidateStatus.REJECTED
+    conflict.candidate.save(update_fields=['status', 'updated_at'])
+    conflict.resolved_transition = resolution
+    conflict.resolution = MemoryConflictResolution.REJECT_CANDIDATE
+    conflict.resolved_at = timezone.now()
+    conflict.save(update_fields=['resolved_transition', 'resolution', 'resolved_at'])
+
+    p9 = _result_by_id(scope)['P9']
+
+    assert p9.state == InvariantState.HEALTHY
+    assert p9.violation_count == 0
+
+    MemoryTransition.objects.filter(id=resolution.id).update(transition_type=MemoryTransitionType.PROMOTE)
+    p9_corrupt = _result_by_id(scope)['P9']
+    assert p9_corrupt.state == InvariantState.VIOLATED
+    assert p9_corrupt.violation_count is not None and p9_corrupt.violation_count >= 1
+
+
+@pytest.mark.django_db
+def test_p9_rejects_foreign_selected_memory_version() -> None:
+    scope, _candidate, conflict, _result = _make_open_v1_conflict('p9-foreign-selected')
+    foreign_scope, _foreign_candidate, _foreign_conflict, foreign_result = _make_open_v1_conflict(
+        'p9-foreign-version'
+    )
+    MemoryConflict.objects.filter(id=conflict.id).update(memory_version_id=foreign_result.memory_version.id)
+
+    p9 = _result_by_id(scope)['P9']
+
+    assert p9.state == InvariantState.VIOLATED
+    assert p9.violation_count is not None and p9.violation_count >= 1
+    assert f'conflict:{conflict.id}' in p9.sample_ids
+    assert foreign_scope.project.id != scope.project.id

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
 
 import pytest
@@ -9,12 +10,35 @@ from pytest_django.fixtures import SettingsWrapper
 from engram.core.models import (
     AuditEvent,
     CandidateStatus,
+    LinkType,
     MemoryCandidate,
+    MemoryConflict,
+    MemoryLink,
     Organization,
     OrganizationSettings,
     Project,
 )
+from engram.memory.candidate_decision_work import evidence_manifest
 from engram.memory.candidate_ttl import ExpireStaleCandidates
+from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
+from engram.memory.curation_tests import (
+    _JudgeGatewayStub,
+    create_candidate,
+    create_curation_policy,
+    create_embedding_policy,
+    create_scope,
+    patch_judge_gateway,
+    promote_candidate,
+    set_curator_settings,
+)
+from engram.memory.transitions import (
+    CandidateFence,
+    ResolveMemoryConflict,
+    ResolveMemoryConflictInput,
+    TransitionRequest,
+    TransitionScope,
+    build_memory_fence,
+)
 
 
 def _make_candidate(
@@ -216,3 +240,172 @@ def test_second_run_is_idempotent(
     assert first.rejected == 1
     assert second.rejected == 0
     assert AuditEvent.objects.filter(event_type='MemoryAutoRejected').count() == 1
+
+
+@pytest.mark.django_db
+def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confidence(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: SettingsWrapper,
+) -> None:
+    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
+    settings.ENGRAM_CANDIDATE_TTL_BATCH = 500
+    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
+    organization, team, project = create_scope(suffix='ttl-conflict')
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Existing claim',
+            body='The deployment gate requires a signed artifact.',
+            content_hash='ttl-existing-claim',
+        ),
+    )
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Existing claim',
+        body='The deployment gate allows unsigned artifacts.',
+        content_hash='ttl-conflicting-claim',
+        confidence='0.100',
+    )
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    opened = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    MemoryCandidate.objects.filter(id=candidate.id).update(
+        created_at=timezone.now() - timedelta(days=30),
+        confidence='0.100',
+    )
+
+    result = ExpireStaleCandidates().execute()
+
+    candidate.refresh_from_db()
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
+    assert opened.decision == 'held_conflict'
+    assert result.scanned == 0
+    assert result.rejected == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert conflict.resolved_transition_id is None
+    assert conflict.resolution == ''
+    assert MemoryLink.objects.filter(id=conflict.semantic_link_id, link_type=LinkType.CONFLICTS_WITH).exists()
+
+
+@pytest.mark.django_db
+def test_ttl_locked_recheck_skips_candidate_with_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: SettingsWrapper,
+) -> None:
+    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
+    organization, team, project = create_scope(suffix='ttl-lock-conflict')
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Lock-protected claim',
+            body='The release requires an approved artifact.',
+            content_hash='ttl-lock-existing',
+        ),
+    )
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Lock-protected claim',
+        body='The release permits an unapproved artifact.',
+        content_hash='ttl-lock-candidate',
+        confidence='0.100',
+    )
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+
+    rejected = ExpireStaleCandidates()._reject_batch([candidate.id])
+
+    candidate.refresh_from_db()
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
+    assert rejected == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert conflict.resolved_transition_id is None
+    assert MemoryLink.objects.filter(id=conflict.semantic_link_id).exists()
+
+
+@pytest.mark.django_db
+def test_resolved_conflict_allows_later_ttl_noop_without_erasing_history(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: SettingsWrapper,
+) -> None:
+    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
+    organization, team, project = create_scope(suffix='ttl-resolved-conflict')
+    create_embedding_policy(organization, team, project)
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    existing = promote_candidate(
+        create_candidate(
+            organization,
+            team,
+            project,
+            title='Resolved claim',
+            body='The release requires an approved artifact.',
+            content_hash='ttl-resolved-existing',
+        ),
+    )
+    candidate = create_candidate(
+        organization,
+        team,
+        project,
+        title='Resolved claim',
+        body='The release permits an unapproved artifact.',
+        content_hash='ttl-resolved-candidate',
+        confidence='0.100',
+    )
+    patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
+    _entries, manifest_hash = evidence_manifest(candidate)
+    request = TransitionRequest(
+        scope=TransitionScope(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=team.id,
+        ),
+        idempotency_key=f'candidate:{candidate.id}:conflict-resolve:v1',
+        actor_type='system',
+        actor_id='ttl-tests',
+        capability='memories:admin',
+        request_id=str(uuid.uuid4()),
+        correlation_id=str(uuid.uuid4()),
+        reason='resolved by test',
+        origin='candidate-ttl-tests',
+    )
+    fence = CandidateFence(
+        candidate_id=candidate.id,
+        candidate_content_hash=candidate.content_hash,
+        evidence_manifest_hash=manifest_hash,
+    )
+    resolved = ResolveMemoryConflict().execute(
+        ResolveMemoryConflictInput(
+            request=request,
+            candidate_fence=fence,
+            conflict_ids=(conflict.id,),
+            conflict_memory_fences=(build_memory_fence(existing),),
+            resolution='reject_candidate',
+        ),
+    )
+    conflict.refresh_from_db()
+    candidate.refresh_from_db()
+    MemoryCandidate.objects.filter(id=candidate.id).update(created_at=timezone.now() - timedelta(days=30))
+
+    before_link_count = MemoryLink.objects.filter(id=conflict.semantic_link_id).count()
+    result = ExpireStaleCandidates().execute()
+
+    assert resolved.transition.id == conflict.resolved_transition_id
+    assert conflict.resolution == 'reject_candidate'
+    assert candidate.status == CandidateStatus.REJECTED
+    assert result.rejected == 0
+    assert MemoryLink.objects.filter(id=conflict.semantic_link_id).count() == before_link_count == 1
