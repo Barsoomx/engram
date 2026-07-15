@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from django.contrib.auth.models import User
@@ -17,6 +18,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
+from engram.console.services import approve_memory_candidate, reject_review_item
 from engram.console.views.memory_review import PAGE_SIZE
 from engram.core.models import (
     AuditEvent,
@@ -34,6 +36,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -182,8 +185,28 @@ def _make_candidate(
     evidence: list | None = None,
     source_observation: Observation | None = None,
     created_at: datetime | None = None,
+    typed: bool = False,
+    candidate_title: str | None = None,
+    candidate_body: str | None = None,
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
+
+    if typed:
+        candidate, _source, _session = provenanced_candidate_in_scope(
+            organization,
+            project,
+            team,
+            suffix=f'console-memory-review-{counter}',
+            title=candidate_title or f'Candidate {counter}',
+            body=candidate_body or f'Body {counter}',
+            visibility_scope=visibility_scope,
+            confidence=Decimal(confidence),
+        )
+        if created_at is not None:
+            MemoryCandidate.objects.filter(id=candidate.id).update(created_at=created_at)
+            candidate.refresh_from_db()
+
+        return candidate
 
     candidate = MemoryCandidate.objects.create(
         organization=organization,
@@ -218,8 +241,39 @@ def _make_memory(
     body: str = 'memory body',
     title: str = 'memory',
     created_at: datetime | None = None,
+    typed: bool = False,
 ) -> Memory:
     counter = Memory.objects.count()
+
+    if typed:
+        actor = Identity.objects.create(
+            organization=organization,
+            identity_type=IdentityType.USER,
+            external_id=f'fixture-memory-review-{uuid.uuid4()}',
+            display_name='Fixture memory review actor',
+        )
+        effective_title = title if title != 'memory' else f'Memory {counter}'
+        candidate = _make_candidate(
+            organization,
+            project,
+            team=team,
+            confidence=confidence,
+            visibility_scope=visibility_scope,
+            typed=True,
+            candidate_title=effective_title,
+            candidate_body=body,
+        )
+        memory = approve_memory_candidate(organization, actor, candidate, 'fixture setup')
+        if status == MemoryStatus.REFUTED:
+            reject_review_item(organization, actor, memory, 'fixture setup')
+            memory.refresh_from_db()
+        elif status not in (MemoryStatus.APPROVED, MemoryStatus.CONFLICT):
+            raise ValueError(f'unsupported typed memory status {status}')
+        if created_at is not None:
+            Memory.objects.filter(id=memory.id).update(created_at=created_at)
+            memory.refresh_from_db()
+
+        return memory
 
     memory = Memory.objects.create(
         organization=organization,
@@ -887,7 +941,7 @@ def test_action_approve_promotes_candidate(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -918,9 +972,7 @@ def test_action_edit_creates_new_version(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
-
-    _make_version(memory, 1, 'original')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -946,9 +998,9 @@ def test_action_narrow_creates_narrowed_by_link(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    target = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='general')
+    target = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='general', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -976,9 +1028,9 @@ def test_action_supersede_creates_link_and_marks_stale(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
-    replacement = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='new')
+    replacement = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='new', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1032,7 +1084,7 @@ def test_action_reject_memory_sets_refuted(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1054,7 +1106,7 @@ def test_action_archive_sets_archived(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1150,9 +1202,9 @@ def test_bulk_archive_by_ids(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, typed=True)
 
-    m2 = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED)
+    m2 = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1178,8 +1230,8 @@ def test_bulk_archive_by_ids(
     assert (
         AuditEvent.objects.filter(
             organization=f_admin_org,
-            event_type='MemoryReviewed',
-            metadata__action='archive',
+            event_type='MemoryTransitionCommitted',
+            metadata__transition_type='archive',
         ).count()
         == 2
     )
@@ -1191,9 +1243,9 @@ def test_bulk_archive_by_confidence_threshold(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
+    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100', typed=True)
 
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.900')
+    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.900', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1221,9 +1273,17 @@ def test_bulk_archive_by_confidence_threshold_scopes_to_project(
 ) -> None:
     other_project = Project.objects.create(organization=f_admin_org, name='Other', slug='other')
 
-    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.200', typed=True)
 
-    out_of_scope = _make_memory(f_admin_org, other_project, status=MemoryStatus.CONFLICT, confidence='0.200')
+    out_of_scope = _make_memory(
+        f_admin_org,
+        other_project,
+        status=MemoryStatus.CONFLICT,
+        confidence='0.200',
+        typed=True,
+    )
+    out_of_scope.status = MemoryStatus.CONFLICT
+    out_of_scope.save(update_fields=['status', 'updated_at'])
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1251,9 +1311,9 @@ def test_bulk_archive_by_confidence_threshold_skips_approved_above_review_thresh
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200')
+    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200', typed=True)
 
-    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450')
+    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1506,13 +1566,7 @@ def test_action_restore_reactivates_agent_refuted_memory(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
-
-    _make_version(memory, 1, 'body')
-
-    memory.refuted = True
-
-    memory.save(update_fields=['refuted', 'updated_at'])
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, confidence='0.900', typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1536,9 +1590,9 @@ def test_bulk_action_approve_promotes_candidates(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
-    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1587,7 +1641,7 @@ def test_bulk_action_reject_handles_candidate_and_memory(
 ) -> None:
     candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
 
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
+    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -1615,7 +1669,7 @@ def test_bulk_action_partial_failure_reports_per_item_outcome(
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
 
     already_promoted = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROMOTED)
 

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import uuid
+from decimal import Decimal
 
 import pytest
 import structlog
 from django.db import transaction
 
 from engram.access.models import Identity, IdentityType
-from engram.console.services import MemoryReviewError
+from engram.console.services import MemoryReviewError, approve_memory_candidate
 from engram.console.usecases.review_action import ReviewActionInput, ReviewActionUseCase
 from engram.core.models import (
     CandidateStatus,
@@ -18,6 +19,7 @@ from engram.core.models import (
     Project,
     VisibilityScope,
 )
+from engram.memory.transitions_test_support import provenanced_candidate_in_scope
 
 
 @pytest.fixture
@@ -45,8 +47,26 @@ def _make_candidate(
     project: Project,
     *,
     status: str = CandidateStatus.PROPOSED,
+    typed: bool = False,
 ) -> MemoryCandidate:
     counter = MemoryCandidate.objects.count()
+
+    if typed:
+        candidate, _source, _session = provenanced_candidate_in_scope(
+            organization,
+            project,
+            None,
+            suffix=f'console-review-{counter}',
+            title=f'Candidate {counter}',
+            body=f'Body {counter}',
+            visibility_scope=VisibilityScope.PROJECT,
+            confidence=Decimal('0.500'),
+        )
+        if status != CandidateStatus.PROPOSED:
+            candidate.status = status
+            candidate.save(update_fields=['status', 'updated_at'])
+
+        return candidate
 
     return MemoryCandidate.objects.create(
         organization=organization,
@@ -65,8 +85,18 @@ def _make_memory(
     project: Project,
     *,
     status: str = MemoryStatus.CONFLICT,
+    typed: bool = False,
+    actor_identity: Identity | None = None,
 ) -> Memory:
     counter = Memory.objects.count()
+
+    if typed:
+        if actor_identity is None:
+            raise ValueError('typed memory fixtures require an actor identity')
+        candidate = _make_candidate(organization, project, typed=True)
+        memory = approve_memory_candidate(organization, actor_identity, candidate, 'fixture setup')
+
+        return memory
 
     return Memory.objects.create(
         organization=organization,
@@ -91,7 +121,7 @@ def test_approve_action_promotes_candidate_and_returns_ids(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_candidate(f_organization, f_project, typed=True)
 
     result = _execute(
         ReviewActionInput(
@@ -120,7 +150,7 @@ def test_edit_action_creates_new_version(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     result = _execute(
         ReviewActionInput(
@@ -148,7 +178,7 @@ def test_edit_action_without_body_raises_body_required(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     with pytest.raises(MemoryReviewError) as error:
         _execute(
@@ -170,9 +200,9 @@ def test_narrow_action_creates_link(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     result = _execute(
         ReviewActionInput(
@@ -218,9 +248,9 @@ def test_supersede_action_marks_stale_and_creates_link(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
-    target = _make_memory(f_organization, f_project)
+    target = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     result = _execute(
         ReviewActionInput(
@@ -271,7 +301,7 @@ def test_reject_action_on_memory_refutes_it(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     result = _execute(
         ReviewActionInput(
@@ -296,7 +326,13 @@ def test_archive_action_sets_archived(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project, status=MemoryStatus.APPROVED)
+    memory = _make_memory(
+        f_organization,
+        f_project,
+        status=MemoryStatus.APPROVED,
+        typed=True,
+        actor_identity=f_actor_identity,
+    )
 
     result = _execute(
         ReviewActionInput(
@@ -343,7 +379,7 @@ def test_approve_action_logs_memory_review_action_applied(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_candidate(f_organization, f_project, typed=True)
 
     with structlog.testing.capture_logs() as captured_logs:
         _execute(
@@ -375,7 +411,7 @@ def test_edit_action_logs_item_type_memory(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    memory = _make_memory(f_organization, f_project)
+    memory = _make_memory(f_organization, f_project, typed=True, actor_identity=f_actor_identity)
 
     with structlog.testing.capture_logs() as captured_logs:
         _execute(
@@ -421,7 +457,7 @@ def test_restore_action_reactivates_archived_memory(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_candidate(f_organization, f_project, typed=True)
 
     result = _execute(
         ReviewActionInput(
@@ -494,7 +530,7 @@ def test_restore_action_logs_item_type_memory(
     f_project: Project,
     f_actor_identity: Identity,
 ) -> None:
-    candidate = _make_candidate(f_organization, f_project)
+    candidate = _make_candidate(f_organization, f_project, typed=True)
 
     approved = _execute(
         ReviewActionInput(
