@@ -725,7 +725,7 @@ def redact_error(message: str) -> str:
 
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> PromoteMemoryCandidateResult:
-        from engram.memory.candidate_decision_work import evidence_manifest
+        from engram.memory.import_provenance import candidate_evidence_manifest
         from engram.memory.transitions import (
             CandidateFence,
             TransitionRequest,
@@ -749,7 +749,7 @@ class PromoteMemoryCandidate:
                 code='legacy_candidate_contract',
             )
 
-        _entries, manifest_hash = evidence_manifest(candidate)
+        _entries, manifest_hash = candidate_evidence_manifest(candidate)
         atomic_result = AtomicPromoteMemoryCandidate().execute(
             AtomicPromoteMemoryCandidateInput(
                 request=TransitionRequest(

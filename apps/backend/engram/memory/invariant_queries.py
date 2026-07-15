@@ -60,6 +60,7 @@ from engram.memory.distillation_provenance import (
     canonical_source_manifest,
 )
 from engram.memory.distillation_provider_stage import stage_target_key
+from engram.memory.import_provenance import is_validated_import_candidate
 from engram.memory.projections import build_exact_memory_projection
 from engram.memory.session_work_reconciler import inspect_session_work
 from engram.memory.transitions import canonical_memory_version_sources, memory_version_provenance_hash
@@ -1264,11 +1265,49 @@ def _p7_v1_candidate_violations(project: Project) -> list[str]:
             disposition__in=('complete', 'no_op'),
             resolved_at__isnull=False,
         ).exists()
+        import_only = False
+        import_candidate_transition_types: tuple[str, ...] | None = None
+        if candidate.decision_work_contract_version == 1:
+            import_sources = list(
+                MemoryCandidateSource.objects.select_related('observation', 'import_source').filter(
+                    candidate_id=candidate.id
+                )
+            )
+            import_only = bool(import_sources) and all(source.source_kind == 'import' for source in import_sources)
+            if import_only and not is_validated_import_candidate(candidate, sources=import_sources):
+                violations.append(candidate_sample)
+                continue
+        if import_only:
+            import_candidate_transition_types = tuple(
+                MemoryTransition.objects.filter(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    candidate_id=candidate.id,
+                )
+                .order_by('id')
+                .values_list('transition_type', flat=True)
+            )
+            import_transition_ok = (
+                transition is not None
+                and transition.transition_type == MemoryTransitionType.PROMOTE
+                and import_candidate_transition_types == (MemoryTransitionType.PROMOTE,)
+            )
+            decision_work_absent = not WorkflowWork.objects.filter(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                work_type=WorkflowWorkType.CANDIDATE_DECISION,
+                subject_id=candidate.id,
+            ).exists()
+            transition_shape_ok = import_transition_ok and decision_work_absent
+        else:
+            transition_shape_ok = transition is not None and (
+                transition.transition_type != MemoryTransitionType.PROMOTE or decision_work_ok
+            )
         if (
             transition is None
             or transition.result_memory_id != candidate.promoted_memory_id
             or transition.candidate_id != candidate.id
-            or (transition.transition_type == MemoryTransitionType.PROMOTE and not decision_work_ok)
+            or not transition_shape_ok
         ):
             violations.append(candidate_sample)
 

@@ -24,6 +24,7 @@ from engram.core.models import (
     MemoryLink,
     MemoryStatus,
     Observation,
+    ObservationSource,
     RetrievalDocument,
     WorkflowRun,
     WorkflowRunStatus,
@@ -39,6 +40,8 @@ from engram.memory.distillation_provenance import (
 )
 from engram.memory.transitions import (
     ArchiveMemory,
+    AttachPromotedCandidateSource,
+    AttachPromotedCandidateSourceInput,
     MarkMemoryStale,
     MemoryStateInput,
     MergeMemories,
@@ -67,6 +70,12 @@ from engram.memory.transitions_test_support import (
 )
 from engram.memory.transitions_test_support import (
     candidate_in_scope as _candidate_in_scope,
+)
+from engram.memory.transitions_test_support import (
+    convert_candidate_to_import as _convert_candidate_to_import,
+)
+from engram.memory.transitions_test_support import (
+    import_provenanced_candidate as _import_provenanced_candidate,
 )
 from engram.memory.transitions_test_support import (
     open_single_conflict as _open_single_conflict,
@@ -206,6 +215,81 @@ def test_two_postgresql_threads_promote_one_candidate_into_one_chain() -> None:
     assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 1
 
 
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+@pytest.mark.parametrize('locked_row', ('observation', 'observation_source'))
+def test_promotion_locks_import_references_before_fence_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    locked_row: str,
+) -> None:
+    candidate, source, _scope = _import_provenanced_candidate(f'import-lock-{locked_row}')
+    request = _request(candidate)
+    observation_id = source.observation_id
+    import_source_id = source.import_source_id
+    fence_entered = threading.Event()
+    release_fence = threading.Event()
+    mutation_acquired = threading.Event()
+
+    transitions = _transitions()
+    original_fence = transitions._candidate_fence
+
+    def pause_fence(*args: Any, **kwargs: Any) -> None:
+        fence_entered.set()
+        assert release_fence.wait(timeout=10)
+        return original_fence(*args, **kwargs)
+
+    monkeypatch.setattr(transitions, '_candidate_fence', pause_fence)
+
+    promotion_result: list[object] = []
+    promotion_error: list[BaseException] = []
+
+    def promote() -> None:
+        close_old_connections()
+        try:
+            promotion_result.append(transitions.PromoteMemoryCandidate().execute(request))
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            promotion_error.append(error)
+        finally:
+            close_old_connections()
+
+    mutation_error: list[BaseException] = []
+
+    def mutate_reference() -> None:
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                if locked_row == 'observation':
+                    Observation.objects.select_for_update().get(id=observation_id)
+                else:
+                    ObservationSource.objects.select_for_update().get(id=import_source_id)
+                mutation_acquired.set()
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            mutation_error.append(error)
+        finally:
+            close_old_connections()
+
+    worker = threading.Thread(target=promote)
+    worker.start()
+    assert fence_entered.wait(timeout=10)
+    mutator = threading.Thread(target=mutate_reference)
+    mutator.start()
+    try:
+        assert not mutation_acquired.wait(timeout=1)
+    finally:
+        release_fence.set()
+        worker.join(timeout=10)
+        mutator.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert not mutator.is_alive()
+    assert not promotion_error
+    assert not mutation_error
+    assert len(promotion_result) == 1
+    assert mutation_acquired.is_set()
+    candidate.refresh_from_db()
+    assert promotion_result[0].memory.id == candidate.promoted_memory_id
+
+
 @pytest.mark.django_db
 def test_replay_is_idempotent_and_collision_or_stale_fence_writes_nothing() -> None:
     candidate, _source, _scope = _provenanced_candidate('replay')
@@ -257,6 +341,116 @@ def _claim_candidate_decision_work(candidate: MemoryCandidate) -> tuple[Workflow
     )
     assert claimed.claim is not None
     return work, claimed.claim
+
+
+def _candidate_with_active_memory(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource, Any]:
+    candidate, source, _scope = _provenanced_candidate(suffix)
+    target, _target_source = _candidate_in_scope(
+        candidate,
+        source,
+        title=f'Import transition target {suffix}',
+        body=f'Import transition target body {suffix}',
+    )
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(target))
+    return candidate, source, promoted
+
+
+def _import_candidate_with_active_memory(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource, Any]:
+    candidate, source, promoted = _candidate_with_active_memory(suffix)
+    candidate, source, _import_source = _convert_candidate_to_import(candidate, source, suffix=suffix)
+    return candidate, source, promoted
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('command_name', ('attach', 'revise', 'merge', 'supersede', 'open', 'resolve'))
+def test_import_only_candidate_is_rejected_by_non_promotion_candidate_transition(command_name: str) -> None:
+    transitions = _transitions()
+    if command_name == 'attach':
+        candidate, source, _scope = _import_provenanced_candidate(f'import-transition-{command_name}')
+        promoted = transitions.PromoteMemoryCandidate().execute(_request(candidate))
+        payload = AttachPromotedCandidateSourceInput(
+            request=_request_for(candidate, key=f'import-transition:{candidate.id}:{command_name}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=transitions.build_memory_fence(promoted.memory),
+            candidate_source_id=source.id,
+        )
+        before = _counts(candidate)
+        with pytest.raises(Exception, match='provenance'):
+            AttachPromotedCandidateSource().execute(payload)
+        assert _counts(candidate) == before
+        return
+
+    if command_name == 'resolve':
+        candidate, source, promoted = _candidate_with_active_memory(f'import-transition-{command_name}')
+    else:
+        candidate, source, promoted = _import_candidate_with_active_memory(f'import-transition-{command_name}')
+    request = _request_for(candidate, key=f'import-transition:{candidate.id}:{command_name}:v1')
+    candidate_fence = _candidate_fence_for(candidate)
+    memory_fence = transitions.build_memory_fence(promoted.memory)
+    if command_name == 'revise':
+        command = ReviseMemoryFromCandidate()
+        payload = ReviseMemoryFromCandidateInput(
+            request=request,
+            candidate_fence=candidate_fence,
+            memory_fence=memory_fence,
+            title='Rejected import revision',
+            body='Rejected import revision body',
+        )
+    elif command_name == 'merge':
+        command = MergeMemoryCandidate()
+        payload = MergeMemoryCandidateInput(
+            request=request,
+            candidate_fence=candidate_fence,
+            memory_fence=memory_fence,
+            title='Rejected import merge',
+            body='Rejected import merge body',
+        )
+    elif command_name == 'supersede':
+        command = SupersedeMemoryWithCandidate()
+        payload = SupersedeMemoryWithCandidateInput(
+            request=request,
+            candidate_fence=candidate_fence,
+            loser_memory_fence=memory_fence,
+        )
+    elif command_name == 'open':
+        command = OpenMemoryConflict()
+        payload = OpenMemoryConflictInput(
+            request=request,
+            candidate_fence=candidate_fence,
+            memory_fence=memory_fence,
+            evidence_hash='a' * 64,
+            redacted_reason='import candidate must be promoted only',
+        )
+    else:
+        conflict = OpenMemoryConflict().execute(
+            OpenMemoryConflictInput(
+                request=_request_for(candidate, key=f'import-transition:{candidate.id}:open:v1'),
+                candidate_fence=candidate_fence,
+                memory_fence=memory_fence,
+                evidence_hash='b' * 64,
+                redacted_reason='setup conflict',
+            )
+        )
+        candidate, _source, _import_source = _convert_candidate_to_import(
+            candidate,
+            source,
+            suffix=f'import-transition-{command_name}',
+        )
+        command = ResolveMemoryConflict()
+        payload = ResolveMemoryConflictInput(
+            request=_request_for(candidate, key=f'import-transition:{candidate.id}:{command_name}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            conflict_ids=(conflict.id,),
+            conflict_memory_fences=(memory_fence,),
+            resolution='reject_candidate',
+        )
+
+    before = _counts(candidate)
+    with pytest.raises(Exception, match='provenance'):
+        command.execute(payload)
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert _counts(candidate) == before
 
 
 @pytest.mark.django_db

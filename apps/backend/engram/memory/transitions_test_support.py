@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import uuid
 from decimal import Decimal
@@ -18,6 +19,7 @@ from engram.core.models import (
     MemoryCandidateSource,
     MemoryConflict,
     Observation,
+    ObservationSource,
     Organization,
     Project,
     Team,
@@ -31,8 +33,9 @@ from engram.memory.distillation_provenance import (
 from engram.memory.distillation_provider_stage import stage_key as provider_stage_key
 from engram.memory.distillation_provider_stage import stage_target_key
 from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.import_provenance import import_candidate_content_hash, import_candidate_source_anchors
 from engram.memory.session_lifecycle import EndSession
-from engram.memory.workflow_work import observation_content_digest
+from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
 
@@ -336,6 +339,56 @@ def provenanced_candidate_in_scope(
     return candidate, source, session
 
 
+def convert_candidate_to_import(
+    candidate: MemoryCandidate,
+    source: MemoryCandidateSource,
+    *,
+    suffix: str = 'import',
+) -> tuple[MemoryCandidate, MemoryCandidateSource, ObservationSource]:
+    observation = source.observation
+    import_source = ObservationSource.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        observation=observation,
+        source_type='claude_mem',
+        source_id=f'claude-mem:{suffix}:{uuid.uuid4()}',
+        metadata={
+            'source_store_id': f'{suffix}-store',
+            'event_type': 'claude_mem.observation',
+        },
+    )
+    anchors = import_candidate_source_anchors(
+        observation=observation,
+        import_source=import_source,
+        source_store_id=f'{suffix}-store',
+        event_type='claude_mem.observation',
+    )
+    source.delete()
+    source = MemoryCandidateSource.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        candidate=candidate,
+        observation=observation,
+        source_kind='import',
+        import_source=import_source,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    candidate.title = observation.title
+    candidate.body = observation.body or observation.title
+    candidate.content_hash = import_candidate_content_hash(import_source.source_id, observation.content_hash)
+    candidate.decision_work_contract_version = 1
+    candidate.save(update_fields=['title', 'body', 'content_hash', 'decision_work_contract_version', 'updated_at'])
+    return candidate, source, import_source
+
+
+def import_provenanced_candidate(suffix: str = 'import') -> tuple[MemoryCandidate, Any, Any]:
+    candidate, source, scope = provenanced_candidate(suffix)
+    candidate, source, _import_source = convert_candidate_to_import(candidate, source, suffix=suffix)
+    return candidate, source, scope
+
+
 def transition_request(candidate: MemoryCandidate, *, key: str | None = None, reason: str = 'test promotion') -> Any:
     transitions = transitions_module()
     scope = transitions.TransitionScope(
@@ -354,9 +407,9 @@ def transition_request(candidate: MemoryCandidate, *, key: str | None = None, re
         reason=reason,
         origin='promotion-tests',
     )
-    from engram.memory.candidate_decision_work import evidence_manifest
+    from engram.memory.import_provenance import candidate_evidence_manifest
 
-    _entries, manifest_hash = evidence_manifest(candidate)
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
     fence = transitions.CandidateFence(
         candidate_id=candidate.id,
         candidate_content_hash=candidate.content_hash,
@@ -401,9 +454,9 @@ def candidate_in_scope(
 
 
 def candidate_fence_for(candidate: MemoryCandidate) -> Any:
-    from engram.memory.candidate_decision_work import evidence_manifest
+    from engram.memory.import_provenance import candidate_evidence_manifest
 
-    _entries, manifest_hash = evidence_manifest(candidate)
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
     return transitions_module().CandidateFence(
         candidate_id=candidate.id,
         candidate_content_hash=candidate.content_hash,

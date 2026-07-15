@@ -61,6 +61,11 @@ class CandidateStatus(models.TextChoices):
     REJECTED = 'rejected', 'Rejected'
 
 
+class MemoryCandidateSourceKind(models.TextChoices):
+    DISTILLATION = 'distillation', 'Distillation'
+    IMPORT = 'import', 'Import'
+
+
 class MemoryStatus(models.TextChoices):
     APPROVED = 'approved', 'Approved'
     ARCHIVED = 'archived', 'Archived'
@@ -2187,9 +2192,34 @@ class MemoryCandidateSource(TimestampedModel):
         blank=True,
     )
     candidate = models.ForeignKey(MemoryCandidate, on_delete=models.PROTECT, related_name='sources')
-    window = models.ForeignKey(DistillationWindow, on_delete=models.PROTECT, related_name='candidate_sources')
+    source_kind = models.CharField(
+        max_length=20,
+        choices=MemoryCandidateSourceKind.choices,
+        default=MemoryCandidateSourceKind.DISTILLATION,
+        db_default=MemoryCandidateSourceKind.DISTILLATION,
+    )
+    window = models.ForeignKey(
+        DistillationWindow,
+        on_delete=models.PROTECT,
+        related_name='candidate_sources',
+        null=True,
+        blank=True,
+    )
     observation = models.ForeignKey(Observation, on_delete=models.PROTECT, related_name='candidate_sources')
-    stage = models.ForeignKey(DistillationStage, on_delete=models.PROTECT, related_name='candidate_sources')
+    stage = models.ForeignKey(
+        DistillationStage,
+        on_delete=models.PROTECT,
+        related_name='candidate_sources',
+        null=True,
+        blank=True,
+    )
+    import_source = models.ForeignKey(
+        ObservationSource,
+        on_delete=models.PROTECT,
+        related_name='memory_candidate_sources',
+        null=True,
+        blank=True,
+    )
     anchors = models.JSONField()
     anchors_hash = models.CharField(max_length=64)
 
@@ -2198,9 +2228,11 @@ class MemoryCandidateSource(TimestampedModel):
         ('project_id', 'project'),
         ('team_id', 'team'),
         ('candidate_id', 'candidate'),
+        ('source_kind', 'source_kind'),
         ('window_id', 'window'),
         ('observation_id', 'observation'),
         ('stage_id', 'stage'),
+        ('import_source_id', 'import_source'),
         ('anchors', 'anchors'),
         ('anchors_hash', 'anchors_hash'),
     )
@@ -2209,7 +2241,30 @@ class MemoryCandidateSource(TimestampedModel):
         constraints = [
             models.UniqueConstraint(
                 fields=['candidate', 'window', 'observation'],
-                name='core_candidate_source_uniq',
+                condition=models.Q(source_kind=MemoryCandidateSourceKind.DISTILLATION),
+                name='core_candidate_source_distill_uniq',
+            ),
+            models.UniqueConstraint(
+                fields=['candidate', 'import_source'],
+                condition=models.Q(source_kind=MemoryCandidateSourceKind.IMPORT),
+                name='core_candidate_source_import_uniq',
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        source_kind=MemoryCandidateSourceKind.DISTILLATION,
+                        window__isnull=False,
+                        stage__isnull=False,
+                        import_source__isnull=True,
+                    )
+                    | models.Q(
+                        source_kind=MemoryCandidateSourceKind.IMPORT,
+                        window__isnull=True,
+                        stage__isnull=True,
+                        import_source__isnull=False,
+                    )
+                ),
+                name='core_candidate_source_shape_ck',
             ),
             models.CheckConstraint(
                 condition=models.Q(anchors_hash__regex=r'^[0-9a-f]{64}$'),
@@ -2228,14 +2283,54 @@ class MemoryCandidateSource(TimestampedModel):
         ]
         ordering = ['candidate_id', 'window_id', 'observation_id']
 
+    def _validate_scope(self, errors: dict[str, list[str]]) -> None:
+        if self.candidate_id:
+            check_project_scope(errors, 'candidate', self.candidate, self.organization_id, self.project_id)
+            if self.candidate.team_id != self.team_id:
+                add_scope_error(errors, 'candidate', 'candidate team must match source team')
+        if self.observation_id:
+            check_project_scope(errors, 'observation', self.observation, self.organization_id, self.project_id)
+            if self.observation.team_id != self.team_id:
+                add_scope_error(errors, 'observation', 'observation team must match source team')
+        if self.window_id:
+            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
+        if self.stage_id:
+            check_project_scope(errors, 'stage', self.stage, self.organization_id, self.project_id)
+            if self.window_id and self.stage.window_id != self.window_id:
+                add_scope_error(errors, 'stage', 'stage must belong to window')
+        self._validate_import_source_scope(errors)
+
+    def _validate_import_source_scope(self, errors: dict[str, list[str]]) -> None:
+        if not self.import_source_id:
+            return
+        check_project_scope(errors, 'import_source', self.import_source, self.organization_id, self.project_id)
+        if self.import_source.observation.team_id != self.team_id:
+            add_scope_error(errors, 'import_source', 'import source team must match source team')
+        if self.import_source.observation_id != self.observation_id:
+            add_scope_error(
+                errors,
+                'import_source',
+                'import source observation must match candidate source observation',
+            )
+
+    def _validate_source_shape(self, errors: dict[str, list[str]]) -> None:
+        if self.source_kind == MemoryCandidateSourceKind.DISTILLATION:
+            if self.window_id is None or self.stage_id is None or self.import_source_id is not None:
+                add_scope_error(errors, 'source_kind', 'distillation source requires window and stage only')
+        elif self.source_kind == MemoryCandidateSourceKind.IMPORT:
+            if self.window_id is not None or self.stage_id is not None or self.import_source_id is None:
+                add_scope_error(errors, 'source_kind', 'import source requires import_source only')
+        else:
+            add_scope_error(errors, 'source_kind', 'invalid source kind')
+
     def clean(self) -> None:
         errors: dict[str, list[str]] = {}
         if self.project_id:
             check_project_organization(errors, 'project', self.project, self.organization_id)
         if self.team_id:
             check_organization_scope(errors, 'team', self.team, self.organization_id)
-        if self.window_id:
-            check_window_scope(errors, self.window, self.organization_id, self.project_id, self.team_id)
+        self._validate_scope(errors)
+        self._validate_source_shape(errors)
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)
 

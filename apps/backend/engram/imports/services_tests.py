@@ -4,6 +4,7 @@ import json
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from threading import Barrier, Lock, local
 from uuid import UUID
@@ -17,6 +18,7 @@ import engram.imports.services as import_services
 from engram.core.models import (
     Agent,
     AgentSession,
+    CandidateStatus,
     Memory,
     MemoryCandidate,
     Observation,
@@ -38,6 +40,7 @@ from engram.imports.services import (
     ClaudeMemImportInput,
     ImportContext,
 )
+from engram.memory.import_provenance import import_candidate_content_hash
 
 
 @dataclass(frozen=True)
@@ -1220,8 +1223,9 @@ def test_concurrent_imports_lock_sessions_in_stable_order_without_deadlock(
         assert session.observation_sequence_cursor == 1
         assert list(Observation.objects.filter(session=session).values_list('session_sequence', flat=True)) == [1]
         assert list(RawEventEnvelope.objects.filter(session=session).values_list('sequence_number', flat=True)) == [1]
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 2
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 2
 
 
 @pytest.mark.django_db
@@ -1297,8 +1301,9 @@ def test_import_materializes_v1_observation_sequences_and_prompt_no_op(
     assert observation_raw_events.filter(normalization_reason__isnull=True).count() == 2
     assert observation_raw_events.filter(sequence_number__in=[1, 2]).count() == 2
     assert ObservationSource.objects.filter(observation__session=session).count() == 2
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 2
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 2
 
     prompt_raw_event = RawEventEnvelope.objects.get(event_type='claude_mem.user_prompt')
     assert prompt_raw_event.normalization_contract_version == 1
@@ -1441,8 +1446,9 @@ def test_import_binds_session_scoped_legacy_observation_and_reuses_sequence(
     assert Observation.objects.count() == 1
     assert session.observation_sequence_cursor == 7
     assert Observation.objects.filter(id=observation.id, session_sequence=7).count() == 1
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 1
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 1
 
 
 @pytest.mark.django_db
@@ -2230,6 +2236,103 @@ def test_import_repairs_exact_master_era_legacy_observation_replay(
         'outbox': CeleryOutbox.objects.count(),
     } == initial_counts
     assert payload == raw_event.payload
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('mismatch', ['candidate_team', 'memory_team', 'source_observation'])
+def test_import_rejects_legacy_candidate_replay_identity_mismatch(
+    f_import_scope: ImportScope,
+    mismatch: str,
+) -> None:
+    importer, context, session, row = _import_context_and_observation(f_import_scope)
+    _raw_event, observation, _source = _create_master_era_import_graph(
+        importer,
+        context,
+        session,
+        row,
+        {'source': 'claude_mem_import'},
+    )
+    source_id = ObservationSource.objects.get(observation=observation).source_id
+    other_team = Team.objects.create(
+        organization=context.organization,
+        name='Legacy Replay Other Team',
+        slug='legacy-replay-other-team',
+    )
+
+    source_observation = observation
+    if mismatch == 'source_observation':
+        other_session = AgentSession.objects.create(
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+            agent=session.agent,
+            external_session_id='claude-mem:fixture-store:sdk_session:legacy-replay-other',
+            content_session_id='legacy-replay-other',
+            memory_session_id='legacy-replay-other-memory',
+            runtime=Runtime.CODEX,
+            metadata={'source': 'claude_mem_import', 'source_store_id': context.source_store_id},
+            observation_sequence_cursor=1,
+        )
+        source_observation = Observation.objects.create(
+            organization=context.organization,
+            project=context.project,
+            team=context.team,
+            agent=session.agent,
+            session=other_session,
+            observation_type='discovery',
+            title=observation.title,
+            body=observation.body,
+            content_hash=observation.content_hash,
+            session_sequence=1,
+            source_metadata={'source_id': source_id, 'event_type': 'claude_mem.observation'},
+        )
+
+    memory = Memory.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=other_team if mismatch == 'memory_team' else context.team,
+        title=observation.title,
+        body=observation.body,
+        metadata={
+            'source': 'claude_mem_import',
+            'source_store_id': context.source_store_id,
+            'source_id': source_id,
+            'event_type': 'claude_mem.observation',
+        },
+        confidence=Decimal('0.700'),
+        transition_contract_version=0,
+    )
+    MemoryCandidate.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=other_team if mismatch == 'candidate_team' else context.team,
+        source_observation=source_observation,
+        promoted_memory=memory,
+        title=observation.title,
+        body=observation.body,
+        status=CandidateStatus.PROMOTED,
+        content_hash=import_candidate_content_hash(source_id, observation.content_hash),
+        confidence=Decimal('0.700'),
+        decision_work_contract_version=0,
+    )
+    initial_counts = {
+        'raw_events': RawEventEnvelope.objects.count(),
+        'observations': Observation.objects.count(),
+        'sources': ObservationSource.objects.count(),
+        'candidates': MemoryCandidate.objects.count(),
+        'memories': Memory.objects.count(),
+    }
+
+    with pytest.raises(ValueError, match='^legacy import candidate identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    assert {
+        'raw_events': RawEventEnvelope.objects.count(),
+        'observations': Observation.objects.count(),
+        'sources': ObservationSource.objects.count(),
+        'candidates': MemoryCandidate.objects.count(),
+        'memories': Memory.objects.count(),
+    } == initial_counts
 
 
 @pytest.mark.django_db
