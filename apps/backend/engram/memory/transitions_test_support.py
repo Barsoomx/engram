@@ -259,9 +259,9 @@ def transition_request(candidate: MemoryCandidate, *, key: str | None = None, re
         reason=reason,
         origin='promotion-tests',
     )
-    from engram.memory.candidate_decision_work import evidence_manifest
+    from engram.memory.import_provenance import candidate_evidence_manifest
 
-    _entries, manifest_hash = evidence_manifest(candidate)
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
     fence = transitions.CandidateFence(
         candidate_id=candidate.id,
         candidate_content_hash=candidate.content_hash,

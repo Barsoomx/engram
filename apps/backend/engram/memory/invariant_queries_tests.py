@@ -2476,10 +2476,12 @@ def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -
     candidate, source, (organization, project, session) = provenanced_candidate('import-p7')
     fields = {field.name for field in type(source)._meta.fields}
     assert {'source_kind', 'import_source'} <= fields
+    observation = source.observation
+    source.delete()
     import_source = ObservationSource.objects.create(
         organization=organization,
         project=project,
-        observation=source.observation,
+        observation=observation,
         source_type='claude_mem',
         source_id='claude-mem:import-p7:1',
         metadata={
@@ -2487,23 +2489,28 @@ def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -
             'event_type': 'claude_mem.observation',
         },
     )
-    source.source_kind = 'import'
-    source.window = None
-    source.stage = None
-    source.import_source = import_source
-    source.anchors = provenance.import_candidate_source_anchors(
-        observation=source.observation,
+    anchors = provenance.import_candidate_source_anchors(
+        observation=observation,
         import_source=import_source,
         source_store_id='import-p7-store',
         event_type='claude_mem.observation',
     )
-    source.anchors_hash = hashlib.sha256(canonical_json_bytes(source.anchors)).hexdigest()
-    source.save(update_fields=['source_kind', 'window', 'stage', 'import_source', 'anchors', 'anchors_hash'])
-    candidate.title = source.observation.title
-    candidate.body = source.observation.body
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        observation=observation,
+        source_kind='import',
+        import_source=import_source,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    candidate.title = observation.title
+    candidate.body = observation.body or observation.title
     candidate.content_hash = provenance.import_candidate_content_hash(
         import_source.source_id,
-        source.observation.content_hash,
+        observation.content_hash,
     )
     candidate.decision_work_contract_version = 1
     candidate.save(update_fields=['title', 'body', 'content_hash', 'decision_work_contract_version'])
@@ -2511,7 +2518,7 @@ def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -
     expected_hash = ClaudeMemImporter()._content_hash(
         'memory-candidate',
         import_source.source_id,
-        source.observation.content_hash,
+        observation.content_hash,
     )
     assert candidate.content_hash == expected_hash
     manifest_entries, manifest_hash = provenance.candidate_evidence_manifest(candidate)
