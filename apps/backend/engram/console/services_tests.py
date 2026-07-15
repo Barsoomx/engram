@@ -274,6 +274,30 @@ def test_approve_memory_candidate_promotes_candidate(
 
 
 @pytest.mark.django_db
+def test_v1_console_approval_records_the_human_transition_actor_and_reason() -> None:
+    from engram.memory.transitions_tests import _provenanced_candidate
+
+    candidate, _source, (organization, _project, _session) = _provenanced_candidate('console-v1-actor')
+    actor = Identity.objects.create(
+        organization=organization,
+        identity_type=IdentityType.USER,
+        external_id=f'console-v1-{uuid.uuid4()}',
+        display_name='Console reviewer',
+    )
+
+    memory = approve_memory_candidate(organization, actor, candidate, 'verified by a human reviewer')
+
+    transition = memory.current_transition
+    audit = transition.audit_event
+    assert audit.actor_type == 'user'
+    assert audit.actor_id == str(actor.id)
+    assert audit.capability == 'memories:review'
+    assert audit.metadata['reason'] == 'verified by a human reviewer'
+    assert audit.metadata['exact_document_id'] == str(transition.result_exact_document_id)
+    assert audit.metadata['exact_projection_hash'] == transition.result_exact_document.exact_projection_hash
+
+
+@pytest.mark.django_db
 def test_approve_memory_candidate_carries_kind_into_memory_metadata_and_column(
     f_organization: Organization,
     f_project: Project,

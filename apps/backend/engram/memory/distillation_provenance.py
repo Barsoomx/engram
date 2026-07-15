@@ -15,6 +15,10 @@ class ProvenanceContractError(ValueError):
     pass
 
 
+def session_candidate_content_hash(session_id: UUID, title: str, body: str) -> str:
+    return hashlib.sha256(f'{session_id}:{title}:{body}'.encode()).hexdigest()
+
+
 _DIGEST_FIELDS = ('observation_digest',)
 _ANCHOR_FIELDS = (
     'files',

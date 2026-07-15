@@ -78,6 +78,7 @@ task_routes = {
     'engram.memory.distill_session': {'queue': QUEUE_BATCH},
     'engram.memory.distill_session_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.process_candidate_decision_work_v1': {'queue': QUEUE_BATCH},
+    'engram.memory.embed_memory_projection_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
     'engram.memory.generate_daily_digest_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},

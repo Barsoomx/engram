@@ -31,6 +31,8 @@ from engram.core.models import (
     MemoryCandidateSource,
     MemoryLink,
     MemoryStatus,
+    MemoryTransition,
+    MemoryVersionSource,
     Observation,
     Organization,
     Project,
@@ -52,6 +54,7 @@ from engram.memory.distillation import (
     DistillationStageError,
     DistillSession,
     DistillSessionInput,
+    _attach_promoted_candidate_source,
     _distill_chunk_char_budget,
     _observation_block,
     _parse_reduced_candidates,
@@ -73,6 +76,9 @@ from engram.memory.distillation_provenance import (
     candidate_source_anchors,
     canonical_source_manifest,
 )
+from engram.memory.distillation_provenance import (
+    session_candidate_content_hash as provenance_session_candidate_content_hash,
+)
 from engram.memory.distillation_provider_stage import stage_key, stage_target_key
 from engram.memory.distillation_window import materialize_distillation_window, render_observation_block
 from engram.memory.services import MemoryWorkerError, PromoteMemoryCandidate
@@ -84,7 +90,12 @@ from engram.memory.work_failures import (
     PROVIDER_TRANSIENT,
     UNEXPECTED,
 )
-from engram.memory.workflow_work import CreateWorkflowWorkInput, canonical_json_bytes, create_work
+from engram.memory.workflow_work import (
+    CreateWorkflowWorkInput,
+    canonical_json_bytes,
+    create_work,
+    observation_content_digest,
+)
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.real_provider_tests import _opener_returning, make_real_policy
 from engram.model_policy.services import (
@@ -100,6 +111,65 @@ from engram.model_policy.services import (
 
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
 _RETRYING_CLASSES = frozenset({UNEXPECTED, INFRASTRUCTURE_TRANSIENT, PROVIDER_TRANSIENT})
+
+
+def test_session_candidate_content_hash_has_one_neutral_canonical_definition() -> None:
+    assert session_candidate_content_hash is provenance_session_candidate_content_hash
+    assert (
+        session_candidate_content_hash(uuid.UUID('00000000-0000-0000-0000-000000000001'), 'title', 'body')
+        == '8e8076db4c858aeeac52fe26cac7ede4d11646e1bbedc9dc26f3ab69ad474423'
+    )
+
+
+@pytest.mark.django_db
+def test_production_late_source_adapter_is_idempotent_without_reopening_decision_work() -> None:
+    from engram.memory import transitions
+    from engram.memory.transitions_tests import _provenanced_candidate, _request
+
+    candidate, source, (organization, project, session) = _provenanced_candidate('distill-late-source')
+    promoted = transitions.PromoteMemoryCandidate().execute(_request(candidate))
+    observation = create_observation(
+        organization,
+        project,
+        session.team,
+        session.agent,
+        session,
+        index=2,
+        title='late source',
+        body='late source body',
+    )
+    anchors = candidate_source_anchors(
+        observation,
+        observation_id=str(observation.id),
+        session_sequence=observation.session_sequence,
+        observation_digest=observation_content_digest(observation),
+    )
+    late_source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        window=source.window,
+        observation=observation,
+        stage=source.stage,
+        anchors=anchors,
+        anchors_hash=canonical_source_manifest(anchors),
+    )
+
+    candidate.refresh_from_db()
+    attached = _attach_promoted_candidate_source(candidate, late_source, source.window)
+    replay = _attach_promoted_candidate_source(candidate, late_source, source.window)
+
+    assert attached is not None and attached.duplicate is False
+    assert replay is not None and replay.duplicate is True
+    assert MemoryTransition.objects.filter(candidate_id=candidate.id).count() == 2
+    assert MemoryVersionSource.objects.filter(memory_version_id=promoted.memory_version.id).count() == 2
+    decision_work = WorkflowWork.objects.filter(
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_id=candidate.id,
+    )
+    assert decision_work.count() == 2
+    assert not decision_work.filter(disposition=WorkflowWorkDisposition.REQUIRED).exists()
 
 
 @pytest.fixture

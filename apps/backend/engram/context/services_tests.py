@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from django.db import connection
+from django.db import IntegrityError, connection
 from django.test.utils import CaptureQueriesContext
 
 from engram.access.models import (
@@ -270,6 +270,11 @@ def _seed_document(
     embedding: list[float],
     sequence: int,
     with_pgvector: bool = True,
+    projection_contract_version: int = 0,
+    exact_projection_hash: str = '',
+    embedding_projection_hash: str = '',
+    embedding_reference: str = '',
+    embedding_projected_at: datetime | None = None,
 ) -> RetrievalDocument:
     memory = Memory.objects.create(
         organization=organization,
@@ -293,6 +298,11 @@ def _seed_document(
         memory_version=version,
         full_text=f'{title}\n\n{body}',
         embedding_vector=embedding,
+        projection_contract_version=projection_contract_version,
+        exact_projection_hash=exact_projection_hash,
+        embedding_projection_hash=embedding_projection_hash,
+        embedding_reference=embedding_reference,
+        embedding_projected_at=embedding_projected_at,
     )
     if with_pgvector and VectorField is not None:
         document.embedding_pgvector = embedding
@@ -531,6 +541,88 @@ def test_dispatcher_falls_back_to_python_without_pgvector_column(
 
     assert [match.document.id for match in matches] == [document.id]
     assert matches[0].inclusion_reason == 'semantic match: cosine 1.00'
+
+
+@pytest.mark.django_db
+def test_semantic_python_path_ignores_stale_v1_embedding_hash(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    current = _seed_document(
+        organization,
+        project,
+        title='current',
+        body='current',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    stale = _seed_document(
+        organization,
+        project,
+        title='stale',
+        body='stale',
+        embedding=_basis_vector(0),
+        sequence=2,
+    )
+    stale.projection_contract_version = 1
+    stale.exact_projection_hash = 'a' * 64
+    stale.embedding_projection_hash = 'b' * 64
+
+    matches = _semantic_retrieval_matches_python((current, stale), [], _basis_vector(0))
+
+    assert [match.document.id for match in matches] == [current.id]
+
+
+@pytestmark_pgvector
+@pytest.mark.django_db
+def test_semantic_pgvector_path_ignores_stale_v1_embedding_hash(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    current = _seed_document(
+        organization,
+        project,
+        title='current',
+        body='current',
+        embedding=_basis_vector(0),
+        sequence=1,
+    )
+    stale = _seed_document(
+        organization,
+        project,
+        title='stale',
+        body='stale',
+        embedding=_basis_vector(0),
+        sequence=2,
+    )
+    stale.projection_contract_version = 1
+    stale.exact_projection_hash = 'a' * 64
+    stale.embedding_projection_hash = 'b' * 64
+
+    matches = semantic_retrieval_matches_pgvector((current, stale), [], _basis_vector(0))
+
+    assert [match.document.id for match in matches] == [current.id]
+
+
+@pytest.mark.django_db
+def test_v1_retrieval_document_rejects_ready_embedding_with_stale_hash(
+    f_scope: tuple[Organization, Project],
+) -> None:
+    organization, project = f_scope
+    with pytest.raises(IntegrityError):
+        _seed_document(
+            organization,
+            project,
+            title='stale',
+            body='stale',
+            embedding=_basis_vector(0),
+            sequence=3,
+            projection_contract_version=1,
+            exact_projection_hash='a' * 64,
+            embedding_projection_hash='b' * 64,
+            embedding_reference='provider:test',
+            embedding_projected_at=datetime.now(UTC),
+        )
 
 
 # authorized_retrieval_documents — deferred embedding columns

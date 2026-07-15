@@ -39,6 +39,7 @@ _TASK_TYPE_BY_WORK = {
     WorkflowWorkType.SESSION_DISTILLATION: 'generation',
     WorkflowWorkType.DAILY_DIGEST: 'digest',
     WorkflowWorkType.WEEKLY_DIGEST: 'digest',
+    WorkflowWorkType.MEMORY_EMBEDDING: 'embedding',
 }
 
 _TERMINAL_EXECUTION_STATES = frozenset(
@@ -611,9 +612,9 @@ def _recorded_completion(work: WorkflowWork) -> str:
     ):
         return 'product_succeeded'
 
-    if (
-        work.execution_state == WorkflowWorkExecutionState.SETTLED
-        and work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+    if work.execution_state == WorkflowWorkExecutionState.SETTLED and work.resolution_reason in (
+        WorkflowWorkResolutionReason.NO_SIGNAL,
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
     ):
         return 'product_no_signal'
 
@@ -655,6 +656,7 @@ def _apply_finish(
     now: datetime,
     completion: str,
     result_memory_id: uuid.UUID | None,
+    resolution_reason: str | None,
 ) -> None:
     run.status = WorkflowRunStatus.SUCCEEDED
     run.finished_at = now
@@ -681,11 +683,17 @@ def _apply_finish(
 
         return
 
-    reason = (
-        WorkflowWorkResolutionReason.SUCCEEDED
-        if completion == 'product_succeeded'
-        else WorkflowWorkResolutionReason.NO_SIGNAL
-    )
+    if completion == 'product_succeeded':
+        if resolution_reason is not None:
+            raise ValueError('product_succeeded does not accept a resolution reason override')
+        reason = WorkflowWorkResolutionReason.SUCCEEDED
+    else:
+        reason = resolution_reason or WorkflowWorkResolutionReason.NO_SIGNAL
+        if reason not in (
+            WorkflowWorkResolutionReason.NO_SIGNAL,
+            WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+        ):
+            raise ValueError('product_no_signal has an unsupported resolution reason')
     _settle_work(work, reason=reason, now=now)
 
     return
@@ -708,10 +716,13 @@ def finish_work_claim(
     now: datetime,
     completion: str,
     result_memory_id: uuid.UUID | None = None,
+    resolution_reason: str | None = None,
 ) -> None:
     _require_aware(now)
     if completion not in ('product_succeeded', 'product_no_signal', 'continue_required'):
         raise ValueError(f'unsupported completion {completion!r}')
+    if completion == 'continue_required' and resolution_reason is not None:
+        raise ValueError('continue_required does not accept a resolution reason override')
 
     with transaction.atomic():
         work, run = _lock_claim_rows(claim)
@@ -719,6 +730,8 @@ def finish_work_claim(
         if run.status == WorkflowRunStatus.SUCCEEDED:
             if _recorded_completion(work) != completion:
                 raise ValueError('workflow run already completed with a different outcome')
+            if resolution_reason is not None and work.resolution_reason != resolution_reason:
+                raise ValueError('workflow run already completed with a different resolution reason')
 
             return
 
@@ -726,7 +739,14 @@ def finish_work_claim(
             raise ValueError('workflow run is not in a completable state')
 
         _require_claim_fence(work, run, claim)
-        _apply_finish(work, run, now=now, completion=completion, result_memory_id=result_memory_id)
+        _apply_finish(
+            work,
+            run,
+            now=now,
+            completion=completion,
+            result_memory_id=result_memory_id,
+            resolution_reason=resolution_reason,
+        )
 
     return
 

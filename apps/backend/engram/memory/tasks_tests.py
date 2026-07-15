@@ -4,6 +4,7 @@ import hashlib
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -15,10 +16,15 @@ from engram import celeryconfig
 from engram.core.models import (
     Agent,
     AgentSession,
+    AuditEvent,
+    AuditResult,
+    Memory,
     MemoryCandidate,
+    MemoryVersion,
     Observation,
     Organization,
     Project,
+    RetrievalDocument,
     Runtime,
     SessionStatus,
     Team,
@@ -72,7 +78,7 @@ from engram.memory.workflow_work import (
     resolve_work_succeeded,
 )
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 
 _OBS_LEASE = timedelta(seconds=120)
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
@@ -177,6 +183,31 @@ def test_process_observation_recorded_has_a_per_task_time_limit() -> None:
 
 def test_task_routes_send_retry_failed_distillations_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.retry_failed_distillations']['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_embedding_projection_worker_is_registered_on_batch_queue() -> None:
+    task = tasks_module.embed_memory_projection_work_v1
+    task_name = 'engram.memory.embed_memory_projection_work_v1'
+
+    assert task.name == task_name
+    assert task.acks_late is True
+    assert task.reject_on_worker_lost is True
+    assert celeryconfig.task_routes[task_name]['queue'] == celeryconfig.QUEUE_BATCH
+
+
+def test_embedding_projection_worker_uses_explicit_embedding_time_limits() -> None:
+    task = tasks_module.embed_memory_projection_work_v1
+
+    assert task.soft_time_limit == tasks_module._EMBEDDING_SOFT_TIME_LIMIT == 180
+    assert task.time_limit == tasks_module._EMBEDDING_TIME_LIMIT == 210
+
+
+def test_embedding_work_uses_embedding_policy_task_type_for_configuration_scope() -> None:
+    from engram.memory import work_execution
+
+    embedding_type = getattr(WorkflowWorkType, 'MEMORY_EMBEDDING', 'memory_embedding')
+
+    assert work_execution._TASK_TYPE_BY_WORK[embedding_type] == 'embedding'
 
 
 def test_beat_schedule_registers_retry_failed_distillations() -> None:
@@ -1538,3 +1569,302 @@ def test_retry_failed_distillations_leaves_v1_retry_wait_work_to_reconciler() ->
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=0).count() == 0
     assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
     assert result == {'retried': 0, 'reconciled': 1, 'candidate_reconciled': 0, 'unlinked': 0}
+
+
+def _embedding_source(version: MemoryVersion) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        source_kind='memory_version',
+        source_type='memory_version',
+        kind='memory_version',
+        source_content_hash=version.content_hash,
+        content_hash=version.content_hash,
+        candidate_source_id=None,
+        source_memory_version_id=version.id,
+        memory_version_id=version.id,
+    )
+
+
+def _activate_v1_embedding_chain(
+    *,
+    memory: Memory,
+    version: MemoryVersion,
+    document: RetrievalDocument,
+    work: WorkflowWork,
+    transition_id: uuid.UUID,
+) -> None:
+    transition_model = __import__('engram.core.models', fromlist=['MemoryTransition']).MemoryTransition
+    audit = AuditEvent.objects.create(
+        organization=memory.organization,
+        project=memory.project,
+        team=memory.team,
+        event_type='MemoryTransitionCommitted',
+        actor_type='test',
+        target_type='memory',
+        target_id=str(memory.id),
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        metadata={'schema': 'memory_transition/v1', 'transition_id': str(transition_id)},
+    )
+    transition_model.objects.create(
+        id=transition_id,
+        organization=memory.organization,
+        project=memory.project,
+        team=memory.team,
+        transition_type='publish_digest',
+        idempotency_key=f'test:{transition_id}:publish:v1',
+        request_fingerprint='6' * 64,
+        memory=memory,
+        from_version=version,
+        to_version=version,
+        result_memory=memory,
+        result_version=version,
+        exact_document=document,
+        result_exact_document=document,
+        embedding_work=work,
+        audit_event=audit,
+        provenance_hash='7' * 64,
+    )
+    Memory.objects.filter(id=memory.id).update(
+        transition_contract_version=1,
+        current_transition_id=transition_id,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedding_completion_recovers_after_failure_without_repromotion(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    from engram.memory import projections
+
+    memory = Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=f_team,
+        title='Embedding recovery memory',
+        body='Embedding recovery body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=f_org,
+        project=f_project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='9' * 64,
+    )
+    transition_id = uuid.uuid4()
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            document = projections.write_exact_memory_projection(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=[_embedding_source(version)],
+            )
+            work, created = projections.create_embedding_work_and_signal(document=document)
+    assert created is True
+    _activate_v1_embedding_chain(
+        memory=memory,
+        version=version,
+        document=document,
+        work=work,
+        transition_id=transition_id,
+    )
+
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type='memory_embedding',
+        lease_owner='embedding:test:00000000-0000-4000-8000-000000000000',
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+        lease_for=timedelta(minutes=5),
+    )
+    assert claim_result.claim is not None
+    claim = claim_result.claim
+
+    failed = ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout')
+    fail_work_claim(claim=claim, now=datetime(2026, 7, 14, 12, 1, tzinfo=UTC), failure=failed)
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert RetrievalDocument.objects.get(id=document.id).embedding_vector == []
+
+    retry_claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type='memory_embedding',
+        lease_owner='embedding:test:00000000-0000-4000-8000-000000000001',
+        now=datetime(2026, 7, 14, 12, 2, tzinfo=UTC),
+        lease_for=timedelta(minutes=5),
+    )
+    assert retry_claim_result.claim is not None
+    embedding = [0.1, 0.2, *([0.0] * 1534)]
+    result = projections.complete_embedding_projection(
+        claim=retry_claim_result.claim,
+        expected_projection_hash=document.exact_projection_hash,
+        embedding=embedding,
+        provider_call_id=uuid.uuid4(),
+        now=datetime(2026, 7, 14, 12, 3, tzinfo=UTC),
+    )
+
+    assert result is not None
+    document.refresh_from_db()
+    assert document.embedding_vector == embedding
+    assert document.embedding_projection_hash == document.exact_projection_hash
+    assert document.embedding_projected_at is not None
+    assert WorkflowWork.objects.filter(subject_id=document.id, work_type='memory_embedding').count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_stale_embedding_completion_is_discarded_without_vector_or_repromotion(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    from engram.memory import projections
+
+    memory = Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=f_team,
+        title='Fenced memory',
+        body='Fenced body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=f_org,
+        project=f_project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='8' * 64,
+    )
+    transition_id = uuid.uuid4()
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            document = projections.write_exact_memory_projection(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=[_embedding_source(version)],
+            )
+            work, _created = projections.create_embedding_work_and_signal(document=document)
+    _activate_v1_embedding_chain(
+        memory=memory,
+        version=version,
+        document=document,
+        work=work,
+        transition_id=transition_id,
+    )
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type='memory_embedding',
+        lease_owner='embedding:test:00000000-0000-4000-8000-000000000002',
+        now=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
+        lease_for=timedelta(minutes=5),
+    )
+    assert claim_result.claim is not None
+    stale_hash = 'a' * 64
+    result = projections.complete_embedding_projection(
+        claim=claim_result.claim,
+        expected_projection_hash=stale_hash,
+        embedding=[0.9, 0.8, *([0.0] * 1534)],
+        provider_call_id=uuid.uuid4(),
+        now=datetime(2026, 7, 14, 12, 1, tzinfo=UTC),
+    )
+
+    assert result is None
+    document.refresh_from_db()
+    assert document.embedding_vector == []
+    assert document.embedding_projection_hash == ''
+    work.refresh_from_db()
+    assert work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
+    assert WorkflowWork.objects.filter(subject_id=document.id, work_type='memory_embedding').count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+def test_embedding_worker_calls_provider_outside_transaction_and_records_policy(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    from engram.memory import projections
+
+    memory = Memory.objects.create(
+        organization=f_org,
+        project=f_project,
+        team=f_team,
+        title='Worker embedding memory',
+        body='Worker embedding body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=f_org,
+        project=f_project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='d' * 64,
+    )
+    transition_id = uuid.uuid4()
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            document = projections.write_exact_memory_projection(
+                memory=memory,
+                version=version,
+                transition_id=transition_id,
+                sources=[_embedding_source(version)],
+            )
+            work, _created = projections.create_embedding_work_and_signal(document=document)
+    _activate_v1_embedding_chain(
+        memory=memory,
+        version=version,
+        document=document,
+        work=work,
+        transition_id=transition_id,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=f_org,
+        team=f_team,
+        project=f_project,
+        name='embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=_provider_secret(f_org, f_team),
+        version=1,
+    )
+    embedding = [0.3, 0.4, *([0.0] * 1534)]
+
+    class RecordingGateway:
+        def embed(self, data: object) -> SimpleNamespace:
+            assert transaction.get_connection().in_atomic_block is False
+            assert data.policy.id == policy.id
+            record = ProviderCallRecord.objects.create(
+                organization=f_org,
+                project=f_project,
+                team=f_team,
+                policy=policy,
+                secret=policy.secret,
+                provider=policy.provider,
+                model=policy.model,
+                task_type=policy.task_type,
+                policy_version=policy.version,
+                request_id=data.request_id,
+                trace_id=data.trace_id,
+                redaction_state='redacted',
+                result=AuditResult.RECORDED,
+                metadata={'schema': 'embedding_call/v1'},
+            )
+            return SimpleNamespace(embedding=embedding, call_record_id=record.id)
+
+    with mock.patch('engram.model_policy.services.get_provider_gateway', return_value=RecordingGateway()):
+        tasks_module.embed_memory_projection_work_v1(str(work.id))
+
+    document.refresh_from_db()
+    work.refresh_from_db()
+    provider_call = ProviderCallRecord.objects.get()
+    assert provider_call.policy_id == policy.id
+    assert provider_call.task_type == 'embedding'
+    assert document.embedding_vector == embedding
+    assert document.embedding_projection_hash == document.exact_projection_hash
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert Memory.objects.filter(id=memory.id).count() == 1

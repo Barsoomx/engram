@@ -17,6 +17,10 @@ MIGRATE_0032B = [('core', '0032b_agentsession_end_work_db_default')]
 MIGRATE_0033 = [('core', '0033_backfill_observation_sequence')]
 MIGRATION_0033_NODE = ('core', '0033_backfill_observation_sequence')
 MIGRATION_0033_MODULE = 'engram.core.migrations.0033_backfill_observation_sequence'
+MIGRATE_0037 = [('core', '0037_distillation_stage_policy_role_coord')]
+MIGRATE_0038 = [('core', '0038_atomic_memory_transitions')]
+MIGRATION_0038_NODE = ('core', '0038_atomic_memory_transitions')
+MIGRATION_0038_MODULE = 'engram.core.migrations.0038_atomic_memory_transitions'
 
 
 def _end_work_contract_column() -> tuple[str | None, str]:
@@ -2188,7 +2192,6 @@ def test_0035_creates_execution_indexes() -> None:
 
 MIGRATE_0036 = [('core', '0036_distillation_coverage')]
 MIGRATION_0036_NODE = ('core', '0036_distillation_coverage')
-MIGRATE_0037 = [('core', '0037_distillation_stage_policy_role_coord')]
 MIGRATION_0037_NODE = ('core', '0037_distillation_stage_policy_role_coord')
 
 _DISTILLATION_TABLES = (
@@ -2626,3 +2629,217 @@ def test_0037_policy_role_coordinate_constraint_round_trip() -> None:
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0038_forward_preserves_legacy_rows_and_adds_complete_atomic_schema() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0038_NODE in executor.loader.graph.nodes
+    migration = executor.loader.graph.nodes[MIGRATION_0038_NODE]
+    assert ('core', '0037_distillation_stage_policy_role_coord') in migration.dependencies
+
+    try:
+        executor.migrate(MIGRATE_0037)
+        old_apps = executor.loader.project_state(MIGRATE_0037).apps
+        organization_model = old_apps.get_model('core', 'Organization')
+        project_model = old_apps.get_model('core', 'Project')
+        memory_model = old_apps.get_model('core', 'Memory')
+        memory_version_model = old_apps.get_model('core', 'MemoryVersion')
+        retrieval_document_model = old_apps.get_model('core', 'RetrievalDocument')
+        suffix = uuid.uuid4().hex
+        organization = organization_model.objects.create(name=f'Legacy {suffix}', slug=f'legacy-{suffix}')
+        project = project_model.objects.create(
+            organization=organization,
+            name=f'Legacy project {suffix}',
+            slug=f'legacy-project-{suffix}',
+        )
+        legacy = memory_model.objects.create(
+            organization=organization,
+            project=project,
+            title='Legacy memory',
+            body='must survive expand',
+            current_version=7,
+        )
+        legacy_version = memory_version_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=legacy,
+            version=7,
+            body=legacy.body,
+            content_hash='f' * 64,
+        )
+        legacy_document = retrieval_document_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=legacy,
+            memory_version=legacy_version,
+            full_text=legacy.body,
+            embedding_reference='provider:legacy',
+            embedding_vector=[0.25],
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0038)
+        new_apps = executor.loader.project_state(MIGRATE_0038).apps
+        migrated = new_apps.get_model('core', 'Memory').objects.get(id=legacy.id)
+        assert migrated.title == 'Legacy memory'
+        assert migrated.body == 'must survive expand'
+        assert migrated.current_version == 7
+        assert migrated.transition_contract_version == 0
+        assert migrated.current_transition_id is None
+        migrated_document = new_apps.get_model('core', 'RetrievalDocument').objects.get(id=legacy_document.id)
+        assert migrated_document.projection_contract_version == 0
+        assert migrated_document.exact_projection_hash == ''
+        assert migrated_document.embedding_projection_hash == ''
+        assert migrated_document.embedding_projected_at is None
+        assert migrated_document.embedding_reference == 'provider:legacy'
+        assert migrated_document.embedding_vector == [0.25]
+
+        expected_models = {
+            'MemoryTransition',
+            'MemoryVersionSource',
+            'MemoryConflict',
+        }
+        assert expected_models <= {model._meta.object_name for model in new_apps.get_models()}
+        retrieval_fields = {field.name for field in new_apps.get_model('core', 'RetrievalDocument')._meta.fields}
+        assert {
+            'projection_contract_version',
+            'exact_projection_hash',
+            'embedding_projection_hash',
+            'embedding_projected_at',
+        } <= retrieval_fields
+        work_choices = dict(new_apps.get_model('core', 'WorkflowWork')._meta.get_field('work_type').choices)
+        subject_choices = dict(new_apps.get_model('core', 'WorkflowWork')._meta.get_field('subject_type').choices)
+        assert 'memory_embedding' in work_choices
+        assert 'retrieval_document' in subject_choices
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0038_reverse_removes_only_additive_schema_and_keeps_legacy_memory() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0038_NODE in executor.loader.graph.nodes
+
+    try:
+        executor.migrate(MIGRATE_0038)
+        apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
+        organization_model = apps_0038.get_model('core', 'Organization')
+        project_model = apps_0038.get_model('core', 'Project')
+        memory_model = apps_0038.get_model('core', 'Memory')
+        suffix = uuid.uuid4().hex
+        organization = organization_model.objects.create(name=f'Reverse {suffix}', slug=f'reverse-{suffix}')
+        project = project_model.objects.create(
+            organization=organization,
+            name=f'Reverse project {suffix}',
+            slug=f'reverse-project-{suffix}',
+        )
+        legacy = memory_model.objects.create(
+            organization=organization,
+            project=project,
+            title='Reverse-safe memory',
+            body='legacy row',
+            transition_contract_version=0,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0037)
+        reversed_apps = executor.loader.project_state(MIGRATE_0037).apps
+        reversed_memory = reversed_apps.get_model('core', 'Memory').objects.get(id=legacy.id)
+        assert reversed_memory.title == 'Reverse-safe memory'
+        assert reversed_memory.body == 'legacy row'
+        assert not hasattr(reversed_memory, 'transition_contract_version')
+        assert not hasattr(reversed_apps.get_model('core', 'Memory'), 'current_transition')
+        with pytest.raises(LookupError):
+            reversed_apps.get_model('core', 'MemoryTransition')
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0038_fresh_apply_accepts_legacy_version_zero_memory() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0038_NODE in executor.loader.graph.nodes
+    root = [('core', '0001_initial')]
+
+    try:
+        executor.migrate(root)
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0038)
+        apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
+        organization_model = apps_0038.get_model('core', 'Organization')
+        project_model = apps_0038.get_model('core', 'Project')
+        memory_model = apps_0038.get_model('core', 'Memory')
+        suffix = uuid.uuid4().hex
+        organization = organization_model.objects.create(name=f'Fresh {suffix}', slug=f'fresh-{suffix}')
+        project = project_model.objects.create(
+            organization=organization,
+            name=f'Fresh project {suffix}',
+            slug=f'fresh-project-{suffix}',
+        )
+        memory = memory_model.objects.create(
+            organization=organization,
+            project=project,
+            title='Fresh version zero',
+            body='accepted after fresh apply',
+        )
+        assert memory.transition_contract_version == 0
+        assert memory.current_transition_id is None
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0038_migration_module_declares_hash_and_scope_constraints() -> None:
+    executor = MigrationExecutor(connection)
+    assert MIGRATION_0038_NODE in executor.loader.graph.nodes
+    migration_module = importlib.import_module(MIGRATION_0038_MODULE)
+    migration = migration_module.Migration
+    operation_models = {
+        operation.name
+        for operation in migration.operations
+        if hasattr(operation, 'name') and operation.__class__.__name__ == 'CreateModel'
+    }
+    assert {'MemoryTransition', 'MemoryVersionSource', 'MemoryConflict'} <= operation_models
+
+    operations_text = '\n'.join(repr(operation) for operation in migration.operations)
+    for token in (
+        'core_memory_transition_idempotency_uniq',
+        'core_memory_transition_request_fingerprint_hex',
+        'core_memory_version_source_exactly_one_fk_ck',
+        'core_memory_conflict_open_close_ck',
+        'core_retrieval_document_embedding_state_ck',
+        'projection_superseded',
+    ):
+        assert token in operations_text
+
+
+def test_0038_reverse_guard_is_last_and_refuses_transition_history() -> None:
+    migration_module = importlib.import_module(MIGRATION_0038_MODULE)
+    migration = migration_module.Migration
+    operation = migration.operations[-1]
+    assert operation.__class__.__name__ == 'RunPython'
+
+    class _TransitionManager:
+        @staticmethod
+        def exists() -> bool:
+            return True
+
+    class _TransitionModel:
+        objects = _TransitionManager()
+
+    class _Apps:
+        @staticmethod
+        def get_model(app_label: str, model_name: str) -> type[_TransitionModel]:
+            assert (app_label, model_name) == ('core', 'MemoryTransition')
+            return _TransitionModel
+
+    assert operation.reverse_code is not None
+    with pytest.raises(RuntimeError, match='cannot reverse 0038'):
+        operation.reverse_code(_Apps(), None)

@@ -38,7 +38,7 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     clamp_memory_kind,
 )
-from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
+from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked, evidence_manifest
 from engram.memory.candidate_parsing import (
     SynthesizedCandidate,
     _clamp_confidence,
@@ -51,6 +51,7 @@ from engram.memory.distillation_provenance import (
     FinalizationPlan,
     ProvenanceContractError,
     build_finalization_plan,
+    session_candidate_content_hash,
 )
 from engram.memory.distillation_provider_stage import (
     STAGE_BLOCKED,
@@ -87,6 +88,14 @@ from engram.memory.services import (
     redact_error,
     redact_value,
     resolve_auto_approve_threshold,
+)
+from engram.memory.transitions import (
+    AttachPromotedCandidateSource,
+    AttachPromotedCandidateSourceInput,
+    CandidateFence,
+    TransitionRequest,
+    TransitionScope,
+    build_memory_fence,
 )
 from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import (
@@ -255,10 +264,6 @@ def chunk_observations(observations: list[Observation], budget: int) -> list[lis
         chunks.append(current)
 
     return chunks
-
-
-def session_candidate_content_hash(session_id: uuid.UUID, title: str, body: str) -> str:
-    return hashlib.sha256(f'{session_id}:{title}:{body}'.encode()).hexdigest()
 
 
 def _parse_reduced_source_ids(raw: object) -> tuple[int, ...] | None:
@@ -1080,6 +1085,46 @@ def _append_compatibility_evidence(
     return
 
 
+def _attach_promoted_candidate_source(
+    candidate: MemoryCandidate,
+    source: MemoryCandidateSource,
+    window: DistillationWindow,
+) -> object | None:
+    if candidate.status != CandidateStatus.PROMOTED or candidate.promoted_memory_id is None:
+        return None
+    promoted_memory = Memory.objects.get(id=candidate.promoted_memory_id)
+    if promoted_memory.transition_contract_version != 1:
+        return None
+    _entries, manifest_hash = evidence_manifest(candidate)
+    idempotency_key = f'candidate-source:{source.id}:attach:v1'
+    return AttachPromotedCandidateSource().execute(
+        AttachPromotedCandidateSourceInput(
+            request=TransitionRequest(
+                scope=TransitionScope(
+                    organization_id=candidate.organization_id,
+                    project_id=candidate.project_id,
+                    team_id=candidate.team_id,
+                ),
+                idempotency_key=idempotency_key,
+                actor_type='memory_worker',
+                actor_id='memory-worker',
+                capability='memories:write',
+                request_id=idempotency_key,
+                correlation_id=f'distillation-window:{window.id}',
+                reason='attach promoted candidate source',
+                origin='memory-worker',
+            ),
+            candidate_fence=CandidateFence(
+                candidate_id=candidate.id,
+                candidate_content_hash=candidate.content_hash,
+                evidence_manifest_hash=manifest_hash,
+            ),
+            memory_fence=build_memory_fence(promoted_memory),
+            candidate_source_id=source.id,
+        ),
+    )
+
+
 def finalize_distillation(  # noqa: C901
     *,
     window: DistillationWindow,
@@ -1161,6 +1206,8 @@ def finalize_distillation(  # noqa: C901
                     )
                 ):
                     raise _finalization_error('existing candidate source does not match finalization')
+                if created:
+                    _attach_promoted_candidate_source(candidate, persisted, locked_window)
             _append_compatibility_evidence(candidate, locked_window, candidate_plan)
         inject('source')
         for coverage in plan.coverage:

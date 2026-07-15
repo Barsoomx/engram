@@ -17,14 +17,22 @@ from django.db.transaction import TransactionManagementError
 from engram.core.models import (
     Agent,
     AgentSession,
+    Memory,
+    MemoryVersion,
     Observation,
     Organization,
     Project,
     ProjectTeam,
+    RetrievalDocument,
     Team,
+    WorkflowRun,
+    WorkflowRunOrigin,
+    WorkflowRunStatus,
+    WorkflowRunType,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
@@ -1094,6 +1102,76 @@ def test_terminal_helpers_are_idempotent_only_for_same_resolution() -> None:
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
 
+@pytest.mark.django_db(transaction=True)
+def test_direct_terminal_resolution_settles_work_and_queued_v1_runs() -> None:
+    scope = create_scope('terminal-direct-queued')
+    work = create_required_work(scope, suffix='terminal-direct-queued')
+    work.fencing_token = 3
+    work.save(update_fields=['fencing_token', 'updated_at'])
+    now = datetime.now(UTC)
+    run = WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+        work=work,
+        input_snapshot=work.input_snapshot,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.AUTOMATIC,
+        dispatched_at=now,
+    )
+
+    resolved = resolve_work_succeeded(
+        work.id,
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+    )
+
+    resolved.refresh_from_db()
+    run.refresh_from_db()
+    assert resolved.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert resolved.lease_owner == ''
+    assert resolved.lease_expires_at is None
+    assert resolved.heartbeat_at is None
+    assert resolved.next_retry_at is None
+    assert resolved.blocked_configuration_fingerprint == ''
+    assert resolved.failure_streak == 0
+    assert resolved.fencing_token == 4
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == 4
+    assert run.finished_at is not None
+
+
+@pytest.mark.django_db(transaction=True)
+def test_direct_terminal_resolution_rejects_leased_work() -> None:
+    scope = create_scope('terminal-direct-leased')
+    work = create_required_work(scope, suffix='terminal-direct-leased')
+    now = datetime.now(UTC)
+    work.execution_state = WorkflowWorkExecutionState.LEASED
+    work.fencing_token = 1
+    work.lease_owner = 'worker:terminal-direct-leased'
+    work.heartbeat_at = now
+    work.lease_expires_at = now + timedelta(minutes=1)
+    work.save(
+        update_fields=[
+            'execution_state',
+            'fencing_token',
+            'lease_owner',
+            'heartbeat_at',
+            'lease_expires_at',
+            'updated_at',
+        ]
+    )
+
+    with pytest.raises(WorkflowWorkStateError):
+        resolve_work_succeeded(
+            work.id,
+            organization_id=work.organization_id,
+            project_id=work.project_id,
+        )
+
+
 @pytest.mark.django_db
 def test_terminal_helpers_require_matching_scope_and_valid_no_input_type() -> None:
     scope = create_scope('terminal-scope')
@@ -1116,3 +1194,74 @@ def test_terminal_helpers_require_matching_scope_and_valid_no_input_type() -> No
 
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db(transaction=True)
+def test_memory_embedding_work_pairs_retrieval_document_and_freezes_exact_snapshot() -> None:
+    scope = create_scope('memory-embedding-pair')
+    organization, team, project, _agent, _session = scope
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Embedding memory',
+        body='Embedding body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='e' * 64,
+    )
+    document = RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=version,
+        full_text=memory.body,
+        exact_projection_hash='f' * 64,
+    )
+    snapshot = {
+        'schema': 'memory_embedding/v1',
+        'retrieval_document_id': str(document.id),
+        'memory_id': str(memory.id),
+        'memory_version_id': str(version.id),
+        'exact_projection_hash': 'f' * 64,
+    }
+    data = CreateWorkflowWorkInput(
+        organization_id=organization.id,
+        project_id=project.id,
+        work_type='memory_embedding',
+        subject_type='retrieval_document',
+        subject_id=document.id,
+        input_snapshot=snapshot,
+    )
+
+    with transaction.atomic():
+        work, created = create_work(data)
+
+    assert created is True
+    assert work.work_type == 'memory_embedding'
+    assert work.subject_type == 'retrieval_document'
+    assert work.subject_id == document.id
+    assert work.team_id == team.id
+    assert work.input_snapshot == snapshot
+    assert work.input_fingerprint == work_input_fingerprint(
+        work_type='memory_embedding',
+        subject_type='retrieval_document',
+        subject_id=document.id,
+        contract_version=1,
+        occurrence_key='',
+        input_snapshot=snapshot,
+    )
+
+
+def test_memory_embedding_identity_pair_uses_workflow_enum_constants() -> None:
+    from engram.memory import workflow_work
+
+    assert (WorkflowWorkType.MEMORY_EMBEDDING, WorkflowSubjectType.RETRIEVAL_DOCUMENT) in (
+        workflow_work._WORK_SUBJECT_PAIRS
+    )

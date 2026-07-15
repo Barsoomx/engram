@@ -309,7 +309,7 @@ def test_terminal_generation_is_not_reopened_when_late_evidence_creates_new_gene
     assert created is True
     assert newer.id != terminal.id
     assert terminal.disposition == 'complete'
-    assert terminal.execution_state == 'ready'
+    assert terminal.execution_state == 'settled'
 
 
 @pytest.mark.django_db
