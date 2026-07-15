@@ -1,30 +1,34 @@
 from __future__ import annotations
 
-import importlib
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
-from decimal import Decimal
 from typing import Any
 
 import pytest
 from django.db import close_old_connections, connection, transaction
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
+    AuditEvent,
     CandidateStatus,
+    LinkType,
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryConflict,
+    MemoryLink,
+    MemoryStatus,
     Observation,
     RetrievalDocument,
-    VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowWork,
+    WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
@@ -32,11 +36,56 @@ from engram.memory.candidate_decision_work import ensure_candidate_decision_work
 from engram.memory.distillation_provenance import (
     candidate_source_anchors,
     canonical_source_manifest,
-    session_candidate_content_hash,
 )
-from engram.memory.distillation_window import materialize_distillation_window
-from engram.memory.observation_work_tests import create_scope
-from engram.memory.reconciler_test_support import ended_session_work
+from engram.memory.transitions import (
+    ArchiveMemory,
+    MarkMemoryStale,
+    MemoryStateInput,
+    MergeMemories,
+    MergeMemoriesInput,
+    MergeMemoryCandidate,
+    MergeMemoryCandidateInput,
+    OpenMemoryConflict,
+    OpenMemoryConflictInput,
+    PublishDigestMemory,
+    PublishDigestMemoryInput,
+    RefuteMemory,
+    ResolveMemoryConflict,
+    ResolveMemoryConflictInput,
+    RestoreMemory,
+    ReviseMemory,
+    ReviseMemoryFromCandidate,
+    ReviseMemoryFromCandidateInput,
+    ReviseMemoryInput,
+    SupersedeMemories,
+    SupersedeMemoriesInput,
+    SupersedeMemoryWithCandidate,
+    SupersedeMemoryWithCandidateInput,
+)
+from engram.memory.transitions_test_support import (
+    candidate_fence_for as _candidate_fence_for,
+)
+from engram.memory.transitions_test_support import (
+    candidate_in_scope as _candidate_in_scope,
+)
+from engram.memory.transitions_test_support import (
+    open_single_conflict as _open_single_conflict,
+)
+from engram.memory.transitions_test_support import (
+    promoted_pair as _promoted_pair,
+)
+from engram.memory.transitions_test_support import (
+    provenanced_candidate as _provenanced_candidate,
+)
+from engram.memory.transitions_test_support import (
+    transition_request as _request,
+)
+from engram.memory.transitions_test_support import (
+    transition_request_for as _request_for,
+)
+from engram.memory.transitions_test_support import (
+    transitions_module as _transitions,
+)
 from engram.memory.work_execution import StaleWorkFenceError, claim_work
 from engram.memory.workflow_work import observation_content_digest
 
@@ -45,85 +94,10 @@ class InjectedPromotionFaultError(RuntimeError):
     pass
 
 
-def _transitions() -> Any:
-    return importlib.import_module('engram.memory.transitions')
-
-
 def _model(name: str) -> Any:
     from engram.core import models
 
     return getattr(models, name)
-
-
-def _provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, Any, Any]:
-    organization, project, session = create_scope(suffix)
-    work = ended_session_work((organization, project, session))
-    window = materialize_distillation_window(work)
-    from engram.memory.invariant_queries_tests import _make_stage_history
-
-    stage, _primary = _make_stage_history((organization, project, session), window)
-    observation = Observation.objects.get(session=session, session_sequence=1)
-    title = f'Promotion candidate {suffix}'
-    body = f'Promotion body {suffix}'
-    candidate = MemoryCandidate.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        source_observation=observation,
-        title=title,
-        body=body,
-        status=CandidateStatus.PROPOSED,
-        visibility_scope=VisibilityScope.PROJECT,
-        evidence=[{'observation_id': str(observation.id)}],
-        content_hash=session_candidate_content_hash(session.id, title, body),
-        confidence=Decimal('0.900'),
-        decision_work_contract_version=1,
-    )
-    anchors = candidate_source_anchors(
-        observation,
-        observation_id=str(observation.id),
-        session_sequence=observation.session_sequence,
-        observation_digest=observation_content_digest(observation),
-    )
-    source = MemoryCandidateSource.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        candidate=candidate,
-        window=window,
-        observation=observation,
-        stage=stage,
-        anchors=anchors,
-        anchors_hash=canonical_source_manifest(anchors),
-    )
-    return candidate, source, (organization, project, session)
-
-
-def _request(candidate: MemoryCandidate, *, key: str | None = None, reason: str = 'test promotion') -> Any:
-    transitions = _transitions()
-    scope = transitions.TransitionScope(
-        organization_id=candidate.organization_id,
-        project_id=candidate.project_id,
-        team_id=candidate.team_id,
-    )
-    request = transitions.TransitionRequest(
-        scope=scope,
-        idempotency_key=key or f'candidate:{candidate.id}:settle:v1',
-        actor_type='test',
-        actor_id='promotion-tests',
-        capability='memories:write',
-        request_id=str(uuid.uuid4()),
-        correlation_id=str(uuid.uuid4()),
-        reason=reason,
-        origin='promotion-tests',
-    )
-    _entries, manifest_hash = evidence_manifest(candidate)
-    fence = transitions.CandidateFence(
-        candidate_id=candidate.id,
-        candidate_content_hash=candidate.content_hash,
-        evidence_manifest_hash=manifest_hash,
-    )
-    return transitions.PromoteMemoryCandidateInput(request=request, candidate_fence=fence)
 
 
 def _counts(candidate: MemoryCandidate) -> dict[str, int]:
@@ -142,6 +116,15 @@ def _counts(candidate: MemoryCandidate) -> dict[str, int]:
         if model is not None:
             values[key] = model.objects.filter(project_id=candidate.project_id).count()
     return values
+
+
+def _lineage_shape(project_id: uuid.UUID) -> dict[str, int]:
+    return {
+        'transitions': _model('MemoryTransition').objects.filter(project_id=project_id).count(),
+        'links': MemoryLink.objects.filter(project_id=project_id).count(),
+        'audits': AuditEvent.objects.filter(project_id=project_id, event_type='MemoryTransitionCommitted').count(),
+        'conflicts': MemoryConflict.objects.filter(project_id=project_id).count(),
+    }
 
 
 @pytest.mark.django_db
@@ -307,6 +290,44 @@ def test_promotion_finishes_owning_work_claim_in_the_semantic_transaction() -> N
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize('command_name', ('revise', 'state'))
+def test_unrelated_same_scope_claim_cannot_be_consumed_by_lineage_command(command_name: str) -> None:
+    candidate, source, _scope = _provenanced_candidate(f'unrelated-work-{command_name}')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    unrelated, _unrelated_source = _candidate_in_scope(
+        candidate,
+        source,
+        title=f'Unrelated claimed work {command_name}',
+        body=f'Unrelated claimed work body {command_name}',
+    )
+    work, claim = _claim_candidate_decision_work(unrelated)
+    request = _request_for(candidate, key=f'request:{uuid.uuid4()}:{command_name}:{promoted.memory.id}:v1')
+    if command_name == 'revise':
+        command = ReviseMemory()
+        payload = ReviseMemoryInput(
+            request=request,
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title='Unrelated work revise',
+            body='Unrelated work revise body',
+            work_claim=claim,
+        )
+    else:
+        command = MarkMemoryStale()
+        payload = MemoryStateInput(
+            request=request,
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            work_claim=claim,
+        )
+
+    with pytest.raises(Exception, match='stale_decision'):
+        command.execute(payload)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+
+
+@pytest.mark.django_db
 def test_foreign_scope_is_rejected_before_semantic_or_package_writes() -> None:
     candidate, _source, _scope = _provenanced_candidate('foreign-target')
     foreign_candidate, _foreign_source, _foreign_scope = _provenanced_candidate('foreign-request')
@@ -404,4 +425,651 @@ def test_late_source_attaches_once_without_reopening_terminal_decision_work() ->
             work_type='memory_embedding',
         ).count()
         == 2
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    'boundary',
+    ('memory', 'version', 'source', 'exact_document', 'link', 'audit', 'transition', 'candidate_pointer'),
+)
+def test_supersession_fault_preserves_one_coherent_lineage_transition(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    loser_candidate, source, _scope = _provenanced_candidate(f'supersede-fault-{boundary}')
+    loser_result = _transitions().PromoteMemoryCandidate().execute(_request(loser_candidate))
+    old_version_id = loser_result.memory_version.id
+    winner_candidate, _winner_source = _candidate_in_scope(
+        loser_candidate,
+        source,
+        title=f'Superseding candidate {boundary}',
+        body=f'Superseding body {boundary}',
+    )
+    data = SupersedeMemoryWithCandidateInput(
+        request=_request_for(winner_candidate, key=f'request:{winner_candidate.id}:supersede:v1'),
+        candidate_fence=_candidate_fence_for(winner_candidate),
+        loser_memory_fence=_transitions().build_memory_fence(loser_result.memory),
+    )
+
+    def fault(point: str) -> None:
+        if point == boundary:
+            raise InjectedPromotionFaultError(point)
+
+    monkeypatch.setattr(_transitions(), '_fault_boundary', fault)
+    before = _lineage_shape(loser_candidate.project_id)
+    with pytest.raises(InjectedPromotionFaultError, match=boundary):
+        SupersedeMemoryWithCandidate().execute(data)
+
+    loser_result.memory.refresh_from_db()
+    winner_candidate.refresh_from_db()
+    after = _lineage_shape(loser_candidate.project_id)
+    complete_delta = {
+        **before,
+        'transitions': before['transitions'] + 1,
+        'links': before['links'] + 1,
+        'audits': before['audits'] + 1,
+    }
+    assert after in (before, complete_delta)
+    if after == before:
+        assert loser_result.memory.stale is False
+        assert winner_candidate.status == CandidateStatus.PROPOSED
+    else:
+        transition = _model('MemoryTransition').objects.get(
+            project_id=loser_candidate.project_id,
+            transition_type='supersede',
+            candidate=winner_candidate,
+        )
+        assert transition.from_version_id == old_version_id
+        assert transition.result_memory_id == winner_candidate.promoted_memory_id
+        assert transition.semantic_link_id is not None
+        assert loser_result.memory.stale is True
+        assert winner_candidate.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_reverse_order_concurrent_lineage_commands_are_deadlock_free_and_one_fence_wins() -> None:
+    first, second, first_result, second_result = _promoted_pair('reverse-lineage')
+    barrier = threading.Barrier(2)
+    first_request = _request_for(first, key=f'request:{uuid.uuid4()}:merge:{first.id}:v1')
+    second_request = _request_for(second, key=f'request:{uuid.uuid4()}:merge:{second.id}:v1')
+    payloads = (
+        MergeMemoriesInput(
+            request=first_request,
+            source_memory_fence=_transitions().build_memory_fence(first_result.memory),
+            result_memory_fence=_transitions().build_memory_fence(second_result.memory),
+            title='Merged reverse order',
+            body='Merged reverse order body',
+        ),
+        MergeMemoriesInput(
+            request=second_request,
+            source_memory_fence=_transitions().build_memory_fence(second_result.memory),
+            result_memory_fence=_transitions().build_memory_fence(first_result.memory),
+            title='Merged reverse order',
+            body='Merged reverse order body',
+        ),
+    )
+
+    def worker(payload: MergeMemoriesInput) -> tuple[object | None, BaseException | None]:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=10)
+            return MergeMemories().execute(payload), None
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            return None, error
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(worker, payloads))
+    errors = [error for _result, error in results if error is not None]
+    assert len(errors) == 1
+    assert getattr(errors[0], 'code', None) == 'stale_decision'
+    assert sum(result is not None for result, _error in results) == 1
+    assert Memory.objects.filter(project_id=first.project_id, stale=False).count() == 2
+    assert _model('MemoryTransition').objects.filter(project_id=first.project_id, transition_type='merge').count() == 1
+
+
+@pytest.mark.django_db
+def test_supersede_memories_stales_only_source_and_preserves_result_projection_and_embedding_work() -> None:
+    first, second, first_result, second_result = _promoted_pair('supersede-preserves-result')
+    source_memory = first_result.memory
+    result_memory = second_result.memory
+    source_document = first_result.retrieval_document
+    result_document = second_result.retrieval_document
+    result_document_fields = (
+        result_document.full_text,
+        result_document.exact_projection_hash,
+        result_document.embedding_reference,
+        list(result_document.embedding_vector),
+        getattr(result_document, 'embedding_pgvector', None),
+        result_document.embedding_projection_hash,
+        result_document.embedding_projected_at,
+    )
+    result_transition_id = result_memory.current_transition_id
+    result_version = result_memory.current_version
+    embedding_work_ids = (first_result.embedding_work.id, second_result.embedding_work.id)
+    embedding_work_before = list(
+        WorkflowWork.objects.filter(id__in=embedding_work_ids).values().order_by('id'),
+    )
+
+    superseded = SupersedeMemories().execute(
+        SupersedeMemoriesInput(
+            request=_request_for(first, key=f'request:{uuid.uuid4()}:supersede-preserves-result:{first.id}:v1'),
+            source_memory_fence=_transitions().build_memory_fence(source_memory),
+            result_memory_fence=_transitions().build_memory_fence(result_memory),
+        )
+    )
+
+    source_memory.refresh_from_db()
+    result_memory.refresh_from_db()
+    source_document.refresh_from_db()
+    result_document.refresh_from_db()
+    assert source_memory.stale is True
+    assert source_memory.current_transition_id == superseded.transition.id
+    assert result_memory.stale is False
+    assert result_memory.current_transition_id == result_transition_id
+    assert result_memory.current_version == result_version
+    assert (
+        result_document.full_text,
+        result_document.exact_projection_hash,
+        result_document.embedding_reference,
+        list(result_document.embedding_vector),
+        getattr(result_document, 'embedding_pgvector', None),
+        result_document.embedding_projection_hash,
+        result_document.embedding_projected_at,
+    ) == result_document_fields
+    assert result_document.stale is False
+    assert source_document.stale is True
+    assert list(WorkflowWork.objects.filter(id__in=embedding_work_ids).values().order_by('id')) == embedding_work_before
+
+
+@pytest.mark.django_db
+def test_memory_fence_for_version_n_cannot_mutate_version_n_plus_one() -> None:
+    candidate, _source, _scope = _provenanced_candidate('version-fence')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    stale_fence = _transitions().build_memory_fence(promoted.memory)
+    revised = ReviseMemory().execute(
+        ReviseMemoryInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:revise:{promoted.memory.id}:v1'),
+            memory_fence=stale_fence,
+            title='Version N plus one',
+            body='Version N plus one body',
+        )
+    )
+    before = _lineage_shape(candidate.project_id)
+    with pytest.raises(Exception, match='stale_decision'):
+        RefuteMemory().execute(
+            MemoryStateInput(
+                request=_request_for(candidate, key=f'request:{uuid.uuid4()}:refute:{promoted.memory.id}:v1'),
+                memory_fence=stale_fence,
+            )
+        )
+    promoted.memory.refresh_from_db()
+    assert promoted.memory.current_transition_id == revised.transition.id
+    assert promoted.memory.current_version == revised.memory_version.version
+    assert _lineage_shape(candidate.project_id) == before
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_refute_restore_concurrency_serializes_to_one_coherent_state() -> None:
+    candidate, _source, _scope = _provenanced_candidate('refute-restore')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    refute = MemoryStateInput(
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:refute:{promoted.memory.id}:v1'),
+        memory_fence=_transitions().build_memory_fence(promoted.memory),
+    )
+    RefuteMemory().execute(refute)
+    promoted.memory.refresh_from_db()
+    restore = MemoryStateInput(
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:restore:{promoted.memory.id}:v1'),
+        memory_fence=_transitions().build_memory_fence(promoted.memory),
+    )
+    stale_refute = replace(
+        refute,
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:refute:{promoted.memory.id}:v1'),
+    )
+    barrier = threading.Barrier(2)
+
+    def worker(command: object, payload: MemoryStateInput) -> tuple[object | None, BaseException | None]:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=10)
+            return command.execute(payload), None
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            return None, error
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(worker, (RestoreMemory(), RefuteMemory()), (restore, stale_refute)))
+    assert sum(result is not None for result, _error in results) == 1
+    assert sum(getattr(error, 'code', None) == 'stale_decision' for _result, error in results) == 1
+    promoted.memory.refresh_from_db()
+    document = RetrievalDocument.objects.get(
+        memory=promoted.memory,
+        memory_version__version=promoted.memory.current_version,
+    )
+    assert document.refuted == promoted.memory.refuted
+    assert document.stale == promoted.memory.stale
+    assert promoted.memory.status in (MemoryStatus.APPROVED, MemoryStatus.REFUTED)
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_supersede_restore_concurrency_serializes_to_one_coherent_state() -> None:
+    loser_candidate, source, _scope = _provenanced_candidate('supersede-restore')
+    loser_result = _transitions().PromoteMemoryCandidate().execute(_request(loser_candidate))
+    winner_candidate, _winner_source = _candidate_in_scope(
+        loser_candidate,
+        source,
+        title='Supersede restore winner',
+        body='Supersede restore winner body',
+    )
+    old_loser_fence = _transitions().build_memory_fence(loser_result.memory)
+    supersede = SupersedeMemoryWithCandidateInput(
+        request=_request_for(winner_candidate, key=f'request:{uuid.uuid4()}:supersede:{winner_candidate.id}:v1'),
+        candidate_fence=_candidate_fence_for(winner_candidate),
+        loser_memory_fence=old_loser_fence,
+    )
+    restore = MemoryStateInput(
+        request=_request_for(loser_candidate, key=f'request:{uuid.uuid4()}:restore:{loser_result.memory.id}:v1'),
+        memory_fence=old_loser_fence,
+    )
+    barrier = threading.Barrier(2)
+
+    def worker(command: object, payload: object) -> tuple[object | None, BaseException | None]:
+        close_old_connections()
+        try:
+            barrier.wait(timeout=10)
+            return command.execute(payload), None
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            return None, error
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(worker, (SupersedeMemoryWithCandidate(), RestoreMemory()), (supersede, restore)))
+    assert sum(result is not None for result, _error in results) == 1
+    failures = [getattr(error, 'code', None) for _result, error in results if error is not None]
+    assert failures and failures[0] in {'memory_state', 'stale_decision'}
+    loser_result.memory.refresh_from_db()
+    document = RetrievalDocument.objects.get(memory=loser_result.memory, memory_version__version=1)
+    assert loser_result.memory.stale is True
+    assert document.stale is True
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            project_id=loser_candidate.project_id,
+            transition_type='supersede',
+        )
+        .count()
+        == 1
+    )
+
+
+@pytest.mark.django_db
+def test_merge_preserves_both_histories_and_exact_relational_provenance() -> None:
+    first, second, first_result, second_result = _promoted_pair('merge-provenance')
+    result = MergeMemories().execute(
+        MergeMemoriesInput(
+            request=_request_for(first, key=f'request:{uuid.uuid4()}:merge:{first.id}:v1'),
+            source_memory_fence=_transitions().build_memory_fence(second_result.memory),
+            result_memory_fence=_transitions().build_memory_fence(first_result.memory),
+            title='Merged memory',
+            body='Merged memory body',
+        )
+    )
+    source_rows = _model('MemoryVersionSource').objects.filter(memory_version_id=result.memory_version.id)
+    assert source_rows.filter(source_memory_version_id=first_result.memory_version.id).exists()
+    assert source_rows.filter(source_memory_version_id=second_result.memory_version.id).exists()
+    assert first_result.memory.id != second_result.memory.id
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            memory_id=first_result.memory.id,
+            transition_type='promote',
+        )
+        .exists()
+    )
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            memory_id=second_result.memory.id,
+            transition_type='promote',
+        )
+        .exists()
+    )
+    assert result.transition.semantic_link.link_type == LinkType.NARROWED_BY
+    assert result.transition.from_version_id == second_result.memory_version.id
+    assert result.transition.result_version_id == result.memory_version.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('boundary', ('link', 'conflict', 'audit', 'transition'))
+def test_conflict_open_fault_leaves_none_or_all_durable_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    candidate, source, _scope = _provenanced_candidate(f'conflict-open-{boundary}')
+    memory_result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    compared, _compared_source = _candidate_in_scope(
+        candidate,
+        source,
+        title=f'Conflict candidate {boundary}',
+        body=f'Conflict body {boundary}',
+    )
+    data = OpenMemoryConflictInput(
+        request=_request_for(compared, key=f'request:{uuid.uuid4()}:conflict-open:{compared.id}:v1'),
+        candidate_fence=_candidate_fence_for(compared),
+        memory_fence=_transitions().build_memory_fence(memory_result.memory),
+        evidence_hash='a' * 64,
+        redacted_reason='conflicting evidence',
+    )
+    before = _lineage_shape(candidate.project_id)
+
+    def fault(point: str) -> None:
+        if point == boundary:
+            raise InjectedPromotionFaultError(point)
+
+    monkeypatch.setattr(_transitions(), '_fault_boundary', fault)
+    with pytest.raises(InjectedPromotionFaultError, match=boundary):
+        OpenMemoryConflict().execute(data)
+    after = _lineage_shape(candidate.project_id)
+    complete_delta = {
+        **before,
+        'transitions': before['transitions'] + 1,
+        'links': before['links'] + 1,
+        'audits': before['audits'] + 1,
+        'conflicts': before['conflicts'] + 1,
+    }
+    assert after in (before, complete_delta)
+    conflict_rows = MemoryConflict.objects.filter(candidate=compared, memory=memory_result.memory)
+    if after == before:
+        assert not conflict_rows.exists()
+        assert not MemoryLink.objects.filter(
+            project_id=candidate.project_id,
+            link_type=LinkType.CONFLICTS_WITH,
+        ).exists()
+    else:
+        conflict = conflict_rows.get()
+        assert conflict.opened_transition.transition_type == 'conflict_open'
+        assert conflict.semantic_link.link_type == LinkType.CONFLICTS_WITH
+        assert conflict.resolved_transition_id is None
+
+
+@pytest.mark.django_db
+def test_conflict_open_replay_is_idempotent_and_link_delete_cannot_remove_evidence() -> None:
+    candidate, source, _scope = _provenanced_candidate('conflict-replay')
+    memory_result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    compared, _source = _candidate_in_scope(candidate, source, title='Conflict replay', body='Conflict replay body')
+    data = OpenMemoryConflictInput(
+        request=_request_for(compared, key=f'request:{uuid.uuid4()}:conflict-open:{compared.id}:v1'),
+        candidate_fence=_candidate_fence_for(compared),
+        memory_fence=_transitions().build_memory_fence(memory_result.memory),
+        evidence_hash='b' * 64,
+        redacted_reason='replayable conflict',
+    )
+    first = OpenMemoryConflict().execute(data)
+    replay = OpenMemoryConflict().execute(data)
+    assert replay.id == first.id
+    assert MemoryConflict.objects.filter(candidate=compared, memory=memory_result.memory).count() == 1
+    link = MemoryLink.objects.get(memory_conflict__candidate=compared)
+    with pytest.raises(ProtectedError):
+        link.delete()
+    assert MemoryConflict.objects.filter(id=first.id).exists()
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('boundary', ('resolution', 'conflict', 'audit', 'transition'))
+def test_conflict_resolution_fault_closes_all_or_none_with_one_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    first_candidate, source, _scope = _provenanced_candidate(f'conflict-resolve-{boundary}')
+    first_memory = _transitions().PromoteMemoryCandidate().execute(_request(first_candidate))
+    second_candidate, _second_source = _candidate_in_scope(
+        first_candidate,
+        source,
+        title=f'Conflict second memory {boundary}',
+        body=f'Conflict second memory body {boundary}',
+    )
+    second_memory = _transitions().PromoteMemoryCandidate().execute(_request(second_candidate))
+    candidate, _conflict_source = _candidate_in_scope(
+        first_candidate,
+        source,
+        title=f'Conflict candidate {boundary}',
+        body=f'Conflict candidate body {boundary}',
+    )
+    for index, memory_result in enumerate((first_memory, second_memory)):
+        OpenMemoryConflict().execute(
+            OpenMemoryConflictInput(
+                request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:{index}:v1'),
+                candidate_fence=_candidate_fence_for(candidate),
+                memory_fence=_transitions().build_memory_fence(memory_result.memory),
+                evidence_hash=f'{index + 1}' * 64,
+                redacted_reason='multiple conflict evidence',
+            )
+        )
+    open_conflicts = tuple(MemoryConflict.objects.filter(candidate=candidate).order_by('id'))
+    data = ResolveMemoryConflictInput(
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-resolve:{candidate.id}:v1'),
+        candidate_fence=_candidate_fence_for(candidate),
+        conflict_ids=tuple(conflict.id for conflict in open_conflicts),
+        conflict_memory_fences=tuple(_transitions().build_memory_fence(conflict.memory) for conflict in open_conflicts),
+        resolution='reject_candidate',
+    )
+
+    def fault(point: str) -> None:
+        if point == boundary:
+            raise InjectedPromotionFaultError(point)
+
+    monkeypatch.setattr(_transitions(), '_fault_boundary', fault)
+    with pytest.raises(InjectedPromotionFaultError, match=boundary):
+        ResolveMemoryConflict().execute(data)
+    rows = list(MemoryConflict.objects.filter(id__in=data.conflict_ids))
+    assert all(row.resolved_transition_id is None for row in rows) or all(
+        row.resolved_transition_id is not None and row.resolution == 'reject_candidate' for row in rows
+    )
+
+
+@pytest.mark.django_db
+def test_conflict_resolution_replay_closes_the_complete_set_once() -> None:
+    candidate, source, _scope = _provenanced_candidate('conflict-resolve-replay')
+    memory_result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    compared, _compared_source = _candidate_in_scope(
+        candidate,
+        source,
+        title='Conflict target',
+        body='Conflict target body',
+    )
+    conflict = OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=_request_for(compared, key=f'request:{uuid.uuid4()}:conflict-open:{compared.id}:v1'),
+            candidate_fence=_candidate_fence_for(compared),
+            memory_fence=_transitions().build_memory_fence(memory_result.memory),
+            evidence_hash='c' * 64,
+            redacted_reason='one conflict',
+        )
+    )
+    data = ResolveMemoryConflictInput(
+        request=_request_for(compared, key=f'request:{uuid.uuid4()}:conflict-resolve:{compared.id}:v1'),
+        candidate_fence=_candidate_fence_for(compared),
+        conflict_ids=(conflict.id,),
+        conflict_memory_fences=(_transitions().build_memory_fence(memory_result.memory),),
+        resolution='reject_candidate',
+    )
+    first = ResolveMemoryConflict().execute(data)
+    replay = ResolveMemoryConflict().execute(data)
+    assert replay.duplicate is True
+    assert replay.transition.id == first.transition.id
+    conflict_row = MemoryConflict.objects.get(id=conflict.id)
+    assert conflict_row.resolved_transition_id == first.transition.id
+    assert MemoryConflict.objects.filter(resolved_transition_id=first.transition.id).count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('resolution', ('publish_candidate', 'merge_candidate', 'supersede_memory', 'reject_candidate'))
+def test_conflict_resolution_outcomes_are_typed_and_retain_links(resolution: str) -> None:
+    candidate, conflict = _open_single_conflict(f'conflict-outcome-{resolution}')
+    selected_fence = _transitions().build_memory_fence(conflict.memory)
+    data = ResolveMemoryConflictInput(
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-resolve:{candidate.id}:v1'),
+        candidate_fence=_candidate_fence_for(candidate),
+        conflict_ids=(conflict.id,),
+        conflict_memory_fences=(selected_fence,),
+        resolution=resolution,
+        selected_memory_fence=selected_fence if resolution in ('merge_candidate', 'supersede_memory') else None,
+        title=f'Resolved {resolution}',
+        body=f'Resolved body {resolution}',
+    )
+    result = ResolveMemoryConflict().execute(data)
+    candidate.refresh_from_db()
+    conflict.refresh_from_db()
+    assert conflict.resolved_transition_id == result.transition.id
+    assert conflict.resolution == resolution
+    assert conflict.semantic_link_id is not None
+    assert MemoryLink.objects.filter(id=conflict.semantic_link_id).exists()
+    if resolution == 'reject_candidate':
+        assert candidate.status == CandidateStatus.REJECTED
+    else:
+        assert candidate.status == CandidateStatus.PROMOTED
+    if resolution == 'supersede_memory':
+        conflict.memory.refresh_from_db()
+        assert conflict.memory.stale is True
+    if resolution == 'merge_candidate':
+        assert result.memory.id == conflict.memory_id
+
+
+@pytest.mark.django_db
+def test_foreign_scope_cannot_satisfy_or_mutate_transition_and_conflict_rows() -> None:
+    target, source, _scope = _provenanced_candidate('foreign-lineage-target')
+    target_result = _transitions().PromoteMemoryCandidate().execute(_request(target))
+    foreign, _foreign_source, _foreign_scope = _provenanced_candidate('foreign-lineage-source')
+    foreign_result = _transitions().PromoteMemoryCandidate().execute(_request(foreign))
+    foreign_candidate, _source = _candidate_in_scope(
+        target,
+        source,
+        title='Foreign candidate input',
+        body='Foreign candidate input body',
+    )
+    request = _request_for(foreign_candidate, key=f'request:{uuid.uuid4()}:conflict-open:{foreign_candidate.id}:v1')
+    request = replace(
+        request,
+        scope=replace(
+            request.scope,
+            organization_id=foreign.organization_id,
+            project_id=foreign.project_id,
+        ),
+    )
+    before_target = _lineage_shape(target.project_id)
+    with pytest.raises(Exception, match='scope'):
+        OpenMemoryConflict().execute(
+            OpenMemoryConflictInput(
+                request=request,
+                candidate_fence=_candidate_fence_for(foreign_candidate),
+                memory_fence=_transitions().build_memory_fence(target_result.memory),
+                evidence_hash='d' * 64,
+                redacted_reason='foreign scope',
+            )
+        )
+    with pytest.raises(Exception, match='scope'):
+        MergeMemories().execute(
+            MergeMemoriesInput(
+                request=request,
+                source_memory_fence=_transitions().build_memory_fence(foreign_result.memory),
+                result_memory_fence=_transitions().build_memory_fence(target_result.memory),
+                title='foreign merge',
+                body='foreign merge body',
+            )
+        )
+    assert _lineage_shape(target.project_id) == before_target
+
+
+@pytest.mark.django_db
+def test_remaining_typed_lineage_commands_commit_named_transitions() -> None:
+    candidate, source, _scope = _provenanced_candidate('typed-lineage-commands')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+
+    revise_candidate, _revise_source = _candidate_in_scope(
+        candidate,
+        source,
+        title='Revision candidate',
+        body='Revision candidate body',
+    )
+    revised = ReviseMemoryFromCandidate().execute(
+        ReviseMemoryFromCandidateInput(
+            request=_request_for(
+                revise_candidate,
+                key=f'request:{uuid.uuid4()}:revise-candidate:{revise_candidate.id}:v1',
+            ),
+            candidate_fence=_candidate_fence_for(revise_candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title='Revised from candidate',
+            body='Revised from candidate body',
+        )
+    )
+    merge_candidate, _merge_source = _candidate_in_scope(
+        candidate,
+        source,
+        title='Merge evidence candidate',
+        body='Merge evidence candidate body',
+    )
+    merged_candidate = MergeMemoryCandidate().execute(
+        MergeMemoryCandidateInput(
+            request=_request_for(
+                merge_candidate,
+                key=f'request:{uuid.uuid4()}:merge-candidate:{merge_candidate.id}:v1',
+            ),
+            candidate_fence=_candidate_fence_for(merge_candidate),
+            memory_fence=_transitions().build_memory_fence(revised.memory),
+            title='Merged candidate result',
+            body='Merged candidate result body',
+        )
+    )
+    digest = PublishDigestMemory().execute(
+        PublishDigestMemoryInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:publish-digest:{candidate.id}:v1'),
+            source_memory_fences=(_transitions().build_memory_fence(merged_candidate.memory),),
+            title='Digest publication',
+            body='Digest publication body',
+            work_claim=None,
+        )
+    )
+    state_memory = digest.memory
+    for command, expected_type in (
+        (MarkMemoryStale(), 'mark_stale'),
+        (RefuteMemory(), 'refute'),
+        (RestoreMemory(), 'restore'),
+        (ArchiveMemory(), 'archive'),
+    ):
+        state_memory.refresh_from_db()
+        result = command.execute(
+            MemoryStateInput(
+                request=_request_for(candidate, key=f'request:{uuid.uuid4()}:{expected_type}:{state_memory.id}:v1'),
+                memory_fence=_transitions().build_memory_fence(state_memory),
+            )
+        )
+        assert result.transition.transition_type == expected_type
+        state_memory = result.memory
+
+    first, second, first_result, second_result = _promoted_pair('typed-supersede-memories')
+    superseded = SupersedeMemories().execute(
+        SupersedeMemoriesInput(
+            request=_request_for(first, key=f'request:{uuid.uuid4()}:supersede-memories:{first.id}:v1'),
+            source_memory_fence=_transitions().build_memory_fence(first_result.memory),
+            result_memory_fence=_transitions().build_memory_fence(second_result.memory),
+        )
+    )
+    assert superseded.transition.transition_type == 'supersede'
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            project_id=candidate.project_id,
+            transition_type__in=('revise', 'merge', 'publish_digest', 'mark_stale', 'refute', 'restore', 'archive'),
+        )
+        .count()
+        >= 7
     )

@@ -20,6 +20,7 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryConflict,
     MemoryLink,
     MemoryVersion,
     Organization,
@@ -426,6 +427,8 @@ class CurateMemoryCandidate:
             return self._replay(candidate)
         if candidate.status != CandidateStatus.PROPOSED:
             raise MemoryWorkerError('Only proposed memory candidates can be curated')
+        if self._has_unresolved_conflict(candidate):
+            return CurateMemoryCandidateResult(decision='held_conflict', candidate=candidate, memory=None)
 
         if is_low_signal(candidate):
             return self._reject(candidate, data)
@@ -578,6 +581,73 @@ class CurateMemoryCandidate:
         except MemoryCandidate.DoesNotExist as error:
             raise MemoryWorkerError('memory candidate not found') from error
 
+    def _has_unresolved_conflict(self, candidate: MemoryCandidate) -> bool:
+        return MemoryConflict.objects.filter(
+            candidate_id=candidate.id,
+            resolved_transition__isnull=True,
+        ).exists()
+
+    def _typed_candidate_fence(self, candidate: MemoryCandidate) -> object:
+        from engram.memory.candidate_decision_work import evidence_manifest
+        from engram.memory.transitions import CandidateFence
+
+        _entries, manifest_hash = evidence_manifest(candidate)
+        return CandidateFence(
+            candidate_id=candidate.id,
+            candidate_content_hash=candidate.content_hash,
+            evidence_manifest_hash=manifest_hash,
+        )
+
+    def _typed_request(
+        self,
+        candidate: MemoryCandidate,
+        data: CurateMemoryCandidateInput,
+        *,
+        action: str,
+        reason: str,
+        memory_id: uuid.UUID | None = None,
+    ) -> object:
+        from engram.memory.transitions import TransitionRequest, TransitionScope
+
+        subject_id = memory_id or candidate.id
+        key = f'request:curator:{candidate.id}:{action}:{subject_id}:v1'
+        return TransitionRequest(
+            scope=TransitionScope(
+                organization_id=candidate.organization_id,
+                project_id=candidate.project_id,
+                team_id=candidate.team_id,
+            ),
+            idempotency_key=key,
+            actor_type='system',
+            actor_id='curator',
+            capability='memories:review',
+            request_id=f'curator:{candidate.id}',
+            correlation_id=data.correlation_id,
+            reason=reason,
+            origin='curator',
+        )
+
+    def _typed_evidence_hash(self, candidate: MemoryCandidate, memory: Memory) -> str:
+        from engram.memory.candidate_decision_work import evidence_manifest
+
+        _entries, manifest_hash = evidence_manifest(candidate)
+        memory_version_id = (
+            MemoryVersion.objects.filter(memory_id=memory.id, version=memory.current_version)
+            .values_list('id', flat=True)
+            .first()
+        )
+        payload = {
+            'schema': 'memory_conflict_evidence/v1',
+            'candidate_id': str(candidate.id),
+            'candidate_content_hash': candidate.content_hash,
+            'evidence_manifest_hash': manifest_hash,
+            'memory_id': str(memory.id),
+            'memory_version_id': str(memory_version_id) if memory_version_id is not None else None,
+            'memory_body_sha256': hashlib.sha256(memory.body.encode()).hexdigest(),
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+        return hashlib.sha256(canonical).hexdigest()
+
     def _replay(self, candidate: MemoryCandidate) -> CurateMemoryCandidateResult:
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
 
@@ -600,6 +670,8 @@ class CurateMemoryCandidate:
         judge_context: dict[str, object] | None = None,
         threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
+        if self._has_unresolved_conflict(candidate):
+            return CurateMemoryCandidateResult(decision='held_conflict', candidate=candidate, memory=None)
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
         if not promotion.duplicate:
             _audit_curator_action(
@@ -632,10 +704,13 @@ class CurateMemoryCandidate:
         threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         already_settled = False
+        held_conflict = False
         with transaction.atomic():
             locked = self._lock_candidate(candidate.id)
             if locked.status != CandidateStatus.PROPOSED:
                 already_settled = True
+            elif self._has_unresolved_conflict(locked):
+                held_conflict = True
             else:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
@@ -654,6 +729,8 @@ class CurateMemoryCandidate:
 
         if already_settled:
             return self._reconcile_already_handled(locked)
+        if held_conflict:
+            return CurateMemoryCandidateResult(decision='held_conflict', candidate=locked, memory=None)
 
         return CurateMemoryCandidateResult(decision='rejected', candidate=locked, memory=None)
 
@@ -671,10 +748,13 @@ class CurateMemoryCandidate:
     ) -> CurateMemoryCandidateResult:
         metadata_reason = f'escalation:{reason}'
         already_settled = False
+        held_conflict = False
         with transaction.atomic():
             locked = self._lock_candidate(candidate.id)
             if locked.status != CandidateStatus.PROPOSED:
                 already_settled = True
+            elif self._has_unresolved_conflict(locked):
+                held_conflict = True
             elif not self._has_escalation_audit(locked):
                 _audit_curator_action(
                     candidate=locked,
@@ -686,6 +766,8 @@ class CurateMemoryCandidate:
 
         if already_settled:
             return self._reconcile_already_handled(locked)
+        if held_conflict:
+            return CurateMemoryCandidateResult(decision='held_conflict', candidate=locked, memory=None)
 
         return CurateMemoryCandidateResult(decision='held_escalation', candidate=locked, memory=None)
 
@@ -711,6 +793,32 @@ class CurateMemoryCandidate:
         threshold: Decimal | None = None,
     ) -> CurateMemoryCandidateResult:
         stored_reason = redact_text(reason)[:200]
+        if candidate.decision_work_contract_version == 1:
+            from engram.memory.transitions import OpenMemoryConflict, OpenMemoryConflictInput, build_memory_fence
+
+            _conflict = OpenMemoryConflict().execute(
+                OpenMemoryConflictInput(
+                    request=self._typed_request(
+                        candidate,
+                        data,
+                        action='conflict_open',
+                        memory_id=existing_memory.id,
+                        reason=stored_reason,
+                    ),
+                    candidate_fence=self._typed_candidate_fence(candidate),
+                    memory_fence=build_memory_fence(existing_memory),
+                    evidence_hash=self._typed_evidence_hash(candidate, existing_memory),
+                    redacted_reason=stored_reason,
+                ),
+            )
+            locked = self._read_candidate(candidate.id)
+            return CurateMemoryCandidateResult(
+                decision='held_conflict',
+                candidate=locked,
+                memory=None,
+                near_dup_score=score,
+            )
+
         already_settled = False
         with transaction.atomic():
             locked = self._lock_candidate(candidate.id)
@@ -769,6 +877,38 @@ class CurateMemoryCandidate:
     ) -> CurateMemoryCandidateResult:
         document, score = near_dup
         loser = document.memory
+        if candidate.decision_work_contract_version == 1:
+            from engram.memory.transitions import (
+                SupersedeMemoryWithCandidate,
+                SupersedeMemoryWithCandidateInput,
+                build_memory_fence,
+            )
+
+            transition_result = SupersedeMemoryWithCandidate().execute(
+                SupersedeMemoryWithCandidateInput(
+                    request=self._typed_request(
+                        candidate,
+                        data,
+                        action='supersede',
+                        reason='curator:supersede',
+                    ),
+                    candidate_fence=self._typed_candidate_fence(candidate),
+                    loser_memory_fence=build_memory_fence(loser),
+                ),
+            )
+            winner = self._read_candidate(candidate.id)
+            loser.refresh_from_db()
+            return CurateMemoryCandidateResult(
+                decision='superseded',
+                candidate=winner,
+                memory=transition_result.memory,
+                memory_version=transition_result.memory_version,
+                retrieval_document=transition_result.retrieval_document,
+                superseded_memory=loser,
+                duplicate=transition_result.duplicate,
+                near_dup_score=score,
+            )
+
         promotion = PromoteMemoryCandidate().execute(PromoteMemoryCandidateInput(candidate_id=candidate.id))
         if promotion.duplicate or loser.id == promotion.memory.id:
             return CurateMemoryCandidateResult(

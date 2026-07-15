@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from django.db import transaction
+from django.db import models, transaction
 from django.db.transaction import TransactionManagementError
 from django.utils import timezone
 
@@ -156,7 +156,7 @@ def write_exact_memory_projection(
     document.symbols = values['symbols']
     document.exact_terms = values['exact_terms']
     document.full_text = values['full_text']
-    document.stale = False
+    document.stale = bool(values['stale'])
     document.refuted = bool(values['refuted'])
     document.metadata = {'projection': values}
     document.projection_contract_version = 1
@@ -196,7 +196,11 @@ def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[Wo
 
 
 def _load_current_transition(memory: Memory, transition_id: uuid.UUID) -> MemoryTransition | None:
-    return MemoryTransition.objects.filter(id=transition_id, memory_id=memory.id).first()
+    return (
+        MemoryTransition.objects.filter(id=transition_id)
+        .filter(models.Q(memory_id=memory.id) | models.Q(result_memory_id=memory.id))
+        .first()
+    )
 
 
 def _transition_matches_projection(
@@ -205,18 +209,32 @@ def _transition_matches_projection(
     version: MemoryVersion,
     work: WorkflowWork,
 ) -> bool:
+    affected_projection = all(
+        (
+            transition.memory_id == document.memory_id,
+            transition.to_version_id == version.id,
+            transition.exact_document_id == document.id,
+        )
+    )
+    result_projection = all(
+        (
+            transition.result_memory_id == document.memory_id,
+            transition.result_version_id == version.id,
+            transition.result_exact_document_id == document.id,
+        )
+    )
+    work_matches = (result_projection and transition.embedding_work_id == work.id) or (
+        affected_projection
+        and transition.memory_id != transition.result_memory_id
+        and transition.embedding_work_id != work.id
+    )
     return all(
         (
             transition.organization_id == document.organization_id,
             transition.project_id == document.project_id,
             transition.team_id == document.team_id,
-            transition.memory_id == document.memory_id,
-            transition.result_memory_id == document.memory_id,
-            transition.to_version_id == version.id,
-            transition.result_version_id == version.id,
-            transition.exact_document_id == document.id,
-            transition.result_exact_document_id == document.id,
-            transition.embedding_work_id == work.id,
+            affected_projection or result_projection,
+            work_matches,
         )
     )
 
@@ -246,7 +264,7 @@ def _projection_is_current(
         return False
     if not _memory_version_matches_projection(memory, version):
         return False
-    return not (memory.stale or memory.refuted)
+    return memory.status == 'approved' and not (memory.stale or memory.refuted)
 
 
 def _snapshot_uuid(work: WorkflowWork, key: str) -> uuid.UUID | None:

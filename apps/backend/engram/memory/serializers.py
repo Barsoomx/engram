@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from rest_framework import serializers
 
+from engram.core.models import LinkType
+
 MEMORY_FEEDBACK_REASON_MAX_LENGTH = 2000
 MEMORY_FEEDBACK_METADATA_MAX_LENGTH = 255
 MEMORY_REPOSITORY_URL_MAX_LENGTH = 1024
@@ -74,7 +76,7 @@ class MemoryLinkSerializer(_RepositoryUrlMixin, serializers.Serializer):
     project_id = serializers.UUIDField(required=False, allow_null=True)
     repository_url = serializers.CharField(required=False, allow_blank=True, default='')
     team_id = serializers.UUIDField(required=False, allow_null=True)
-    link_type = serializers.ChoiceField(choices=('file', 'symbol', 'commit', 'issue'))
+    link_type = serializers.ChoiceField(choices=LinkType.values)
     target = serializers.CharField(max_length=MEMORY_LINK_TARGET_MAX_LENGTH, allow_blank=False)
     label = serializers.CharField(
         required=False,

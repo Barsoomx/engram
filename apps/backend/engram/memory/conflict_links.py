@@ -12,8 +12,13 @@ def conflict_candidate_target(candidate_id: uuid.UUID) -> str:
 
 
 def clear_candidate_conflict_links(candidate: MemoryCandidate) -> None:
+    # Canonical CP4 conflict links are protected by their relational owners.
+    # Only pre-cutover string links, which have no durable owner, are cleanup-safe.
     MemoryLink.objects.filter(
         organization=candidate.organization,
+        project=candidate.project,
         link_type=LinkType.CONFLICTS_WITH,
         target=conflict_candidate_target(candidate.id),
+        memory_conflict__isnull=True,
+        memory_transition__isnull=True,
     ).delete()

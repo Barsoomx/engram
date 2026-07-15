@@ -23,7 +23,19 @@ from engram.context.context_api_tests import (
     create_approved_memory_document,
     create_project_scope,
 )
-from engram.core.models import AuditEvent, MemoryLink, Organization, Project, Team, VisibilityScope
+from engram.core.models import (
+    AuditEvent,
+    CandidateStatus,
+    MemoryCandidate,
+    MemoryConflict,
+    MemoryLink,
+    MemoryTransition,
+    MemoryTransitionType,
+    Organization,
+    Project,
+    Team,
+    VisibilityScope,
+)
 
 AGENT_RAW_KEY = 'egk_test_memory_link_agent_0123456789abcdefghijklmnopqrstuvwxyz'
 AGENT_CAPS = ('memories:review', 'memories:read', 'projects:agent')
@@ -82,6 +94,72 @@ def link_payload(project: Project, **overrides: object) -> dict[str, object]:
     payload.update(overrides)
 
     return payload
+
+
+def _protect_link_with_transition(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    memory: object,
+    version: object,
+    document: object,
+    link_type: str,
+    *,
+    candidate: MemoryCandidate | None = None,
+) -> MemoryLink:
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type=link_type,
+        target=f'{link_type}:protected-target',
+        label='protected semantic link',
+    )
+    audit = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        event_type='MemoryTransitionCommitted',
+        actor_type='test',
+        actor_id='memory-link-tests',
+    )
+    transition = MemoryTransition.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        transition_type=(
+            MemoryTransitionType.CONFLICT_OPEN if candidate is not None else MemoryTransitionType.SUPERSEDE
+        ),
+        idempotency_key=f'protected-link:{link.id}',
+        request_fingerprint='a' * 64,
+        candidate=candidate,
+        memory=memory,
+        from_version=version,
+        to_version=version,
+        result_memory=memory,
+        result_version=version,
+        exact_document=document,
+        result_exact_document=document,
+        semantic_link=link,
+        audit_event=audit,
+        provenance_hash='b' * 64,
+    )
+    if candidate is not None:
+        MemoryConflict.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            candidate=candidate,
+            memory=memory,
+            memory_version=version,
+            semantic_link=link,
+            opened_transition=transition,
+            evidence_hash='c' * 64,
+            resolution='',
+            resolved_at=None,
+        )
+
+    return link
 
 
 @pytest.mark.django_db
@@ -149,6 +227,45 @@ def test_create_memory_link_is_idempotent_for_same_target() -> None:
     assert first.json()['created'] is True
     assert second.json()['created'] is False
     assert MemoryLink.objects.filter(memory=memory).count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('link_type', ('file', 'symbol', 'commit', 'issue'))
+def test_generic_memory_link_api_accepts_only_ordinary_link_types(link_type: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, link_type=link_type, target=f'{link_type}:ordinary-target'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 201, response.json()
+    assert response.json()['link_type'] == link_type
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('link_type', ('narrowed_by', 'superseded_by', 'conflicts_with'))
+def test_generic_memory_link_api_rejects_transition_owned_types(link_type: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/links',
+        link_payload(project, link_type=link_type, target=f'{link_type}:transition-target'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'semantic_link_requires_transition'
+    assert not MemoryLink.objects.filter(memory=memory, link_type=link_type).exists()
 
 
 @pytest.mark.django_db
@@ -244,6 +361,101 @@ def test_delete_memory_link_removes_and_audits() -> None:
     assert audit.capability == 'memories:review'
     assert audit.metadata['memory_id'] == str(memory.id)
     assert RAW_KEY not in str(body)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('link_type', ('file', 'symbol', 'commit', 'issue'))
+def test_generic_memory_link_delete_accepts_ordinary_link_types(link_type: str) -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    link = MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        link_type=link_type,
+        target=f'{link_type}:ordinary-target',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(link.id), 'request_id': f'request-link-del-{link_type}'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()['link_type'] == link_type
+    assert not MemoryLink.objects.filter(id=link.id).exists()
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_maps_transition_protect_to_stable_conflict_response() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, version, document = create_approved_memory_document(organization, team, project)
+    link = _protect_link_with_transition(
+        organization,
+        project,
+        team,
+        memory,
+        version,
+        document,
+        'superseded_by',
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(link.id), 'request_id': 'request-link-del-protected-transition'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()['code'] == 'semantic_link_protected'
+    assert MemoryLink.objects.filter(id=link.id).exists()
+
+
+@pytest.mark.django_db
+def test_delete_memory_link_maps_conflict_protect_to_stable_conflict_response() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_review_capability(RAW_KEY)
+    memory, version, document = create_approved_memory_document(organization, team, project)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Protected conflict candidate',
+        body='Protected conflict candidate body',
+        status=CandidateStatus.PROPOSED,
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash='d' * 64,
+    )
+    link = _protect_link_with_transition(
+        organization,
+        project,
+        team,
+        memory,
+        version,
+        document,
+        'conflicts_with',
+        candidate=candidate,
+    )
+    client = APIClient()
+
+    response = client.delete(
+        f'/v1/memories/{memory.id}/links',
+        {'project_id': str(project.id), 'link_id': str(link.id), 'request_id': 'request-link-del-protected-conflict'},
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 409
+    assert response.json()['code'] == 'semantic_link_protected'
+    assert MemoryLink.objects.filter(id=link.id).exists()
+    assert MemoryConflict.objects.filter(semantic_link_id=link.id, resolved_transition__isnull=True).exists()
 
 
 @pytest.mark.django_db

@@ -124,10 +124,10 @@ def test_session_candidate_content_hash_has_one_neutral_canonical_definition() -
 @pytest.mark.django_db
 def test_production_late_source_adapter_is_idempotent_without_reopening_decision_work() -> None:
     from engram.memory import transitions
-    from engram.memory.transitions_tests import _provenanced_candidate, _request
+    from engram.memory.transitions_test_support import provenanced_candidate, transition_request
 
-    candidate, source, (organization, project, session) = _provenanced_candidate('distill-late-source')
-    promoted = transitions.PromoteMemoryCandidate().execute(_request(candidate))
+    candidate, source, (organization, project, session) = provenanced_candidate('distill-late-source')
+    promoted = transitions.PromoteMemoryCandidate().execute(transition_request(candidate))
     observation = create_observation(
         organization,
         project,
