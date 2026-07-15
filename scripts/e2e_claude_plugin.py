@@ -552,7 +552,8 @@ candidate = (
         status='proposed',
         decision_work_contract_version=1,
         title__startswith={json.dumps(GENERATION_TITLE_PREFIX)},
-        sources__observation__raw_event__event_type='session_end',
+        sources__source_kind='distillation',
+        sources__window__isnull=False,
     ).distinct().order_by('-created_at').first()
 )
 if candidate is None:
