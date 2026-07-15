@@ -227,6 +227,42 @@ def seed_existing_and_duplicate(
     return existing, duplicate
 
 
+def seed_atomic_existing_and_duplicate(
+    suffix: str,
+) -> tuple[Organization, Team, Project, Memory, MemoryCandidate]:
+    from engram.memory.transitions_tests import (
+        _candidate_in_scope,
+        _provenanced_candidate,
+        _request,
+        _transitions,
+    )
+
+    source_candidate, source, (organization, project, session) = _provenanced_candidate(suffix)
+    existing = _transitions().PromoteMemoryCandidate().execute(_request(source_candidate)).memory
+    duplicate, _duplicate_source = _candidate_in_scope(
+        source_candidate,
+        source,
+        title=f'Atomic duplicate {suffix}',
+        body=_LONG_BODY,
+    )
+
+    return organization, session.team, project, existing, duplicate
+
+
+def patch_atomic_near_duplicate(
+    monkeypatch: pytest.MonkeyPatch,
+    existing: Memory,
+    *,
+    score: float,
+) -> None:
+    document = RetrievalDocument.objects.get(memory=existing)
+    monkeypatch.setattr('engram.memory.curation.embed_candidate', lambda _candidate: [1.0])
+    monkeypatch.setattr(
+        'engram.memory.curation.find_near_duplicate',
+        lambda *_args, **_kwargs: (document, score),
+    )
+
+
 class _JudgeGatewayStub(FakeProviderGateway):
     def __init__(self, body: str) -> None:
         self._body = body
@@ -364,28 +400,12 @@ def test_embed_candidate_returns_vector_with_embedding_policy() -> None:
 
 
 @pytest.mark.django_db
-def test_curator_supersession_commits_one_typed_lineage_transition() -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+def test_curator_supersession_commits_one_typed_lineage_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, _project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-typed-supersession'
+    )
     set_curator_settings(organization)
-    existing = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='Retrieval ranking',
-            body=_LONG_BODY,
-            content_hash='hash-existing-lineage',
-        ),
-    )
-    duplicate = create_candidate(
-        organization,
-        team,
-        project,
-        title='Retrieval ranking',
-        body=_LONG_BODY,
-        content_hash='hash-duplicate-lineage',
-    )
+    patch_atomic_near_duplicate(monkeypatch, existing, score=0.970)
 
     result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
 
@@ -491,28 +511,12 @@ def test_curate_does_not_supersede_memory_in_another_org() -> None:
 
 
 @pytest.mark.django_db
-def test_curate_supersedes_existing_near_duplicate_memory() -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+def test_curate_supersedes_existing_near_duplicate_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, _team, _project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-near-duplicate'
+    )
     set_curator_settings(organization)
-    existing = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='Retrieval ranking',
-            body=_LONG_BODY,
-            content_hash='hash-existing',
-        ),
-    )
-    duplicate = create_candidate(
-        organization,
-        team,
-        project,
-        title='Retrieval ranking',
-        body=_LONG_BODY,
-        content_hash='hash-duplicate',
-    )
+    patch_atomic_near_duplicate(monkeypatch, existing, score=0.970)
 
     result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
 
@@ -565,11 +569,12 @@ def test_curate_rejects_low_signal_candidate_without_creating_memory() -> None:
 
 @pytest.mark.django_db
 def test_curate_reject_does_not_clear_durable_conflict_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-reject'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing, candidate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
 
     opened = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
@@ -818,11 +823,12 @@ def test_curate_judge_keep_both_promotes_clean_without_supersede() -> None:
 
 @pytest.mark.django_db
 def test_curate_judge_merge_supersedes_near_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-judge-merge'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "merge"}'))
 
     result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
@@ -904,11 +910,12 @@ def test_curate_judge_reject_applies_even_with_pre_existing_provider_call_record
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_opens_durable_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-open'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
 
     result = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
@@ -946,11 +953,12 @@ def test_curate_judge_contradicts_opens_durable_conflict(monkeypatch: pytest.Mon
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-replay'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
 
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
@@ -982,11 +990,12 @@ def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.Monkey
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_redacts_reason_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-redaction'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(
         monkeypatch,
         _JudgeGatewayStub(
@@ -1004,11 +1013,12 @@ def test_curate_judge_contradicts_redacts_reason_before_persisting(monkeypatch: 
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_truncates_stored_reason_to_200_chars(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-truncation'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     long_reason = 'x' * 250
     patch_judge_gateway(
         monkeypatch,
@@ -1075,11 +1085,12 @@ def test_curate_gray_band_without_judge_promotes_clean(monkeypatch: pytest.Monke
 
 @pytest.mark.django_db
 def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-above-threshold'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='0.850', llm_judge_enabled=True)
-    existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=0.970)
     patch_judge_gateway(monkeypatch, _ExplodingJudgeGateway())
 
     result = CurateMemoryCandidate().execute(
@@ -1326,11 +1337,12 @@ def test_curate_escalation_holds_even_when_curator_disabled(monkeypatch: pytest.
 
 @pytest.mark.django_db
 def test_plain_promotion_cannot_bypass_open_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project = create_scope()
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
+        'curator-conflict-promotion-guard'
+    )
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    _existing, duplicate = seed_existing_and_duplicate(organization, team, project)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=duplicate.id))
     conflict = MemoryConflict.objects.get(candidate=duplicate, resolved_transition__isnull=True)

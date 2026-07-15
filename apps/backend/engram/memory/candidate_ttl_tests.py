@@ -23,12 +23,10 @@ from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.curation_tests import (
     _JudgeGatewayStub,
-    create_candidate,
     create_curation_policy,
-    create_embedding_policy,
-    create_scope,
+    patch_atomic_near_duplicate,
     patch_judge_gateway,
-    promote_candidate,
+    seed_atomic_existing_and_duplicate,
     set_curator_settings,
 )
 from engram.memory.transitions import (
@@ -250,29 +248,10 @@ def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confiden
     settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
     settings.ENGRAM_CANDIDATE_TTL_BATCH = 500
     settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
-    organization, team, project = create_scope(suffix='ttl-conflict')
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-conflict')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='Existing claim',
-            body='The deployment gate requires a signed artifact.',
-            content_hash='ttl-existing-claim',
-        ),
-    )
-    candidate = create_candidate(
-        organization,
-        team,
-        project,
-        title='Existing claim',
-        body='The deployment gate allows unsigned artifacts.',
-        content_hash='ttl-conflicting-claim',
-        confidence='0.100',
-    )
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     opened = CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
     MemoryCandidate.objects.filter(id=candidate.id).update(
@@ -299,29 +278,10 @@ def test_ttl_locked_recheck_skips_candidate_with_conflict(
     settings: SettingsWrapper,
 ) -> None:
     settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    organization, team, project = create_scope(suffix='ttl-lock-conflict')
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-lock-conflict')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='Lock-protected claim',
-            body='The release requires an approved artifact.',
-            content_hash='ttl-lock-existing',
-        ),
-    )
-    candidate = create_candidate(
-        organization,
-        team,
-        project,
-        title='Lock-protected claim',
-        body='The release permits an unapproved artifact.',
-        content_hash='ttl-lock-candidate',
-        confidence='0.100',
-    )
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
 
@@ -341,29 +301,10 @@ def test_resolved_conflict_allows_later_ttl_noop_without_erasing_history(
     settings: SettingsWrapper,
 ) -> None:
     settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    organization, team, project = create_scope(suffix='ttl-resolved-conflict')
-    create_embedding_policy(organization, team, project)
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-resolved-conflict')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    existing = promote_candidate(
-        create_candidate(
-            organization,
-            team,
-            project,
-            title='Resolved claim',
-            body='The release requires an approved artifact.',
-            content_hash='ttl-resolved-existing',
-        ),
-    )
-    candidate = create_candidate(
-        organization,
-        team,
-        project,
-        title='Resolved claim',
-        body='The release permits an unapproved artifact.',
-        content_hash='ttl-resolved-candidate',
-        confidence='0.100',
-    )
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
     patch_judge_gateway(monkeypatch, _JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
     CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
     conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
