@@ -230,16 +230,16 @@ def seed_existing_and_duplicate(
 def seed_atomic_existing_and_duplicate(
     suffix: str,
 ) -> tuple[Organization, Team, Project, Memory, MemoryCandidate]:
-    from engram.memory.transitions_tests import (
-        _candidate_in_scope,
-        _provenanced_candidate,
-        _request,
-        _transitions,
+    from engram.memory.transitions_test_support import (
+        candidate_in_scope,
+        provenanced_candidate,
+        transition_request,
+        transitions_module,
     )
 
-    source_candidate, source, (organization, project, session) = _provenanced_candidate(suffix)
-    existing = _transitions().PromoteMemoryCandidate().execute(_request(source_candidate)).memory
-    duplicate, _duplicate_source = _candidate_in_scope(
+    source_candidate, source, (organization, project, session) = provenanced_candidate(suffix)
+    existing = transitions_module().PromoteMemoryCandidate().execute(transition_request(source_candidate)).memory
+    duplicate, _duplicate_source = candidate_in_scope(
         source_candidate,
         source,
         title=f'Atomic duplicate {suffix}',

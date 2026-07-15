@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import importlib
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import timedelta
-from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -27,10 +25,10 @@ from engram.core.models import (
     MemoryStatus,
     Observation,
     RetrievalDocument,
-    VisibilityScope,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowWork,
+    WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
@@ -38,11 +36,7 @@ from engram.memory.candidate_decision_work import ensure_candidate_decision_work
 from engram.memory.distillation_provenance import (
     candidate_source_anchors,
     canonical_source_manifest,
-    session_candidate_content_hash,
 )
-from engram.memory.distillation_window import materialize_distillation_window
-from engram.memory.observation_work_tests import create_scope
-from engram.memory.reconciler_test_support import ended_session_work
 from engram.memory.transitions import (
     ArchiveMemory,
     MarkMemoryStale,
@@ -68,6 +62,30 @@ from engram.memory.transitions import (
     SupersedeMemoryWithCandidate,
     SupersedeMemoryWithCandidateInput,
 )
+from engram.memory.transitions_test_support import (
+    candidate_fence_for as _candidate_fence_for,
+)
+from engram.memory.transitions_test_support import (
+    candidate_in_scope as _candidate_in_scope,
+)
+from engram.memory.transitions_test_support import (
+    open_single_conflict as _open_single_conflict,
+)
+from engram.memory.transitions_test_support import (
+    promoted_pair as _promoted_pair,
+)
+from engram.memory.transitions_test_support import (
+    provenanced_candidate as _provenanced_candidate,
+)
+from engram.memory.transitions_test_support import (
+    transition_request as _request,
+)
+from engram.memory.transitions_test_support import (
+    transition_request_for as _request_for,
+)
+from engram.memory.transitions_test_support import (
+    transitions_module as _transitions,
+)
 from engram.memory.work_execution import StaleWorkFenceError, claim_work
 from engram.memory.workflow_work import observation_content_digest
 
@@ -76,85 +94,10 @@ class InjectedPromotionFaultError(RuntimeError):
     pass
 
 
-def _transitions() -> Any:
-    return importlib.import_module('engram.memory.transitions')
-
-
 def _model(name: str) -> Any:
     from engram.core import models
 
     return getattr(models, name)
-
-
-def _provenanced_candidate(suffix: str = 'promotion') -> tuple[MemoryCandidate, Any, Any]:
-    organization, project, session = create_scope(suffix)
-    work = ended_session_work((organization, project, session))
-    window = materialize_distillation_window(work)
-    from engram.memory.invariant_queries_tests import _make_stage_history
-
-    stage, _primary = _make_stage_history((organization, project, session), window)
-    observation = Observation.objects.get(session=session, session_sequence=1)
-    title = f'Promotion candidate {suffix}'
-    body = f'Promotion body {suffix}'
-    candidate = MemoryCandidate.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        source_observation=observation,
-        title=title,
-        body=body,
-        status=CandidateStatus.PROPOSED,
-        visibility_scope=VisibilityScope.PROJECT,
-        evidence=[{'observation_id': str(observation.id)}],
-        content_hash=session_candidate_content_hash(session.id, title, body),
-        confidence=Decimal('0.900'),
-        decision_work_contract_version=1,
-    )
-    anchors = candidate_source_anchors(
-        observation,
-        observation_id=str(observation.id),
-        session_sequence=observation.session_sequence,
-        observation_digest=observation_content_digest(observation),
-    )
-    source = MemoryCandidateSource.objects.create(
-        organization=organization,
-        project=project,
-        team=session.team,
-        candidate=candidate,
-        window=window,
-        observation=observation,
-        stage=stage,
-        anchors=anchors,
-        anchors_hash=canonical_source_manifest(anchors),
-    )
-    return candidate, source, (organization, project, session)
-
-
-def _request(candidate: MemoryCandidate, *, key: str | None = None, reason: str = 'test promotion') -> Any:
-    transitions = _transitions()
-    scope = transitions.TransitionScope(
-        organization_id=candidate.organization_id,
-        project_id=candidate.project_id,
-        team_id=candidate.team_id,
-    )
-    request = transitions.TransitionRequest(
-        scope=scope,
-        idempotency_key=key or f'candidate:{candidate.id}:settle:v1',
-        actor_type='test',
-        actor_id='promotion-tests',
-        capability='memories:write',
-        request_id=str(uuid.uuid4()),
-        correlation_id=str(uuid.uuid4()),
-        reason=reason,
-        origin='promotion-tests',
-    )
-    _entries, manifest_hash = evidence_manifest(candidate)
-    fence = transitions.CandidateFence(
-        candidate_id=candidate.id,
-        candidate_content_hash=candidate.content_hash,
-        evidence_manifest_hash=manifest_hash,
-    )
-    return transitions.PromoteMemoryCandidateInput(request=request, candidate_fence=fence)
 
 
 def _counts(candidate: MemoryCandidate) -> dict[str, int]:
@@ -173,68 +116,6 @@ def _counts(candidate: MemoryCandidate) -> dict[str, int]:
         if model is not None:
             values[key] = model.objects.filter(project_id=candidate.project_id).count()
     return values
-
-
-def _candidate_in_scope(
-    base: MemoryCandidate,
-    source: MemoryCandidateSource,
-    *,
-    title: str,
-    body: str,
-) -> tuple[MemoryCandidate, MemoryCandidateSource]:
-    candidate = MemoryCandidate.objects.create(
-        organization_id=base.organization_id,
-        project_id=base.project_id,
-        team_id=base.team_id,
-        source_observation=base.source_observation,
-        title=title,
-        body=body,
-        status=CandidateStatus.PROPOSED,
-        visibility_scope=base.visibility_scope,
-        evidence=base.evidence,
-        content_hash=session_candidate_content_hash(base.source_observation.session_id, title, body),
-        confidence=base.confidence,
-        decision_work_contract_version=1,
-    )
-    candidate_source = MemoryCandidateSource.objects.create(
-        organization_id=base.organization_id,
-        project_id=base.project_id,
-        team_id=base.team_id,
-        candidate=candidate,
-        window=source.window,
-        observation=source.observation,
-        stage=source.stage,
-        anchors=source.anchors,
-        anchors_hash=source.anchors_hash,
-    )
-    return candidate, candidate_source
-
-
-def _candidate_fence_for(candidate: MemoryCandidate) -> Any:
-    _entries, manifest_hash = evidence_manifest(candidate)
-    return _transitions().CandidateFence(
-        candidate_id=candidate.id,
-        candidate_content_hash=candidate.content_hash,
-        evidence_manifest_hash=manifest_hash,
-    )
-
-
-def _request_for(candidate: MemoryCandidate, *, key: str, reason: str = 'lineage test') -> Any:
-    request = _request(candidate, key=key, reason=reason)
-    return request.request
-
-
-def _promoted_pair(suffix: str) -> tuple[MemoryCandidate, MemoryCandidate, Any, Any]:
-    first, source, _scope = _provenanced_candidate(suffix)
-    first_result = _transitions().PromoteMemoryCandidate().execute(_request(first))
-    second, _second_source = _candidate_in_scope(
-        first,
-        source,
-        title=f'Second memory {suffix}',
-        body=f'Second body {suffix}',
-    )
-    second_result = _transitions().PromoteMemoryCandidate().execute(_request(second))
-    return first, second, first_result, second_result
 
 
 def _lineage_shape(project_id: uuid.UUID) -> dict[str, int]:
@@ -406,6 +287,44 @@ def test_promotion_finishes_owning_work_claim_in_the_semantic_transaction() -> N
     assert work.execution_state == WorkflowWorkExecutionState.SETTLED
     assert run.status == WorkflowRunStatus.SUCCEEDED
     assert run.result_memory_id == result.memory.id
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('command_name', ('revise', 'state'))
+def test_unrelated_same_scope_claim_cannot_be_consumed_by_lineage_command(command_name: str) -> None:
+    candidate, source, _scope = _provenanced_candidate(f'unrelated-work-{command_name}')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+    unrelated, _unrelated_source = _candidate_in_scope(
+        candidate,
+        source,
+        title=f'Unrelated claimed work {command_name}',
+        body=f'Unrelated claimed work body {command_name}',
+    )
+    work, claim = _claim_candidate_decision_work(unrelated)
+    request = _request_for(candidate, key=f'request:{uuid.uuid4()}:{command_name}:{promoted.memory.id}:v1')
+    if command_name == 'revise':
+        command = ReviseMemory()
+        payload = ReviseMemoryInput(
+            request=request,
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title='Unrelated work revise',
+            body='Unrelated work revise body',
+            work_claim=claim,
+        )
+    else:
+        command = MarkMemoryStale()
+        payload = MemoryStateInput(
+            request=request,
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            work_claim=claim,
+        )
+
+    with pytest.raises(Exception, match='stale_decision'):
+        command.execute(payload)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
 
 
 @pytest.mark.django_db
@@ -610,6 +529,60 @@ def test_reverse_order_concurrent_lineage_commands_are_deadlock_free_and_one_fen
     assert sum(result is not None for result, _error in results) == 1
     assert Memory.objects.filter(project_id=first.project_id, stale=False).count() == 2
     assert _model('MemoryTransition').objects.filter(project_id=first.project_id, transition_type='merge').count() == 1
+
+
+@pytest.mark.django_db
+def test_supersede_memories_stales_only_source_and_preserves_result_projection_and_embedding_work() -> None:
+    first, second, first_result, second_result = _promoted_pair('supersede-preserves-result')
+    source_memory = first_result.memory
+    result_memory = second_result.memory
+    source_document = first_result.retrieval_document
+    result_document = second_result.retrieval_document
+    result_document_fields = (
+        result_document.full_text,
+        result_document.exact_projection_hash,
+        result_document.embedding_reference,
+        list(result_document.embedding_vector),
+        getattr(result_document, 'embedding_pgvector', None),
+        result_document.embedding_projection_hash,
+        result_document.embedding_projected_at,
+    )
+    result_transition_id = result_memory.current_transition_id
+    result_version = result_memory.current_version
+    embedding_work_ids = (first_result.embedding_work.id, second_result.embedding_work.id)
+    embedding_work_before = list(
+        WorkflowWork.objects.filter(id__in=embedding_work_ids).values().order_by('id'),
+    )
+
+    superseded = SupersedeMemories().execute(
+        SupersedeMemoriesInput(
+            request=_request_for(first, key=f'request:{uuid.uuid4()}:supersede-preserves-result:{first.id}:v1'),
+            source_memory_fence=_transitions().build_memory_fence(source_memory),
+            result_memory_fence=_transitions().build_memory_fence(result_memory),
+        )
+    )
+
+    source_memory.refresh_from_db()
+    result_memory.refresh_from_db()
+    source_document.refresh_from_db()
+    result_document.refresh_from_db()
+    assert source_memory.stale is True
+    assert source_memory.current_transition_id == superseded.transition.id
+    assert result_memory.stale is False
+    assert result_memory.current_transition_id == result_transition_id
+    assert result_memory.current_version == result_version
+    assert (
+        result_document.full_text,
+        result_document.exact_projection_hash,
+        result_document.embedding_reference,
+        list(result_document.embedding_vector),
+        getattr(result_document, 'embedding_pgvector', None),
+        result_document.embedding_projection_hash,
+        result_document.embedding_projected_at,
+    ) == result_document_fields
+    assert result_document.stale is False
+    assert source_document.stale is True
+    assert list(WorkflowWork.objects.filter(id__in=embedding_work_ids).values().order_by('id')) == embedding_work_before
 
 
 @pytest.mark.django_db
@@ -922,27 +895,6 @@ def test_conflict_resolution_replay_closes_the_complete_set_once() -> None:
     conflict_row = MemoryConflict.objects.get(id=conflict.id)
     assert conflict_row.resolved_transition_id == first.transition.id
     assert MemoryConflict.objects.filter(resolved_transition_id=first.transition.id).count() == 1
-
-
-def _open_single_conflict(suffix: str) -> tuple[MemoryCandidate, MemoryConflict]:
-    base_candidate, source, _scope = _provenanced_candidate(suffix)
-    memory_result = _transitions().PromoteMemoryCandidate().execute(_request(base_candidate))
-    candidate, _candidate_source = _candidate_in_scope(
-        base_candidate,
-        source,
-        title=f'Resolution candidate {suffix}',
-        body=f'Resolution candidate body {suffix}',
-    )
-    conflict = OpenMemoryConflict().execute(
-        OpenMemoryConflictInput(
-            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:v1'),
-            candidate_fence=_candidate_fence_for(candidate),
-            memory_fence=_transitions().build_memory_fence(memory_result.memory),
-            evidence_hash='e' * 64,
-            redacted_reason='resolution outcome contract',
-        )
-    )
-    return candidate, MemoryConflict.objects.get(id=conflict.id)
 
 
 @pytest.mark.django_db
