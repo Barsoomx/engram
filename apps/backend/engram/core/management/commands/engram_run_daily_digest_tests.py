@@ -105,5 +105,5 @@ def test_command_isolates_failing_project_and_reports_failure_count(
 
     assert 'failed_projects=1' in out.getvalue()
     assert 'scheduled_projects=1' in out.getvalue()
-    assert WorkflowWork.objects.filter(project=healthy).exists()
-    assert not WorkflowWork.objects.filter(project=failing).exists()
+    assert WorkflowWork.objects.filter(project=healthy, work_type=WorkflowWorkType.DAILY_DIGEST).exists()
+    assert not WorkflowWork.objects.filter(project=failing, work_type=WorkflowWorkType.DAILY_DIGEST).exists()

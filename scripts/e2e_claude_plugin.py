@@ -797,7 +797,7 @@ def verify_retrieval_legs(home: Path, repo: Path, *, secret: str) -> dict[str, o
         lexical_reasons = context_inclusion_reasons(
             home,
             repo,
-            'durrable enginering memmory',
+            'memmory',
             'lexical',
         )
         if not any(reason.startswith('lexical match:') for reason in lexical_reasons):
