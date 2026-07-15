@@ -1132,7 +1132,7 @@ def test_model_confidence_held_below_configured_threshold() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
-def test_observation_recorded_worker_concurrent_duplicate_delivery_creates_exactly_one() -> None:
+def test_observation_recorded_worker_concurrent_delivery_creates_one_held_candidate() -> None:
     if connection.vendor != 'postgresql':
         pytest.skip('requires real row locking on postgres')
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
@@ -1164,14 +1164,18 @@ def test_observation_recorded_worker_concurrent_duplicate_delivery_creates_exact
 
     assert not errors, errors
     assert len(results) == 2
-    assert MemoryCandidate.objects.count() == 1
-    assert Memory.objects.count() == 1
-    assert MemoryVersion.objects.count() == 1
-    assert RetrievalDocument.objects.count() == 1
+    candidate = MemoryCandidate.objects.get()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.decision_work_contract_version == 0
+    assert {result.candidate.id for result in results} == {candidate.id}
+    assert all(result.held_for_review for result in results)
+    assert not Memory.objects.exists()
+    assert not MemoryVersion.objects.exists()
+    assert not RetrievalDocument.objects.exists()
 
 
 @pytest.mark.django_db(transaction=True)
-def test_observation_recorded_worker_concurrent_duplicate_delivery_with_embedding_creates_exactly_one() -> None:
+def test_observation_recorded_worker_concurrent_delivery_does_not_embed_unproven_candidate() -> None:
     if connection.vendor != 'postgresql':
         pytest.skip('requires real row locking on postgres')
     organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
@@ -1204,10 +1208,15 @@ def test_observation_recorded_worker_concurrent_duplicate_delivery_with_embeddin
 
     assert not errors, errors
     assert len(results) == 2
-    assert MemoryCandidate.objects.count() == 1
-    assert Memory.objects.count() == 1
-    assert MemoryVersion.objects.count() == 1
-    assert RetrievalDocument.objects.count() == 1
+    candidate = MemoryCandidate.objects.get()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.decision_work_contract_version == 0
+    assert {result.candidate.id for result in results} == {candidate.id}
+    assert all(result.held_for_review for result in results)
+    assert not Memory.objects.exists()
+    assert not MemoryVersion.objects.exists()
+    assert not RetrievalDocument.objects.exists()
+    assert not ProviderCallRecord.objects.filter(task_type='embedding').exists()
     assert MemoryLink.objects.filter(link_type=LinkType.SUPERSEDED_BY).count() == 0
 
 
