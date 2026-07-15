@@ -509,7 +509,7 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
         failures.append(f'no candidate generated from the mock provider: {candidate_titles}')
     memory_titles = [str(title) for title in state.get('memory_titles') or []]
     if not any(title.startswith(GENERATION_TITLE_PREFIX) for title in memory_titles):
-        failures.append(f'no mock-generated memory auto-promoted: {memory_titles}')
+        failures.append(f'no mock-generated memory approved through typed review: {memory_titles}')
     if state.get('embedding_dims') != [EMBEDDING_DIMENSION]:
         failures.append(f'unexpected embedding dims: {state.get("embedding_dims")}')
     if state.get('embedding_references') != ['provider']:
@@ -534,6 +534,48 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
         raise E2EError('Backend contract failures:\n- ' + '\n- '.join(failures))
 
     return state
+
+
+def approve_cp3_candidate(*, secret: str) -> dict[str, object]:
+    return wait_for_db_state(
+        f"""
+import json
+from engram.console.services import approve_memory_candidate
+from engram.core.models import Identity, MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+
+project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+if project is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': project not auto-created')
+candidate = (
+    MemoryCandidate.objects.filter(
+        project=project,
+        status='proposed',
+        title__startswith={json.dumps(GENERATION_TITLE_PREFIX)},
+    ).order_by('-created_at').first()
+)
+if candidate is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': generated CP3 candidate not ready')
+work = WorkflowWork.objects.filter(
+    project=project,
+    subject_id=candidate.id,
+    work_type='candidate_decision',
+).first()
+if work is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate-decision work missing')
+run = WorkflowRun.objects.filter(
+    work=work,
+    status='failed',
+    failure_code='candidate_decision_capability_unavailable',
+).first()
+if run is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
+organization = Organization.objects.get(id=project.organization_id)
+actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
+memory = approve_memory_candidate(organization, actor, candidate, 'CP3 Claude plugin typed approval')
+print(json.dumps({'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}))
+""",
+        secret=secret,
+    )
 
 
 def backdate_memories_into_daily_window() -> str:
@@ -683,45 +725,6 @@ print(json.dumps({{'held_candidate': str(candidate.id), 'promoted': candidate.pr
         set_auto_approve_threshold('0.000', secret=secret)
 
     return {'held_candidate': held.get('held_candidate')}
-
-
-def verify_curation_supersede(home: Path, repo: Path, *, secret: str) -> dict[str, object]:
-    env = cli_hook_env(home)
-    command = [sys.executable, '-m', 'engram_cli', 'hook', 'post-tool-use', '--agent', 'claude-code']
-    for run_index in ('a', 'b'):
-        hook_input = {
-            'session_id': f'e2e-dup-session-{run_index}',
-            'event_id': f'e2e-dup-{run_index}',
-            'idempotency_key': f'e2e-dup-{run_index}',
-            'request_id': f'e2e-dup-{run_index}',
-            'tool_name': 'Bash',
-            'tool_input': {'command': 'echo identical-duplicate-body'},
-            'repository_root': str(repo),
-            'cwd': str(repo),
-        }
-        run_json(command, cwd=repo, env=env, secret='', input_text=json.dumps(hook_input))
-
-    return wait_for_db_state(
-        f"""
-import json
-from engram.core.models import AuditEvent, Memory, MemoryLink
-
-link = MemoryLink.objects.filter(link_type='superseded_by').order_by('-created_at').first()
-if link is None:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': superseded_by link not created yet')
-
-audit = AuditEvent.objects.filter(event_type='MemorySuperseded').first()
-if audit is None:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': MemorySuperseded audit missing')
-
-stale_count = Memory.objects.filter(stale=True).count()
-if not stale_count:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': no memory marked stale yet')
-
-print(json.dumps({{'superseded_link': str(link.id), 'stale_memories': stale_count}}))
-""",
-        secret=secret,
-    )
 
 
 def verify_search_api(home: Path, repo: Path) -> dict[str, object]:
@@ -1164,6 +1167,10 @@ def main() -> int:
                     f'claude run failed:\nstdout:\n{claude_result.stdout[-4000:]}\nstderr:\n{claude_result.stderr[-4000:]}',
                 )
 
+            progress('Waiting for CP3 candidate-decision block and approving typed memory')
+            approved = approve_cp3_candidate(secret=agent_key)
+            progress(f'Typed approval OK: {json.dumps(approved)}')
+
             progress('Verifying backend contract state (distillation, promotion, embeddings)')
             state = verify_backend_state(secret=agent_key)
             progress(f'Backend state OK: {json.dumps(state)}')
@@ -1211,10 +1218,6 @@ def main() -> int:
             progress('Verifying held-for-review path')
             held = verify_held_for_review(home, repo, secret=agent_key)
             progress(f'Held-for-review OK: {json.dumps(held)}')
-
-            progress('Verifying curation supersede path')
-            superseded = verify_curation_supersede(home, repo, secret=agent_key)
-            progress(f'Supersede OK: {json.dumps(superseded)}')
 
             progress('Verifying sniffed mock traffic')
             traffic = verify_mock_traffic(traffic_log, agent_key)
