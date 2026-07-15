@@ -616,6 +616,11 @@ def approve_memory_candidate(
             'invalid_state',
             'only proposed candidates can be approved',
         )
+    if candidate.decision_work_contract_version != 1:
+        raise MemoryReviewError(
+            'invalid_state',
+            'legacy memory candidate promotion is disabled; typed promotion requires decision work contract version 1',
+        )
 
     review_example = _record_review_example(
         organization=organization,
@@ -975,13 +980,20 @@ def bulk_archive_memories(
 
     if ids is not None:
         memories = list(
-            Memory.objects.filter(organization=organization, id__in=ids),
+            Memory.objects.filter(
+                organization=organization,
+                id__in=ids,
+                transition_contract_version=1,
+                current_transition__isnull=False,
+            ),
         )
 
     else:
         queryset = Memory.objects.filter(
             organization=organization,
             confidence__lte=confidence_lte,
+            transition_contract_version=1,
+            current_transition__isnull=False,
         ).filter(reviewable_memory_filter())
 
         if project_id is not None:

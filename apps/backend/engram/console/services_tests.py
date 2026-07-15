@@ -302,6 +302,25 @@ def test_approve_memory_candidate_promotes_candidate(
 
 
 @pytest.mark.django_db
+def test_approve_memory_candidate_rejects_legacy_v0_candidate_before_promotion(
+    f_organization: Organization,
+    f_project: Project,
+    f_actor_identity: Identity,
+) -> None:
+    candidate = _make_candidate(f_organization, f_project)
+
+    with pytest.raises(MemoryReviewError) as error:
+        approve_memory_candidate(f_organization, f_actor_identity, candidate, 'reason')
+
+    assert error.value.code == 'invalid_state'
+    assert 'legacy' in str(error.value).lower()
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert MemoryReviewExample.objects.filter(item_id=str(candidate.id)).count() == 0
+
+
+@pytest.mark.django_db
 def test_v1_console_approval_records_the_human_transition_actor_and_reason() -> None:
     from engram.memory.transitions_tests import _provenanced_candidate
 
