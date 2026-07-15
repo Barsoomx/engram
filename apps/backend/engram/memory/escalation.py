@@ -9,6 +9,9 @@ _ESCALATION_SENSITIVE = 'security_sensitive'
 
 
 def escalation_reason(candidate: MemoryCandidate) -> str:
+    if candidate.decision_work_contract_version == 1:
+        return ''
+
     if not settings.ENGRAM_CURATOR_ESCALATION_ENABLED:
         return ''
 
