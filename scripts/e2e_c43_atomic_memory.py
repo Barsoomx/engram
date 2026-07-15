@@ -212,6 +212,7 @@ def deterministic_env(env_file: Path, *, source: Mapping[str, str] = os.environ)
         'USERPROFILE',
         'APPDATA',
         'LOCALAPPDATA',
+        'ProgramFiles',
         'XDG_RUNTIME_DIR',
         'DOCKER_HOST',
         'DOCKER_CONTEXT',
