@@ -1704,3 +1704,136 @@ def test_c41_v1_pointer_and_immutable_relations_reject_invalid_rows() -> None:
     assert {'idempotency_key', 'request_fingerprint', 'provenance_hash'} <= field_names
     assert {'candidate_source', 'source_memory_version'} <= {field.name for field in source._meta.fields}
     assert {'resolution', 'resolved_at', 'resolved_transition'} <= {field.name for field in conflict._meta.fields}
+
+
+def _candidate_source_model_contract() -> tuple[type[models.Model], type[models.TextChoices]]:
+    source_model = get_c41_model('MemoryCandidateSource')
+    source_kind = get_c41_choice('MemoryCandidateSourceKind')
+    fields = {field.name: field for field in source_model._meta.fields}
+    assert {'source_kind', 'import_source'} <= fields.keys()
+    assert fields['source_kind'].null is False
+    assert fields['source_kind'].default == 'distillation'
+    assert fields['window'].null is True
+    assert fields['stage'].null is True
+    assert fields['import_source'].null is True
+    assert {value for value, _label in source_kind.choices} == {'distillation', 'import'}
+    return source_model, source_kind
+
+
+@pytest.mark.django_db
+def test_c43_import_candidate_source_accepts_only_protected_observation_shape() -> None:
+    source_model, source_kind = _candidate_source_model_contract()
+    organization, team, project, agent, session = create_scope()
+    observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        observation_type='imported_observation',
+        title='Imported observation',
+        body='Imported body',
+        content_hash='1' * 64,
+        session_sequence=1,
+    )
+    source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        source_type='claude_mem',
+        source_id='claude-mem:store:observation:1',
+        metadata={'source_store_id': 'store', 'event_type': 'claude_mem.observation'},
+    )
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        source_observation=observation,
+        title=observation.title,
+        body=observation.body,
+        content_hash='2' * 64,
+        decision_work_contract_version=1,
+    )
+    valid = source_model(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        observation=observation,
+        source_kind=source_kind.IMPORT,
+        import_source=source,
+        anchors={'schema': 'import_candidate_source.v1', 'observation_id': str(observation.id)},
+        anchors_hash='a' * 64,
+    )
+    valid.full_clean()
+    valid.save()
+
+    assert valid.source_kind == 'import'
+    assert valid.window_id is None
+    assert valid.stage_id is None
+    assert valid.import_source_id == source.id
+
+    other_observation = Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        agent=agent,
+        session=session,
+        observation_type='imported_observation',
+        title='Other observation',
+        body='Other body',
+        content_hash='3' * 64,
+        session_sequence=2,
+    )
+    invalid_shapes = (
+        {'import_source': None},
+        {'source_kind': 'distillation', 'import_source': source},
+        {'source_kind': 'import', 'observation': other_observation},
+    )
+    for overrides in invalid_shapes:
+        values = {
+            'organization': organization,
+            'project': project,
+            'team': team,
+            'candidate': candidate,
+            'observation': observation,
+            'source_kind': source_kind.IMPORT,
+            'import_source': source,
+            'anchors': {'schema': 'import_candidate_source.v1'},
+            'anchors_hash': 'b' * 64,
+        }
+        values.update(overrides)
+        with pytest.raises(ValidationError):
+            source_model(**values).full_clean()
+
+    foreign_organization, _foreign_team, foreign_project, _foreign_agent, foreign_session = create_second_scope()
+    foreign_observation = Observation.objects.create(
+        organization=foreign_organization,
+        project=foreign_project,
+        agent=foreign_session.agent,
+        session=foreign_session,
+        observation_type='imported_observation',
+        title='Foreign observation',
+        body='Foreign body',
+        content_hash='4' * 64,
+        session_sequence=1,
+    )
+    foreign_source = ObservationSource.objects.create(
+        organization=foreign_organization,
+        project=foreign_project,
+        observation=foreign_observation,
+        source_type='claude_mem',
+        source_id='claude-mem:foreign:observation:1',
+    )
+    with pytest.raises(ValidationError):
+        source_model(
+            organization=organization,
+            project=project,
+            team=team,
+            candidate=candidate,
+            observation=observation,
+            source_kind=source_kind.IMPORT,
+            import_source=foreign_source,
+            anchors={'schema': 'import_candidate_source.v1'},
+            anchors_hash='c' * 64,
+        ).full_clean()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -51,6 +53,7 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkType,
 )
+from engram.imports.services import ClaudeMemImporter
 from engram.memory import work_execution
 from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
@@ -58,6 +61,7 @@ from engram.memory.distillation_provenance import candidate_source_anchors, cano
 from engram.memory.distillation_provider_stage import stage_key as provider_stage_key
 from engram.memory.distillation_provider_stage import stage_target_key
 from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.import_provenance import candidate_evidence_manifest
 from engram.memory.invariant_queries import (
     InvariantId,
     InvariantResult,
@@ -70,6 +74,7 @@ from engram.memory.reconciler_test_support import StubBuilder, ended_session_wor
 from engram.memory.transitions_test_support import (
     candidate_fence_for,
     candidate_in_scope,
+    import_provenanced_candidate,
     open_single_conflict,
     promoted_pair,
     provenanced_candidate,
@@ -79,6 +84,7 @@ from engram.memory.transitions_test_support import (
 )
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
+    canonical_json_bytes,
     create_work,
     observation_content_digest,
     work_input_fingerprint,
@@ -2464,6 +2470,130 @@ def test_p7_version_one_promotion_chain_is_healthy() -> None:
     assert result.memory_version.version == 1
     assert p7.state == InvariantState.HEALTHY
     assert p7.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -> None:
+    provenance = importlib.import_module('engram.memory.import_provenance')
+    candidate, source, (organization, project, session) = provenanced_candidate('import-p7')
+    fields = {field.name for field in type(source)._meta.fields}
+    assert {'source_kind', 'import_source'} <= fields
+    observation = source.observation
+    source.delete()
+    import_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=observation,
+        source_type='claude_mem',
+        source_id='claude-mem:import-p7:1',
+        metadata={
+            'source_store_id': 'import-p7-store',
+            'event_type': 'claude_mem.observation',
+        },
+    )
+    anchors = provenance.import_candidate_source_anchors(
+        observation=observation,
+        import_source=import_source,
+        source_store_id='import-p7-store',
+        event_type='claude_mem.observation',
+    )
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        observation=observation,
+        source_kind='import',
+        import_source=import_source,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    candidate.title = observation.title
+    candidate.body = observation.body or observation.title
+    candidate.content_hash = provenance.import_candidate_content_hash(
+        import_source.source_id,
+        observation.content_hash,
+    )
+    candidate.decision_work_contract_version = 1
+    candidate.save(update_fields=['title', 'body', 'content_hash', 'decision_work_contract_version'])
+
+    expected_hash = ClaudeMemImporter()._content_hash(
+        'memory-candidate',
+        import_source.source_id,
+        observation.content_hash,
+    )
+    assert candidate.content_hash == expected_hash
+    manifest_entries, manifest_hash = provenance.candidate_evidence_manifest(candidate)
+    assert manifest_entries
+    assert manifest_hash == provenance.candidate_evidence_manifest(candidate)[1]
+
+    base_request = transition_request(candidate)
+    import_request = replace(
+        base_request,
+        candidate_fence=replace(base_request.candidate_fence, evidence_manifest_hash=manifest_hash),
+    )
+    MemoryCandidate.objects.filter(id=candidate.id).update(content_hash='f' * 64)
+    with pytest.raises(ValueError, match='stale_decision'):
+        transitions_module().PromoteMemoryCandidate().execute(import_request)
+    assert not Memory.objects.filter(organization=organization).exists()
+    MemoryCandidate.objects.filter(id=candidate.id).update(content_hash=expected_hash)
+    candidate.refresh_from_db()
+    result = transitions_module().PromoteMemoryCandidate().execute(import_request)
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+    assert result.memory.transition_contract_version == 1
+    assert p7.state == InvariantState.HEALTHY
+    assert p7.violation_count == 0
+    assert not WorkflowWork.objects.filter(
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_id=candidate.id,
+    ).exists()
+
+
+@pytest.mark.django_db
+def test_p7_marks_import_candidate_with_non_promote_transition_violated() -> None:
+    candidate, _source, (organization, project, session) = import_provenanced_candidate('p7-import-transition')
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    MemoryTransition.objects.filter(id=result.transition.id).update(transition_type=MemoryTransitionType.MERGE)
+
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+
+    assert p7.state == InvariantState.VIOLATED
+    assert p7.violation_count is not None and p7.violation_count >= 1
+    assert f'candidate:{candidate.id}' in p7.sample_ids
+
+
+@pytest.mark.django_db
+def test_p7_marks_import_candidate_with_any_candidate_decision_work_violated() -> None:
+    candidate, _source, (organization, project, session) = import_provenanced_candidate('p7-import-work')
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
+    create_work(
+        CreateWorkflowWorkInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+            subject_id=candidate.id,
+            input_snapshot={
+                'schema': 'candidate_decision_input/v1',
+                'candidate_id': str(candidate.id),
+                'candidate_content_hash': candidate.content_hash,
+                'organization_id': str(organization.id),
+                'project_id': str(project.id),
+                'team_id': str(session.team.id),
+                'evidence_manifest_hash': manifest_hash,
+                'policy_version': 1,
+            },
+        ),
+    )
+
+    p7 = _result_by_id(ScopeFixture(organization, project, session.team, session.agent))['P7']
+
+    candidate.refresh_from_db()
+    assert result.memory.id == candidate.promoted_memory_id
+    assert p7.state == InvariantState.VIOLATED
+    assert p7.violation_count is not None and p7.violation_count >= 1
+    assert f'candidate:{candidate.id}' in p7.sample_ids
 
 
 @pytest.mark.django_db
