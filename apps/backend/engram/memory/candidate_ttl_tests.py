@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 from pytest_django.fixtures import SettingsWrapper
 
 from engram.core.models import (
@@ -17,11 +18,18 @@ from engram.core.models import (
     Organization,
     OrganizationSettings,
     Project,
+    WorkflowRun,
+    WorkflowWork,
 )
+from engram.memory import candidate_work_reconciler
 from engram.memory.candidate_decision_work import evidence_manifest
 from engram.memory.candidate_decision_work_tests import (
     _candidate as _decision_candidate,
+)
+from engram.memory.candidate_decision_work_tests import (
     _mark_cp3_candidate,
+)
+from engram.memory.candidate_decision_work_tests import (
     _scope as _decision_scope,
 )
 from engram.memory.candidate_ttl import ExpireStaleCandidates
@@ -103,7 +111,7 @@ def test_candidate_ttl_never_rejects_or_audits_old_low_confidence_candidate(
     candidate.refresh_from_db()
 
     assert result.scanned == 0
-    assert result.queued == 0
+    assert result.rejected == 0
     assert result.rejected == 0
     assert candidate.status == CandidateStatus.PROPOSED
     assert not AuditEvent.objects.filter(target_id=str(candidate.id), event_type='MemoryAutoRejected').exists()
@@ -136,16 +144,26 @@ def test_reconciliation_creates_and_queues_missing_v1_work_once(
     candidate = _decision_candidate(scope, 'candidate')
     _mark_cp3_candidate(scope, candidate)
     sent: list[tuple[object, ...]] = []
-    monkeypatch.setattr('engram.memory.work_dispatch.app.send_task', lambda _name, *, args, **_kwargs: sent.append(tuple(args)))
+    monkeypatch.setattr(
+        'engram.memory.work_dispatch.app.send_task',
+        lambda _name, *, args, **_kwargs: sent.append(tuple(args)),
+    )
     as_of = timezone.now()
 
     first = ReconcileCandidateDecisionWork().execute(as_of=as_of)
-    second = ReconcileCandidateDecisionWork().execute(as_of=as_of)
+    second = ReconcileCandidateDecisionWork().execute(as_of=as_of + timedelta(minutes=31))
 
     assert first.scanned == 1
     assert first.queued == 1
+    run_count = WorkflowRun.objects.filter(work__subject_id=candidate.id).count()
+    outbox_count = CeleryOutbox.objects.count()
+    first_run = WorkflowRun.objects.get(work__subject_id=candidate.id)
     assert second.queued == 0
     assert len(sent) == 1
+    assert WorkflowRun.objects.filter(work__subject_id=candidate.id).count() == run_count
+    assert CeleryOutbox.objects.count() == outbox_count
+    first_run.refresh_from_db()
+    assert first_run.dispatched_at == as_of
 
 
 @pytest.mark.django_db
@@ -162,8 +180,52 @@ def test_legacy_expire_task_delegates_without_semantic_writes(monkeypatch: pytes
 
     assert len(calls) == 1
     assert returned.scanned == 3
-    assert returned.queued == 2
     assert returned.rejected == 0
+
+
+@pytest.mark.django_db
+def test_reconciliation_locked_recheck_skips_conflict_created_after_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-race')
+    create_curation_policy(organization, team, project)
+    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
+    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
+    patch_judge_gateway(monkeypatch, JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
+    selected = candidate_work_reconciler._cp3_repair_candidates(organization.id, project.id)
+    assert [row.id for row in selected] == [candidate.id]
+
+    before: dict[str, object] = {}
+    original_repair = candidate_work_reconciler._repair_candidate
+
+    def create_conflict_then_recheck(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
+        CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate_id))
+        before['candidate'] = list(MemoryCandidate.objects.filter(id=candidate_id).values().order_by('id'))
+        before['conflicts'] = list(MemoryConflict.objects.filter(candidate_id=candidate_id).values().order_by('id'))
+        before['links'] = list(MemoryLink.objects.filter(organization=organization).values().order_by('id'))
+        before['audits'] = list(AuditEvent.objects.filter(organization=organization).values().order_by('id'))
+        before['works'] = list(WorkflowWork.objects.filter(subject_id=candidate_id).values().order_by('id'))
+        before['outbox'] = list(CeleryOutbox.objects.values().order_by('id'))
+        return original_repair(candidate_id=candidate_id, as_of=as_of)
+
+    monkeypatch.setattr(candidate_work_reconciler, '_repair_candidate', create_conflict_then_recheck)
+    sent: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        'engram.memory.work_dispatch.app.send_task',
+        lambda _name, *, args, **_kwargs: sent.append(tuple(args)),
+    )
+
+    result = candidate_work_reconciler.ReconcileCandidateDecisionWork().execute(as_of=timezone.now())
+
+    assert result.queued == 0
+    assert not WorkflowRun.objects.filter(work__subject_id=candidate.id).exists()
+    assert not sent
+    assert list(WorkflowWork.objects.filter(subject_id=candidate.id).values().order_by('id')) == before['works']
+    assert list(CeleryOutbox.objects.values().order_by('id')) == before['outbox']
+    assert list(MemoryCandidate.objects.filter(id=candidate.id).values().order_by('id')) == before['candidate']
+    assert list(MemoryConflict.objects.filter(candidate_id=candidate.id).values().order_by('id')) == before['conflicts']
+    assert list(MemoryLink.objects.filter(organization=organization).values().order_by('id')) == before['links']
+    assert list(AuditEvent.objects.filter(organization=organization).values().order_by('id')) == before['audits']
 
 
 @pytest.mark.django_db
@@ -260,7 +322,7 @@ def test_old_candidates_are_not_batch_rejected(
     result = ExpireStaleCandidates().execute()
 
     assert result.rejected == 0
-    assert result.queued == 0
+    assert result.rejected == 0
 
     for candidate in candidates:
         candidate.refresh_from_db()

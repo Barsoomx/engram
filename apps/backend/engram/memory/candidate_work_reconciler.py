@@ -268,12 +268,10 @@ def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
             or work.execution_state != WorkflowWorkExecutionState.READY
         ):
             return False
-        previous = (
-            WorkflowRun.objects.filter(work_id=work.id, status=WorkflowRunStatus.QUEUED)
-            .order_by('created_at', 'id')
-            .first()
-        )
-        run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
-        if previous is not None and previous.dispatched_at == as_of:
+        if WorkflowRun.objects.filter(
+            work_id=work.id,
+            status__in=(WorkflowRunStatus.QUEUED, WorkflowRunStatus.RUNNING),
+        ).exists():
             return False
+        run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
         return run.dispatched_at == as_of

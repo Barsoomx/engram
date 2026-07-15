@@ -1167,7 +1167,7 @@ def expire_stale_candidates() -> dict[str, int]:
     logger.info(
         'expire_stale_candidates_completed',
         scanned=result.scanned,
-        queued=result.queued,
+        rejected=result.rejected,
     )
 
-    return {'scanned': result.scanned, 'queued': result.queued}
+    return {'scanned': result.scanned, 'rejected': result.rejected}

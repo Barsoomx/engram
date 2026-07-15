@@ -53,8 +53,8 @@ from engram.memory.tasks import (
     generate_weekly_digest,
     process_observation_recorded,
     process_observation_work_v1,
-    retry_failed_distillations,
     reconcile_candidate_decision_work,
+    retry_failed_distillations,
 )
 from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import (
@@ -634,7 +634,9 @@ def test_task_routes_send_expire_stale_candidates_to_batch_queue() -> None:
 
 
 def test_task_routes_send_candidate_reconciliation_to_batch_queue() -> None:
-    assert celeryconfig.task_routes['engram.memory.reconcile_candidate_decision_work']['queue'] == celeryconfig.QUEUE_BATCH
+    assert celeryconfig.task_routes['engram.memory.reconcile_candidate_decision_work']['queue'] == (
+        celeryconfig.QUEUE_BATCH
+    )
 
 
 def test_beat_schedule_registers_reconcile_candidate_decision_work() -> None:
@@ -648,13 +650,20 @@ def test_beat_schedule_registers_reconcile_candidate_decision_work() -> None:
 
 
 def test_expire_stale_candidates_invokes_the_service() -> None:
-    m_result = ExpireStaleCandidatesResult(scanned=7, queued=4)
+    m_result = ExpireStaleCandidatesResult(7, 0)
 
     with mock.patch('engram.memory.tasks.ExpireStaleCandidates.execute', return_value=m_result) as m_execute:
         result = expire_stale_candidates()
 
     m_execute.assert_called_once_with()
-    assert result == {'scanned': 7, 'queued': 4}
+    assert result == {'scanned': 7, 'rejected': 0}
+
+
+def test_expire_stale_candidates_result_preserves_legacy_shape() -> None:
+    result = ExpireStaleCandidatesResult(7, 3)
+
+    assert (result.scanned, result.rejected) == (7, 3)
+    assert not hasattr(result, 'queued')
 
 
 def test_reconcile_candidate_decision_work_invokes_the_service() -> None:

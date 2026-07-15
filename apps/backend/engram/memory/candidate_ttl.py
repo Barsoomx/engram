@@ -8,13 +8,11 @@ from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWo
 @dataclass(frozen=True, slots=True)
 class ExpireStaleCandidatesResult:
     scanned: int
-    queued: int = 0
-    # Kept as a read-only compatibility field for callers of the former TTL API.
-    rejected: int = 0
+    rejected: int
 
 
 class ExpireStaleCandidates:
     def execute(self) -> ExpireStaleCandidatesResult:
         result = ReconcileCandidateDecisionWork().execute()
 
-        return ExpireStaleCandidatesResult(scanned=result.scanned, queued=result.queued)
+        return ExpireStaleCandidatesResult(scanned=result.scanned, rejected=0)
