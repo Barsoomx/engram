@@ -659,11 +659,11 @@ def test_team_id_restricts_added_bucket_to_that_team(
 
     mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
 
-    Memory.objects.filter(id=mem_team_a.id).update(created_at=_out_of_window())
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
 
     mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
 
-    Memory.objects.filter(id=mem_team_b.id).update(created_at=_out_of_window())
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
 
     result = _run(f_org, f_project, team_id=team_a.id)
 
@@ -685,11 +685,11 @@ def test_without_team_id_excludes_team_owned_memories(
 
     mem_team_a = _make_memory(f_org, f_project, title='team-a-mem', team=team_a)
 
-    Memory.objects.filter(id=mem_team_a.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_a.id).update(created_at=_out_of_window())
 
     mem_team_b = _make_memory(f_org, f_project, title='team-b-mem', team=team_b)
 
-    Memory.objects.filter(id=mem_team_b.id).update(created_at=_in_window())
+    Memory.objects.filter(id=mem_team_b.id).update(created_at=_out_of_window())
 
     mem_no_team = _make_memory(f_org, f_project, title='no-team-mem')
     Memory.objects.filter(id=mem_no_team.id).update(created_at=_in_window())
