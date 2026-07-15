@@ -21,7 +21,6 @@ ENV_EXAMPLE = (ROOT / "deploy/compose/.env.example").resolve()
 TARGET_QUEUE = "engram-near-realtime"
 TARGET_TASK = "engram.memory.process_observation_work_v1"
 TARGET_CANDIDATE_DECISION_TASK = "engram.memory.process_candidate_decision_work_v1"
-TARGET_CANDIDATE_DECISION_FAILURE_CODE = "candidate_decision_capability_unavailable"
 GLOBAL_TIMEOUT = 25 * 60.0
 FAILURE_LOG_SERVICES = (
     "api",
@@ -640,10 +639,8 @@ class Harness:
         versions: int,
         documents: int,
         candidates: int = 0,
+        candidate_held_audits: int = 0,
         candidate_decision_work: int = 0,
-        candidate_decision_work_blocked: int | None = None,
-        candidate_decision_work_required: int | None = None,
-        candidate_decision_failed_runs: int | None = None,
         candidate_decision_outbox: int = 0,
         timeout: float = COMMAND_TIMEOUT,
     ) -> dict[str, object]:
@@ -652,6 +649,7 @@ class Harness:
             "observations": observations,
             "outbox": outbox,
             "candidates": candidates,
+            "candidate_held_audits": candidate_held_audits,
             "candidate_decision_work": candidate_decision_work,
             "candidate_decision_outbox": candidate_decision_outbox,
             "memories": versions,
@@ -659,16 +657,6 @@ class Harness:
             "documents": documents,
             "linked_documents": documents,
         }
-        if candidate_decision_work_blocked is not None:
-            expected["candidate_decision_work_blocked"] = (
-                candidate_decision_work_blocked
-            )
-        if candidate_decision_work_required is not None:
-            expected["candidate_decision_work_required"] = (
-                candidate_decision_work_required
-            )
-        if candidate_decision_failed_runs is not None:
-            expected["candidate_decision_failed_runs"] = candidate_decision_failed_runs
         for key, value in expected.items():
             if state.get(key) != value:
                 raise HarnessError(
@@ -1096,14 +1084,13 @@ import json
 from django.db.models import F
 from django_celery_outbox.models import CeleryOutbox
 from engram.core.models import (
+    AuditEvent,
     Memory,
     MemoryCandidate,
-    MemoryCandidateSource,
     MemoryStatus,
     MemoryVersion,
     Observation,
     RetrievalDocument,
-    WorkflowRun,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkType,
@@ -1132,20 +1119,21 @@ outbox = sum(
     for row in CeleryOutbox.objects.filter(task_name={json.dumps(TARGET_TASK)}).only('args')
     if row.args in ([work_id] for work_id in work_ids)
 )
-candidate_sources = MemoryCandidateSource.objects.filter(
-    project_id=project_id,
-    candidate__project_id=project_id,
-    observation__raw_event__client_event_id=client_event_id,
-    observation__raw_event__request_id=request_id,
-)
-candidate_ids = list(dict.fromkeys(
-    str(value) for value in candidate_sources.values_list('candidate_id', flat=True)
-))
 candidates = MemoryCandidate.objects.filter(
     project_id=project_id,
-    id__in=candidate_ids,
+    source_observation__raw_event__client_event_id=client_event_id,
+    source_observation__raw_event__request_id=request_id,
     status='proposed',
-    decision_work_contract_version=1,
+    decision_work_contract_version=0,
+    promoted_memory__isnull=True,
+)
+candidate_ids = [str(value) for value in candidates.values_list('id', flat=True)]
+candidate_held_audits = AuditEvent.objects.filter(
+    project_id=project_id,
+    event_type='MemoryCandidateHeldForReview',
+    target_type='memory_candidate',
+    target_id__in=candidate_ids,
+    result='recorded',
 )
 candidate_decision_work = WorkflowWork.objects.filter(
     project_id=project_id,
@@ -1163,14 +1151,6 @@ candidate_decision_outbox = sum(
         task_name={json.dumps(TARGET_CANDIDATE_DECISION_TASK)}
     ).only('args')
     if row.args in ([work_id] for work_id in candidate_decision_work_ids)
-)
-candidate_decision_failed_runs = WorkflowRun.objects.filter(
-    project_id=project_id,
-    work_id__in=candidate_decision_work_ids,
-    run_type='candidate_decision',
-    status='failed',
-    failure_class='configuration',
-    failure_code={json.dumps(TARGET_CANDIDATE_DECISION_FAILURE_CODE)},
 )
 versions = MemoryVersion.objects.select_related('memory', 'source_observation__raw_event').filter(
     project_id=project_id,
@@ -1205,10 +1185,8 @@ print(json.dumps({{
     'observations': observations.count(),
     'outbox': outbox,
     'candidates': candidates.count(),
+    'candidate_held_audits': candidate_held_audits.count(),
     'candidate_decision_work': candidate_decision_work.count(),
-    'candidate_decision_work_blocked': candidate_decision_work.filter(execution_state='blocked').count(),
-    'candidate_decision_work_required': candidate_decision_work.filter(disposition='required').count(),
-    'candidate_decision_failed_runs': candidate_decision_failed_runs.count(),
     'candidate_decision_outbox': candidate_decision_outbox,
     'memories': memories.count(),
     'versions': versions.count(),
@@ -1373,10 +1351,8 @@ def wait_exact(
     versions: int,
     documents: int,
     candidates: int = 0,
+    candidate_held_audits: int = 0,
     candidate_decision_work: int = 0,
-    candidate_decision_work_blocked: int | None = None,
-    candidate_decision_work_required: int | None = None,
-    candidate_decision_failed_runs: int | None = None,
     candidate_decision_outbox: int = 0,
     timeout: float = COMMAND_TIMEOUT,
 ) -> dict[str, object]:
@@ -1392,10 +1368,8 @@ def wait_exact(
                 versions=versions,
                 documents=documents,
                 candidates=candidates,
+                candidate_held_audits=candidate_held_audits,
                 candidate_decision_work=candidate_decision_work,
-                candidate_decision_work_blocked=candidate_decision_work_blocked,
-                candidate_decision_work_required=candidate_decision_work_required,
-                candidate_decision_failed_runs=candidate_decision_failed_runs,
                 candidate_decision_outbox=candidate_decision_outbox,
                 timeout=remaining,
             ),
@@ -1508,10 +1482,7 @@ def fault_a(harness: Harness, config_dir: Path, project_id: str, run_id: str) ->
         versions=0,
         documents=0,
         candidates=1,
-        candidate_decision_work=1,
-        candidate_decision_work_blocked=1,
-        candidate_decision_work_required=1,
-        candidate_decision_failed_runs=1,
+        candidate_held_audits=1,
         candidate_decision_outbox=0,
         timeout=result_deadline.remaining(),
     )
@@ -1594,10 +1565,7 @@ def fault_b(harness: Harness, config_dir: Path, project_id: str, run_id: str) ->
         versions=0,
         documents=0,
         candidates=1,
-        candidate_decision_work=1,
-        candidate_decision_work_blocked=1,
-        candidate_decision_work_required=1,
-        candidate_decision_failed_runs=1,
+        candidate_held_audits=1,
         candidate_decision_outbox=0,
         timeout=recovery_deadline.remaining(),
     )
@@ -1953,10 +1921,7 @@ def fault_d(
                 versions=0,
                 documents=0,
                 candidates=1,
-                candidate_decision_work=1,
-                candidate_decision_work_blocked=1,
-                candidate_decision_work_required=1,
-                candidate_decision_failed_runs=1,
+                candidate_held_audits=1,
                 candidate_decision_outbox=0,
                 timeout=relay_deadline.remaining(),
             )

@@ -962,10 +962,30 @@ def verify_weekly_digest(*, secret: str) -> dict[str, object]:
     result = compose_shell_json(
         f"""
 import json
+from datetime import timedelta
+from django.utils import timezone
 from engram.core.models import Memory, Project, WorkflowRun
+from engram.memory.digest_scheduler import weekly_bucket
 from engram.memory.services import run_weekly_digest_with_tracking
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
+source = (
+    Memory.objects.filter(
+        project=project,
+        title__startswith={json.dumps(SESSION_TITLE_PREFIX)},
+        status='approved',
+        stale=False,
+        transition_contract_version=1,
+        current_transition__isnull=False,
+    )
+    .exclude(kind='digest')
+    .order_by('created_at')
+    .first()
+)
+if source is None:
+    raise SystemExit('weekly digest typed source not found')
+bucket = weekly_bucket(as_of=timezone.now())
+Memory.objects.filter(id=source.id).update(created_at=bucket.window_start + timedelta(hours=1))
 result = run_weekly_digest_with_tracking(project.organization_id, project.id, request_id='e2e-weekly-1')
 run = WorkflowRun.objects.filter(project=project, run_type='weekly_digest').order_by('-created_at').first()
 weekly = (
@@ -974,6 +994,7 @@ weekly = (
     .first()
 )
 print(json.dumps({{
+    'source_memory_id': str(source.id),
     'workflow_status': run.status if run else None,
     'weekly_memory': weekly.title if weekly else None,
 }}))
@@ -982,6 +1003,8 @@ print(json.dumps({{
     )
     if result.get('workflow_status') != 'succeeded':
         raise E2EError(f'weekly digest workflow did not succeed: {result}')
+    if not result.get('weekly_memory'):
+        raise E2EError(f'weekly digest memory was not published: {result}')
 
     return result
 
