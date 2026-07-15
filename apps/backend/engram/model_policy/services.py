@@ -923,6 +923,7 @@ class FakeProviderGateway:
         if not ProviderSecretEnvelope.objects.filter(secret=secret, active=True).exists():
             raise ProviderSecretError('provider secret has no active envelope')
 
+        _apply_fake_provider_delay()
         _log_repeat_attempt(data)
 
         redacted_text = redact_value(data.text)
