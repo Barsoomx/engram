@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import uuid
@@ -81,6 +82,7 @@ from engram.memory.transitions_test_support import (
 )
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
+    canonical_json_bytes,
     create_work,
     observation_content_digest,
     work_input_fingerprint,
@@ -2480,23 +2482,22 @@ def test_import_provenance_fence_hash_and_p7_need_no_candidate_decision_work() -
         observation=source.observation,
         source_type='claude_mem',
         source_id='claude-mem:import-p7:1',
+        metadata={
+            'source_store_id': 'import-p7-store',
+            'event_type': 'claude_mem.observation',
+        },
     )
     source.source_kind = 'import'
     source.window = None
     source.stage = None
     source.import_source = import_source
-    source.anchors = {
-        'schema': 'import_candidate_source.v1',
-        'observation_id': str(source.observation.id),
-        'session_sequence': source.observation.session_sequence,
-        'observation_digest': source.observation.content_hash,
-        'source_type': 'claude_mem',
-        'source_id': import_source.source_id,
-        'source_store_id': 'import-p7-store',
-        'event_type': 'claude_mem.observation',
-        'raw_event_id': None,
-    }
-    source.anchors_hash = canonical_source_manifest(source.anchors)
+    source.anchors = provenance.import_candidate_source_anchors(
+        observation=source.observation,
+        import_source=import_source,
+        source_store_id='import-p7-store',
+        event_type='claude_mem.observation',
+    )
+    source.anchors_hash = hashlib.sha256(canonical_json_bytes(source.anchors)).hexdigest()
     source.save(update_fields=['source_kind', 'window', 'stage', 'import_source', 'anchors', 'anchors_hash'])
     candidate.title = source.observation.title
     candidate.body = source.observation.body

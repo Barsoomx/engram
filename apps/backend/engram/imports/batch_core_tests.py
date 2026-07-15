@@ -150,7 +150,7 @@ def test_import_batch_publishes_v1_provenance_without_candidate_decision_work(f_
     assert version.version == 1
     assert MemoryVersionSource.objects.filter(memory_version=version, candidate_source=candidate_source).count() == 1
     document = RetrievalDocument.objects.get(memory_version=version)
-    assert document.full_text == version.body
+    assert document.full_text == memory.metadata['full_text'] == f'{memory.title}\n\n{version.body}'
     transition = MemoryTransition.objects.get(candidate=candidate)
     assert transition.embedding_work_id is not None
     assert AuditEvent.objects.filter(memory_transition__candidate=candidate).count() == 1
