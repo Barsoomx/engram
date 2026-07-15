@@ -368,6 +368,19 @@ def _source_rows(candidate: MemoryCandidate) -> list[MemoryCandidateSource]:
     )
 
 
+def canonical_memory_version_sources(
+    sources: list[MemoryVersionSource] | tuple[MemoryVersionSource, ...],
+) -> list[MemoryVersionSource]:
+    return sorted(
+        sources,
+        key=lambda source: (
+            str(source.candidate_source_id or ''),
+            str(source.source_memory_version_id or ''),
+            str(source.id),
+        ),
+    )
+
+
 def memory_version_provenance_hash(sources: list[MemoryVersionSource]) -> str:
     return hashlib.sha256(
         canonical_json_bytes(
@@ -380,7 +393,7 @@ def memory_version_provenance_hash(sources: list[MemoryVersionSource]) -> str:
                     if source.source_memory_version_id
                     else None,
                 }
-                for source in sources
+                for source in canonical_memory_version_sources(sources)
             ],
         ),
     ).hexdigest()
@@ -388,9 +401,7 @@ def memory_version_provenance_hash(sources: list[MemoryVersionSource]) -> str:
 
 def _version_sources(version: MemoryVersion) -> list[MemoryVersionSource]:
     sources = list(MemoryVersionSource.objects.filter(memory_version_id=version.id).select_related('candidate_source'))
-    return sorted(
-        sources, key=lambda source: (str(source.candidate_source_id or ''), str(source.source_memory_version_id or ''))
-    )
+    return canonical_memory_version_sources(sources)
 
 
 def _transition_result(transition: MemoryTransition, *, duplicate: bool = False) -> MemoryTransitionResult:
@@ -503,6 +514,66 @@ def _finish_optional_work(claim: WorkClaim | None, *, result_memory_id: uuid.UUI
     )
 
 
+def _reject_existing_memory_work_claim(claim: WorkClaim | None) -> None:
+    if claim is not None:
+        raise MemoryTransitionError(
+            'stale_decision',
+            'existing-memory transitions do not accept workflow work claims',
+            retryable=True,
+        )
+
+
+def _digest_snapshot_source_set(work: WorkflowWork) -> set[tuple[str, str]]:
+    key = 'sources' if work.work_type == WorkflowWorkType.DAILY_DIGEST else 'changes'
+    refs = work.input_snapshot.get(key)
+    if not isinstance(refs, list):
+        raise MemoryTransitionError('stale_decision', 'digest work snapshot has no frozen source set', retryable=True)
+    source_set: set[tuple[str, str]] = set()
+    for ref in refs:
+        if not isinstance(ref, dict):
+            raise MemoryTransitionError('stale_decision', 'digest work snapshot source is malformed', retryable=True)
+        memory_id = ref.get('memory_id')
+        version_id = ref.get('memory_version_id')
+        if not isinstance(memory_id, str) or not isinstance(version_id, str):
+            raise MemoryTransitionError('stale_decision', 'digest work snapshot source is malformed', retryable=True)
+        source_set.add((memory_id, version_id))
+
+    return source_set
+
+
+def _validate_digest_work_claim(
+    work: WorkflowWork,
+    request: TransitionRequest,
+    fences: tuple[MemoryFence, ...],
+) -> None:
+    if work.work_type not in (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST):
+        raise MemoryTransitionError('stale_decision', 'owning work is not digest work', retryable=True)
+    if work.organization_id != request.scope.organization_id or work.project_id != request.scope.project_id:
+        raise MemoryTransitionError(
+            'stale_decision', 'digest work subject is outside the declared scope', retryable=True
+        )
+    if work.subject_type == WorkflowSubjectType.PROJECT:
+        if work.subject_id != request.scope.project_id or work.team_id is not None or request.scope.team_id is not None:
+            raise MemoryTransitionError(
+                'stale_decision', 'digest work project subject does not match request', retryable=True
+            )
+    elif work.subject_type == WorkflowSubjectType.TEAM:
+        if (
+            work.work_type != WorkflowWorkType.WEEKLY_DIGEST
+            or work.team_id != work.subject_id
+            or request.scope.team_id != work.subject_id
+        ):
+            raise MemoryTransitionError(
+                'stale_decision', 'digest work team subject does not match request', retryable=True
+            )
+    else:
+        raise MemoryTransitionError('stale_decision', 'digest work subject type is invalid', retryable=True)
+
+    declared_sources = {(str(fence.memory_id), str(fence.current_version_id)) for fence in fences}
+    if _digest_snapshot_source_set(work) != declared_sources:
+        raise MemoryTransitionError('stale_decision', 'digest source snapshot no longer matches', retryable=True)
+
+
 def _lock_candidate(request: TransitionRequest, fence: CandidateFence) -> MemoryCandidate:
     try:
         candidate = MemoryCandidate.objects.select_for_update().get(id=fence.candidate_id)
@@ -581,13 +652,9 @@ def _lock_declared_memories(
 ) -> tuple[dict[uuid.UUID, Memory], dict[uuid.UUID, MemoryVersion]]:
     memory_ids, version_ids = _declared_fence_ids(fences)
 
-    locked_memories = list(
-        Memory.objects.select_for_update().filter(id__in=memory_ids).order_by('id')
-    )
+    locked_memories = list(Memory.objects.select_for_update().filter(id__in=memory_ids).order_by('id'))
     memories = _locked_memory_map(request, locked_memories, expected_count=len(memory_ids))
-    locked_versions = list(
-        MemoryVersion.objects.select_for_update().filter(id__in=version_ids).order_by('id')
-    )
+    locked_versions = list(MemoryVersion.objects.select_for_update().filter(id__in=version_ids).order_by('id'))
     versions = _locked_version_map(request, fences, locked_versions, expected_count=len(version_ids))
 
     return memories, versions
@@ -1138,7 +1205,12 @@ class AttachPromotedCandidateSource:
             subject_id=data.candidate_source_id,
             command={
                 'candidate_fence': _candidate_fence_value(data.candidate_fence),
-                'memory_fence': _memory_fence_value(data.memory_fence),
+                'memory_fence': {
+                    'memory_id': str(data.memory_fence.memory_id),
+                    'current_version_id': (
+                        str(data.memory_fence.current_version_id) if data.memory_fence.current_version_id else None
+                    ),
+                },
                 'candidate_source_id': str(data.candidate_source_id),
                 'work_claim': _work_claim_value(data.work_claim),
             },
@@ -1295,13 +1367,10 @@ class PublishDigestMemory:
         )
         with transaction.atomic():
             claimed_work = _lock_optional_work(data.work_claim, request)
-            if claimed_work is not None and claimed_work.work_type not in (
-                WorkflowWorkType.DAILY_DIGEST,
-                WorkflowWorkType.WEEKLY_DIGEST,
-            ):
-                raise MemoryTransitionError('stale_decision', 'owning work is not digest work', retryable=True)
             memories, versions = _lock_declared_memories(request, fences)
             _lock_exact_documents(versions)
+            if claimed_work is not None:
+                _validate_digest_work_claim(claimed_work, request, fences)
             existing = _existing_transition(request, fingerprint=fingerprint)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
@@ -1348,6 +1417,7 @@ class PublishDigestMemory:
 
 class ReviseMemory:
     def execute(self, data: ReviseMemoryInput) -> MemoryTransitionResult:
+        _reject_existing_memory_work_claim(data.work_claim)
         request = data.request
         fingerprint = _request_fingerprint(
             request,
@@ -1362,7 +1432,6 @@ class ReviseMemory:
         )
         fences = (data.memory_fence,)
         with transaction.atomic():
-            _lock_optional_work(data.work_claim, request)
             memories, versions = _lock_declared_memories(request, fences)
             _lock_exact_documents(versions)
             existing = _existing_transition(request, fingerprint=fingerprint)
@@ -1405,7 +1474,6 @@ class ReviseMemory:
             )
             _advance_memory_pointer(memory, transition_row, version)
             _fault_boundary('candidate_pointer')
-            _finish_optional_work(data.work_claim, result_memory_id=memory.id)
 
             return _transition_result(transition_row)
 
@@ -1519,6 +1587,7 @@ class MergeMemoryCandidate:
 
 class MergeMemories:
     def execute(self, data: MergeMemoriesInput) -> MemoryTransitionResult:
+        _reject_existing_memory_work_claim(data.work_claim)
         request = data.request
         if data.source_memory_fence.memory_id == data.result_memory_fence.memory_id:
             raise MemoryTransitionError('memory_state', 'merge requires two distinct memories')
@@ -1536,7 +1605,6 @@ class MergeMemories:
             },
         )
         with transaction.atomic():
-            _lock_optional_work(data.work_claim, request)
             memories, versions = _lock_declared_memories(request, fences)
             _lock_exact_documents(versions)
             existing = _existing_transition(request, fingerprint=fingerprint)
@@ -1595,7 +1663,6 @@ class MergeMemories:
             _advance_memory_pointer(source, transition_row, source_version)
             _advance_memory_pointer(result, transition_row, version)
             _fault_boundary('candidate_pointer')
-            _finish_optional_work(data.work_claim, result_memory_id=result.id)
 
             return _transition_result(transition_row)
 
@@ -1691,6 +1758,7 @@ class SupersedeMemoryWithCandidate:
 
 class SupersedeMemories:
     def execute(self, data: SupersedeMemoriesInput) -> MemoryTransitionResult:
+        _reject_existing_memory_work_claim(data.work_claim)
         request = data.request
         if data.source_memory_fence.memory_id == data.result_memory_fence.memory_id:
             raise MemoryTransitionError('memory_state', 'supersession requires two distinct memories')
@@ -1706,9 +1774,8 @@ class SupersedeMemories:
             },
         )
         with transaction.atomic():
-            _lock_optional_work(data.work_claim, request)
             memories, versions = _lock_declared_memories(request, fences)
-            _lock_exact_documents(versions)
+            documents = _lock_exact_documents(versions)
             existing = _existing_transition(request, fingerprint=fingerprint)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
@@ -1729,14 +1796,8 @@ class SupersedeMemories:
                 transition_id=transition_id,
                 sources=source_sources,
             )
-            result_document = _write_exact(
-                memory=result,
-                version=result_version,
-                transition_id=transition_id,
-                sources=result_sources,
-            )
             _fault_boundary('exact_document')
-            embedding_work = _embedding_for_active_result(result, result_document)
+            result_document = documents[result.id]
             link = _create_semantic_link(source=source, result=result, link_type=LinkType.SUPERSEDED_BY)
             provenance_hash = memory_version_provenance_hash(result_sources)
             transition_row = _commit_transition(
@@ -1751,14 +1812,11 @@ class SupersedeMemories:
                 result_version=result_version,
                 exact_document=source_document,
                 result_exact_document=result_document,
-                embedding_work=embedding_work,
                 semantic_link=link,
                 provenance_hash=provenance_hash,
             )
             _advance_memory_pointer(source, transition_row, source_version)
-            _advance_memory_pointer(result, transition_row, result_version)
             _fault_boundary('candidate_pointer')
-            _finish_optional_work(data.work_claim, result_memory_id=result.id)
 
             return _transition_result(transition_row)
 
@@ -1791,6 +1849,7 @@ def _apply_memory_state(memory: Memory, transition_type: str) -> None:
 
 
 def _execute_memory_state(data: MemoryStateInput, *, transition_type: str) -> MemoryTransitionResult:
+    _reject_existing_memory_work_claim(data.work_claim)
     request = data.request
     fingerprint = _request_fingerprint(
         request,
@@ -1803,7 +1862,6 @@ def _execute_memory_state(data: MemoryStateInput, *, transition_type: str) -> Me
     )
     fences = (data.memory_fence,)
     with transaction.atomic():
-        _lock_optional_work(data.work_claim, request)
         memories, versions = _lock_declared_memories(request, fences)
         _lock_exact_documents(versions)
         existing = _existing_transition(request, fingerprint=fingerprint)
@@ -1841,7 +1899,6 @@ def _execute_memory_state(data: MemoryStateInput, *, transition_type: str) -> Me
         )
         _advance_memory_pointer(memory, transition_row, version)
         _fault_boundary('candidate_pointer')
-        _finish_optional_work(data.work_claim, result_memory_id=memory.id)
 
         return _transition_result(transition_row)
 
@@ -2298,9 +2355,7 @@ def _commit_conflict_resolution(
     outcome: _ConflictResolutionOutcome,
 ) -> MemoryTransitionResult:
     to_version = (
-        outcome.result_version
-        if outcome.affected_memory.id == outcome.result_memory.id
-        else outcome.affected_version
+        outcome.result_version if outcome.affected_memory.id == outcome.result_memory.id else outcome.affected_version
     )
     transition_row = _commit_transition(
         request=data.request,
