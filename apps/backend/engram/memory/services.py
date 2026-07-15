@@ -710,7 +710,7 @@ class PromoteMemoryCandidate:
             .first()
         )
         if candidate_contract_version == 1:
-            from engram.memory.candidate_decision_work import evidence_manifest
+            from engram.memory.import_provenance import candidate_evidence_manifest
             from engram.memory.transitions import (
                 CandidateFence,
                 TransitionRequest,
@@ -724,7 +724,7 @@ class PromoteMemoryCandidate:
             )
 
             candidate = MemoryCandidate.objects.get(id=data.candidate_id)
-            _entries, manifest_hash = evidence_manifest(candidate)
+            _entries, manifest_hash = candidate_evidence_manifest(candidate)
             atomic_result = AtomicPromoteMemoryCandidate().execute(
                 AtomicPromoteMemoryCandidateInput(
                     request=TransitionRequest(

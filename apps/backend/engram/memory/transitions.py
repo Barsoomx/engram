@@ -15,6 +15,7 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryConflictResolution,
     MemoryLink,
@@ -35,9 +36,14 @@ from engram.memory.candidate_decision_work import (
     build_candidate_decision_input,
     candidate_decision_snapshot,
     ensure_candidate_decision_work_locked,
-    evidence_manifest,
 )
 from engram.memory.distillation_provenance import session_candidate_content_hash
+from engram.memory.import_provenance import (
+    ImportProvenanceError,
+    candidate_evidence_manifest,
+    import_candidate_content_hash,
+    import_source_metadata,
+)
 from engram.memory.projections import create_embedding_work_and_signal, write_exact_memory_projection
 from engram.memory.work_execution import WorkClaim, finish_work_claim, lock_work_fence
 from engram.memory.workflow_work import canonical_json_bytes, resolve_work_no_signal, resolve_work_succeeded
@@ -250,27 +256,47 @@ def _scope_matches(
     )
 
 
-def _candidate_fence(candidate: MemoryCandidate, fence: CandidateFence) -> None:
+def _candidate_fence(
+    candidate: MemoryCandidate,
+    fence: CandidateFence,
+    sources: list[MemoryCandidateSource],
+) -> None:
     if candidate.id != fence.candidate_id:
         raise MemoryTransitionError(
             'stale_decision', 'candidate fence does not identify the locked candidate', retryable=True
         )
-    _entries, manifest_hash = evidence_manifest(candidate)
-    session_id = candidate.source_observation.session_id if candidate.source_observation_id else None
-    if session_id is None:
-        session_id = (
-            MemoryCandidateSource.objects.filter(candidate_id=candidate.id)
-            .order_by('id')
-            .values_list('observation__session_id', flat=True)
-            .first()
-        )
-    if session_id is None:
-        raise MemoryTransitionError(
-            'stale_decision',
-            'candidate content session cannot be reconstructed',
-            retryable=True,
-        )
-    canonical_content_hash = session_candidate_content_hash(session_id, candidate.title, candidate.body)
+    try:
+        _entries, manifest_hash = candidate_evidence_manifest(candidate, sources=sources)
+    except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
+        raise MemoryTransitionError('stale_decision', 'candidate provenance is invalid', retryable=True) from error
+    if sources and all(source.source_kind == MemoryCandidateSourceKind.IMPORT for source in sources):
+        source = sources[0]
+        try:
+            if source.import_source is None:
+                raise ImportProvenanceError('import source is required')
+            expected_content_hash = import_candidate_content_hash(
+                source.import_source.source_id,
+                source.observation.content_hash,
+            )
+        except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
+            raise MemoryTransitionError('stale_decision', 'candidate provenance is invalid', retryable=True) from error
+        canonical_content_hash = expected_content_hash
+    else:
+        session_id = candidate.source_observation.session_id if candidate.source_observation_id else None
+        if session_id is None:
+            session_id = (
+                MemoryCandidateSource.objects.filter(candidate_id=candidate.id)
+                .order_by('id')
+                .values_list('observation__session_id', flat=True)
+                .first()
+            )
+        if session_id is None:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'candidate content session cannot be reconstructed',
+                retryable=True,
+            )
+        canonical_content_hash = session_candidate_content_hash(session_id, candidate.title, candidate.body)
     if (
         candidate.content_hash != canonical_content_hash
         or fence.candidate_content_hash != canonical_content_hash
@@ -351,21 +377,30 @@ def _audit_metadata(
 
 def _source_rows(candidate: MemoryCandidate) -> list[MemoryCandidateSource]:
     sources = list(
-        MemoryCandidateSource.objects.select_for_update()
-        .select_related('window', 'observation', 'stage')
+        MemoryCandidateSource.objects.select_for_update(of=('self',))
+        .select_related('window', 'observation', 'stage', 'import_source')
         .filter(candidate_id=candidate.id)
         .order_by('id'),
     )
-    return sorted(
-        sources,
-        key=lambda source: (
+
+    def sort_key(source: MemoryCandidateSource) -> tuple[object, ...]:
+        if source.source_kind == MemoryCandidateSourceKind.IMPORT:
+            return (
+                'import',
+                source.observation.session_sequence,
+                str(source.observation_id),
+                source.anchors_hash,
+            )
+        return (
+            'distillation',
             source.window.input_hash,
             source.observation.session_sequence,
             str(source.observation_id),
             source.stage.stage_key,
             source.anchors_hash,
-        ),
-    )
+        )
+
+    return sorted(sources, key=sort_key)
 
 
 def canonical_memory_version_sources(
@@ -1031,6 +1066,74 @@ def _advance_memory_pointer(memory: Memory, transition_row: MemoryTransition, ve
     )
 
 
+def _promotion_uses_import_source(
+    candidate: MemoryCandidate,
+    sources: list[MemoryCandidateSource],
+    *,
+    work_claim: WorkClaim | None,
+    claimed_work: WorkflowWork | None,
+) -> bool:
+    import_only = all(source.source_kind == MemoryCandidateSourceKind.IMPORT for source in sources)
+    if import_only:
+        if len(sources) != 1:
+            raise MemoryTransitionError('provenance', 'import provenance is invalid')
+        if work_claim is not None:
+            raise MemoryTransitionError(
+                'stale_decision',
+                'import promotion does not accept candidate decision work',
+                retryable=True,
+            )
+    elif any(source.source_kind != MemoryCandidateSourceKind.DISTILLATION for source in sources):
+        raise MemoryTransitionError('provenance', 'candidate provenance has mixed source kinds')
+    if claimed_work is not None and not import_only:
+        _require_claimed_candidate_work(claimed_work, candidate)
+    return import_only
+
+
+def _promotion_memory_metadata(
+    candidate: MemoryCandidate,
+    sources: list[MemoryCandidateSource],
+    *,
+    import_only: bool,
+) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        'source': 'memory_candidate',
+        'memory_candidate_id': str(candidate.id),
+        'evidence': candidate.evidence,
+        'full_text': f'{candidate.title}\n\n{candidate.body}'.strip(),
+        'file_paths': [
+            *(candidate.source_observation.files_read if candidate.source_observation else []),
+            *(candidate.source_observation.files_modified if candidate.source_observation else []),
+        ],
+        'source_observation_ids': [str(candidate.source_observation_id)] if candidate.source_observation_id else [],
+        **({'kind': candidate.kind} if candidate.kind else {}),
+    }
+    if import_only:
+        try:
+            metadata.update(import_source_metadata(candidate, sources=sources))
+        except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
+            raise MemoryTransitionError('provenance', 'import provenance is invalid') from error
+    return metadata
+
+
+def _finish_promotion_work(
+    candidate: MemoryCandidate,
+    *,
+    import_only: bool,
+    claim: WorkClaim | None,
+    claimed_work: WorkflowWork | None,
+    result_memory_id: uuid.UUID,
+) -> None:
+    if import_only:
+        return
+    _finish_candidate_work(
+        candidate,
+        claim=claim,
+        claimed_work=claimed_work,
+        result_memory_id=result_memory_id,
+    )
+
+
 class PromoteMemoryCandidate:
     def execute(self, data: PromoteMemoryCandidateInput) -> MemoryTransitionResult:
         request = data.request
@@ -1052,13 +1155,9 @@ class PromoteMemoryCandidate:
             candidate = MemoryCandidate.objects.select_for_update().get(id=data.candidate_fence.candidate_id)
             if not _scope_matches(candidate, request.scope):
                 raise MemoryTransitionError('scope', 'candidate is outside the declared scope')
-            if claimed_work is not None:
-                _require_claimed_candidate_work(claimed_work, candidate)
             existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
-            _candidate_fence(candidate, data.candidate_fence)
-            _require_no_open_conflict(candidate)
             if candidate.status == CandidateStatus.PROMOTED and candidate.promoted_memory_id:
                 raise MemoryTransitionError(
                     'idempotency_collision', 'candidate was already promoted by another request'
@@ -1068,6 +1167,15 @@ class PromoteMemoryCandidate:
             sources = _source_rows(candidate)
             if not sources:
                 raise MemoryTransitionError('provenance', 'promotion requires non-empty provenance')
+            import_only = _promotion_uses_import_source(
+                candidate,
+                sources,
+                work_claim=data.work_claim,
+                claimed_work=claimed_work,
+            )
+            _candidate_fence(candidate, data.candidate_fence, sources)
+            _require_no_open_conflict(candidate)
+            metadata = _promotion_memory_metadata(candidate, sources, import_only=import_only)
             memory = Memory.objects.create(
                 organization_id=candidate.organization_id,
                 project_id=candidate.project_id,
@@ -1079,20 +1187,7 @@ class PromoteMemoryCandidate:
                 current_version=0,
                 transition_contract_version=0,
                 confidence=candidate.confidence,
-                metadata={
-                    'source': 'memory_candidate',
-                    'memory_candidate_id': str(candidate.id),
-                    'evidence': candidate.evidence,
-                    'full_text': f'{candidate.title}\n\n{candidate.body}'.strip(),
-                    'file_paths': [
-                        *(candidate.source_observation.files_read if candidate.source_observation else []),
-                        *(candidate.source_observation.files_modified if candidate.source_observation else []),
-                    ],
-                    'source_observation_ids': [str(candidate.source_observation_id)]
-                    if candidate.source_observation_id
-                    else [],
-                    **({'kind': candidate.kind} if candidate.kind else {}),
-                },
+                metadata=metadata,
             )
             _fault_boundary('memory')
             version = MemoryVersion.objects.create(
@@ -1187,8 +1282,9 @@ class PromoteMemoryCandidate:
             candidate.promoted_memory_id = memory.id
             candidate.save(update_fields=['status', 'promoted_memory', 'updated_at'])
             _fault_boundary('candidate_pointer')
-            _finish_candidate_work(
+            _finish_promotion_work(
                 candidate,
+                import_only=import_only,
                 claim=data.work_claim,
                 claimed_work=claimed_work,
                 result_memory_id=memory.id,
@@ -1229,7 +1325,8 @@ class AttachPromotedCandidateSource:
             existing = _existing_transition(request, fingerprint=fingerprint)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
-            _candidate_fence(candidate, data.candidate_fence)
+            candidate_sources = _source_rows(candidate)
+            _candidate_fence(candidate, data.candidate_fence, candidate_sources)
             if candidate.status != CandidateStatus.PROMOTED or candidate.promoted_memory_id is None:
                 raise MemoryTransitionError('candidate_state', 'candidate is not promoted')
             source = MemoryCandidateSource.objects.select_for_update().get(id=data.candidate_source_id)
@@ -1518,7 +1615,7 @@ def _execute_candidate_revision(
         existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
         if existing is not None:
             return _transition_result(existing, duplicate=True)
-        _candidate_fence(candidate, data.candidate_fence)
+        _candidate_fence(candidate, data.candidate_fence, candidate_sources)
         _require_no_open_conflict(candidate)
         _require_proposed_candidate(candidate)
         if not candidate_sources:
@@ -1694,7 +1791,7 @@ class SupersedeMemoryWithCandidate:
             existing = _existing_transition(request, fingerprint=fingerprint, subject_id=candidate.id)
             if existing is not None:
                 return _transition_result(existing, duplicate=True)
-            _candidate_fence(candidate, data.candidate_fence)
+            _candidate_fence(candidate, data.candidate_fence, candidate_sources)
             _require_no_open_conflict(candidate)
             _require_proposed_candidate(candidate)
             if not candidate_sources:
@@ -1964,7 +2061,7 @@ class OpenMemoryConflict:
                         'conflict_state',
                         'conflict transition has no durable conflict',
                     ) from error
-            _candidate_fence(candidate, data.candidate_fence)
+            _candidate_fence(candidate, data.candidate_fence, candidate_sources)
             _require_proposed_candidate(candidate)
             if not candidate_sources:
                 raise MemoryTransitionError('provenance', 'conflict candidate requires non-empty provenance')
@@ -2120,7 +2217,7 @@ def _validate_conflict_resolution_rows(
     fences: tuple[MemoryFence, ...],
     locked: _ConflictResolutionLocks,
 ) -> dict[uuid.UUID, MemoryFence]:
-    _candidate_fence(locked.candidate, data.candidate_fence)
+    _candidate_fence(locked.candidate, data.candidate_fence, locked.candidate_sources)
     _require_proposed_candidate(locked.candidate)
     if not locked.candidate_sources:
         raise MemoryTransitionError('provenance', 'conflict candidate requires non-empty provenance')
