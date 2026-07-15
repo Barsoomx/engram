@@ -122,6 +122,33 @@ def _make_memory(
     return memory, version
 
 
+def _make_legacy_memory(
+    organization: Organization,
+    project: Project,
+    *,
+    title: str,
+    body: str,
+) -> tuple[Memory, MemoryVersion]:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title=title,
+        body=body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=memory.current_version,
+        body=body,
+        content_hash=hashlib.sha256(body.encode()).hexdigest(),
+    )
+
+    return memory, version
+
+
 def _add_version(memory: Memory, *, body: str) -> MemoryVersion:
     next_version = memory.current_version + 1
     version = MemoryVersion.objects.create(
@@ -673,6 +700,106 @@ def test_weekly_project_output_excludes_team_private_sources() -> None:
     change_memory_ids = {change['memory_id'] for change in snapshot['changes']}
     assert str(project_memory.id) in change_memory_ids
     assert str(team_memory.id) not in change_memory_ids
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('work_type', (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST))
+def test_digest_snapshot_admits_only_transition_owned_sources(work_type: str) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope(f'{work_type}-typed-admission')
+    legacy_memory, _legacy_version = _make_legacy_memory(
+        organization,
+        project,
+        title='Legacy source',
+        body='legacy body',
+    )
+    typed_memory, _typed_version = _make_memory(
+        organization,
+        project,
+        title='Typed source',
+        body='typed body',
+    )
+    window_start, window_end = _daily_window() if work_type == WorkflowWorkType.DAILY_DIGEST else _weekly_window()
+
+    if work_type == WorkflowWorkType.DAILY_DIGEST:
+        snapshot = digest_work.freeze_daily_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='daily:typed-admission',
+            max_sources=10,
+        )
+        refs = snapshot['sources']
+        assert snapshot['eligible_source_count'] == 1
+    else:
+        snapshot = digest_work.freeze_weekly_digest_input(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            window_start=window_start,
+            window_end=window_end,
+            schedule_key='weekly:typed-admission',
+        )
+        refs = snapshot['changes']
+
+    assert {ref['memory_id'] for ref in refs} == {str(typed_memory.id)}
+    legacy_memory.refresh_from_db()
+    assert legacy_memory.transition_contract_version == 0
+    assert legacy_memory.current_transition_id is None
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('work_type', (WorkflowWorkType.DAILY_DIGEST, WorkflowWorkType.WEEKLY_DIGEST))
+def test_all_legacy_digest_input_resolves_no_input_without_publication(work_type: str) -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope(f'{work_type}-legacy-no-input')
+    legacy_memory, _legacy_version = _make_legacy_memory(
+        organization,
+        project,
+        title='Legacy source',
+        body='legacy body',
+    )
+    schedule_key = f'{work_type}:legacy-no-input'
+    window_start, window_end = _daily_window() if work_type == WorkflowWorkType.DAILY_DIGEST else _weekly_window()
+
+    with transaction.atomic():
+        if work_type == WorkflowWorkType.DAILY_DIGEST:
+            snapshot = digest_work.freeze_daily_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+                max_sources=10,
+            )
+            refs = snapshot['sources']
+            data = _daily_data(organization, project, snapshot, schedule_key)
+            signal_task = generate_daily_digest_work_v1
+        else:
+            snapshot = digest_work.freeze_weekly_digest_input(
+                organization_id=organization.id,
+                project_id=project.id,
+                team_id=None,
+                window_start=window_start,
+                window_end=window_end,
+                schedule_key=schedule_key,
+            )
+            refs = snapshot['changes']
+            data = _weekly_data(organization, project, None, snapshot, schedule_key)
+            signal_task = generate_weekly_digest_work_v1
+
+        work, created = digest_work.create_digest_work_and_signal(data=data, signal_task=signal_task)
+
+    assert refs == []
+    assert created is True
+    assert work.disposition == WorkflowWorkDisposition.NO_OP
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_INPUT
+    assert _digest_outbox().count() == 0
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    legacy_memory.refresh_from_db()
+    assert legacy_memory.transition_contract_version == 0
+    assert legacy_memory.current_transition_id is None
 
 
 @pytest.mark.django_db
