@@ -149,7 +149,11 @@ def test_exact_rebuild_dry_run_is_inert_and_apply_changes_only_exact_fields() ->
         projection_contract_version=0,
     )
     document.refresh_from_db()
-    before = {field: getattr(document, field) for field in document._meta.get_fields() if hasattr(field, 'attname')}
+    before = {
+        field.attname: getattr(document, field.attname)
+        for field in document._meta.get_fields()
+        if hasattr(field, 'attname')
+    }
     semantic_before = _semantic_snapshot(result.memory.id)
     work_count_before = WorkflowWork.objects.filter(subject_id=document.id).count()
 
@@ -158,7 +162,9 @@ def test_exact_rebuild_dry_run_is_inert_and_apply_changes_only_exact_fields() ->
     document.refresh_from_db()
     assert dry_run.changed == 0
     assert {
-        field: getattr(document, field) for field in document._meta.get_fields() if hasattr(field, 'attname')
+        field.attname: getattr(document, field.attname)
+        for field in document._meta.get_fields()
+        if hasattr(field, 'attname')
     } == before
     assert WorkflowWork.objects.filter(subject_id=document.id).count() == work_count_before
     assert _semantic_snapshot(result.memory.id) == semantic_before
