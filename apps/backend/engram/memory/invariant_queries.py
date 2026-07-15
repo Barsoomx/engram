@@ -1266,6 +1266,7 @@ def _p7_v1_candidate_violations(project: Project) -> list[str]:
             resolved_at__isnull=False,
         ).exists()
         import_only = False
+        import_candidate_transition_types: tuple[str, ...] | None = None
         if candidate.decision_work_contract_version == 1:
             import_sources = list(
                 MemoryCandidateSource.objects.select_related('observation', 'import_source').filter(
@@ -1276,11 +1277,37 @@ def _p7_v1_candidate_violations(project: Project) -> list[str]:
             if import_only and not is_validated_import_candidate(candidate, sources=import_sources):
                 violations.append(candidate_sample)
                 continue
+        if import_only:
+            import_candidate_transition_types = tuple(
+                MemoryTransition.objects.filter(
+                    organization_id=project.organization_id,
+                    project_id=project.id,
+                    candidate_id=candidate.id,
+                )
+                .order_by('id')
+                .values_list('transition_type', flat=True)
+            )
+            import_transition_ok = (
+                transition is not None
+                and transition.transition_type == MemoryTransitionType.PROMOTE
+                and import_candidate_transition_types == (MemoryTransitionType.PROMOTE,)
+            )
+            decision_work_absent = not WorkflowWork.objects.filter(
+                organization_id=project.organization_id,
+                project_id=project.id,
+                work_type=WorkflowWorkType.CANDIDATE_DECISION,
+                subject_id=candidate.id,
+            ).exists()
+            transition_shape_ok = import_transition_ok and decision_work_absent
+        else:
+            transition_shape_ok = transition is not None and (
+                transition.transition_type != MemoryTransitionType.PROMOTE or decision_work_ok
+            )
         if (
             transition is None
             or transition.result_memory_id != candidate.promoted_memory_id
             or transition.candidate_id != candidate.id
-            or (transition.transition_type == MemoryTransitionType.PROMOTE and not decision_work_ok and not import_only)
+            or not transition_shape_ok
         ):
             violations.append(candidate_sample)
 

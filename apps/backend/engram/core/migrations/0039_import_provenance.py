@@ -4,11 +4,6 @@ from django.db import migrations, models
 from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 
 
-def _backfill_distillation(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
-    source_model = apps.get_model('core', 'MemoryCandidateSource')
-    source_model.objects.filter(source_kind__isnull=True).update(source_kind='distillation')
-
-
 def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
     source_model = apps.get_model('core', 'MemoryCandidateSource')
     if source_model.objects.filter(source_kind='import').exists():
@@ -104,5 +99,5 @@ class Migration(migrations.Migration):
                 name='core_candidate_source_shape_ck',
             ),
         ),
-        migrations.RunPython(_backfill_distillation, _guard_reverse),
+        migrations.RunPython(migrations.RunPython.noop, _guard_reverse),
     ]

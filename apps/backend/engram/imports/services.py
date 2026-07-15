@@ -21,6 +21,7 @@ from engram.core.models import (
     CandidateStatus,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryStatus,
     Observation,
     ObservationSource,
     Organization,
@@ -1142,6 +1143,7 @@ class ClaudeMemImporter:
             source_id=source_id,
             event_type=event_type,
             source_store_id=context.source_store_id,
+            confidence=confidence,
         ):
             return self._empty_memory_result(payload_redacted or observation_redacted)
 
@@ -1232,7 +1234,7 @@ class ClaudeMemImporter:
                 source_id=source_id,
                 event_type=event_type,
             )
-        self._capture_import_observation_source(
+        observation_source = self._capture_import_observation_source(
             context=context,
             observation=observation,
             raw_event=raw_event,
@@ -1246,6 +1248,7 @@ class ClaudeMemImporter:
             event_type,
             confidence,
             defer_embedding,
+            observation_source,
         )
 
         return {
@@ -1300,34 +1303,65 @@ class ClaudeMemImporter:
         *,
         organization: Organization,
         project: Project,
+        team: Team | None,
+        observation: Observation,
         source_id: str,
-        observation_content_hash: str,
         source_store_id: str,
         event_type: str,
-    ) -> None:
-        candidate_hash = import_candidate_content_hash(source_id, observation_content_hash)
+        confidence: Decimal,
+    ) -> MemoryCandidate | None:
+        candidate_hash = import_candidate_content_hash(source_id, observation.content_hash)
         candidates = list(
             MemoryCandidate.objects.filter(
                 organization=organization,
                 project=project,
                 content_hash=candidate_hash,
+                decision_work_contract_version=0,
             ).select_related('promoted_memory')
         )
-        for candidate in candidates:
-            if candidate.decision_work_contract_version != 0:
-                continue
-            memory = candidate.promoted_memory
-            if candidate.status != CandidateStatus.PROMOTED or memory is None:
-                raise ValueError('legacy import candidate identity collision')
-            if (
-                memory.transition_contract_version != 0
-                or not isinstance(memory.metadata, dict)
-                or memory.metadata.get('source') != 'claude_mem_import'
-                or memory.metadata.get('source_store_id') != source_store_id
-                or memory.metadata.get('source_id') != source_id
-                or memory.metadata.get('event_type') != event_type
-            ):
-                raise ValueError('legacy import candidate identity collision')
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise ValueError('legacy import candidate identity collision')
+
+        candidate = candidates[0]
+        memory = candidate.promoted_memory
+        expected_team_id = team.id if team is not None else None
+        expected_body = observation.body or observation.title
+        expected_metadata = {
+            'source': _IMPORT_SESSION_SOURCE,
+            'source_store_id': source_store_id,
+            'source_id': source_id,
+            'event_type': event_type,
+        }
+        if (
+            candidate.organization_id != organization.id
+            or candidate.project_id != project.id
+            or observation.organization_id != organization.id
+            or observation.project_id != project.id
+            or observation.team_id != expected_team_id
+            or candidate.team_id != expected_team_id
+            or candidate.source_observation_id != observation.id
+            or candidate.title != observation.title
+            or candidate.body != expected_body
+            or candidate.status != CandidateStatus.PROMOTED
+            or candidate.visibility_scope != VisibilityScope.PROJECT
+            or candidate.confidence != confidence
+            or memory is None
+            or memory.organization_id != organization.id
+            or memory.project_id != project.id
+            or memory.team_id != expected_team_id
+            or memory.title != observation.title
+            or memory.body != expected_body
+            or memory.status != MemoryStatus.APPROVED
+            or memory.visibility_scope != VisibilityScope.PROJECT
+            or memory.confidence != confidence
+            or memory.transition_contract_version != 0
+            or memory.metadata != expected_metadata
+        ):
+            raise ValueError('legacy import candidate identity collision')
+
+        return candidate
 
     def _existing_import_observation(
         self,
@@ -1468,6 +1502,7 @@ class ClaudeMemImporter:
         source_id: str,
         event_type: str,
         source_store_id: str,
+        confidence: Decimal,
     ) -> bool:
         sources = list(
             ObservationSource.objects.select_related('observation', 'raw_event')
@@ -1509,10 +1544,12 @@ class ClaudeMemImporter:
         self._validate_existing_import_candidate_replay(
             organization=organization,
             project=project,
+            team=team,
+            observation=observation,
             source_id=source_id,
-            observation_content_hash=observation.content_hash,
             source_store_id=source_store_id,
             event_type=event_type,
+            confidence=confidence,
         )
 
         if legacy_shape:
@@ -1779,38 +1816,20 @@ class ClaudeMemImporter:
         event_type: str,
         confidence: Decimal,
         defer_embedding: bool,
+        observation_source: ObservationSource,
     ) -> dict[str, bool]:
         candidate_hash = import_candidate_content_hash(source_id, observation.content_hash)
-        observation_source = ObservationSource.objects.get(
+        legacy_candidate = self._validate_existing_import_candidate_replay(
             organization=observation.organization,
             project=observation.project,
+            team=context.team,
             observation=observation,
-            source_type='claude_mem',
             source_id=source_id,
-        )
-        legacy_candidate = (
-            MemoryCandidate.objects.filter(
-                organization=observation.organization,
-                project=observation.project,
-                content_hash=candidate_hash,
-                decision_work_contract_version=0,
-                status=CandidateStatus.PROMOTED,
-            )
-            .select_related('promoted_memory')
-            .first()
+            source_store_id=context.source_store_id,
+            event_type=event_type,
+            confidence=confidence,
         )
         if legacy_candidate is not None:
-            memory = legacy_candidate.promoted_memory
-            if (
-                memory is None
-                or memory.transition_contract_version != 0
-                or not isinstance(memory.metadata, dict)
-                or memory.metadata.get('source') != 'claude_mem_import'
-                or memory.metadata.get('source_store_id') != context.source_store_id
-                or memory.metadata.get('source_id') != source_id
-                or memory.metadata.get('event_type') != event_type
-            ):
-                raise ValueError('legacy import candidate identity collision')
             return {
                 'candidate_created': False,
                 'memory_created': False,
