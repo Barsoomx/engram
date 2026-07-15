@@ -196,9 +196,11 @@ def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[Wo
 
 
 def _load_current_transition(memory: Memory, transition_id: uuid.UUID) -> MemoryTransition | None:
-    return MemoryTransition.objects.filter(id=transition_id).filter(
-        models.Q(memory_id=memory.id) | models.Q(result_memory_id=memory.id)
-    ).first()
+    return (
+        MemoryTransition.objects.filter(id=transition_id)
+        .filter(models.Q(memory_id=memory.id) | models.Q(result_memory_id=memory.id))
+        .first()
+    )
 
 
 def _transition_matches_projection(
@@ -221,9 +223,7 @@ def _transition_matches_projection(
             transition.result_exact_document_id == document.id,
         )
     )
-    work_matches = (
-        result_projection and transition.embedding_work_id == work.id
-    ) or (
+    work_matches = (result_projection and transition.embedding_work_id == work.id) or (
         affected_projection
         and transition.memory_id != transition.result_memory_id
         and transition.embedding_work_id != work.id

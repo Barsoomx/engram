@@ -1909,10 +1909,7 @@ def _p8_audit_document_is_valid(
             exact_id_key, exact_hash_key = 'result_exact_document_id', 'result_exact_projection_hash'
         version_key = 'version_id' if metadata.get('version_id') else 'result_version_id'
         expected_version = transition.result_version_id
-    if (
-        metadata.get(exact_id_key) != str(document.id)
-        or metadata.get(version_key) != str(expected_version)
-    ):
+    if metadata.get(exact_id_key) != str(document.id) or metadata.get(version_key) != str(expected_version):
         return False
     if not _p8_hash_is_valid(metadata.get(exact_hash_key)):
         return False

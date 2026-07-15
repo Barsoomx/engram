@@ -699,10 +699,15 @@ def test_supersede_restore_concurrency_serializes_to_one_coherent_state() -> Non
     document = RetrievalDocument.objects.get(memory=loser_result.memory, memory_version__version=1)
     assert loser_result.memory.stale is True
     assert document.stale is True
-    assert _model('MemoryTransition').objects.filter(
-        project_id=loser_candidate.project_id,
-        transition_type='supersede',
-    ).count() == 1
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            project_id=loser_candidate.project_id,
+            transition_type='supersede',
+        )
+        .count()
+        == 1
+    )
 
 
 @pytest.mark.django_db
@@ -721,14 +726,22 @@ def test_merge_preserves_both_histories_and_exact_relational_provenance() -> Non
     assert source_rows.filter(source_memory_version_id=first_result.memory_version.id).exists()
     assert source_rows.filter(source_memory_version_id=second_result.memory_version.id).exists()
     assert first_result.memory.id != second_result.memory.id
-    assert _model('MemoryTransition').objects.filter(
-        memory_id=first_result.memory.id,
-        transition_type='promote',
-    ).exists()
-    assert _model('MemoryTransition').objects.filter(
-        memory_id=second_result.memory.id,
-        transition_type='promote',
-    ).exists()
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            memory_id=first_result.memory.id,
+            transition_type='promote',
+        )
+        .exists()
+    )
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            memory_id=second_result.memory.id,
+            transition_type='promote',
+        )
+        .exists()
+    )
     assert result.transition.semantic_link.link_type == LinkType.NARROWED_BY
     assert result.transition.from_version_id == second_result.memory_version.id
     assert result.transition.result_version_id == result.memory_version.id
@@ -1051,7 +1064,12 @@ def test_remaining_typed_lineage_commands_commit_named_transitions() -> None:
         )
     )
     assert superseded.transition.transition_type == 'supersede'
-    assert _model('MemoryTransition').objects.filter(
-        project_id=candidate.project_id,
-        transition_type__in=('revise', 'merge', 'publish_digest', 'mark_stale', 'refute', 'restore', 'archive'),
-    ).count() >= 7
+    assert (
+        _model('MemoryTransition')
+        .objects.filter(
+            project_id=candidate.project_id,
+            transition_type__in=('revise', 'merge', 'publish_digest', 'mark_stale', 'refute', 'restore', 'archive'),
+        )
+        .count()
+        >= 7
+    )

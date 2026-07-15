@@ -409,9 +409,7 @@ def test_curate_does_not_supersede_memory_in_another_org() -> None:
 
 @pytest.mark.django_db
 def test_curate_supersedes_existing_near_duplicate_memory(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, _team, _project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-near-duplicate'
-    )
+    organization, _team, _project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-near-duplicate')
     set_curator_settings(organization)
     patch_atomic_near_duplicate(monkeypatch, existing, score=0.970)
 
@@ -466,9 +464,7 @@ def test_curate_rejects_low_signal_candidate_without_creating_memory() -> None:
 
 @pytest.mark.django_db
 def test_curate_reject_does_not_clear_durable_conflict_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate(
-        'curator-conflict-reject'
-    )
+    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('curator-conflict-reject')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -720,9 +716,7 @@ def test_curate_judge_keep_both_promotes_clean_without_supersede() -> None:
 
 @pytest.mark.django_db
 def test_curate_judge_merge_supersedes_near_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-judge-merge'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-judge-merge')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -807,9 +801,7 @@ def test_curate_judge_reject_applies_even_with_pre_existing_provider_call_record
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_opens_durable_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-conflict-open'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-conflict-open')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -850,9 +842,7 @@ def test_curate_judge_contradicts_opens_durable_conflict(monkeypatch: pytest.Mon
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-conflict-replay'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-conflict-replay')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -878,18 +868,20 @@ def test_curate_judge_contradicts_rerun_is_idempotent(monkeypatch: pytest.Monkey
         == 1
     )
     assert MemoryLink.objects.filter(link_type=LinkType.CONFLICTS_WITH).count() == link_count == 1
-    assert MemoryTransition.objects.filter(
-        candidate=duplicate,
-        transition_type=MemoryTransitionType.CONFLICT_OPEN,
-    ).count() == transition_count == 1
+    assert (
+        MemoryTransition.objects.filter(
+            candidate=duplicate,
+            transition_type=MemoryTransitionType.CONFLICT_OPEN,
+        ).count()
+        == transition_count
+        == 1
+    )
     assert AuditEvent.objects.filter(event_type='MemoryTransitionCommitted').count() == audit_count
 
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_redacts_reason_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-conflict-redaction'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-conflict-redaction')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -910,9 +902,7 @@ def test_curate_judge_contradicts_redacts_reason_before_persisting(monkeypatch: 
 
 @pytest.mark.django_db
 def test_curate_judge_contradicts_truncates_stored_reason_to_200_chars(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-conflict-truncation'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-conflict-truncation')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
@@ -982,9 +972,7 @@ def test_curate_gray_band_without_judge_promotes_clean(monkeypatch: pytest.Monke
 
 @pytest.mark.django_db
 def test_curate_above_threshold_supersedes_without_consulting_judge(monkeypatch: pytest.MonkeyPatch) -> None:
-    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate(
-        'curator-above-threshold'
-    )
+    organization, team, project, existing, duplicate = seed_atomic_existing_and_duplicate('curator-above-threshold')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='0.850', llm_judge_enabled=True)
     patch_atomic_near_duplicate(monkeypatch, existing, score=0.970)

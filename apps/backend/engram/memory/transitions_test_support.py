@@ -343,13 +343,19 @@ def open_single_conflict(suffix: str) -> tuple[MemoryCandidate, MemoryConflict]:
         title=f'Resolution candidate {suffix}',
         body=f'Resolution candidate body {suffix}',
     )
-    conflict = transitions_module().OpenMemoryConflict().execute(
-        transitions_module().OpenMemoryConflictInput(
-            request=transition_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:v1'),
-            candidate_fence=candidate_fence_for(candidate),
-            memory_fence=transitions_module().build_memory_fence(memory_result.memory),
-            evidence_hash='e' * 64,
-            redacted_reason='resolution outcome contract',
+    conflict = (
+        transitions_module()
+        .OpenMemoryConflict()
+        .execute(
+            transitions_module().OpenMemoryConflictInput(
+                request=transition_request_for(
+                    candidate, key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:v1'
+                ),
+                candidate_fence=candidate_fence_for(candidate),
+                memory_fence=transitions_module().build_memory_fence(memory_result.memory),
+                evidence_hash='e' * 64,
+                redacted_reason='resolution outcome contract',
+            )
         )
     )
     return candidate, MemoryConflict.objects.get(id=conflict.id)
