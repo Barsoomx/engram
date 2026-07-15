@@ -1220,8 +1220,9 @@ def test_concurrent_imports_lock_sessions_in_stable_order_without_deadlock(
         assert session.observation_sequence_cursor == 1
         assert list(Observation.objects.filter(session=session).values_list('session_sequence', flat=True)) == [1]
         assert list(RawEventEnvelope.objects.filter(session=session).values_list('sequence_number', flat=True)) == [1]
-    assert not WorkflowWork.objects.exists()
-    assert not CeleryOutbox.objects.exists()
+    assert WorkflowWork.objects.filter(work_type='memory_embedding').count() == 2
+    assert not WorkflowWork.objects.exclude(work_type='memory_embedding').exists()
+    assert CeleryOutbox.objects.filter(task_name='engram.memory.embed_memory_projection_work_v1').count() == 2
 
 
 @pytest.mark.django_db
