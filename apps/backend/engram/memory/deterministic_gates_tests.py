@@ -70,10 +70,7 @@ def _retry_snapshot() -> dict[str, object]:
     snapshot: dict[str, object] = {}
     for model in models:
         fields = tuple(field.attname for field in model._meta.concrete_fields)
-        rows = tuple(
-            tuple(row[field] for field in fields)
-            for row in model.objects.order_by('pk').values(*fields)
-        )
+        rows = tuple(tuple(row[field] for field in fields) for row in model.objects.order_by('pk').values(*fields))
         snapshot[model._meta.label] = {'count': len(rows), 'fields': fields, 'rows': rows}
     return snapshot
 

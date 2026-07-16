@@ -313,10 +313,7 @@ def _active_versions(candidate: MemoryCandidate, scope: EffectiveCandidateScope)
         if (
             version.memory.organization_id != candidate.organization_id
             or version.memory.project_id != candidate.project_id
-            or (
-                version.memory.team_id is not None
-                and version.memory.team.organization_id != candidate.organization_id
-            )
+            or (version.memory.team_id is not None and version.memory.team.organization_id != candidate.organization_id)
         ):
             raise CandidateDecisionWorkScopeError('current memory version has foreign scope')
 

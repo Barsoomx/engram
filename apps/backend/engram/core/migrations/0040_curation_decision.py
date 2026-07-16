@@ -6,7 +6,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('core', '0039_import_provenance'),
         ('model_policy', '0004_alter_providercallrecord_result'),
@@ -22,29 +21,189 @@ class Migration(migrations.Migration):
                 ('input_fingerprint', models.CharField(max_length=64)),
                 ('evidence_manifest_hash', models.CharField(max_length=64)),
                 ('comparison_manifest_hash', models.CharField(max_length=64)),
-                ('outcome', models.CharField(choices=[('publish_new', 'Publish new'), ('merge_evidence', 'Merge evidence'), ('revise_memory', 'Revise memory'), ('supersede_memory', 'Supersede memory'), ('reject_candidate', 'Reject candidate'), ('open_conflict', 'Open conflict')], max_length=40)),
-                ('reason_code', models.CharField(choices=[('noise_empty', 'Noise: empty'), ('noise_title_echo', 'Noise: title echo'), ('noise_redaction_only', 'Noise: redaction only'), ('noise_parse_wrapper', 'Noise: parse wrapper'), ('noise_lifecycle_only', 'Noise: lifecycle only'), ('unsupported_provenance', 'Unsupported provenance'), ('unsafe_content_after_redaction', 'Unsafe content after redaction'), ('non_durable_session_scope', 'Non-durable session scope'), ('exact_identity', 'Exact identity'), ('exact_duplicate_no_new_evidence', 'Exact duplicate without new evidence'), ('distinct_claim', 'Distinct claim'), ('equivalent_claim', 'Equivalent claim'), ('same_subject_revision', 'Same subject revision'), ('ordered_replacement', 'Ordered replacement'), ('redundant_claim', 'Redundant claim'), ('unsupported_claim', 'Unsupported claim'), ('same_scope_contradiction', 'Same-scope contradiction')], max_length=64)),
+                (
+                    'outcome',
+                    models.CharField(
+                        choices=[
+                            ('publish_new', 'Publish new'),
+                            ('merge_evidence', 'Merge evidence'),
+                            ('revise_memory', 'Revise memory'),
+                            ('supersede_memory', 'Supersede memory'),
+                            ('reject_candidate', 'Reject candidate'),
+                            ('open_conflict', 'Open conflict'),
+                        ],
+                        max_length=40,
+                    ),
+                ),
+                (
+                    'reason_code',
+                    models.CharField(
+                        choices=[
+                            ('noise_empty', 'Noise: empty'),
+                            ('noise_title_echo', 'Noise: title echo'),
+                            ('noise_redaction_only', 'Noise: redaction only'),
+                            ('noise_parse_wrapper', 'Noise: parse wrapper'),
+                            ('noise_lifecycle_only', 'Noise: lifecycle only'),
+                            ('unsupported_provenance', 'Unsupported provenance'),
+                            ('unsafe_content_after_redaction', 'Unsafe content after redaction'),
+                            ('non_durable_session_scope', 'Non-durable session scope'),
+                            ('exact_identity', 'Exact identity'),
+                            ('exact_duplicate_no_new_evidence', 'Exact duplicate without new evidence'),
+                            ('distinct_claim', 'Distinct claim'),
+                            ('equivalent_claim', 'Equivalent claim'),
+                            ('same_subject_revision', 'Same subject revision'),
+                            ('ordered_replacement', 'Ordered replacement'),
+                            ('redundant_claim', 'Redundant claim'),
+                            ('unsupported_claim', 'Unsupported claim'),
+                            ('same_scope_contradiction', 'Same-scope contradiction'),
+                        ],
+                        max_length=64,
+                    ),
+                ),
                 ('redacted_reason', models.CharField(blank=True, default='', max_length=500)),
-                ('effective_visibility_scope', models.CharField(choices=[('session', 'Session'), ('project', 'Project'), ('team', 'Team'), ('organization', 'Organization')], max_length=40)),
-                ('evidence_tier', models.CharField(choices=[('none', 'None'), ('supported', 'Supported'), ('corroborated', 'Corroborated')], max_length=20)),
+                (
+                    'effective_visibility_scope',
+                    models.CharField(
+                        choices=[
+                            ('session', 'Session'),
+                            ('project', 'Project'),
+                            ('team', 'Team'),
+                            ('organization', 'Organization'),
+                        ],
+                        max_length=40,
+                    ),
+                ),
+                (
+                    'evidence_tier',
+                    models.CharField(
+                        choices=[('none', 'None'), ('supported', 'Supported'), ('corroborated', 'Corroborated')],
+                        max_length=20,
+                    ),
+                ),
                 ('policy_version', models.PositiveIntegerField(blank=True, null=True)),
                 ('payload_hash', models.CharField(max_length=64)),
-                ('candidate', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='core.memorycandidate')),
-                ('conflict', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='core.memoryconflict')),
-                ('effective_team', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='effective_curation_decisions', to='core.team')),
-                ('organization', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='core.organization')),
-                ('policy', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='model_policy.modelpolicy')),
-                ('project', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='core.project')),
-                ('provider_call_record', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='model_policy.providercallrecord')),
-                ('target_memory_version', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='target_curation_decisions', to='core.memoryversion')),
-                ('team', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='curation_decisions', to='core.team')),
-                ('transition', models.OneToOneField(blank=True, null=True, on_delete=django.db.models.deletion.PROTECT, related_name='curation_decision', to='core.memorytransition')),
-                ('work', models.OneToOneField(on_delete=django.db.models.deletion.PROTECT, related_name='curation_decision', to='core.workflowwork')),
+                (
+                    'candidate',
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='core.memorycandidate',
+                    ),
+                ),
+                (
+                    'conflict',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='core.memoryconflict',
+                    ),
+                ),
+                (
+                    'effective_team',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='effective_curation_decisions',
+                        to='core.team',
+                    ),
+                ),
+                (
+                    'organization',
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='core.organization',
+                    ),
+                ),
+                (
+                    'policy',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='model_policy.modelpolicy',
+                    ),
+                ),
+                (
+                    'project',
+                    models.ForeignKey(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='core.project',
+                    ),
+                ),
+                (
+                    'provider_call_record',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='model_policy.providercallrecord',
+                    ),
+                ),
+                (
+                    'target_memory_version',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='target_curation_decisions',
+                        to='core.memoryversion',
+                    ),
+                ),
+                (
+                    'team',
+                    models.ForeignKey(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decisions',
+                        to='core.team',
+                    ),
+                ),
+                (
+                    'transition',
+                    models.OneToOneField(
+                        blank=True,
+                        null=True,
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decision',
+                        to='core.memorytransition',
+                    ),
+                ),
+                (
+                    'work',
+                    models.OneToOneField(
+                        on_delete=django.db.models.deletion.PROTECT,
+                        related_name='curation_decision',
+                        to='core.workflowwork',
+                    ),
+                ),
             ],
             options={
                 'ordering': ['organization_id', 'project_id', 'created_at'],
-                'indexes': [models.Index(fields=['organization', 'project', 'created_at'], name='core_curdec_scope_time_idx'), models.Index(fields=['candidate'], name='core_curdec_candidate_idx')],
-                'constraints': [models.CheckConstraint(condition=models.Q(('contract_version', 1)), name='core_curation_decision_contract_ck'), models.CheckConstraint(condition=models.Q(models.Q(('effective_team__isnull', True), ('effective_visibility_scope', 'project')), models.Q(('effective_team__isnull', False), ('effective_visibility_scope', 'team')), _connector='OR'), name='core_curation_decision_effective_scope_ck')],
+                'indexes': [
+                    models.Index(fields=['organization', 'project', 'created_at'], name='core_curdec_scope_time_idx'),
+                    models.Index(fields=['candidate'], name='core_curdec_candidate_idx'),
+                ],
+                'constraints': [
+                    models.CheckConstraint(
+                        condition=models.Q(('contract_version', 1)), name='core_curation_decision_contract_ck'
+                    ),
+                    models.CheckConstraint(
+                        condition=models.Q(
+                            models.Q(('effective_team__isnull', True), ('effective_visibility_scope', 'project')),
+                            models.Q(('effective_team__isnull', False), ('effective_visibility_scope', 'team')),
+                            _connector='OR',
+                        ),
+                        name='core_curation_decision_effective_scope_ck',
+                    ),
+                ],
             },
         ),
     ]

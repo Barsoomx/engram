@@ -258,7 +258,9 @@ def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
                 source_kind=MemoryCandidateSourceKind.DISTILLATION,
                 window__isnull=False,
                 stage__isnull=False,
-            ).select_related('window', 'observation', 'stage').order_by('window_id', 'observation_id', 'id')
+            )
+            .select_related('window', 'observation', 'stage')
+            .order_by('window_id', 'observation_id', 'id')
         )
         if not sources:
             return False
