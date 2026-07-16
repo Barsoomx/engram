@@ -342,6 +342,60 @@ def test_openai_gateway_call_raises_provider_timeout_on_timeout_error() -> None:
 
 
 @pytest.mark.django_db
+def test_openai_curation_decision_prompt_carries_verdict_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('{}'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='curation-schema-1',
+            trace_id='curation-schema-1',
+            prompt='{"schema":"curation_judge_input.v1"}',
+            response_kind='curation_decision_v1',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    user_message = sent['messages'][-1]['content']
+
+    assert 'exactly one JSON object' in user_message
+    assert 'candidate_evidence_refs' in user_message
+    assert 'supersede_memory' in user_message
+    assert 'temporal_order' in user_message
+    assert user_message.rstrip().endswith('{"schema":"curation_judge_input.v1"}')
+
+
+@pytest.mark.django_db
+def test_openai_single_kind_prompt_has_no_curation_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('Title: X\nBody: Y'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='single-schema-1',
+            trace_id='single-schema-1',
+            prompt='plain prompt',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+
+    assert sent['messages'][-1]['content'] == 'plain prompt'
+
+
+@pytest.mark.django_db
 def test_openai_gateway_embed_raises_provider_timeout_on_timeout_error() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)

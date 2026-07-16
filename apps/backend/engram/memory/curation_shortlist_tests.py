@@ -12,6 +12,7 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryConflict,
+    MemoryStatus,
     MemoryTransition,
     MemoryVersion,
     Team,
@@ -421,6 +422,44 @@ def test_missing_embedding_on_nonempty_scope_retries_without_publication() -> No
                 scope[0].id,
                 scope[1].id,
                 EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+                title='',
+                body='',
+            ),
+        )
+
+    assert getattr(error.value, 'code', None) == 'embedding_unavailable'
+    assert _semantic_snapshot(scope[1].id) == before
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('status', [MemoryStatus.ARCHIVED, MemoryStatus.REFUTED])
+def test_shortlist_excludes_archived_and_status_refuted_memories(status: str) -> None:
+    scope, memory, version, document, _candidate, _source = _promote(f'shortlist-status-{status}')
+    memory.status = status
+    memory.save(update_fields=['status', 'updated_at'])
+    _write_projection(memory, version, memory.current_transition_id, full_text=document.full_text)
+    before = _semantic_snapshot(scope[1].id)
+
+    result = _shortlist_module().BuildCurationShortlist.execute(
+        _input(scope[0].id, scope[1].id, EffectiveCandidateScope(VisibilityScope.PROJECT, None)),
+    )
+
+    assert result.entries == ()
+    assert _semantic_snapshot(scope[1].id) == before
+
+
+@pytest.mark.django_db
+def test_query_embedding_with_unembedded_corpus_retries_without_blind_completion() -> None:
+    scope, _memory, _version, _document, _candidate, _source = _promote('shortlist-corpus-no-embedding')
+    before = _semantic_snapshot(scope[1].id)
+
+    with pytest.raises(ValueError) as error:
+        _shortlist_module().BuildCurationShortlist.execute(
+            _input(
+                scope[0].id,
+                scope[1].id,
+                EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+                embedding=_embedding(7),
                 title='',
                 body='',
             ),

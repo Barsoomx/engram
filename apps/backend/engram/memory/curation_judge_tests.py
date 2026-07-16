@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
@@ -32,6 +33,9 @@ from engram.memory.transitions_test_support import (
 )
 from engram.memory.workflow_work import observation_content_digest
 from engram.model_policy.services import ProviderCallResult
+
+_CANDIDATE_EVIDENCE_AT = datetime(2026, 2, 1, tzinfo=UTC)
+_TARGET_EVIDENCE_AT = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def _judge_module() -> object:
@@ -75,8 +79,18 @@ def _fixture(*, comparison_complete: bool = True) -> tuple[object, object, objec
         comparison_complete=comparison_complete,
     )
     evidence = module.CurationEvidenceContext(
-        candidate=module.ClaimEvidence(tier='corroborated', refs=('candidate-ref', 'candidate-ref-2')),
-        targets={target_id: module.ClaimEvidence(tier='supported', refs=('target-ref',))},
+        candidate=module.ClaimEvidence(
+            tier='corroborated',
+            refs=('candidate-ref', 'candidate-ref-2'),
+            latest_evidence_at=_CANDIDATE_EVIDENCE_AT,
+        ),
+        targets={
+            target_id: module.ClaimEvidence(
+                tier='supported',
+                refs=('target-ref',),
+                latest_evidence_at=_TARGET_EVIDENCE_AT,
+            )
+        },
     )
     data = module.CurationJudgeInput(
         organization_id=scope[0].id,
@@ -115,7 +129,11 @@ def _two_entry_fixture() -> tuple[object, object, tuple[object, object], object]
         data.evidence,
         targets={
             first.memory_version_id: data.evidence.targets[first.memory_version_id],
-            second.memory_version_id: module.ClaimEvidence(tier='supported', refs=('target-ref-2',)),
+            second.memory_version_id: module.ClaimEvidence(
+                tier='supported',
+                refs=('target-ref-2',),
+                latest_evidence_at=_TARGET_EVIDENCE_AT,
+            ),
         },
     )
     return module, replace(data, shortlist=shortlist, evidence=evidence), (first, second), candidate
@@ -460,6 +478,7 @@ def test_judge_allows_only_locked_outcome_relation_target_combinations(
             candidate=module.ClaimEvidence(
                 tier=candidate_tier,
                 refs=() if candidate_tier == 'none' else ('candidate-ref', 'candidate-ref-2'),
+                latest_evidence_at=_CANDIDATE_EVIDENCE_AT,
             ),
         ),
     )
@@ -682,6 +701,153 @@ def test_missing_target_provenance_raises_operational_retry_without_override() -
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
     assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_corrupt_target_provenance_raises_operational_retry_without_downgrade() -> None:
+    module = _judge_module()
+    candidate, source, _scope = provenanced_candidate('judge-evidence-corrupt-target')
+    promotable, _promotable_source = candidate_in_scope(
+        candidate,
+        source,
+        title='Target memory for corrupt provenance',
+        body='Target memory body for corrupt provenance',
+    )
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(promotable))
+    MemoryCandidateSource.objects.filter(candidate_id=promotable.id).update(anchors_hash='f' * 64)
+    shortlist = _shortlist_for(result.memory, result.memory_version)
+    before = _semantic_snapshot(candidate.project_id)
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.build_curation_evidence_context(candidate.id, shortlist)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+    assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_targetless_outcome_rejects_identity_relation_comparison() -> None:
+    module, data, entry, candidate = _fixture()
+    payload = _payload(
+        entry,
+        outcome='publish_new',
+        relation='unrelated',
+        target=None,
+        comparisons=[
+            {
+                'memory_version_id': str(entry.memory_version_id),
+                'relation': 'equivalent',
+                'target_evidence_refs': ['target-ref'],
+            }
+        ],
+    )
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+
+
+@pytest.mark.django_db
+def test_supersede_requires_deterministic_precedence_not_provider_claim() -> None:
+    module, data, entry, candidate = _fixture()
+    data = replace(
+        data,
+        evidence=replace(
+            data.evidence,
+            candidate=replace(
+                data.evidence.candidate,
+                latest_evidence_at=datetime(2025, 1, 1, tzinfo=UTC),
+            ),
+        ),
+    )
+    payload = _payload(
+        entry,
+        outcome='supersede_memory',
+        relation='candidate_supersedes',
+        target=str(entry.memory_version_id),
+        reason_code='ordered_replacement',
+        applicability='same',
+        temporal_order='candidate_newer',
+        reason='provider asserts precedence the evidence does not support',
+    )
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+@pytest.mark.django_db
+def test_supersede_requires_same_applicability() -> None:
+    module, data, entry, candidate = _fixture()
+    payload = _payload(
+        entry,
+        outcome='supersede_memory',
+        relation='candidate_supersedes',
+        target=str(entry.memory_version_id),
+        reason_code='ordered_replacement',
+        applicability='different',
+        temporal_order='candidate_newer',
+        reason='supersession across a different applicability is not authorized',
+    )
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+@pytest.mark.django_db
+def test_judge_prompt_binds_comparison_manifest_and_completeness() -> None:
+    module, data, _entry, _candidate = _fixture()
+
+    prompt = json.loads(module.build_curation_judge_prompt(data))
+
+    assert prompt.get('comparison_manifest_hash') == data.shortlist.manifest_hash
+    assert prompt.get('authorized_corpus_count') == data.shortlist.authorized_corpus_count
+    assert prompt.get('comparison_complete') == data.shortlist.comparison_complete
+
+
+@pytest.mark.django_db
+def test_judge_prompt_bounds_oversized_claim_snapshots() -> None:
+    module, data, _entry, _candidate = _fixture()
+    data = replace(data, candidate=replace(data.candidate, body='x' * 9000))
+
+    prompt = module.build_curation_judge_prompt(data)
+    envelope = json.loads(prompt)
+
+    assert len(envelope['candidate']['claim']['body']) < 9000
+    assert '[truncated' in envelope['candidate']['claim']['body']
+
+
+@pytest.mark.django_db
+def test_judge_result_carries_comparison_manifest_binding(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, data, entry, candidate = _fixture()
+    candidate.refresh_from_db()
+    organization, project = candidate.organization, candidate.project
+    session_team = candidate.team
+    create_curation_policy(organization, session_team, project, task_type='curation')
+    verdict_body = json.dumps(_payload(entry))
+
+    class GatewayStub:
+        def call(self, call_input: object) -> ProviderCallResult:
+            return ProviderCallResult(
+                provider=call_input.policy.provider,
+                model=call_input.policy.model,
+                call_record_id=uuid.uuid4(),
+                redaction_state='clean',
+                generated_title='',
+                generated_body=verdict_body,
+            )
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())
+
+    result = module.JudgeCurationCandidate().execute(data)
+
+    assert result.comparison_manifest_hash == data.shortlist.manifest_hash
+    assert result.authorized_corpus_count == data.shortlist.authorized_corpus_count
+    assert result.comparison_complete is data.shortlist.comparison_complete
 
 
 @pytest.mark.django_db
