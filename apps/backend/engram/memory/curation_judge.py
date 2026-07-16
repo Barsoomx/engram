@@ -352,6 +352,20 @@ def _candidate_precedes(data: CurationJudgeInput, target_id: uuid.UUID | None) -
     return candidate_at > target_at
 
 
+def _deterministic_precedence(data: CurationJudgeInput, target_id: uuid.UUID | None) -> bool:
+    if target_id is None:
+        return False
+    target = data.evidence.targets.get(target_id)
+    if target is None:
+        return False
+    candidate_at = data.evidence.candidate.latest_evidence_at
+    target_at = target.latest_evidence_at
+    if candidate_at is None or target_at is None:
+        return False
+
+    return candidate_at != target_at
+
+
 def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeInput) -> None:  # noqa: C901
     key = (verdict.outcome, verdict.relation)
     if key not in _ALLOWED_COMBINATIONS:
@@ -404,11 +418,16 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
     elif outcome == 'reject_candidate':
         ok = candidate_tier == 'none'
     else:
+        target_refs = data.evidence.targets[target_id].refs if target_id in data.evidence.targets else ()
         ok = (
             candidate_tier in _SUPPORTED_TIERS
             and target_tier in _SUPPORTED_TIERS
+            and bool(data.evidence.candidate.refs)
+            and bool(target_refs)
+            and complete
             and verdict.applicability == 'same'
             and verdict.temporal_order == 'unordered'
+            and not _deterministic_precedence(data, target_id)
         )
 
     if not ok:
