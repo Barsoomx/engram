@@ -1124,6 +1124,15 @@ class DecideMemoryCandidate:
             with transaction.atomic():
                 lock_work_fence(claim=claim, now=timezone.now())
                 locked = MemoryCandidate.objects.select_for_update().get(id=candidate.id)
+                if self._is_superseded_generation(work, locked):
+                    finish_work_claim(
+                        claim=claim,
+                        now=timezone.now(),
+                        completion='product_no_signal',
+                        resolution_reason=WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+                    )
+
+                    return
                 if locked.status == CandidateStatus.PROPOSED:
                     locked.status = CandidateStatus.REJECTED
                     locked.save(update_fields=['status', 'updated_at'])
@@ -1211,6 +1220,21 @@ class DecideMemoryCandidate:
         verdict = judge_result.verdict
         self._validate_verdict(verdict, shortlist, judge_result)
         target_version_id = verdict.target_memory_version_id
+        if verdict.outcome == 'reject_candidate':
+            self._settle_model_rejection(
+                work=work,
+                candidate=candidate,
+                claim=claim,
+                scope=scope,
+                verdict=verdict,
+                evidence=evidence,
+                shortlist=shortlist,
+                judge_result=judge_result,
+                target_memory_version_id=target_version_id,
+            )
+
+            return
+
         memory_fence = None
         if target_version_id is not None:
             memory_fence = self._shortlist_memory_fence(target_version_id, shortlist)
@@ -1235,6 +1259,53 @@ class DecideMemoryCandidate:
 
         return
 
+    def _settle_model_rejection(
+        self,
+        *,
+        work: WorkflowWork,
+        candidate: MemoryCandidate,
+        claim: WorkClaim,
+        scope: EffectiveCandidateScope,
+        verdict: object,
+        evidence: CurationEvidenceContext,
+        shortlist: CurationShortlist,
+        judge_result: CurationJudgeResult,
+        target_memory_version_id: uuid.UUID | None,
+    ) -> None:
+        _fault_boundary('before_transition')
+        with transaction.atomic():
+            lock_work_fence(claim=claim, now=timezone.now())
+            locked = MemoryCandidate.objects.select_for_update().get(id=candidate.id)
+            if self._is_superseded_generation(work, locked):
+                finish_work_claim(
+                    claim=claim,
+                    now=timezone.now(),
+                    completion='product_no_signal',
+                    resolution_reason=WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+                )
+
+                return
+            if locked.status == CandidateStatus.PROPOSED:
+                locked.status = CandidateStatus.REJECTED
+                locked.save(update_fields=['status', 'updated_at'])
+            finish_work_claim(claim=claim, now=timezone.now(), completion='product_no_signal')
+            self._write_decision(
+                work=work,
+                candidate=locked,
+                scope=scope,
+                outcome=CurationOutcome.REJECT_CANDIDATE,
+                reason_code=verdict.reason_code,
+                evidence_tier=evidence.candidate.tier,
+                comparison_manifest_hash=shortlist.manifest_hash,
+                target_memory_version_id=target_memory_version_id,
+                transition=None,
+                conflict=None,
+                judge=judge_result,
+                redacted_reason=redact_text(verdict.reason)[:500],
+            )
+
+        return
+
     def _apply_transition(
         self,
         work: WorkflowWork,
@@ -1244,16 +1315,6 @@ class DecideMemoryCandidate:
         memory_fence: MemoryFence | None,
     ) -> tuple[object | None, object | None]:
         outcome = verdict.outcome
-        if outcome == 'reject_candidate':
-            lock_work_fence(claim=claim, now=timezone.now())
-            locked = MemoryCandidate.objects.select_for_update().get(id=candidate.id)
-            if locked.status == CandidateStatus.PROPOSED:
-                locked.status = CandidateStatus.REJECTED
-                locked.save(update_fields=['status', 'updated_at'])
-            finish_work_claim(claim=claim, now=timezone.now(), completion='product_no_signal')
-
-            return None, None
-
         request = self._request(work, candidate)
         candidate_fence = self._candidate_fence(candidate)
         if outcome == 'publish_new':
@@ -1314,7 +1375,7 @@ class DecideMemoryCandidate:
             ),
         )
 
-        return None, conflict
+        return conflict.opened_transition, conflict
 
     def _validate_verdict(
         self,
@@ -1339,7 +1400,7 @@ class DecideMemoryCandidate:
                 project_id=candidate.project_id,
                 team_id=candidate.team_id,
             ),
-            idempotency_key=f'curation-decision:{work.id}:v1',
+            idempotency_key=f'decision-work:{work.id}:settle:v1',
             actor_type='system',
             actor_id='curation-orchestrator',
             capability='memories:write',
@@ -1362,8 +1423,14 @@ class DecideMemoryCandidate:
         entry = next((item for item in shortlist.entries if item.memory_version_id == target_version_id), None)
         if entry is None:
             raise _operational('judge_reference_invalid', 'verdict target is not in the shortlist')
+        try:
+            memory = Memory.objects.get(id=entry.memory_id)
+        except Memory.DoesNotExist as error:
+            raise _operational('stale_decision', 'target memory no longer exists') from error
+        if memory.current_transition_id != entry.current_transition_id:
+            raise _operational('stale_decision', 'target advanced after the shortlist snapshot was frozen')
 
-        return self._memory_fence(entry.memory_id)
+        return build_memory_fence(memory)
 
     def _target_memory_fence(self, target_version_id: uuid.UUID | None, candidate: MemoryCandidate) -> MemoryFence:
         if target_version_id is None:
