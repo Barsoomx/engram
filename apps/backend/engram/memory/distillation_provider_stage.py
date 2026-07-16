@@ -26,6 +26,7 @@ from engram.core.models import (
 )
 from engram.memory import work_execution
 from engram.memory.distillation_window import max_provider_calls_per_attempt, render_observation_block
+from engram.memory.services import MemoryWorkerError
 from engram.memory.work_execution import (
     StaleWorkFenceError,
     WorkClaim,
@@ -78,8 +79,9 @@ _IDENTITY_SCHEMA = 'distillation_stage_identity/v1'
 
 _EXTRACT_SYSTEM_PROMPT = (
     'Return a JSON object with exactly the keys memories and no_signal_observation_ids '
-    'following the distill_extract.v1 contract. Every chunk observation must appear in a '
-    'memory supporting set or in no_signal_observation_ids.'
+    'following the distill_extract.v1 contract. Every memory must have a non-empty title and a '
+    'non-empty body. Every chunk observation must appear in a memory supporting set or in '
+    'no_signal_observation_ids.'
 )
 
 
@@ -296,7 +298,7 @@ def _parse_memory(item: object, chunk_observation_ids: frozenset[str]) -> Extrac
         raise ExtractionContractError('memory title is invalid')
 
     body = item['body']
-    if not isinstance(body, str) or len(body) > _MAX_BODY:
+    if not isinstance(body, str) or not body.strip() or len(body) > _MAX_BODY:
         raise ExtractionContractError('memory body is invalid')
 
     supporting = _parse_id_list(
@@ -682,7 +684,7 @@ def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage |
         )
     }
     if set(observations) != set(observation_ids):
-        raise ExtractionContractError('chunk observation is outside the stage scope')
+        raise MemoryWorkerError('chunk observation is outside the stage scope', code='work_scope_invalid')
 
     for observation_id in observation_ids:
         try:
@@ -690,7 +692,10 @@ def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage |
         except ValueError as error:
             raise ExtractionContractError('observation content cannot be digested') from error
         if digest != expected_digests[observation_id]:
-            raise ExtractionContractError('observation content digest does not match the frozen manifest')
+            raise MemoryWorkerError(
+                'observation content digest does not match the frozen manifest',
+                code='work_fingerprint_mismatch',
+            )
 
     cap = chunk.window.chunk_char_budget
     blocks = [render_observation_block(observations[observation_id], cap) for observation_id in observation_ids]

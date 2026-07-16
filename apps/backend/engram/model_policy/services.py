@@ -1287,7 +1287,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                         'type': 'object',
                         'properties': {
                             'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
-                            'body': {'type': 'string', 'maxLength': 3000},
+                            'body': {'type': 'string', 'minLength': 1, 'maxLength': 3000},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                             'supporting_observation_ids': {
                                 'type': 'array',
