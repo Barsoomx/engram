@@ -17,6 +17,7 @@ from engram.core.models import (
     WorkflowRun,
     WorkflowRunOrigin,
     WorkflowRunStatus,
+    WorkflowWork,
     WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
 )
@@ -240,6 +241,17 @@ def reconcile_scheduled_candidate_work(*, as_of: datetime) -> int:
     return ReconcileCandidateDecisionWork().execute(as_of=as_of).queued
 
 
+def _requeue_eligible(work: WorkflowWork, as_of: datetime) -> bool:
+    if work.execution_state == WorkflowWorkExecutionState.READY:
+        return True
+
+    return (
+        work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+        and work.next_retry_at is not None
+        and work.next_retry_at <= as_of
+    )
+
+
 def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
     with transaction.atomic():
         try:
@@ -265,10 +277,7 @@ def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
         if not sources:
             return False
         work, _created = ensure_candidate_decision_work_locked(locked, sources=sources)
-        if (
-            work.disposition != WorkflowWorkDisposition.REQUIRED
-            or work.execution_state != WorkflowWorkExecutionState.READY
-        ):
+        if work.disposition != WorkflowWorkDisposition.REQUIRED or not _requeue_eligible(work, as_of):
             return False
         if WorkflowRun.objects.filter(
             work_id=work.id,
