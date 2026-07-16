@@ -381,22 +381,6 @@ class ProcessObservationRecorded:
                 curated_decision='legacy_replay',
             )
 
-        if should_promote:
-            from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
-
-            curation = CurateMemoryCandidate().execute(
-                CurateMemoryCandidateInput(candidate_id=candidate.id, correlation_id=correlation_id),
-            )
-
-            return MemoryCandidateWorkerResult(
-                candidate=curation.candidate,
-                duplicate=not candidate_created or curation.duplicate,
-                memory=curation.memory,
-                memory_version=curation.memory_version,
-                retrieval_document=curation.retrieval_document,
-                curated_decision=curation.decision,
-            )
-
         return MemoryCandidateWorkerResult(
             candidate=candidate,
             duplicate=not candidate_created,

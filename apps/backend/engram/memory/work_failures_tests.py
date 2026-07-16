@@ -346,3 +346,57 @@ def test_translate_failure_uncoded_worker_error_stays_unexpected() -> None:
 
     assert failure.failure_class == 'unexpected'
     assert failure.code == 'unexpected_exception'
+
+
+# ---------------------------------------------------------------------------
+# C5.3 review round - curation orchestrator operational reasons (MemoryTransitionError)
+# must map to their exact CP2 classification, never collapse to unexpected.
+# ---------------------------------------------------------------------------
+
+CURATION_TRANSITION_TABLE = (
+    ('embedding_provider_unavailable', 'provider_transient', False),
+    ('judge_provider_unavailable', 'provider_transient', False),
+    ('judge_invalid_output', 'provider_transient', False),
+    ('judge_reference_invalid', 'provider_transient', False),
+    ('evidence_unavailable', 'infrastructure_transient', False),
+    ('shortlist_query_failed', 'infrastructure_transient', False),
+    ('stale_decision', 'infrastructure_transient', False),
+    ('transition_contention', 'infrastructure_transient', False),
+    ('embedding_policy_unavailable', 'configuration', True),
+    ('judge_policy_unavailable', 'configuration', True),
+    ('candidate_decision_capability_unavailable', 'configuration', True),
+    ('rollout_not_enabled', 'configuration', True),
+)
+
+
+@pytest.mark.parametrize(('code', 'expected_class', 'needs_fingerprint'), CURATION_TRANSITION_TABLE)
+def test_translate_failure_maps_curation_operational_reasons(
+    code: str, expected_class: str, needs_fingerprint: bool
+) -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    fingerprint = HEX64 if needs_fingerprint else ''
+    failure = _wf().translate_failure(
+        MemoryTransitionError(code, 'operational failure', retryable=True),
+        configuration_fingerprint=fingerprint,
+    )
+
+    assert failure.failure_class == expected_class
+    assert failure.code == code
+    assert failure.configuration_fingerprint == fingerprint
+
+
+def test_translate_failure_unknown_transition_code_stays_unexpected() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(MemoryTransitionError('some_unmapped_reason', 'x', retryable=True))
+
+    assert failure.failure_class == 'unexpected'
+    assert failure.code == 'unexpected_exception'
+
+
+def test_translate_failure_redacts_secret_shaped_detail() -> None:
+    failure = _wf().translate_failure(ValueError('embedding vector leaked sk-abcdefghijklmnop while failing'))
+
+    assert 'sk-abcdefghijklmnop' not in failure.redacted_detail
+    assert '[REDACTED]' in failure.redacted_detail

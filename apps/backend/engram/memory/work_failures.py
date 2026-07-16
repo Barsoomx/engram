@@ -4,6 +4,7 @@ from datetime import timedelta
 
 from django.db.utils import DatabaseError
 
+from engram.core.redaction import redact_value
 from engram.memory.services import MemoryWorkerError
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 
@@ -40,6 +41,24 @@ _MODEL_POLICY_CODE_MAP = {
     'policy_scope_mismatch': (CONFIGURATION, 'policy_scope_invalid'),
     'team_required': (CONFIGURATION, 'policy_scope_invalid'),
     'secret_scope_denied': (CONFIGURATION, 'provider_secret_unavailable'),
+}
+
+_CURATION_TRANSITION_CODE_MAP = {
+    'embedding_provider_unavailable': (PROVIDER_TRANSIENT, 'embedding_provider_unavailable'),
+    'embedding_invalid_result': (PROVIDER_TRANSIENT, 'embedding_invalid_result'),
+    'judge_provider_unavailable': (PROVIDER_TRANSIENT, 'judge_provider_unavailable'),
+    'judge_invalid_output': (PROVIDER_TRANSIENT, 'judge_invalid_output'),
+    'judge_reference_invalid': (PROVIDER_TRANSIENT, 'judge_reference_invalid'),
+    'judge_policy_denied': (PROVIDER_TRANSIENT, 'judge_policy_denied'),
+    'embedding_policy_unavailable': (CONFIGURATION, 'embedding_policy_unavailable'),
+    'judge_policy_unavailable': (CONFIGURATION, 'judge_policy_unavailable'),
+    'candidate_decision_capability_unavailable': (CONFIGURATION, 'candidate_decision_capability_unavailable'),
+    'rollout_not_enabled': (CONFIGURATION, 'rollout_not_enabled'),
+    'evidence_unavailable': (INFRASTRUCTURE_TRANSIENT, 'evidence_unavailable'),
+    'shortlist_query_failed': (INFRASTRUCTURE_TRANSIENT, 'shortlist_query_failed'),
+    'transition_dependency_unavailable': (INFRASTRUCTURE_TRANSIENT, 'transition_dependency_unavailable'),
+    'stale_decision': (INFRASTRUCTURE_TRANSIENT, 'stale_decision'),
+    'transition_contention': (INFRASTRUCTURE_TRANSIENT, 'transition_contention'),
 }
 
 
@@ -94,9 +113,22 @@ def _classify_model_policy(error: ModelPolicyError) -> tuple[str, str]:
     return UNEXPECTED, 'unexpected_exception'
 
 
+def _classify_transition(code: str) -> tuple[str, str]:
+    mapping = _CURATION_TRANSITION_CODE_MAP.get(code)
+    if mapping is not None:
+        return mapping
+
+    return UNEXPECTED, 'unexpected_exception'
+
+
 def _classify(error: BaseException) -> tuple[str, str]:
+    from engram.memory.transitions import MemoryTransitionError
+
     if isinstance(error, MemoryWorkerError) and error.code in _WORKER_INVALID_INPUT_CODES:
         return INVALID_INPUT, error.code
+
+    if isinstance(error, MemoryTransitionError):
+        return _classify_transition(error.code)
 
     if isinstance(error, ModelPolicyError):
         return _classify_model_policy(error)
@@ -123,7 +155,7 @@ def translate_failure(error: BaseException, *, configuration_fingerprint: str = 
     return ClassifiedWorkFailure(
         failure_class=failure_class,
         code=code,
-        redacted_detail=str(error)[:_MAX_DETAIL],
+        redacted_detail=str(redact_value(str(error)).value)[:_MAX_DETAIL],
         configuration_fingerprint=fingerprint,
     )
 
