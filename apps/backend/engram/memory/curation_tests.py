@@ -10,12 +10,16 @@ from decimal import Decimal
 import pytest
 import structlog
 from django.db import connection
+from django.utils import timezone
 
 from engram.access.services import EffectiveScope
 from engram.context.services import authorized_retrieval_documents
 from engram.core.models import (
     AuditEvent,
     CandidateStatus,
+    CurationOutcome,
+    CurationReasonCode,
+    EvidenceTier,
     LinkType,
     Memory,
     MemoryCandidate,
@@ -24,15 +28,23 @@ from engram.core.models import (
     MemoryStatus,
     MemoryTransition,
     MemoryTransitionType,
+    MemoryVersion,
     Organization,
     Project,
     RetrievalDocument,
     Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
+    WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory import c53_orchestrator_test_support as orch
+from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.curation import (
     CurateMemoryCandidate,
     CurateMemoryCandidateInput,
@@ -45,6 +57,7 @@ from engram.memory.curation import (
     parse_curation_reason,
     resolve_curator_llm_judge_enabled,
 )
+from engram.memory.curation_judge import CurationJudgeComparisonV1, CurationJudgeVerdictV1
 from engram.memory.curation_test_support import (
     JudgeGatewayStub,
     create_curation_policy,
@@ -1554,3 +1567,683 @@ def test_curate_audit_excludes_conflict_entries_from_evidence_source_ids() -> No
 
     audit = AuditEvent.objects.get(event_type='MemoryCuratorPromoted')
     assert audit.metadata['evidence_source_ids'] == ['obs-real']
+
+
+# ---------------------------------------------------------------------------
+# C5.3 - Work-Driven Automatic Decision Orchestration (DecideMemoryCandidate)
+# RED tests for the new orchestrator. These drive the production task entry
+# point `process_candidate_decision_work_v1` with the rollout gate enabled and
+# stub the frozen C5.1/C5.2 seams (embedding, shortlist, evidence, judge) so the
+# orchestration/persistence/atomicity contract is exercised in isolation.
+# ---------------------------------------------------------------------------
+
+_EMBEDDING = (0.1,) + (0.0,) * 1535
+
+
+@pytest.mark.django_db
+def test_publish_new_outcome_commits_promotion_decision_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('publish')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='publish')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.outcome == CurationOutcome.PUBLISH_NEW
+    assert decision.reason_code == CurationReasonCode.DISTINCT_CLAIM
+    assert decision.target_memory_version_id is None
+    assert decision.transition_id is not None
+    assert decision.conflict_id is None
+    assert decision.evidence_tier == EvidenceTier.SUPPORTED
+    assert decision.input_fingerprint == work.input_fingerprint
+    assert decision.evidence_manifest_hash == work.input_snapshot['evidence_manifest_hash']
+    assert decision.comparison_manifest_hash == shortlist.manifest_hash
+    assert decision.provider_call_record_id == call.id
+    assert decision.policy_id == policy.id
+    assert decision.policy_version == policy.version
+    assert decision.effective_visibility_scope == VisibilityScope.PROJECT
+    assert decision.effective_team_id is None
+    assert decision.payload_hash
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id is not None
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_merge_evidence_outcome_commits_merge_decision_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('merge')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='merge', title='Cache eviction policy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='merge', title='Cache eviction approach', body='The hot cache tier evicts oldest entries first.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('merge_evidence', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.outcome == CurationOutcome.MERGE_EVIDENCE
+    assert decision.reason_code == CurationReasonCode.EQUIVALENT_CLAIM
+    assert decision.target_memory_version_id == target_version.id
+    assert decision.transition_id is not None
+    assert decision.comparison_manifest_hash == shortlist.manifest_hash
+    candidate.refresh_from_db()
+    memory.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert MemoryVersion.objects.filter(memory=memory).count() == 2
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_revise_memory_outcome_commits_revision_decision_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('revise')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='revise', title='Deployment rollback path', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='revise', title='Deployment rollback update', body='Rollback now drains connections first.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('revise_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.outcome == CurationOutcome.REVISE_MEMORY
+    assert decision.reason_code == CurationReasonCode.SAME_SUBJECT_REVISION
+    assert decision.target_memory_version_id == target_version.id
+    assert decision.transition_id is not None
+    candidate.refresh_from_db()
+    memory.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == memory.id
+    assert MemoryVersion.objects.filter(memory=memory).count() == 2
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_supersede_memory_outcome_commits_supersession_decision_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('supersede')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='supersede', title='Broker prefetch value', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='supersede', title='Broker prefetch replacement', body='Prefetch is now set to one per worker.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('supersede_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.outcome == CurationOutcome.SUPERSEDE_MEMORY
+    assert decision.reason_code == CurationReasonCode.ORDERED_REPLACEMENT
+    assert decision.target_memory_version_id == target_version.id
+    assert decision.transition_id is not None
+    candidate.refresh_from_db()
+    memory.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id is not None
+    assert candidate.promoted_memory_id != memory.id
+    assert memory.stale is True
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_open_conflict_outcome_commits_conflict_decision_atomically(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('conflict')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='conflict', title='Primary region choice', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='conflict', title='Primary region choice', body='The primary region is now the eastern zone.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    decision = decisions[0]
+    assert decision.outcome == CurationOutcome.OPEN_CONFLICT
+    assert decision.reason_code == CurationReasonCode.SAME_SCOPE_CONTRADICTION
+    assert decision.conflict_id is not None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.resolved_transition_id is None
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_reject_candidate_and_superseded_generation_complete_as_product_no_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('nosignal')
+    reject_candidate, reject_work, reject_run = orch.subject_candidate(
+        scope, suffix='reject', visibility_scope=VisibilityScope.SESSION
+    )
+    orch.install_deterministic_only(monkeypatch)
+
+    _reject_result, reject_error = orch.run_decision(reject_work, reject_run)
+
+    assert reject_error is None
+    reject_decisions = orch.curation_decisions_for(reject_candidate)
+    assert len(reject_decisions) == 1
+    assert reject_decisions[0].outcome == CurationOutcome.REJECT_CANDIDATE
+    assert reject_decisions[0].reason_code == CurationReasonCode.NON_DURABLE_SESSION_SCOPE
+    assert reject_decisions[0].transition_id is None
+    reject_candidate.refresh_from_db()
+    reject_work.refresh_from_db()
+    assert reject_candidate.status == CandidateStatus.REJECTED
+    assert reject_work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert reject_work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+
+    gen_candidate, gen_work, gen_run = orch.subject_candidate(scope, suffix='generation')
+    orch.mutate_candidate_generation(gen_candidate, new_title='Rewritten claim after fresher evidence arrived')
+    orch.install_deterministic_only(monkeypatch)
+
+    _gen_result, gen_error = orch.run_decision(gen_work, gen_run)
+
+    assert gen_error is None
+    assert orch.curation_decisions_for(gen_candidate) == []
+    gen_candidate.refresh_from_db()
+    gen_work.refresh_from_db()
+    assert gen_candidate.status == CandidateStatus.PROPOSED
+    assert gen_work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert gen_work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
+
+
+@pytest.mark.django_db
+def test_deterministic_terminal_bypasses_shortlist_and_judge(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('bypass')
+    candidate, work, run = orch.subject_candidate(scope, suffix='bypass', visibility_scope=VisibilityScope.SESSION)
+    orch.install_deterministic_only(monkeypatch)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.REJECT_CANDIDATE
+    assert decisions[0].reason_code == CurationReasonCode.NON_DURABLE_SESSION_SCOPE
+    assert (
+        ProviderCallRecord.objects.filter(
+            organization=scope.organization,
+            request_id__startswith='curation-decision',
+        ).count()
+        == 0
+    )
+
+
+@pytest.mark.django_db
+def test_crash_after_embedding_preserves_proposed_candidate_and_retryable_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('f20')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='f20')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def crash() -> None:
+        raise RuntimeError('crash after embedding before judgment')
+
+    orch.install_fault(monkeypatch, 'after_embedding', crash)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_crash_after_judge_response_creates_no_semantic_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('f22')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='f22')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def crash() -> None:
+        raise RuntimeError('process died after judge response')
+
+    orch.install_fault(monkeypatch, 'after_judge', crash)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_target_version_advance_fences_stale_judgment(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('f23')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='f23', title='Queue backpressure policy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='f23', title='Queue backpressure revision', body='Backpressure now trips at 80 percent depth.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('revise_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def advance() -> None:
+        orch.advance_target_memory(memory, title='Queue backpressure policy v2', body='Thresholds were revised again.')
+
+    orch.install_fault(monkeypatch, 'before_transition', advance)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('outcome', 'service', 'candidate_tier'),
+    [
+        ('publish_new', 'PromoteMemoryCandidate', 'supported'),
+        ('merge_evidence', 'MergeMemoryCandidate', 'supported'),
+        ('supersede_memory', 'SupersedeMemoryWithCandidate', 'corroborated'),
+    ],
+)
+def test_cp4_fault_at_each_transition_boundary_rolls_back_work_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+    service: str,
+    candidate_tier: str,
+) -> None:
+    scope = orch.orchestrator_scope(f'cp4-{outcome}')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    target_version = None
+    if outcome == 'publish_new':
+        shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+        evidence = orch.stub_evidence(candidate_tier=candidate_tier)
+    else:
+        memory = orch.target_memory(scope, suffix=outcome, title=f'{outcome} target', body=_LONG_BODY)
+        target_version = orch.current_version(memory)
+        shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+        evidence = orch.stub_evidence(candidate_tier=candidate_tier, target=target_version, candidate_newer=True)
+    candidate, work, run = orch.subject_candidate(scope, suffix=outcome)
+    verdict = orch.stub_verdict(outcome, target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    orch.patch_cp4_service(monkeypatch, service)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_crash_after_commit_replays_one_decision_and_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('f24')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='f24')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _first_result, first_error = orch.run_decision(work, run)
+
+    assert first_error is None
+    committed = orch.curation_decisions_for(candidate)
+    assert len(committed) == 1
+    first = committed[0]
+
+    orch.run_decision(work, run)
+
+    replayed = orch.curation_decisions_for(candidate)
+    assert len(replayed) == 1
+    assert replayed[0].id == first.id
+    assert replayed[0].transition_id == first.transition_id
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_concurrent_candidate_decisions_on_one_target_relist_the_loser(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('concurrent')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='concurrent', title='Retry ceiling policy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    loser_candidate, loser_work, loser_run = orch.subject_candidate(
+        scope, suffix='loser', title='Retry ceiling revision A', body='The retry ceiling should drop to three.'
+    )
+    winner_candidate, winner_work, winner_run = orch.subject_candidate(
+        scope, suffix='winner', title='Retry ceiling revision B', body='The retry ceiling should drop to four.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('revise_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    triggered: list[bool] = []
+
+    def winner_runs() -> None:
+        if triggered:
+            return
+        triggered.append(True)
+        orch.run_decision(winner_work, winner_run)
+
+    orch.install_fault(monkeypatch, 'before_transition', winner_runs)
+
+    _result, error = orch.run_decision(loser_work, loser_run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(loser_candidate) == []
+    loser_candidate.refresh_from_db()
+    loser_work.refresh_from_db()
+    assert loser_candidate.status == CandidateStatus.PROPOSED
+    assert loser_work.execution_state != WorkflowWorkExecutionState.SETTLED
+    winner_decisions = orch.curation_decisions_for(winner_candidate)
+    assert len(winner_decisions) == 1
+    assert winner_decisions[0].outcome == CurationOutcome.REVISE_MEMORY
+    winner_candidate.refresh_from_db()
+    assert winner_candidate.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
+def test_expired_worker_fence_cannot_apply_provider_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('expired')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='expired')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def expire() -> None:
+        orch.steal_work_lease(work)
+
+    orch.install_fault(monkeypatch, 'before_transition', expire)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+
+
+@pytest.mark.django_db
+def test_reconciler_restores_one_missing_decision_work_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('reconcile')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        scope.organization,
+        scope.project,
+        scope.team,
+        suffix='reconcile',
+        title='Idempotent replay contract',
+        body=_LONG_BODY,
+    )
+    missing = WorkflowWork.objects.filter(subject_id=candidate.id, work_type=WorkflowWorkType.CANDIDATE_DECISION)
+    assert missing.count() == 0
+
+    result = ReconcileCandidateDecisionWork().execute(as_of=timezone.now())
+
+    assert result.queued == 1
+    works = WorkflowWork.objects.filter(subject_id=candidate.id, work_type=WorkflowWorkType.CANDIDATE_DECISION)
+    assert works.count() == 1
+    work = works.get()
+    run = WorkflowRun.objects.get(work=work, status=WorkflowRunStatus.QUEUED)
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert len(orch.curation_decisions_for(candidate)) == 1
+
+
+@pytest.mark.django_db
+def test_genuine_conflict_predicate_opens_canonical_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('genuine')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='genuine', title='Default timeout value', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='genuine', title='Default timeout value', body='The default request timeout is ninety seconds.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.memory_version_id == target_version.id
+    assert conflict.resolved_transition_id is None
+    assert conflict.opened_transition_id is not None
+    assert conflict.semantic_link_id is not None
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.OPEN_CONFLICT
+    assert decisions[0].conflict_id == conflict.id
+
+
+@pytest.mark.django_db
+def test_temporal_precedence_supersedes_instead_of_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('precedence')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='precedence', title='Feature flag default', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='precedence', title='Feature flag default on', body='The feature flag now defaults to enabled.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('supersede_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert MemoryConflict.objects.filter(candidate=candidate).count() == 0
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.SUPERSEDE_MEMORY
+
+
+@pytest.mark.django_db
+def test_different_applicability_is_not_a_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('applicability')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='applicability', title='Staging cache size', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='applicability', title='Production cache size', body='The production cache holds two gigabytes.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='publish_new',
+        relation='compatible_distinct',
+        target_memory_version_id=None,
+        candidate_evidence_refs=('cref-1',),
+        comparisons=(CurationJudgeComparisonV1(target_version.id, 'compatible_distinct', ('tref-1',)),),
+        applicability='different',
+        temporal_order='not_applicable',
+        reason_code='distinct_claim',
+        reason='different applicability so publish separately',
+    )
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert MemoryConflict.objects.filter(candidate=candidate).count() == 0
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.PUBLISH_NEW
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
+def test_existing_open_conflict_pair_is_not_duplicated(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('duplicate')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='duplicate', title='Log retention window', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='duplicate', title='Log retention window', body='Logs are retained for thirty days now.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _first_result, first_error = orch.run_decision(work, run)
+
+    assert first_error is None
+    assert MemoryConflict.objects.filter(candidate=candidate, memory=memory).count() == 1
+    assert len(orch.curation_decisions_for(candidate)) == 1
+
+    orch.run_decision(work, run)
+
+    assert MemoryConflict.objects.filter(candidate=candidate, memory=memory).count() == 1
+    assert len(orch.curation_decisions_for(candidate)) == 1

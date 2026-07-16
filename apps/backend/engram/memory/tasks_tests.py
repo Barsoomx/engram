@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -18,8 +19,8 @@ from engram.core.models import (
     AgentSession,
     AuditEvent,
     AuditResult,
+    CandidateStatus,
     Memory,
-    MemoryCandidate,
     MemoryVersion,
     Observation,
     Organization,
@@ -39,12 +40,12 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.memory import c53_orchestrator_test_support as orch
 from engram.memory import tasks as tasks_module
-from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
 from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWorkResult
 from engram.memory.confidence_decay import DecayMemoryConfidenceResult
-from engram.memory.services import MemoryCandidateWorkerResult, MemoryWorkerError
+from engram.memory.services import MemoryCandidateWorkerResult, MemoryWorkerError, ProcessObservationRecorded
 from engram.memory.tasks import (
     decay_memory_confidence,
     distill_session,
@@ -56,7 +57,6 @@ from engram.memory.tasks import (
     reconcile_candidate_decision_work,
     retry_failed_distillations,
 )
-from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import (
     StaleWorkFenceError,
     claim_work,
@@ -296,56 +296,6 @@ def create_observation(
         session_sequence=session_sequence,
         observed_at=timezone.now(),
     )
-
-
-@pytest.mark.django_db
-def test_candidate_decision_handler_blocks_unavailable_capability_without_semantic_mutation(
-    f_org: Organization,
-    f_team: Team,
-    f_project: Project,
-) -> None:
-    candidate = MemoryCandidate.objects.create(
-        organization=f_org,
-        project=f_project,
-        team=f_team,
-        title='Frozen candidate',
-        body='Frozen body',
-        evidence=[{'kind': 'frozen'}],
-        content_hash='a' * 64,
-        confidence='0.800',
-        kind='gotcha',
-    )
-    with transaction.atomic():
-        work, created = ensure_candidate_decision_work_locked(candidate, sources=[])
-    assert created is True
-    run = queue_work_attempt(work_id=work.id, now=timezone.now(), origin=WorkflowRunOrigin.AUTOMATIC)
-    semantic_before = (
-        candidate.status,
-        candidate.title,
-        candidate.body,
-        candidate.evidence,
-        candidate.promoted_memory_id,
-    )
-
-    task = tasks_module.process_candidate_decision_work_v1
-    task(str(work.id), str(run.id))
-
-    candidate.refresh_from_db()
-    work.refresh_from_db()
-    run.refresh_from_db()
-    assert (
-        candidate.status,
-        candidate.title,
-        candidate.body,
-        candidate.evidence,
-        candidate.promoted_memory_id,
-    ) == semantic_before
-    assert work.disposition == WorkflowWorkDisposition.REQUIRED
-    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
-    assert work.blocked_configuration_fingerprint == execution_configuration_fingerprint(work)
-    assert run.status == WorkflowRunStatus.FAILED
-    assert run.failure_class == CONFIGURATION
-    assert run.failure_code == 'candidate_decision_capability_unavailable'
 
 
 def frozen_input_digest(value: object) -> str:
@@ -1888,3 +1838,62 @@ def test_embedding_worker_calls_provider_outside_transaction_and_records_policy(
     assert document.embedding_projection_hash == document.exact_projection_hash
     assert work.execution_state == WorkflowWorkExecutionState.SETTLED
     assert Memory.objects.filter(id=memory.id).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# C5.3 - task handler cutover: process_candidate_decision_work_v1 runs the
+# DecideMemoryCandidate orchestrator when the rollout is enabled, and only
+# capability-blocks (rollout_not_enabled) when it is disabled. The observation
+# path no longer curates synchronously.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_candidate_decision_handler_runs_orchestrator_when_rollout_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('cutover-on')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='cutover-on')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=orch.EMBEDDING_1536, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert len(orch.curation_decisions_for(candidate)) == 1
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_candidate_decision_handler_blocks_with_rollout_not_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('cutover-off')
+    candidate, work, run = orch.subject_candidate(scope, suffix='cutover-off')
+    orch.disable_rollout(monkeypatch)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert orch.curation_decisions_for(candidate) == []
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == CONFIGURATION
+    assert run.failure_code == 'rollout_not_enabled'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+def test_observation_processing_does_not_curate_synchronously() -> None:
+    source = inspect.getsource(ProcessObservationRecorded.execute)
+
+    assert 'CurateMemoryCandidate' not in source
+    assert 'DecideMemoryCandidate' not in source
