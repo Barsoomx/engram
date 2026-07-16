@@ -37,9 +37,16 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.memory.candidate_decision_work import (
+    CandidateDecisionWorkScopeError,
     build_candidate_decision_input,
     candidate_decision_snapshot,
     ensure_candidate_decision_work_locked,
+)
+from engram.memory.deterministic_gates import (
+    EffectiveCandidateScope,
+    SanitizedCandidateView,
+    effective_candidate_scope,
+    redact_candidate_view,
 )
 from engram.memory.distillation_provenance import session_candidate_content_hash
 from engram.memory.import_provenance import (
@@ -92,6 +99,10 @@ class PromoteMemoryCandidateInput:
     request: TransitionRequest
     candidate_fence: CandidateFence
     work_claim: WorkClaim | None = None
+    sanitized_title: str | None = None
+    sanitized_body: str | None = None
+    effective_visibility_scope: str | None = None
+    effective_team_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +143,10 @@ class ReviseMemoryFromCandidateInput:
     title: str
     body: str
     work_claim: WorkClaim | None = None
+    sanitized_title: str | None = None
+    sanitized_body: str | None = None
+    effective_visibility_scope: str | None = None
+    effective_team_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +157,10 @@ class MergeMemoryCandidateInput:
     title: str
     body: str
     work_claim: WorkClaim | None = None
+    sanitized_title: str | None = None
+    sanitized_body: str | None = None
+    effective_visibility_scope: str | None = None
+    effective_team_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +179,10 @@ class SupersedeMemoryWithCandidateInput:
     candidate_fence: CandidateFence
     loser_memory_fence: MemoryFence
     work_claim: WorkClaim | None = None
+    sanitized_title: str | None = None
+    sanitized_body: str | None = None
+    effective_visibility_scope: str | None = None
+    effective_team_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,21 +547,23 @@ def _finish_candidate_work(
     claim: WorkClaim | None,
     claimed_work: WorkflowWork | None,
     result_memory_id: uuid.UUID | None,
+    completion: str | None = None,
 ) -> None:
     decision_work, _created = ensure_candidate_decision_work_locked(candidate)
+    resolved_completion = completion or ('product_succeeded' if result_memory_id is not None else 'product_no_signal')
     if claim is not None:
         if claimed_work is None or decision_work.id != claimed_work.id:
             raise MemoryTransitionError('stale_decision', 'owning candidate work generation changed', retryable=True)
         finish_work_claim(
             claim=claim,
             now=timezone.now(),
-            completion='product_succeeded' if result_memory_id is not None else 'product_no_signal',
+            completion=resolved_completion,
             result_memory_id=result_memory_id,
         )
         return
     if decision_work.disposition != WorkflowWorkDisposition.REQUIRED:
         return
-    resolver = resolve_work_succeeded if result_memory_id is not None else resolve_work_no_signal
+    resolver = resolve_work_succeeded if resolved_completion == 'product_succeeded' else resolve_work_no_signal
     resolver(decision_work.id, organization_id=candidate.organization_id, project_id=candidate.project_id)
 
 
@@ -954,27 +979,86 @@ def _candidate_memory_metadata(candidate: MemoryCandidate, *, title: str, body: 
     }
 
 
+def _revalidated_sanitized_view(
+    candidate: MemoryCandidate,
+    *,
+    sanitized_title: str | None,
+    sanitized_body: str | None,
+) -> SanitizedCandidateView | None:
+    if sanitized_title is None:
+        return None
+
+    view = redact_candidate_view(candidate)
+    if view.title != sanitized_title or view.body != sanitized_body:
+        raise MemoryTransitionError(
+            'stale_decision',
+            'sanitized candidate content no longer derives from the locked candidate',
+            retryable=True,
+        )
+
+    return view
+
+
+def _revalidated_effective_scope(
+    candidate: MemoryCandidate,
+    sources: list[MemoryCandidateSource],
+    *,
+    effective_visibility_scope: str | None,
+    effective_team_id: uuid.UUID | None,
+) -> EffectiveCandidateScope | None:
+    if effective_visibility_scope is None:
+        return None
+
+    try:
+        derived = effective_candidate_scope(candidate, sources)
+    except CandidateDecisionWorkScopeError as error:
+        raise MemoryTransitionError(
+            'stale_decision', 'effective candidate scope could not be revalidated', retryable=True
+        ) from error
+    if derived.visibility_scope != effective_visibility_scope or derived.team_id != effective_team_id:
+        raise MemoryTransitionError(
+            'stale_decision',
+            'effective candidate scope no longer derives from the locked candidate',
+            retryable=True,
+        )
+
+    return derived
+
+
+def _sanitized_metadata(metadata: dict[str, object]) -> dict[str, object]:
+    redacted = redact_value(metadata).value
+
+    return redacted if isinstance(redacted, dict) else dict(metadata)
+
+
 def _create_candidate_memory(
     candidate: MemoryCandidate,
     sources: list[MemoryCandidateSource],
     *,
     title: str | None = None,
     body: str | None = None,
+    scope_override: EffectiveCandidateScope | None = None,
+    sanitize_metadata: bool = False,
 ) -> tuple[Memory, MemoryVersion, list[MemoryVersionSource]]:
     result_title = title if title is not None else candidate.title
     result_body = body if body is not None else candidate.body
+    visibility_scope = scope_override.visibility_scope if scope_override is not None else candidate.visibility_scope
+    team_id = candidate.team_id
+    metadata = _candidate_memory_metadata(candidate, title=result_title, body=result_body)
+    if sanitize_metadata:
+        metadata = _sanitized_metadata(metadata)
     memory = Memory.objects.create(
         organization_id=candidate.organization_id,
         project_id=candidate.project_id,
-        team_id=candidate.team_id,
+        team_id=team_id,
         title=result_title,
         body=result_body,
         status=MemoryStatus.APPROVED,
-        visibility_scope=candidate.visibility_scope,
+        visibility_scope=visibility_scope,
         current_version=0,
         transition_contract_version=0,
         confidence=candidate.confidence,
-        metadata=_candidate_memory_metadata(candidate, title=result_title, body=result_body),
+        metadata=metadata,
     )
     _fault_boundary('memory')
     content_hash = (
@@ -1340,29 +1424,54 @@ class PromoteMemoryCandidate:
                 ),
             )
             _require_no_open_conflict(candidate)
+            sanitized_view = _revalidated_sanitized_view(
+                candidate,
+                sanitized_title=data.sanitized_title,
+                sanitized_body=data.sanitized_body,
+            )
+            effective_scope = _revalidated_effective_scope(
+                candidate,
+                sources,
+                effective_visibility_scope=data.effective_visibility_scope,
+                effective_team_id=data.effective_team_id,
+            )
+            result_title = sanitized_view.title if sanitized_view is not None else candidate.title
+            result_body = sanitized_view.body if sanitized_view is not None else candidate.body
+            visibility_scope = (
+                effective_scope.visibility_scope if effective_scope is not None else candidate.visibility_scope
+            )
+            team_id = candidate.team_id
             metadata = _promotion_memory_metadata(candidate, sources, import_only=import_only)
+            if sanitized_view is not None:
+                metadata['full_text'] = f'{result_title}\n\n{result_body}'.strip()
+                metadata = _sanitized_metadata(metadata)
             memory = Memory.objects.create(
                 organization_id=candidate.organization_id,
                 project_id=candidate.project_id,
-                team_id=candidate.team_id,
-                title=candidate.title,
-                body=candidate.body,
+                team_id=team_id,
+                title=result_title,
+                body=result_body,
                 status=MemoryStatus.APPROVED,
-                visibility_scope=candidate.visibility_scope,
+                visibility_scope=visibility_scope,
                 current_version=0,
                 transition_contract_version=0,
                 confidence=candidate.confidence,
                 metadata=metadata,
             )
             _fault_boundary('memory')
+            content_hash = (
+                candidate.content_hash
+                if result_title == candidate.title and result_body == candidate.body
+                else _content_hash(memory_id=memory.id, version=1, title=result_title, body=result_body)
+            )
             version = MemoryVersion.objects.create(
                 organization_id=candidate.organization_id,
                 project_id=candidate.project_id,
                 memory=memory,
                 source_observation=candidate.source_observation,
                 version=1,
-                body=candidate.body,
-                content_hash=candidate.content_hash,
+                body=result_body,
+                content_hash=content_hash,
             )
             _fault_boundary('version')
             for source in sources:
@@ -1825,11 +1934,18 @@ def _execute_candidate_revision(
         memory = memories[data.memory_fence.memory_id]
         prior_version = versions[memory.id]
         _require_active_memory(memory)
+        sanitized_view = _revalidated_sanitized_view(
+            candidate,
+            sanitized_title=data.sanitized_title,
+            sanitized_body=data.sanitized_body,
+        )
+        result_title = sanitized_view.title if sanitized_view is not None else data.title
+        result_body = sanitized_view.body if sanitized_view is not None else data.body
         version, version_sources = _create_revision_version(
             memory,
             prior_version,
-            title=data.title,
-            body=data.body,
+            title=result_title,
+            body=result_body,
             candidate_sources=candidate_sources,
         )
         transition_id = uuid.uuid4()
@@ -2006,7 +2122,25 @@ class SupersedeMemoryWithCandidate:
             loser = memories[data.loser_memory_fence.memory_id]
             loser_version = versions[loser.id]
             _require_active_memory(loser)
-            result, result_version, result_sources = _create_candidate_memory(candidate, candidate_sources)
+            sanitized_view = _revalidated_sanitized_view(
+                candidate,
+                sanitized_title=data.sanitized_title,
+                sanitized_body=data.sanitized_body,
+            )
+            effective_scope = _revalidated_effective_scope(
+                candidate,
+                candidate_sources,
+                effective_visibility_scope=data.effective_visibility_scope,
+                effective_team_id=data.effective_team_id,
+            )
+            result, result_version, result_sources = _create_candidate_memory(
+                candidate,
+                candidate_sources,
+                title=sanitized_view.title if sanitized_view is not None else None,
+                body=sanitized_view.body if sanitized_view is not None else None,
+                scope_override=effective_scope,
+                sanitize_metadata=sanitized_view is not None,
+            )
             loser.stale = True
             loser_sources = _current_version_sources(loser_version)
             transition_id = uuid.uuid4()
@@ -2324,6 +2458,7 @@ class OpenMemoryConflict:
                 claim=data.work_claim,
                 claimed_work=claimed_work,
                 result_memory_id=None,
+                completion='product_succeeded',
             )
 
             return conflict

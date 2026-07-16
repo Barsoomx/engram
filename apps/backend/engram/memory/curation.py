@@ -1154,6 +1154,11 @@ class DecideMemoryCandidate:
 
             return
 
+        if gate.requires_transition is False:
+            self._settle_exact_duplicate(work, candidate, claim, gate)
+
+            return
+
         memory_fence = self._target_memory_fence(gate.target_memory_version_id, candidate)
         with transaction.atomic():
             result = MergeMemoryCandidate().execute(
@@ -1164,6 +1169,8 @@ class DecideMemoryCandidate:
                     title=candidate.title,
                     body=candidate.body,
                     work_claim=claim,
+                    sanitized_title=gate.sanitized_candidate.title,
+                    sanitized_body=gate.sanitized_candidate.body,
                 ),
             )
             self._write_decision(
@@ -1182,6 +1189,68 @@ class DecideMemoryCandidate:
             )
 
         return
+
+    def _settle_exact_duplicate(
+        self,
+        work: WorkflowWork,
+        candidate: MemoryCandidate,
+        claim: WorkClaim,
+        gate: DeterministicGateResult,
+    ) -> None:
+        with transaction.atomic():
+            lock_work_fence(claim=claim, now=timezone.now())
+            locked = MemoryCandidate.objects.select_for_update().get(id=candidate.id)
+            if self._is_superseded_generation(work, locked):
+                finish_work_claim(
+                    claim=claim,
+                    now=timezone.now(),
+                    completion='product_no_signal',
+                    resolution_reason=WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+                )
+
+                return
+            target_memory = self._current_target_memory(gate.target_memory_version_id)
+            if locked.status == CandidateStatus.PROPOSED:
+                locked.status = CandidateStatus.PROMOTED
+                locked.promoted_memory_id = target_memory.id
+                locked.save(update_fields=['status', 'promoted_memory', 'updated_at'])
+            finish_work_claim(
+                claim=claim,
+                now=timezone.now(),
+                completion='product_succeeded',
+                result_memory_id=target_memory.id,
+            )
+            self._write_decision(
+                work=work,
+                candidate=locked,
+                scope=gate.effective_scope,
+                outcome=CurationOutcome.MERGE_EVIDENCE,
+                reason_code=gate.reason_code,
+                evidence_tier=EvidenceTier.NONE,
+                comparison_manifest_hash=_DETERMINISTIC_COMPARISON_HASH,
+                target_memory_version_id=gate.target_memory_version_id,
+                transition=None,
+                conflict=None,
+                judge=None,
+                redacted_reason='',
+            )
+
+        return
+
+    def _current_target_memory(self, target_memory_version_id: uuid.UUID | None) -> Memory:
+        if target_memory_version_id is None:
+            raise _operational('stale_decision', 'exact duplicate settlement requires a target version')
+        try:
+            version = (
+                MemoryVersion.objects.select_for_update().select_related('memory').get(id=target_memory_version_id)
+            )
+        except MemoryVersion.DoesNotExist as error:
+            raise _operational('stale_decision', 'exact duplicate target no longer exists') from error
+        memory = version.memory
+        if memory.current_version != version.version or memory.stale or memory.refuted:
+            raise _operational('stale_decision', 'exact duplicate target advanced after gate evaluation')
+
+        return memory
 
     def _settle_model_decision(
         self,
@@ -1241,7 +1310,7 @@ class DecideMemoryCandidate:
 
         _fault_boundary('before_transition')
         with transaction.atomic():
-            transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence)
+            transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence, view, scope)
             self._write_decision(
                 work=work,
                 candidate=candidate,
@@ -1313,13 +1382,23 @@ class DecideMemoryCandidate:
         claim: WorkClaim,
         verdict: object,
         memory_fence: MemoryFence | None,
+        view: SanitizedCandidateView,
+        scope: EffectiveCandidateScope,
     ) -> tuple[object | None, object | None]:
         outcome = verdict.outcome
         request = self._request(work, candidate)
         candidate_fence = self._candidate_fence(candidate)
         if outcome == 'publish_new':
             result = PromoteMemoryCandidate().execute(
-                PromoteMemoryCandidateInput(request=request, candidate_fence=candidate_fence, work_claim=claim),
+                PromoteMemoryCandidateInput(
+                    request=request,
+                    candidate_fence=candidate_fence,
+                    work_claim=claim,
+                    sanitized_title=view.title,
+                    sanitized_body=view.body,
+                    effective_visibility_scope=scope.visibility_scope,
+                    effective_team_id=scope.team_id,
+                ),
             )
 
             return result.transition, None
@@ -1333,6 +1412,8 @@ class DecideMemoryCandidate:
                     title=candidate.title,
                     body=candidate.body,
                     work_claim=claim,
+                    sanitized_title=view.title,
+                    sanitized_body=view.body,
                 ),
             )
 
@@ -1347,6 +1428,8 @@ class DecideMemoryCandidate:
                     title=candidate.title,
                     body=candidate.body,
                     work_claim=claim,
+                    sanitized_title=view.title,
+                    sanitized_body=view.body,
                 ),
             )
 
@@ -1359,6 +1442,10 @@ class DecideMemoryCandidate:
                     candidate_fence=candidate_fence,
                     loser_memory_fence=memory_fence,
                     work_claim=claim,
+                    sanitized_title=view.title,
+                    sanitized_body=view.body,
+                    effective_visibility_scope=scope.visibility_scope,
+                    effective_team_id=scope.team_id,
                 ),
             )
 

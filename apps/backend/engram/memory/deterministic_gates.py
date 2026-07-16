@@ -555,3 +555,7 @@ class EvaluateDeterministicCandidateGates:
             target_memory_version_id=target_id,
             requires_transition=requires_transition,
         )
+
+
+redact_candidate_view = _redact_candidate
+effective_candidate_scope = _scope_for
