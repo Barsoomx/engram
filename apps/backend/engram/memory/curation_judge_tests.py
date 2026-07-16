@@ -373,6 +373,110 @@ def test_conflict_tag_blocks_revise_and_supersede_targets() -> None:
         assert getattr(error.value, 'code', None) == 'judge_policy_denied'
 
 
+def _conflict_payload(
+    entry: object,
+    *,
+    candidate_refs: list[str] | None = None,
+    target_refs: list[str] | None = None,
+) -> dict[str, object]:
+    return _payload(
+        entry,
+        outcome='open_conflict',
+        relation='mutually_incompatible',
+        target=str(entry.memory_version_id),
+        candidate_refs=candidate_refs,
+        target_refs=target_refs,
+        reason_code='same_scope_contradiction',
+        applicability='same',
+        temporal_order='unordered',
+        reason='same scope contradiction',
+    )
+
+
+def _conflict_data(
+    module: object,
+    data: object,
+    entry: object,
+    *,
+    candidate_at: datetime | None,
+    target_at: datetime | None,
+    candidate_refs: tuple[str, ...] = ('candidate-ref',),
+    target_refs: tuple[str, ...] = ('target-ref',),
+    complete: bool = True,
+) -> object:
+    evidence = module.CurationEvidenceContext(
+        candidate=module.ClaimEvidence(tier='supported', refs=candidate_refs, latest_evidence_at=candidate_at),
+        targets={
+            entry.memory_version_id: module.ClaimEvidence(
+                tier='supported', refs=target_refs, latest_evidence_at=target_at
+            )
+        },
+    )
+
+    return replace(data, shortlist=replace(data.shortlist, comparison_complete=complete), evidence=evidence)
+
+
+@pytest.mark.django_db
+def test_open_conflict_opens_with_genuinely_unordered_evidence() -> None:
+    module, data, entry, candidate = _fixture()
+    data = _conflict_data(module, data, entry, candidate_at=_TARGET_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT)
+    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'open_conflict'
+
+
+@pytest.mark.django_db
+def test_open_conflict_denied_when_comparison_incomplete() -> None:
+    module, data, entry, candidate = _fixture()
+    data = _conflict_data(
+        module, data, entry, candidate_at=_TARGET_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT, complete=False
+    )
+    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+@pytest.mark.django_db
+def test_open_conflict_denied_when_deterministic_precedence_exists() -> None:
+    module, data, entry, candidate = _fixture()
+    data = _conflict_data(module, data, entry, candidate_at=_CANDIDATE_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT)
+    payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('side', ['candidate', 'target'])
+def test_open_conflict_denied_when_evidence_refs_empty(side: str) -> None:
+    module, data, entry, candidate = _fixture()
+    candidate_refs = () if side == 'candidate' else ('candidate-ref',)
+    target_refs = () if side == 'target' else ('target-ref',)
+    data = _conflict_data(
+        module,
+        data,
+        entry,
+        candidate_at=_TARGET_EVIDENCE_AT,
+        target_at=_TARGET_EVIDENCE_AT,
+        candidate_refs=candidate_refs,
+        target_refs=target_refs,
+    )
+    payload = _conflict_payload(entry, candidate_refs=list(candidate_refs), target_refs=list(target_refs))
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     'mutator',
@@ -470,6 +574,7 @@ def test_judge_allows_only_locked_outcome_relation_target_combinations(
     complete: bool,
 ) -> None:
     module, data, entry, candidate = _fixture()
+    candidate_at = _TARGET_EVIDENCE_AT if outcome == 'open_conflict' else _CANDIDATE_EVIDENCE_AT
     data = replace(
         data,
         shortlist=replace(data.shortlist, comparison_complete=complete),
@@ -478,7 +583,7 @@ def test_judge_allows_only_locked_outcome_relation_target_combinations(
             candidate=module.ClaimEvidence(
                 tier=candidate_tier,
                 refs=() if candidate_tier == 'none' else ('candidate-ref', 'candidate-ref-2'),
-                latest_evidence_at=_CANDIDATE_EVIDENCE_AT,
+                latest_evidence_at=candidate_at,
             ),
         ),
     )

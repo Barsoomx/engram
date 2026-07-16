@@ -54,6 +54,7 @@ from engram.memory.curation_shortlist import (
     BuildCurationShortlistInput,
     CurationShortlist,
     CurationShortlistError,
+    revalidate_curation_shortlist,
 )
 from engram.memory.deterministic_gates import (
     DeterministicGateDisposition,
@@ -1310,6 +1311,7 @@ class DecideMemoryCandidate:
 
         _fault_boundary('before_transition')
         with transaction.atomic():
+            self._revalidate_shortlist(work, view, scope, embedding, shortlist)
             transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence, view, scope)
             self._write_decision(
                 work=work,
@@ -1451,6 +1453,18 @@ class DecideMemoryCandidate:
 
             return result.transition, None
 
+        existing = self._existing_open_conflict(candidate, memory_fence)
+        if existing is not None:
+            lock_work_fence(claim=claim, now=timezone.now())
+            finish_work_claim(
+                claim=claim,
+                now=timezone.now(),
+                completion='product_succeeded',
+                result_memory_id=None,
+            )
+
+            return None, existing
+
         conflict = OpenMemoryConflict().execute(
             OpenMemoryConflictInput(
                 request=request,
@@ -1463,6 +1477,25 @@ class DecideMemoryCandidate:
         )
 
         return conflict.opened_transition, conflict
+
+    def _existing_open_conflict(
+        self,
+        candidate: MemoryCandidate,
+        memory_fence: MemoryFence | None,
+    ) -> MemoryConflict | None:
+        if memory_fence is None:
+            return None
+
+        return (
+            MemoryConflict.objects.select_for_update()
+            .filter(
+                candidate_id=candidate.id,
+                memory_id=memory_fence.memory_id,
+                resolved_transition__isnull=True,
+            )
+            .order_by('id')
+            .first()
+        )
 
     def _validate_verdict(
         self,
@@ -1548,6 +1581,24 @@ class DecideMemoryCandidate:
         }
 
         return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+    def _revalidate_shortlist(
+        self,
+        work: WorkflowWork,
+        view: SanitizedCandidateView,
+        scope: EffectiveCandidateScope,
+        embedding: tuple[float, ...],
+        shortlist: CurationShortlist,
+    ) -> None:
+        data = self._shortlist_input(work, view, scope, embedding)
+        try:
+            unchanged = revalidate_curation_shortlist(data, shortlist)
+        except CurationShortlistError as error:
+            raise _operational(error.code, 'shortlist revalidation failed') from error
+        if not unchanged:
+            raise _operational('stale_decision', 'authorized shortlist changed before settlement')
+
+        return
 
     def _shortlist_input(
         self,

@@ -207,6 +207,25 @@ def _manifest_hash(
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
+def revalidate_curation_shortlist(data: BuildCurationShortlistInput, shortlist: CurationShortlist) -> bool:
+    try:
+        if _authorized_memories(data).count() != shortlist.authorized_corpus_count:
+            return False
+        if not shortlist.entries:
+            return True
+        current = dict(
+            Memory.objects.filter(
+                id__in=[entry.memory_id for entry in shortlist.entries],
+                organization_id=data.organization_id,
+                project_id=data.project_id,
+            ).values_list('id', 'current_transition_id')
+        )
+    except (DatabaseError, FieldError, TypeError, ValueError) as exc:
+        raise CurationShortlistError('shortlist_query_failed') from exc
+
+    return all(current.get(entry.memory_id) == entry.current_transition_id for entry in shortlist.entries)
+
+
 class BuildCurationShortlist:
     MAX_VECTOR: ClassVar[int] = 8
     MAX_EXACT: ClassVar[int] = 4

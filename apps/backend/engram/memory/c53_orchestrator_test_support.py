@@ -127,6 +127,14 @@ def subject_candidate(
     return candidate, work, run
 
 
+def next_generation_work(candidate: MemoryCandidate) -> tuple[WorkflowWork, WorkflowRun]:
+    with transaction.atomic():
+        work, _created = ensure_candidate_decision_work_locked(candidate)
+    run = queue_work_attempt(work_id=work.id, now=timezone.now(), origin=WorkflowRunOrigin.AUTOMATIC)
+
+    return work, run
+
+
 def curation_policy(scope: OrchestratorScope) -> ModelPolicy:
     secret = ProviderSecret.objects.create(
         organization=scope.organization,
