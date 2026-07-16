@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 from uuid import UUID
 
 import pytest
+from django.db import transaction
 from django.utils import timezone
 
 from engram.core.models import (
@@ -18,10 +18,12 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.memory.deterministic_gates import EffectiveCandidateScope
+from engram.memory.projections import write_exact_memory_projection
 from engram.memory.transitions_test_support import (
     candidate_in_scope,
     open_single_conflict,
     provenanced_candidate,
+    provenanced_candidate_in_scope,
     transition_request,
     transitions_module,
 )
@@ -41,14 +43,16 @@ def _input(
     embedding: tuple[float, ...] | None = None,
     terms: tuple[str, ...] = (),
     symbols: tuple[str, ...] = (),
+    title: str = 'candidate title',
+    body: str = 'candidate body',
 ) -> object:
     module = _shortlist_module()
     return module.BuildCurationShortlistInput(
         organization_id=organization_id,
         project_id=project_id,
         effective_scope=scope,
-        title='candidate title',
-        body='candidate body',
+        title=title,
+        body=body,
         query_embedding=embedding,
         exact_terms=terms,
         symbols=symbols,
@@ -60,7 +64,7 @@ def _semantic_snapshot(project_id: UUID) -> dict[str, tuple[object, ...]]:
         'decisions': tuple(
             CurationDecision.objects.filter(project_id=project_id)
             .order_by('id')
-            .values_list('id', 'outcome', 'relation', 'target_memory_version_id')
+            .values_list('id', 'outcome', 'reason_code', 'target_memory_version_id')
         ),
         'transitions': tuple(
             MemoryTransition.objects.filter(project_id=project_id)
@@ -97,24 +101,31 @@ def _semantic_snapshot(project_id: UUID) -> dict[str, tuple[object, ...]]:
     }
 
 
+def _write_projection(memory: object, version: object, transition_id: UUID, *, full_text: str) -> object:
+    version.source_metadata = {
+        'exact_terms': ['term'],
+        'symbols': ['Symbol.method'],
+        'full_text': full_text,
+    }
+    version.save(update_fields=['source_metadata', 'updated_at'])
+    with transaction.atomic():
+        return write_exact_memory_projection(
+            memory=memory,
+            version=version,
+            transition_id=transition_id,
+            sources=list(version.provenance_sources.all()),
+        )
+
+
 def _promote(suffix: str) -> tuple[object, object, object, object, object, object]:
     candidate, source, scope = provenanced_candidate(suffix)
     result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
     document = result.retrieval_document
-    document.exact_terms = ['candidate', 'term']
-    document.symbols = ['Symbol.method']
-    document.full_text = f'{document.memory.title}\n\n{document.memory.body}'
-    document.projection_contract_version = 1
-    document.exact_projection_hash = hashlib.sha256(document.full_text.encode()).hexdigest()
-    document.save(
-        update_fields=[
-            'exact_terms',
-            'symbols',
-            'full_text',
-            'projection_contract_version',
-            'exact_projection_hash',
-            'updated_at',
-        ],
+    document = _write_projection(
+        result.memory,
+        result.memory_version,
+        result.transition.id,
+        full_text=f'{document.memory.title}\n\n{document.memory.body}',
     )
     return scope, result.memory, result.memory_version, document, candidate, source
 
@@ -158,23 +169,23 @@ def test_pgvector_shortlist_authorizes_before_distance_ordering() -> None:
         slug='foreign-shortlist-team',
     )
     scope[1].team_links.create(organization_id=scope[0].id, team=foreign_team)
-    foreign_candidate, foreign_source = candidate_in_scope(
-        base_candidate,
-        base_source,
+    foreign_candidate, foreign_source, _foreign_session = provenanced_candidate_in_scope(
+        scope[0],
+        scope[1],
+        foreign_team,
+        suffix='shortlist-foreign-closer',
         title='Foreign closer candidate',
         body='Foreign closer body',
+        visibility_scope=VisibilityScope.TEAM,
     )
-    foreign_candidate.team_id = foreign_team.id
-    foreign_candidate.visibility_scope = VisibilityScope.TEAM
-    foreign_candidate.save(update_fields=['team_id', 'visibility_scope', 'updated_at'])
-    foreign_source.team_id = foreign_team.id
-    foreign_source.save(update_fields=['team_id'])
     foreign_result = transitions_module().PromoteMemoryCandidate().execute(transition_request(foreign_candidate))
     foreign_document = foreign_result.retrieval_document
-    foreign_document.visibility_scope = VisibilityScope.TEAM
-    foreign_document.exact_terms = ['not-a-match']
-    foreign_document.full_text = 'Foreign closer body'
-    foreign_document.save(update_fields=['visibility_scope', 'exact_terms', 'full_text', 'updated_at'])
+    foreign_document = _write_projection(
+        foreign_result.memory,
+        foreign_result.memory_version,
+        foreign_result.transition.id,
+        full_text='Foreign closer body',
+    )
     _set_embedding(foreign_document, 0)
     before = _semantic_snapshot(scope[1].id)
 
@@ -205,12 +216,12 @@ def test_shortlist_enforces_three_bounded_legs_union_cap_and_tie_order() -> None
         )
         result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
         document = result.retrieval_document
-        document.exact_terms = ['term']
-        document.symbols = ['Symbol.method']
-        document.full_text = f'term Symbol.method bounded body {index}'
-        document.projection_contract_version = 1
-        document.exact_projection_hash = hashlib.sha256(document.full_text.encode()).hexdigest()
-        document.save(update_fields=['exact_terms', 'symbols', 'full_text', 'updated_at'])
+        document = _write_projection(
+            result.memory,
+            result.memory_version,
+            result.transition.id,
+            full_text=f'term Symbol.method bounded body {index}',
+        )
         _set_embedding(document, 1)
 
     before = _semantic_snapshot(scope[1].id)
@@ -230,14 +241,17 @@ def test_shortlist_enforces_three_bounded_legs_union_cap_and_tie_order() -> None
     assert len([entry for entry in result.entries if entry.exact_overlap]) <= 4
     assert len(result.entries) <= 12
     assert len({entry.memory_version_id for entry in result.entries}) == len(result.entries)
-    assert [entry.memory_id for entry in result.entries] == sorted(
-        (entry.memory_id for entry in result.entries),
-        key=lambda value: str(value),
+    expected_order = sorted(
+        result.entries,
+        key=lambda entry: (
+            -entry.exact_overlap,
+            entry.vector_distance is None,
+            entry.vector_distance if entry.vector_distance is not None else 0.0,
+            -(entry.lexical_rank or 0.0),
+            str(entry.memory_version_id),
+        ),
     )
-    assert result.entries[0].memory_id == min(
-        (entry.memory_id for entry in result.entries),
-        key=lambda value: str(value),
-    )
+    assert list(result.entries) == expected_order
     assert _semantic_snapshot(scope[1].id) == before
 
 
@@ -257,7 +271,7 @@ def test_shortlist_applies_effective_visibility_and_excludes_inactive_rows(
     team_case: str | None,
     authorized: bool,
 ) -> None:
-    scope, memory, _version, document, _candidate, _source = _promote('shortlist-visibility')
+    scope, memory, version, document, _candidate, _source = _promote('shortlist-visibility')
     memory.visibility_scope = visibility
     effective_scope = EffectiveCandidateScope(VisibilityScope.PROJECT, None)
     if visibility == VisibilityScope.TEAM:
@@ -275,7 +289,7 @@ def test_shortlist_applies_effective_visibility_and_excludes_inactive_rows(
     else:
         document.visibility_scope = visibility
     memory.save(update_fields=['visibility_scope', 'team_id', 'updated_at'])
-    document.save(update_fields=['visibility_scope', 'team_id', 'updated_at'])
+    document = _write_projection(memory, version, memory.current_transition_id, full_text=document.full_text)
     before = _semantic_snapshot(scope[1].id)
 
     result = _shortlist_module().BuildCurationShortlist.execute(
@@ -294,11 +308,11 @@ def test_shortlist_applies_effective_visibility_and_excludes_inactive_rows(
 @pytest.mark.django_db
 @pytest.mark.parametrize('field', ['stale', 'refuted'])
 def test_shortlist_excludes_stale_and_refuted_current_memories(field: str) -> None:
-    scope, memory, _version, document, _candidate, _source = _promote(f'shortlist-{field}')
+    scope, memory, version, document, _candidate, _source = _promote(f'shortlist-{field}')
     setattr(memory, field, True)
     setattr(document, field, True)
     memory.save(update_fields=[field, 'updated_at'])
-    document.save(update_fields=[field, 'updated_at'])
+    document = _write_projection(memory, version, memory.current_transition_id, full_text=document.full_text)
     before = _semantic_snapshot(scope[1].id)
 
     result = _shortlist_module().BuildCurationShortlist.execute(
@@ -369,21 +383,11 @@ def test_shortlist_manifest_hash_is_replay_stable_and_fences_transition_changes(
             body='new generation body',
         ),
     )
-    revised_document = revised.retrieval_document
-    revised_document.exact_terms = ['candidate', 'term']
-    revised_document.symbols = ['Symbol.method']
-    revised_document.full_text = 'new generation\n\nnew generation body'
-    revised_document.projection_contract_version = 1
-    revised_document.exact_projection_hash = hashlib.sha256(revised_document.full_text.encode()).hexdigest()
-    revised_document.save(
-        update_fields=[
-            'exact_terms',
-            'symbols',
-            'full_text',
-            'projection_contract_version',
-            'exact_projection_hash',
-            'updated_at',
-        ],
+    _write_projection(
+        revised.memory,
+        revised.memory_version,
+        revised.transition.id,
+        full_text='new generation\n\nnew generation body',
     )
     assert version.id in {entry.memory_version_id for entry in first.entries}
     changed = _shortlist_module().BuildCurationShortlist.execute(data)
@@ -413,7 +417,13 @@ def test_missing_embedding_on_nonempty_scope_retries_without_publication() -> No
 
     with pytest.raises(ValueError) as error:
         _shortlist_module().BuildCurationShortlist.execute(
-            _input(scope[0].id, scope[1].id, EffectiveCandidateScope(VisibilityScope.PROJECT, None)),
+            _input(
+                scope[0].id,
+                scope[1].id,
+                EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+                title='',
+                body='',
+            ),
         )
 
     assert getattr(error.value, 'code', None) == 'embedding_unavailable'
@@ -438,12 +448,12 @@ def test_zero_authorized_corpus_returns_empty_complete_manifest_without_embeddin
 
 @pytest.mark.django_db
 def test_project_visible_row_with_retained_team_provenance_remains_authorized() -> None:
-    scope, memory, _version, document, _candidate, _source = _promote('shortlist-project-retained-team')
+    scope, memory, version, document, _candidate, _source = _promote('shortlist-project-retained-team')
     memory.visibility_scope = VisibilityScope.PROJECT
     document.visibility_scope = VisibilityScope.PROJECT
     document.team_id = scope[2].team_id
     memory.save(update_fields=['visibility_scope', 'updated_at'])
-    document.save(update_fields=['visibility_scope', 'team_id', 'updated_at'])
+    _write_projection(memory, version, memory.current_transition_id, full_text=document.full_text)
 
     result = _shortlist_module().BuildCurationShortlist.execute(
         _input(scope[0].id, scope[1].id, EffectiveCandidateScope(VisibilityScope.PROJECT, None)),
@@ -491,9 +501,12 @@ def test_empty_and_duplicate_term_symbol_inputs_are_bounded_before_query(
     )
 
     if not terms and not symbols:
-        assert result.entries == ()
+        assert result.entries
+        assert all(entry.exact_overlap == 0 for entry in result.entries)
     else:
         assert result.entries
         assert result.entries[0].exact_overlap > 0 or result.entries[0].lexical_rank is not None
     assert len(result.entries) <= 12
+    if not terms and not symbols:
+        assert result.comparison_complete is False
     assert _semantic_snapshot(scope[1].id) == before
