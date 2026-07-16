@@ -13,13 +13,24 @@ from engram.core.models import (
     CurationDecision,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryConflict,
     MemoryTransition,
+    MemoryVersionSource,
+    Observation,
     VisibilityScope,
 )
 from engram.memory.curation_test_support import create_curation_policy
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
-from engram.memory.transitions_test_support import provenanced_candidate
+from engram.memory.distillation_provenance import candidate_source_anchors, canonical_source_manifest
+from engram.memory.transitions_test_support import (
+    candidate_in_scope,
+    provenanced_candidate,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transitions_module,
+)
+from engram.memory.workflow_work import observation_content_digest
 from engram.model_policy.services import ProviderCallResult
 
 
@@ -165,7 +176,7 @@ def _semantic_snapshot(project_id: UUID) -> dict[str, tuple[object, ...]]:
         'decisions': tuple(
             CurationDecision.objects.filter(project_id=project_id)
             .order_by('id')
-            .values_list('id', 'outcome', 'relation', 'target_memory_version_id')
+            .values_list('id', 'outcome', 'target_memory_version_id')
         ),
         'transitions': tuple(
             MemoryTransition.objects.filter(project_id=project_id)
@@ -310,6 +321,7 @@ def test_similarity_point_999_cannot_choose_destructive_outcome() -> None:
         outcome='supersede_memory',
         relation='candidate_supersedes',
         target=str(ranked_entry.memory_version_id),
+        candidate_refs=['candidate-ref'],
         reason_code='ordered_replacement',
         temporal_order='candidate_newer',
         reason='high similarity is retrieval evidence only',
@@ -514,3 +526,204 @@ def test_judge_reason_is_bounded_and_redacted(reason: str) -> None:
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(payload), data)
     assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+
+
+def _empty_shortlist() -> object:
+    shortlist_module = _shortlist_module()
+    return shortlist_module.CurationShortlist(
+        entries=(),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=0,
+        comparison_complete=True,
+    )
+
+
+def _shortlist_for(memory: object, version: object) -> object:
+    shortlist_module = _shortlist_module()
+    entry = shortlist_module.CurationShortlistEntry(
+        memory_id=memory.id,
+        memory_version_id=version.id,
+        current_transition_id=memory.current_transition_id,
+        visibility_scope=VisibilityScope.PROJECT,
+        team_id=None,
+        title=memory.title,
+        body=version.body,
+        kind=memory.kind or 'decision',
+        body_hash='a' * 64,
+        exact_overlap=0,
+        vector_distance=0.1,
+        lexical_rank=0.0,
+        trigram_similarity=0.0,
+        has_open_conflict=False,
+    )
+    return shortlist_module.CurationShortlist(
+        entries=(entry,),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=1,
+        comparison_complete=True,
+    )
+
+
+def _add_distillation_source(
+    candidate: MemoryCandidate,
+    session: object,
+    *,
+    window: object,
+    stage: object,
+    sequence: int,
+    title: str,
+    body: str,
+) -> MemoryCandidateSource:
+    observation = Observation.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title=title,
+        body=body,
+        content_hash=f'evidence-content-{session.id}-{sequence}',
+        session_sequence=sequence,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    anchors = candidate_source_anchors(
+        observation,
+        observation_id=str(observation.id),
+        session_sequence=sequence,
+        observation_digest=observation_content_digest(observation),
+    )
+    return MemoryCandidateSource.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        candidate=candidate,
+        window=window,
+        observation=observation,
+        stage=stage,
+        anchors=anchors,
+        anchors_hash=canonical_source_manifest(anchors),
+    )
+
+
+@pytest.mark.django_db
+def test_repeated_window_group_counts_as_one_candidate_group() -> None:
+    module = _judge_module()
+    candidate, source, scope = provenanced_candidate('judge-evidence-repeat-window')
+    _add_distillation_source(
+        candidate,
+        scope[2],
+        window=source.window,
+        stage=source.stage,
+        sequence=2,
+        title='Second observation same window',
+        body='Second observation body in the same distillation window',
+    )
+    before = _semantic_snapshot(candidate.project_id)
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'supported'
+    assert len(context.candidate.refs) == 1
+    assert len(set(context.candidate.refs)) == len(context.candidate.refs)
+    assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_two_distinct_window_groups_reach_corroborated_candidate_tier() -> None:
+    module = _judge_module()
+    candidate, _source, scope = provenanced_candidate('judge-evidence-two-windows')
+    _second_candidate, second_source, _second_session = provenanced_candidate_in_scope(
+        scope[0],
+        scope[1],
+        scope[2].team,
+        suffix='judge-evidence-second-window',
+        title='Independent window candidate',
+        body='Independent window body',
+    )
+    MemoryCandidateSource.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        candidate=candidate,
+        window=second_source.window,
+        observation=second_source.observation,
+        stage=second_source.stage,
+        anchors=second_source.anchors,
+        anchors_hash=second_source.anchors_hash,
+    )
+    before = _semantic_snapshot(candidate.project_id)
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'corroborated'
+    assert len(context.candidate.refs) >= 2
+    assert len(set(context.candidate.refs)) == len(context.candidate.refs)
+    assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_missing_target_provenance_raises_operational_retry_without_override() -> None:
+    module = _judge_module()
+    candidate, source, _scope = provenanced_candidate('judge-evidence-missing-target')
+    promotable, _promotable_source = candidate_in_scope(
+        candidate,
+        source,
+        title='Target memory for missing provenance',
+        body='Target memory body for missing provenance',
+    )
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(promotable))
+    MemoryVersionSource.objects.filter(memory_version_id=result.memory_version.id).delete()
+    shortlist = _shortlist_for(result.memory, result.memory_version)
+    before = _semantic_snapshot(candidate.project_id)
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.build_curation_evidence_context(candidate.id, shortlist)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+    assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_cyclic_target_provenance_is_detected_without_infinite_recursion() -> None:
+    module = _judge_module()
+    candidate, source, _scope = provenanced_candidate('judge-evidence-cyclic-target')
+    first_candidate, _first_source = candidate_in_scope(
+        candidate,
+        source,
+        title='First cyclic memory',
+        body='First cyclic memory body',
+    )
+    second_candidate, _second_source = candidate_in_scope(
+        candidate,
+        source,
+        title='Second cyclic memory',
+        body='Second cyclic memory body',
+    )
+    first = transitions_module().PromoteMemoryCandidate().execute(transition_request(first_candidate))
+    second = transitions_module().PromoteMemoryCandidate().execute(transition_request(second_candidate))
+    cycle_hash = 'c' * 64
+    MemoryVersionSource.objects.create(
+        organization=first.memory.organization,
+        project=first.memory.project,
+        team=first.memory.team,
+        memory_version=first.memory_version,
+        source_memory_version=second.memory_version,
+        source_content_hash=cycle_hash,
+    )
+    MemoryVersionSource.objects.create(
+        organization=second.memory.organization,
+        project=second.memory.project,
+        team=second.memory.team,
+        memory_version=second.memory_version,
+        source_memory_version=first.memory_version,
+        source_content_hash=cycle_hash,
+    )
+    shortlist = _shortlist_for(first.memory, first.memory_version)
+    before = _semantic_snapshot(candidate.project_id)
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.build_curation_evidence_context(candidate.id, shortlist)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+    assert _semantic_snapshot(candidate.project_id) == before
