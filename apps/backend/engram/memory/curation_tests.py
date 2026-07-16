@@ -23,12 +23,14 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryConflict,
     MemoryLink,
     MemoryStatus,
     MemoryTransition,
     MemoryTransitionType,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     Project,
     RetrievalDocument,
@@ -1770,6 +1772,111 @@ def test_open_conflict_outcome_commits_conflict_decision_atomically(monkeypatch:
     assert candidate.status == CandidateStatus.PROPOSED
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_publish_new_reredacts_stale_secret_before_persisting(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret = 'sk-livetoken0123456789abcdef'
+    scope = orch.orchestrator_scope('reredact')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='reredact',
+        title='Gateway credential rotation',
+        body=f'The staging gateway key is {secret} and must be rotated each release.',
+    )
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    candidate.refresh_from_db()
+    assert candidate.promoted_memory_id is not None
+    memory = Memory.objects.get(id=candidate.promoted_memory_id)
+    version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
+    document = RetrievalDocument.objects.get(memory_version=version)
+    assert secret not in memory.title
+    assert secret not in memory.body
+    assert secret not in json.dumps(memory.metadata)
+    assert secret not in version.body
+    assert secret not in document.full_text
+    assert secret not in json.dumps(document.metadata)
+
+
+@pytest.mark.django_db
+def test_publish_new_persists_gate_narrowed_visibility(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('narrow')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='narrow',
+        title='Org-wide retry policy',
+        body=_LONG_BODY,
+        visibility_scope=VisibilityScope.ORGANIZATION,
+    )
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    candidate.refresh_from_db()
+    memory = Memory.objects.get(id=candidate.promoted_memory_id)
+    decision = orch.curation_decisions_for(candidate)[0]
+    assert memory.visibility_scope != VisibilityScope.ORGANIZATION
+    assert memory.visibility_scope == decision.effective_visibility_scope
+    assert memory.team_id == decision.effective_team_id
+
+
+@pytest.mark.django_db
+def test_exact_duplicate_no_new_evidence_settles_without_new_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('exactdup')
+    memory = orch.target_memory(scope, suffix='exactdup', title='Cache eviction policy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='exactdup', title='Cache eviction policy', body=_LONG_BODY
+    )
+    source = MemoryCandidateSource.objects.get(candidate=candidate)
+    MemoryVersionSource.objects.create(
+        organization_id=candidate.organization_id,
+        project_id=candidate.project_id,
+        team_id=target_version.memory.team_id,
+        memory_version=target_version,
+        candidate_source=source,
+        source_content_hash=source.anchors_hash,
+    )
+    orch.install_deterministic_only(monkeypatch)
+    before_versions = MemoryVersion.objects.filter(memory=memory).count()
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert MemoryVersion.objects.filter(memory=memory).count() == before_versions
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.MERGE_EVIDENCE
+    assert decisions[0].reason_code == CurationReasonCode.EXACT_DUPLICATE_NO_NEW_EVIDENCE
+    assert decisions[0].transition_id is None
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == memory.id
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
 
 @pytest.mark.django_db
