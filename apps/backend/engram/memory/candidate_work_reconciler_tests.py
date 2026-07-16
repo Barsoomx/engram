@@ -339,7 +339,7 @@ def _conflict_memory(scope: Scope, suffix: str) -> Memory:
 
 
 @pytest.mark.django_db
-def test_canonical_conflict_satisfies_candidate_and_ordinary_proposal_reports_missing() -> None:
+def test_memory_link_does_not_satisfy_candidate_conflict_exclusion() -> None:
     scope = create_scope('candidate-conflict-exception')
     organization, project, _session = scope
     conflicted = _candidate(scope, 'conflicted')
@@ -363,14 +363,12 @@ def test_canonical_conflict_satisfies_candidate_and_ordinary_proposal_reports_mi
 
     findings = _inspect(scope, as_of=timezone.now())
 
-    assert _codes(findings) == ['candidate_decision_work_missing']
-    missing = _one(findings, 'candidate_decision_work_missing')
-    assert missing.entity_id == str(ordinary.id)
-    assert all(finding.entity_id != str(conflicted.id) for finding in findings)
+    assert _codes(findings) == ['candidate_decision_work_missing', 'candidate_decision_work_missing']
+    assert {finding.entity_id for finding in findings} == {str(conflicted.id), str(ordinary.id)}
 
 
 @pytest.mark.django_db
-def test_canonical_conflict_satisfies_candidate_without_builder() -> None:
+def test_memory_link_does_not_satisfy_candidate_without_builder() -> None:
     scope = create_scope('candidate-conflict-no-builder')
     organization, project, _session = scope
     conflicted = _candidate(scope, 'conflicted')
@@ -384,7 +382,9 @@ def test_canonical_conflict_satisfies_candidate_without_builder() -> None:
     )
     candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
-    assert _inspect(scope, as_of=timezone.now()) == []
+    findings = _inspect(scope, as_of=timezone.now())
+    assert _codes(findings) == ['candidate_decision_builder_unavailable']
+    assert findings[0].entity_id == str(conflicted.id)
 
 
 @pytest.mark.django_db

@@ -55,6 +55,17 @@ def test_escalation_reason_returns_empty_for_benign_candidate() -> None:
     assert escalation_reason(candidate) == ''
 
 
+def test_escalation_reason_skips_human_escalation_for_version_one_decision_work() -> None:
+    candidate = MemoryCandidate(
+        title='Org-wide rollout',
+        body='Rotate the client secret before release',
+        visibility_scope=VisibilityScope.ORGANIZATION,
+        decision_work_contract_version=1,
+    )
+
+    assert escalation_reason(candidate) == ''
+
+
 @override_settings(ENGRAM_CURATOR_ESCALATION_ENABLED=False)
 def test_escalation_reason_disabled_by_settings_returns_empty_for_sensitive_term() -> None:
     candidate = MemoryCandidate(title='Deploy notes', body='Rotate the client secret before release')

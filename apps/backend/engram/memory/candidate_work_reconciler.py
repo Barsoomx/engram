@@ -5,16 +5,18 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from django.db import transaction
-from django.db.models import CharField, Exists, OuterRef, Value
-from django.db.models.functions import Cast, Concat
+from django.db.models import Exists, OuterRef
+from django.utils import timezone
 
 from engram.core.models import (
     CandidateStatus,
-    LinkType,
     MemoryCandidate,
     MemoryCandidateSource,
-    MemoryLink,
+    MemoryCandidateSourceKind,
+    MemoryConflict,
+    WorkflowRun,
     WorkflowRunOrigin,
+    WorkflowRunStatus,
     WorkflowWorkDisposition,
     WorkflowWorkExecutionState,
 )
@@ -26,7 +28,6 @@ from engram.memory.candidate_decision_work import (
 from engram.memory.candidate_decision_work import (
     CandidateDecisionWorkInput as _CandidateDecisionWorkInput,
 )
-from engram.memory.conflict_links import CONFLICT_CANDIDATE_TARGET_PREFIX
 from engram.memory.session_work_reconciler import SessionWorkFinding
 from engram.memory.work_dispatch import queue_work_attempt
 
@@ -49,6 +50,27 @@ _INACTIVE_EXECUTION_STATES = frozenset(
 
 
 _BUILDER: CandidateDecisionWorkBuilder | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ReconcileCandidateDecisionWorkResult:
+    scanned: int
+    queued: int
+
+
+class ReconcileCandidateDecisionWork:
+    def execute(self, as_of: datetime | None = None) -> ReconcileCandidateDecisionWorkResult:
+        if as_of is None:
+            as_of = timezone.now()
+        require_aware(as_of)
+
+        candidates = _cp3_repair_candidates()
+        queued = 0
+        for candidate in candidates:
+            if _repair_candidate(candidate_id=candidate.id, as_of=as_of):
+                queued += 1
+
+        return ReconcileCandidateDecisionWorkResult(scanned=len(candidates), queued=queued)
 
 
 def set_candidate_decision_work_builder(builder: CandidateDecisionWorkBuilder | None) -> None:
@@ -107,16 +129,9 @@ def _classify(
 
 
 def _proposed_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> list[MemoryCandidate]:
-    conflict_links = MemoryLink.objects.filter(
-        organization_id=organization_id,
-        project_id=project_id,
-        memory__organization_id=organization_id,
-        memory__project_id=project_id,
-        link_type=LinkType.CONFLICTS_WITH,
-        target=Concat(
-            Value(CONFLICT_CANDIDATE_TARGET_PREFIX),
-            Cast(OuterRef('id'), output_field=CharField()),
-        ),
+    unresolved_conflicts = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
     )
     candidates = (
         MemoryCandidate.objects.filter(
@@ -124,7 +139,7 @@ def _proposed_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> l
             project_id=project_id,
             status=CandidateStatus.PROPOSED,
         )
-        .annotate(has_canonical_conflict=Exists(conflict_links))
+        .annotate(has_canonical_conflict=Exists(unresolved_conflicts))
         .only('id', 'organization_id', 'project_id', 'team_id', 'created_at')
         .order_by('created_at', 'id')
     )
@@ -132,27 +147,33 @@ def _proposed_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> l
     return list(candidates)
 
 
-def _cp3_repair_candidates(organization_id: uuid.UUID, project_id: uuid.UUID) -> list[MemoryCandidate]:
-    conflict_links = MemoryLink.objects.filter(
-        organization_id=organization_id,
-        project_id=project_id,
-        memory__organization_id=organization_id,
-        memory__project_id=project_id,
-        link_type=LinkType.CONFLICTS_WITH,
-        target=Concat(
-            Value(CONFLICT_CANDIDATE_TARGET_PREFIX),
-            Cast(OuterRef('id'), output_field=CharField()),
-        ),
+def _cp3_repair_candidates(
+    organization_id: uuid.UUID | None = None,
+    project_id: uuid.UUID | None = None,
+) -> list[MemoryCandidate]:
+    unresolved_conflicts = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
     )
+    durable_sources = MemoryCandidateSource.objects.filter(
+        candidate_id=OuterRef('pk'),
+        source_kind=MemoryCandidateSourceKind.DISTILLATION,
+        window__isnull=False,
+        stage__isnull=False,
+    )
+    filters = {
+        'status': CandidateStatus.PROPOSED,
+        'decision_work_contract_version': 1,
+    }
+    if organization_id is not None:
+        filters['organization_id'] = organization_id
+    if project_id is not None:
+        filters['project_id'] = project_id
     return list(
-        MemoryCandidate.objects.filter(
-            organization_id=organization_id,
-            project_id=project_id,
-            status=CandidateStatus.PROPOSED,
-            decision_work_contract_version=1,
-            sources__isnull=False,
-        )
-        .annotate(has_canonical_conflict=Exists(conflict_links))
+        MemoryCandidate.objects.filter(**filters)
+        .filter(Exists(durable_sources))
+        .annotate(has_canonical_conflict=Exists(unresolved_conflicts))
+        .filter(has_canonical_conflict=False)
         .only('id', 'organization_id', 'project_id', 'team_id', 'created_at')
         .distinct()
         .order_by('created_at', 'id')
@@ -203,30 +224,7 @@ def reconcile_candidate_work(
 
     applied: list[str] = []
     for candidate in _cp3_repair_candidates(organization_id, project_id):
-        if candidate.has_canonical_conflict:
-            continue
-        with transaction.atomic():
-            try:
-                locked = MemoryCandidate.objects.select_for_update().get(
-                    id=candidate.id,
-                    organization_id=organization_id,
-                    project_id=project_id,
-                    status=CandidateStatus.PROPOSED,
-                    decision_work_contract_version=1,
-                )
-            except MemoryCandidate.DoesNotExist:
-                continue
-            if not MemoryCandidateSource.objects.filter(candidate_id=locked.id).exists():
-                continue
-            work, _created = ensure_candidate_decision_work_locked(locked)
-            if (
-                work.disposition != WorkflowWorkDisposition.REQUIRED
-                or work.execution_state != WorkflowWorkExecutionState.READY
-            ):
-                continue
-            run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
-            if run.dispatched_at != as_of:
-                continue
+        if _repair_candidate(candidate_id=candidate.id, as_of=as_of):
             applied.append(str(candidate.id))
 
     return CandidateWorkReconciliation(
@@ -239,24 +237,43 @@ def reconcile_candidate_work(
 
 
 def reconcile_scheduled_candidate_work(*, as_of: datetime) -> int:
-    require_aware(as_of)
-    scopes = (
-        MemoryCandidateSource.objects.filter(
-            candidate__status=CandidateStatus.PROPOSED,
-            candidate__decision_work_contract_version=1,
-        )
-        .values_list('organization_id', 'project_id')
-        .distinct()
-        .order_by('organization_id', 'project_id')
-    )
+    return ReconcileCandidateDecisionWork().execute(as_of=as_of).queued
 
-    total = 0
-    for organization_id, project_id in scopes:
-        result = reconcile_candidate_work(
-            organization_id=organization_id,
-            project_id=project_id,
-            as_of=as_of,
-        )
-        total += result.queued
 
-    return total
+def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
+    with transaction.atomic():
+        try:
+            locked = MemoryCandidate.objects.select_for_update().get(
+                id=candidate_id,
+                status=CandidateStatus.PROPOSED,
+                decision_work_contract_version=1,
+            )
+        except MemoryCandidate.DoesNotExist:
+            return False
+        if MemoryConflict.objects.filter(candidate_id=locked.id, resolved_transition__isnull=True).exists():
+            return False
+        sources = list(
+            MemoryCandidateSource.objects.filter(
+                candidate_id=locked.id,
+                source_kind=MemoryCandidateSourceKind.DISTILLATION,
+                window__isnull=False,
+                stage__isnull=False,
+            )
+            .select_related('window', 'observation', 'stage')
+            .order_by('window_id', 'observation_id', 'id')
+        )
+        if not sources:
+            return False
+        work, _created = ensure_candidate_decision_work_locked(locked, sources=sources)
+        if (
+            work.disposition != WorkflowWorkDisposition.REQUIRED
+            or work.execution_state != WorkflowWorkExecutionState.READY
+        ):
+            return False
+        if WorkflowRun.objects.filter(
+            work_id=work.id,
+            status__in=(WorkflowRunStatus.QUEUED, WorkflowRunStatus.RUNNING),
+        ).exists():
+            return False
+        run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+        return run.dispatched_at == as_of

@@ -48,7 +48,7 @@ EXPECTED_BEAT_ENTRIES = frozenset(
         "retry-failed-distillations",
         "reembed-missing-embeddings",
         "confidence-decay",
-        "expire-stale-candidates",
+        "reconcile-candidate-decision-work",
         "expire-stale-import-jobs",
     }
 )

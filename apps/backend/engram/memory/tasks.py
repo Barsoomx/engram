@@ -30,7 +30,7 @@ from engram.memory.candidate_decision_work import (
     candidate_decision_snapshot,
 )
 from engram.memory.candidate_ttl import ExpireStaleCandidates
-from engram.memory.candidate_work_reconciler import reconcile_scheduled_candidate_work
+from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.distillation import (
     DistillationStageError,
@@ -1123,12 +1123,10 @@ def retry_failed_distillations() -> dict[str, int]:
     legacy = RetryFailedDistillations().execute()
     as_of = timezone.now()
     reconciled = reconcile_scheduled_session_work(as_of=as_of)
-    candidate_reconciled = reconcile_scheduled_candidate_work(as_of=as_of)
 
     return {
         'retried': len(legacy.retried),
         'reconciled': reconciled,
-        'candidate_reconciled': candidate_reconciled,
         'unlinked': len(legacy.unlinked_run_ids),
     }
 
@@ -1153,6 +1151,13 @@ def decay_memory_confidence() -> dict[str, int]:
         'projects': result.projects,
         'memories': result.memories,
     }
+
+
+@app.task(name='engram.memory.reconcile_candidate_decision_work')
+def reconcile_candidate_decision_work() -> dict[str, int]:
+    result = ReconcileCandidateDecisionWork().execute(as_of=timezone.now())
+
+    return {'scanned': result.scanned, 'queued': result.queued}
 
 
 @app.task(name='engram.memory.expire_stale_candidates')

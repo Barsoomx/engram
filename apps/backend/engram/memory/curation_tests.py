@@ -134,6 +134,7 @@ def create_candidate(
     confidence: str = '0.900',
     visibility_scope: str = VisibilityScope.PROJECT,
     evidence: list[dict[str, object]] | None = None,
+    decision_work_contract_version: int = 1,
 ) -> MemoryCandidate:
     existing_curation_policy_ids = tuple(
         ModelPolicy.objects.filter(
@@ -157,9 +158,12 @@ def create_candidate(
         project=project,
         task_type='curation',
     ).exclude(id__in=existing_curation_policy_ids).update(active=False)
+    update_fields = ['decision_work_contract_version', 'updated_at']
+    candidate.decision_work_contract_version = decision_work_contract_version
     if evidence is not None:
         candidate.evidence = evidence
-        candidate.save(update_fields=['evidence', 'updated_at'])
+        update_fields.insert(0, 'evidence')
+    candidate.save(update_fields=update_fields)
 
     return candidate
 
@@ -1128,7 +1132,9 @@ def test_curate_memory_candidate_concurrent_execution_creates_exactly_one_memory
 
 
 @pytest.mark.django_db
-def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_curate_escalates_sensitive_candidate_without_creating_memory_legacy_v0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     organization, team, project = create_scope()
     set_curator_settings(organization)
     candidate = create_candidate(
@@ -1138,6 +1144,7 @@ def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatc
         title='Deploy notes',
         body='Remember to rotate the client secret before the release goes out',
         content_hash='hash-escalation-sensitive',
+        decision_work_contract_version=0,
     )
     patch_judge_gateway(monkeypatch, _ExplodingGateway())
     provider_call_count = ProviderCallRecord.objects.count()
@@ -1160,7 +1167,9 @@ def test_curate_escalates_sensitive_candidate_without_creating_memory(monkeypatc
 
 
 @pytest.mark.django_db
-def test_curate_escalates_org_wide_candidate_without_creating_memory(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_curate_escalates_org_wide_candidate_without_creating_memory_legacy_v0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     organization, team, project = create_scope()
     set_curator_settings(organization)
     candidate = create_candidate(
@@ -1171,6 +1180,7 @@ def test_curate_escalates_org_wide_candidate_without_creating_memory(monkeypatch
         body=_LONG_BODY,
         content_hash='hash-escalation-org-wide',
         visibility_scope=VisibilityScope.ORGANIZATION,
+        decision_work_contract_version=0,
     )
     patch_judge_gateway(monkeypatch, _ExplodingGateway())
 
@@ -1207,7 +1217,9 @@ def test_curate_benign_candidate_promotes_without_escalation() -> None:
 
 
 @pytest.mark.django_db
-def test_curate_escalation_rerun_writes_single_audit_row(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_curate_escalation_rerun_writes_single_audit_row_legacy_v0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     organization, team, project = create_scope()
     set_curator_settings(organization)
     candidate = create_candidate(
@@ -1217,6 +1229,7 @@ def test_curate_escalation_rerun_writes_single_audit_row(monkeypatch: pytest.Mon
         title='Deploy notes',
         body='Remember to rotate the client secret before the release goes out',
         content_hash='hash-escalation-rerun',
+        decision_work_contract_version=0,
     )
     patch_judge_gateway(monkeypatch, _ExplodingGateway())
 
@@ -1231,7 +1244,9 @@ def test_curate_escalation_rerun_writes_single_audit_row(monkeypatch: pytest.Mon
 
 
 @pytest.mark.django_db
-def test_curate_escalation_holds_even_when_curator_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_curate_escalation_holds_even_when_curator_disabled_legacy_v0(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     organization, team, project = create_scope()
     set_curator_settings(organization, enabled=False)
     candidate = create_candidate(
@@ -1241,6 +1256,7 @@ def test_curate_escalation_holds_even_when_curator_disabled(monkeypatch: pytest.
         title='Deploy notes',
         body='Remember to rotate the client secret before the release goes out',
         content_hash='hash-escalation-disabled-curator',
+        decision_work_contract_version=0,
     )
     patch_judge_gateway(monkeypatch, _ExplodingGateway())
 

@@ -24,6 +24,11 @@ MIGRATION_0038_MODULE = 'engram.core.migrations.0038_atomic_memory_transitions'
 MIGRATE_0039 = [('core', '0039_import_provenance')]
 MIGRATION_0039_NODE = ('core', '0039_import_provenance')
 MIGRATION_0039_MODULE = 'engram.core.migrations.0039_import_provenance'
+MIGRATE_0040 = [
+    ('core', '0040_curation_decision'),
+    ('model_policy', '0004_alter_providercallrecord_result'),
+]
+MIGRATION_0040_NODE = ('core', '0040_curation_decision')
 
 
 def _end_work_contract_column() -> tuple[str | None, str]:
@@ -2948,6 +2953,7 @@ def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance(
         migration = executor.loader.graph.nodes[MIGRATION_0039_NODE]
         assert migration.operations[-1].__class__.__name__ == 'RunPython'
 
+        executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0038)
         apps_0038 = executor.loader.project_state(MIGRATE_0038).apps
         assert 'source_kind' not in {
@@ -2998,5 +3004,32 @@ def test_0039_reverse_preserves_distillation_rows_and_refuses_import_provenance(
         )
         with pytest.raises(RuntimeError, match='0039|import'):
             MigrationExecutor(connection).migrate(MIGRATE_0038)
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0040_curation_decision_round_trip_preserves_schema() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0040_NODE in executor.loader.graph.nodes
+    table_name = 'core_curationdecision'
+    try:
+        executor.migrate(MIGRATE_0039 + [('model_policy', '0004_alter_providercallrecord_result')])
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0040)
+
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.core_curationdecision')")
+            assert cursor.fetchone()[0] == table_name
+            constraints = connection.introspection.get_constraints(cursor, table_name)
+
+        assert 'core_curation_decision_contract_ck' in constraints
+        assert 'core_curation_decision_effective_scope_ck' in constraints
+
+        MigrationExecutor(connection).migrate(MIGRATE_0039 + [('model_policy', '0004_alter_providercallrecord_result')])
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT to_regclass('public.core_curationdecision')")
+            assert cursor.fetchone()[0] is None
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)

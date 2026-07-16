@@ -85,6 +85,7 @@ task_routes = {
     'engram.memory.generate_weekly_digest_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.sweep_stale_sessions': {'queue': QUEUE_BATCH},
     'engram.memory.retry_failed_distillations': {'queue': QUEUE_BATCH},
+    'engram.memory.reconcile_candidate_decision_work': {'queue': QUEUE_BATCH},
     'engram.memory.decay_memory_confidence': {'queue': QUEUE_BATCH},
     'engram.memory.expire_stale_candidates': {'queue': QUEUE_BATCH},
     'engram.imports.expire_stale_import_jobs': {'queue': QUEUE_BATCH},
@@ -157,8 +158,8 @@ beat_schedule: dict[str, dict] = {
         'schedule': crontab(day_of_week=1, hour=4, minute=0),
         'options': {'queue': QUEUE_BATCH},
     },
-    'expire-stale-candidates': {
-        'task': 'engram.memory.expire_stale_candidates',
+    'reconcile-candidate-decision-work': {
+        'task': 'engram.memory.reconcile_candidate_decision_work',
         'schedule': timedelta(minutes=30),
         'options': {'queue': QUEUE_BATCH},
     },
