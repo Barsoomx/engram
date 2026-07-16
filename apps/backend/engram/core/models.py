@@ -2897,6 +2897,17 @@ class CurationDecision(ImmutableCreatedModel):
         ):
             if related is not None:
                 check_project_scope(errors, field, related, self.organization_id, self.project_id)
+        if self.candidate.team_id != self.team_id:
+            add_scope_error(errors, 'team', 'decision team must match candidate team')
+        if self.work.team_id != self.team_id:
+            add_scope_error(errors, 'team', 'decision team must match work team')
+        if (
+            self.work.work_type != WorkflowWorkType.CANDIDATE_DECISION
+            or self.work.subject_type != WorkflowSubjectType.MEMORY_CANDIDATE
+        ):
+            add_scope_error(errors, 'work', 'curation decision work must be candidate decision work')
+        elif self.work.subject_id != self.candidate_id:
+            add_scope_error(errors, 'work', 'curation decision work must target candidate')
         if self.effective_team_id:
             check_organization_scope(errors, 'effective_team', self.effective_team, self.organization_id)
         if self.effective_visibility_scope not in (VisibilityScope.PROJECT, VisibilityScope.TEAM):
@@ -2905,6 +2916,37 @@ class CurationDecision(ImmutableCreatedModel):
             add_scope_error(errors, 'effective_team', 'project scope cannot include effective team')
         elif self.effective_visibility_scope == VisibilityScope.TEAM and not self.effective_team_id:
             add_scope_error(errors, 'effective_team', 'team scope requires effective team')
+        elif self.effective_visibility_scope == VisibilityScope.TEAM and self.effective_team_id != self.team_id:
+            add_scope_error(errors, 'effective_team', 'team-effective decision must match decision team')
+
+        if self.target_memory_version is not None:
+            target_memory = self.target_memory_version.memory
+            check_project_scope(errors, 'target_memory', target_memory, self.organization_id, self.project_id)
+            if target_memory.team_id:
+                check_organization_scope(errors, 'target_memory_team', target_memory.team, self.organization_id)
+            if self.effective_visibility_scope == VisibilityScope.TEAM:
+                if target_memory.visibility_scope != VisibilityScope.TEAM:
+                    add_scope_error(errors, 'target_memory_version', 'team-effective target must be team-visible')
+                if target_memory.team_id != self.effective_team_id:
+                    add_scope_error(
+                        errors,
+                        'target_memory_version',
+                        'team-effective target team must match effective team',
+                    )
+            elif self.effective_visibility_scope == VisibilityScope.PROJECT:
+                if target_memory.visibility_scope != VisibilityScope.PROJECT:
+                    add_scope_error(errors, 'target_memory_version', 'project-effective target must be project-visible')
+
+        if self.transition is not None:
+            if self.transition.candidate_id != self.candidate_id:
+                add_scope_error(errors, 'transition', 'transition candidate must match decision candidate')
+            if self.transition.team_id != self.team_id:
+                add_scope_error(errors, 'transition', 'transition team must match decision team')
+        if self.conflict is not None:
+            if self.conflict.candidate_id != self.candidate_id:
+                add_scope_error(errors, 'conflict', 'conflict candidate must match decision candidate')
+            if self.conflict.team_id != self.team_id:
+                add_scope_error(errors, 'conflict', 'conflict team must match decision team')
 
         if self.contract_version != 1:
             add_scope_error(errors, 'contract_version', 'curation decision contract version must be 1')
@@ -2932,6 +2974,10 @@ class CurationDecision(ImmutableCreatedModel):
                 add_scope_error(errors, 'policy_version', 'provider call policy version must match policy version')
             if self.policy.version != self.policy_version:
                 add_scope_error(errors, 'policy_version', 'policy version must match policy version')
+            if self.provider_call_record.team_id is not None and self.provider_call_record.team_id != self.team_id:
+                add_scope_error(errors, 'provider_call_record', 'provider call team must match decision team')
+            if self.policy.team_id is not None and self.policy.team_id != self.team_id:
+                add_scope_error(errors, 'policy', 'policy team must match decision team')
 
         enforce_immutable_fields(self, self._IMMUTABLE_FIELDS, errors)
         raise_scope_errors(errors)

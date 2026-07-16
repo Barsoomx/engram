@@ -35,7 +35,12 @@ from engram.memory.deterministic_gates import (
     SanitizedCandidateView,
 )
 from engram.memory.escalation import escalation_reason
-from engram.memory.transitions_test_support import provenanced_candidate
+from engram.memory.transitions import PromoteMemoryCandidate
+from engram.memory.transitions_test_support import (
+    provenanced_candidate,
+    provenanced_candidate_in_scope,
+    transition_request,
+)
 from engram.model_policy.models import ProviderCallRecord
 
 
@@ -150,6 +155,36 @@ def test_exact_identity_merges_provenance_without_new_version() -> None:
     assert result.target_memory_version_id == memory.versions.get(version=1).id
     assert result.requires_transition is True
     assert MemoryVersion.objects.count() == before_versions
+
+
+@pytest.mark.django_db
+def test_project_visible_cp4_memory_with_team_provenance_merges_exact_duplicate_read_only() -> None:
+    promoted_candidate, _source, scope = provenanced_candidate('project-cp4-team-provenance')
+    promoted = PromoteMemoryCandidate().execute(transition_request(promoted_candidate))
+    organization, project, _session = scope
+    candidate, _duplicate_source, _duplicate_session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        promoted_candidate.team,
+        suffix='project-cp4-team-provenance-duplicate',
+        title=promoted_candidate.title,
+        body=promoted_candidate.body,
+    )
+    candidate.content_hash = 'f' * 64
+    candidate.save(update_fields=['content_hash', 'updated_at'])
+    work = _work_for(candidate)
+    before = _retry_snapshot()
+    provider_calls_before = ProviderCallRecord.objects.count()
+
+    result = EvaluateDeterministicCandidateGates().execute(work.id)
+
+    assert result.disposition == DeterministicGateDisposition.TERMINAL
+    assert result.terminal_outcome == DeterministicTerminalOutcome.MERGE_EVIDENCE
+    assert result.reason_code == 'exact_identity'
+    assert result.target_memory_version_id == promoted.memory_version.id
+    assert result.requires_transition is True
+    assert ProviderCallRecord.objects.count() == provider_calls_before
+    assert _retry_snapshot() == before
 
 
 @pytest.mark.django_db

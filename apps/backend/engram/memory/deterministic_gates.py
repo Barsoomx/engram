@@ -336,7 +336,7 @@ def _active_versions(candidate: MemoryCandidate, scope: EffectiveCandidateScope)
         memory__project_id=candidate.project_id,
     )
     if scope.visibility_scope == VisibilityScope.PROJECT:
-        query = query.filter(memory__visibility_scope=VisibilityScope.PROJECT, memory__team_id__isnull=True)
+        query = query.filter(memory__visibility_scope=VisibilityScope.PROJECT)
     elif scope.visibility_scope == VisibilityScope.TEAM:
         query = query.filter(memory__visibility_scope=VisibilityScope.TEAM, memory__team_id=scope.team_id)
     else:
