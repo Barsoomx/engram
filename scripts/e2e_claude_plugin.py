@@ -570,7 +570,7 @@ if work is None:
 run = WorkflowRun.objects.filter(
     work=work,
     status='failed',
-    failure_code='candidate_decision_capability_unavailable',
+    failure_code='rollout_not_enabled',
 ).first()
 if run is None:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
