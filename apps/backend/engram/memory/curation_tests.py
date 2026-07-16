@@ -2356,6 +2356,84 @@ def test_existing_open_conflict_pair_is_not_duplicated(monkeypatch: pytest.Monke
     assert len(orch.curation_decisions_for(candidate)) == 1
 
 
+@pytest.mark.django_db
+def test_empty_shortlist_publish_is_stale_when_new_memory_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('revalidate')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='revalidate')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def appear() -> None:
+        orch.target_memory(scope, suffix='revalidate-intruder', title='Concurrent current memory', body=_LONG_BODY)
+
+    orch.install_fault(monkeypatch, 'before_transition', appear)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+
+
+@pytest.mark.django_db
+def test_existing_open_conflict_pair_settles_idempotently_across_generations(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('idempair')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='idempair', title='Primary region choice', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='idempair', title='Primary region choice', body='The primary region is now the eastern zone.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _first, first_error = orch.run_decision(work, run)
+
+    assert first_error is None
+    open_pairs = MemoryConflict.objects.filter(candidate=candidate, memory=memory, resolved_transition__isnull=True)
+    assert open_pairs.count() == 1
+
+    orch.mutate_candidate_generation(candidate, new_title='Primary region choice with revised wording')
+    generation, run2 = orch.next_generation_work(candidate)
+    memory.refresh_from_db()
+    target_version2 = orch.current_version(memory)
+    shortlist2 = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence2 = orch.stub_evidence(candidate_tier='supported', target=target_version2, target_tier='supported')
+    verdict2 = orch.stub_verdict('open_conflict', target=target_version2)
+    judge2 = orch.stub_judge_result(verdict2, call, policy, shortlist2)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist2, evidence=evidence2, judge_result=judge2
+    )
+
+    _second, second_error = orch.run_decision(generation, run2)
+
+    assert second_error is None
+    assert open_pairs.count() == 1
+    generation.refresh_from_db()
+    assert generation.disposition == WorkflowWorkDisposition.COMPLETE
+    assert generation.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 2
+    assert {decision.outcome for decision in decisions} == {CurationOutcome.OPEN_CONFLICT}
+
+
 # ---------------------------------------------------------------------------
 # C5.3 combined review round - regression tests for the audited defects.
 # ---------------------------------------------------------------------------
