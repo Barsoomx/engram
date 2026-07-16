@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
@@ -19,16 +20,23 @@ from engram.core.models import (
     Organization,
     Project,
     Team,
+    WorkflowRun,
+    WorkflowRunOrigin,
+    WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory import candidate_work_reconciler
 from engram.memory.candidate_decision_work import (
     build_candidate_decision_input,
+    ensure_candidate_decision_work,
     ensure_candidate_decision_work_locked,
     get_candidate_decision_work_builder,
 )
+from engram.memory.work_execution import claim_work, fail_work_claim
+from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     canonical_json_bytes,
@@ -394,3 +402,138 @@ def test_scheduled_candidate_reconciliation_reaches_cp3_orphan(monkeypatch: pyte
 
     assert queued == 1
     assert WorkflowWork.objects.filter(subject_id=candidate.id).count() == 1
+
+
+def _fail_candidate_decision_work(
+    candidate: MemoryCandidate,
+    *,
+    now: object,
+    failure: ClassifiedWorkFailure,
+) -> WorkflowWork:
+    work, _created = ensure_candidate_decision_work(candidate.id)
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_owner=f'host:worker:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(seconds=300),
+    )
+    fail_work_claim(claim=claimed.claim, now=now, failure=failure)
+    work.refresh_from_db()
+
+    return work
+
+
+def _collect_sent(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple[object, ...]]]:
+    sent: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        'engram.memory.work_dispatch.app.send_task',
+        lambda task_name, *, args, **_kwargs: sent.append((task_name, tuple(args))),
+    )
+
+    return sent
+
+
+@pytest.mark.django_db
+def test_reconcile_retry_wait_due_requeues_one_attempt(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('retry-wait-due')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    now = timezone.now()
+    work = _fail_candidate_decision_work(
+        candidate,
+        now=now,
+        failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout'),
+    )
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.next_retry_at is not None
+
+    as_of = now + timedelta(minutes=30)
+    WorkflowWork.objects.filter(id=work.id).update(next_retry_at=as_of - timedelta(minutes=1))
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=as_of,
+    )
+
+    assert result.queued == 1
+    queued = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert queued.get().origin == WorkflowRunOrigin.RECONCILIATION
+    assert WorkflowWork.objects.filter(subject_id=candidate.id).count() == 1
+    assert len(sent) == 1
+
+    within_window = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=as_of + timedelta(seconds=60),
+    )
+
+    assert within_window.queued == 0
+    assert queued.count() == 1
+    assert len(sent) == 1
+
+
+@pytest.mark.django_db
+def test_reconcile_retry_wait_future_is_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('retry-wait-future')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    now = timezone.now()
+    work = _fail_candidate_decision_work(
+        candidate,
+        now=now,
+        failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='provider_timeout'),
+    )
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.next_retry_at > now
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now,
+    )
+
+    assert result.queued == 0
+    assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
+    assert sent == []
+
+
+@pytest.mark.django_db
+def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('blocked')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    now = timezone.now()
+    work = _fail_candidate_decision_work(
+        candidate,
+        now=now,
+        failure=ClassifiedWorkFailure(
+            failure_class=CONFIGURATION,
+            code='model_policy_unavailable',
+            configuration_fingerprint='a' * 64,
+        ),
+    )
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(minutes=30),
+    )
+
+    assert result.queued == 0
+    assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
+    assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert sent == []
