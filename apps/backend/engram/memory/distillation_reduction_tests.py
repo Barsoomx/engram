@@ -144,6 +144,41 @@ def test_parser_requires_exact_envelope_and_known_duplicate_free_ids() -> None:
         )
 
 
+def _memory(source_ids: list[str]) -> dict[str, object]:
+    return {
+        'title': 'Reduced fact',
+        'body': 'A durable reduced memory body.',
+        'confidence': 0.8,
+        'source_ids': source_ids,
+    }
+
+
+def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
+    ids = [draft.draft_id for draft in inputs]
+    buckets: list[list[str]] = [[] for _ in range(count)]
+    for index, draft_id in enumerate(ids):
+        buckets[index % count].append(draft_id)
+    return {'memories': [_memory(bucket) for bucket in buckets]}
+
+
+def test_reduction_accepts_spec_cap_above_twelve() -> None:
+    inputs = [_draft(index) for index in range(40)]
+    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=12)
+    assert len(parsed.memories) == 20
+
+
+def test_reduction_rejects_output_above_spec_cap() -> None:
+    inputs = [_draft(index) for index in range(40)]
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output(_cover(inputs, 21), inputs, reduction_target=12)
+
+
+def test_reduction_target_twenty_accepts_twenty_memories() -> None:
+    inputs = [_draft(index) for index in range(50)]
+    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=20)
+    assert len(parsed.memories) == 20
+
+
 def test_final_drafts_wait_until_all_targets_accepted() -> None:
     assert derive_final_reduction_drafts((), (), reduction_target=2) == ()
 

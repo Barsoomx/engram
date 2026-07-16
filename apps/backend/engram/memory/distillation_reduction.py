@@ -18,7 +18,6 @@ class ReductionContractError(ValueError):
     pass
 
 
-MAX_MEMORIES = 12
 MAX_TITLE = 255
 MAX_BODY = 3000
 REDUCTION_MANIFEST_SCHEMA = 'distillation_reduce_manifest.v1'
@@ -217,8 +216,6 @@ def parse_reduction_output(  # noqa: C901
         ):
             raise ReductionContractError('kind is unknown or not permitted')
         memories.append(ReducedMemory(title, body, _confidence(item['confidence']), tuple(source_ids), kind))
-    if len(memories) > MAX_MEMORIES:
-        raise ReductionContractError('too many memories')
     if inputs and not memories:
         raise ReductionContractError('reduction output is empty')
     if inputs:

@@ -31,8 +31,9 @@ from engram.core.models import (
 from engram.memory import distillation_provider_stage as dps
 from engram.memory import work_execution
 from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.services import MemoryWorkerError
 from engram.memory.work_execution import StaleWorkFenceError, WorkClaim, claim_work
-from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT
+from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT, translate_failure
 from engram.memory.workflow_work import CreateWorkflowWorkInput, canonical_json_bytes, create_work
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
@@ -194,6 +195,18 @@ def _valid_body(chunk: DistillationChunk, *, kind: str | None = None) -> str:
     }
     if kind is not None:
         memory['kind'] = kind
+
+    return json.dumps({'memories': [memory], 'no_signal_observation_ids': observation_ids[1:]})
+
+
+def _empty_body(chunk: DistillationChunk, *, body: str = '') -> str:
+    observation_ids = _chunk_observation_ids(chunk)
+    memory: dict[str, object] = {
+        'title': 'Durable engineering fact',
+        'body': body,
+        'confidence': 0.9,
+        'supporting_observation_ids': [observation_ids[0]],
+    }
 
     return json.dumps({'memories': [memory], 'no_signal_observation_ids': observation_ids[1:]})
 
@@ -1069,9 +1082,11 @@ def test_tampered_observation_digest_fails_before_attempt_or_provider_call(
     stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
     Observation.objects.filter(id=_chunk_observation_ids(chunk)[0]).update(body='tampered')
 
-    with pytest.raises(dps.ExtractionContractError):
+    with pytest.raises(MemoryWorkerError) as excinfo:
         dps.execute_distillation_stage(stage, claim, now=now)
 
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
+    assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
     assert len(gateway.calls) == 0
     assert DistillationStage.objects.get(id=stage.id).attempt_count == 0
 
@@ -1395,3 +1410,68 @@ def test_real_factory_fake_gateway_reaches_strict_stage_and_replays_without_dupl
     assert first.status == 'completed'
     assert replay.status == 'completed'
     assert ProviderCallRecord.objects.filter(request_id=f'distill-stage:{stage.stage_key}').count() == 1
+
+
+@pytest.mark.parametrize('body', ['', '   ', '\n\t '])
+def test_parse_memory_rejects_empty_or_whitespace_body(body: str) -> None:
+    item = {
+        'title': 'Durable engineering fact',
+        'body': body,
+        'confidence': 0.9,
+        'supporting_observation_ids': ['obs-1'],
+    }
+    with pytest.raises(dps.ExtractionContractError):
+        dps._parse_memory(item, frozenset({'obs-1'}))
+
+
+@pytest.mark.django_db
+def test_empty_body_extraction_is_malformed_and_retryable(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-empty-body')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_empty_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.failure is not None
+    assert result.failure.code == dps.PROVIDER_OUTPUT_MALFORMED
+    assert result.failure.failure_class == PROVIDER_TRANSIENT
+    stage.refresh_from_db()
+    assert stage.status != 'complete'
+
+
+@pytest.mark.django_db
+def test_render_stage_prompt_digest_mismatch_is_invalid_input(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-digest-mismatch')
+    _curation_policy(scope)
+    _work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    observation_id = _chunk_observation_ids(chunk)[0]
+    Observation.objects.filter(id=observation_id).update(body='content mutated after the manifest was frozen')
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps._render_stage_prompt(chunk)
+
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
+    assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
+
+
+@pytest.mark.django_db
+def test_render_stage_prompt_scope_mismatch_is_invalid_input(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = _scope('stage-scope-mismatch')
+    _curation_policy(scope)
+    _work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    observation_id = _chunk_observation_ids(chunk)[0]
+    Observation.objects.filter(id=observation_id).delete()
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps._render_stage_prompt(chunk)
+
+    assert excinfo.value.code == 'work_scope_invalid'
+    assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
