@@ -13,7 +13,6 @@ from engram.celery_app import app
 from engram.context.services import ReembedMissingEmbeddings
 from engram.core.models import (
     AgentSession,
-    MemoryCandidate,
     Observation,
     RetrievalDocument,
     WorkflowRun,
@@ -25,13 +24,10 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
-from engram.memory.candidate_decision_work import (
-    build_candidate_decision_input,
-    candidate_decision_snapshot,
-)
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.confidence_decay import DecayMemoryConfidence
+from engram.memory.curation import DecideMemoryCandidate, candidate_decision_enabled
 from engram.memory.distillation import (
     DistillationStageError,
     run_complete_distillation_attempt,
@@ -619,34 +615,6 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
     )
 
 
-def _validate_candidate_decision_subject(work: WorkflowWork) -> MemoryCandidate:
-    if work.subject_type != WorkflowSubjectType.MEMORY_CANDIDATE:
-        raise MemoryWorkerError(
-            'workflow work subject type does not match candidate task',
-            code='work_contract_invalid',
-        )
-    try:
-        candidate = MemoryCandidate.objects.get(
-            id=work.subject_id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-            team_id=work.team_id,
-        )
-    except MemoryCandidate.DoesNotExist as error:
-        raise MemoryWorkerError('candidate is outside workflow work scope', code='work_scope_invalid') from error
-    try:
-        current_snapshot = candidate_decision_snapshot(build_candidate_decision_input(candidate))
-    except (TypeError, ValueError) as error:
-        raise MemoryWorkerError('candidate decision evidence is invalid', code='work_fingerprint_mismatch') from error
-    if current_snapshot != work.input_snapshot:
-        raise MemoryWorkerError(
-            'candidate decision input no longer matches frozen work',
-            code='work_fingerprint_mismatch',
-        )
-
-    return candidate
-
-
 @app.task(
     bind=True,
     name='engram.memory.process_candidate_decision_work_v1',
@@ -664,14 +632,18 @@ def process_candidate_decision_work_v1(
 
     def execute(claim: object) -> str:
         _verify_work_fingerprint(work)
-        _validate_candidate_decision_subject(work)
-        failure = ClassifiedWorkFailure(
-            failure_class=CONFIGURATION,
-            code='candidate_decision_capability_unavailable',
-            redacted_detail='candidate decision capability unavailable',
-            configuration_fingerprint=execution_configuration_fingerprint(work),
-        )
-        fail_work_claim(claim=claim, now=timezone.now(), failure=failure)
+        if not candidate_decision_enabled(work):
+            failure = ClassifiedWorkFailure(
+                failure_class=CONFIGURATION,
+                code='rollout_not_enabled',
+                redacted_detail='candidate decision rollout not enabled',
+                configuration_fingerprint=execution_configuration_fingerprint(work),
+            )
+            fail_work_claim(claim=claim, now=timezone.now(), failure=failure)
+
+            return str(claim.workflow_run_id)
+
+        DecideMemoryCandidate().execute(work=work, claim=claim)
 
         return str(claim.workflow_run_id)
 
