@@ -2020,3 +2020,129 @@ def test_openai_gateway_call_success_creates_single_recorded_record_no_error_rec
         request_id='regression-success-1',
         result=AuditResult.ERROR,
     ).exists()
+
+
+@pytest.mark.django_db
+def test_openai_gateway_curation_decision_v1_uses_json_mode_and_fixed_budget() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, task_type='curation')
+    body = {
+        'choices': [
+            {
+                'message': {
+                    'content': json.dumps(
+                        {
+                            'schema_version': 1,
+                            'outcome': 'publish_new',
+                            'relation': 'unrelated',
+                            'target_memory_version_id': None,
+                            'candidate_evidence_refs': ['candidate-ref'],
+                            'comparisons': [],
+                            'applicability': 'same',
+                            'temporal_order': 'not_applicable',
+                            'reason_code': 'distinct_claim',
+                            'reason': 'distinct claim',
+                        },
+                    ),
+                },
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(body).encode())
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='curation-decision-openai-1',
+            trace_id='curation-decision-openai-1',
+            prompt='bounded judge envelope',
+            response_kind='curation_decision_v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    assert sent_body['response_format'] == {'type': 'json_object'}
+    assert sent_body['max_tokens'] == 4096
+    assert json.loads(result.generated_body) == json.loads(body['choices'][0]['message']['content'])
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_curation_decision_v1_forces_closed_dedicated_tool() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='curation',
+        provider='anthropic',
+        base_url='https://api.anthropic.example',
+    )
+    response = {
+        'content': [
+            {
+                'type': 'tool_use',
+                'name': 'emit_curation_decision',
+                'input': {
+                    'schema_version': 1,
+                    'outcome': 'publish_new',
+                    'relation': 'unrelated',
+                    'target_memory_version_id': None,
+                    'candidate_evidence_refs': ['candidate-ref'],
+                    'comparisons': [],
+                    'applicability': 'same',
+                    'temporal_order': 'not_applicable',
+                    'reason_code': 'distinct_claim',
+                    'reason': 'distinct claim',
+                },
+            },
+        ],
+    }
+    opener = _opener_returning(json.dumps(response).encode())
+    gateway = AnthropicMessagesGateway(base_url='https://api.anthropic.example', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='curation-decision-anthropic-1',
+            trace_id='curation-decision-anthropic-1',
+            prompt='bounded judge envelope',
+            response_kind='curation_decision_v1',
+        ),
+    )
+
+    sent_body = json.loads(opener.requests[0].data)
+    tool = sent_body['tools'][0]
+    assert sent_body['max_tokens'] == 4096
+    assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_curation_decision'}
+    schema = tool['input_schema']
+    expected_keys = {
+        'schema_version',
+        'outcome',
+        'relation',
+        'target_memory_version_id',
+        'candidate_evidence_refs',
+        'comparisons',
+        'applicability',
+        'temporal_order',
+        'reason_code',
+        'reason',
+    }
+    assert schema['additionalProperties'] is False
+    assert set(schema['required']) == expected_keys
+    assert schema['properties']['candidate_evidence_refs']['maxItems'] == 16
+    assert schema['properties']['comparisons']['maxItems'] == 12
+    comparison_schema = schema['properties']['comparisons']['items']
+    assert comparison_schema['additionalProperties'] is False
+    assert set(comparison_schema['required']) == {
+        'memory_version_id',
+        'relation',
+        'target_evidence_refs',
+    }
+    assert comparison_schema['properties']['target_evidence_refs']['maxItems'] == 16
+    assert json.loads(result.generated_body) == response['content'][0]['input']

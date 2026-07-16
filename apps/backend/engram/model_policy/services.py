@@ -1071,6 +1071,45 @@ def generated_distill_reduce_payload(prompt: str) -> str:
     )
 
 
+def generated_curation_decision_payload(prompt: str) -> str:
+    try:
+        envelope = json.loads(prompt)
+    except (json.JSONDecodeError, TypeError):
+        envelope = {}
+    candidate = envelope.get('candidate') if isinstance(envelope, dict) else {}
+    candidate_refs = candidate.get('evidence_refs') if isinstance(candidate, dict) else []
+    if not isinstance(candidate_refs, list):
+        candidate_refs = []
+    raw_comparisons = envelope.get('comparisons') if isinstance(envelope, dict) else []
+    comparisons = []
+    for item in raw_comparisons if isinstance(raw_comparisons, list) else []:
+        if not isinstance(item, dict):
+            continue
+        target_refs = item.get('evidence_refs')
+        comparisons.append(
+            {
+                'memory_version_id': item.get('memory_version_id'),
+                'relation': 'unrelated',
+                'target_evidence_refs': target_refs if isinstance(target_refs, list) else [],
+            }
+        )
+
+    return json.dumps(
+        {
+            'schema_version': 1,
+            'outcome': 'publish_new',
+            'relation': 'unrelated',
+            'target_memory_version_id': None,
+            'candidate_evidence_refs': candidate_refs,
+            'comparisons': comparisons,
+            'applicability': 'same',
+            'temporal_order': 'not_applicable',
+            'reason_code': 'distinct_claim',
+            'reason': 'fake provider curation decision',
+        }
+    )
+
+
 def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, str]:
     title, body = generated_candidate_content(prompt)
     if data.response_kind == 'candidates':
@@ -1081,6 +1120,8 @@ def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, s
         return title, generated_distill_extract_payload(prompt)
     if data.response_kind == 'distill_reduce.v1':
         return title, generated_distill_reduce_payload(prompt)
+    if data.response_kind == 'curation_decision_v1':
+        return title, generated_curation_decision_payload(prompt)
 
     return title, body
 
@@ -1106,7 +1147,9 @@ def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, objec
     return {}
 
 
-_STRUCTURED_RESPONSE_KINDS = frozenset({'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1'})
+_STRUCTURED_RESPONSE_KINDS = frozenset(
+    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'}
+)
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
 
@@ -1132,8 +1175,64 @@ _MAX_TOKENS_BY_KIND = {
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
     'distill_reduce.v1': 8192,
+    'curation_decision_v1': 4096,
 }
-_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1'})
+_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
+_CURATION_DECISION_OUTCOMES = (
+    'publish_new',
+    'merge_evidence',
+    'revise_memory',
+    'supersede_memory',
+    'reject_candidate',
+    'open_conflict',
+)
+_CURATION_DECISION_RELATIONS = (
+    'unrelated',
+    'compatible_distinct',
+    'equivalent',
+    'candidate_revises',
+    'candidate_supersedes',
+    'redundant',
+    'unsupported',
+    'mutually_incompatible',
+)
+_CURATION_DECISION_REASON_CODES = (
+    'distinct_claim',
+    'equivalent_claim',
+    'same_subject_revision',
+    'ordered_replacement',
+    'redundant_claim',
+    'unsupported_claim',
+    'same_scope_contradiction',
+)
+_CURATION_DECISION_TEMPORAL_ORDERS = ('candidate_newer', 'target_newer', 'unordered', 'not_applicable')
+_CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
+    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+    'The object must contain exactly these keys and no additional properties (recursively): '
+    'schema_version (integer, always 1); '
+    f'outcome (one of: {", ".join(_CURATION_DECISION_OUTCOMES)}); '
+    f'relation (one of: {", ".join(_CURATION_DECISION_RELATIONS)}); '
+    'target_memory_version_id (a shortlist memory_version_id string, or null); '
+    'candidate_evidence_refs (array of provided evidence reference tokens, unique, at most 16); '
+    'comparisons (array with exactly one object per shortlist entry, in the given order; each object has '
+    'memory_version_id, relation, and target_evidence_refs); '
+    'applicability (one of: same, different); '
+    f'temporal_order (one of: {", ".join(_CURATION_DECISION_TEMPORAL_ORDERS)}); '
+    f'reason_code (one of: {", ".join(_CURATION_DECISION_REASON_CODES)}); '
+    'reason (a short redacted explanation, at most 500 characters). '
+    'Only reference memory_version_id values and evidence tokens present in the input. '
+    'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
+    'must equal the top-level relation.'
+)
+
+
+def curation_schema_prompt_prefix(response_kind: str) -> str:
+    if response_kind == 'curation_decision_v1':
+        return _CURATION_DECISION_SCHEMA_INSTRUCTIONS
+
+    return ''
+
+
 _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
     'candidates': {
         'name': 'emit_memories',
@@ -1250,6 +1349,61 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'additionalProperties': False,
         },
     },
+    'curation_decision_v1': {
+        'name': 'emit_curation_decision',
+        'description': 'Return the strict curation decision verdict.',
+        'input_schema': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'schema_version': {'type': 'integer', 'enum': [1]},
+                'outcome': {'type': 'string', 'enum': list(_CURATION_DECISION_OUTCOMES)},
+                'relation': {'type': 'string', 'enum': list(_CURATION_DECISION_RELATIONS)},
+                'target_memory_version_id': {'type': ['string', 'null']},
+                'candidate_evidence_refs': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'maxItems': 16,
+                    'uniqueItems': True,
+                },
+                'comparisons': {
+                    'type': 'array',
+                    'maxItems': 12,
+                    'items': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'memory_version_id': {'type': 'string'},
+                            'relation': {'type': 'string', 'enum': list(_CURATION_DECISION_RELATIONS)},
+                            'target_evidence_refs': {
+                                'type': 'array',
+                                'items': {'type': 'string'},
+                                'maxItems': 16,
+                                'uniqueItems': True,
+                            },
+                        },
+                        'required': ['memory_version_id', 'relation', 'target_evidence_refs'],
+                    },
+                },
+                'applicability': {'type': 'string', 'enum': ['same', 'different']},
+                'temporal_order': {'type': 'string', 'enum': list(_CURATION_DECISION_TEMPORAL_ORDERS)},
+                'reason_code': {'type': 'string', 'enum': list(_CURATION_DECISION_REASON_CODES)},
+                'reason': {'type': 'string', 'maxLength': 500},
+            },
+            'required': [
+                'schema_version',
+                'outcome',
+                'relation',
+                'target_memory_version_id',
+                'candidate_evidence_refs',
+                'comparisons',
+                'applicability',
+                'temporal_order',
+                'reason_code',
+                'reason',
+            ],
+        },
+    },
 }
 
 
@@ -1334,6 +1488,9 @@ class OpenAICompatibleGateway:
         _log_repeat_attempt(data)
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
+        schema_prefix = curation_schema_prompt_prefix(data.response_kind)
+        if schema_prefix:
+            prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
