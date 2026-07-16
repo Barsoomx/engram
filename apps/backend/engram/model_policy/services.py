@@ -1206,6 +1206,33 @@ _CURATION_DECISION_REASON_CODES = (
     'same_scope_contradiction',
 )
 _CURATION_DECISION_TEMPORAL_ORDERS = ('candidate_newer', 'target_newer', 'unordered', 'not_applicable')
+_CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
+    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+    'The object must contain exactly these keys and no additional properties (recursively): '
+    'schema_version (integer, always 1); '
+    f'outcome (one of: {", ".join(_CURATION_DECISION_OUTCOMES)}); '
+    f'relation (one of: {", ".join(_CURATION_DECISION_RELATIONS)}); '
+    'target_memory_version_id (a shortlist memory_version_id string, or null); '
+    'candidate_evidence_refs (array of provided evidence reference tokens, unique, at most 16); '
+    'comparisons (array with exactly one object per shortlist entry, in the given order; each object has '
+    'memory_version_id, relation, and target_evidence_refs); '
+    'applicability (one of: same, different); '
+    f'temporal_order (one of: {", ".join(_CURATION_DECISION_TEMPORAL_ORDERS)}); '
+    f'reason_code (one of: {", ".join(_CURATION_DECISION_REASON_CODES)}); '
+    'reason (a short redacted explanation, at most 500 characters). '
+    'Only reference memory_version_id values and evidence tokens present in the input. '
+    'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
+    'must equal the top-level relation.'
+)
+
+
+def curation_schema_prompt_prefix(response_kind: str) -> str:
+    if response_kind == 'curation_decision_v1':
+        return _CURATION_DECISION_SCHEMA_INSTRUCTIONS
+
+    return ''
+
+
 _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
     'candidates': {
         'name': 'emit_memories',
@@ -1461,6 +1488,9 @@ class OpenAICompatibleGateway:
         _log_repeat_attempt(data)
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
+        schema_prefix = curation_schema_prompt_prefix(data.response_kind)
+        if schema_prefix:
+            prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type))

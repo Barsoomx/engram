@@ -4,6 +4,7 @@ import hashlib
 import json
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 from engram.core.models import (
     MemoryCandidate,
@@ -12,6 +13,7 @@ from engram.core.models import (
     MemoryVersionSource,
 )
 from engram.core.redaction import SECRET_STRING_RE, redact_value
+from engram.memory.candidate_parsing import truncate_with_marker
 from engram.memory.curation_shortlist import CurationShortlist, CurationShortlistEntry
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
 from engram.memory.distillation_provenance import ProvenanceContractError, canonical_source_manifest
@@ -35,6 +37,7 @@ class CurationJudgeError(ValueError):
 class ClaimEvidence:
     tier: str
     refs: tuple[str, ...]
+    latest_evidence_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +88,15 @@ class CurationJudgeResult:
     policy_version: int
     response_hash: str
     fallback_used: bool
+    comparison_manifest_hash: str
+    authorized_corpus_count: int
+    comparison_complete: bool
 
 
 _LIFECYCLE_TYPES = frozenset({'session_start', 'session_end', 'session_lifecycle'})
 _GROUP_TOKEN_PREFIX = 'curation-evidence-group:v1:'
 _MAX_EVIDENCE_REFS = 16
+_MAX_CLAIM_SNAPSHOT_CHARS = 2000
 
 _TOP_KEYS = frozenset(
     {
@@ -145,13 +152,17 @@ _ALLOWED_COMBINATIONS = {
     ('open_conflict', 'mutually_incompatible'): True,
 }
 _SUPPORTED_TIERS = frozenset({'supported', 'corroborated'})
+_IDENTITY_RELATIONS = frozenset(
+    {'equivalent', 'candidate_revises', 'candidate_supersedes', 'redundant', 'mutually_incompatible'}
+)
+_TARGETLESS_OUTCOMES = frozenset({'publish_new', 'reject_candidate'})
 
 
 def _group_token(input_hash: str) -> str:
     return hashlib.sha256(f'{_GROUP_TOKEN_PREFIX}{input_hash}'.encode()).hexdigest()[:32]
 
 
-def _claim_evidence(hashes: set[str]) -> ClaimEvidence:
+def _claim_evidence(hashes: set[str], latest_evidence_at: datetime | None) -> ClaimEvidence:
     tokens = sorted(_group_token(value) for value in hashes)
     if not hashes:
         tier = 'none'
@@ -160,7 +171,26 @@ def _claim_evidence(hashes: set[str]) -> ClaimEvidence:
     else:
         tier = 'corroborated'
 
-    return ClaimEvidence(tier=tier, refs=tuple(tokens[:_MAX_EVIDENCE_REFS]))
+    return ClaimEvidence(
+        tier=tier,
+        refs=tuple(tokens[:_MAX_EVIDENCE_REFS]),
+        latest_evidence_at=latest_evidence_at,
+    )
+
+
+def _source_evidence_time(source: MemoryCandidateSource) -> datetime | None:
+    observation = source.observation
+
+    return observation.observed_at or observation.created_at
+
+
+def _newer(current: datetime | None, candidate: datetime | None) -> datetime | None:
+    if candidate is None:
+        return current
+    if current is None or candidate > current:
+        return candidate
+
+    return current
 
 
 def _eligible_group_hash(source: MemoryCandidateSource) -> str | None:
@@ -174,32 +204,36 @@ def _eligible_group_hash(source: MemoryCandidateSource) -> str | None:
         return None
     anchors = source.anchors
     try:
-        if canonical_source_manifest(anchors) != source.anchors_hash:
-            return None
-    except ProvenanceContractError:
-        return None
+        manifest = canonical_source_manifest(anchors)
+    except ProvenanceContractError as error:
+        raise CurationJudgeError('transition_dependency_unavailable') from error
+    if manifest != source.anchors_hash:
+        raise CurationJudgeError('transition_dependency_unavailable')
     if anchors.get('observation_digest') != observation_content_digest(observation):
-        return None
+        raise CurationJudgeError('transition_dependency_unavailable')
 
     return source.window.input_hash
 
 
-def _candidate_group_hashes(candidate_id: uuid.UUID) -> set[str]:
+def _candidate_group_hashes(candidate_id: uuid.UUID) -> tuple[set[str], datetime | None]:
     sources = MemoryCandidateSource.objects.select_related('window', 'observation', 'stage').filter(
         candidate_id=candidate_id
     )
     hashes: set[str] = set()
+    latest: datetime | None = None
     for source in sources:
         value = _eligible_group_hash(source)
         if value is not None:
             hashes.add(value)
+            latest = _newer(latest, _source_evidence_time(source))
 
-    return hashes
+    return hashes, latest
 
 
 def _traverse_target(
     version_id: uuid.UUID,
     hashes: set[str],
+    times: list[datetime],
     path: set[uuid.UUID],
     resolved: set[uuid.UUID],
 ) -> None:
@@ -225,8 +259,11 @@ def _traverse_target(
             value = _eligible_group_hash(row.candidate_source)
             if value is not None:
                 hashes.add(value)
+                moment = _source_evidence_time(row.candidate_source)
+                if moment is not None:
+                    times.append(moment)
         elif row.source_memory_version_id is not None:
-            _traverse_target(row.source_memory_version_id, hashes, path, resolved)
+            _traverse_target(row.source_memory_version_id, hashes, times, path, resolved)
 
     path.discard(version_id)
     resolved.add(version_id)
@@ -234,13 +271,15 @@ def _traverse_target(
 
 def _target_evidence(version_id: uuid.UUID) -> ClaimEvidence:
     hashes: set[str] = set()
-    _traverse_target(version_id, hashes, set(), set())
+    times: list[datetime] = []
+    _traverse_target(version_id, hashes, times, set(), set())
 
-    return _claim_evidence(hashes)
+    return _claim_evidence(hashes, max(times) if times else None)
 
 
 def build_curation_evidence_context(candidate_id: uuid.UUID, shortlist: CurationShortlist) -> CurationEvidenceContext:
-    candidate = _claim_evidence(_candidate_group_hashes(candidate_id))
+    candidate_hashes, candidate_latest = _candidate_group_hashes(candidate_id)
+    candidate = _claim_evidence(candidate_hashes, candidate_latest)
     targets = {entry.memory_version_id: _target_evidence(entry.memory_version_id) for entry in shortlist.entries}
 
     return CurationEvidenceContext(candidate=candidate, targets=targets)
@@ -299,6 +338,20 @@ def _validate_comparisons(
     return tuple(comparisons)
 
 
+def _candidate_precedes(data: CurationJudgeInput, target_id: uuid.UUID | None) -> bool:
+    if target_id is None:
+        return False
+    target = data.evidence.targets.get(target_id)
+    if target is None:
+        return False
+    candidate_at = data.evidence.candidate.latest_evidence_at
+    target_at = target.latest_evidence_at
+    if candidate_at is None or target_at is None:
+        return False
+
+    return candidate_at > target_at
+
+
 def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeInput) -> None:  # noqa: C901
     key = (verdict.outcome, verdict.relation)
     if key not in _ALLOWED_COMBINATIONS:
@@ -332,6 +385,7 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
             and target_tier in _SUPPORTED_TIERS
             and verdict.applicability == 'same'
             and verdict.temporal_order == 'candidate_newer'
+            and _candidate_precedes(data, target_id)
         )
     elif outcome == 'supersede_memory':
         if entry is not None and entry.has_open_conflict:
@@ -341,7 +395,9 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
             candidate_tier == 'corroborated'
             and target_tier in _SUPPORTED_TIERS
             and complete
+            and verdict.applicability == 'same'
             and verdict.temporal_order == 'candidate_newer'
+            and _candidate_precedes(data, target_id)
         )
     elif outcome == 'reject_candidate' and verdict.relation == 'redundant':
         ok = target_tier in _SUPPORTED_TIERS
@@ -359,7 +415,7 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
         raise CurationJudgeError('judge_policy_denied')
 
 
-def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:
+def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:  # noqa: C901
     try:
         payload = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError) as error:
@@ -393,6 +449,10 @@ def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> Curation
         selected = next((item for item in comparisons if item.memory_version_id == target_id), None)
         if selected is None or selected.relation != payload['relation']:
             raise CurationJudgeError('judge_invalid_output')
+    elif payload['outcome'] in _TARGETLESS_OUTCOMES and any(
+        comparison.relation in _IDENTITY_RELATIONS for comparison in comparisons
+    ):
+        raise CurationJudgeError('judge_invalid_output')
 
     reason = payload['reason']
     if not isinstance(reason, str) or not (1 <= len(reason) <= 500) or SECRET_STRING_RE.search(reason):
@@ -426,9 +486,17 @@ def _iter_strings(value: object) -> list[str]:
     return []
 
 
+def _bounded(text: str) -> str:
+    return truncate_with_marker(text, _MAX_CLAIM_SNAPSHOT_CHARS)
+
+
 def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
     candidate_block = {
-        'claim': {'title': data.candidate.title, 'body': data.candidate.body, 'kind': data.candidate.kind},
+        'claim': {
+            'title': _bounded(data.candidate.title),
+            'body': _bounded(data.candidate.body),
+            'kind': data.candidate.kind,
+        },
         'content_hash': data.candidate.content_hash,
         'evidence_tier': data.evidence.candidate.tier,
         'evidence_refs': list(data.evidence.candidate.refs),
@@ -446,8 +514,8 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
                 'evidence_tier': target.tier if target is not None else 'none',
                 'evidence_refs': list(target.refs) if target is not None else [],
                 'claim': {
-                    'title': entry.title,
-                    'body': entry.body,
+                    'title': _bounded(entry.title),
+                    'body': _bounded(entry.body),
                     'kind': entry.kind,
                     'body_hash': entry.body_hash,
                 },
@@ -460,6 +528,9 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
             'visibility_scope': data.effective_scope.visibility_scope,
             'team_id': str(data.effective_scope.team_id) if data.effective_scope.team_id is not None else None,
         },
+        'comparison_manifest_hash': data.shortlist.manifest_hash,
+        'authorized_corpus_count': data.shortlist.authorized_corpus_count,
+        'comparison_complete': data.shortlist.comparison_complete,
         'comparisons': comparisons,
     }
     redacted = redact_value(envelope).value
@@ -552,4 +623,7 @@ class JudgeCurationCandidate:
             policy_version=policy.version,
             response_hash=hashlib.sha256(result.generated_body.encode()).hexdigest(),
             fallback_used=fallback_used,
+            comparison_manifest_hash=data.shortlist.manifest_hash,
+            authorized_corpus_count=data.shortlist.authorized_corpus_count,
+            comparison_complete=data.shortlist.comparison_complete,
         )

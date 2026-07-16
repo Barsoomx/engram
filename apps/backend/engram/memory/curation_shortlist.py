@@ -178,22 +178,32 @@ def _validate_embedding(embedding: tuple[float, ...] | None) -> tuple[float, ...
     return values
 
 
-def _manifest_hash(entries: tuple[CurationShortlistEntry, ...]) -> str:
-    payload = [
-        {
-            'memory_id': str(entry.memory_id),
-            'memory_version_id': str(entry.memory_version_id),
-            'current_transition_id': str(entry.current_transition_id),
-            'scope_key': f'{entry.visibility_scope}:{entry.team_id or ""}',
-            'exact_overlap': entry.exact_overlap,
-            'vector_distance': None if entry.vector_distance is None else f'{entry.vector_distance:.12f}',
-            'lexical_rank': None if entry.lexical_rank is None else f'{entry.lexical_rank:.12f}',
-            'trigram_similarity': None if entry.trigram_similarity is None else f'{entry.trigram_similarity:.12f}',
-            'has_open_conflict': entry.has_open_conflict,
-            'body_hash': entry.body_hash,
-        }
-        for entry in entries
-    ]
+def _manifest_hash(
+    entries: tuple[CurationShortlistEntry, ...],
+    authorized_corpus_count: int,
+    comparison_complete: bool,
+) -> str:
+    payload = {
+        'authorized_corpus_count': authorized_corpus_count,
+        'comparison_complete': comparison_complete,
+        'entries': [
+            {
+                'memory_id': str(entry.memory_id),
+                'memory_version_id': str(entry.memory_version_id),
+                'current_transition_id': str(entry.current_transition_id),
+                'scope_key': f'{entry.visibility_scope}:{entry.team_id or ""}',
+                'exact_overlap': entry.exact_overlap,
+                'vector_distance': None if entry.vector_distance is None else f'{entry.vector_distance:.12f}',
+                'lexical_rank': None if entry.lexical_rank is None else f'{entry.lexical_rank:.12f}',
+                'trigram_similarity': (
+                    None if entry.trigram_similarity is None else f'{entry.trigram_similarity:.12f}'
+                ),
+                'has_open_conflict': entry.has_open_conflict,
+                'body_hash': entry.body_hash,
+            }
+            for entry in entries
+        ],
+    }
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
@@ -214,10 +224,15 @@ class BuildCurationShortlist:
             corpus = _authorized_memories(data)
             corpus_count = corpus.count()
             if corpus_count == 0:
-                return CurationShortlist((), _manifest_hash(()), 0, True)
+                return CurationShortlist((), _manifest_hash((), 0, True), 0, True)
             base = _coherent_documents(data)
             if base.count() != corpus_count:
                 raise CurationShortlistError('transition_dependency_unavailable')
+            corpus_fully_embedded = not (
+                embedding is not None
+                and CosineDistance is not None
+                and base.filter(embedding_pgvector__isnull=True).exists()
+            )
             scores: dict[UUID, dict[str, float | int | None]] = {}
             if embedding is not None and CosineDistance is not None:
                 vector_rows = (
@@ -336,8 +351,15 @@ class BuildCurationShortlist:
             )
             if revalidated_count != len(final):
                 raise CurationShortlistError('transition_dependency_unavailable')
-            vector_covered = embedding is not None and all(item.vector_distance is not None for item in final)
-            return CurationShortlist(final, _manifest_hash(final), corpus_count, vector_covered)
+            if not final and not corpus_fully_embedded:
+                raise CurationShortlistError('embedding_unavailable')
+            comparison_complete = embedding is not None and CosineDistance is not None and corpus_fully_embedded
+            return CurationShortlist(
+                final,
+                _manifest_hash(final, corpus_count, comparison_complete),
+                corpus_count,
+                comparison_complete,
+            )
         except CurationShortlistError:
             raise
         except (DatabaseError, FieldError, TypeError, ValueError) as exc:
