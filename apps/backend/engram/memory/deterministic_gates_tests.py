@@ -37,6 +37,7 @@ from engram.memory.deterministic_gates import (
 from engram.memory.escalation import escalation_reason
 from engram.memory.transitions import PromoteMemoryCandidate
 from engram.memory.transitions_test_support import (
+    open_single_conflict,
     provenanced_candidate,
     provenanced_candidate_in_scope,
     transition_request,
@@ -188,6 +189,28 @@ def test_project_visible_cp4_memory_with_team_provenance_merges_exact_duplicate_
 
 
 @pytest.mark.django_db
+def test_exact_identity_against_open_conflict_memory_does_not_merge() -> None:
+    _resolution_candidate, conflict = open_single_conflict('conflict-exact-identity')
+    conflicted_memory = conflict.memory
+    conflicted_version = conflict.memory_version
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        conflicted_memory.organization,
+        conflicted_memory.project,
+        None,
+        suffix='conflict-exact-identity-duplicate',
+        title=conflicted_memory.title,
+        body=conflicted_version.body,
+        kind=conflicted_memory.kind,
+    )
+    work = _work_for(candidate)
+
+    result = EvaluateDeterministicCandidateGates().execute(work.id)
+
+    assert result.terminal_outcome != DeterministicTerminalOutcome.MERGE_EVIDENCE
+    assert result.disposition == DeterministicGateDisposition.CONTINUE
+
+
+@pytest.mark.django_db
 def test_cross_scope_evidence_calls_no_provider_and_mutates_nothing() -> None:
     candidate, source, _scope = provenanced_candidate('cross-scope')
     work, _created = ensure_candidate_decision_work(candidate.id)
@@ -211,6 +234,7 @@ def test_session_scope_rejects_as_non_durable() -> None:
 
     assert result.disposition == DeterministicGateDisposition.TERMINAL
     assert result.reason_code == 'non_durable_session_scope'
+    assert result.effective_scope == EffectiveCandidateScope(VisibilityScope.PROJECT, None)
 
 
 @pytest.mark.django_db

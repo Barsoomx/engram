@@ -935,7 +935,7 @@ class RebuildMemoryProjections:
                 if evaluation.embedding_code is None or evaluation.document is None:
                     continue
                 if not data.apply:
-                    skipped += 1
+                    changed += 1
 
                     continue
                 _work, created = create_embedding_work_and_signal(document=evaluation.document)

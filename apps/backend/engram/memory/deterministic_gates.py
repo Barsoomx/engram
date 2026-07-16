@@ -10,12 +10,13 @@ from enum import StrEnum
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import DatabaseError
-from django.db.models import F
+from django.db.models import Exists, F, OuterRef
 
 from engram.core.models import (
     CurationReasonCode,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryConflict,
     MemoryStatus,
     MemoryVersion,
     MemoryVersionSource,
@@ -236,7 +237,7 @@ def _extract_key(value: object, wanted: str) -> object:
 
 def _scope_for(candidate: MemoryCandidate, sources: list[MemoryCandidateSource]) -> EffectiveCandidateScope:
     if candidate.visibility_scope == VisibilityScope.SESSION:
-        return EffectiveCandidateScope(VisibilityScope.SESSION, candidate.team_id)
+        return EffectiveCandidateScope(VisibilityScope.PROJECT, None)
     source_teams = {source.team_id for source in sources}
     if candidate.visibility_scope == VisibilityScope.PROJECT:
         return EffectiveCandidateScope(VisibilityScope.PROJECT, None)
@@ -341,6 +342,8 @@ def _active_versions(candidate: MemoryCandidate, scope: EffectiveCandidateScope)
         query = query.filter(memory__visibility_scope=VisibilityScope.TEAM, memory__team_id=scope.team_id)
     else:
         query = query.none()
+    open_conflict = MemoryConflict.objects.filter(memory_version_id=OuterRef('pk'), resolved_transition__isnull=True)
+    query = query.filter(~Exists(open_conflict))
     return list(query)
 
 

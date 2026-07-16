@@ -209,6 +209,28 @@ def test_exact_rebuild_apply_is_idempotent() -> None:
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.transactional
+def test_embedding_rebuild_dry_run_counts_repairs_without_enqueue() -> None:
+    result, scope = _promoted('consistency-embedding-dry-run')
+    RetrievalDocument.objects.filter(id=result.retrieval_document.id).update(
+        embedding_reference='',
+        embedding_vector=[],
+        embedding_projection_hash='',
+        embedding_projected_at=None,
+    )
+    document = RetrievalDocument.objects.get(id=result.retrieval_document.id)
+    work_count_before = WorkflowWork.objects.filter(subject_id=document.id).count()
+    semantic_before = _semantic_snapshot(result.memory.id)
+
+    dry_run = consistency.RebuildMemoryProjections().execute(_rebuild_input(scope, kind='embedding'))
+
+    assert dry_run.changed == 1
+    assert dry_run.skipped == 0
+    assert WorkflowWork.objects.filter(subject_id=document.id).count() == work_count_before
+    assert _semantic_snapshot(result.memory.id) == semantic_before
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.transactional
 @pytest.mark.parametrize(
     ('mismatch', 'expected_code'),
     (
