@@ -593,7 +593,7 @@ def test_distill_extract_tool_schema_matches_provider_contract() -> None:
         'kind',
     }
     assert memory['properties']['title'] == {'type': 'string', 'minLength': 1, 'maxLength': 255}
-    assert memory['properties']['body'] == {'type': 'string', 'maxLength': 3000}
+    assert memory['properties']['body'] == {'type': 'string', 'minLength': 1, 'maxLength': 3000}
     assert memory['properties']['confidence'] == {'type': 'number', 'minimum': 0, 'maximum': 1}
     assert memory['properties']['supporting_observation_ids'] == {
         'type': 'array',
