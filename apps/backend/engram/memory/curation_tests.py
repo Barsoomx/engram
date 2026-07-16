@@ -2247,3 +2247,148 @@ def test_existing_open_conflict_pair_is_not_duplicated(monkeypatch: pytest.Monke
 
     assert MemoryConflict.objects.filter(candidate=candidate, memory=memory).count() == 1
     assert len(orch.curation_decisions_for(candidate)) == 1
+
+
+# ---------------------------------------------------------------------------
+# C5.3 combined review round - regression tests for the audited defects.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_settlement_request_uses_frozen_decision_work_idempotency_key() -> None:
+    scope = orch.orchestrator_scope('m10')
+    candidate, work, _run = orch.subject_candidate(scope, suffix='m10')
+
+    request = orch.decide_memory_candidate()()._request(work, candidate)
+
+    assert request.idempotency_key == f'decision-work:{work.id}:settle:v1'
+
+
+@pytest.mark.django_db
+def test_open_conflict_decision_references_opened_transition(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('m9')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='m9', title='Replica placement rule', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='m9', title='Replica placement rule', body='Replicas now span three availability zones.'
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    decision = orch.curation_decisions_for(candidate)[0]
+    assert decision.conflict_id == conflict.id
+    assert decision.transition_id == conflict.opened_transition_id
+    assert decision.transition_id is not None
+
+
+@pytest.mark.django_db
+def test_stale_shortlist_target_transition_fences_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('b2')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(scope, suffix='b2', title='Index build strategy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='b2', title='Index build revision', body='Indexes now build concurrently online.'
+    )
+    entry = orch.shortlist_entry(memory)
+    orch.advance_target_memory(
+        memory, title='Index build strategy v2', body='The strategy changed again before judgment.'
+    )
+    shortlist = orch.stub_shortlist(entry)
+    evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
+    verdict = orch.stub_verdict('revise_memory', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is not None
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+def _reject_verdict() -> CurationJudgeVerdictV1:
+    return CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='reject_candidate',
+        relation='unsupported',
+        target_memory_version_id=None,
+        candidate_evidence_refs=(),
+        comparisons=(),
+        applicability='different',
+        temporal_order='not_applicable',
+        reason_code='unsupported_claim',
+        reason='no durable support for this claim',
+    )
+
+
+@pytest.mark.django_db
+def test_model_reject_unsupported_records_rejection_decision(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('b3ok')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='b3ok')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='none')
+    judge = orch.stub_judge_result(_reject_verdict(), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.REJECT_CANDIDATE
+    assert decisions[0].reason_code == CurationReasonCode.UNSUPPORTED_CLAIM
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.REJECTED
+    assert work.resolution_reason == WorkflowWorkResolutionReason.NO_SIGNAL
+
+
+@pytest.mark.django_db
+def test_model_reject_of_superseded_generation_settles_without_rejecting(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('b3gen')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='b3gen')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='none')
+    judge = orch.stub_judge_result(_reject_verdict(), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def mutate() -> None:
+        orch.mutate_candidate_generation(candidate, new_title='Fresher evidence arrived after the older rejection')
+
+    orch.install_fault(monkeypatch, 'before_transition', mutate)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
