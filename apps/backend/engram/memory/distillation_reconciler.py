@@ -3,30 +3,32 @@ from __future__ import annotations
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import structlog
 from django.db import transaction
 from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
-from engram.celery_app import app
 from engram.core.models import (
     AgentSession,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowWork,
     WorkflowWorkDisposition,
     WorkflowWorkType,
 )
+from engram.memory.work_dispatch import queue_work_attempt
 
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_COOLDOWN_MINUTES = 30
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_TRANSIENT_MAX_ATTEMPTS = 10
-_DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
+_LEGACY_CONTRACT_VERSION = 0
+_POISONED_RUN_FAILURE_REASON = 'legacy_run_contract_mismatch'
 
 _TRANSIENT_FAILURE_MARKERS = (
     'provider returned 402',
@@ -77,7 +79,8 @@ class _WorkEvaluation:
 
 class RetryFailedDistillations:
     def execute(self) -> RetryFailedDistillationsResult:
-        cutoff = timezone.now() - self._cooldown()
+        now = timezone.now()
+        cutoff = now - self._cooldown()
         max_attempts = self._max_attempts()
         transient_max_attempts = self._transient_max_attempts()
 
@@ -91,7 +94,9 @@ class RetryFailedDistillations:
             .exclude(_v1_managed_session())
             .order_by('created_at', 'id'),
         )
-        runs_by_work = self._runs_by_work([work.id for work in required_works])
+        work_ids = [work.id for work in required_works]
+        self._terminalize_poisoned_runs(work_ids, now)
+        runs_by_work = self._runs_by_work(work_ids)
 
         retried: list[RetriedWork] = []
         for work in required_works:
@@ -115,6 +120,7 @@ class RetryFailedDistillations:
 
             retried_work = self._retry_under_lock(
                 work.id,
+                now,
                 cutoff,
                 max_attempts,
                 transient_max_attempts,
@@ -138,6 +144,34 @@ class RetryFailedDistillations:
             .values_list('id', flat=True),
         )
 
+    def _terminalize_poisoned_runs(self, work_ids: list[uuid.UUID], now: datetime) -> None:
+        if not work_ids:
+            return
+
+        poisoned_run_ids = list(
+            WorkflowRun.objects.filter(
+                run_type=WorkflowRunType.SESSION_DISTILLATION,
+                work_id__in=work_ids,
+                execution_contract_version=_LEGACY_CONTRACT_VERSION,
+                status=WorkflowRunStatus.QUEUED,
+            ).values_list('id', flat=True),
+        )
+        if not poisoned_run_ids:
+            return
+
+        WorkflowRun.objects.filter(id__in=poisoned_run_ids).update(
+            status=WorkflowRunStatus.FAILED,
+            failure_reason=_POISONED_RUN_FAILURE_REASON,
+            finished_at=now,
+            updated_at=now,
+        )
+        logger.warning(
+            'distillation_reconciler_poisoned_runs_terminalized',
+            run_count=len(poisoned_run_ids),
+        )
+
+        return
+
     def _runs_by_work(self, work_ids: list[uuid.UUID]) -> dict[uuid.UUID, list[WorkflowRun]]:
         runs = WorkflowRun.objects.filter(
             run_type=WorkflowRunType.SESSION_DISTILLATION,
@@ -153,6 +187,7 @@ class RetryFailedDistillations:
     def _retry_under_lock(
         self,
         work_id: uuid.UUID,
+        now: datetime,
         cutoff: object,
         max_attempts: int,
         transient_max_attempts: int,
@@ -181,20 +216,10 @@ class RetryFailedDistillations:
             if not evaluation.retriable:
                 return None
 
-            run = WorkflowRun.objects.create(
-                organization_id=work.organization_id,
-                project_id=work.project_id,
-                team_id=work.team_id,
+            run = queue_work_attempt(
                 work_id=work.id,
-                run_type=WorkflowRunType.SESSION_DISTILLATION,
-                status=WorkflowRunStatus.QUEUED,
-                input_snapshot=work.input_snapshot,
-            )
-            app.send_task(
-                _DISTILL_WORK_TASK_NAME,
-                args=[str(work.id), str(run.id)],
-                kwargs={},
-                task_id=f'workflow-work:{work.id}:run:{run.id}',
+                now=now,
+                origin=WorkflowRunOrigin.RECONCILIATION,
             )
 
             return RetriedWork(work_id=work.id, run_id=run.id)
@@ -206,13 +231,14 @@ class RetryFailedDistillations:
         max_attempts: int,
         transient_max_attempts: int,
     ) -> _WorkEvaluation:
-        if not work_runs:
+        attempts = [run for run in work_runs if not self._is_poisoned_cleanup(run)]
+        if not attempts:
             return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
 
-        if any(run.status == WorkflowRunStatus.SUCCEEDED for run in work_runs):
+        if any(run.status == WorkflowRunStatus.SUCCEEDED for run in attempts):
             return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
 
-        failed_runs = [run for run in work_runs if run.status == WorkflowRunStatus.FAILED]
+        failed_runs = [run for run in attempts if run.status == WorkflowRunStatus.FAILED]
         failed_count = len(failed_runs)
         transient_count = sum(1 for run in failed_runs if is_transient_failure(run.failure_reason))
         non_transient_count = failed_count - transient_count
@@ -225,7 +251,7 @@ class RetryFailedDistillations:
                 transient_count=transient_count,
             )
 
-        latest_run = work_runs[-1]
+        latest_run = attempts[-1]
         if latest_run.status != WorkflowRunStatus.FAILED:
             return _WorkEvaluation(
                 retriable=False,
@@ -247,6 +273,12 @@ class RetryFailedDistillations:
             abandoned=False,
             failed_count=failed_count,
             transient_count=transient_count,
+        )
+
+    def _is_poisoned_cleanup(self, run: WorkflowRun) -> bool:
+        return (
+            run.execution_contract_version == _LEGACY_CONTRACT_VERSION
+            and run.failure_reason == _POISONED_RUN_FAILURE_REASON
         )
 
     def _cooldown(self) -> timedelta:

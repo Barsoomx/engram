@@ -244,7 +244,12 @@ def test_execute_suppresses_ineligible_required_or_terminal_work(
             created_at=now - timedelta(hours=2),
             finished_at=now - timedelta(hours=2),
         )
-        create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=now - timedelta(hours=1))
+        queued = create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=now - timedelta(hours=1))
+        WorkflowRun.objects.filter(id=queued.id).update(
+            execution_contract_version=1,
+            origin=WorkflowRunOrigin.AUTOMATIC,
+            dispatched_at=now - timedelta(hours=1),
+        )
     elif scenario == 'latest_running':
         create_linked_run(
             work,
