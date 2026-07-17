@@ -25,6 +25,7 @@ from engram.model_policy.services import (
     UpdateModelPolicy,
     UpdateModelPolicyInput,
     _split_completion,
+    curation_schema_prompt_prefix,
     generated_candidates_payload,
     secret_fingerprint,
 )
@@ -369,6 +370,105 @@ def test_openai_curation_decision_prompt_carries_verdict_schema_instructions() -
     assert 'supersede_memory' in user_message
     assert 'temporal_order' in user_message
     assert user_message.rstrip().endswith('{"schema":"curation_judge_input.v1"}')
+
+
+@pytest.mark.django_db
+def test_openai_distill_extract_prompt_carries_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('{}'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='distill-extract-schema-1',
+            trace_id='distill-extract-schema-1',
+            prompt='Observation: 6f1d0b3c-1f6c-4a4a-9f61-2f2a1c9d4b77',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    user_message = sent['messages'][-1]['content']
+
+    assert 'memories' in user_message
+    assert 'no_signal_observation_ids' in user_message
+    assert 'supporting_observation_ids' in user_message
+    assert 'confidence' in user_message
+    assert user_message.rstrip().endswith('Observation: 6f1d0b3c-1f6c-4a4a-9f61-2f2a1c9d4b77')
+
+
+@pytest.mark.django_db
+def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('{}'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='distill-reduce-schema-1',
+            trace_id='distill-reduce-schema-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v1',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    user_message = sent['messages'][-1]['content']
+
+    assert 'memories' in user_message
+    assert 'source_ids' in user_message
+    assert 'confidence' in user_message
+    assert user_message.rstrip().endswith('{"drafts":[]}')
+
+
+def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
+    instructions = curation_schema_prompt_prefix('distill_extract.v1')
+
+    assert instructions == (
+        'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+        'The object must contain exactly these keys and no additional properties: '
+        'memories (array of at most 12 objects); '
+        'no_signal_observation_ids (array of observation ids, unique, may be empty). '
+        'Each memories entry must contain exactly these keys and no additional properties: '
+        'title (non-blank string, at most 255 characters); '
+        'body (non-blank string, at most 3000 characters); '
+        'confidence (a JSON number between 0 and 1, never a string); '
+        'supporting_observation_ids (non-empty array of unique observation ids); '
+        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
+        'Only use observation ids copied verbatim from the input observations. '
+        'Every input observation id must appear at least once across the memories supporting_observation_ids '
+        'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+        'The same observation id may support more than one memory.'
+    )
+
+
+def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
+    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
+
+    assert instructions == (
+        'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+        'The object must contain exactly the key memories (array of objects) and no additional properties. '
+        'Each memories entry must contain exactly these keys and no additional properties: '
+        'title (non-blank string, at most 255 characters); '
+        'body (non-blank string, at most 3000 characters); '
+        'confidence (a JSON number between 0 and 1); '
+        'source_ids (non-empty array of unique draft ids); '
+        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
+        'Only use draft ids copied verbatim from the input drafts. '
+        'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+        'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
+        'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+    )
 
 
 @pytest.mark.django_db

@@ -5,6 +5,7 @@ import json
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from django.db import DatabaseError
@@ -37,7 +38,7 @@ from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_T
 from engram.memory.workflow_work import CreateWorkflowWorkInput, canonical_json_bytes, create_work
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
-from engram.model_policy.services import ProviderCallResult
+from engram.model_policy.services import ProviderCallResult, curation_schema_prompt_prefix
 
 Scope = tuple[Organization, Team, Project, Agent, AgentSession]
 
@@ -1475,3 +1476,36 @@ def test_render_stage_prompt_scope_mismatch_is_invalid_input(m_monkeypatch: pyte
 
     assert excinfo.value.code == 'work_scope_invalid'
     assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
+
+
+def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> None:
+    instructions = curation_schema_prompt_prefix('distill_extract.v1')
+    supported = '2b0f4f4e-6c0d-4f5e-8b7a-9c1d2e3f4a5b'
+    no_signal = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+    observation_ids = frozenset({supported, no_signal})
+    payload = {
+        'memories': [
+            {
+                'title': 'Durable fact',
+                'body': 'A durable fact grounded in this extraction chunk.',
+                'confidence': 0.9,
+                'supporting_observation_ids': [supported],
+                'kind': 'gotcha',
+            }
+        ],
+        'no_signal_observation_ids': [no_signal],
+    }
+
+    assert instructions
+    assert str(dps._MAX_MEMORIES) in instructions
+    assert str(dps._MAX_TITLE) in instructions
+    assert str(dps._MAX_BODY) in instructions
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in instructions
+
+    parsed = dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=observation_ids)
+
+    assert parsed.memories[0].kind == 'gotcha'
+    assert parsed.memories[0].supporting_observation_ids == (supported,)
+    assert parsed.memories[0].confidence == Decimal('0.9')
+    assert parsed.no_signal_observation_ids == (no_signal,)
