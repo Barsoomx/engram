@@ -293,7 +293,7 @@ def disable_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tasks_module(), 'candidate_decision_enabled', lambda _work: False, raising=False)
 
 
-def install_judged_decision(
+def install_decision_services(
     monkeypatch: pytest.MonkeyPatch,
     *,
     embedding: tuple[float, ...] | None,
@@ -302,11 +302,24 @@ def install_judged_decision(
     judge_result: CurationJudgeResult,
 ) -> None:
     module = curation_module()
-    enable_rollout(monkeypatch)
     monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: embedding, raising=False)
     monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist, raising=False)
     monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence, raising=False)
     monkeypatch.setattr(module, 'judge_curation_candidate', lambda *_a, **_k: judge_result, raising=False)
+
+
+def install_judged_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    embedding: tuple[float, ...] | None,
+    shortlist: CurationShortlist,
+    evidence: CurationEvidenceContext,
+    judge_result: CurationJudgeResult,
+) -> None:
+    enable_rollout(monkeypatch)
+    install_decision_services(
+        monkeypatch, embedding=embedding, shortlist=shortlist, evidence=evidence, judge_result=judge_result
+    )
 
 
 def install_deterministic_only(monkeypatch: pytest.MonkeyPatch) -> None:
