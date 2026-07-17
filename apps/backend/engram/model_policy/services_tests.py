@@ -9,6 +9,7 @@ from structlog.testing import capture_logs
 
 from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
+from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
@@ -469,6 +470,57 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
         'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
         'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
     )
+
+
+def test_curation_decision_schema_prefix_states_allowed_combination_table() -> None:
+    instructions = curation_schema_prompt_prefix('curation_decision_v1')
+
+    assert instructions == (
+        'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+        'The object must contain exactly these keys and no additional properties (recursively): '
+        'schema_version (integer, always 1); '
+        'outcome (one of: publish_new, merge_evidence, revise_memory, supersede_memory, reject_candidate, '
+        'open_conflict); '
+        'relation (one of: unrelated, compatible_distinct, equivalent, candidate_revises, candidate_supersedes, '
+        'redundant, unsupported, mutually_incompatible); '
+        'target_memory_version_id (a shortlist memory_version_id string, or null); '
+        'candidate_evidence_refs (array of provided evidence reference tokens, unique, at most 16); '
+        'comparisons (array with exactly one object per shortlist entry, in the given order; each object has '
+        'memory_version_id, relation, and target_evidence_refs); '
+        'applicability (one of: same, different); '
+        'temporal_order (one of: candidate_newer, target_newer, unordered, not_applicable); '
+        'reason_code (one of: distinct_claim, equivalent_claim, same_subject_revision, ordered_replacement, '
+        'redundant_claim, unsupported_claim, same_scope_contradiction); '
+        'reason (a short redacted explanation, at most 500 characters). '
+        'Only reference memory_version_id values and evidence tokens present in the input. '
+        'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
+        'must equal the top-level relation.'
+        ' Allowed outcome and relation combinations (any other combination is invalid): '
+        'publish_new with relation unrelated or compatible_distinct and target_memory_version_id null; '
+        'merge_evidence with relation equivalent and a non-null target; '
+        'revise_memory with relation candidate_revises, a non-null target and temporal_order candidate_newer; '
+        'supersede_memory with relation candidate_supersedes, a non-null target and temporal_order candidate_newer; '
+        'reject_candidate with relation redundant and a non-null target; '
+        'reject_candidate with relation unsupported and target null; '
+        'open_conflict with relation mutually_incompatible, a non-null target and temporal_order unordered. '
+        'The top-level relation describes the selected target; with a null target use unrelated, '
+        'compatible_distinct or unsupported. '
+        'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
+        'When every shortlist comparison is unrelated or compatible_distinct and the candidate has evidence, '
+        'choose publish_new with target null.'
+    )
+
+
+def test_curation_decision_instructions_align_with_allowed_combinations() -> None:
+    instructions = curation_schema_prompt_prefix('curation_decision_v1')
+    marker = 'combinations (any other combination is invalid): '
+
+    assert marker in instructions
+
+    enumeration = instructions.split(marker, 1)[1].split('. The top-level relation describes', 1)[0]
+    clauses = [clause.strip() for clause in enumeration.split(';')]
+    for outcome, relation in _ALLOWED_COMBINATIONS:
+        assert any(outcome in clause and relation in clause for clause in clauses)
 
 
 @pytest.mark.django_db

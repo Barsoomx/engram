@@ -20,6 +20,7 @@ from engram.model_policy.services import (
     ProviderCallInput,
     ProviderSecretError,
     _resolve_base_url,
+    deepseek_thinking_override,
     default_base_url,
     encrypt_secret,
     get_provider_gateway,
@@ -1037,6 +1038,72 @@ def test_openai_gateway_disables_thinking_but_omits_json_mode_for_deepseek_candi
     sent_body = json.loads(opener.requests[0].data)
     assert sent_body['thinking'] == {'type': 'disabled'}
     assert 'response_format' not in sent_body
+
+
+def test_deepseek_thinking_override_enables_for_curation_decision() -> None:
+    assert deepseek_thinking_override('deepseek', 'curation', 'curation_decision_v1') == {
+        'thinking': {'type': 'enabled'},
+    }
+
+
+def test_deepseek_thinking_override_disables_for_other_deepseek_curation_kinds() -> None:
+    assert deepseek_thinking_override('deepseek', 'curation', 'candidates') == {'thinking': {'type': 'disabled'}}
+    assert deepseek_thinking_override('deepseek', 'digest', 'curation_judgment') == {'thinking': {'type': 'disabled'}}
+
+
+def test_deepseek_thinking_override_empty_for_other_providers_and_tasks() -> None:
+    assert deepseek_thinking_override('openai', 'curation', 'curation_decision_v1') == {}
+    assert deepseek_thinking_override('deepseek', 'generation', 'candidates') == {}
+
+
+@pytest.mark.django_db
+def test_openai_gateway_enables_thinking_for_deepseek_curation_decision_only() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek', task_type='curation')
+    decision_opener = _opener_returning(json.dumps({'choices': [{'message': {'content': 'Title\nBody'}}]}).encode())
+    decision_gateway = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1',
+        api_key='key',
+        opener=decision_opener,
+    )
+    candidates_opener = _opener_returning(
+        json.dumps({'choices': [{'message': {'content': '{"memories": []}'}}]}).encode(),
+    )
+    candidates_gateway = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1',
+        api_key='key',
+        opener=candidates_opener,
+    )
+
+    decision_gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='ds-decision-1',
+            trace_id='ds-decision-1',
+            prompt='prompt text',
+            response_kind='curation_decision_v1',
+        ),
+    )
+    candidates_gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='ds-candidates-1',
+            trace_id='ds-candidates-1',
+            prompt='prompt text',
+            response_kind='candidates',
+        ),
+    )
+
+    decision_body = json.loads(decision_opener.requests[0].data)
+    candidates_body = json.loads(candidates_opener.requests[0].data)
+    assert decision_body['thinking'] == {'type': 'enabled'}
+    assert candidates_body['thinking'] == {'type': 'disabled'}
 
 
 @pytest.mark.django_db
