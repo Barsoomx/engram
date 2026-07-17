@@ -19,6 +19,7 @@ from engram.core.models import (
     SessionStatus,
     Team,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowWork,
@@ -35,6 +36,7 @@ from engram.memory.workflow_work import (
 
 _DISTILL_WORK_TASK_NAME = 'engram.memory.distill_session_work_v1'
 _LEGACY_DISTILL_TASK_NAME = 'engram.memory.distill_session'
+_POISONED_RUN_FAILURE_REASON = 'legacy_run_contract_mismatch'
 
 
 @pytest.fixture
@@ -65,6 +67,7 @@ def create_session(
     *,
     status: str = SessionStatus.ENDED,
     suffix: str = '1',
+    end_work_contract_version: int = 0,
 ) -> AgentSession:
     return AgentSession.objects.create(
         organization=organization,
@@ -75,6 +78,7 @@ def create_session(
         runtime=Runtime.CODEX,
         status=status,
         observation_sequence_cursor=0,
+        end_work_contract_version=end_work_contract_version,
     )
 
 
@@ -130,6 +134,35 @@ def create_linked_run(
         run.refresh_from_db()
 
     return run
+
+
+def create_poisoned_legacy_run(work: WorkflowWork, *, created_at: object = None) -> WorkflowRun:
+    run = WorkflowRun.objects.create(
+        organization_id=work.organization_id,
+        project_id=work.project_id,
+        team_id=work.team_id,
+        work=work,
+        run_type=WorkflowRunType.SESSION_DISTILLATION,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=0,
+        origin=WorkflowRunOrigin.LEGACY,
+        input_snapshot=work.input_snapshot,
+    )
+    if created_at is not None:
+        WorkflowRun.objects.filter(id=run.id).update(created_at=created_at)
+        run.refresh_from_db()
+
+    return run
+
+
+def fresh_v1_runs(work: WorkflowWork) -> list[WorkflowRun]:
+    return list(
+        WorkflowRun.objects.filter(
+            work=work,
+            execution_contract_version=1,
+            status=WorkflowRunStatus.QUEUED,
+        ).order_by('created_at', 'id'),
+    )
 
 
 @pytest.mark.django_db
@@ -446,6 +479,176 @@ def test_failed_run_without_linked_work_is_reported_unlinked_and_never_backfille
     assert legacy_run.id in result.unlinked_run_ids
     assert WorkflowWork.objects.count() == 0
     assert WorkflowRun.objects.filter(status=WorkflowRunStatus.QUEUED).count() == 0
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_retry_queues_v1_contract_attempt_with_reconciliation_origin_and_dispatched_at(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    create_linked_run(work, finished_at=timezone.now() - timedelta(minutes=40))
+
+    result = RetryFailedDistillations().execute()
+
+    queued = fresh_v1_runs(work)
+    assert len(queued) == 1
+    new_run = queued[0]
+    assert new_run.execution_contract_version == 1
+    assert new_run.origin == WorkflowRunOrigin.RECONCILIATION
+    assert new_run.status == WorkflowRunStatus.QUEUED
+    assert new_run.dispatched_at is not None
+    assert new_run.fencing_token is None
+    assert new_run.lease_owner == ''
+
+    outbox = CeleryOutbox.objects.get()
+    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
+    assert outbox.args == [str(work.id), str(new_run.id)]
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{new_run.id}'
+
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+    assert result.retried[0].run_id == new_run.id
+
+
+@pytest.mark.django_db
+def test_poisoned_legacy_run_is_failed_and_work_requeued_in_one_pass(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    poisoned = create_poisoned_legacy_run(work, created_at=now - timedelta(hours=1))
+
+    result = RetryFailedDistillations().execute()
+
+    poisoned.refresh_from_db()
+    assert poisoned.status == WorkflowRunStatus.FAILED
+    assert poisoned.failure_reason == _POISONED_RUN_FAILURE_REASON
+    assert poisoned.finished_at is not None
+    assert poisoned.execution_contract_version == 0
+
+    queued = fresh_v1_runs(work)
+    assert len(queued) == 1
+    new_run = queued[0]
+    assert new_run.origin == WorkflowRunOrigin.RECONCILIATION
+    assert new_run.dispatched_at is not None
+
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+    assert result.retried[0].run_id == new_run.id
+
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1
+    outbox = CeleryOutbox.objects.get(task_name=_DISTILL_WORK_TASK_NAME)
+    assert outbox.args == [str(work.id), str(new_run.id)]
+
+
+@pytest.mark.django_db
+def test_poisoned_run_cleanup_does_not_count_toward_non_transient_attempt_cap(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 400',
+    )
+    create_poisoned_legacy_run(work, created_at=now - timedelta(hours=1))
+
+    with capture_logs() as logs:
+        result = RetryFailedDistillations().execute()
+
+    assert [entry for entry in logs if entry['event'] == 'distillation_reconciler_abandoned'] == []
+    assert len(fresh_v1_runs(work)) == 1
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+
+
+@pytest.mark.django_db
+def test_abandonment_accounting_ignores_poisoned_runs_but_still_terminalizes_them(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=3),
+        finished_at=now - timedelta(hours=3),
+        failure_reason='provider returned 400',
+    )
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(minutes=40),
+        failure_reason='provider returned 400',
+    )
+    poisoned = create_poisoned_legacy_run(work, created_at=now - timedelta(hours=1))
+
+    with capture_logs() as logs:
+        result = RetryFailedDistillations().execute()
+
+    poisoned.refresh_from_db()
+    assert poisoned.status == WorkflowRunStatus.FAILED
+    assert poisoned.failure_reason == _POISONED_RUN_FAILURE_REASON
+
+    abandoned = [entry for entry in logs if entry['event'] == 'distillation_reconciler_abandoned']
+    assert len(abandoned) == 1
+    assert abandoned[0]['work_id'] == str(work.id)
+    assert abandoned[0]['failed_count'] == 2
+    assert abandoned[0]['transient_count'] == 0
+
+    assert result.retried == ()
+    assert fresh_v1_runs(work) == []
+    assert CeleryOutbox.objects.count() == 0
+
+
+@pytest.mark.django_db
+def test_v1_managed_session_keeps_its_runs_and_is_never_touched_by_cleanup(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent, end_work_contract_version=1)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+    )
+    poisoned = create_poisoned_legacy_run(work, created_at=now - timedelta(hours=1))
+
+    result = RetryFailedDistillations().execute()
+
+    poisoned.refresh_from_db()
+    assert poisoned.status == WorkflowRunStatus.QUEUED
+    assert poisoned.failure_reason == ''
+    assert result.retried == ()
+    assert fresh_v1_runs(work) == []
     assert CeleryOutbox.objects.count() == 0
 
 
