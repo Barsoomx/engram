@@ -73,11 +73,13 @@ _DIGEST_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_SOFT_TIME_LIMIT', '1
 _DIGEST_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_TIME_LIMIT', '210'))
 _EMBEDDING_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_SOFT_TIME_LIMIT', '180'))
 _EMBEDDING_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_TIME_LIMIT', '210'))
+_CANDIDATE_DECISION_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_CANDIDATE_DECISION_SOFT_TIME_LIMIT', '240'))
+_CANDIDATE_DECISION_TIME_LIMIT = int(os.environ.get('ENGRAM_CANDIDATE_DECISION_TIME_LIMIT', '270'))
 
 _OBSERVATION_LEASE = timedelta(seconds=120)
 _SESSION_LEASE = timedelta(seconds=720)
 _DIGEST_LEASE = timedelta(seconds=240)
-_CANDIDATE_DECISION_LEASE = timedelta(seconds=120)
+_CANDIDATE_DECISION_LEASE = timedelta(seconds=300)
 _EMBEDDING_LEASE = timedelta(seconds=300)
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
@@ -621,6 +623,8 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
     max_retries=_MAX_RETRIES,
     acks_late=True,
     reject_on_worker_lost=True,
+    soft_time_limit=_CANDIDATE_DECISION_SOFT_TIME_LIMIT,
+    time_limit=_CANDIDATE_DECISION_TIME_LIMIT,
 )
 def process_candidate_decision_work_v1(
     self: object,

@@ -183,6 +183,14 @@ def test_process_observation_recorded_has_a_per_task_time_limit() -> None:
     assert process_observation_recorded.time_limit == 90
 
 
+def test_candidate_decision_worker_uses_explicit_time_limits_within_its_lease() -> None:
+    task = tasks_module.process_candidate_decision_work_v1
+
+    assert task.soft_time_limit == tasks_module._CANDIDATE_DECISION_SOFT_TIME_LIMIT == 240
+    assert task.time_limit == tasks_module._CANDIDATE_DECISION_TIME_LIMIT == 270
+    assert tasks_module._CANDIDATE_DECISION_LEASE == timedelta(seconds=300)
+
+
 def test_task_routes_send_retry_failed_distillations_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.retry_failed_distillations']['queue'] == celeryconfig.QUEUE_BATCH
 

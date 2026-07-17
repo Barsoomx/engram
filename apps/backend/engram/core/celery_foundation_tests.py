@@ -24,6 +24,7 @@ _LEASE_MARGIN_SECONDS = 30
 _VERSIONED_WORK_TASKS_BY_TYPE = {
     WorkflowWorkType.OBSERVATION_PROCESSING: memory_tasks.process_observation_work_v1,
     WorkflowWorkType.SESSION_DISTILLATION: memory_tasks.distill_session_work_v1,
+    WorkflowWorkType.CANDIDATE_DECISION: memory_tasks.process_candidate_decision_work_v1,
     WorkflowWorkType.DAILY_DIGEST: memory_tasks.generate_daily_digest_work_v1,
     WorkflowWorkType.WEEKLY_DIGEST: memory_tasks.generate_weekly_digest_work_v1,
 }

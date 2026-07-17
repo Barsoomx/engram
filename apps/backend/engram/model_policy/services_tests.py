@@ -496,18 +496,30 @@ def test_curation_decision_schema_prefix_states_allowed_combination_table() -> N
         'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
         'must equal the top-level relation.'
         ' Allowed outcome and relation combinations (any other combination is invalid): '
-        'publish_new with relation unrelated or compatible_distinct and target_memory_version_id null; '
-        'merge_evidence with relation equivalent and a non-null target; '
-        'revise_memory with relation candidate_revises, a non-null target and temporal_order candidate_newer; '
-        'supersede_memory with relation candidate_supersedes, a non-null target and temporal_order candidate_newer; '
-        'reject_candidate with relation redundant and a non-null target; '
-        'reject_candidate with relation unsupported and target null; '
-        'open_conflict with relation mutually_incompatible, a non-null target and temporal_order unordered. '
+        'publish_new with relation unrelated or compatible_distinct, target_memory_version_id null, '
+        'candidate evidence tier supported or corroborated and comparison_complete true; '
+        'merge_evidence with relation equivalent, a non-null target and both candidate and target evidence tiers '
+        'supported or corroborated; '
+        'revise_memory with relation candidate_revises, a non-null target, candidate evidence tier corroborated, '
+        'target evidence tier supported or corroborated and temporal_order candidate_newer used only when the '
+        'candidate evidence is clearly newer, which the system verifies; '
+        'supersede_memory with relation candidate_supersedes, a non-null target, candidate evidence tier '
+        'corroborated, target evidence tier supported or corroborated, temporal_order candidate_newer used only '
+        'when the candidate evidence is clearly newer, which the system verifies, and comparison_complete true; '
+        'reject_candidate with relation redundant, a non-null target and target evidence tier supported or '
+        'corroborated; '
+        'reject_candidate with relation unsupported, target null and the candidate having no supporting evidence, '
+        'evidence tier none; '
+        'open_conflict with relation mutually_incompatible, a non-null target, temporal_order unordered, both '
+        'candidate and target evidence tiers supported or corroborated, non-empty evidence refs on both sides, '
+        'comparison_complete true and applicability same. '
         'The top-level relation describes the selected target; with a null target use unrelated, '
         'compatible_distinct or unsupported. '
         'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
-        'When every shortlist comparison is unrelated or compatible_distinct and the candidate has evidence, '
-        'choose publish_new with target null.'
+        'When comparison_complete is true, every shortlist comparison is unrelated or compatible_distinct and the '
+        'candidate evidence tier is supported or corroborated, choose publish_new with target null. '
+        'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
+        'candidate evidence.'
     )
 
 
@@ -519,8 +531,37 @@ def test_curation_decision_instructions_align_with_allowed_combinations() -> Non
 
     enumeration = instructions.split(marker, 1)[1].split('. The top-level relation describes', 1)[0]
     clauses = [clause.strip() for clause in enumeration.split(';')]
+    gate_tokens = {
+        ('publish_new', 'unrelated'): ('supported or corroborated', 'comparison_complete true'),
+        ('publish_new', 'compatible_distinct'): ('supported or corroborated', 'comparison_complete true'),
+        ('merge_evidence', 'equivalent'): ('candidate and target evidence tiers supported or corroborated',),
+        ('revise_memory', 'candidate_revises'): (
+            'candidate evidence tier corroborated',
+            'target evidence tier supported or corroborated',
+            'candidate_newer',
+        ),
+        ('supersede_memory', 'candidate_supersedes'): (
+            'candidate evidence tier corroborated',
+            'target evidence tier supported or corroborated',
+            'comparison_complete true',
+        ),
+        ('reject_candidate', 'redundant'): ('target evidence tier supported or corroborated',),
+        ('reject_candidate', 'unsupported'): ('no supporting evidence', 'evidence tier none'),
+        ('open_conflict', 'mutually_incompatible'): (
+            'supported or corroborated',
+            'evidence refs on both sides',
+            'comparison_complete true',
+            'applicability same',
+        ),
+    }
     for outcome, relation in _ALLOWED_COMBINATIONS:
-        assert any(outcome in clause and relation in clause for clause in clauses)
+        matches = [clause for clause in clauses if outcome in clause and relation in clause]
+
+        assert matches, (outcome, relation)
+
+        clause = matches[0]
+        for token in gate_tokens[(outcome, relation)]:
+            assert token in clause, (outcome, relation, token)
 
 
 @pytest.mark.django_db
