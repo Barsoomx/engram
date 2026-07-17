@@ -170,26 +170,23 @@ class RetryFailedDistillations:
         if not work_ids:
             return
 
-        poisoned_run_ids = list(
-            WorkflowRun.objects.filter(
-                run_type=WorkflowRunType.SESSION_DISTILLATION,
-                work_id__in=work_ids,
-                execution_contract_version=_LEGACY_CONTRACT_VERSION,
-                status=WorkflowRunStatus.QUEUED,
-            ).values_list('id', flat=True),
-        )
-        if not poisoned_run_ids:
-            return
-
-        WorkflowRun.objects.filter(id__in=poisoned_run_ids).update(
+        updated = WorkflowRun.objects.filter(
+            run_type=WorkflowRunType.SESSION_DISTILLATION,
+            work_id__in=work_ids,
+            execution_contract_version=_LEGACY_CONTRACT_VERSION,
+            status=WorkflowRunStatus.QUEUED,
+        ).update(
             status=WorkflowRunStatus.FAILED,
             failure_reason=_POISONED_RUN_FAILURE_REASON,
             finished_at=now,
             updated_at=now,
         )
+        if not updated:
+            return
+
         logger.warning(
             'distillation_reconciler_poisoned_runs_terminalized',
-            run_count=len(poisoned_run_ids),
+            run_count=updated,
         )
 
         return

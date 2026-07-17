@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 from django.db import close_old_connections, connection, transaction
+from django.db.models.query import QuerySet
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from structlog.testing import capture_logs
@@ -854,3 +855,80 @@ def test_blocked_work_with_stale_v1_queued_run_still_resignals(
     assert len(result.resignaled) == 1
     assert result.resignaled[0].work_id == work.id
     assert result.resignaled[0].run_id == queued.id
+
+
+@pytest.mark.django_db(transaction=True)
+def test_poisoned_cleanup_does_not_overwrite_concurrent_legacy_success(
+    monkeypatch: pytest.MonkeyPatch,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    poisoned = create_poisoned_legacy_run(
+        work,
+        created_at=now - timedelta(hours=1),
+    )
+
+    poison_ids_selected = Event()
+    success_committed = Event()
+    real_update = QuerySet.update
+
+    def pause_poison_update(queryset: QuerySet, **kwargs: object) -> int:
+        if kwargs.get('failure_reason') == _POISONED_RUN_FAILURE_REASON:
+            poison_ids_selected.set()
+            assert success_committed.wait(timeout=10)
+
+        return real_update(queryset, **kwargs)
+
+    monkeypatch.setattr(QuerySet, 'update', pause_poison_update)
+
+    def reconcile() -> object:
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                return RetryFailedDistillations().execute()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reconcile)
+        assert poison_ids_selected.wait(timeout=10)
+
+        succeeded_at = timezone.now()
+        try:
+            with transaction.atomic():
+                completed = WorkflowRun.objects.filter(
+                    id=poisoned.id,
+                    status=WorkflowRunStatus.QUEUED,
+                ).update(
+                    status=WorkflowRunStatus.SUCCEEDED,
+                    failure_reason='',
+                    finished_at=succeeded_at,
+                    updated_at=succeeded_at,
+                )
+                assert completed == 1
+        finally:
+            success_committed.set()
+
+        result = future.result(timeout=15)
+
+    poisoned.refresh_from_db()
+    assert poisoned.status == WorkflowRunStatus.SUCCEEDED
+    assert poisoned.failure_reason == ''
+    assert poisoned.finished_at == succeeded_at
+    assert result.retried == ()
+    assert fresh_v1_runs(work) == []
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 0
