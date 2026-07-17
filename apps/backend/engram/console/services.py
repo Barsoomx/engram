@@ -24,6 +24,7 @@ from engram.access.models import (
     Role,
 )
 from engram.access.services import (
+    EffectiveScope,
     api_key_fingerprint,
     api_key_prefix,
     hash_api_key,
@@ -1024,8 +1025,15 @@ CONFLICT_RESOLUTION_ACTIONS = (
 _CONFLICT_TARGET_ACTIONS = ('merge_candidate', 'supersede_memory')
 
 
+def _scope_conflict_candidates(queryset: Any, scope: EffectiveScope) -> Any:
+    return queryset.filter(project_id__in=scope.project_ids).filter(
+        Q(team_id__isnull=True) | Q(team_id__in=scope.team_ids),
+    )
+
+
 def open_conflict_candidates(
     organization: Organization,
+    scope: EffectiveScope,
     *,
     project_id: uuid.UUID | None = None,
     team_id: uuid.UUID | None = None,
@@ -1037,7 +1045,10 @@ def open_conflict_candidates(
         resolved_transition__isnull=True,
     )
 
-    queryset = MemoryCandidate.objects.filter(organization=organization).filter(Exists(unresolved))
+    queryset = _scope_conflict_candidates(
+        MemoryCandidate.objects.filter(organization=organization).filter(Exists(unresolved)),
+        scope,
+    )
 
     if project_id is not None:
         queryset = queryset.filter(project_id=project_id)
@@ -1086,6 +1097,7 @@ def open_conflicts_for_candidates(
 def get_conflict_candidate_or_404(
     organization: Organization,
     candidate_id: uuid.UUID,
+    scope: EffectiveScope,
 ) -> MemoryCandidate:
     unresolved = MemoryConflict.objects.filter(
         candidate_id=OuterRef('pk'),
@@ -1093,9 +1105,12 @@ def get_conflict_candidate_or_404(
     )
 
     candidate = (
-        MemoryCandidate.objects.filter(
-            organization=organization,
-            id=candidate_id,
+        _scope_conflict_candidates(
+            MemoryCandidate.objects.filter(
+                organization=organization,
+                id=candidate_id,
+            ),
+            scope,
         )
         .filter(Exists(unresolved))
         .first()

@@ -12,16 +12,20 @@ from django.contrib.auth.models import User
 from django.core.management import call_command
 from rest_framework.test import APIClient
 
-from engram.access.auth_services import external_id_for_user
+from rest_framework.authtoken.models import Token
+
+from engram.access.auth_services import external_id_for_user, resolve_user_scope_for_organization
 from engram.access.models import (
     Capability,
     Identity,
     IdentityType,
     OrganizationMembership,
+    ProjectGrant,
     Role,
     RoleCapability,
+    TeamMembership,
 )
-from engram.console.services import approve_memory_candidate, reject_review_item
+from engram.console.services import approve_memory_candidate, conflict_set_etag, reject_review_item
 from engram.core.models import (
     CandidateStatus,
     Memory,
@@ -35,6 +39,7 @@ from engram.core.models import (
     Observation,
     Organization,
     Project,
+    ProjectTeam,
     Team,
     VisibilityScope,
 )
@@ -101,7 +106,7 @@ def f_admin_token() -> str:
 
     role = _make_role_with_capabilities(
         'memory_admin',
-        ('memories:review', 'memories:admin'),
+        ('memories:review', 'memories:admin', 'projects:*', 'teams:*'),
     )
 
     OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
@@ -654,3 +659,110 @@ def test_conflict_resolution_records_exported_review_example(
     conflict_rows = [row for row in exported if row['item_id'] == str(candidate.id)]
     assert conflict_rows
     assert conflict_rows[0]['action'] == 'reject_candidate'
+
+
+@pytest.mark.django_db
+def test_conflict_review_enforces_effective_project_and_team_scope() -> None:
+    organization = Organization.objects.create(name='Scoped conflict org', slug='scoped-conflict-org')
+
+    allowed_project = Project.objects.create(
+        organization=organization,
+        name='Allowed project',
+        slug='allowed-project',
+    )
+    allowed_team = Team.objects.create(
+        organization=organization,
+        name='Allowed team',
+        slug='allowed-team',
+    )
+    ProjectTeam.objects.create(
+        organization=organization,
+        project=allowed_project,
+        team=allowed_team,
+    )
+
+    foreign_project = Project.objects.create(
+        organization=organization,
+        name='Foreign project',
+        slug='foreign-project',
+    )
+    foreign_team = Team.objects.create(
+        organization=organization,
+        name='Foreign team',
+        slug='foreign-team',
+    )
+    ProjectTeam.objects.create(
+        organization=organization,
+        project=foreign_project,
+        team=foreign_team,
+    )
+
+    user = _make_user('scoped-conflict-admin')
+    identity = _make_identity(user, organization)
+    membership_role = _make_role_with_capabilities('scoped_conflict_member', ())
+    scoped_role = _make_role_with_capabilities(
+        'scoped_conflict_admin',
+        ('memories:review', 'memories:admin'),
+    )
+    OrganizationMembership.objects.create(
+        organization=organization,
+        identity=identity,
+        role=membership_role,
+    )
+    ProjectGrant.objects.create(
+        organization=organization,
+        project=allowed_project,
+        identity=identity,
+        role=scoped_role,
+    )
+    TeamMembership.objects.create(
+        organization=organization,
+        team=allowed_team,
+        identity=identity,
+        role=scoped_role,
+    )
+
+    scope = resolve_user_scope_for_organization(user, organization)
+    assert scope.project_ids == (allowed_project.id,)
+    assert scope.team_ids == (allowed_team.id,)
+    assert foreign_project.id not in scope.project_ids
+    assert foreign_team.id not in scope.team_ids
+    assert {'memories:review', 'memories:admin'} <= set(scope.capabilities)
+
+    candidate, _memories, conflicts = _open_conflicts_for_candidate(
+        organization,
+        foreign_project,
+        team=foreign_team,
+        suffix='same-org-outside-effective-scope',
+    )
+    etag = conflict_set_etag(candidate)
+    client = _auth_client(Token.objects.create(user=user).key, organization)
+
+    listing = client.get('/v1/admin/memory-review/')
+    detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    resolve = client.post(
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'must not cross effective scope'},
+        format='json',
+        HTTP_IF_MATCH=etag,
+    )
+
+    candidate.refresh_from_db()
+    for conflict in conflicts:
+        conflict.refresh_from_db()
+
+    listed_ids = {str(item['id']) for item in _list_items(listing.data)}
+    observed = (
+        str(candidate.id) in listed_ids,
+        detail.status_code,
+        resolve.status_code,
+        candidate.status,
+        all(conflict.resolved_transition_id is None for conflict in conflicts),
+    )
+    assert observed == (
+        False,
+        404,
+        404,
+        CandidateStatus.PROPOSED,
+        True,
+    )

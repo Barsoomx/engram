@@ -64,7 +64,7 @@ class MemoryReviewViewSet(
 
         ordering = self._ordering(request)
 
-        base = open_conflict_candidates(organization, **filters)
+        base = open_conflict_candidates(organization, request.effective_scope, **filters)
 
         candidates = list(base.order_by(*ordering)[:PAGE_SIZE])
 
@@ -89,7 +89,7 @@ class MemoryReviewViewSet(
 
         candidate_id = self._uuid_kwarg(kwargs)
 
-        candidate = get_conflict_candidate_or_404(organization, candidate_id)
+        candidate = get_conflict_candidate_or_404(organization, candidate_id, request.effective_scope)
 
         conflicts = open_conflicts_for_candidates(organization, [candidate.id])[candidate.id]
 
@@ -109,7 +109,7 @@ class MemoryReviewViewSet(
 
         candidate_id = self._uuid_kwarg(kwargs)
 
-        candidate = get_conflict_candidate_or_404(organization, candidate_id)
+        candidate = get_conflict_candidate_or_404(organization, candidate_id, request.effective_scope)
 
         if_match = request.META.get('HTTP_IF_MATCH')
 
