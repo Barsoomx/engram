@@ -692,7 +692,7 @@ class ReductionStageContract:
                 entry['kind'] = draft.kind
             drafts.append(entry)
         prompt = json.dumps(
-            {'drafts': drafts},
+            {'drafts': drafts, 'reduction_target': stage.window.reduction_target},
             ensure_ascii=False,
             separators=(',', ':'),
         )

@@ -1,15 +1,22 @@
+import json
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
 import pytest
+from django.utils import timezone
 
+from engram.core.models import DistillationStage, DistillationWindow
 from engram.memory.distillation_provider_stage import ProviderStageOutputError
 from engram.memory.distillation_reduction import (
+    MAX_BODY,
+    MAX_TITLE,
+    REDUCTION_MANIFEST_SCHEMA,
     ReductionBatch,
     ReductionContractError,
     ReductionDraft,
     ReductionStageContract,
+    _snapshot_drafts,
     build_reduction_batches,
     derive_final_reduction_drafts,
     derive_first_pending_reduction_target,
@@ -19,6 +26,9 @@ from engram.memory.distillation_reduction import (
     resolve_reduction_stage,
     stable_draft_id,
 )
+from engram.memory.distillation_tests import create_session_distillation_work, create_session_scope
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
+from engram.model_policy.services import curation_schema_prompt_prefix
 
 
 def _draft(index: int, *, stage: str = 'extract-stage') -> ReductionDraft:
@@ -257,3 +267,163 @@ def test_reduction_stage_resolution_uses_the_generic_identity_resolver(
     monkeypatch.setattr(engine, 'resolve_provider_stage', resolve)
 
     assert resolve_reduction_stage('target', 'claim', now='now') is expected
+
+
+REDUCTION_TARGET = 3
+
+
+@pytest.fixture
+def f_reduce_stage() -> DistillationStage:
+    organization, team, project, _agent, session = create_session_scope(suffix='reduce-prompt-target')
+    work = create_session_distillation_work(session, upper=1)
+    window = DistillationWindow.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        session=session,
+        contract_version=1,
+        lower_sequence_exclusive=0,
+        upper_sequence_inclusive=1,
+        observation_count=1,
+        input_hash='1' * 64,
+        chunk_char_budget=8000,
+        reduction_target=REDUCTION_TARGET,
+        chunk_contract_version=1,
+    )
+    secret = ProviderSecret.objects.create(
+        organization=organization,
+        team=team,
+        name='Reduce prompt secret',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    policy = ModelPolicy.objects.create(
+        organization=organization,
+        team=team,
+        project=project,
+        secret=secret,
+        name='Reduce prompt policy',
+        scope='project',
+        task_type='generation',
+        provider='openai',
+        model='reduce-prompt-model',
+    )
+    call = ProviderCallRecord.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        policy=policy,
+        secret=secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type=policy.task_type,
+        policy_version=policy.version,
+        request_id=f'reduce-prompt-source:{window.id}',
+        redaction_state='redacted',
+    )
+    source = DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        window=window,
+        stage_kind='reduce',
+        level=1,
+        ordinal=0,
+        target_key='2' * 64,
+        stage_key='3' * 64,
+        input_hash='4' * 64,
+        input_manifest={
+            'schema': REDUCTION_MANIFEST_SCHEMA,
+            'level': 1,
+            'ordinal': 0,
+            'refs': [],
+        },
+        prompt_contract='distill_reduce.v1',
+        policy=policy,
+        policy_version=policy.version,
+        policy_role='primary',
+        status='complete',
+        attempt_count=1,
+        accepted_provider_call=call,
+        response_hash='5' * 64,
+        response_size=1,
+        output_snapshot={
+            'memories': [
+                {
+                    'title': 'Durable fact',
+                    'body': 'A durable fact carried into the next reduction level.',
+                    'confidence': '0.9',
+                    'source_ids': ['leaf-source'],
+                    'kind': 'gotcha',
+                }
+            ]
+        },
+        output_hash='6' * 64,
+        completed_at=timezone.now(),
+    )
+
+    return DistillationStage.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        window=window,
+        stage_kind='reduce',
+        level=2,
+        ordinal=0,
+        target_key='7' * 64,
+        stage_key='8' * 64,
+        input_hash='9' * 64,
+        input_manifest={
+            'schema': REDUCTION_MANIFEST_SCHEMA,
+            'level': 2,
+            'ordinal': 0,
+            'refs': [draft.ref.as_manifest() for draft in _snapshot_drafts(source)],
+        },
+        prompt_contract='distill_reduce.v1',
+        policy=policy,
+        policy_version=policy.version,
+        policy_role='primary',
+        status='required',
+    )
+
+
+def test_reduce_schema_instructions_describe_a_payload_the_parser_accepts() -> None:
+    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
+    inputs = [_draft(index) for index in range(4)]
+    payload = {
+        'memories': [
+            {
+                'title': 'Consolidated durable fact',
+                'body': 'One reduced fact preserving every input draft.',
+                'confidence': 0.9,
+                'source_ids': [draft.draft_id for draft in inputs],
+                'kind': 'decision',
+            }
+        ]
+    }
+
+    assert instructions
+    assert str(MAX_TITLE) in instructions
+    assert str(MAX_BODY) in instructions
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in instructions
+
+    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
+
+    assert len(parsed.memories) == 1
+    assert parsed.memories[0].kind == 'decision'
+    assert parsed.memories[0].source_ids == tuple(draft.draft_id for draft in inputs)
+    assert parsed.memories[0].confidence == Decimal('0.9')
+
+
+@pytest.mark.django_db
+def test_prepare_call_prompt_carries_the_stage_reduction_target(f_reduce_stage: DistillationStage) -> None:
+    prepared = ReductionStageContract().prepare_call(f_reduce_stage)
+    prompt = json.loads(prepared.prompt)
+
+    assert prompt['reduction_target'] == REDUCTION_TARGET
+    assert [draft['id'] for draft in prompt['drafts']] == [
+        draft.draft_id for draft in _snapshot_drafts(f_reduce_stage.window.stages.get(level=1))
+    ]

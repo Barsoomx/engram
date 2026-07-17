@@ -1226,9 +1226,48 @@ _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
 )
 
 
+_MEMORY_KIND_VALUES = ('decision', 'convention', 'gotcha', 'architecture', 'incident')
+_DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
+    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+    'The object must contain exactly these keys and no additional properties: '
+    'memories (array of at most 12 objects); '
+    'no_signal_observation_ids (array of observation ids, unique, may be empty). '
+    'Each memories entry must contain exactly these keys and no additional properties: '
+    'title (non-blank string, at most 255 characters); '
+    'body (non-blank string, at most 3000 characters); '
+    'confidence (a JSON number between 0 and 1, never a string); '
+    'supporting_observation_ids (non-empty array of unique observation ids); '
+    f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
+    'Only use observation ids copied verbatim from the input observations. '
+    'Every input observation id must appear at least once across the memories supporting_observation_ids '
+    'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+    'The same observation id may support more than one memory.'
+)
+_DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
+    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+    'The object must contain exactly the key memories (array of objects) and no additional properties. '
+    'Each memories entry must contain exactly these keys and no additional properties: '
+    'title (non-blank string, at most 255 characters); '
+    'body (non-blank string, at most 3000 characters); '
+    'confidence (a JSON number between 0 and 1); '
+    'source_ids (non-empty array of unique draft ids); '
+    f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
+    'Only use draft ids copied verbatim from the input drafts. '
+    'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+    'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
+    'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+)
+
+
 def curation_schema_prompt_prefix(response_kind: str) -> str:
     if response_kind == 'curation_decision_v1':
         return _CURATION_DECISION_SCHEMA_INSTRUCTIONS
+
+    if response_kind == 'distill_extract.v1':
+        return _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS
+
+    if response_kind == 'distill_reduce.v1':
+        return _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS
 
     return ''
 
