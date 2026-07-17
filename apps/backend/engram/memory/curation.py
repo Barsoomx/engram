@@ -1001,8 +1001,15 @@ _VERDICT_OUTCOME = {
 }
 
 
+_CANDIDATE_DECISION_FALSY = frozenset({'0', 'false', 'no', 'off'})
+
+
 def candidate_decision_enabled(work: WorkflowWork) -> bool:
-    return os.environ.get('ENGRAM_CANDIDATE_DECISION_ENABLED', 'false').strip().lower() == 'true'
+    raw = os.environ.get('ENGRAM_CANDIDATE_DECISION_ENABLED')
+    if raw is None:
+        return True
+
+    return raw.strip().lower() not in _CANDIDATE_DECISION_FALSY
 
 
 def _fault_boundary(_point: str) -> None:

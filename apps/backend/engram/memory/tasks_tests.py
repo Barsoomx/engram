@@ -1892,6 +1892,60 @@ def test_candidate_decision_handler_blocks_with_rollout_not_enabled(monkeypatch:
     assert candidate.status == CandidateStatus.PROPOSED
 
 
+# ---------------------------------------------------------------------------
+# C5 - default-on cutover: with ENGRAM_CANDIDATE_DECISION_ENABLED unset the
+# handler autonomously runs the orchestrator; only the explicit off-switch
+# (=0 and the usual falsy spellings) capability-blocks with rollout_not_enabled.
+# These exercise the REAL env-reading candidate_decision_enabled (not patched).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_candidate_decision_handler_runs_orchestrator_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_CANDIDATE_DECISION_ENABLED', raising=False)
+    scope = orch.orchestrator_scope('env-default-on')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='env-default-on')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_decision_services(
+        monkeypatch, embedding=orch.EMBEDDING_1536, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert len(orch.curation_decisions_for(candidate)) == 1
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('falsy', ['0', 'false', 'FALSE', 'no', 'off'])
+def test_candidate_decision_handler_blocks_when_env_disabled(monkeypatch: pytest.MonkeyPatch, falsy: str) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_DECISION_ENABLED', falsy)
+    scope = orch.orchestrator_scope(f'env-off-{falsy.lower()}')
+    candidate, work, run = orch.subject_candidate(scope, suffix=f'env-off-{falsy.lower()}')
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert orch.curation_decisions_for(candidate) == []
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert run.status == WorkflowRunStatus.FAILED
+    assert run.failure_class == CONFIGURATION
+    assert run.failure_code == 'rollout_not_enabled'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
 def test_observation_processing_does_not_curate_synchronously() -> None:
     source = inspect.getsource(ProcessObservationRecorded.execute)
 
