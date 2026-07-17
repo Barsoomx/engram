@@ -15,9 +15,7 @@ from engram.core.models import (
     AgentSession,
     Observation,
     RetrievalDocument,
-    WorkflowRun,
     WorkflowRunOrigin,
-    WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
@@ -54,8 +52,6 @@ from engram.memory.work_execution import (
 from engram.memory.work_failures import CONFIGURATION, ClassifiedWorkFailure, translate_failure
 from engram.memory.workflow_work import (
     observation_content_digest,
-    resolve_work_no_signal,
-    resolve_work_succeeded,
     work_input_fingerprint,
 )
 
@@ -140,161 +136,6 @@ def _load_versioned_work(work_id: uuid.UUID, expected_work_type: str) -> Workflo
     return work
 
 
-def _load_workflow_run(
-    work: WorkflowWork,
-    workflow_run_id: uuid.UUID,
-    *,
-    allow_succeeded: bool,
-) -> WorkflowRun:
-    allowed_statuses = [WorkflowRunStatus.QUEUED]
-    if allow_succeeded:
-        allowed_statuses.append(WorkflowRunStatus.SUCCEEDED)
-
-    try:
-        return WorkflowRun.objects.get(
-            id=workflow_run_id,
-            work_id=work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-            team_id=work.team_id,
-            run_type=work.work_type,
-            status__in=allowed_statuses,
-        )
-    except WorkflowRun.DoesNotExist as error:
-        raise MemoryWorkerError('workflow run does not match queued work scope') from error
-
-
-def _claim_workflow_run(work: WorkflowWork, workflow_run: WorkflowRun) -> WorkflowRun:
-    with transaction.atomic():
-        claimed = WorkflowRun.objects.filter(
-            id=workflow_run.id,
-            work_id=work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-            team_id=work.team_id,
-            run_type=work.work_type,
-            status=WorkflowRunStatus.QUEUED,
-        ).update(
-            status=WorkflowRunStatus.RUNNING,
-            started_at=timezone.now(),
-            finished_at=None,
-            failure_reason='',
-        )
-    if claimed != 1:
-        try:
-            return WorkflowRun.objects.get(
-                id=workflow_run.id,
-                work_id=work.id,
-                organization_id=work.organization_id,
-                project_id=work.project_id,
-                team_id=work.team_id,
-                run_type=work.work_type,
-                status=WorkflowRunStatus.SUCCEEDED,
-            )
-        except WorkflowRun.DoesNotExist as error:
-            raise MemoryWorkerError('workflow run is no longer queued') from error
-
-    workflow_run.refresh_from_db()
-
-    return workflow_run
-
-
-def _succeeded_workflow_run_result(
-    work: WorkflowWork,
-    workflow_run: WorkflowRun,
-    *,
-    via: str,
-) -> str:
-    disposition = (
-        WorkflowWork.objects.filter(
-            id=work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-        )
-        .values_list('disposition', flat=True)
-        .get()
-    )
-    if disposition != WorkflowWorkDisposition.COMPLETE:
-        raise MemoryWorkerError('succeeded workflow run has non-complete work')
-
-    logger.info(
-        'workflow_run_duplicate_delivery_absorbed',
-        work_id=str(work.id),
-        workflow_run_id=str(workflow_run.id),
-        via=via,
-    )
-
-    return str(workflow_run.id)
-
-
-def _requeue_workflow_run(workflow_run: WorkflowRun) -> None:
-    requeued = WorkflowRun.objects.filter(
-        id=workflow_run.id,
-        status=WorkflowRunStatus.RUNNING,
-    ).update(
-        status=WorkflowRunStatus.QUEUED,
-        finished_at=None,
-        failure_reason='',
-    )
-    if requeued != 1:
-        raise MemoryWorkerError('workflow run is no longer running')
-
-
-def _fail_workflow_run(workflow_run: WorkflowRun, error: Exception) -> None:
-    WorkflowRun.objects.filter(
-        id=workflow_run.id,
-        status=WorkflowRunStatus.RUNNING,
-    ).update(
-        status=WorkflowRunStatus.FAILED,
-        failure_reason=str(error)[:1024],
-        finished_at=timezone.now(),
-    )
-
-
-def _complete_workflow_run(
-    workflow_run: WorkflowRun,
-    *,
-    result_memory_id: uuid.UUID | None = None,
-    provider_call_ids: list[str] | None = None,
-    escalation: bool = False,
-) -> None:
-    fields: dict[str, object] = {
-        'status': WorkflowRunStatus.SUCCEEDED,
-        'result_memory_id': result_memory_id,
-        'finished_at': timezone.now(),
-    }
-    if provider_call_ids is not None:
-        fields['provider_call_ids'] = provider_call_ids
-    if escalation:
-        fields['escalation'] = True
-
-    completed = WorkflowRun.objects.filter(
-        id=workflow_run.id,
-        status=WorkflowRunStatus.RUNNING,
-    ).update(**fields)
-    if completed == 1:
-        return
-
-    if WorkflowRun.objects.filter(id=workflow_run.id, status=WorkflowRunStatus.SUCCEEDED).exists():
-        return
-
-    raise MemoryWorkerError('workflow run is no longer running')
-
-
-def _record_workflow_run_error(
-    workflow_run: WorkflowRun | None,
-    error: Exception,
-    *,
-    requeue: bool,
-) -> None:
-    if workflow_run is None:
-        return
-    if requeue:
-        _requeue_workflow_run(workflow_run)
-    else:
-        _fail_workflow_run(workflow_run, error)
-
-
 def _lease_owner(task: object) -> str:
     hostname = getattr(getattr(task, 'request', None), 'hostname', None) or socket.gethostname()
     hostname = hostname.replace(':', '_')
@@ -365,31 +206,6 @@ def _run_fenced_automatic(
         _record_claim_failure(claim, error, configuration_fingerprint=configuration_fingerprint)
 
         raise
-
-
-def _finalize_observation_work(
-    work: WorkflowWork,
-    workflow_run: WorkflowRun,
-    result: object,
-) -> None:
-    if work.disposition == WorkflowWorkDisposition.REQUIRED:
-        resolver = (
-            resolve_work_succeeded
-            if result.memory is not None or result.candidate is not None
-            else resolve_work_no_signal
-        )
-        resolver(
-            work.id,
-            organization_id=work.organization_id,
-            project_id=work.project_id,
-        )
-
-    _complete_workflow_run(
-        workflow_run,
-        result_memory_id=result.memory.id if result.memory is not None else None,
-    )
-
-    return
 
 
 def _verify_work_fingerprint(work: WorkflowWork) -> None:
@@ -527,53 +343,11 @@ def process_observation_work_v1(
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, WorkflowWorkType.OBSERVATION_PROCESSING)
 
-    if parsed_run_id is not None:
-        return _run_observation_explicit_delivery(self, work, parsed_run_id)
-
-    return _run_observation_automatic_delivery(self, work)
+    return _run_observation_delivery(self, work, parsed_run_id)
 
 
-def _run_observation_explicit_delivery(
-    task: object,
-    work: WorkflowWork,
-    workflow_run_id: uuid.UUID,
-) -> str:
-    workflow_run = _load_workflow_run(work, workflow_run_id, allow_succeeded=True)
-    duplicate_via = 'load'
-    if workflow_run.status == WorkflowRunStatus.QUEUED:
-        workflow_run = _claim_workflow_run(work, workflow_run)
-        duplicate_via = 'claim_cas_loss'
-    if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-        return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
-    if workflow_run.status != WorkflowRunStatus.RUNNING:
-        raise MemoryWorkerError('workflow run claim returned invalid status')
-
-    structlog.contextvars.clear_contextvars()
-    try:
-        _verify_work_fingerprint(work)
-        observation = _load_observation_work_subject(work)
-        result = ProcessObservationRecorded().execute(
-            MemoryCandidateWorkerInput(observation_id=observation.id),
-        )
-        _finalize_observation_work(work, workflow_run, result)
-    except MemoryWorkerError as exc:
-        can_retry = exc.retryable and task.request.retries < task.max_retries
-        _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
-        if can_retry:
-            countdown = _RETRY_BACKOFF_BASE ** (task.request.retries + 1)
-            raise task.retry(exc=exc, countdown=countdown) from None
-        raise
-    except Exception as error:
-        _record_workflow_run_error(workflow_run, error, requeue=False)
-        raise
-    finally:
-        structlog.contextvars.clear_contextvars()
-
-    return str(workflow_run.id)
-
-
-def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str:
-    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+def _run_observation_delivery(task: object, work: WorkflowWork, workflow_run_id: uuid.UUID | None) -> str:
+    if workflow_run_id is None and work.disposition != WorkflowWorkDisposition.REQUIRED:
         logger.info(
             'observation_work_already_resolved',
             work_id=str(work.id),
@@ -615,6 +389,7 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
         lease_for=_OBSERVATION_LEASE,
         event_prefix='observation_work',
         execute=execute,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -901,43 +676,15 @@ def generate_daily_digest(
     return str(result.memory.id)
 
 
-def _run_digest_explicit_delivery(task: object, work: WorkflowWork, workflow_run_id: uuid.UUID) -> str:
+def _run_digest_delivery(
+    task: object,
+    work: WorkflowWork,
+    expected_work_type: str,
+    workflow_run_id: uuid.UUID | None,
+) -> str:
     from engram.memory.digest_work import execute_frozen_digest_work
 
-    workflow_run = _load_workflow_run(work, workflow_run_id, allow_succeeded=True)
-    duplicate_via = 'load'
-    if workflow_run.status == WorkflowRunStatus.QUEUED:
-        workflow_run = _claim_workflow_run(work, workflow_run)
-        duplicate_via = 'claim_cas_loss'
-    if workflow_run.status == WorkflowRunStatus.SUCCEEDED:
-        return _succeeded_workflow_run_result(work, workflow_run, via=duplicate_via)
-    if workflow_run.status != WorkflowRunStatus.RUNNING:
-        raise MemoryWorkerError('workflow run claim returned invalid status')
-
-    structlog.contextvars.clear_contextvars()
-    try:
-        result_memory_id = execute_frozen_digest_work(work, workflow_run)
-        _complete_workflow_run(workflow_run, result_memory_id=result_memory_id)
-    except MemoryWorkerError as exc:
-        can_retry = exc.retryable and task.request.retries < task.max_retries
-        _record_workflow_run_error(workflow_run, exc, requeue=can_retry)
-        if can_retry:
-            countdown = _RETRY_BACKOFF_BASE ** (task.request.retries + 1)
-            raise task.retry(exc=exc, countdown=countdown) from None
-        raise
-    except Exception as error:
-        _record_workflow_run_error(workflow_run, error, requeue=False)
-        raise
-    finally:
-        structlog.contextvars.clear_contextvars()
-
-    return str(workflow_run.id)
-
-
-def _run_digest_automatic_delivery(task: object, work: WorkflowWork, expected_work_type: str) -> str:
-    from engram.memory.digest_work import execute_frozen_digest_work
-
-    if work.disposition != WorkflowWorkDisposition.REQUIRED:
+    if workflow_run_id is None and work.disposition != WorkflowWorkDisposition.REQUIRED:
         logger.info(
             'digest_work_already_resolved',
             work_id=str(work.id),
@@ -964,6 +711,7 @@ def _run_digest_automatic_delivery(task: object, work: WorkflowWork, expected_wo
         lease_for=_DIGEST_LEASE,
         event_prefix='digest_work',
         execute=execute,
+        workflow_run_id=workflow_run_id,
     )
 
 
@@ -984,10 +732,7 @@ def generate_daily_digest_work_v1(
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, WorkflowWorkType.DAILY_DIGEST)
 
-    if parsed_run_id is not None:
-        return _run_digest_explicit_delivery(self, work, parsed_run_id)
-
-    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.DAILY_DIGEST)
+    return _run_digest_delivery(self, work, WorkflowWorkType.DAILY_DIGEST, parsed_run_id)
 
 
 @app.task(
@@ -1052,10 +797,7 @@ def generate_weekly_digest_work_v1(
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, WorkflowWorkType.WEEKLY_DIGEST)
 
-    if parsed_run_id is not None:
-        return _run_digest_explicit_delivery(self, work, parsed_run_id)
-
-    return _run_digest_automatic_delivery(self, work, WorkflowWorkType.WEEKLY_DIGEST)
+    return _run_digest_delivery(self, work, WorkflowWorkType.WEEKLY_DIGEST, parsed_run_id)
 
 
 @app.task(name='engram.memory.reembed_missing_embeddings')

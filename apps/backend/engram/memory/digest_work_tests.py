@@ -1473,12 +1473,16 @@ def _digest_output_for_work(project: Project, work: WorkflowWork) -> int:
 
 
 @pytest.mark.django_db
-def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
+def test_daily_work_explicit_v1_run_ends_succeeded_with_result_memory_id() -> None:
     organization, project = _make_scope('daily-run-succeeded')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
-    run = _linked_daily_run(organization, project, work)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
 
     result = generate_daily_digest_work_v1(str(work.id), str(run.id))
 
@@ -1491,23 +1495,32 @@ def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
 
 
 @pytest.mark.django_db
-def test_daily_work_linked_run_fails_on_frozen_drift_before_provider() -> None:
+def test_daily_work_explicit_v1_frozen_drift_terminalizes_at_claim_without_provider() -> None:
     organization, project = _make_scope('daily-run-failed')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
-    run = _linked_daily_run(organization, project, work)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
 
     tampered = dict(work.input_snapshot)
     tampered['input_digest'] = 'deadbeef' * 8
     WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
 
-    with pytest.raises(MemoryWorkerError, match='fingerprint'):
-        generate_daily_digest_work_v1(str(work.id), str(run.id))
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
 
+    assert result == str(work.id)
     run.refresh_from_db()
-    assert run.status == WorkflowRunStatus.FAILED
-    assert run.failure_reason != ''
+    assert run.status == WorkflowRunStatus.QUEUED
+    terminal = _v1_runs(work).exclude(id=run.id).get()
+    assert terminal.status == WorkflowRunStatus.FAILED
+    assert terminal.failure_class == INVALID_INPUT
+    assert terminal.failure_code == 'work_fingerprint_mismatch'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
 
 
