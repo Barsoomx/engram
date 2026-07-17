@@ -25,11 +25,13 @@ from engram.model_policy.services import (
     UpdateModelPolicy,
     UpdateModelPolicyInput,
     _split_completion,
+    curation_schema_prompt_prefix,
     generated_candidates_payload,
     secret_fingerprint,
 )
 
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
+MEMORY_KIND_TOKENS = ('decision', 'convention', 'gotcha', 'architecture', 'incident')
 
 
 def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
@@ -369,6 +371,94 @@ def test_openai_curation_decision_prompt_carries_verdict_schema_instructions() -
     assert 'supersede_memory' in user_message
     assert 'temporal_order' in user_message
     assert user_message.rstrip().endswith('{"schema":"curation_judge_input.v1"}')
+
+
+@pytest.mark.django_db
+def test_openai_distill_extract_prompt_carries_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('{}'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='distill-extract-schema-1',
+            trace_id='distill-extract-schema-1',
+            prompt='Observation: 6f1d0b3c-1f6c-4a4a-9f61-2f2a1c9d4b77',
+            response_kind='distill_extract.v1',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    user_message = sent['messages'][-1]['content']
+
+    assert 'memories' in user_message
+    assert 'no_signal_observation_ids' in user_message
+    assert 'supporting_observation_ids' in user_message
+    assert 'confidence' in user_message
+    assert user_message.rstrip().endswith('Observation: 6f1d0b3c-1f6c-4a4a-9f61-2f2a1c9d4b77')
+
+
+@pytest.mark.django_db
+def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('{}'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='distill-reduce-schema-1',
+            trace_id='distill-reduce-schema-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v1',
+        ),
+    )
+
+    sent = json.loads(opener.requests[0].data)
+    user_message = sent['messages'][-1]['content']
+
+    assert 'memories' in user_message
+    assert 'source_ids' in user_message
+    assert 'confidence' in user_message
+    assert user_message.rstrip().endswith('{"drafts":[]}')
+
+
+def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
+    instructions = curation_schema_prompt_prefix('distill_extract.v1')
+
+    assert instructions
+    for token in ('memories', 'no_signal_observation_ids', 'supporting_observation_ids', 'title', 'body', 'kind'):
+        assert token in instructions
+
+    for kind in MEMORY_KIND_TOKENS:
+        assert kind in instructions
+
+    assert '12' in instructions
+    assert '255' in instructions
+    assert '3000' in instructions
+
+
+def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
+    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
+
+    assert instructions
+    for token in ('memories', 'source_ids', 'confidence', 'title', 'body', 'kind', 'reduction_target'):
+        assert token in instructions
+
+    for kind in MEMORY_KIND_TOKENS:
+        assert kind in instructions
+
+    assert '255' in instructions
+    assert '3000' in instructions
 
 
 @pytest.mark.django_db
