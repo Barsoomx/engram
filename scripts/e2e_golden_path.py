@@ -165,7 +165,9 @@ def main() -> int:
                 secret=api_key,
             )
             assert_equal(session_end.get('status'), 'accepted', 'session-end status')
-            approve_cp3_candidate(project_id, run_id, agent_key)
+            progress('Waiting for autonomous curation decision (publish_new) without manual approval')
+            decision = wait_for_autonomous_curation_decision(project_id, run_id, agent_key)
+            assert_equal(decision.get('outcome'), 'publish_new', 'autonomous curation outcome')
 
             progress('Waiting for worker-created retrieval document')
             worker_memory = wait_for_worker_memory(project_id, run_id, api_key)
@@ -241,7 +243,9 @@ def main() -> int:
                 secret=api_key,
             )
             assert_equal(session_end_repo_url.get('status'), 'accepted', 'session-end (repo-url) status')
-            approve_cp3_candidate(project_id, run_id_repo_url, agent_key)
+            progress('Waiting for autonomous curation decision (repo-url, publish_new) without manual approval')
+            decision_repo_url = wait_for_autonomous_curation_decision(project_id, run_id_repo_url, agent_key)
+            assert_equal(decision_repo_url.get('outcome'), 'publish_new', 'autonomous curation outcome (repo-url)')
 
             progress('Waiting for second worker-created retrieval document')
             worker_memory_repo_url = wait_for_worker_memory(project_id, run_id_repo_url, api_key)
@@ -543,13 +547,19 @@ def wait_for_worker_memory(project_id: str, run_id: str, secret: str) -> dict[st
     )
 
 
-def approve_cp3_candidate(project_id: str, run_id: str, secret: str) -> dict[str, object]:
+def wait_for_autonomous_curation_decision(project_id: str, run_id: str, secret: str) -> dict[str, object]:
     query = f"""
 import json
-from engram.access.models import Identity
-from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+from engram.core.models import (
+    CandidateStatus,
+    CurationDecision,
+    CurationOutcome,
+    MemoryCandidate,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
+)
 project_id = {json.dumps(project_id)}
-project = Project.objects.get(id=project_id)
 client_event_id = {json.dumps(f'e2e-hook-event-{run_id}')}
 request_id = {json.dumps(f'e2e-hook-request-{run_id}')}
 candidate = (
@@ -558,7 +568,6 @@ candidate = (
         decision_work_contract_version=1,
         sources__observation__raw_event__client_event_id=client_event_id,
         sources__observation__raw_event__request_id=request_id,
-        status='proposed',
     ).distinct().order_by('-created_at').first()
 )
 if candidate is None:
@@ -567,18 +576,27 @@ work = WorkflowWork.objects.filter(
     project_id=project_id,
     subject_id=candidate.id,
     work_type='candidate_decision',
-    execution_state='blocked',
-).first()
+).order_by('-created_at').first()
 if work is None:
     raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision work missing')
-run = WorkflowRun.objects.filter(work=work, status='failed', failure_code='rollout_not_enabled').first()
-if run is None:
-    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
-organization = Organization.objects.get(id=project.organization_id)
-actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
-from engram.console.services import approve_memory_candidate
-memory = approve_memory_candidate(organization, actor, candidate, 'CP3 golden-path typed approval')
-print(json.dumps({{'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}}))
+if (
+    work.execution_state != WorkflowWorkExecutionState.SETTLED
+    or work.disposition != WorkflowWorkDisposition.COMPLETE
+):
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate decision not autonomously settled')
+decision = CurationDecision.objects.filter(work=work, candidate=candidate).first()
+if decision is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': autonomous curation decision not recorded')
+if decision.outcome != CurationOutcome.PUBLISH_NEW:
+    raise SystemExit('autonomous curation decision outcome is ' + str(decision.outcome) + ', expected publish_new')
+candidate.refresh_from_db()
+if candidate.status != CandidateStatus.PROMOTED or candidate.promoted_memory_id is None:
+    raise SystemExit({json.dumps(WORKER_MEMORY_NOT_READY_ERROR)} + ': candidate not autonomously promoted')
+print(json.dumps({{
+    'candidate_id': str(candidate.id),
+    'memory_id': str(candidate.promoted_memory_id),
+    'outcome': str(decision.outcome),
+}}))
 """
     return wait_for_golden_db_state(query, secret)
 

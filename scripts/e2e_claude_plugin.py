@@ -536,13 +536,20 @@ def verify_backend_state(*, secret: str) -> dict[str, object]:
     return state
 
 
-def approve_cp3_candidate(*, secret: str) -> dict[str, object]:
+def wait_for_autonomous_curation_decision(*, secret: str) -> dict[str, object]:
     return wait_for_db_state(
         f"""
 import json
-from engram.console.services import approve_memory_candidate
-from engram.access.models import Identity
-from engram.core.models import MemoryCandidate, Organization, Project, WorkflowRun, WorkflowWork
+from engram.core.models import (
+    CandidateStatus,
+    CurationDecision,
+    CurationOutcome,
+    MemoryCandidate,
+    Project,
+    WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
+)
 
 project = Project.objects.filter(repository_url={json.dumps(CANONICAL_REPO_URL)}).first()
 if project is None:
@@ -550,7 +557,6 @@ if project is None:
 candidate = (
     MemoryCandidate.objects.filter(
         project=project,
-        status='proposed',
         decision_work_contract_version=1,
         title__startswith={json.dumps(SESSION_TITLE_PREFIX)},
         sources__source_kind='distillation',
@@ -563,21 +569,27 @@ work = WorkflowWork.objects.filter(
     project=project,
     subject_id=candidate.id,
     work_type='candidate_decision',
-    execution_state='blocked',
-).first()
+).order_by('-created_at').first()
 if work is None:
     raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate-decision work missing')
-run = WorkflowRun.objects.filter(
-    work=work,
-    status='failed',
-    failure_code='rollout_not_enabled',
-).first()
-if run is None:
-    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate decision is not configuration-blocked')
-organization = Organization.objects.get(id=project.organization_id)
-actor = Identity.objects.get(organization=organization, external_id='golden-path-operator', active=True)
-memory = approve_memory_candidate(organization, actor, candidate, 'CP3 Claude plugin typed approval')
-print(json.dumps({{'candidate_id': str(candidate.id), 'memory_id': str(memory.id)}}))
+if (
+    work.execution_state != WorkflowWorkExecutionState.SETTLED
+    or work.disposition != WorkflowWorkDisposition.COMPLETE
+):
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate decision not autonomously settled')
+decision = CurationDecision.objects.filter(work=work, candidate=candidate).first()
+if decision is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': autonomous curation decision not recorded')
+if decision.outcome != CurationOutcome.PUBLISH_NEW:
+    raise SystemExit('autonomous curation decision outcome is ' + str(decision.outcome) + ', expected publish_new')
+candidate.refresh_from_db()
+if candidate.status != CandidateStatus.PROMOTED or candidate.promoted_memory_id is None:
+    raise SystemExit({json.dumps(DB_NOT_READY_ERROR)} + ': candidate not autonomously promoted')
+print(json.dumps({{
+    'candidate_id': str(candidate.id),
+    'memory_id': str(candidate.promoted_memory_id),
+    'outcome': str(decision.outcome),
+}}))
 """,
         secret=secret,
     )
@@ -1195,9 +1207,11 @@ def main() -> int:
                     f'claude run failed:\nstdout:\n{claude_result.stdout[-4000:]}\nstderr:\n{claude_result.stderr[-4000:]}',
                 )
 
-            progress('Waiting for CP3 candidate-decision block and approving typed memory')
-            approved = approve_cp3_candidate(secret=agent_key)
-            progress(f'Typed approval OK: {json.dumps(approved)}')
+            progress('Waiting for autonomous CP3 curation decision (publish_new) without manual approval')
+            approved = wait_for_autonomous_curation_decision(secret=agent_key)
+            if approved.get('outcome') != 'publish_new':
+                raise E2EError(f'autonomous curation outcome was {approved.get("outcome")}, expected publish_new')
+            progress(f'Autonomous publish OK: {json.dumps(approved)}')
 
             progress('Verifying backend contract state (distillation, promotion, embeddings)')
             state = verify_backend_state(secret=agent_key)
