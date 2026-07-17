@@ -3119,3 +3119,199 @@ def test_0040_curation_decision_round_trip_preserves_schema() -> None:
             assert cursor.fetchone()[0] is None
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0035_reverse_refuses_v1_execution_history() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0035)
+        apps_0035 = executor.loader.project_state(MIGRATE_0035).apps
+        scope = _create_historical_0032b_scope(apps_0035)
+        work_model = apps_0035.get_model('core', 'WorkflowWork')
+        run_model = apps_0035.get_model('core', 'WorkflowRun')
+        work = work_model.objects.create(
+            **_execution_work_fields(
+                scope,
+                execution_state='terminal_failure',
+                fencing_token=9,
+                failure_streak=3,
+            )
+        )
+        finished_at = timezone.now()
+        run = run_model.objects.create(
+            **_v1_run_fields(
+                scope,
+                work,
+                'failed',
+                origin='automatic',
+                fencing_token=9,
+                lease_owner='migration-test-worker',
+                started_at=finished_at - timedelta(seconds=1),
+                finished_at=finished_at,
+                failure_class='provider_transient',
+                failure_code='provider_timeout',
+            )
+        )
+
+        with pytest.raises(RuntimeError, match='cannot reverse 0035.*v1'):
+            MigrationExecutor(connection).migrate(MIGRATE_0034)
+
+        preserved_work = work_model.objects.get(id=work.id)
+        preserved_run = run_model.objects.get(id=run.id)
+        assert preserved_work.execution_state == 'terminal_failure'
+        assert preserved_work.fencing_token == 9
+        assert preserved_work.failure_streak == 3
+        assert preserved_run.execution_contract_version == 1
+        assert preserved_run.fencing_token == 9
+        assert preserved_run.failure_class == 'provider_transient'
+        assert preserved_run.failure_code == 'provider_timeout'
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0036_reverse_refuses_populated_distillation_lineage() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0036)
+        apps_0036 = executor.loader.project_state(MIGRATE_0036).apps
+        _stage_model, stage = _create_historical_0036_stage_fixture(apps_0036, 'a')
+        window = stage.window
+        session = window.session
+        scope = {
+            'organization': window.organization,
+            'project': window.project,
+            'team': window.team,
+            'agent': session.agent,
+        }
+        observation = _create_historical_observation(
+            apps_0036,
+            scope,
+            session,
+            'a' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        candidate = apps_0036.get_model('core', 'MemoryCandidate').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Reverse guard candidate',
+            body='Durable candidate provenance',
+            content_hash='b' * 64,
+            decision_work_contract_version=1,
+        )
+        coverage = apps_0036.get_model('core', 'DistillationObservationCoverage').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            window=window,
+            observation=observation,
+            session_sequence=1,
+            observation_digest='c' * 64,
+            outcome='signal',
+            deciding_stage=stage,
+        )
+        source = apps_0036.get_model('core', 'MemoryCandidateSource').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=candidate,
+            window=window,
+            observation=observation,
+            stage=stage,
+            anchors={'schema': 'distillation_candidate_source.v1'},
+            anchors_hash='d' * 64,
+        )
+
+        with pytest.raises(RuntimeError, match='cannot reverse 0036.*distillation'):
+            MigrationExecutor(connection).migrate(MIGRATE_0035)
+
+        assert apps_0036.get_model('core', 'DistillationWindow').objects.filter(id=window.id).exists()
+        assert apps_0036.get_model('core', 'DistillationStage').objects.filter(id=stage.id).exists()
+        assert (
+            apps_0036.get_model('core', 'DistillationObservationCoverage')
+            .objects.filter(id=coverage.id)
+            .exists()
+        )
+        assert apps_0036.get_model('core', 'MemoryCandidateSource').objects.filter(id=source.id).exists()
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0040_reverse_refuses_populated_curation_decisions() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0040)
+        apps_0040 = executor.loader.project_state(MIGRATE_0040).apps
+        scope = _create_historical_0032b_scope(apps_0040)
+        session = _create_historical_session(apps_0040, scope, 'migration-0040-reverse-guard')
+        observation = _create_historical_observation(
+            apps_0040,
+            scope,
+            session,
+            'e' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        candidate = apps_0040.get_model('core', 'MemoryCandidate').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Decision reverse guard candidate',
+            body='The append-only decision must survive a rejected reverse.',
+            content_hash='f' * 64,
+            decision_work_contract_version=1,
+        )
+        work = apps_0040.get_model('core', 'WorkflowWork').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            work_type='candidate_decision',
+            subject_type='memory_candidate',
+            subject_id=candidate.id,
+            contract_version=1,
+            occurrence_key='',
+            input_fingerprint='1' * 64,
+            input_snapshot={'schema': 'candidate_decision_input/v1'},
+            disposition='complete',
+            resolution_reason='succeeded',
+            resolved_at=timezone.now(),
+            execution_state='settled',
+        )
+        decision = apps_0040.get_model('core', 'CurationDecision').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            work=work,
+            candidate=candidate,
+            contract_version=1,
+            input_fingerprint=work.input_fingerprint,
+            evidence_manifest_hash='2' * 64,
+            comparison_manifest_hash='3' * 64,
+            outcome='reject_candidate',
+            reason_code='noise_empty',
+            redacted_reason='empty after deterministic normalization',
+            effective_visibility_scope='team',
+            effective_team=scope['team'],
+            evidence_tier='none',
+            payload_hash='4' * 64,
+        )
+
+        target = MIGRATE_0039 + [('model_policy', '0004_alter_providercallrecord_result')]
+        with pytest.raises(RuntimeError, match='cannot reverse 0040.*CurationDecision'):
+            MigrationExecutor(connection).migrate(target)
+
+        assert apps_0040.get_model('core', 'CurationDecision').objects.filter(id=decision.id).exists()
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
