@@ -37,6 +37,7 @@ from engram.core.models import (
     VisibilityScope,
     WorkflowRun,
     WorkflowRunFailureClass,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowSubjectType,
@@ -65,6 +66,7 @@ from engram.memory.transitions_test_support import (
     transition_request,
     transitions_module,
 )
+from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     create_work,
@@ -1304,6 +1306,59 @@ def test_automatic_observation_work_delivery_is_idempotent_after_terminal_resolu
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_observation_explicit_v1_attempt_is_claimed_and_completed_with_a_fence() -> None:
+    organization, _team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+
+    with mock.patch(
+        'engram.memory.tasks.ProcessObservationRecorded.execute',
+        return_value=MemoryCandidateWorkerResult(candidate=None, duplicate=False, memory=None),
+    ):
+        result = tasks_module.process_observation_work_v1(str(work.id), workflow_run_id=str(run.id))
+
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert result == str(run.id)
+    assert run.execution_contract_version == 1
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == work.fencing_token == 1
+    assert run.lease_owner != ''
+    assert run.heartbeat_at is not None
+    assert run.lease_expires_at is not None
+
+
+@pytest.mark.django_db
+def test_observation_explicit_delivery_rejects_legacy_v0_before_domain_access() -> None:
+    organization, team, project, _session, _raw_event, observation = create_observation_recorded_scope()
+    work = create_required_observation_work(observation)
+    run = WorkflowRun.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        work=work,
+        run_type=WorkflowRunType.OBSERVATION_PROCESSING,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    with mock.patch('engram.memory.tasks.ProcessObservationRecorded.execute') as m_execute:
+        with pytest.raises(ValueError, match='queued v1 attempt'):
+            tasks_module.process_observation_work_v1(str(work.id), workflow_run_id=str(run.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert run.execution_contract_version == 0
+    assert run.status == WorkflowRunStatus.QUEUED
+    assert run.fencing_token is None
+    assert work.fencing_token == 0
 
 
 @pytest.mark.django_db

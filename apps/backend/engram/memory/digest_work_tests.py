@@ -46,6 +46,7 @@ from engram.memory.transitions import (
     build_memory_fence,
 )
 from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
+from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import execution_configuration_fingerprint
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
 from engram.memory.workflow_work import CreateWorkflowWorkInput
@@ -1508,6 +1509,54 @@ def test_daily_work_linked_run_fails_on_frozen_drift_before_provider() -> None:
     assert run.status == WorkflowRunStatus.FAILED
     assert run.failure_reason != ''
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_explicit_v1_attempt_is_claimed_and_completed_with_a_fence() -> None:
+    organization, project = _make_scope('daily-explicit-v1-fence')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert result == str(run.id)
+    assert run.execution_contract_version == 1
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == work.fencing_token == 1
+    assert run.lease_owner != ''
+    assert run.heartbeat_at is not None
+    assert run.lease_expires_at is not None
+
+
+@pytest.mark.django_db
+def test_daily_explicit_delivery_rejects_legacy_v0_before_domain_access() -> None:
+    organization, project = _make_scope('daily-explicit-v0-rejected')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    with mock.patch(
+        'engram.memory.digest_work.execute_frozen_digest_work',
+        return_value=None,
+    ) as m_execute:
+        with pytest.raises(ValueError, match='queued v1 attempt'):
+            generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert run.execution_contract_version == 0
+    assert run.status == WorkflowRunStatus.QUEUED
+    assert run.fencing_token is None
+    assert work.fencing_token == 0
 
 
 @pytest.mark.django_db
