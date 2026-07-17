@@ -1140,7 +1140,10 @@ def default_base_url(provider: str) -> str:
     return 'https://api.openai.com/v1'
 
 
-def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, object]:
+def deepseek_thinking_override(provider: str, task_type: str, response_kind: str) -> dict[str, object]:
+    if provider == 'deepseek' and response_kind == 'curation_decision_v1':
+        return {'thinking': {'type': 'enabled'}}
+
     if provider == 'deepseek' and task_type in ('curation', 'digest'):
         return {'thinking': {'type': 'disabled'}}
 
@@ -1223,6 +1226,31 @@ _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
     'Only reference memory_version_id values and evidence tokens present in the input. '
     'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
     'must equal the top-level relation.'
+    ' Allowed outcome and relation combinations (any other combination is invalid): '
+    'publish_new with relation unrelated or compatible_distinct, target_memory_version_id null, '
+    'candidate evidence tier supported or corroborated and comparison_complete true; '
+    'merge_evidence with relation equivalent, a non-null target and both candidate and target evidence tiers '
+    'supported or corroborated; '
+    'revise_memory with relation candidate_revises, a non-null target, candidate evidence tier corroborated, '
+    'target evidence tier supported or corroborated and temporal_order candidate_newer used only when the '
+    'candidate evidence is clearly newer, which the system verifies; '
+    'supersede_memory with relation candidate_supersedes, a non-null target, candidate evidence tier '
+    'corroborated, target evidence tier supported or corroborated, temporal_order candidate_newer used only '
+    'when the candidate evidence is clearly newer, which the system verifies, and comparison_complete true; '
+    'reject_candidate with relation redundant, a non-null target and target evidence tier supported or '
+    'corroborated; '
+    'reject_candidate with relation unsupported, target null and the candidate having no supporting evidence, '
+    'evidence tier none; '
+    'open_conflict with relation mutually_incompatible, a non-null target, temporal_order unordered, both '
+    'candidate and target evidence tiers supported or corroborated, non-empty evidence refs on both sides, '
+    'comparison_complete true and applicability same. '
+    'The top-level relation describes the selected target; with a null target use unrelated, '
+    'compatible_distinct or unsupported. '
+    'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
+    'When comparison_complete is true, every shortlist comparison is unrelated or compatible_distinct and the '
+    'candidate evidence tier is supported or corroborated, choose publish_new with target null. '
+    'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
+    'candidate evidence.'
 )
 
 
@@ -1532,7 +1560,7 @@ class OpenAICompatibleGateway:
             prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
         extra: dict[str, object] = {}
-        extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
+        extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
         extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
         started_at = time.monotonic()
