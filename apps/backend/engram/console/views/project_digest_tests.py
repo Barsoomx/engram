@@ -236,6 +236,9 @@ def test_post_digest_run_reuses_work_across_manual_requests_with_distinct_runs(
 
     WorkflowRun.objects.filter(id=run_one.id).update(
         status=WorkflowRunStatus.SUCCEEDED,
+        fencing_token=1,
+        lease_owner='manual-digest-test',
+        started_at=timezone.now(),
         finished_at=timezone.now(),
     )
 
@@ -439,6 +442,9 @@ def test_post_digest_run_reports_already_built_when_occurrence_complete(
     resolve_work_succeeded(work.id, organization_id=f_org.id, project_id=f_project.id)
     WorkflowRun.objects.filter(id=run.id).update(
         status=WorkflowRunStatus.SUCCEEDED,
+        fencing_token=1,
+        lease_owner='manual-digest-test',
+        started_at=timezone.now(),
         finished_at=timezone.now(),
     )
 
