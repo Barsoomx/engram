@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
 import uuid
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
 import structlog
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Exists, Min, OuterRef, Q
 from django.utils import timezone
 from rest_framework import status
 
@@ -38,6 +40,7 @@ from engram.core.models import (
     CandidateStatus,
     Memory,
     MemoryCandidate,
+    MemoryConflict,
     MemoryLink,
     MemoryReviewExample,
     MemoryStatus,
@@ -49,17 +52,21 @@ from engram.core.models import (
 from engram.core.redaction import redact_value as core_redact_value
 from engram.core.repository import canonicalize_repository_url
 from engram.memory.conflict_links import clear_candidate_conflict_links
+from engram.memory.import_provenance import candidate_evidence_manifest
 from engram.memory.services import (
     PromoteMemoryCandidate,
     PromoteMemoryCandidateInput,
 )
 from engram.memory.transitions import (
     ArchiveMemory,
+    CandidateFence,
     MemoryStateInput,
     MemoryTransitionError,
     MergeMemories,
     MergeMemoriesInput,
     RefuteMemory,
+    ResolveMemoryConflict,
+    ResolveMemoryConflictInput,
     RestoreMemory,
     ReviseMemory,
     ReviseMemoryInput,
@@ -1005,3 +1012,251 @@ def bulk_archive_memories(
         archived_ids.append(memory.id)
 
     return archived_ids
+
+
+CONFLICT_RESOLUTION_ACTIONS = (
+    'publish_candidate',
+    'merge_candidate',
+    'supersede_memory',
+    'reject_candidate',
+)
+
+_CONFLICT_TARGET_ACTIONS = ('merge_candidate', 'supersede_memory')
+
+
+def open_conflict_candidates(
+    organization: Organization,
+    *,
+    project_id: uuid.UUID | None = None,
+    team_id: uuid.UUID | None = None,
+    opened_at__gte: Any = None,
+    search: str | None = None,
+) -> Any:
+    unresolved = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
+    )
+
+    queryset = MemoryCandidate.objects.filter(organization=organization).filter(Exists(unresolved))
+
+    if project_id is not None:
+        queryset = queryset.filter(project_id=project_id)
+
+    if team_id is not None:
+        queryset = queryset.filter(team_id=team_id)
+
+    if search:
+        queryset = queryset.filter(Q(title__icontains=search) | Q(body__icontains=search))
+
+    queryset = queryset.annotate(
+        opened_at=Min(
+            'memory_conflicts__created_at',
+            filter=Q(memory_conflicts__resolved_transition__isnull=True),
+        ),
+    )
+
+    if opened_at__gte is not None:
+        queryset = queryset.filter(opened_at__gte=opened_at__gte)
+
+    return queryset
+
+
+def open_conflicts_for_candidates(
+    organization: Organization,
+    candidate_ids: Iterable[uuid.UUID],
+) -> dict[uuid.UUID, list[MemoryConflict]]:
+    conflicts = (
+        MemoryConflict.objects.filter(
+            organization=organization,
+            candidate_id__in=list(candidate_ids),
+            resolved_transition__isnull=True,
+        )
+        .select_related('memory', 'memory_version')
+        .order_by('candidate_id', 'id')
+    )
+
+    grouped: dict[uuid.UUID, list[MemoryConflict]] = defaultdict(list)
+
+    for conflict in conflicts:
+        grouped[conflict.candidate_id].append(conflict)
+
+    return grouped
+
+
+def get_conflict_candidate_or_404(
+    organization: Organization,
+    candidate_id: uuid.UUID,
+) -> MemoryCandidate:
+    unresolved = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
+    )
+
+    candidate = (
+        MemoryCandidate.objects.filter(
+            organization=organization,
+            id=candidate_id,
+        )
+        .filter(Exists(unresolved))
+        .first()
+    )
+
+    if candidate is None:
+        raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
+    return candidate
+
+
+def conflict_set_etag(candidate: MemoryCandidate) -> str:
+    open_conflicts = list(
+        MemoryConflict.objects.filter(
+            candidate=candidate,
+            resolved_transition__isnull=True,
+        )
+        .select_related('memory')
+        .order_by('id'),
+    )
+
+    parts = [
+        str(candidate.id),
+        ','.join(sorted(str(conflict.id) for conflict in open_conflicts)),
+        ','.join(sorted(str(conflict.opened_transition_id) for conflict in open_conflicts)),
+        ','.join(sorted(conflict.evidence_hash for conflict in open_conflicts)),
+        ','.join(sorted(build_memory_fence(conflict.memory).state_hash for conflict in open_conflicts)),
+    ]
+
+    digest = hashlib.sha256('|'.join(parts).encode()).hexdigest()
+
+    return f'"{digest}"'
+
+
+@transaction.atomic
+def resolve_candidate_conflicts(
+    *,
+    organization: Organization,
+    actor_identity: Identity,
+    candidate: MemoryCandidate,
+    action: str,
+    reason: str,
+    target_memory_id: uuid.UUID | None = None,
+    merged_title: str | None = None,
+    merged_body: str | None = None,
+) -> dict[str, Any]:
+    open_conflicts = list(
+        MemoryConflict.objects.filter(
+            candidate=candidate,
+            resolved_transition__isnull=True,
+        )
+        .select_related('memory')
+        .order_by('id'),
+    )
+
+    if not open_conflicts:
+        raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
+    conflict_ids = tuple(conflict.id for conflict in open_conflicts)
+    conflict_memory_fences = tuple(build_memory_fence(conflict.memory) for conflict in open_conflicts)
+
+    selected_memory_fence = _selected_conflict_memory_fence(open_conflicts, action, target_memory_id)
+
+    _entries, manifest_hash = candidate_evidence_manifest(candidate)
+    candidate_fence = CandidateFence(
+        candidate_id=candidate.id,
+        candidate_content_hash=candidate.content_hash,
+        evidence_manifest_hash=manifest_hash,
+    )
+
+    operation_id = f'console-conflict-resolve:{candidate.id}:{uuid.uuid4()}:v1'
+
+    title = merged_title if action != 'reject_candidate' else None
+    body = merged_body if action != 'reject_candidate' else None
+
+    result = _execute_conflict_resolution(
+        lambda: ResolveMemoryConflict().execute(
+            ResolveMemoryConflictInput(
+                request=TransitionRequest(
+                    scope=TransitionScope(
+                        organization_id=organization.id,
+                        project_id=candidate.project_id,
+                        team_id=candidate.team_id,
+                    ),
+                    idempotency_key=operation_id,
+                    actor_type='user',
+                    actor_id=str(actor_identity.id),
+                    capability='memories:admin',
+                    request_id=operation_id,
+                    correlation_id=operation_id,
+                    reason=reason,
+                    origin='console',
+                ),
+                candidate_fence=candidate_fence,
+                conflict_ids=conflict_ids,
+                conflict_memory_fences=conflict_memory_fences,
+                resolution=action,
+                selected_memory_fence=selected_memory_fence,
+                title=title,
+                body=body,
+            )
+        )
+    )
+
+    _record_review_example(
+        organization=organization,
+        actor_identity=actor_identity,
+        item=candidate,
+        action=action,
+        reason=reason,
+        curator_context={'conflict_ids': [str(conflict_id) for conflict_id in conflict_ids]},
+    )
+
+    rejected = action == 'reject_candidate'
+
+    return {
+        'id': str(candidate.id),
+        'candidate_id': str(candidate.id),
+        'state': 'resolved',
+        'action': action,
+        'conflict_ids': [str(conflict_id) for conflict_id in conflict_ids],
+        'transition_id': str(result.transition.id),
+        'memory_id': None if rejected else str(result.memory.id),
+        'version_id': None if rejected else str(result.memory_version.id),
+    }
+
+
+def _selected_conflict_memory_fence(
+    open_conflicts: list[MemoryConflict],
+    action: str,
+    target_memory_id: uuid.UUID | None,
+) -> Any:
+    if action in _CONFLICT_TARGET_ACTIONS:
+        if target_memory_id is None:
+            raise MemoryReviewError('invalid_target', 'target_memory_id is required for this action')
+
+        selected = next(
+            (conflict for conflict in open_conflicts if conflict.memory_id == target_memory_id),
+            None,
+        )
+
+        if selected is None:
+            raise MemoryReviewError('invalid_target', 'target memory is not in the conflict set')
+
+        return build_memory_fence(selected.memory)
+
+    if target_memory_id is not None:
+        raise MemoryReviewError('invalid_target', 'target memory is not allowed for this action')
+
+    return None
+
+
+def _execute_conflict_resolution(call: Any) -> Any:
+    try:
+        return call()
+
+    except MemoryTransitionError as error:
+        if error.retryable or error.code == 'stale_decision':
+            raise MemoryReviewError('stale_conflict_set', str(error), status=412) from error
+
+        if error.code == 'scope':
+            raise MemoryReviewError('not_found', str(error), status=404) from error
+
+        raise MemoryReviewError('invalid_state', str(error), status=400) from error

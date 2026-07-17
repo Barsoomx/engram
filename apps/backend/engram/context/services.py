@@ -10,7 +10,7 @@ from decimal import Decimal
 import structlog
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
@@ -33,6 +33,7 @@ from engram.core.models import (
     ContextBundleItem,
     ContextBundleStatus,
     Memory,
+    MemoryConflict,
     MemoryStatus,
     MemoryTransition,
     MemoryVersion,
@@ -310,6 +311,14 @@ def authorized_retrieval_documents(
         memory__refuted=False,
         stale=False,
         refuted=False,
+    )
+    documents = documents.filter(
+        ~Exists(
+            MemoryConflict.objects.filter(
+                memory_id=OuterRef('memory_id'),
+                resolved_transition__isnull=True,
+            ),
+        ),
     )
     if kinds:
         documents = documents.filter(memory__kind__in=kinds)

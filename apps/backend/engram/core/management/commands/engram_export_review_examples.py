@@ -15,13 +15,13 @@ class Command(BaseCommand):
     help = 'Export review-decision examples as JSON Lines for curator evaluation.'
 
     def add_arguments(self, parser: CommandParser) -> None:
-        parser.add_argument('--organization', required=True, dest='organization_id')
-        parser.add_argument('--project', default=None, dest='project_id')
+        parser.add_argument('--organization', required=True, dest='organization')
+        parser.add_argument('--project', default=None, dest='project')
         parser.add_argument('--output', default='-', dest='output')
 
     def handle(self, *args: Any, **options: Any) -> None:
-        organization_id = uuid.UUID(str(options['organization_id']))
-        project_id = uuid.UUID(str(options['project_id'])) if options['project_id'] else None
+        organization_id = uuid.UUID(str(options['organization']))
+        project_id = uuid.UUID(str(options['project'])) if options['project'] else None
         output = str(options['output'])
 
         if output == '-':
