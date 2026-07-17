@@ -31,7 +31,6 @@ from engram.model_policy.services import (
 )
 
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
-MEMORY_KIND_TOKENS = ('decision', 'convention', 'gotcha', 'architecture', 'incident')
 
 
 def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
@@ -435,30 +434,41 @@ def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
 def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
     instructions = curation_schema_prompt_prefix('distill_extract.v1')
 
-    assert instructions
-    for token in ('memories', 'no_signal_observation_ids', 'supporting_observation_ids', 'title', 'body', 'kind'):
-        assert token in instructions
-
-    for kind in MEMORY_KIND_TOKENS:
-        assert kind in instructions
-
-    assert '12' in instructions
-    assert '255' in instructions
-    assert '3000' in instructions
+    assert instructions == (
+        'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+        'The object must contain exactly these keys and no additional properties: '
+        'memories (array of at most 12 objects); '
+        'no_signal_observation_ids (array of observation ids, unique, may be empty). '
+        'Each memories entry must contain exactly these keys and no additional properties: '
+        'title (non-blank string, at most 255 characters); '
+        'body (non-blank string, at most 3000 characters); '
+        'confidence (a JSON number between 0 and 1, never a string); '
+        'supporting_observation_ids (non-empty array of unique observation ids); '
+        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
+        'Only use observation ids copied verbatim from the input observations. '
+        'Every input observation id must appear at least once across the memories supporting_observation_ids '
+        'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+        'The same observation id may support more than one memory.'
+    )
 
 
 def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
     instructions = curation_schema_prompt_prefix('distill_reduce.v1')
 
-    assert instructions
-    for token in ('memories', 'source_ids', 'confidence', 'title', 'body', 'kind', 'reduction_target'):
-        assert token in instructions
-
-    for kind in MEMORY_KIND_TOKENS:
-        assert kind in instructions
-
-    assert '255' in instructions
-    assert '3000' in instructions
+    assert instructions == (
+        'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+        'The object must contain exactly the key memories (array of objects) and no additional properties. '
+        'Each memories entry must contain exactly these keys and no additional properties: '
+        'title (non-blank string, at most 255 characters); '
+        'body (non-blank string, at most 3000 characters); '
+        'confidence (a JSON number between 0 and 1); '
+        'source_ids (non-empty array of unique draft ids); '
+        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
+        'Only use draft ids copied verbatim from the input drafts. '
+        'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+        'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
+        'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+    )
 
 
 @pytest.mark.django_db
