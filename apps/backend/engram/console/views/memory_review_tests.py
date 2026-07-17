@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from django.contrib.auth.models import User
-from django.utils import timezone
+from django.core.management import call_command
 from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user
@@ -19,24 +22,35 @@ from engram.access.models import (
     RoleCapability,
 )
 from engram.console.services import approve_memory_candidate, reject_review_item
-from engram.console.views.memory_review import PAGE_SIZE
 from engram.core.models import (
-    AuditEvent,
     CandidateStatus,
-    LinkType,
     Memory,
     MemoryCandidate,
+    MemoryConflict,
     MemoryLink,
+    MemoryReviewExample,
     MemoryStatus,
-    MemoryVersion,
+    MemoryTransition,
+    MemoryTransitionType,
     Observation,
-    ObservationSource,
     Organization,
     Project,
     Team,
     VisibilityScope,
 )
-from engram.memory.transitions_test_support import provenanced_candidate_in_scope
+from engram.memory.transitions import (
+    OpenMemoryConflict,
+    OpenMemoryConflictInput,
+    PromoteMemoryCandidate,
+    build_memory_fence,
+)
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    candidate_in_scope,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
+)
 
 
 def _make_user(username: str = 'alice') -> User:
@@ -294,637 +308,81 @@ def _make_memory(
     return memory
 
 
-def _make_version(memory: Memory, version: int, body: str) -> MemoryVersion:
-    import hashlib
-
-    return MemoryVersion.objects.create(
-        organization=memory.organization,
-        project=memory.project,
-        memory=memory,
-        version=version,
-        body=body,
-        content_hash=hashlib.sha256(f'{memory.id}:{version}:{body}'.encode()).hexdigest(),
-    )
-
-
-@pytest.mark.django_db
-def test_queue_returns_proposed_candidates_and_reviewable_memories(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 4
-
-    types = {item['type'] for item in items}
-
-    assert 'candidate' in types
-
-    assert 'memory' in types
-
-
-@pytest.mark.django_db
-def test_queue_excludes_legacy_rows_but_lists_typed_rows(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    legacy_candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
-    typed_candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-    legacy_memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
-    typed_memory = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.APPROVED,
-        confidence='0.100',
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-    ids = {item['id'] for item in response.data['results']}
-    assert str(legacy_candidate.id) not in ids
-    assert str(legacy_memory.id) not in ids
-    assert str(typed_candidate.id) in ids
-    assert str(typed_memory.id) in ids
-
-
-@pytest.mark.django_db
-def test_queue_orders_mixed_items_by_created_at_desc(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    now = timezone.now()
-
-    oldest = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        created_at=now - timedelta(days=3),
-        typed=True,
-    )
-
-    middle = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        created_at=now - timedelta(days=2),
-        typed=True,
-    )
-
-    newest = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        created_at=now - timedelta(days=1),
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    ordered_ids = [item['id'] for item in response.data['results']]
-
-    assert ordered_ids == [str(newest.id), str(middle.id), str(oldest.id)]
-
-    assert response.data['count'] == 3
-
-
-@pytest.mark.django_db
-def test_queue_paginates_across_pages_by_created_at(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    now = timezone.now()
-
-    candidates = [
-        _make_candidate(
-            f_admin_org,
-            f_project,
-            status=CandidateStatus.PROPOSED,
-            created_at=now - timedelta(minutes=index),
-            typed=True,
-        )
-        for index in range(PAGE_SIZE + 5)
-    ]
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    first = client.get('/v1/admin/memory-review/')
-
-    assert first.status_code == 200
-    assert len(first.data['results']) == PAGE_SIZE
-    assert first.data['count'] == PAGE_SIZE + 5
-    assert first.data['next'] is not None
-    assert first.data['previous'] is None
-    assert [item['id'] for item in first.data['results']] == [str(c.id) for c in candidates[:PAGE_SIZE]]
-
-    second = client.get('/v1/admin/memory-review/?page=2')
-
-    assert second.status_code == 200
-    assert len(second.data['results']) == 5
-    assert second.data['next'] is None
-    assert second.data['previous'] is not None
-    assert [item['id'] for item in second.data['results']] == [str(c.id) for c in candidates[PAGE_SIZE:]]
-
-
-@pytest.mark.django_db
-def test_queue_issues_bounded_queries_for_large_backlog(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    from django.db import connection
-    from django.test.utils import CaptureQueriesContext
-
-    for _ in range(PAGE_SIZE * 2 + 10):
-        _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    with CaptureQueriesContext(connection) as ctx:
-        response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-    assert len(response.data['results']) == PAGE_SIZE
-    assert response.data['count'] == PAGE_SIZE * 2 + 10
-
-    candidate_selects = [
-        query['sql']
-        for query in ctx.captured_queries
-        if 'memorycandidate' in query['sql'].lower()
-        and query['sql'].lstrip().lower().startswith('select')
-        and 'count(' not in query['sql'].lower()
-    ]
-
-    assert candidate_selects
-    assert all(f'LIMIT {PAGE_SIZE}' in sql for sql in candidate_selects)
-
-
-@pytest.mark.django_db
-def test_queue_excludes_approved_high_confidence_memories_and_other_org(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-    f_foreign_org: Organization,
-) -> None:
-    foreign_project = Project.objects.create(
-        organization=f_foreign_org,
-        name='Foreign',
-        slug='foreign',
-    )
-
-    _make_memory(f_foreign_org, foreign_project, status=MemoryStatus.CONFLICT)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    assert response.data['results'] == []
-
-    assert response.data['count'] == 0
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_confidence_range(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.100',
-        typed=True,
-    )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.500',
-        typed=True,
-    )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.950',
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?confidence__gte=0.300&confidence__lte=0.700')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    assert items[0]['confidence'] == '0.500'
-
-
-@pytest.mark.django_db
-def test_queue_ordering_by_confidence(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    low = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.100',
-        typed=True,
-    )
-
-    mid = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.500',
-        typed=True,
-    )
-
-    high = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        confidence='0.900',
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    ascending = client.get('/v1/admin/memory-review/', {'ordering': 'confidence'})
-    descending = client.get('/v1/admin/memory-review/', {'ordering': '-confidence'})
-
-    assert ascending.status_code == 200
-
-    assert [item['id'] for item in ascending.data['results']] == [str(low.id), str(mid.id), str(high.id)]
-
-    assert [item['id'] for item in descending.data['results']] == [str(high.id), str(mid.id), str(low.id)]
-
-
-@pytest.mark.django_db
-def test_queue_ordering_by_created_at_ascending(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    older = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        typed=True,
-    )
-
-    newer = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        typed=True,
-    )
-
-    Memory.objects.filter(id=older.id).update(created_at=timezone.now() - timedelta(days=2))
-
-    Memory.objects.filter(id=newer.id).update(created_at=timezone.now())
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/', {'ordering': 'created_at'})
-
-    assert response.status_code == 200
-
-    assert [item['id'] for item in response.data['results']] == [str(older.id), str(newer.id)]
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_visibility_scope(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-    f_team: Team,
-) -> None:
-    _make_memory(
-        f_admin_org,
-        f_project,
-        team=f_team,
-        status=MemoryStatus.REFUTED,
-        visibility_scope=VisibilityScope.TEAM,
-        typed=True,
-    )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
+# C5.4 conflict-only surface (RED) --------------------------------------------
+
+
+def _list_items(response_data: Any) -> list[dict[str, Any]]:
+    if isinstance(response_data, dict):
+        return list(response_data.get('results', []))
+
+    return list(response_data)
+
+
+def _open_conflicts_for_candidate(
+    organization: Organization,
+    project: Project,
+    *,
+    team: Team | None = None,
+    memory_count: int = 1,
+    suffix: str = 'console-conflict',
+) -> tuple[MemoryCandidate, list[Memory], list[MemoryConflict]]:
+    base, source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix=f'{suffix}-base',
+        title=f'{suffix} base claim',
+        body=f'{suffix} base body about retrieval ranking',
         visibility_scope=VisibilityScope.PROJECT,
-        typed=True,
+    )
+    memories = [PromoteMemoryCandidate().execute(transition_request(base)).memory]
+    for index in range(1, memory_count):
+        sibling, sibling_source = candidate_in_scope(
+            base,
+            source,
+            title=f'{suffix} compared claim {index}',
+            body=f'{suffix} compared body {index}',
+        )
+        memories.append(PromoteMemoryCandidate().execute(transition_request(sibling)).memory)
+
+    candidate, _candidate_source = candidate_in_scope(
+        base,
+        source,
+        title=f'{suffix} candidate claim',
+        body=f'{suffix} candidate body about retrieval ranking',
     )
 
-    client = _auth_client(f_admin_token, f_admin_org)
+    conflicts: list[MemoryConflict] = []
+    for index, memory in enumerate(memories):
+        conflict = OpenMemoryConflict().execute(
+            OpenMemoryConflictInput(
+                request=transition_request_for(
+                    candidate,
+                    key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:{index}:v1',
+                ),
+                candidate_fence=candidate_fence_for(candidate),
+                memory_fence=build_memory_fence(memory),
+                evidence_hash=f'{index + 1}' * 64,
+                redacted_reason='console conflict evidence',
+            )
+        )
+        conflicts.append(MemoryConflict.objects.get(id=conflict.id))
 
-    response = client.get('/v1/admin/memory-review/?visibility_scope=team')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    assert items[0]['visibility_scope'] == 'team'
+    return candidate, memories, conflicts
 
 
 @pytest.mark.django_db
-def test_queue_filters_by_status(
+def test_human_inbox_returns_only_open_conflicts(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?status=refuted')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    assert items[0]['status'] == 'refuted'
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_age_days(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    old_created = timezone.now() - timedelta(days=10)
-
-    _make_memory(
+    conflict_candidate, _memories, _conflicts = _open_conflicts_for_candidate(
         f_admin_org,
         f_project,
-        status=MemoryStatus.REFUTED,
-        created_at=old_created,
-        typed=True,
+        suffix='inbox-open',
     )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?age_days__gte=5')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_team_and_project(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-    f_team: Team,
-) -> None:
-    other_project = Project.objects.create(
-        organization=f_admin_org,
-        name='Other',
-        slug='other',
-    )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        team=f_team,
-        status=MemoryStatus.REFUTED,
-        typed=True,
-    )
-
-    _make_memory(
-        f_admin_org,
-        other_project,
-        status=MemoryStatus.REFUTED,
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get(f'/v1/admin/memory-review/?project_id={f_project.id}')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    response_team = client.get(f'/v1/admin/memory-review/?team_id={f_team.id}')
-
-    assert response_team.status_code == 200
-
-    assert len(response_team.data['results']) == 1
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_invalid_team_id_returns_400(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?team_id=not-a-uuid')
-
-    assert response.status_code == 400
-
-    assert response.data['code'] == 'invalid_filter'
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_invalid_project_id_returns_400(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?project_id=not-a-uuid')
-
-    assert response.status_code == 400
-
-    assert response.data['code'] == 'invalid_filter'
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_search_matches_title_and_body(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    target = _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        title='Authentication flow notes',
-        body='describes the login handshake',
-        typed=True,
-    )
-
-    _make_memory(
-        f_admin_org,
-        f_project,
-        status=MemoryStatus.REFUTED,
-        title='Billing notes',
-        body='unrelated billing details',
-        typed=True,
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?search=authentication')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    assert items[0]['id'] == str(target.id)
-
-
-@pytest.mark.django_db
-def test_queue_filters_by_source_type(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    file_candidate = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        typed=True,
-    )
-    ObservationSource.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        observation=file_candidate.source_observation,
-        source_type='file',
-        source_id='src/app.py',
-    )
-
-    web_candidate = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        typed=True,
-    )
-    ObservationSource.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        observation=web_candidate.source_observation,
-        source_type='web',
-        source_id='https://example.com',
-    )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/?source_type=file')
-
-    assert response.status_code == 200
-
-    items = response.data['results']
-
-    assert len(items) == 1
-
-    assert items[0]['id'] == str(file_candidate.id)
-
-
-@pytest.mark.django_db
-def test_queue_serializer_includes_provenance_and_citations(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(
-        f_admin_org,
-        f_project,
-        status=CandidateStatus.PROPOSED,
-        typed=True,
-    )
-    candidate.evidence = [{'provider_call_id': 'pc-1', 'provider': 'anthropic', 'model': 'claude-x'}]
-    candidate.save(update_fields=['evidence', 'updated_at'])
-    observation = candidate.source_observation
-    observation.title = 'Obs title'
-    observation.save(update_fields=['title', 'updated_at'])
-    ObservationSource.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        observation=observation,
-        source_type='file',
-        source_id='src/app.py',
-        citation='L10',
-    )
-
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    MemoryLink.objects.create(
-        organization=f_admin_org,
-        project=f_project,
-        memory=memory,
-        link_type=LinkType.FILE,
-        target='src/app.py',
-        label='main module',
-    )
+    plain_candidate = _make_candidate(f_admin_org, f_project, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
@@ -932,1068 +390,267 @@ def test_queue_serializer_includes_provenance_and_citations(
 
     assert response.status_code == 200
 
-    by_id = {item['id']: item for item in response.data['results']}
+    items = _list_items(response.data)
+    ids = {str(item['id']) for item in items}
 
-    candidate_item = by_id[str(candidate.id)]
-
-    assert candidate_item['type'] == 'candidate'
-
-    assert candidate_item['evidence'] == [
-        {'provider_call_id': 'pc-1', 'provider': 'anthropic', 'model': 'claude-x'},
-    ]
-
-    assert candidate_item['source_observation']['title'] == 'Obs title'
-
-    memory_item = by_id[str(memory.id)]
-
-    assert memory_item['type'] == 'memory'
-
-    assert len(memory_item['citations']) == 1
-
-    assert memory_item['citations'][0]['link_type'] == 'file'
+    assert str(conflict_candidate.id) in ids
+    assert str(plain_candidate.id) not in ids
+    assert all(item['type'] == 'conflict' for item in items)
+    assert all(item['state'] == 'open' for item in items)
+    conflict_item = next(item for item in items if str(item['id']) == str(conflict_candidate.id))
+    assert conflict_item['conflict_ids']
 
 
 @pytest.mark.django_db
-def test_queue_serializer_includes_current_version_for_memory(
+def test_low_confidence_refuted_and_proposed_rows_never_enter_inbox(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    Memory.objects.filter(id=memory.id).update(current_version=3)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    memory_item = next(item for item in response.data['results'] if item['id'] == str(memory.id))
-
-    assert memory_item['current_version'] == 3
-
-
-@pytest.mark.django_db
-def test_diff_returns_from_and_to_versions(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    _make_version(memory, 1, 'first body')
-
-    _make_version(memory, 2, 'second body')
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get(
-        f'/v1/admin/memory-review/{memory.id}/diff/?from_version=1&to_version=2',
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['from']['version'] == 1
-
-    assert response.data['from']['body'] == 'first body'
-
-    assert response.data['to']['version'] == 2
-
-    assert response.data['to']['body'] == 'second body'
-
-
-@pytest.mark.django_db
-def test_diff_requires_review_capability(
-    f_reviewer_token: str,
-    f_reviewer_org: Organization,
-) -> None:
-    project = Project.objects.create(organization=f_reviewer_org, name='P', slug='p')
-
-    memory = _make_memory(f_reviewer_org, project, status=MemoryStatus.CONFLICT)
-
-    _make_version(memory, 1, 'b')
-
-    client = _auth_client(f_reviewer_token, f_reviewer_org)
-
-    response = client.get(
-        f'/v1/admin/memory-review/{memory.id}/diff/?from_version=1&to_version=1',
-    )
-
-    assert response.status_code == 200
-
-
-@pytest.mark.django_db
-def test_action_approve_promotes_candidate(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{candidate.id}/action/',
-        {'action': 'approve', 'reason': 'looks good'},
-    )
-
-    assert response.status_code == 200
-
-    candidate.refresh_from_db()
-
-    assert candidate.status == CandidateStatus.PROMOTED
-
-    assert candidate.promoted_memory_id is not None
-
-    assert AuditEvent.objects.filter(
-        organization=f_admin_org,
-        event_type='MemoryReviewed',
-        target_id=str(candidate.id),
-        metadata__action='approve',
-    ).exists()
-
-
-@pytest.mark.django_db
-def test_action_edit_creates_new_version(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {'action': 'edit', 'reason': 'clarify', 'body': 'edited body'},
-    )
-
-    assert response.status_code == 200
-
-    memory.refresh_from_db()
-
-    assert memory.body == 'edited body'
-
-    assert memory.current_version == 2
-
-    assert MemoryVersion.objects.filter(memory=memory, version=2, body='edited body').exists()
-
-
-@pytest.mark.django_db
-def test_action_narrow_creates_narrowed_by_link(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    target = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='general', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {
-            'action': 'narrow',
-            'reason': 'specific case',
-            'target_memory_id': str(target.id),
-        },
-    )
-
-    assert response.status_code == 200
-
-    assert MemoryLink.objects.filter(
-        memory=memory,
-        link_type=LinkType.NARROWED_BY,
-        target=str(target.id),
-    ).exists()
-
-
-@pytest.mark.django_db
-def test_action_supersede_creates_link_and_marks_stale(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    replacement = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, body='new', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {
-            'action': 'supersede',
-            'reason': 'outdated',
-            'target_memory_id': str(replacement.id),
-        },
-    )
-
-    assert response.status_code == 200
-
-    memory.refresh_from_db()
-
-    assert memory.stale is True
-
-    assert MemoryLink.objects.filter(
-        memory=memory,
-        link_type=LinkType.SUPERSEDED_BY,
-        target=str(replacement.id),
-    ).exists()
-
-
-@pytest.mark.django_db
-def test_action_reject_candidate_sets_rejected(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{candidate.id}/action/',
-        {'action': 'reject', 'reason': 'duplicate'},
-    )
-
-    assert response.status_code == 200
-
-    candidate.refresh_from_db()
-
-    assert candidate.status == CandidateStatus.REJECTED
-
-
-@pytest.mark.django_db
-def test_action_reject_memory_sets_refuted(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {'action': 'reject', 'reason': 'wrong'},
-    )
-
-    assert response.status_code == 200
-
-    memory.refresh_from_db()
-
-    assert memory.status == MemoryStatus.REFUTED
-
-
-@pytest.mark.django_db
-def test_action_archive_sets_archived(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {'action': 'archive', 'reason': 'stale topic'},
-    )
-
-    assert response.status_code == 200
-
-    memory.refresh_from_db()
-
-    assert memory.status == MemoryStatus.ARCHIVED
-
-
-@pytest.mark.django_db
-def test_action_denied_without_admin_capability(
-    f_reviewer_token: str,
-    f_reviewer_org: Organization,
-) -> None:
-    project = Project.objects.create(organization=f_reviewer_org, name='P', slug='p')
-
-    candidate = _make_candidate(f_reviewer_org, project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_reviewer_token, f_reviewer_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{candidate.id}/action/',
-        {'action': 'approve', 'reason': 'try'},
-    )
-
-    assert response.status_code == 403
-
-    candidate.refresh_from_db()
-
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_queue_denied_without_review_capability() -> None:
-    user = _make_user('nobody')
-
-    org = Organization.objects.create(name='Noacc', slug='noacc')
-
-    identity = _make_identity(user, org)
-
-    role = _make_role_with_capabilities('none', ('observations:read',))
-
-    OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
-
-    from rest_framework.authtoken.models import Token
-
-    token = Token.objects.get_or_create(user=user)[0].key
-
-    client = _auth_client(token, org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 403
-
-
-@pytest.mark.django_db
-def test_action_is_tenant_scoped(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_foreign_org: Organization,
-) -> None:
-    foreign_project = Project.objects.create(
-        organization=f_foreign_org,
-        name='FP',
-        slug='fp',
-    )
-
-    candidate = _make_candidate(f_foreign_org, foreign_project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{candidate.id}/action/',
-        {'action': 'approve', 'reason': 'cross'},
-    )
-
-    assert response.status_code == 404
-
-    candidate.refresh_from_db()
-
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_bulk_archive_by_ids(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
-
-    m2 = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'ids': [str(m1.id), str(m2.id)], 'reason': 'cleanup'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['archived_count'] == 2
-
-    assert set(response.data['archived_ids']) == {str(m1.id), str(m2.id)}
-
-    m1.refresh_from_db()
-
-    m2.refresh_from_db()
-
-    assert m1.status == MemoryStatus.ARCHIVED
-
-    assert m2.status == MemoryStatus.ARCHIVED
-
-    assert (
-        AuditEvent.objects.filter(
-            organization=f_admin_org,
-            event_type='MemoryTransitionCommitted',
-            metadata__transition_type='archive',
-        ).count()
-        == 2
-    )
-
-
-@pytest.mark.django_db
-def test_bulk_archive_by_ids_rejects_legacy_memory(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    legacy = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'ids': [str(legacy.id)], 'reason': 'legacy cleanup'},
-    )
-
-    assert response.status_code == 400
-    assert response.data['code'] == 'invalid_state'
-    legacy.refresh_from_db()
-    assert legacy.status == MemoryStatus.CONFLICT
-
-
-@pytest.mark.django_db
-def test_bulk_archive_by_confidence_threshold(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    m1 = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100', typed=True)
-
-    _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'confidence__lte': '0.300', 'reason': 'low confidence cleanup'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['archived_count'] == 1
-
-    assert response.data['archived_ids'] == [str(m1.id)]
-
-    m1.refresh_from_db()
-
-    assert m1.status == MemoryStatus.ARCHIVED
-
-
-@pytest.mark.django_db
-def test_bulk_archive_by_confidence_threshold_excludes_legacy_memory(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    legacy = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT, confidence='0.100')
-    typed = _make_memory(
+    conflict_candidate, _memories, _conflicts = _open_conflicts_for_candidate(
         f_admin_org,
         f_project,
-        status=MemoryStatus.APPROVED,
+        suffix='inbox-filter',
+    )
+    low_confidence_proposed = _make_candidate(
+        f_admin_org,
+        f_project,
         confidence='0.100',
         typed=True,
     )
+    refuted_memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, typed=True)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'confidence__lte': '0.300', 'reason': 'legacy-safe cleanup'},
-    )
+    response = client.get('/v1/admin/memory-review/')
 
     assert response.status_code == 200
-    assert response.data['archived_ids'] == [str(typed.id)]
-    legacy.refresh_from_db()
-    typed.refresh_from_db()
-    assert legacy.status == MemoryStatus.CONFLICT
-    assert typed.status == MemoryStatus.ARCHIVED
+
+    ids = {str(item['id']) for item in _list_items(response.data)}
+
+    assert ids == {str(conflict_candidate.id)}
+    assert str(low_confidence_proposed.id) not in ids
+    assert str(refuted_memory.id) not in ids
 
 
 @pytest.mark.django_db
-def test_bulk_archive_by_confidence_threshold_scopes_to_project(
+def test_conflict_detail_contains_candidate_and_all_compared_claims(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    other_project = Project.objects.create(organization=f_admin_org, name='Other', slug='other')
-
-    in_scope = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200', typed=True)
-
-    out_of_scope = _make_memory(
+    candidate, memories, conflicts = _open_conflicts_for_candidate(
         f_admin_org,
-        other_project,
-        status=MemoryStatus.APPROVED,
-        confidence='0.200',
-        typed=True,
+        f_project,
+        memory_count=2,
+        suffix='detail',
     )
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'confidence__lte': '0.300', 'project_id': str(f_project.id), 'reason': 'scoped cleanup'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['archived_ids'] == [str(in_scope.id)]
-
-    in_scope.refresh_from_db()
-
-    out_of_scope.refresh_from_db()
-
-    assert in_scope.status == MemoryStatus.ARCHIVED
-
-    assert out_of_scope.status == MemoryStatus.APPROVED
-
-
-@pytest.mark.django_db
-def test_bulk_archive_by_confidence_threshold_skips_approved_above_review_threshold(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    reviewable = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.200', typed=True)
-
-    active = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.450', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'confidence__lte': '0.500', 'reason': 'threshold cleanup'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['archived_ids'] == [str(reviewable.id)]
-
-    reviewable.refresh_from_db()
-
-    active.refresh_from_db()
-
-    assert reviewable.status == MemoryStatus.ARCHIVED
-
-    assert active.status == MemoryStatus.APPROVED
-
-
-@pytest.mark.django_db
-def test_bulk_archive_requires_reason(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'ids': [str(memory.id)]},
-    )
-
-    assert response.status_code == 400
-
-    memory.refresh_from_db()
-
-    assert memory.status == MemoryStatus.CONFLICT
-
-
-@pytest.mark.django_db
-def test_bulk_archive_denied_without_admin_capability(
-    f_reviewer_token: str,
-    f_reviewer_org: Organization,
-) -> None:
-    project = Project.objects.create(organization=f_reviewer_org, name='P', slug='p')
-
-    memory = _make_memory(f_reviewer_org, project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_reviewer_token, f_reviewer_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-archive/',
-        {'ids': [str(memory.id)], 'reason': 'try'},
-    )
-
-    assert response.status_code == 403
-
-    memory.refresh_from_db()
-
-    assert memory.status == MemoryStatus.CONFLICT
-
-
-@pytest.mark.django_db
-def test_action_approbe_requires_reason(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        f'/v1/admin/memory-review/{candidate.id}/action/',
-        {'action': 'approve'},
-    )
-
-    assert response.status_code == 400
-
-
-@pytest.mark.django_db
-def test_retrieve_candidate_by_id(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
 
     client = _auth_client(f_admin_token, f_admin_org)
 
     response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
 
     assert response.status_code == 200
+    assert response.get('ETag')
 
-    assert response.data['type'] == 'candidate'
+    body = response.data
+    assert str(body['id']) == str(candidate.id)
+    assert body['type'] == 'conflict'
+    assert body['candidate_claim']
 
-    assert response.data['id'] == str(candidate.id)
+    compared_memory_ids = {str(claim['memory_id']) for claim in body['existing_claims']}
+    assert compared_memory_ids == {str(memory.id) for memory in memories}
+    assert set(map(str, body['conflict_ids'])) == {str(conflict.id) for conflict in conflicts}
 
 
 @pytest.mark.django_db
-def test_retrieve_memory_by_id(
+def test_conflict_resolution_requires_current_etag(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.CONFLICT)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get(f'/v1/admin/memory-review/{memory.id}/')
-
-    assert response.status_code == 200
-
-    assert response.data['type'] == 'memory'
-
-    assert response.data['id'] == str(memory.id)
-
-
-@pytest.mark.django_db
-def test_retrieve_unknown_id_returns_404(
-    f_admin_token: str,
-    f_admin_org: Organization,
-) -> None:
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/00000000-0000-0000-0000-000000000001/')
-
-    assert response.status_code == 404
-
-
-@pytest.mark.django_db
-def test_retrieve_unknown_id_returns_domain_error_shape(
-    f_admin_token: str,
-    f_admin_org: Organization,
-) -> None:
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/00000000-0000-0000-0000-000000000001/')
-
-    assert response.status_code == 404
-
-    assert response.data['code'] == 'not_found'
-
-    assert response.data['error_code'] == 'not_found'
-
-
-@pytest.mark.django_db
-def test_retrieve_foreign_org_item_returns_404(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_foreign_org: Organization,
-) -> None:
-    foreign_project = Project.objects.create(
-        organization=f_foreign_org,
-        name='FP2',
-        slug='fp2',
+    candidate, _memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='etag',
     )
 
-    candidate = _make_candidate(f_foreign_org, foreign_project, status=CandidateStatus.PROPOSED)
-
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    missing = client.post(
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'no precondition supplied'},
+        format='json',
+    )
+    assert missing.status_code == 428
 
-    assert response.status_code == 404
+    stale = client.post(
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'stale precondition supplied'},
+        format='json',
+        HTTP_IF_MATCH='"stale-etag-value"',
+    )
+    assert stale.status_code == 412
 
-
-@pytest.mark.django_db
-def test_retrieve_denied_without_review_capability() -> None:
-    user = _make_user('noreview')
-
-    org = Organization.objects.create(name='Noreview', slug='noreview')
-
-    identity = _make_identity(user, org)
-
-    role = _make_role_with_capabilities('noreview_role', ('observations:read',))
-
-    OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
-
-    from rest_framework.authtoken.models import Token
-
-    token = Token.objects.get_or_create(user=user)[0].key
-
-    project = Project.objects.create(organization=org, name='NR', slug='nr')
-
-    candidate = _make_candidate(org, project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(token, org)
-
-    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
-
-    assert response.status_code == 403
+    for conflict in conflicts:
+        conflict.refresh_from_db()
+        assert conflict.resolved_transition_id is None
 
 
 @pytest.mark.django_db
-def test_queue_includes_agent_refuted_approved_memory(
+def test_conflict_resolution_closes_complete_candidate_set_in_one_cp4_transition(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900', typed=True)
-
-    memory.refuted = True
-
-    memory.save(update_fields=['refuted', 'updated_at'])
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    items = {item['id']: item for item in response.data['results']}
-
-    assert str(memory.id) in items
-
-    assert items[str(memory.id)]['refuted'] is True
-
-
-@pytest.mark.django_db
-def test_queue_excludes_stale_superseded_approved_memory(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.900')
-
-    memory.stale = True
-
-    memory.save(update_fields=['stale', 'updated_at'])
+    candidate, _memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        memory_count=2,
+        suffix='close-set',
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.get('/v1/admin/memory-review/')
-
-    assert response.status_code == 200
-
-    ids = {item['id'] for item in response.data['results']}
-
-    assert str(memory.id) not in ids
-
-
-@pytest.mark.django_db
-def test_action_restore_reactivates_agent_refuted_memory(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.REFUTED, confidence='0.900', typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
+    detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    assert detail.status_code == 200
+    etag = detail.get('ETag')
 
     response = client.post(
-        f'/v1/admin/memory-review/{memory.id}/action/',
-        {'action': 'restore', 'reason': 'undo feedback refute'},
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'close the whole conflict set'},
+        format='json',
+        HTTP_IF_MATCH=etag,
     )
 
     assert response.status_code == 200
 
-    memory.refresh_from_db()
+    transition_id = str(response.data['transition_id'])
+    assert set(map(str, response.data['conflict_ids'])) == {str(conflict.id) for conflict in conflicts}
+    assert response.data['state'] == 'resolved'
 
-    assert memory.refuted is False
+    for conflict in conflicts:
+        conflict.refresh_from_db()
+        assert conflict.resolved_transition_id is not None
+        assert str(conflict.resolved_transition_id) == transition_id
 
-    assert memory.status == MemoryStatus.APPROVED
-
-
-@pytest.mark.django_db
-def test_bulk_action_approve_promotes_candidates(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    c1 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    c2 = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(c1.id), str(c2.id)], 'action': 'approve', 'reason': 'batch approve'},
+    resolve_transitions = MemoryTransition.objects.filter(
+        id__in=[conflict.resolved_transition_id for conflict in conflicts],
+        transition_type=MemoryTransitionType.CONFLICT_RESOLVE,
     )
-
-    assert response.status_code == 200
-
-    assert response.data['done_count'] == 2
-
-    assert response.data['skipped_count'] == 0
-
-    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
-
-    assert outcomes[str(c1.id)] == 'done'
-
-    assert outcomes[str(c2.id)] == 'done'
-
-    c1.refresh_from_db()
-
-    c2.refresh_from_db()
-
-    assert c1.status == CandidateStatus.PROMOTED
-
-    assert c2.status == CandidateStatus.PROMOTED
-
-    assert c1.promoted_memory_id is not None
-
-    assert (
-        AuditEvent.objects.filter(
-            organization=f_admin_org,
-            event_type='MemoryReviewed',
-            metadata__action='approve',
-        ).count()
-        == 2
-    )
-
-
-@pytest.mark.django_db
-def test_bulk_action_reports_legacy_candidate_invalid_state_and_approves_typed_sibling(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    legacy = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
-    typed = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(legacy.id), str(typed.id)], 'action': 'approve', 'reason': 'mixed approve'},
-    )
-
-    assert response.status_code == 200
-    assert response.data['done_count'] == 1
-    assert response.data['skipped_count'] == 1
-    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
-    assert outcomes[str(legacy.id)] == 'invalid_state'
-    assert outcomes[str(typed.id)] == 'done'
-    legacy.refresh_from_db()
-    typed.refresh_from_db()
-    assert legacy.status == CandidateStatus.PROPOSED
-    assert typed.status == CandidateStatus.PROMOTED
-
-
-@pytest.mark.django_db
-def test_bulk_action_reject_handles_candidate_and_memory(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
-
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, typed=True)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(candidate.id), str(memory.id)], 'action': 'reject', 'reason': 'batch reject'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['done_count'] == 2
+    assert resolve_transitions.count() == 1
 
     candidate.refresh_from_db()
-
-    memory.refresh_from_db()
-
     assert candidate.status == CandidateStatus.REJECTED
 
-    assert memory.status == MemoryStatus.REFUTED
-
 
 @pytest.mark.django_db
-def test_bulk_action_partial_failure_reports_per_item_outcome(
+def test_resolved_conflict_disappears_without_deleting_evidence(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    approvable = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED, typed=True)
-
-    already_promoted = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROMOTED)
-
-    missing_id = uuid.uuid4()
+    candidate, _memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='disappears',
+    )
+    link_ids = [conflict.semantic_link_id for conflict in conflicts]
 
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {
-            'ids': [str(approvable.id), str(already_promoted.id), str(missing_id)],
-            'action': 'approve',
-            'reason': 'batch approve',
-        },
+    detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    assert detail.status_code == 200
+
+    resolve = client.post(
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'resolve and retain evidence'},
+        format='json',
+        HTTP_IF_MATCH=detail.get('ETag'),
     )
+    assert resolve.status_code == 200
 
-    assert response.status_code == 200
+    after_list = client.get('/v1/admin/memory-review/')
+    assert str(candidate.id) not in {str(item['id']) for item in _list_items(after_list.data)}
 
-    assert response.data['done_count'] == 1
+    after_detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    assert after_detail.status_code == 404
 
-    assert response.data['skipped_count'] == 2
-
-    outcomes = {item['id']: item['outcome'] for item in response.data['results']}
-
-    assert outcomes[str(approvable.id)] == 'done'
-
-    assert outcomes[str(already_promoted.id)] == 'invalid_state'
-
-    assert outcomes[str(missing_id)] == 'not_found'
-
-    approvable.refresh_from_db()
-
-    assert approvable.status == CandidateStatus.PROMOTED
+    assert MemoryConflict.objects.filter(candidate=candidate).count() == len(conflicts)
+    for conflict in conflicts:
+        conflict.refresh_from_db()
+        assert conflict.resolved_transition_id is not None
+    assert MemoryLink.objects.filter(id__in=link_ids).count() == len(link_ids)
 
 
 @pytest.mark.django_db
-def test_bulk_action_denied_without_admin_capability(
-    f_reviewer_token: str,
-    f_reviewer_org: Organization,
+def test_foreign_conflict_list_detail_and_resolve_return_no_existence(
+    f_admin_token: str,
+    f_admin_org: Organization,
 ) -> None:
-    project = Project.objects.create(organization=f_reviewer_org, name='P', slug='p')
-
-    candidate = _make_candidate(f_reviewer_org, project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_reviewer_token, f_reviewer_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(candidate.id)], 'action': 'approve', 'reason': 'try'},
+    foreign_org = Organization.objects.create(name='Foreignco', slug='foreignco')
+    foreign_project = Project.objects.create(organization=foreign_org, name='Foreign', slug='foreign')
+    foreign_candidate, _memories, _conflicts = _open_conflicts_for_candidate(
+        foreign_org,
+        foreign_project,
+        suffix='foreign',
     )
 
-    assert response.status_code == 403
+    client = _auth_client(f_admin_token, f_admin_org)
 
-    candidate.refresh_from_db()
+    listing = client.get('/v1/admin/memory-review/')
+    assert listing.status_code == 200
+    assert str(foreign_candidate.id) not in {str(item['id']) for item in _list_items(listing.data)}
 
-    assert candidate.status == CandidateStatus.PROPOSED
+    detail = client.get(f'/v1/admin/memory-review/{foreign_candidate.id}/')
+    assert detail.status_code == 404
+
+    resolve = client.post(
+        f'/v1/admin/memory-review/{foreign_candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'foreign scope'},
+        format='json',
+        HTTP_IF_MATCH='"any"',
+    )
+    assert resolve.status_code == 404
 
 
 @pytest.mark.django_db
-def test_bulk_action_requires_reason(
+def test_conflict_resolution_records_exported_review_example(
     f_admin_token: str,
     f_admin_org: Organization,
     f_project: Project,
 ) -> None:
-    candidate = _make_candidate(f_admin_org, f_project, status=CandidateStatus.PROPOSED)
+    candidate, _memories, _conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='export-example',
+    )
 
     client = _auth_client(f_admin_token, f_admin_org)
 
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(candidate.id)], 'action': 'approve'},
+    detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    assert detail.status_code == 200
+
+    resolve = client.post(
+        f'/v1/admin/memory-review/{candidate.id}/resolve/',
+        {'action': 'reject_candidate', 'reason': 'record human example for eval'},
+        format='json',
+        HTTP_IF_MATCH=detail.get('ETag'),
     )
+    assert resolve.status_code == 200
 
-    assert response.status_code == 400
+    example = MemoryReviewExample.objects.filter(
+        organization=f_admin_org,
+        item_id=str(candidate.id),
+        action='reject_candidate',
+    ).first()
+    assert example is not None
+    assert example.curator_context.get('conflict_ids')
 
-    candidate.refresh_from_db()
+    buffer = io.StringIO()
+    call_command('engram_export_review_examples', organization=str(f_admin_org.id), stdout=buffer)
 
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_bulk_action_rejects_more_than_200_ids(
-    f_admin_token: str,
-    f_admin_org: Organization,
-) -> None:
-    ids = [str(uuid.uuid4()) for _ in range(201)]
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': ids, 'action': 'approve', 'reason': 'too many'},
-    )
-
-    assert response.status_code == 400
-
-
-@pytest.mark.django_db
-def test_bulk_action_is_tenant_scoped(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_foreign_org: Organization,
-) -> None:
-    foreign_project = Project.objects.create(
-        organization=f_foreign_org,
-        name='FP3',
-        slug='fp3',
-    )
-
-    candidate = _make_candidate(f_foreign_org, foreign_project, status=CandidateStatus.PROPOSED)
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(candidate.id)], 'action': 'approve', 'reason': 'cross'},
-    )
-
-    assert response.status_code == 200
-
-    assert response.data['results'][0]['outcome'] == 'not_found'
-
-    candidate.refresh_from_db()
-
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_bulk_action_rejects_invalid_action_choice(
-    f_admin_token: str,
-    f_admin_org: Organization,
-    f_project: Project,
-) -> None:
-    memory = _make_memory(f_admin_org, f_project, status=MemoryStatus.APPROVED, confidence='0.100')
-
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [str(memory.id)], 'action': 'archive', 'reason': 'not allowed'},
-    )
-
-    assert response.status_code == 400
-
-    memory.refresh_from_db()
-
-    assert memory.status == MemoryStatus.APPROVED
-
-
-@pytest.mark.django_db
-def test_bulk_action_rejects_empty_ids(
-    f_admin_token: str,
-    f_admin_org: Organization,
-) -> None:
-    client = _auth_client(f_admin_token, f_admin_org)
-
-    response = client.post(
-        '/v1/admin/memory-review/bulk-action/',
-        {'ids': [], 'action': 'approve', 'reason': 'empty'},
-    )
-
-    assert response.status_code == 400
+    exported = [json.loads(line) for line in buffer.getvalue().splitlines() if line.strip()]
+    conflict_rows = [row for row in exported if row['item_id'] == str(candidate.id)]
+    assert conflict_rows
+    assert conflict_rows[0]['action'] == 'reject_candidate'

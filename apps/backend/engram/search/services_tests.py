@@ -7,6 +7,7 @@ import pytest
 from engram.context.context_api_tests import RAW_KEY, create_embedding_policy, create_project_scope
 from engram.core.models import (
     Memory,
+    MemoryConflict,
     MemoryStatus,
     MemoryVersion,
     Organization,
@@ -16,6 +17,19 @@ from engram.core.models import (
     Team,
     VectorField,
     VisibilityScope,
+)
+from engram.memory.transitions import (
+    OpenMemoryConflict,
+    OpenMemoryConflictInput,
+    PromoteMemoryCandidate,
+    build_memory_fence,
+)
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    candidate_in_scope,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
 )
 from engram.search.search_api_tests import grant_search_capability
 from engram.search.services import SearchInput, SearchMemories
@@ -146,3 +160,68 @@ def test_search_lexical_recall_surfaces_lexical_only_match_when_enabled() -> Non
     assert fuzzy.id in matched_ids
     fuzzy_match = next(match for match in result.matches if match.document.id == fuzzy.id)
     assert fuzzy_match.inclusion_reason.startswith('lexical match:')
+
+
+# C5.4 unresolved-conflict search exclusion (RED) -----------------------------
+
+
+def _seed_conflicted_and_clean_memories(
+    organization: Organization,
+    team: Team,
+    project: Project,
+) -> tuple[Memory, Memory]:
+    clean_candidate, _clean_source, _clean_session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='search-clean',
+        title='authorization',
+        body='authorization ranking clean claim body',
+    )
+    clean_memory = PromoteMemoryCandidate().execute(transition_request(clean_candidate)).memory
+
+    base, base_source, _base_session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix='search-conflicted',
+        title='authorization',
+        body='authorization ranking conflicted claim body',
+    )
+    conflicted_memory = PromoteMemoryCandidate().execute(transition_request(base)).memory
+
+    opponent, _opponent_source = candidate_in_scope(
+        base,
+        base_source,
+        title='authorization opponent claim',
+        body='authorization opponent claim body',
+    )
+    OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=transition_request_for(
+                opponent,
+                key=f'request:{uuid.uuid4()}:conflict-open:{opponent.id}:v1',
+            ),
+            candidate_fence=candidate_fence_for(opponent),
+            memory_fence=build_memory_fence(conflicted_memory),
+            evidence_hash='e' * 64,
+            redacted_reason='search conflict evidence',
+        )
+    )
+
+    return clean_memory, conflicted_memory
+
+
+@pytest.mark.django_db
+def test_search_excludes_memory_with_unresolved_conflict() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    clean_memory, conflicted_memory = _seed_conflicted_and_clean_memories(organization, team, project)
+
+    assert MemoryConflict.objects.filter(memory=conflicted_memory, resolved_transition__isnull=True).exists()
+
+    result = SearchMemories().execute(_search_input(project, query='authorization'))
+
+    matched_memory_ids = {match.document.memory_id for match in result.matches}
+    assert clean_memory.id in matched_memory_ids
+    assert conflicted_memory.id not in matched_memory_ids

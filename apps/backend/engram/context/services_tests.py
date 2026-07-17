@@ -66,8 +66,19 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
-from engram.memory.transitions import PromoteMemoryCandidate
-from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
+from engram.memory.transitions import (
+    PromoteMemoryCandidate,
+    ResolveMemoryConflict,
+    ResolveMemoryConflictInput,
+    build_memory_fence,
+)
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    open_single_conflict,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
+)
 from engram.model_policy.models import ProviderCallRecord
 from engram.model_policy.services import EMBEDDING_DIMENSION, generated_embedding
 
@@ -2261,3 +2272,48 @@ def test_context_bundle_replay_fails_closed_on_unproven_digest() -> None:
     assert replay['rendered_context'] == ''
     assert replay['items'] == []
     assert _UNPROVEN_BUNDLE in str(replay)
+
+
+# C5.4 unresolved-conflict retrieval exclusion (RED) --------------------------
+
+
+@pytest.mark.django_db
+def test_authorized_documents_exclude_unresolved_conflict_claim() -> None:
+    candidate, conflict = open_single_conflict('ctx-conflict-exclude')
+    organization = conflict.organization
+    project = conflict.project
+
+    assert RetrievalDocument.objects.filter(memory_id=conflict.memory_id).exists()
+
+    documents = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+
+    assert conflict.memory_id not in {document.memory_id for document in documents}
+
+
+@pytest.mark.django_db
+def test_resolved_conflict_restores_authorized_document() -> None:
+    candidate, conflict = open_single_conflict('ctx-conflict-restore')
+    organization = conflict.organization
+    project = conflict.project
+
+    before = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+    assert conflict.memory_id not in {document.memory_id for document in before}
+
+    selected_fence = build_memory_fence(conflict.memory)
+    ResolveMemoryConflict().execute(
+        ResolveMemoryConflictInput(
+            request=transition_request_for(
+                candidate,
+                key=f'request:{uuid.uuid4()}:conflict-resolve:{candidate.id}:v1',
+            ),
+            candidate_fence=candidate_fence_for(candidate),
+            conflict_ids=(conflict.id,),
+            conflict_memory_fences=(selected_fence,),
+            resolution='publish_candidate',
+            title='Resolved retrieval claim',
+            body='Resolved retrieval claim body',
+        )
+    )
+
+    after = authorized_retrieval_documents(organization, project, _effective_scope(organization))
+    assert conflict.memory_id in {document.memory_id for document in after}
