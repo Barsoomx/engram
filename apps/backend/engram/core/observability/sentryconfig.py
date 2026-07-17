@@ -18,7 +18,7 @@ def optional_env(value: str | None) -> str | None:
 
 
 SENTRY_DSN = optional_env(os.environ.get('SENTRY_DSN'))
-SENTRY_ENV = optional_env(os.environ.get('SENTRY_ENV'))
+SENTRY_ENV = optional_env(os.environ.get('SENTRY_ENV')) or optional_env(os.environ.get('SENTRY_ENVIRONMENT'))
 SENTRY_RELEASE = optional_env(os.environ.get('ENGRAM_RELEASE'))
 EVENT_LEVEL = 40
 

@@ -1,5 +1,6 @@
 'use client';
 
+import * as Sentry from '@sentry/nextjs';
 import { AlertTriangle } from 'lucide-react';
 import Link from 'next/link';
 import * as React from 'react';
@@ -12,6 +13,8 @@ export default function AdminSegmentError({
   reset: () => void;
 }) {
   React.useEffect(() => {
+    // No-op when Sentry was never initialised (no DSN configured).
+    Sentry.captureException(error);
     console.error(error);
   }, [error]);
 

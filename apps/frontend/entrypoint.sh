@@ -13,13 +13,22 @@ set -e
 
 SED_SCRIPT="$(mktemp)"
 
-# Longest keys first so a shorter key can't partially match a longer one.
+# Longest keys first so a shorter key can't partially match a longer one. The value is
+# escaped for the sed replacement (backslash first, then & and the | delimiter) so an
+# awkward-but-legitimate value cannot break out of the s|...| command or inject sed syntax;
+# a newline in a value cannot reach here because awk splits records on newline upstream.
 printenv \
   | grep '^NEXT_PUBLIC' \
   | awk -F'=' '{ print length($1), $0 }' \
   | sort -nr \
   | cut -d' ' -f2- \
-  | awk -F'=' '{ key=$1; $1=""; value=substr($0,2); printf "s|APP_%s|%s|g\n", key, value }' \
+  | awk -F'=' '{
+      key=$1; value=substr($0, index($0, "=") + 1);
+      gsub(/\\/, "\\\\\\\\", value);
+      gsub(/&/, "\\\\&", value);
+      gsub(/\|/, "\\\\&", value);
+      printf "s|APP_%s|%s|g\n", key, value
+    }' \
   > "$SED_SCRIPT"
 
 if [ -s "$SED_SCRIPT" ]; then

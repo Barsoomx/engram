@@ -19,6 +19,7 @@ if (dsn) {
       process.env.NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE,
     ),
     sendDefaultPii: false,
+    beforeBreadcrumb: () => null,
   });
 }
 

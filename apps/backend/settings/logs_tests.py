@@ -4,6 +4,8 @@ from typing import Any
 
 import pytest
 import sentry_sdk
+from sentry_sdk.integrations.celery import CeleryIntegration
+from sentry_sdk.integrations.logging import LoggingIntegration
 
 from settings import logs
 from settings.logs import configure_logger, resolve_environment
@@ -66,6 +68,12 @@ def test_configure_logger_initialises_sentry_once_when_dsn_present(
     assert kwargs['release'] == 'engram@1.2.3'
     assert kwargs['send_default_pii'] is False
     assert kwargs['debug'] is False
+    assert callable(kwargs['before_send'])
+    assert callable(kwargs['before_send_transaction'])
+    assert callable(kwargs['traces_sampler'])
+    integrations = kwargs['integrations']
+    assert any(isinstance(integration, CeleryIntegration) for integration in integrations)
+    assert any(isinstance(integration, LoggingIntegration) for integration in integrations)
 
 
 def test_configure_logger_falls_back_to_env_profile_without_sentry_environment(
