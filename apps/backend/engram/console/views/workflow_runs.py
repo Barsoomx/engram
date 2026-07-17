@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
@@ -69,15 +70,14 @@ class WorkflowRunViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        queryset = WorkflowRun.objects.filter(
-            organization=self.request.active_organization,
-        ).select_related('project', 'team', 'result_memory')
-        if self.action == 'rerun':
-            project_ids = self.request.effective_scope.project_ids
-            if project_ids:
-                return queryset.filter(project_id__in=project_ids)
+        scope = self.request.effective_scope
 
-        return queryset
+        return (
+            WorkflowRun.objects.filter(organization=self.request.active_organization)
+            .select_related('project', 'team', 'result_memory')
+            .filter(project_id__in=scope.project_ids)
+            .filter(Q(team_id__isnull=True) | Q(team_id__in=scope.team_ids))
+        )
 
     def get_serializer_class(self) -> type:
         if self.action == 'retrieve':
