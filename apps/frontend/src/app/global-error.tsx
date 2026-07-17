@@ -1,5 +1,6 @@
 'use client';
 
+import * as Sentry from '@sentry/nextjs';
 import * as React from 'react';
 
 export default function GlobalError({
@@ -10,6 +11,8 @@ export default function GlobalError({
   reset: () => void;
 }) {
   React.useEffect(() => {
+    // No-op when Sentry was never initialised (no DSN configured).
+    Sentry.captureException(error);
     console.error(error);
   }, [error]);
 

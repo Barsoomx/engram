@@ -10,8 +10,16 @@ from engram.core.redaction import redact_value
 
 BeforeSendFn = Callable[[dict[str, Any], Any], dict[str, Any] | None]
 
-SENTRY_DSN = os.environ.get('SENTRY_DSN')
-SENTRY_ENV = os.environ.get('SENTRY_ENV')
+
+def optional_env(value: str | None) -> str | None:
+    cleaned = (value or '').strip()
+
+    return cleaned or None
+
+
+SENTRY_DSN = optional_env(os.environ.get('SENTRY_DSN'))
+SENTRY_ENV = optional_env(os.environ.get('SENTRY_ENV')) or optional_env(os.environ.get('SENTRY_ENVIRONMENT'))
+SENTRY_RELEASE = optional_env(os.environ.get('ENGRAM_RELEASE'))
 EVENT_LEVEL = 40
 
 SENTRY_ORG = os.environ.get('SENTRY_ORG', 'engram')

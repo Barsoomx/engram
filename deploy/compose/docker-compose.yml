@@ -150,6 +150,21 @@ services:
         condition: service_healthy
     environment:
       NEXT_PUBLIC_ENGRAM_API_URL: http://api:8000
+      # Sentry is opt-in: unset => these resolve empty, entrypoint.sh clears the baked
+      # APP_* placeholders and the browser SDK stays off. NEXT_PUBLIC_SENTRY_CSP_ORIGIN is
+      # the ingest origin only (no DSN key) and must be set whenever the DSN is, or the CSP
+      # connect-src will block every event.
+      NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+      NEXT_PUBLIC_SENTRY_CSP_ORIGIN: ${NEXT_PUBLIC_SENTRY_CSP_ORIGIN:-}
+      NEXT_PUBLIC_SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-${ENGRAM_ENVIRONMENT:-}}
+      NEXT_PUBLIC_SENTRY_RELEASE: ${ENGRAM_RELEASE:-}
+      NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE: ${NEXT_PUBLIC_SENTRY_TRACES_SAMPLE_RATE:-}
+      # Frontend server-side (node) reads this live — same Sentry project as the browser,
+      # deliberately NOT the backend's SENTRY_DSN.
+      SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
+      SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-}
+      SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-}
+      ENGRAM_RELEASE: ${ENGRAM_RELEASE:-}
       NUXT_TELEMETRY_DISABLED: '1'
       PORT: '3000'
     ports:

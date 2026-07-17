@@ -9,8 +9,10 @@ from sentry_sdk.integrations.logging import LoggingIntegration
 from engram.core.observability.logs import configure_structlog
 from engram.core.observability.sentryconfig import (
     SENTRY_DSN,
+    SENTRY_RELEASE,
     create_before_send,
     create_before_send_transaction,
+    optional_env,
     traces_sampler,
 )
 
@@ -34,13 +36,18 @@ IGNORE_ERRORS = [
 ]
 
 
+def resolve_environment(env_profile: str) -> str:
+    return optional_env(os.environ.get('SENTRY_ENVIRONMENT')) or env_profile
+
+
 def configure_logger(log_level: str = 'INFO', env_profile: str = 'dev') -> None:
     logging.basicConfig(level=log_level)
 
     if SENTRY_DSN is not None:
         sentry_sdk.init(
             debug=False,
-            environment=env_profile,
+            environment=resolve_environment(env_profile),
+            release=SENTRY_RELEASE,
             dsn=SENTRY_DSN,
             integrations=[
                 CeleryIntegration(monitor_beat_tasks=True),

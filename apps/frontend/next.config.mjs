@@ -1,4 +1,5 @@
 import { codecovNextJSWebpackPlugin } from '@codecov/nextjs-webpack-plugin'
+import { withSentryConfig } from '@sentry/nextjs'
 
 /** @type {import('next').NextConfig} */
 
@@ -22,11 +23,36 @@ function resolveApiOrigin() {
   }
 }
 
+// The browser SDK POSTs events straight to the Sentry ingest host, so that origin must be
+// in connect-src or every event is silently blocked by the CSP. The DSN itself can't be
+// used here (CSP host-sources reject the `key@` userinfo), and it is a runtime placeholder
+// at build time anyway — hence a dedicated origin-only variable, passed through with the
+// same APP_* token mechanism as the API origin. Unset => Sentry stays out of the CSP.
+function resolveSentryCspOrigin() {
+  const raw = process.env.NEXT_PUBLIC_SENTRY_CSP_ORIGIN
+
+  if (!raw) {
+    return null
+  }
+
+  if (raw.startsWith('APP_')) {
+    return raw
+  }
+
+  try {
+    return new URL(raw).origin
+  } catch {
+    return null
+  }
+}
+
 const apiOrigin = resolveApiOrigin()
+const sentryCspOrigin = resolveSentryCspOrigin()
 
 const connectSrc = [
   "'self'",
   apiOrigin,
+  sentryCspOrigin,
   ...(isDev ? ['ws:', 'wss:'] : []),
 ]
   .filter(Boolean)
@@ -75,4 +101,12 @@ const nextConfig = {
   },
 }
 
-export default nextConfig
+// Sourcemap upload and release creation are deliberately off: both would require
+// SENTRY_AUTH_TOKEN at build time, and the image is built generically in CI with no Sentry
+// credentials. Stack traces arrive minified — accepted for now.
+export default withSentryConfig(nextConfig, {
+  silent: true,
+  telemetry: false,
+  sourcemaps: { disable: true },
+  release: { create: false, finalize: false },
+})
