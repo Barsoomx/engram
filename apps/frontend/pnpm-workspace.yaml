@@ -1,5 +1,6 @@
 allowBuilds:
   '@heroui/shared-utils': false
+  '@sentry/cli': false
   sharp: true
   unrs-resolver: false
 overrides:
