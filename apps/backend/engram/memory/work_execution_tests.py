@@ -1165,3 +1165,50 @@ def test_execution_configuration_fingerprint_ignores_execution_state() -> None:
     claim(module, work, lease_owner=owner('state'), now=NOW)
 
     assert module.execution_configuration_fingerprint(get_work(work)) == before
+
+
+@pytest.mark.django_db
+def test_finish_rejects_claim_after_lease_expiry_before_reclaim() -> None:
+    module = _we()
+    scope = create_scope('finish-expired-before-reclaim')
+    work = create_required_work(scope, suffix='finish-expired-before-reclaim')
+    first = claim(module, work, lease_owner=owner('expired-finish'), now=NOW)
+    finish_at = first.claim.lease_expires_at + timedelta(microseconds=1)
+
+    with pytest.raises(module.StaleWorkFenceError):
+        module.finish_work_claim(
+            claim=first.claim,
+            now=finish_at,
+            completion='product_succeeded',
+        )
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.LEASED
+    assert stored.fencing_token == first.claim.fencing_token
+    assert stored.lease_owner == first.claim.lease_owner
+    assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.RUNNING
+
+
+@pytest.mark.django_db
+def test_fail_rejects_claim_after_lease_expiry_before_reclaim() -> None:
+    module = _we()
+    scope = create_scope('fail-expired-before-reclaim')
+    work = create_required_work(scope, suffix='fail-expired-before-reclaim')
+    first = claim(module, work, lease_owner=owner('expired-fail'), now=NOW)
+    fail_at = first.claim.lease_expires_at + timedelta(microseconds=1)
+
+    with pytest.raises(module.StaleWorkFenceError):
+        module.fail_work_claim(
+            claim=first.claim,
+            now=fail_at,
+            failure=ClassifiedWorkFailure(
+                failure_class='provider_transient',
+                code='provider_timeout',
+            ),
+        )
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.LEASED
+    assert stored.fencing_token == first.claim.fencing_token
+    assert stored.lease_owner == first.claim.lease_owner
+    assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.RUNNING

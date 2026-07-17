@@ -593,12 +593,15 @@ def _lock_claim_rows(claim: WorkClaim) -> tuple[WorkflowWork, WorkflowRun]:
     return work, run
 
 
-def _require_claim_fence(work: WorkflowWork, run: WorkflowRun, claim: WorkClaim) -> None:
+def _require_claim_fence(work: WorkflowWork, run: WorkflowRun, claim: WorkClaim, now: datetime) -> None:
     if (
         run.fencing_token != claim.fencing_token
         or run.lease_owner != claim.lease_owner
         or work.fencing_token != claim.fencing_token
+        or work.lease_owner != claim.lease_owner
         or work.execution_state != WorkflowWorkExecutionState.LEASED
+        or work.lease_expires_at is None
+        or now >= work.lease_expires_at
     ):
         raise StaleWorkFenceError('workflow run no longer matches the claim')
 
@@ -738,7 +741,7 @@ def finish_work_claim(
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a completable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
         _apply_finish(
             work,
             run,
@@ -762,7 +765,7 @@ def finish_claim_resolved_elsewhere(*, claim: WorkClaim, now: datetime) -> None:
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a completable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
 
         run.status = WorkflowRunStatus.SUCCEEDED
         run.finished_at = now
@@ -843,7 +846,7 @@ def fail_work_claim(*, claim: WorkClaim, now: datetime, failure: ClassifiedWorkF
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a failable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
         _apply_failure_run(run, now=now, failure=failure)
         _apply_failure_work(work, now=now, failure=failure)
 
