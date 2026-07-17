@@ -441,6 +441,59 @@ def test_valid_manual_queued_run_leases_settled_work() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    'origin',
+    (
+        WorkflowRunOrigin.AUTOMATIC,
+        WorkflowRunOrigin.RECONCILIATION,
+        WorkflowRunOrigin.MEMORY_TRANSITION,
+    ),
+)
+def test_supplied_non_manual_run_does_not_reopen_settled_work(
+    origin: str,
+) -> None:
+    module = _we()
+    scope = create_scope(f'claim-settled-{origin}')
+    work = create_required_work(scope, suffix=f'claim-settled-{origin}')
+    settle_work(module, work)
+    settled = get_work(work)
+    settled_token = settled.fencing_token
+    queued = make_queued_run(
+        work,
+        origin=origin,
+        dispatched_at=NOW + timedelta(seconds=5),
+    )
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner(f'late-{origin}'),
+        now=NOW + timedelta(seconds=10),
+        run_id=queued.id,
+    )
+
+    stored = get_work(work)
+    stored_run = get_run(queued.id)
+    assert (
+        result.outcome,
+        result.claim,
+        stored.disposition,
+        stored.execution_state,
+        stored.fencing_token,
+        stored_run.status,
+        stored_run.fencing_token,
+    ) == (
+        'terminal',
+        None,
+        WorkflowWorkDisposition.COMPLETE,
+        WorkflowWorkExecutionState.SETTLED,
+        settled_token,
+        WorkflowRunStatus.QUEUED,
+        None,
+    )
+
+
+@pytest.mark.django_db
 def test_claim_rejects_naive_now_blank_and_oversized_owner() -> None:
     module = _we()
     scope = create_scope('claim-inputs')

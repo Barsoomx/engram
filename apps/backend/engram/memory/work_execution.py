@@ -411,10 +411,10 @@ def _do_claim(
     )
 
 
-def _short_circuit_state(work: WorkflowWork, *, now: datetime, is_automatic: bool) -> ClaimResult | None:
+def _short_circuit_state(work: WorkflowWork, *, now: datetime, absorb_terminal: bool) -> ClaimResult | None:
     state = work.execution_state
 
-    if state in _TERMINAL_EXECUTION_STATES and is_automatic:
+    if state in _TERMINAL_EXECUTION_STATES and absorb_terminal:
         return ClaimResult(outcome='terminal', claim=None)
 
     if state == WorkflowWorkExecutionState.RETRY_WAIT and now < work.next_retry_at:
@@ -494,7 +494,12 @@ def claim_work(
         runs = _locked_v1_runs(work)
         is_automatic = workflow_run_id is None
 
-        short_circuit = _short_circuit_state(work, now=now, is_automatic=is_automatic)
+        supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
+        absorb_terminal = is_automatic or (
+            supplied_run is not None and supplied_run.origin != WorkflowRunOrigin.MANUAL
+        )
+
+        short_circuit = _short_circuit_state(work, now=now, absorb_terminal=absorb_terminal)
         if short_circuit is not None:
             return short_circuit
 
@@ -513,7 +518,6 @@ def claim_work(
             if leased is not None:
                 return leased
 
-        supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
         if pending_error is None:
             return _do_claim(work, supplied_run, lease_owner=lease_owner, now=now, lease_for=lease_for)
 
