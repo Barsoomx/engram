@@ -64,15 +64,23 @@ class RetriedWork:
 
 
 @dataclass(frozen=True)
+class ResignaledWork:
+    work_id: uuid.UUID
+    run_id: uuid.UUID
+
+
+@dataclass(frozen=True)
 class RetryFailedDistillationsResult:
     retried: tuple[RetriedWork, ...]
     unlinked_run_ids: tuple[uuid.UUID, ...]
+    resignaled: tuple[ResignaledWork, ...] = ()
 
 
 @dataclass(frozen=True)
 class _WorkEvaluation:
     retriable: bool
     abandoned: bool
+    resignal_queued: bool
     failed_count: int
     transient_count: int
 
@@ -99,6 +107,7 @@ class RetryFailedDistillations:
         runs_by_work = self._runs_by_work(work_ids)
 
         retried: list[RetriedWork] = []
+        resignaled: list[ResignaledWork] = []
         for work in required_works:
             evaluation = self._evaluate(
                 runs_by_work.get(work.id, []),
@@ -113,6 +122,18 @@ class RetryFailedDistillations:
                     failed_count=evaluation.failed_count,
                     transient_count=evaluation.transient_count,
                 )
+
+                continue
+            if evaluation.resignal_queued:
+                resignaled_work = self._resignal_under_lock(
+                    work.id,
+                    now,
+                    cutoff,
+                    max_attempts,
+                    transient_max_attempts,
+                )
+                if resignaled_work is not None:
+                    resignaled.append(resignaled_work)
 
                 continue
             if not evaluation.retriable:
@@ -131,6 +152,7 @@ class RetryFailedDistillations:
         return RetryFailedDistillationsResult(
             retried=tuple(retried),
             unlinked_run_ids=unlinked_run_ids,
+            resignaled=tuple(resignaled),
         )
 
     def _unlinked_failed_run_ids(self) -> list[uuid.UUID]:
@@ -224,6 +246,48 @@ class RetryFailedDistillations:
 
             return RetriedWork(work_id=work.id, run_id=run.id)
 
+    def _resignal_under_lock(
+        self,
+        work_id: uuid.UUID,
+        now: datetime,
+        cutoff: object,
+        max_attempts: int,
+        transient_max_attempts: int,
+    ) -> ResignaledWork | None:
+        with transaction.atomic():
+            try:
+                work = (
+                    WorkflowWork.objects.select_for_update()
+                    .exclude(_v1_managed_session())
+                    .get(
+                        id=work_id,
+                        work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                        disposition=WorkflowWorkDisposition.REQUIRED,
+                    )
+                )
+            except WorkflowWork.DoesNotExist:
+                return None
+
+            runs = list(
+                WorkflowRun.objects.filter(
+                    work_id=work.id,
+                    run_type=WorkflowRunType.SESSION_DISTILLATION,
+                ).order_by('created_at', 'id'),
+            )
+            evaluation = self._evaluate(runs, cutoff, max_attempts, transient_max_attempts)
+            if not evaluation.resignal_queued:
+                return None
+
+            run = queue_work_attempt(
+                work_id=work.id,
+                now=now,
+                origin=WorkflowRunOrigin.RECONCILIATION,
+            )
+            if run.dispatched_at != now:
+                return None
+
+            return ResignaledWork(work_id=work.id, run_id=run.id)
+
     def _evaluate(
         self,
         work_runs: list[WorkflowRun],
@@ -233,10 +297,22 @@ class RetryFailedDistillations:
     ) -> _WorkEvaluation:
         attempts = [run for run in work_runs if not self._is_poisoned_cleanup(run)]
         if not attempts:
-            return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+            return _WorkEvaluation(
+                retriable=False,
+                abandoned=False,
+                resignal_queued=False,
+                failed_count=0,
+                transient_count=0,
+            )
 
         if any(run.status == WorkflowRunStatus.SUCCEEDED for run in attempts):
-            return _WorkEvaluation(retriable=False, abandoned=False, failed_count=0, transient_count=0)
+            return _WorkEvaluation(
+                retriable=False,
+                abandoned=False,
+                resignal_queued=False,
+                failed_count=0,
+                transient_count=0,
+            )
 
         failed_runs = [run for run in attempts if run.status == WorkflowRunStatus.FAILED]
         failed_count = len(failed_runs)
@@ -247,15 +323,22 @@ class RetryFailedDistillations:
             return _WorkEvaluation(
                 retriable=False,
                 abandoned=True,
+                resignal_queued=False,
                 failed_count=failed_count,
                 transient_count=transient_count,
             )
 
         latest_run = attempts[-1]
         if latest_run.status != WorkflowRunStatus.FAILED:
+            resignal_queued = (
+                latest_run.status == WorkflowRunStatus.QUEUED
+                and latest_run.execution_contract_version == 1
+            )
+
             return _WorkEvaluation(
                 retriable=False,
                 abandoned=False,
+                resignal_queued=resignal_queued,
                 failed_count=failed_count,
                 transient_count=transient_count,
             )
@@ -264,6 +347,7 @@ class RetryFailedDistillations:
             return _WorkEvaluation(
                 retriable=False,
                 abandoned=False,
+                resignal_queued=False,
                 failed_count=failed_count,
                 transient_count=transient_count,
             )
@@ -271,6 +355,7 @@ class RetryFailedDistillations:
         return _WorkEvaluation(
             retriable=True,
             abandoned=False,
+            resignal_queued=False,
             failed_count=failed_count,
             transient_count=transient_count,
         )

@@ -23,6 +23,7 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowWork,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory.distillation_reconciler import RetryFailedDistillations
@@ -155,6 +156,23 @@ def create_poisoned_legacy_run(work: WorkflowWork, *, created_at: object = None)
     return run
 
 
+def create_v1_queued_run(
+    work: WorkflowWork,
+    *,
+    created_at: object,
+    dispatched_at: object,
+) -> WorkflowRun:
+    run = create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=created_at)
+    WorkflowRun.objects.filter(id=run.id).update(
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+        dispatched_at=dispatched_at,
+    )
+    run.refresh_from_db()
+
+    return run
+
+
 def fresh_v1_runs(work: WorkflowWork) -> list[WorkflowRun]:
     return list(
         WorkflowRun.objects.filter(
@@ -206,7 +224,6 @@ def test_required_work_with_stale_failed_run_creates_one_linked_queued_run_and_v
     'scenario',
     (
         'latest_succeeded_truncated',
-        'latest_queued',
         'latest_running',
         'work_complete',
         'work_no_op',
@@ -237,19 +254,6 @@ def test_execute_suppresses_ineligible_required_or_terminal_work(
             finished_at=now - timedelta(minutes=40),
         )
         WorkflowRun.objects.filter(id=succeeded.id).update(escalation=True)
-    elif scenario == 'latest_queued':
-        create_linked_run(
-            work,
-            status=WorkflowRunStatus.FAILED,
-            created_at=now - timedelta(hours=2),
-            finished_at=now - timedelta(hours=2),
-        )
-        queued = create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=now - timedelta(hours=1))
-        WorkflowRun.objects.filter(id=queued.id).update(
-            execution_contract_version=1,
-            origin=WorkflowRunOrigin.AUTOMATIC,
-            dispatched_at=now - timedelta(hours=1),
-        )
     elif scenario == 'latest_running':
         create_linked_run(
             work,
@@ -689,3 +693,164 @@ def test_concurrent_execute_calls_create_one_queued_run_and_one_signal(
     assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).count() == 1
     assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1
     assert CeleryOutbox.objects.filter(task_name=_LEGACY_DISTILL_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_stale_v1_queued_run_is_resignaled_without_new_row(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    queued = create_v1_queued_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        dispatched_at=now - timedelta(hours=1),
+    )
+    run_ids_before = set(WorkflowRun.objects.values_list('id', flat=True))
+    original_dispatched_at = queued.dispatched_at
+
+    result = RetryFailedDistillations().execute()
+
+    assert set(WorkflowRun.objects.values_list('id', flat=True)) == run_ids_before
+
+    outbox = CeleryOutbox.objects.get()
+    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{queued.id}'
+    assert outbox.args == [str(work.id), str(queued.id)]
+
+    queued.refresh_from_db()
+    assert queued.dispatched_at > original_dispatched_at
+
+    assert result.retried == ()
+    assert len(result.resignaled) == 1
+    assert result.resignaled[0].work_id == work.id
+    assert result.resignaled[0].run_id == queued.id
+
+
+@pytest.mark.django_db
+def test_recent_v1_queued_run_within_window_is_not_resignaled(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    queued = create_v1_queued_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        dispatched_at=now - timedelta(minutes=2),
+    )
+    run_ids_before = set(WorkflowRun.objects.values_list('id', flat=True))
+    original_dispatched_at = queued.dispatched_at
+
+    result = RetryFailedDistillations().execute()
+
+    assert set(WorkflowRun.objects.values_list('id', flat=True)) == run_ids_before
+    assert CeleryOutbox.objects.count() == 0
+
+    queued.refresh_from_db()
+    assert queued.dispatched_at == original_dispatched_at
+
+    assert result.retried == ()
+    assert result.resignaled == ()
+
+
+@pytest.mark.django_db
+def test_latest_v1_running_run_stays_suppressed_without_resignal(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    running = create_linked_run(work, status=WorkflowRunStatus.QUEUED, created_at=now - timedelta(hours=1))
+    WorkflowRun.objects.filter(id=running.id).update(
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+        status=WorkflowRunStatus.RUNNING,
+        fencing_token=1,
+        lease_owner='worker-1',
+        dispatched_at=now - timedelta(hours=1),
+        started_at=now - timedelta(minutes=50),
+        heartbeat_at=now - timedelta(minutes=1),
+        lease_expires_at=now + timedelta(minutes=5),
+    )
+    run_ids_before = set(WorkflowRun.objects.values_list('id', flat=True))
+
+    result = RetryFailedDistillations().execute()
+
+    assert set(WorkflowRun.objects.values_list('id', flat=True)) == run_ids_before
+    assert CeleryOutbox.objects.count() == 0
+    assert result.retried == ()
+    assert result.resignaled == ()
+
+
+@pytest.mark.django_db
+def test_blocked_work_with_stale_v1_queued_run_still_resignals(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    queued = create_v1_queued_run(
+        work,
+        created_at=now - timedelta(hours=1),
+        dispatched_at=now - timedelta(hours=1),
+    )
+    WorkflowWork.objects.filter(id=work.id).update(
+        execution_state=WorkflowWorkExecutionState.BLOCKED,
+        blocked_configuration_fingerprint='a' * 64,
+    )
+    original_dispatched_at = queued.dispatched_at
+
+    result = RetryFailedDistillations().execute()
+
+    assert WorkflowRun.objects.filter(work=work).count() == 2
+
+    outbox = CeleryOutbox.objects.get()
+    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
+    assert outbox.task_id == f'workflow-work:{work.id}:run:{queued.id}'
+    assert outbox.args == [str(work.id), str(queued.id)]
+
+    queued.refresh_from_db()
+    assert queued.dispatched_at > original_dispatched_at
+
+    assert result.retried == ()
+    assert len(result.resignaled) == 1
+    assert result.resignaled[0].work_id == work.id
+    assert result.resignaled[0].run_id == queued.id
