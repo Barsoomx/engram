@@ -1959,3 +1959,234 @@ def test_observation_processing_does_not_curate_synchronously() -> None:
 
     assert 'CurateMemoryCandidate' not in source
     assert 'DecideMemoryCandidate' not in source
+
+
+def _unreferenced_embedding_work(
+    organization: Organization,
+    team: Team,
+    project: Project,
+) -> tuple[RetrievalDocument, WorkflowWork, WorkflowRun]:
+    from engram.memory.projections import create_embedding_work_and_signal
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Subject validation memory',
+        body='Subject validation body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='a' * 64,
+    )
+    document = RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=version,
+        full_text='Subject validation memory\n\nSubject validation body',
+        projection_contract_version=1,
+        exact_projection_hash='b' * 64,
+    )
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            work, created = create_embedding_work_and_signal(document=document)
+    assert created is True
+    queued_run = WorkflowRun.objects.get(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    return document, work, queued_run
+
+
+def _settle_for_late_delivery(
+    work: WorkflowWork,
+    *,
+    work_type: str,
+    workflow_run_id: uuid.UUID | None = None,
+) -> None:
+    from engram.memory.work_execution import finish_work_claim
+
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=work_type,
+        lease_owner=f'subject-validation:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=workflow_run_id,
+    )
+    assert claimed.claim is not None
+    finish_work_claim(
+        claim=claimed.claim,
+        now=now,
+        completion='product_succeeded',
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('subject_failure', 'expected_code'),
+    [
+        ('missing', 'work_scope_invalid'),
+        ('out_of_scope', 'work_scope_invalid'),
+        ('frozen_mismatch', 'work_fingerprint_mismatch'),
+    ],
+)
+def test_observation_subject_failure_records_typed_terminal_attempt(
+    subject_failure: str,
+    expected_code: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    observation = Observation.objects.get(id=work.subject_id)
+
+    if subject_failure == 'missing':
+        observation.delete()
+    elif subject_failure == 'out_of_scope':
+        other_project = Project.objects.create(
+            organization=f_org,
+            name='Other subject project',
+            slug='other-subject-project',
+        )
+        Observation.objects.filter(id=observation.id).update(project_id=other_project.id)
+    else:
+        Observation.objects.filter(id=observation.id).update(body='drifted after work creation')
+
+    with pytest.raises(MemoryWorkerError):
+        process_observation_work_v1(str(work.id))
+
+    work.refresh_from_db()
+    failed = WorkflowRun.objects.filter(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.FAILED,
+        failure_class=INVALID_INPUT,
+    ).first()
+    assert (
+        work.disposition,
+        work.execution_state,
+        failed.failure_code if failed is not None else None,
+    ) == (
+        WorkflowWorkDisposition.REQUIRED,
+        WorkflowWorkExecutionState.TERMINAL_FAILURE,
+        expected_code,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('subject_failure', 'expected_code'),
+    [
+        ('missing', 'work_scope_invalid'),
+        ('out_of_scope', 'work_scope_invalid'),
+        ('frozen_mismatch', 'work_fingerprint_mismatch'),
+    ],
+)
+def test_embedding_subject_failure_records_typed_terminal_attempt(
+    subject_failure: str,
+    expected_code: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    document, work, queued_run = _unreferenced_embedding_work(f_org, f_team, f_project)
+
+    if subject_failure == 'missing':
+        document.delete()
+    elif subject_failure == 'out_of_scope':
+        other_project = Project.objects.create(
+            organization=f_org,
+            name='Other embedding project',
+            slug='other-embedding-project',
+        )
+        RetrievalDocument.objects.filter(id=document.id).update(project_id=other_project.id)
+    else:
+        next_version = MemoryVersion.objects.create(
+            organization=f_org,
+            project=f_project,
+            memory=document.memory,
+            version=2,
+            body='Drifted version',
+            content_hash='c' * 64,
+        )
+        RetrievalDocument.objects.filter(id=document.id).update(memory_version_id=next_version.id)
+
+    with pytest.raises(MemoryWorkerError):
+        tasks_module.embed_memory_projection_work_v1(
+            str(work.id),
+            str(queued_run.id),
+        )
+
+    work.refresh_from_db()
+    failed = WorkflowRun.objects.filter(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.FAILED,
+        failure_class=INVALID_INPUT,
+    ).first()
+    assert (
+        work.disposition,
+        work.execution_state,
+        failed.failure_code if failed is not None else None,
+    ) == (
+        WorkflowWorkDisposition.REQUIRED,
+        WorkflowWorkExecutionState.TERMINAL_FAILURE,
+        expected_code,
+    )
+
+
+@pytest.mark.django_db
+def test_late_settled_observation_delivery_is_absorbed_before_subject_lookup(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    _settle_for_late_delivery(
+        work,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+    )
+    Observation.objects.get(id=work.subject_id).delete()
+    run_count = WorkflowRun.objects.filter(work=work).count()
+
+    assert process_observation_work_v1(str(work.id)) == str(work.id)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work).count() == run_count
+
+
+@pytest.mark.django_db
+def test_late_settled_embedding_delivery_is_absorbed_before_subject_lookup(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    document, work, queued_run = _unreferenced_embedding_work(f_org, f_team, f_project)
+    _settle_for_late_delivery(
+        work,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        workflow_run_id=queued_run.id,
+    )
+    document.delete()
+    run_count = WorkflowRun.objects.filter(work=work).count()
+
+    assert tasks_module.embed_memory_projection_work_v1(str(work.id)) == str(work.id)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work).count() == run_count

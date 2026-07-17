@@ -414,7 +414,9 @@ def _verify_work_fingerprint(work: WorkflowWork) -> None:
 
 def _load_observation_work_subject(work: WorkflowWork) -> Observation:
     if work.subject_type != WorkflowSubjectType.OBSERVATION:
-        raise MemoryWorkerError('workflow work subject type does not match observation task')
+        raise MemoryWorkerError(
+            'workflow work subject type does not match observation task', code='work_contract_invalid'
+        )
 
     try:
         observation = Observation.objects.get(
@@ -424,14 +426,14 @@ def _load_observation_work_subject(work: WorkflowWork) -> Observation:
             team_id=work.team_id,
         )
     except Observation.DoesNotExist as error:
-        raise MemoryWorkerError('observation is outside workflow work scope') from error
+        raise MemoryWorkerError('observation is outside workflow work scope', code='work_scope_invalid') from error
 
     try:
         current_digest = observation_content_digest(observation)
     except ValueError as error:
-        raise MemoryWorkerError('observation digest cannot be recomputed') from error
+        raise MemoryWorkerError('observation digest cannot be recomputed', code='work_fingerprint_mismatch') from error
     if current_digest != work.input_snapshot['observation_digest']:
-        raise MemoryWorkerError('observation digest does not match frozen input')
+        raise MemoryWorkerError('observation digest does not match frozen input', code='work_fingerprint_mismatch')
 
     return observation
 
@@ -571,8 +573,6 @@ def _run_observation_explicit_delivery(
 
 
 def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str:
-    observation = _load_observation_work_subject(work)
-
     if work.disposition != WorkflowWorkDisposition.REQUIRED:
         logger.info(
             'observation_work_already_resolved',
@@ -583,6 +583,7 @@ def _run_observation_automatic_delivery(task: object, work: WorkflowWork) -> str
         return str(work.id)
 
     def execute(claim: object) -> str:
+        observation = _load_observation_work_subject(work)
         structlog.contextvars.clear_contextvars()
         try:
             result = ProcessObservationRecorded().execute(
@@ -686,9 +687,9 @@ def embed_memory_projection_work_v1(
 
     parsed_work_id, parsed_run_id = _parse_work_task_ids(work_id, workflow_run_id)
     work = _load_versioned_work(parsed_work_id, WorkflowWorkType.MEMORY_EMBEDDING)
-    document = _load_embedding_work_document(work)
 
     def execute(claim: object) -> str:
+        document = _load_embedding_work_document(work)
         _verify_work_fingerprint(work)
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
