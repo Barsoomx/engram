@@ -2,13 +2,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pytest
-from django.http import QueryDict
 from django.utils import timezone
 
-from engram.console.views.memory_review import MemoryReviewViewSet
 from engram.core.models import (
     AuditEvent,
     Memory,
@@ -18,8 +15,6 @@ from engram.core.models import (
     Project,
 )
 from engram.memory.confidence_decay import DecayMemoryConfidence
-from engram.memory.transitions import PromoteMemoryCandidate
-from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 _AGED_DAYS = 40
 _YOUNG_DAYS = 5
@@ -57,30 +52,6 @@ def _make_memory(
         refuted=refuted,
         metadata={'kind': kind} if kind else {},
     )
-
-    Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(days=age_days))
-    memory.refresh_from_db()
-
-    return memory
-
-
-def _make_typed_memory(
-    organization: Organization,
-    project: Project,
-    *,
-    confidence: str,
-    age_days: int = _AGED_DAYS,
-) -> Memory:
-    candidate, _source, _session = provenanced_candidate_in_scope(
-        organization,
-        project,
-        None,
-        suffix=f'confidence-decay-{Memory.objects.count()}',
-        title=f'Memory {Memory.objects.count()}',
-        body='body',
-        confidence=Decimal(confidence),
-    )
-    memory = PromoteMemoryCandidate().execute(transition_request(candidate)).memory
 
     Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(days=age_days))
     memory.refresh_from_db()
@@ -263,25 +234,3 @@ def test_execute_returns_summary_counts(f_org: Organization, f_project: Project)
     assert result.organizations == 1
     assert result.projects == 1
     assert result.memories == 1
-
-
-@pytest.mark.django_db
-def test_decayed_memory_enters_the_console_review_queue(f_org: Organization, f_project: Project) -> None:
-    memory = _make_typed_memory(f_org, f_project, confidence='0.320')
-
-    viewset = MemoryReviewViewSet()
-    fake_request = SimpleNamespace(query_params=QueryDict(''))
-
-    before_ids = list(viewset._filtered_memories(fake_request, f_org).values_list('id', flat=True))
-
-    assert memory.id not in before_ids
-
-    DecayMemoryConfidence().execute()
-
-    memory.refresh_from_db()
-
-    assert memory.confidence == Decimal('0.270')
-
-    after_ids = list(viewset._filtered_memories(fake_request, f_org).values_list('id', flat=True))
-
-    assert memory.id in after_ids

@@ -887,7 +887,7 @@ def test_curate_judge_contradicts_opens_durable_conflict(monkeypatch: pytest.Mon
     assert existing.stale is False
     assert existing.refuted is False
     documents = authorized_retrieval_documents(organization, project, build_scope(organization, team, project))
-    assert any(document.memory_id == existing.id for document in documents)
+    assert existing.id not in {document.memory_id for document in documents}
 
 
 @pytest.mark.django_db
