@@ -1140,7 +1140,10 @@ def default_base_url(provider: str) -> str:
     return 'https://api.openai.com/v1'
 
 
-def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, object]:
+def deepseek_thinking_override(provider: str, task_type: str, response_kind: str) -> dict[str, object]:
+    if provider == 'deepseek' and response_kind == 'curation_decision_v1':
+        return {'thinking': {'type': 'enabled'}}
+
     if provider == 'deepseek' and task_type in ('curation', 'digest'):
         return {'thinking': {'type': 'disabled'}}
 
@@ -1223,6 +1226,19 @@ _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
     'Only reference memory_version_id values and evidence tokens present in the input. '
     'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
     'must equal the top-level relation.'
+    ' Allowed outcome and relation combinations (any other combination is invalid): '
+    'publish_new with relation unrelated or compatible_distinct and target_memory_version_id null; '
+    'merge_evidence with relation equivalent and a non-null target; '
+    'revise_memory with relation candidate_revises, a non-null target and temporal_order candidate_newer; '
+    'supersede_memory with relation candidate_supersedes, a non-null target and temporal_order candidate_newer; '
+    'reject_candidate with relation redundant and a non-null target; '
+    'reject_candidate with relation unsupported and target null; '
+    'open_conflict with relation mutually_incompatible, a non-null target and temporal_order unordered. '
+    'The top-level relation describes the selected target; with a null target use unrelated, '
+    'compatible_distinct or unsupported. '
+    'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
+    'When every shortlist comparison is unrelated or compatible_distinct and the candidate has evidence, '
+    'choose publish_new with target null.'
 )
 
 
@@ -1532,7 +1548,7 @@ class OpenAICompatibleGateway:
             prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
         extra: dict[str, object] = {}
-        extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
+        extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
         extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
         started_at = time.monotonic()
