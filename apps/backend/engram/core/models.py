@@ -895,8 +895,8 @@ class RetrievalDocument(TimestampedModel):
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
     projection_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
-    exact_projection_hash = models.CharField(max_length=64, default='', blank=True)
-    embedding_projection_hash = models.CharField(max_length=64, default='', blank=True)
+    exact_projection_hash = models.CharField(max_length=64, default='', db_default='', blank=True)
+    embedding_projection_hash = models.CharField(max_length=64, default='', db_default='', blank=True)
     embedding_projected_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:

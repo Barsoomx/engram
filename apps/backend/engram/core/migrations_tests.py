@@ -2804,6 +2804,92 @@ def test_0038_fresh_apply_accepts_legacy_version_zero_memory() -> None:
 
 
 @pytest.mark.django_db(transaction=True)
+def test_0038_accepts_retrieval_document_insert_from_0037_model() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0037)
+        old_apps = executor.loader.project_state(MIGRATE_0037).apps
+        organization_model = old_apps.get_model('core', 'Organization')
+        project_model = old_apps.get_model('core', 'Project')
+        memory_model = old_apps.get_model('core', 'Memory')
+        memory_version_model = old_apps.get_model('core', 'MemoryVersion')
+        retrieval_document_model = old_apps.get_model('core', 'RetrievalDocument')
+        suffix = uuid.uuid4().hex
+        organization = organization_model.objects.create(
+            name=f'Rolling {suffix}',
+            slug=f'rolling-{suffix}',
+        )
+        project = project_model.objects.create(
+            organization=organization,
+            name=f'Rolling project {suffix}',
+            slug=f'rolling-project-{suffix}',
+        )
+        memory = memory_model.objects.create(
+            organization=organization,
+            project=project,
+            title='Created by a 0037 writer',
+            body='must remain insertable after the expand migration',
+            current_version=1,
+        )
+        version = memory_version_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=memory,
+            version=1,
+            body=memory.body,
+            content_hash='f' * 64,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0038)
+
+        document = retrieval_document_model.objects.create(
+            organization=organization,
+            project=project,
+            memory=memory,
+            memory_version=version,
+            full_text=memory.body,
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name, column_default, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'core_retrievaldocument'
+                  AND column_name IN (
+                      'exact_projection_hash',
+                      'embedding_projection_hash'
+                  )
+                """,
+            )
+            columns = {
+                name: (column_default, is_nullable)
+                for name, column_default, is_nullable in cursor.fetchall()
+            }
+
+        assert set(columns) == {
+            'exact_projection_hash',
+            'embedding_projection_hash',
+        }
+        assert all(column_default is not None for column_default, _nullable in columns.values())
+        assert all(nullable == 'NO' for _column_default, nullable in columns.values())
+
+        new_apps = executor.loader.project_state(MIGRATE_0038).apps
+        migrated = new_apps.get_model('core', 'RetrievalDocument').objects.get(id=document.id)
+        assert migrated.projection_contract_version == 0
+        assert migrated.exact_projection_hash == ''
+        assert migrated.embedding_projection_hash == ''
+        assert migrated.embedding_projected_at is None
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
 def test_0038_migration_module_declares_hash_and_scope_constraints() -> None:
     executor = MigrationExecutor(connection)
     assert MIGRATION_0038_NODE in executor.loader.graph.nodes
