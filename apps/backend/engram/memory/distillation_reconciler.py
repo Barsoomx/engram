@@ -331,8 +331,7 @@ class RetryFailedDistillations:
         latest_run = attempts[-1]
         if latest_run.status != WorkflowRunStatus.FAILED:
             resignal_queued = (
-                latest_run.status == WorkflowRunStatus.QUEUED
-                and latest_run.execution_contract_version == 1
+                latest_run.status == WorkflowRunStatus.QUEUED and latest_run.execution_contract_version == 1
             )
 
             return _WorkEvaluation(
