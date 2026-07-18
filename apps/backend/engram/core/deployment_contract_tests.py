@@ -21,6 +21,12 @@ WORKER_QUEUES = {
 WORKER_SERVICES = tuple(WORKER_QUEUES)
 BACKEND_SERVICES = ('api', *WORKER_SERVICES, 'beat', 'relay')
 LONG_LIVED_SERVICES = (*BACKEND_SERVICES, 'rabbitmq', 'redis', 'postgres', 'frontend')
+FRONTEND_CI_STEPS = (
+    'pnpm typecheck',
+    'pnpm lint',
+    'pnpm build',
+    'node --test src/lib/memory-conflict-actions.test.ts',
+)
 
 _DURATION_PART = re.compile(r'(?P<value>\d+(?:\.\d+)?)(?P<unit>ns|us|ms|s|m|h)')
 _DURATION_UNIT_SECONDS = {
@@ -277,3 +283,20 @@ def test_all_long_lived_services_restart_and_backend_env_is_overrideable(f_compo
     for service_name in BACKEND_SERVICES:
         env_file = _service(f_compose, service_name).get('env_file')
         assert env_file == ['${ENGRAM_ENV_FILE:-.env}']
+
+
+def test_frontend_ci_target_runs_the_cp5_conflict_frontend_gate(f_compose: ComposeMapping) -> None:
+    service = _service(f_compose, 'frontend-ci')
+    build = _as_mapping(service.get('build'), label='frontend-ci build')
+    assert build.get('target') == 'builder'
+
+    assert service.get('profiles') == ['ci']
+    assert 'frontend-ci' not in LONG_LIVED_SERVICES
+    assert service.get('restart') is None
+
+    command = _command_tokens(service.get('command'), label='frontend-ci')
+    assert command[:2] in (['sh', '-ec'], ['/bin/sh', '-ec'])
+    assert len(command) == 3
+    script = command[2]
+    for step in FRONTEND_CI_STEPS:
+        assert step in script, f'frontend-ci gate is missing step: {step}'
