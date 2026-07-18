@@ -982,3 +982,95 @@ def test_legacy_reconciler_reclaims_expired_lease_stuck_running_work(
         == 1
     )
     assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1
+
+
+@pytest.mark.django_db
+def test_v1_provider_transient_failure_class_uses_transient_retry_cap(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.core.models import WorkflowWorkDisposition
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import claim_work, fail_work_claim
+    from engram.memory.work_failures import PROVIDER_TRANSIENT, ClassifiedWorkFailure
+
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_COOLDOWN_MINUTES', '30')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_MAX_ATTEMPTS', '2')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_TRANSIENT_MAX_ATTEMPTS', '10')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=3),
+        finished_at=now - timedelta(hours=3),
+        failure_reason='provider timed out',
+    )
+
+    for index, attempt_started_at in enumerate(
+        (
+            now - timedelta(hours=2),
+            now - timedelta(minutes=41),
+        ),
+        start=1,
+    ):
+        queued = queue_work_attempt(
+            work_id=work.id,
+            now=attempt_started_at,
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        )
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            lease_owner=f'distill-retry:{index}',
+            now=attempt_started_at,
+            lease_for=timedelta(minutes=5),
+            workflow_run_id=queued.id,
+        )
+        assert claimed.claim is not None
+        fail_work_claim(
+            claim=claimed.claim,
+            now=attempt_started_at + timedelta(minutes=1),
+            failure=ClassifiedWorkFailure(
+                failure_class=PROVIDER_TRANSIENT,
+                code='provider_timeout',
+            ),
+        )
+
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.next_retry_at is not None
+    assert work.next_retry_at < now
+
+    failed_v1 = list(
+        WorkflowRun.objects.filter(
+            work=work,
+            execution_contract_version=1,
+        ).order_by('created_at', 'id')
+    )
+    assert len(failed_v1) == 2
+    assert all(run.failure_class == PROVIDER_TRANSIENT for run in failed_v1)
+    assert all(run.failure_reason == '' for run in failed_v1)
+    CeleryOutbox.objects.all().delete()
+
+    with capture_logs() as logs:
+        result = RetryFailedDistillations().execute()
+
+    abandoned_counts = [
+        (entry['failed_count'], entry['transient_count'])
+        for entry in logs
+        if entry['event'] == 'distillation_reconciler_abandoned'
+    ]
+    observed = (
+        len(result.retried),
+        abandoned_counts,
+        len(fresh_v1_runs(work)),
+        CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count(),
+    )
+    assert observed == (1, [], 1, 1)

@@ -22,8 +22,11 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.work_dispatch import queue_work_attempt
+from engram.memory.work_failures import INFRASTRUCTURE_TRANSIENT, PROVIDER_TRANSIENT, WORKER_LOST
 
 logger = structlog.get_logger(__name__)
+
+_TRANSIENT_FAILURE_CLASSES = frozenset({PROVIDER_TRANSIENT, INFRASTRUCTURE_TRANSIENT, WORKER_LOST})
 
 _DEFAULT_COOLDOWN_MINUTES = 30
 _DEFAULT_MAX_ATTEMPTS = 2
@@ -318,7 +321,7 @@ class RetryFailedDistillations:
 
         failed_runs = [run for run in attempts if run.status == WorkflowRunStatus.FAILED]
         failed_count = len(failed_runs)
-        transient_count = sum(1 for run in failed_runs if is_transient_failure(run.failure_reason))
+        transient_count = sum(1 for run in failed_runs if self._run_is_transient(run))
         non_transient_count = failed_count - transient_count
 
         if non_transient_count >= max_attempts or transient_count >= transient_max_attempts:
@@ -369,6 +372,12 @@ class RetryFailedDistillations:
             failed_count=failed_count,
             transient_count=transient_count,
         )
+
+    def _run_is_transient(self, run: WorkflowRun) -> bool:
+        if run.execution_contract_version == 1:
+            return run.failure_class in _TRANSIENT_FAILURE_CLASSES
+
+        return is_transient_failure(run.failure_reason)
 
     def _lease_expired(self, work: WorkflowWork, now: datetime) -> bool:
         return (
