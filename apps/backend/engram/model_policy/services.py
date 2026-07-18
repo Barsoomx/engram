@@ -1178,7 +1178,7 @@ _MAX_TOKENS_BY_KIND = {
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
     'distill_reduce.v1': 8192,
-    'curation_decision_v1': 4096,
+    'curation_decision_v1': 16384,
 }
 _FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
 _CURATION_DECISION_OUTCOMES = (
@@ -1267,8 +1267,8 @@ _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
     'supporting_observation_ids (non-empty array of unique observation ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
     'Only use observation ids copied verbatim from the input observations. '
-    'Every input observation id must appear at least once across the memories supporting_observation_ids '
-    'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+    'Put each observation id that supports a memory in that memory supporting_observation_ids, and list '
+    'observation ids that carry no durable signal in no_signal_observation_ids. '
     'The same observation id may support more than one memory.'
 )
 _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
@@ -1281,7 +1281,7 @@ _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'source_ids (non-empty array of unique draft ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
     'Only use draft ids copied verbatim from the input drafts. '
-    'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+    'Group each input draft id into the source_ids of the memory that consolidates it. '
     'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
     'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
 )

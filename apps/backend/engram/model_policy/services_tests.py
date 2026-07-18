@@ -11,7 +11,7 @@ from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.models import ProviderCallRecord
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
@@ -28,6 +28,7 @@ from engram.model_policy.services import (
     _split_completion,
     curation_schema_prompt_prefix,
     generated_candidates_payload,
+    resolve_max_tokens,
     secret_fingerprint,
 )
 
@@ -447,8 +448,8 @@ def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
         'supporting_observation_ids (non-empty array of unique observation ids); '
         'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
         'Only use observation ids copied verbatim from the input observations. '
-        'Every input observation id must appear at least once across the memories supporting_observation_ids '
-        'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+        'Put each observation id that supports a memory in that memory supporting_observation_ids, and list '
+        'observation ids that carry no durable signal in no_signal_observation_ids. '
         'The same observation id may support more than one memory.'
     )
 
@@ -466,7 +467,7 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
         'source_ids (non-empty array of unique draft ids); '
         'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
         'Only use draft ids copied verbatim from the input drafts. '
-        'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+        'Group each input draft id into the source_ids of the memory that consolidates it. '
         'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
         'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
     )
@@ -521,6 +522,10 @@ def test_curation_decision_schema_prefix_states_allowed_combination_table() -> N
         'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
         'candidate evidence.'
     )
+
+
+def test_resolve_max_tokens_curation_decision_uses_reasoning_budget() -> None:
+    assert resolve_max_tokens(ModelPolicy(), 'curation_decision_v1') == 16384
 
 
 def test_curation_decision_instructions_align_with_allowed_combinations() -> None:

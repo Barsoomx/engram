@@ -92,13 +92,12 @@ _EXTRACT_SYSTEM_PROMPT = (
     'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
     'Observation ids must be copied verbatim from the Observation: lines of the input; '
     'never invent, alter, or abbreviate an id. '
-    'Every input observation id must appear at least once across the memories supporting_observation_ids '
-    'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+    'Put each observation id that supports a memory in that memory supporting_observation_ids, and list '
+    'observation ids that carry no durable signal in no_signal_observation_ids. '
     'The same observation id may support more than one memory. '
     'Record only durable, reusable engineering knowledge. When unsure whether an observation '
     'carries durable signal, put its id in no_signal_observation_ids. '
-    'If nothing durable was learned, return an empty memories array and every observation id '
-    'in no_signal_observation_ids.'
+    'If nothing durable was learned, return an empty memories array.'
 )
 
 
@@ -268,35 +267,38 @@ def _parse_kind(value: object) -> str:
     return clamped
 
 
-def _parse_id_list(
-    value: object,
-    chunk_observation_ids: frozenset[str],
-    label: str,
-    *,
-    require_non_empty: bool = False,
-) -> tuple[str, ...]:
+def _parse_supporting_ids(value: object, chunk_observation_ids: frozenset[str]) -> tuple[str, ...]:
     if not isinstance(value, list):
-        raise ExtractionContractError(f'{label} must be a list')
+        raise ExtractionContractError('supporting_observation_ids must be a list')
 
-    if require_non_empty and not value:
-        raise ExtractionContractError(f'{label} must be non-empty')
+    if not value:
+        raise ExtractionContractError('supporting_observation_ids must be non-empty')
 
-    ids: list[str] = []
     seen: set[str] = set()
+    valid: list[str] = []
     for entry in value:
         if not isinstance(entry, str):
-            raise ExtractionContractError(f'{label} must contain strings')
+            raise ExtractionContractError('supporting_observation_ids must contain strings')
 
         if entry in seen:
-            raise ExtractionContractError(f'{label} must be duplicate-free')
-
-        if entry not in chunk_observation_ids:
-            raise ExtractionContractError(f'{label} references an unknown observation')
+            raise ExtractionContractError('supporting_observation_ids must be duplicate-free')
 
         seen.add(entry)
-        ids.append(entry)
+        if entry in chunk_observation_ids:
+            valid.append(entry)
 
-    return tuple(ids)
+    return tuple(valid)
+
+
+def _validate_no_signal_ids(value: object) -> None:
+    if not isinstance(value, list):
+        raise ExtractionContractError('no_signal_observation_ids must be a list')
+
+    for entry in value:
+        if not isinstance(entry, str):
+            raise ExtractionContractError('no_signal_observation_ids must contain strings')
+
+    return
 
 
 def _parse_memory(item: object, chunk_observation_ids: frozenset[str]) -> ExtractedMemory:
@@ -318,12 +320,7 @@ def _parse_memory(item: object, chunk_observation_ids: frozenset[str]) -> Extrac
     if not isinstance(body, str) or not body.strip() or len(body) > _MAX_BODY:
         raise ExtractionContractError('memory body is invalid')
 
-    supporting = _parse_id_list(
-        item['supporting_observation_ids'],
-        chunk_observation_ids,
-        'supporting_observation_ids',
-        require_non_empty=True,
-    )
+    supporting = _parse_supporting_ids(item['supporting_observation_ids'], chunk_observation_ids)
     kind = _parse_kind(item['kind']) if 'kind' in item else ''
 
     return ExtractedMemory(
@@ -354,19 +351,15 @@ def parse_extraction_output(raw_body: str, *, chunk_observation_ids: frozenset[s
     if len(memories_raw) > _MAX_MEMORIES:
         raise ExtractionContractError('too many memories')
 
-    memories = tuple(_parse_memory(item, chunk_observation_ids) for item in memories_raw)
-    no_signal = _parse_id_list(parsed['no_signal_observation_ids'], chunk_observation_ids, 'no_signal_observation_ids')
+    _validate_no_signal_ids(parsed['no_signal_observation_ids'])
+    parsed_memories = tuple(_parse_memory(item, chunk_observation_ids) for item in memories_raw)
+    memories = tuple(memory for memory in parsed_memories if memory.supporting_observation_ids)
 
     supporting_union: set[str] = set()
     for memory in memories:
         supporting_union.update(memory.supporting_observation_ids)
 
-    no_signal_set = set(no_signal)
-    if supporting_union & no_signal_set:
-        raise ExtractionContractError('an observation cannot be both supporting and no-signal')
-
-    if supporting_union | no_signal_set != set(chunk_observation_ids):
-        raise ExtractionContractError('coverage does not equal the chunk manifest')
+    no_signal = tuple(sorted(chunk_observation_ids - supporting_union))
 
     return ExtractionOutput(memories=memories, no_signal_observation_ids=no_signal)
 

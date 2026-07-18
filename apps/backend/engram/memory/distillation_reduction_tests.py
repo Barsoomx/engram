@@ -267,6 +267,45 @@ def test_reduction_target_twenty_accepts_twenty_memories() -> None:
     assert len(parsed.memories) == 20
 
 
+def _flip_last_hex_digit(source_id: str) -> str:
+    last = source_id[-1]
+    replacement = '0' if last != '0' else '1'
+
+    return source_id[:-1] + replacement
+
+
+def test_parse_reduction_drops_typoed_source_id_and_tolerates_uncovered_draft() -> None:
+    inputs = [_draft(index) for index in range(4)]
+    typo = _flip_last_hex_digit(inputs[1].draft_id)
+    payload = {
+        'memories': [
+            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, typo]},
+            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[2].draft_id, inputs[3].draft_id]},
+        ]
+    }
+
+    parsed = parse_reduction_output(payload, inputs, reduction_target=2)
+
+    assert len(parsed.memories) == 2
+    assert parsed.memories[0].source_ids == (inputs[0].draft_id,)
+    assert parsed.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
+
+
+def test_parse_reduction_discards_memory_with_only_unknown_source_ids() -> None:
+    inputs = [_draft(0), _draft(1)]
+    payload = {
+        'memories': [
+            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [_flip_last_hex_digit(inputs[0].draft_id)]},
+            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, inputs[1].draft_id]},
+        ]
+    }
+
+    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
+
+    assert len(parsed.memories) == 1
+    assert parsed.memories[0].source_ids == (inputs[0].draft_id, inputs[1].draft_id)
+
+
 def test_final_drafts_wait_until_all_targets_accepted() -> None:
     assert derive_final_reduction_drafts((), (), reduction_target=2) == ()
 
