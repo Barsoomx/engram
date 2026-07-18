@@ -62,6 +62,7 @@ from engram.memory.work_execution import (
     claim_work,
     execution_configuration_fingerprint,
     fail_work_claim,
+    finish_work_claim,
     lock_work_fence,
 )
 from engram.memory.work_failures import (
@@ -985,6 +986,37 @@ def test_distill_session_work_v1_settled_work_is_absorbed_as_terminal_without_ex
     m_execute.assert_not_called()
     assert result == str(work.id)
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_explicit_redelivery_of_succeeded_run_absorbs_as_terminal(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='redeliver:worker',
+        now=now,
+        lease_for=timedelta(seconds=720),
+    )
+    run_id = claimed.claim.workflow_run_id
+    lock_work_fence(claim=claimed.claim, now=now)
+    finish_work_claim(claim=claimed.claim, now=now, completion='product_succeeded')
+
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_execute:
+        result = tasks_module.distill_session_work_v1(str(work.id), str(run_id))
+
+    m_execute.assert_not_called()
+    assert result == str(work.id)
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.RUNNING).count() == 0
 
 
 @pytest.mark.django_db

@@ -494,6 +494,62 @@ def test_supplied_non_manual_run_does_not_reopen_settled_work(
 
 
 @pytest.mark.django_db
+def test_explicit_redelivery_of_succeeded_run_absorbs_as_terminal() -> None:
+    module = _we()
+    scope = create_scope('claim-redeliver-succeeded')
+    work = create_required_work(scope, suffix='claim-redeliver-succeeded')
+    claimed = claim(module, work, lease_owner=owner('worker'), now=NOW)
+    run_id = claimed.claim.workflow_run_id
+    module.lock_work_fence(claim=claimed.claim, now=NOW)
+    module.finish_work_claim(claim=claimed.claim, now=NOW, completion='product_succeeded')
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner('redeliver'),
+        now=NOW + timedelta(seconds=5),
+        run_id=run_id,
+    )
+
+    assert result.outcome == 'terminal'
+    assert result.claim is None
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert stored.disposition == WorkflowWorkDisposition.COMPLETE
+    assert get_run(run_id).status == WorkflowRunStatus.SUCCEEDED
+    assert running_v1_count(work) == 0
+
+
+@pytest.mark.django_db
+def test_explicit_redelivery_of_failed_run_absorbs_on_terminal_failure() -> None:
+    module = _we()
+    scope = create_scope('claim-redeliver-failed')
+    work = create_required_work(scope, suffix='claim-redeliver-failed')
+    first = claim(module, work, lease_owner=owner('worker'), now=NOW)
+    run_id = first.claim.workflow_run_id
+    module.fail_work_claim(
+        claim=first.claim,
+        now=NOW,
+        failure=ClassifiedWorkFailure(failure_class='invalid_input', code='work_contract_invalid'),
+    )
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner('redeliver'),
+        now=NOW + timedelta(seconds=5),
+        run_id=run_id,
+    )
+
+    assert result.outcome == 'terminal'
+    assert result.claim is None
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert get_run(run_id).status == WorkflowRunStatus.FAILED
+    assert running_v1_count(work) == 0
+
+
+@pytest.mark.django_db
 def test_claim_rejects_naive_now_blank_and_oversized_owner() -> None:
     module = _we()
     scope = create_scope('claim-inputs')

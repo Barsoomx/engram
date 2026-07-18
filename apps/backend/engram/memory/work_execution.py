@@ -522,6 +522,21 @@ def _resolve_supplied_run(
         return None, error
 
 
+def _absorbs_redelivered_terminal_run(
+    work: WorkflowWork,
+    runs: list[WorkflowRun],
+    workflow_run_id: uuid.UUID | None,
+) -> bool:
+    if work.execution_state not in _TERMINAL_EXECUTION_STATES:
+        return False
+
+    for run in runs:
+        if run.id == workflow_run_id:
+            return run.status in (WorkflowRunStatus.SUCCEEDED, WorkflowRunStatus.FAILED)
+
+    return False
+
+
 def claim_work(
     *,
     work_id: uuid.UUID,
@@ -542,6 +557,9 @@ def claim_work(
 
         supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
         absorb_terminal = is_automatic or (supplied_run is not None and supplied_run.origin != WorkflowRunOrigin.MANUAL)
+
+        if pending_error is not None and _absorbs_redelivered_terminal_run(work, runs, workflow_run_id):
+            return ClaimResult(outcome='terminal', claim=None)
 
         short_circuit = _short_circuit_state(work, now=now, absorb_terminal=absorb_terminal)
         if short_circuit is not None:
