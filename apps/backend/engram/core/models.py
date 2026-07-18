@@ -2835,8 +2835,8 @@ class CurationDecision(ImmutableCreatedModel):
         null=True,
         blank=True,
     )
-    applicability = models.CharField(max_length=20, blank=True, default='')
-    evidence_membership = models.JSONField(default=dict, blank=True)
+    applicability = models.CharField(max_length=20, blank=True, default='', db_default='')
+    evidence_membership = models.JSONField(default=dict, blank=True, db_default={})
     payload_hash = models.CharField(max_length=64)
 
     _IMMUTABLE_FIELDS = (

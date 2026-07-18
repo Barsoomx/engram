@@ -17,6 +17,14 @@ MIGRATE_0040 = [
     ('core', '0040_curation_decision'),
     ('model_policy', '0004_alter_providercallrecord_result'),
 ]
+MIGRATE_0042 = [
+    ('core', '0042_memory_confidence_decayed_at'),
+    ('model_policy', '0004_alter_providercallrecord_result'),
+]
+MIGRATE_0043 = [
+    ('core', '0043_curation_decision_evidence_context'),
+    ('model_policy', '0004_alter_providercallrecord_result'),
+]
 
 
 def _create_historical_0032b_scope(historical_apps: Apps) -> dict[str, object]:
@@ -572,3 +580,101 @@ def test_0040_reverse_refuses_populated_curation_decisions() -> None:
         assert apps_0040.get_model('core', 'CurationDecision').objects.filter(id=decision.id).exists()
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0043_accepts_curation_decision_insert_from_0042_model() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0042)
+        old_apps = executor.loader.project_state(MIGRATE_0042).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'migration-0043-defaults')
+        observation = _create_historical_observation(
+            old_apps,
+            scope,
+            session,
+            'e' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        candidate = old_apps.get_model('core', 'MemoryCandidate').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Rolling defaults candidate',
+            body='The 0042 writer omits the new decision columns.',
+            content_hash='f' * 64,
+            decision_work_contract_version=1,
+        )
+        work = old_apps.get_model('core', 'WorkflowWork').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            work_type='candidate_decision',
+            subject_type='memory_candidate',
+            subject_id=candidate.id,
+            contract_version=1,
+            occurrence_key='',
+            input_fingerprint='1' * 64,
+            input_snapshot={'schema': 'candidate_decision_input/v1'},
+            disposition='complete',
+            resolution_reason='succeeded',
+            resolved_at=timezone.now(),
+            execution_state='settled',
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0043)
+
+        decision = old_apps.get_model('core', 'CurationDecision').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            work=work,
+            candidate=candidate,
+            contract_version=1,
+            input_fingerprint=work.input_fingerprint,
+            evidence_manifest_hash='2' * 64,
+            comparison_manifest_hash='3' * 64,
+            outcome='reject_candidate',
+            reason_code='noise_empty',
+            redacted_reason='empty after deterministic normalization',
+            effective_visibility_scope='team',
+            effective_team=scope['team'],
+            evidence_tier='none',
+            payload_hash='4' * 64,
+        )
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT column_name, column_default, is_nullable
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'core_curationdecision'
+                  AND column_name IN (
+                      'applicability',
+                      'evidence_membership'
+                  )
+                """,
+            )
+            columns = {name: (column_default, is_nullable) for name, column_default, is_nullable in cursor.fetchall()}
+
+        assert set(columns) == {
+            'applicability',
+            'evidence_membership',
+        }
+        assert all(column_default is not None for column_default, _nullable in columns.values())
+        assert all(nullable == 'NO' for _column_default, nullable in columns.values())
+
+        new_apps = executor.loader.project_state(MIGRATE_0043).apps
+        migrated = new_apps.get_model('core', 'CurationDecision').objects.get(id=decision.id)
+        assert migrated.applicability == ''
+        assert migrated.evidence_membership == {}
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)

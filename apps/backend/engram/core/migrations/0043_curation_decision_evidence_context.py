@@ -10,11 +10,11 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name='curationdecision',
             name='applicability',
-            field=models.CharField(blank=True, default='', max_length=20),
+            field=models.CharField(blank=True, db_default='', default='', max_length=20),
         ),
         migrations.AddField(
             model_name='curationdecision',
             name='evidence_membership',
-            field=models.JSONField(blank=True, default=dict),
+            field=models.JSONField(blank=True, db_default={}, default=dict),
         ),
     ]
