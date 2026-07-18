@@ -2784,3 +2784,107 @@ def test_redundant_rejection_revalidates_target_before_settlement(
     assert candidate.promoted_memory_id is None
     assert work.execution_state != WorkflowWorkExecutionState.SETTLED
     assert memory.current_version == 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL transaction semantics')
+def test_concurrent_targetless_publications_serialize_and_relist_loser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from django.db import close_old_connections
+
+    scope = orch.orchestrator_scope('targetless-race')
+    policy = orch.curation_policy(scope)
+    first_candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='targetless-race-a',
+        title='Retry ceiling policy',
+        body='The retry ceiling is four attempts.',
+    )
+    second_candidate, second_work, second_run = orch.subject_candidate(
+        scope,
+        suffix='targetless-race-b',
+        title='Retry ceiling policy',
+        body='The retry ceiling is four attempts.',
+    )
+    assert first_candidate.content_hash != second_candidate.content_hash
+
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge_results = {
+        candidate.id: orch.stub_judge_result(
+            verdict,
+            orch.provider_call_record(scope, policy),
+            policy,
+            shortlist,
+        )
+        for candidate in (first_candidate, second_candidate)
+    }
+    module = orch.curation_module()
+    orch.enable_rollout(monkeypatch)
+    monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: _EMBEDDING)
+    monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist)
+    monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence)
+    monkeypatch.setattr(
+        module,
+        'judge_curation_candidate',
+        lambda data: judge_results[data.candidate_id],
+    )
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', orch._stub_revalidate)
+
+    real_revalidate = module.revalidate_curation_shortlist
+    revalidated = threading.Barrier(2)
+
+    def synchronized_revalidate(data: object, frozen: object) -> bool:
+        unchanged = real_revalidate(data, frozen)
+        try:
+            revalidated.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+
+        return unchanged
+
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', synchronized_revalidate)
+    start = threading.Barrier(2)
+
+    def worker(item: tuple[WorkflowWork, WorkflowRun]) -> tuple[str | None, BaseException | None]:
+        work, run = item
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+
+            return orch.run_decision(work, run)
+        finally:
+            close_old_connections()
+
+    pairs = ((first_work, first_run), (second_work, second_run))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(worker, pairs))
+
+    candidates = (first_candidate, second_candidate)
+    works = (first_work, second_work)
+    for candidate in candidates:
+        candidate.refresh_from_db()
+    for work in works:
+        work.refresh_from_db()
+    errors = [error for _result, error in results if error is not None]
+    active = Memory.objects.filter(
+        organization=scope.organization,
+        project=scope.project,
+        status=MemoryStatus.APPROVED,
+        stale=False,
+        refuted=False,
+        transition_contract_version=1,
+    )
+
+    assert active.count() == 1
+    assert sum(len(orch.curation_decisions_for(candidate)) for candidate in candidates) == 1
+    assert sum(candidate.status == CandidateStatus.PROMOTED for candidate in candidates) == 1
+    assert sum(candidate.status == CandidateStatus.PROPOSED for candidate in candidates) == 1
+    assert sum(work.execution_state == WorkflowWorkExecutionState.SETTLED for work in works) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], MemoryTransitionError)
+    assert errors[0].code == 'stale_decision'

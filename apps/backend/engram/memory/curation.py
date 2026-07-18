@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import structlog
 from django.conf import settings
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from engram.access.services import EffectiveScope
@@ -1260,6 +1260,12 @@ class DecideMemoryCandidate:
 
         return memory
 
+    def _acquire_targetless_publication_lock(self, project_id: uuid.UUID) -> None:
+        digest = hashlib.sha256(f'targetless-publication:{project_id}'.encode()).digest()
+        key = int.from_bytes(digest[:8], 'big', signed=True)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', [key])
+
     def _settle_model_decision(
         self,
         work: WorkflowWork,
@@ -1320,6 +1326,8 @@ class DecideMemoryCandidate:
 
         _fault_boundary('before_transition')
         with transaction.atomic():
+            if memory_fence is None:
+                self._acquire_targetless_publication_lock(work.project_id)
             self._revalidate_shortlist(work, view, scope, embedding, shortlist)
             transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence, view, scope)
             self._write_decision(
