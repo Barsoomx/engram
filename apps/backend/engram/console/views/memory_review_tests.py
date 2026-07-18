@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import uuid
@@ -10,9 +11,8 @@ from typing import Any
 import pytest
 from django.contrib.auth.models import User
 from django.core.management import call_command
-from rest_framework.test import APIClient
-
 from rest_framework.authtoken.models import Token
+from rest_framework.test import APIClient
 
 from engram.access.auth_services import external_id_for_user, resolve_user_scope_for_organization
 from engram.access.models import (
@@ -25,7 +25,10 @@ from engram.access.models import (
     RoleCapability,
     TeamMembership,
 )
+from engram.console import services as console_services
+from engram.console.serializers.memory_review import ConflictResolveSerializer
 from engram.console.services import approve_memory_candidate, conflict_set_etag, reject_review_item
+from engram.console.views import memory_review as memory_review_view_module
 from engram.core.models import (
     CandidateStatus,
     Memory,
@@ -47,6 +50,8 @@ from engram.memory.transitions import (
     OpenMemoryConflict,
     OpenMemoryConflictInput,
     PromoteMemoryCandidate,
+    ResolveMemoryConflict,
+    ResolveMemoryConflictInput,
     build_memory_fence,
 )
 from engram.memory.transitions_test_support import (
@@ -1134,3 +1139,257 @@ def test_conflict_review_enforces_effective_project_and_team_scope() -> None:
         CandidateStatus.PROPOSED,
         True,
     )
+
+
+# C5.4 list/detail contract gaps (codex 32, RED) ------------------------------
+
+
+@pytest.mark.django_db
+def test_conflict_list_cursor_reaches_candidate_after_first_fifty(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    candidate_ids: set[str] = set()
+
+    for index in range(51):
+        candidate, _memories, _conflicts = _open_conflicts_for_candidate(
+            f_admin_org,
+            f_project,
+            suffix=f'pagination-{index}',
+        )
+        candidate_ids.add(str(candidate.id))
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    first = client.get('/v1/admin/memory-review/')
+
+    assert first.status_code == 200
+    assert len(first.data['results']) == 50
+    assert first.data['next'] is not None
+
+    second = client.get(first.data['next'])
+
+    assert second.status_code == 200
+    returned_ids = {
+        str(item['id'])
+        for item in [*first.data['results'], *second.data['results']]
+    }
+    assert returned_ids == candidate_ids
+
+
+@pytest.mark.django_db
+def test_conflict_search_matches_compared_claim_body(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    token = 'compared-only-zebra-417'
+    base, source, _session = provenanced_candidate_in_scope(
+        f_admin_org,
+        f_project,
+        None,
+        suffix='search-compared-claim',
+        title='Existing compared claim',
+        body=f'This immutable compared body contains {token}.',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    memory = PromoteMemoryCandidate().execute(transition_request(base)).memory
+    candidate, _candidate_source = candidate_in_scope(
+        base,
+        source,
+        title='Candidate claim without the marker',
+        body='Candidate body without the marker.',
+    )
+    opened = OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=transition_request_for(
+                candidate,
+                key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:search',
+            ),
+            candidate_fence=candidate_fence_for(candidate),
+            memory_fence=build_memory_fence(memory),
+            evidence_hash='a' * 64,
+            redacted_reason='compared-claim search contract',
+        ),
+    )
+    conflict = MemoryConflict.objects.select_related('memory_version').get(id=opened.id)
+    assert token in conflict.memory_version.body
+    assert token not in candidate.title
+    assert token not in candidate.body
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/', {'search': token})
+
+    assert response.status_code == 200
+    assert str(candidate.id) in {
+        str(item['id'])
+        for item in _list_items(response.data)
+    }
+
+
+def test_conflict_resolve_rejects_title_above_memory_column_limit() -> None:
+    serializer = ConflictResolveSerializer(
+        data={
+            'action': 'merge_candidate',
+            'reason': 'exercise the persistence boundary',
+            'target_memory_id': str(uuid.uuid4()),
+            'merged_title': 'x' * 256,
+            'merged_body': 'valid merged body',
+        },
+    )
+
+    assert serializer.is_valid() is False
+    assert serializer.errors['merged_title'][0].code == 'max_length'
+
+
+@pytest.mark.django_db
+def test_conflict_detail_body_matches_its_pinned_version_id(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    candidate, memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='pinned-detail',
+    )
+    memory = memories[0]
+    pinned_version = conflicts[0].memory_version
+
+    # codex 14 (this branch) blocks ReviseMemory while a conflict pins the memory,
+    # so the divergence between the immutable pinned version and the live row is
+    # seeded directly to prove the serializer reads the pinned version snapshot.
+    Memory.objects.filter(id=memory.id).update(
+        title='Live revised title',
+        body='Live revised body',
+        current_version=pinned_version.version + 1,
+    )
+
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 200
+    claim = next(
+        item
+        for item in response.data['existing_claims']
+        if str(item['memory_id']) == str(memory.id)
+    )
+    assert str(claim['version_id']) == str(pinned_version.id)
+    assert claim['body'] == pinned_version.body
+    assert claim['body_hash'] == hashlib.sha256(pinned_version.body.encode()).hexdigest()
+
+
+def _resolve_conflicts_during_read(
+    candidate: MemoryCandidate,
+    memories: list[Memory],
+    conflicts: list[MemoryConflict],
+    *,
+    key: str,
+) -> None:
+    ResolveMemoryConflict().execute(
+        ResolveMemoryConflictInput(
+            request=transition_request_for(candidate, key=key),
+            candidate_fence=candidate_fence_for(candidate),
+            conflict_ids=tuple(conflict.id for conflict in conflicts),
+            conflict_memory_fences=tuple(
+                build_memory_fence(memory)
+                for memory in memories
+            ),
+            resolution='reject_candidate',
+        ),
+    )
+
+
+@pytest.mark.django_db
+def test_conflict_list_skips_candidate_resolved_between_read_queries(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='list-resolution-race',
+    )
+    real_fetch = console_services.open_conflicts_for_candidates
+    resolved = False
+
+    def resolve_then_fetch(
+        organization: Organization,
+        candidate_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, list[MemoryConflict]]:
+        nonlocal resolved
+
+        if not resolved:
+            resolved = True
+            _resolve_conflicts_during_read(
+                candidate,
+                memories,
+                conflicts,
+                key=f'list-resolution-race:{candidate.id}',
+            )
+
+        return real_fetch(organization, candidate_ids)
+
+    monkeypatch.setattr(
+        memory_review_view_module,
+        'open_conflicts_for_candidates',
+        resolve_then_fetch,
+    )
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get('/v1/admin/memory-review/')
+
+    assert response.status_code == 200
+    assert str(candidate.id) not in {
+        str(item['id'])
+        for item in _list_items(response.data)
+    }
+
+
+@pytest.mark.django_db
+def test_conflict_detail_returns_404_when_resolved_between_read_queries(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate, memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='detail-resolution-race',
+    )
+    real_fetch = console_services.open_conflicts_for_candidates
+    resolved = False
+
+    def resolve_then_fetch(
+        organization: Organization,
+        candidate_ids: list[uuid.UUID],
+    ) -> dict[uuid.UUID, list[MemoryConflict]]:
+        nonlocal resolved
+
+        if not resolved:
+            resolved = True
+            _resolve_conflicts_during_read(
+                candidate,
+                memories,
+                conflicts,
+                key=f'detail-resolution-race:{candidate.id}',
+            )
+
+        return real_fetch(organization, candidate_ids)
+
+    monkeypatch.setattr(
+        memory_review_view_module,
+        'open_conflicts_for_candidates',
+        resolve_then_fetch,
+    )
+    client = _auth_client(f_admin_token, f_admin_org)
+
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 404

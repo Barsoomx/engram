@@ -8,6 +8,8 @@ from rest_framework import serializers
 from engram.core.models import Memory, MemoryCandidate, MemoryConflict, MemoryVersion
 from engram.core.redaction import redact_value
 
+MEMORY_TITLE_MAX_LENGTH = Memory._meta.get_field('title').max_length
+
 
 class MemoryReviewActionSerializer(serializers.Serializer):
     action = serializers.ChoiceField(
@@ -191,7 +193,7 @@ class ConflictResolveSerializer(serializers.Serializer):
 
     target_memory_id = serializers.UUIDField(required=False)
 
-    merged_title = serializers.CharField(required=False, allow_blank=False, max_length=32768)
+    merged_title = serializers.CharField(required=False, allow_blank=False, max_length=MEMORY_TITLE_MAX_LENGTH)
 
     merged_body = serializers.CharField(required=False, allow_blank=False, max_length=32768)
 
@@ -250,24 +252,47 @@ def _candidate_claim(
     return claim
 
 
+def _version_title(version: MemoryVersion, memory: Memory) -> str:
+    metadata = version.source_metadata if isinstance(version.source_metadata, dict) else {}
+    full_text = metadata.get('full_text')
+
+    if isinstance(full_text, str) and full_text:
+        title_part, separator, _body = full_text.partition('\n\n')
+
+        if separator:
+            return title_part
+
+    return memory.title
+
+
+def _version_kind(version: MemoryVersion, memory: Memory) -> str:
+    metadata = version.source_metadata if isinstance(version.source_metadata, dict) else {}
+    kind = metadata.get('kind')
+
+    if isinstance(kind, str) and kind:
+        return kind
+
+    return memory.kind
+
+
 def _existing_claim(
     conflict: MemoryConflict,
     *,
     include_body: bool,
     evidence: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    memory = conflict.memory
+    version = conflict.memory_version
 
     claim = {
         'memory_id': str(conflict.memory_id),
         'version_id': str(conflict.memory_version_id),
-        'title': _redacted(memory.title),
-        'kind': memory.kind,
-        'body_hash': _body_hash(memory.body),
+        'title': _redacted(_version_title(version, conflict.memory)),
+        'kind': _version_kind(version, conflict.memory),
+        'body_hash': _body_hash(version.body),
     }
 
     if include_body:
-        claim['body'] = _redacted(memory.body)
+        claim['body'] = _redacted(version.body)
 
     if evidence is not None:
         claim['evidence'] = evidence

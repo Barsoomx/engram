@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 from django.db import IntegrityError, transaction
-from django.db.models import Exists, Min, OuterRef, Q
+from django.db.models import Exists, OuterRef, Q, Subquery
 from django.utils import timezone
 from rest_framework import status
 
@@ -1059,19 +1059,33 @@ def open_conflict_candidates(
         queryset = queryset.filter(team_id=team_id)
 
     if search:
-        queryset = queryset.filter(Q(title__icontains=search) | Q(body__icontains=search))
+        queryset = queryset.filter(_conflict_search_predicate(search))
 
-    queryset = queryset.annotate(
-        opened_at=Min(
-            'memory_conflicts__created_at',
-            filter=Q(memory_conflicts__resolved_transition__isnull=True),
-        ),
+    opened_at_subquery = (
+        MemoryConflict.objects.filter(
+            candidate_id=OuterRef('pk'),
+            resolved_transition__isnull=True,
+        )
+        .order_by('created_at')
+        .values('created_at')[:1]
     )
+
+    queryset = queryset.annotate(opened_at=Subquery(opened_at_subquery))
 
     if opened_at__gte is not None:
         queryset = queryset.filter(opened_at__gte=opened_at__gte)
 
     return queryset
+
+
+def _conflict_search_predicate(search: str) -> Q:
+    compared = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
+        memory_version__body__icontains=search,
+    )
+
+    return Q(title__icontains=search) | Q(body__icontains=search) | Exists(compared)
 
 
 def open_conflicts_for_candidates(
@@ -1203,6 +1217,10 @@ def resolve_candidate_conflicts(
 
     if candidate is None:
         raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
+    title_limit = Memory._meta.get_field('title').max_length
+    if merged_title is not None and len(merged_title) > title_limit:
+        raise MemoryReviewError('invalid_title', 'merged_title exceeds the maximum length', status=400)
 
     if expected_etag is not None and expected_etag != conflict_set_etag(candidate):
         raise MemoryReviewError('stale_conflict_set', 'conflict set has changed', status=412)
