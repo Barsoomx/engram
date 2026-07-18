@@ -1362,7 +1362,7 @@ def test_observation_explicit_delivery_rejects_legacy_v0_before_domain_access() 
 
 
 @pytest.mark.django_db
-def test_observation_explicit_v1_executes_once_and_rejects_redelivery_of_settled_run() -> None:
+def test_observation_explicit_v1_executes_once_and_absorbs_redelivery_of_settled_run() -> None:
     organization, _team, project, _session, _raw_event, observation = create_observation_recorded_scope()
     work = create_required_observation_work(observation)
     run = queue_work_attempt(
@@ -1376,11 +1376,11 @@ def test_observation_explicit_v1_executes_once_and_rejects_redelivery_of_settled
         return_value=MemoryCandidateWorkerResult(candidate=None, duplicate=False, memory=None),
     ) as m_execute:
         first = tasks_module.process_observation_work_v1(str(work.id), workflow_run_id=str(run.id))
-        with pytest.raises(ValueError, match='queued v1 attempt'):
-            tasks_module.process_observation_work_v1(str(work.id), workflow_run_id=str(run.id))
+        second = tasks_module.process_observation_work_v1(str(work.id), workflow_run_id=str(run.id))
 
     m_execute.assert_called_once()
     assert first == str(run.id)
+    assert second == str(work.id)
     run.refresh_from_db()
     work.refresh_from_db()
     assert run.status == WorkflowRunStatus.SUCCEEDED
