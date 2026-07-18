@@ -724,6 +724,7 @@ class Memory(TimestampedModel):
     )
     current_version = models.PositiveIntegerField(default=1)
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    confidence_decayed_at = models.DateTimeField(null=True, blank=True)
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
