@@ -34,6 +34,11 @@ from engram.model_policy.services import ResolveModelPolicy, ResolveModelPolicyI
 
 _MAX_OWNER_LENGTH = 255
 _LEASE_EXPIRED_CODE = 'lease_expired'
+_DEFAULT_FAILURE_STREAK_LIMIT = 12
+
+
+def _failure_streak_limit() -> int:
+    return int(os.getenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', str(_DEFAULT_FAILURE_STREAK_LIMIT)))
 
 _TASK_TYPE_BY_WORK = {
     WorkflowWorkType.OBSERVATION_PROCESSING: 'generation',
@@ -859,6 +864,10 @@ def _apply_failure_work(work: WorkflowWork, *, now: datetime, failure: Classifie
         work.blocked_configuration_fingerprint = failure.configuration_fingerprint
         work.next_retry_at = None
     elif failure.failure_class == INVALID_INPUT:
+        work.execution_state = WorkflowWorkExecutionState.TERMINAL_FAILURE
+        work.blocked_configuration_fingerprint = ''
+        work.next_retry_at = None
+    elif streak >= _failure_streak_limit():
         work.execution_state = WorkflowWorkExecutionState.TERMINAL_FAILURE
         work.blocked_configuration_fingerprint = ''
         work.next_retry_at = None

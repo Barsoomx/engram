@@ -582,3 +582,46 @@ def test_reconcile_expired_candidate_lease_queues_recovery_attempt(
             (str(work.id), str(queued.get().id)),
         )
     ]
+
+
+@pytest.mark.django_db
+def test_retry_streak_ceiling_parks_candidate_work_and_reconciler_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', '3')
+    scope = _scope('ceiling')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, _created = ensure_candidate_decision_work(candidate.id)
+    now = timezone.now()
+
+    for attempt in range(1, 4):
+        claim_now = now + timedelta(hours=attempt - 1)
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            lease_owner=f'ceiling:{attempt}',
+            now=claim_now,
+            lease_for=timedelta(minutes=5),
+        )
+        assert claimed.outcome == 'claimed'
+        fail_work_claim(
+            claim=claimed.claim,
+            now=claim_now,
+            failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='judge_policy_denied'),
+        )
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.failure_streak == 3
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(days=1),
+    )
+
+    assert result.queued == 0
+    assert sent == []

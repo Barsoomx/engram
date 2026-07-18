@@ -1265,3 +1265,27 @@ def test_fail_rejects_claim_after_lease_expiry_before_reclaim() -> None:
     assert stored.fencing_token == first.claim.fencing_token
     assert stored.lease_owner == first.claim.lease_owner
     assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.RUNNING
+
+
+@pytest.mark.django_db
+def test_retry_streak_ceiling_parks_work_as_terminal_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _we()
+    monkeypatch.setenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', '3')
+    scope = create_scope('claim-ceiling')
+    work = create_required_work(scope, suffix='claim-ceiling')
+    failure = ClassifiedWorkFailure(failure_class='provider_transient', code='judge_policy_denied')
+
+    for attempt in range(1, 4):
+        claim_now = NOW + timedelta(hours=attempt - 1)
+        claimed = claim(module, work, lease_owner=owner(f'ceil-{attempt}'), now=claim_now)
+        assert claimed.outcome == 'claimed'
+        module.fail_work_claim(claim=claimed.claim, now=claim_now, failure=failure)
+        stored = get_work(work)
+        assert stored.failure_streak == attempt
+        if attempt < 3:
+            assert stored.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert stored.next_retry_at is None
+    assert stored.failure_streak == 3
