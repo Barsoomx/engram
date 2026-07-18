@@ -10,6 +10,8 @@ from uuid import UUID
 
 import pytest
 
+from django.utils import timezone
+
 from engram.core.models import (
     CurationDecision,
     Memory,
@@ -19,12 +21,17 @@ from engram.core.models import (
     MemoryTransition,
     MemoryVersionSource,
     Observation,
+    SessionStatus,
     VisibilityScope,
+    WorkflowWork,
 )
 from engram.memory.curation_test_support import create_curation_policy
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
 from engram.memory.distillation_provenance import candidate_source_anchors, canonical_source_manifest
+from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.session_lifecycle import EndSession
 from engram.memory.transitions_test_support import (
+    _stage_history,
     candidate_in_scope,
     provenanced_candidate,
     provenanced_candidate_in_scope,
@@ -784,6 +791,72 @@ def test_two_distinct_window_groups_reach_corroborated_candidate_tier() -> None:
     assert len(context.candidate.refs) >= 2
     assert len(set(context.candidate.refs)) == len(context.candidate.refs)
     assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_cumulative_windows_do_not_corroborate_the_same_observation() -> None:
+    module = _judge_module()
+    candidate, first_source, scope = provenanced_candidate('judge-evidence-cumulative-window')
+    organization, project, session = scope
+    original = first_source.observation
+    first_window = first_source.window
+
+    type(session).objects.filter(id=session.id).update(
+        status=SessionStatus.ACTIVE,
+        ended_at=None,
+        end_work_contract_version=0,
+        observation_sequence_cursor=2,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='Later unrelated observation',
+        body='This later event does not independently support the candidate claim.',
+        content_hash=f'evidence-content-{session.id}-2',
+        session_sequence=2,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    ended = EndSession().execute(
+        organization_id=organization.id,
+        project_id=project.id,
+        session_id=session.id,
+        ended_at=timezone.now(),
+        source='explicit',
+    )
+    second_work = WorkflowWork.objects.get(id=ended.work_id)
+    second_window = materialize_distillation_window(second_work)
+    second_stage, _primary_stage = _stage_history(scope, second_window)
+
+    second_manifest_ids = {
+        entry['observation_id']
+        for chunk in second_window.chunks.order_by('ordinal')
+        for entry in chunk.input_manifest['observations']
+    }
+    assert first_window.lower_sequence_exclusive == 0
+    assert second_window.lower_sequence_exclusive == 0
+    assert first_window.input_hash != second_window.input_hash
+    assert str(original.id) in second_manifest_ids
+
+    MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        window=second_window,
+        observation=original,
+        stage=second_stage,
+        anchors=first_source.anchors,
+        anchors_hash=first_source.anchors_hash,
+    )
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'supported'
+    assert len(context.candidate.refs) == 1
 
 
 @pytest.mark.django_db

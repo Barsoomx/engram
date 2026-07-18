@@ -193,7 +193,7 @@ def _newer(current: datetime | None, candidate: datetime | None) -> datetime | N
     return current
 
 
-def _eligible_group_hash(source: MemoryCandidateSource) -> str | None:
+def _eligible_group_pair(source: MemoryCandidateSource) -> tuple[str, str] | None:
     if source.source_kind != MemoryCandidateSourceKind.DISTILLATION:
         return None
     if source.window_id is None or source.stage_id is None:
@@ -209,30 +209,62 @@ def _eligible_group_hash(source: MemoryCandidateSource) -> str | None:
         raise CurationJudgeError('transition_dependency_unavailable') from error
     if manifest != source.anchors_hash:
         raise CurationJudgeError('transition_dependency_unavailable')
-    if anchors.get('observation_digest') != observation_content_digest(observation):
+    digest = observation_content_digest(observation)
+    if anchors.get('observation_digest') != digest:
         raise CurationJudgeError('transition_dependency_unavailable')
 
-    return source.window.input_hash
+    return source.window.input_hash, digest
+
+
+def _independence_group_hashes(pairs: list[tuple[str, str]]) -> set[str]:
+    windows: set[str] = set()
+    observation_windows: dict[str, list[str]] = {}
+    for window_hash, observation_digest in pairs:
+        windows.add(window_hash)
+        observation_windows.setdefault(observation_digest, []).append(window_hash)
+
+    parent = {window_hash: window_hash for window_hash in windows}
+
+    def find(node: str) -> str:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for shared_windows in observation_windows.values():
+        first = shared_windows[0]
+        for other in shared_windows[1:]:
+            union(first, other)
+
+    return {find(window_hash) for window_hash in windows}
 
 
 def _candidate_group_hashes(candidate_id: uuid.UUID) -> tuple[set[str], datetime | None]:
     sources = MemoryCandidateSource.objects.select_related('window', 'observation', 'stage').filter(
         candidate_id=candidate_id
     )
-    hashes: set[str] = set()
+    pairs: list[tuple[str, str]] = []
     latest: datetime | None = None
     for source in sources:
-        value = _eligible_group_hash(source)
-        if value is not None:
-            hashes.add(value)
+        pair = _eligible_group_pair(source)
+        if pair is not None:
+            pairs.append(pair)
             latest = _newer(latest, _source_evidence_time(source))
 
-    return hashes, latest
+    return _independence_group_hashes(pairs), latest
 
 
 def _traverse_target(
     version_id: uuid.UUID,
-    hashes: set[str],
+    pairs: list[tuple[str, str]],
     times: list[datetime],
     path: set[uuid.UUID],
     resolved: set[uuid.UUID],
@@ -256,25 +288,25 @@ def _traverse_target(
 
     for row in rows:
         if row.candidate_source_id is not None:
-            value = _eligible_group_hash(row.candidate_source)
-            if value is not None:
-                hashes.add(value)
+            pair = _eligible_group_pair(row.candidate_source)
+            if pair is not None:
+                pairs.append(pair)
                 moment = _source_evidence_time(row.candidate_source)
                 if moment is not None:
                     times.append(moment)
         elif row.source_memory_version_id is not None:
-            _traverse_target(row.source_memory_version_id, hashes, times, path, resolved)
+            _traverse_target(row.source_memory_version_id, pairs, times, path, resolved)
 
     path.discard(version_id)
     resolved.add(version_id)
 
 
 def _target_evidence(version_id: uuid.UUID) -> ClaimEvidence:
-    hashes: set[str] = set()
+    pairs: list[tuple[str, str]] = []
     times: list[datetime] = []
-    _traverse_target(version_id, hashes, times, set(), set())
+    _traverse_target(version_id, pairs, times, set(), set())
 
-    return _claim_evidence(hashes, max(times) if times else None)
+    return _claim_evidence(_independence_group_hashes(pairs), max(times) if times else None)
 
 
 def build_curation_evidence_context(candidate_id: uuid.UUID, shortlist: CurationShortlist) -> CurationEvidenceContext:
