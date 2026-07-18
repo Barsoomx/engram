@@ -2654,3 +2654,133 @@ def test_model_redundant_rejection_retries_when_shortlist_target_advances(
         0,
         CandidateStatus.PROPOSED,
     )
+
+
+@pytest.mark.django_db
+def test_deterministic_exact_identity_does_not_rebase_onto_advanced_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('deterministic-stale-target')
+    memory = orch.target_memory(
+        scope,
+        suffix='deterministic-stale-target',
+        title='Cache eviction policy',
+        body=_LONG_BODY,
+    )
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='deterministic-stale-target',
+        title='Cache eviction policy',
+        body=_LONG_BODY,
+    )
+    module = orch.curation_module()
+    original_gate = module.EvaluateDeterministicCandidateGates
+    orch.install_deterministic_only(monkeypatch)
+
+    class AdvancingDeterministicGate:
+        def execute(self, work_id: uuid.UUID) -> object:
+            result = original_gate().execute(work_id)
+            orch.advance_target_memory(
+                memory,
+                title='Cache eviction policy v2',
+                body='A concurrent revision changed eviction to frequency-based admission.',
+            )
+
+            return result
+
+    monkeypatch.setattr(
+        module,
+        'EvaluateDeterministicCandidateGates',
+        AdvancingDeterministicGate,
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    memory.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+    assert memory.title == 'Cache eviction policy v2'
+    assert memory.body == 'A concurrent revision changed eviction to frequency-based admission.'
+    assert memory.current_version == 2
+
+
+@pytest.mark.django_db
+def test_redundant_rejection_revalidates_target_before_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('redundant-stale-target')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='redundant-stale-target',
+        title='Retry backoff policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='redundant-stale-target',
+        title='Retry backoff policy restatement',
+        body='The retry policy uses the same bounded exponential backoff.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='reject_candidate',
+        relation='redundant',
+        target_memory_version_id=target_version.id,
+        candidate_evidence_refs=('cref-1',),
+        comparisons=(
+            CurationJudgeComparisonV1(
+                target_version.id,
+                'redundant',
+                ('tref-1',),
+            ),
+        ),
+        applicability='same',
+        temporal_order='not_applicable',
+        reason_code='redundant_claim',
+        reason='the candidate is redundant with the selected current target',
+    )
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    def advance() -> None:
+        orch.advance_target_memory(
+            memory,
+            title='Retry backoff policy v2',
+            body='The current policy now uses fixed-delay retries without backoff.',
+        )
+
+    orch.install_fault(monkeypatch, 'before_transition', advance)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    memory.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+    assert memory.current_version == 2

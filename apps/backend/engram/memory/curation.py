@@ -1167,8 +1167,8 @@ class DecideMemoryCandidate:
 
             return
 
-        memory_fence = self._target_memory_fence(gate.target_memory_version_id, candidate)
         with transaction.atomic():
+            memory_fence = self._target_memory_fence(gate.target_memory_version_id)
             result = MergeMemoryCandidate().execute(
                 MergeMemoryCandidateInput(
                     request=self._request(work, candidate),
@@ -1564,21 +1564,18 @@ class DecideMemoryCandidate:
 
         return build_memory_fence(memory)
 
-    def _target_memory_fence(self, target_version_id: uuid.UUID | None, candidate: MemoryCandidate) -> MemoryFence:
+    def _target_memory_fence(self, target_version_id: uuid.UUID | None) -> MemoryFence:
         if target_version_id is None:
             raise _operational('stale_decision', 'deterministic merge requires a target version')
         try:
-            memory_id = MemoryVersion.objects.values_list('memory_id', flat=True).get(id=target_version_id)
+            version = (
+                MemoryVersion.objects.select_for_update().select_related('memory').get(id=target_version_id)
+            )
         except MemoryVersion.DoesNotExist as error:
             raise _operational('stale_decision', 'deterministic merge target no longer exists') from error
-
-        return self._memory_fence(memory_id)
-
-    def _memory_fence(self, memory_id: uuid.UUID) -> MemoryFence:
-        try:
-            memory = Memory.objects.get(id=memory_id)
-        except Memory.DoesNotExist as error:
-            raise _operational('stale_decision', 'target memory no longer exists') from error
+        memory = version.memory
+        if memory.current_version != version.version or memory.stale or memory.refuted:
+            raise _operational('stale_decision', 'deterministic merge target advanced after gate evaluation')
 
         return build_memory_fence(memory)
 
