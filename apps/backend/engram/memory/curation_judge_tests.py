@@ -379,6 +379,27 @@ def test_conflict_tag_blocks_revise_and_supersede_targets() -> None:
         assert getattr(error.value, 'code', None) == 'judge_policy_denied'
 
 
+@pytest.mark.django_db
+def test_conflict_tag_blocks_merge_evidence_target() -> None:
+    module, data, entry, candidate = _fixture()
+    conflicted = replace(entry, has_open_conflict=True)
+    data = replace(data, shortlist=replace(data.shortlist, entries=(conflicted,)))
+    payload = _payload(
+        conflicted,
+        outcome='merge_evidence',
+        relation='equivalent',
+        target=str(conflicted.memory_version_id),
+        reason_code='equivalent_claim',
+        applicability='same',
+        temporal_order='not_applicable',
+    )
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
 def _conflict_payload(
     entry: object,
     *,

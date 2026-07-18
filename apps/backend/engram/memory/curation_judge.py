@@ -421,6 +421,9 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
     if outcome == 'publish_new':
         ok = candidate_tier in _SUPPORTED_TIERS and complete
     elif outcome == 'merge_evidence':
+        if entry is not None and entry.has_open_conflict:
+            raise CurationJudgeError('judge_policy_denied')
+
         ok = candidate_tier in _SUPPORTED_TIERS and target_tier in _SUPPORTED_TIERS and verdict.applicability == 'same'
     elif outcome == 'revise_memory':
         if entry is not None and entry.has_open_conflict:
