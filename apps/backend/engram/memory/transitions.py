@@ -124,6 +124,7 @@ class PublishDigestMemoryInput:
     work_claim: WorkClaim | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     visibility_scope: str = VisibilityScope.PROJECT
+    require_active_sources: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1773,9 +1774,10 @@ class PublishDigestMemory:
                 memories, versions = _lock_digest_sources_from_versions(request, version_ids, data.visibility_scope)
                 source_pairs = {(str(memory_id), str(version.id)) for memory_id, version in versions.items()}
             _lock_exact_documents(versions)
-            for source_memory in memories.values():
-                _require_active_memory(source_memory)
-                _require_memory_has_no_open_conflict(source_memory)
+            if data.require_active_sources:
+                for source_memory in memories.values():
+                    _require_active_memory(source_memory)
+                    _require_memory_has_no_open_conflict(source_memory)
             if claimed_work is not None:
                 _validate_digest_work_claim(claimed_work, request, source_pairs)
             existing = _existing_transition(request, fingerprint=fingerprint)

@@ -749,6 +749,7 @@ def _publish(
             metadata=metadata,
             visibility_scope=visibility,
             work_claim=claim,
+            require_active_sources=False,
         ),
     )
     if claim is None:

@@ -1767,6 +1767,7 @@ class BuildWeeklyStructuredDigest:
                     body=body,
                     metadata=metadata,
                     visibility_scope=visibility_scope,
+                    require_active_sources=False,
                 ),
             )
         except MemoryTransitionError as error:
