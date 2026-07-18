@@ -33,9 +33,9 @@ _REDUCE_SYSTEM_PROMPT = (
     'confidence (a JSON number between 0 and 1, never a string); '
     'source_ids (non-empty array of unique draft ids); '
     'kind (optional, one of: decision, convention, gotcha, architecture, incident; omit it when none applies). '
-    'Every source_ids value must be an id copied verbatim from the input drafts: any other value is rejected. '
-    'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted, '
-    'and the same draft id may appear in more than one entry. '
+    'Every source_ids value must be an id copied verbatim from the input drafts. '
+    'Group each input draft id into the source_ids of the memory that consolidates it; '
+    'the same draft id may appear in more than one entry. '
     'memories must never be empty. '
     'The user message is one JSON object: drafts (array of {id, title, body, confidence, kind?}) '
     'and reduction_target (a number). '
@@ -235,8 +235,7 @@ def parse_reduction_output(  # noqa: C901
             raise ReductionContractError('source_ids must contain strings')
         if len(set(source_ids)) != len(source_ids):
             raise ReductionContractError('source_ids must be duplicate-free')
-        if not set(source_ids) <= known:
-            raise ReductionContractError('source_ids references an unknown draft')
+        valid_source_ids = tuple(source_id for source_id in source_ids if source_id in known)
         kind = item.get('kind', '')
         if not isinstance(kind, str) or (
             kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
@@ -245,14 +244,13 @@ def parse_reduction_output(  # noqa: C901
         confidence_value = item['confidence']
         if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
             raise ReductionContractError('confidence must be numeric')
+        if not valid_source_ids:
+            continue
 
-        memories.append(ReducedMemory(title, body, _confidence(confidence_value), tuple(source_ids), kind))
+        memories.append(ReducedMemory(title, body, _confidence(confidence_value), valid_source_ids, kind))
     if inputs and not memories:
         raise ReductionContractError('reduction output is empty')
     if inputs:
-        covered = {source_id for memory in memories for source_id in memory.source_ids}
-        if covered != known:
-            raise ReductionContractError('reduction output does not cover every input')
         target = reduction_target if reduction_target is not None else len(inputs) - 1
         if len(inputs) > 1 and len(memories) >= len(inputs):
             raise ReductionContractError('reduction output must shrink')

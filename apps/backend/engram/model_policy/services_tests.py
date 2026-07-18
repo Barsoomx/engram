@@ -467,7 +467,7 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
         'source_ids (non-empty array of unique draft ids); '
         'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
         'Only use draft ids copied verbatim from the input drafts. '
-        'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+        'Group each input draft id into the source_ids of the memory that consolidates it. '
         'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
         'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
     )

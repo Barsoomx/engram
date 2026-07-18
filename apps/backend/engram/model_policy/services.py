@@ -1281,7 +1281,7 @@ _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'source_ids (non-empty array of unique draft ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
     'Only use draft ids copied verbatim from the input drafts. '
-    'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+    'Group each input draft id into the source_ids of the memory that consolidates it. '
     'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
     'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
 )
