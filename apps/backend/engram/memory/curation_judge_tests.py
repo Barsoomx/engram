@@ -1061,6 +1061,40 @@ def test_judge_result_carries_comparison_manifest_binding(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db
+def test_judge_call_carries_decision_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, data, entry, candidate = _fixture()
+    candidate.refresh_from_db()
+    organization, project = candidate.organization, candidate.project
+    session_team = candidate.team
+    create_curation_policy(organization, session_team, project, task_type='curation')
+    verdict_body = json.dumps(_payload(entry))
+    calls: list[object] = []
+
+    class GatewayStub:
+        def call(self, call_input: object) -> ProviderCallResult:
+            calls.append(call_input)
+            return ProviderCallResult(
+                provider=call_input.policy.provider,
+                model=call_input.policy.model,
+                call_record_id=uuid.uuid4(),
+                redaction_state='clean',
+                generated_title='',
+                generated_body=verdict_body,
+            )
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())
+
+    module.JudgeCurationCandidate().execute(data)
+
+    assert calls
+    assert calls[0].system_prompt == module._CURATION_JUDGE_SYSTEM_PROMPT
+    assert 'curation_judge_input.v1' in calls[0].system_prompt
+    assert 'Allowed outcome and relation combinations' in calls[0].system_prompt
+    assert 'copied verbatim' in calls[0].system_prompt
+    assert 'exactly one object per input comparisons entry' in calls[0].system_prompt
+
+
+@pytest.mark.django_db
 def test_cyclic_target_provenance_is_detected_without_infinite_recursion() -> None:
     module = _judge_module()
     candidate, source, _scope = provenanced_candidate('judge-evidence-cyclic-target')
