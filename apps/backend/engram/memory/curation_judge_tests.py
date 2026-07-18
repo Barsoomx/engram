@@ -1089,9 +1089,9 @@ def test_judge_call_carries_decision_system_prompt(monkeypatch: pytest.MonkeyPat
     assert calls
     assert calls[0].system_prompt == module._CURATION_JUDGE_SYSTEM_PROMPT
     assert 'curation_judge_input.v1' in calls[0].system_prompt
-    assert 'Allowed outcome and relation combinations' in calls[0].system_prompt
-    assert 'copied verbatim' in calls[0].system_prompt
-    assert 'exactly one object per input comparisons entry' in calls[0].system_prompt
+    assert 'reject_candidate form that matches the candidate evidence' in calls[0].system_prompt
+    assert 'Allowed outcome and relation combinations' not in calls[0].system_prompt
+    assert 'exactly one object per input comparisons entry' not in calls[0].system_prompt
 
 
 @pytest.mark.django_db
