@@ -109,12 +109,13 @@ class ProjectDigestRunView(APIView):
             occurrence_key=schedule_key,
         )
 
-        work, _created = create_work(data)
+        work, created = create_work(data)
 
-        sources = snapshot.get('sources') or []
+        winning_snapshot = work.input_snapshot if isinstance(work.input_snapshot, dict) else {}
+        sources = winning_snapshot.get('sources') or []
 
         if not sources:
-            if work.disposition == WorkflowWorkDisposition.REQUIRED:
+            if created and work.disposition == WorkflowWorkDisposition.REQUIRED:
                 resolve_work_no_input(
                     work.id,
                     organization_id=organization.id,
