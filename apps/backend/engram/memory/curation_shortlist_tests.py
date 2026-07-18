@@ -549,3 +549,171 @@ def test_empty_and_duplicate_term_symbol_inputs_are_bounded_before_query(
     if not terms and not symbols:
         assert result.comparison_complete is False
     assert _semantic_snapshot(scope[1].id) == before
+
+
+@pytest.mark.django_db
+def test_revalidation_detects_selected_vector_rank_and_membership_change() -> None:
+    module = _shortlist_module()
+    scope, memory, _version, document, _candidate, _source = _promote('revalidate-vector-rank')
+    _set_embedding(document, 0)
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        embedding=_embedding(0),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    frozen_transition_id = memory.current_transition_id
+    assert [entry.memory_id for entry in frozen.entries] == [memory.id]
+
+    _set_embedding(document, 1)
+    rebuilt = module.BuildCurationShortlist.execute(data)
+    memory.refresh_from_db()
+
+    assert rebuilt.entries == ()
+    assert rebuilt.manifest_hash != frozen.manifest_hash
+    assert memory.current_transition_id == frozen_transition_id
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_detects_selected_projection_becoming_incoherent() -> None:
+    module = _shortlist_module()
+    scope, memory, _version, document, _candidate, _source = _promote('revalidate-projection')
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    frozen_transition_id = memory.current_transition_id
+    assert [entry.memory_id for entry in frozen.entries] == [memory.id]
+
+    document.projection_contract_version = 0
+    document.save(update_fields=['projection_contract_version', 'updated_at'])
+
+    with pytest.raises(ValueError) as error:
+        module.BuildCurationShortlist.execute(data)
+
+    memory.refresh_from_db()
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+    assert memory.current_transition_id == frozen_transition_id
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_detects_selected_open_conflict_tag_change() -> None:
+    from engram.memory.transitions_test_support import candidate_fence_for, transition_request_for
+
+    module = _shortlist_module()
+    scope, memory, _version, _document, base_candidate, base_source = _promote('revalidate-conflict')
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    frozen_transition_id = memory.current_transition_id
+    assert frozen.entries[0].has_open_conflict is False
+
+    competing, _source = candidate_in_scope(
+        base_candidate,
+        base_source,
+        title='Competing supported claim',
+        body='A competing claim now requires conflict handling.',
+    )
+    transitions = transitions_module()
+    transitions.OpenMemoryConflict().execute(
+        transitions.OpenMemoryConflictInput(
+            request=transition_request_for(
+                competing,
+                key=f'revalidate-conflict:{competing.id}:v1',
+            ),
+            candidate_fence=candidate_fence_for(competing),
+            memory_fence=transitions.build_memory_fence(memory),
+            evidence_hash='e' * 64,
+            redacted_reason='concurrent conflict',
+        )
+    )
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+    memory.refresh_from_db()
+    assert rebuilt.entries[0].has_open_conflict is True
+    assert rebuilt.manifest_hash != frozen.manifest_hash
+    assert memory.current_transition_id == frozen_transition_id
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_detects_transition_of_previously_unselected_memory() -> None:
+    module = _shortlist_module()
+    scope, selected, _version, _document, base_candidate, base_source = _promote('revalidate-unselected')
+    other_candidate, _other_source = candidate_in_scope(
+        base_candidate,
+        base_source,
+        title='Dormant comparison',
+        body='This comparison is initially outside the exact leg.',
+    )
+    transitions = transitions_module()
+    other_result = transitions.PromoteMemoryCandidate().execute(transition_request(other_candidate))
+    other_version = other_result.memory_version
+    other_version.source_metadata = {
+        'exact_terms': ['other'],
+        'symbols': [],
+        'full_text': 'dormant comparison',
+    }
+    other_version.save(update_fields=['source_metadata', 'updated_at'])
+    with transaction.atomic():
+        write_exact_memory_projection(
+            memory=other_result.memory,
+            version=other_version,
+            transition_id=other_result.memory.current_transition_id,
+            sources=list(other_version.provenance_sources.all()),
+        )
+
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    selected_transition_id = selected.current_transition_id
+    assert [entry.memory_id for entry in frozen.entries] == [selected.id]
+    assert frozen.authorized_corpus_count == 2
+
+    revised = transitions.ReviseMemory().execute(
+        transitions.ReviseMemoryInput(
+            request=transition_request(
+                other_candidate,
+                key=f'revalidate-unselected:{other_result.memory.id}:v2',
+            ).request,
+            memory_fence=transitions.build_memory_fence(other_result.memory),
+            title='Newly relevant comparison',
+            body='The current comparison now matches the exact shortlist leg.',
+        )
+    )
+    _write_projection(
+        revised.memory,
+        revised.memory_version,
+        revised.transition.id,
+        full_text='newly relevant comparison',
+    )
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+    selected.refresh_from_db()
+    assert other_result.memory.id in {entry.memory_id for entry in rebuilt.entries}
+    assert rebuilt.manifest_hash != frozen.manifest_hash
+    assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
+    assert selected.current_transition_id == selected_transition_id
+    assert module.revalidate_curation_shortlist(data, frozen) is False

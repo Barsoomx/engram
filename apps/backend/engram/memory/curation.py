@@ -1303,6 +1303,8 @@ class DecideMemoryCandidate:
                 candidate=candidate,
                 claim=claim,
                 scope=scope,
+                view=view,
+                embedding=embedding,
                 verdict=verdict,
                 evidence=evidence,
                 shortlist=shortlist,
@@ -1344,6 +1346,8 @@ class DecideMemoryCandidate:
         candidate: MemoryCandidate,
         claim: WorkClaim,
         scope: EffectiveCandidateScope,
+        view: SanitizedCandidateView,
+        embedding: tuple[float, ...],
         verdict: object,
         evidence: CurationEvidenceContext,
         shortlist: CurationShortlist,
@@ -1363,6 +1367,7 @@ class DecideMemoryCandidate:
                 )
 
                 return
+            self._revalidate_shortlist(work, view, scope, embedding, shortlist)
             if locked.status == CandidateStatus.PROPOSED:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])

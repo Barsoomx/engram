@@ -2577,3 +2577,80 @@ def test_model_reject_of_superseded_generation_settles_without_rejecting(monkeyp
     assert candidate.status == CandidateStatus.PROPOSED
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
+
+
+@pytest.mark.django_db
+def test_model_redundant_rejection_retries_when_shortlist_target_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('reject-stale-target')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='reject-stale-target',
+        title='Retry backoff policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='reject-stale-target',
+        title='Retry backoff policy duplicate',
+        body='The same retry backoff policy is repeated here.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='reject_candidate',
+        relation='redundant',
+        target_memory_version_id=target_version.id,
+        candidate_evidence_refs=('cref-1',),
+        comparisons=(
+            CurationJudgeComparisonV1(
+                memory_version_id=target_version.id,
+                relation='redundant',
+                target_evidence_refs=('tref-1',),
+            ),
+        ),
+        applicability='same',
+        temporal_order='not_applicable',
+        reason_code='redundant_claim',
+        reason='the frozen target already contains this claim',
+    )
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    def advance() -> None:
+        orch.advance_target_memory(
+            memory,
+            title='Retry backoff policy v2',
+            body='The target changed after the redundant verdict.',
+        )
+
+    orch.install_fault(monkeypatch, 'before_transition', advance)
+
+    _result, error = orch.run_decision(work, run)
+
+    candidate.refresh_from_db()
+    observed = (
+        getattr(error, 'code', None),
+        len(orch.curation_decisions_for(candidate)),
+        candidate.status,
+    )
+    assert observed == (
+        'stale_decision',
+        0,
+        CandidateStatus.PROPOSED,
+    )
