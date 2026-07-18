@@ -28,6 +28,11 @@ logger = structlog.get_logger(__name__)
 
 _TRANSIENT_FAILURE_CLASSES = frozenset({PROVIDER_TRANSIENT, INFRASTRUCTURE_TRANSIENT, WORKER_LOST})
 
+_INELIGIBLE_EXECUTION_STATES = (
+    WorkflowWorkExecutionState.TERMINAL_FAILURE,
+    WorkflowWorkExecutionState.BLOCKED,
+)
+
 _DEFAULT_COOLDOWN_MINUTES = 30
 _DEFAULT_MAX_ATTEMPTS = 2
 _DEFAULT_TRANSIENT_MAX_ATTEMPTS = 10
@@ -104,6 +109,7 @@ class RetryFailedDistillations:
                 disposition=WorkflowWorkDisposition.REQUIRED,
             )
             .exclude(_v1_managed_session())
+            .exclude(execution_state__in=_INELIGIBLE_EXECUTION_STATES)
             .order_by('created_at', 'id'),
         )
         work_ids = [work.id for work in required_works]
@@ -222,6 +228,7 @@ class RetryFailedDistillations:
                 work = (
                     WorkflowWork.objects.select_for_update()
                     .exclude(_v1_managed_session())
+                    .exclude(execution_state__in=_INELIGIBLE_EXECUTION_STATES)
                     .get(
                         id=work_id,
                         work_type=WorkflowWorkType.SESSION_DISTILLATION,
@@ -262,6 +269,7 @@ class RetryFailedDistillations:
                 work = (
                     WorkflowWork.objects.select_for_update()
                     .exclude(_v1_managed_session())
+                    .exclude(execution_state__in=_INELIGIBLE_EXECUTION_STATES)
                     .get(
                         id=work_id,
                         work_type=WorkflowWorkType.SESSION_DISTILLATION,

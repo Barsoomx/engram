@@ -813,7 +813,7 @@ def test_latest_v1_running_run_stays_suppressed_without_resignal(
 
 
 @pytest.mark.django_db
-def test_blocked_work_with_stale_v1_queued_run_still_resignals(
+def test_blocked_work_with_stale_v1_queued_run_is_not_resignaled(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -842,19 +842,13 @@ def test_blocked_work_with_stale_v1_queued_run_still_resignals(
     result = RetryFailedDistillations().execute()
 
     assert WorkflowRun.objects.filter(work=work).count() == 2
-
-    outbox = CeleryOutbox.objects.get()
-    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
-    assert outbox.task_id == f'workflow-work:{work.id}:run:{queued.id}'
-    assert outbox.args == [str(work.id), str(queued.id)]
+    assert CeleryOutbox.objects.count() == 0
 
     queued.refresh_from_db()
-    assert queued.dispatched_at > original_dispatched_at
+    assert queued.dispatched_at == original_dispatched_at
 
     assert result.retried == ()
-    assert len(result.resignaled) == 1
-    assert result.resignaled[0].work_id == work.id
-    assert result.resignaled[0].run_id == queued.id
+    assert result.resignaled == ()
 
 
 @pytest.mark.django_db(transaction=True)
@@ -1074,3 +1068,82 @@ def test_v1_provider_transient_failure_class_uses_transient_retry_cap(
         CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count(),
     )
     assert observed == (1, [], 1, 1)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('failure_class', 'expected_state'),
+    (
+        ('invalid_input', WorkflowWorkExecutionState.TERMINAL_FAILURE),
+        ('configuration', WorkflowWorkExecutionState.BLOCKED),
+    ),
+)
+def test_legacy_reconciler_does_not_queue_terminal_or_unchanged_blocked_work(
+    failure_class: str,
+    expected_state: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import (
+        claim_work,
+        execution_configuration_fingerprint,
+        fail_work_claim,
+    )
+    from engram.memory.work_failures import ClassifiedWorkFailure
+
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_COOLDOWN_MINUTES', '30')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_MAX_ATTEMPTS', '2')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    attempt_at = now - timedelta(hours=2)
+    failed_at = attempt_at + timedelta(minutes=1)
+    queued = queue_work_attempt(
+        work_id=work.id,
+        now=attempt_at,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='item-29-initial-attempt',
+        now=attempt_at,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=queued.id,
+    )
+    assert claimed.claim is not None
+
+    failure_kwargs: dict[str, str] = {}
+    if failure_class == 'configuration':
+        failure_kwargs['configuration_fingerprint'] = execution_configuration_fingerprint(work)
+    fail_work_claim(
+        claim=claimed.claim,
+        now=failed_at,
+        failure=ClassifiedWorkFailure(
+            failure_class=failure_class,
+            code=(
+                'model_policy_unavailable'
+                if failure_class == 'configuration'
+                else 'work_contract_invalid'
+            ),
+            **failure_kwargs,
+        ),
+    )
+    CeleryOutbox.objects.all().delete()
+
+    stored = WorkflowWork.objects.get(id=work.id)
+    assert stored.execution_state == expected_state
+    runs_before = WorkflowRun.objects.filter(work=work).count()
+
+    result = RetryFailedDistillations().execute()
+
+    assert result.retried == ()
+    assert result.resignaled == ()
+    assert WorkflowRun.objects.filter(work=work).count() == runs_before
+    assert CeleryOutbox.objects.count() == 0
