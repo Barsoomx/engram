@@ -861,6 +861,10 @@ class UpdateMemoryBody:
             ensure_memory_team_scope(memory, scope)
             if memory.stale or memory.refuted:
                 raise MemoryVersionError('memory_not_editable', 'Memory is stale or refuted and cannot be edited')
+            if MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists():
+                raise MemoryVersionError(
+                    'memory_not_editable', 'Memory has an unresolved conflict and cannot be edited'
+                )
 
             latest_version = memory.versions.order_by('-version').first()
             if latest_version is not None and latest_version.body == data.body:

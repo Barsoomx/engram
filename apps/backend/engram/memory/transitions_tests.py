@@ -1267,3 +1267,26 @@ def test_remaining_typed_lineage_commands_commit_named_transitions() -> None:
         .count()
         >= 7
     )
+
+
+@pytest.mark.django_db
+def test_publish_digest_rejects_source_pinned_by_open_conflict() -> None:
+    candidate, conflict = _open_single_conflict('digest-source-open-conflict')
+    transitions = _transitions()
+
+    with pytest.raises(transitions.MemoryTransitionError) as error:
+        PublishDigestMemory().execute(
+            PublishDigestMemoryInput(
+                request=_request_for(
+                    candidate,
+                    key=f'request:{uuid.uuid4()}:publish-digest-conflict:{conflict.memory_id}:v1',
+                ),
+                source_memory_fences=(transitions.build_memory_fence(conflict.memory),),
+                title='Digest over a conflicted source',
+                body='Digest over a conflicted source body',
+                work_claim=None,
+            )
+        )
+
+    assert error.value.code == 'memory_conflicted'
+    assert conflict.memory.versions.count() == 1
