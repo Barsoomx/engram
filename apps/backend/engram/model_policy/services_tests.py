@@ -448,8 +448,8 @@ def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
         'supporting_observation_ids (non-empty array of unique observation ids); '
         'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
         'Only use observation ids copied verbatim from the input observations. '
-        'Every input observation id must appear at least once across the memories supporting_observation_ids '
-        'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+        'Put each observation id that supports a memory in that memory supporting_observation_ids, and list '
+        'observation ids that carry no durable signal in no_signal_observation_ids. '
         'The same observation id may support more than one memory.'
     )
 
