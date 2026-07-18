@@ -197,9 +197,9 @@ def parse_reduction_output(  # noqa: C901
         ):
             raise ReductionContractError('memory has malformed keys')
         title, body = item['title'], item['body']
-        if not isinstance(title, str) or not title or len(title) > MAX_TITLE:
+        if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE:
             raise ReductionContractError('title is invalid')
-        if not isinstance(body, str) or not body or len(body) > MAX_BODY:
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
             raise ReductionContractError('body is invalid')
         source_ids = item['source_ids']
         if not isinstance(source_ids, list) or not source_ids:
@@ -215,7 +215,11 @@ def parse_reduction_output(  # noqa: C901
             kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
         ):
             raise ReductionContractError('kind is unknown or not permitted')
-        memories.append(ReducedMemory(title, body, _confidence(item['confidence']), tuple(source_ids), kind))
+        confidence_value = item['confidence']
+        if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
+            raise ReductionContractError('confidence must be numeric')
+
+        memories.append(ReducedMemory(title, body, _confidence(confidence_value), tuple(source_ids), kind))
     if inputs and not memories:
         raise ReductionContractError('reduction output is empty')
     if inputs:
@@ -235,14 +239,16 @@ parse_reduction_json = parse_reduction_output
 
 
 def _draft_payload(draft: ReductionDraft) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         'id': draft.draft_id,
         'title': draft.title,
         'body': draft.body,
         'confidence': str(draft.confidence),
-        'source_ids': list(draft.source_ids),
-        'kind': draft.kind,
     }
+    if draft.kind:
+        payload['kind'] = draft.kind
+
+    return payload
 
 
 def reduction_input_hash(refs: Sequence[DraftRef]) -> str:

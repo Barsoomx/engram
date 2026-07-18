@@ -171,6 +171,83 @@ def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
     return {'memories': [_memory(bucket) for bucket in buckets]}
 
 
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('title', ' \t '),
+        ('body', ' \n '),
+        ('confidence', '0.8'),
+    ],
+)
+def test_reduction_rejects_blank_text_and_string_confidence(field: str, value: object) -> None:
+    inputs = [_draft(0), _draft(1)]
+    memory = _memory([draft.draft_id for draft in inputs])
+    memory[field] = value
+
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [memory]}, inputs, reduction_target=1)
+
+
+def test_reduction_budget_does_not_charge_unprompted_observation_lineage() -> None:
+    observation_ids = tuple(f'{index:036d}' for index in range(100))
+    drafts = [
+        ReductionDraft(
+            draft_id=marker * 64,
+            title='T',
+            body='B',
+            confidence=Decimal('0.8'),
+            source_ids=observation_ids,
+        )
+        for marker in ('a', 'b')
+    ]
+    charged_payload = json.dumps(
+        [
+            {
+                'id': draft.draft_id,
+                'title': draft.title,
+                'body': draft.body,
+                'confidence': str(draft.confidence),
+                'source_ids': list(draft.source_ids),
+                'kind': draft.kind,
+            }
+            for draft in drafts
+        ],
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode()
+    rendered_prompt = json.dumps(
+        {
+            'drafts': [
+                {
+                    'id': draft.draft_id,
+                    'title': draft.title,
+                    'body': draft.body,
+                    'confidence': str(draft.confidence),
+                }
+                for draft in drafts
+            ],
+            'reduction_target': 1,
+        },
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode()
+
+    assert len(charged_payload) == 8083
+    assert len(rendered_prompt) == 265
+    assert len(rendered_prompt) <= 8000 < len(charged_payload)
+
+    batches = build_reduction_batches(
+        drafts,
+        reduction_target=1,
+        prompt_budget=8000,
+    )
+
+    assert len(batches) == 1
+    assert batches[0].input_drafts == tuple(drafts)
+    assert batches[0].provider_required is True
+
+
 def test_reduction_accepts_spec_cap_above_twelve() -> None:
     inputs = [_draft(index) for index in range(40)]
     parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=12)
