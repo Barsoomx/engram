@@ -2133,7 +2133,7 @@ def test_openai_gateway_curation_decision_v1_uses_json_mode_and_fixed_budget() -
 
     sent_body = json.loads(opener.requests[0].data)
     assert sent_body['response_format'] == {'type': 'json_object'}
-    assert sent_body['max_tokens'] == 4096
+    assert sent_body['max_tokens'] == 16384
     assert json.loads(result.generated_body) == json.loads(body['choices'][0]['message']['content'])
 
 
@@ -2185,7 +2185,7 @@ def test_anthropic_gateway_curation_decision_v1_forces_closed_dedicated_tool() -
 
     sent_body = json.loads(opener.requests[0].data)
     tool = sent_body['tools'][0]
-    assert sent_body['max_tokens'] == 4096
+    assert sent_body['max_tokens'] == 16384
     assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_curation_decision'}
     schema = tool['input_schema']
     expected_keys = {

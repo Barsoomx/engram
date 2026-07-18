@@ -11,7 +11,7 @@ from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.models import ProviderCallRecord
+from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
@@ -28,6 +28,7 @@ from engram.model_policy.services import (
     _split_completion,
     curation_schema_prompt_prefix,
     generated_candidates_payload,
+    resolve_max_tokens,
     secret_fingerprint,
 )
 
@@ -521,6 +522,10 @@ def test_curation_decision_schema_prefix_states_allowed_combination_table() -> N
         'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
         'candidate evidence.'
     )
+
+
+def test_resolve_max_tokens_curation_decision_uses_reasoning_budget() -> None:
+    assert resolve_max_tokens(ModelPolicy(), 'curation_decision_v1') == 16384
 
 
 def test_curation_decision_instructions_align_with_allowed_combinations() -> None:

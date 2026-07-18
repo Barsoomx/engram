@@ -1178,7 +1178,7 @@ _MAX_TOKENS_BY_KIND = {
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
     'distill_reduce.v1': 8192,
-    'curation_decision_v1': 4096,
+    'curation_decision_v1': 16384,
 }
 _FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
 _CURATION_DECISION_OUTCOMES = (
