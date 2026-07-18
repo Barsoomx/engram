@@ -18,12 +18,14 @@ from engram.access.models import (
     ProjectGrant,
     Role,
     RoleCapability,
+    TeamMembership,
 )
 from engram.core.models import (
     AuditEvent,
     Memory,
     Organization,
     Project,
+    ProjectTeam,
     Team,
     VisibilityScope,
     WorkflowRun,
@@ -153,7 +155,7 @@ def f_admin_client() -> APIClient:
 
     role = _make_role_with_capabilities(
         'workflow_admin',
-        ('memories:read', 'memories:admin'),
+        ('memories:read', 'memories:admin', 'projects:*', 'teams:*'),
     )
 
     OrganizationMembership.objects.create(organization=org, identity=identity, role=role)
@@ -980,3 +982,190 @@ def test_rerun_out_of_scope_run_returns_404() -> None:
     assert response.status_code == 404
     assert CeleryOutbox.objects.count() == 0
     assert WorkflowRun.objects.filter(work=_work).count() == 1
+
+
+def _team_scoped_admin_client(
+    org: Organization,
+    team: Team,
+    username: str,
+) -> APIClient:
+    user = _make_user(username)
+    identity = _make_identity(user, org)
+    role = _make_role_with_capabilities(
+        f'{username}_role',
+        ('memories:read', 'memories:admin'),
+    )
+    OrganizationMembership.objects.create(
+        organization=org,
+        identity=identity,
+        role=role,
+    )
+    TeamMembership.objects.create(
+        organization=org,
+        team=team,
+        identity=identity,
+        role=role,
+    )
+
+    from rest_framework.authtoken.models import Token
+
+    token = Token.objects.create(user=user).key
+
+    return _client(token, org)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('operation', ('list', 'retrieve'))
+def test_workflow_run_reads_respect_effective_project_scope(
+    operation: str,
+) -> None:
+    org = Organization.objects.create(name='Read Scope', slug=f'read-scope-{operation}')
+    granted_project = _make_project(org, slug=f'granted-{operation}')
+    foreign_project = _make_project(org, slug=f'foreign-{operation}')
+    client = _scoped_admin_client(
+        org,
+        granted_project,
+        f'read-scope-{operation}',
+    )
+    run = _make_run(
+        org,
+        foreign_project,
+        request_id='foreign-project',
+    )
+
+    if operation == 'list':
+        response = client.get('/v1/admin/workflow-runs/')
+
+        assert response.status_code == 200
+        assert response.data['results'] == []
+    else:
+        response = client.get(f'/v1/admin/workflow-runs/{run.id}/')
+
+        assert response.status_code == 404
+
+
+@pytest.mark.django_db
+def test_rerun_empty_effective_project_scope_returns_404_without_writes() -> None:
+    org = Organization.objects.create(name='Empty Scope', slug='empty-scope')
+    project = _make_project(org, slug='ungranted')
+    user = _make_user('empty-scope-admin')
+    identity = _make_identity(user, org)
+    role = _make_role_with_capabilities(
+        'empty_scope_admin_role',
+        ('memories:read', 'memories:admin'),
+    )
+    OrganizationMembership.objects.create(
+        organization=org,
+        identity=identity,
+        role=role,
+    )
+
+    from rest_framework.authtoken.models import Token
+
+    token = Token.objects.create(user=user).key
+    client = _client(token, org)
+    work, run = _make_linked_digest_work_and_run(
+        org,
+        project,
+        work_type=WorkflowWorkType.DAILY_DIGEST,
+        run_type=WorkflowRunType.DAILY_DIGEST,
+        occurrence_key='daily:empty-scope',
+    )
+
+    response = client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+    assert response.status_code == 404
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert CeleryOutbox.objects.count() == 0
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('operation', ('list', 'retrieve', 'rerun'))
+def test_workflow_run_endpoints_respect_effective_team_scope(
+    operation: str,
+) -> None:
+    org = Organization.objects.create(name='Team Scope', slug=f'team-scope-{operation}')
+    project = _make_project(org, slug=f'shared-{operation}')
+    allowed_team = Team.objects.create(
+        organization=org,
+        name='Allowed',
+        slug=f'allowed-{operation}',
+    )
+    foreign_team = Team.objects.create(
+        organization=org,
+        name='Foreign',
+        slug=f'foreign-{operation}',
+    )
+    ProjectTeam.objects.create(
+        organization=org,
+        project=project,
+        team=allowed_team,
+    )
+    ProjectTeam.objects.create(
+        organization=org,
+        project=project,
+        team=foreign_team,
+    )
+    client = _team_scoped_admin_client(
+        org,
+        allowed_team,
+        f'team-scope-{operation}',
+    )
+    occurrence_key = f'weekly:team-scope:{operation}'
+    snapshot: dict[str, object] = {
+        'schema': 'weekly_digest_input/v1',
+        'project_id': str(project.id),
+        'team_id': str(foreign_team.id),
+        'schedule_key': occurrence_key,
+        'input_digest': 'a' * 64,
+        'visibility_policy': 'digest_visibility/v1',
+        'allowed_team_ids': [str(foreign_team.id)],
+        'output_visibility_scope': 'team',
+        'output_team_id': str(foreign_team.id),
+        'changes': [],
+    }
+    work = WorkflowWork.objects.create(
+        organization=org,
+        project=project,
+        team=foreign_team,
+        work_type=WorkflowWorkType.WEEKLY_DIGEST,
+        subject_type=WorkflowSubjectType.TEAM,
+        subject_id=foreign_team.id,
+        contract_version=1,
+        occurrence_key=occurrence_key,
+        input_fingerprint='0' * 64,
+        input_snapshot=snapshot,
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        resolution_reason=WorkflowWorkResolutionReason.SUCCEEDED,
+        resolved_at=timezone.now(),
+    )
+    run = WorkflowRun.objects.create(
+        organization=org,
+        project=project,
+        team=foreign_team,
+        work=work,
+        run_type=WorkflowRunType.WEEKLY_DIGEST,
+        status=WorkflowRunStatus.SUCCEEDED,
+        input_snapshot=snapshot,
+        request_id='foreign-team',
+        finished_at=timezone.now(),
+    )
+
+    if operation == 'list':
+        response = client.get('/v1/admin/workflow-runs/')
+
+        assert response.status_code == 200
+        assert response.data['results'] == []
+    elif operation == 'retrieve':
+        response = client.get(f'/v1/admin/workflow-runs/{run.id}/')
+
+        assert response.status_code == 404
+    else:
+        response = client.post(f'/v1/admin/workflow-runs/{run.id}/rerun/')
+
+        assert response.status_code == 404
+
+    assert WorkflowRun.objects.filter(work=work).count() == 1
+    assert CeleryOutbox.objects.count() == 0
+    assert AuditEvent.objects.filter(target_id=str(run.id)).count() == 0

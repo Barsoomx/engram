@@ -55,7 +55,7 @@ const NAV_GROUPS: SidebarNavGroup[] = [
       { href: '/observations', label: 'Observations', icon: ScrollText },
       {
         href: '/memory-review',
-        label: 'Memory Review',
+        label: 'Memory Conflicts',
         icon: ShieldCheck,
         capability: 'memories:review',
       },

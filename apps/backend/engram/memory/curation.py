@@ -9,7 +9,7 @@ from decimal import Decimal
 
 import structlog
 from django.conf import settings
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from engram.access.services import EffectiveScope
@@ -25,6 +25,7 @@ from engram.core.models import (
     MemoryCandidate,
     MemoryConflict,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     OrganizationSettings,
     RetrievalDocument,
@@ -990,6 +991,7 @@ class CurateMemoryCandidate:
 
 
 _DETERMINISTIC_COMPARISON_HASH = hashlib.sha256(b'curation_decision.deterministic_no_comparison.v1').hexdigest()
+_MAX_EVIDENCE_MEMBERSHIP = 32
 
 _VERDICT_OUTCOME = {
     'publish_new': CurationOutcome.PUBLISH_NEW,
@@ -1071,6 +1073,11 @@ class DecideMemoryCandidate:
 
             return
 
+        if self._candidate_is_terminally_settled(candidate):
+            self._settle_superseded_generation(claim)
+
+            return
+
         gate = EvaluateDeterministicCandidateGates().execute(work.id)
         if gate.disposition == DeterministicGateDisposition.RETRY:
             raise _operational(gate.operational_reason or 'stale_decision', 'deterministic gate requires retry')
@@ -1099,6 +1106,12 @@ class DecideMemoryCandidate:
             )
         except MemoryCandidate.DoesNotExist as error:
             raise MemoryWorkerError('candidate is outside workflow work scope', code='work_scope_invalid') from error
+
+    def _candidate_is_terminally_settled(self, candidate: MemoryCandidate) -> bool:
+        if candidate.status != CandidateStatus.PROPOSED or candidate.promoted_memory_id is not None:
+            return True
+
+        return MemoryConflict.objects.filter(candidate_id=candidate.id, resolved_transition__isnull=True).exists()
 
     def _is_superseded_generation(self, work: WorkflowWork, candidate: MemoryCandidate) -> bool:
         try:
@@ -1167,8 +1180,8 @@ class DecideMemoryCandidate:
 
             return
 
-        memory_fence = self._target_memory_fence(gate.target_memory_version_id, candidate)
         with transaction.atomic():
+            memory_fence = self._target_memory_fence(gate.target_memory_version_id)
             result = MergeMemoryCandidate().execute(
                 MergeMemoryCandidateInput(
                     request=self._request(work, candidate),
@@ -1260,6 +1273,12 @@ class DecideMemoryCandidate:
 
         return memory
 
+    def _acquire_targetless_publication_lock(self, project_id: uuid.UUID) -> None:
+        digest = hashlib.sha256(f'targetless-publication:{project_id}'.encode()).digest()
+        key = int.from_bytes(digest[:8], 'big', signed=True)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', [key])
+
     def _settle_model_decision(
         self,
         work: WorkflowWork,
@@ -1303,6 +1322,8 @@ class DecideMemoryCandidate:
                 candidate=candidate,
                 claim=claim,
                 scope=scope,
+                view=view,
+                embedding=embedding,
                 verdict=verdict,
                 evidence=evidence,
                 shortlist=shortlist,
@@ -1318,6 +1339,8 @@ class DecideMemoryCandidate:
 
         _fault_boundary('before_transition')
         with transaction.atomic():
+            if memory_fence is None:
+                self._acquire_targetless_publication_lock(work.project_id)
             self._revalidate_shortlist(work, view, scope, embedding, shortlist)
             transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence, view, scope)
             self._write_decision(
@@ -1333,6 +1356,7 @@ class DecideMemoryCandidate:
                 conflict=conflict,
                 judge=judge_result,
                 redacted_reason=redact_text(verdict.reason)[:500],
+                applicability=getattr(verdict, 'applicability', ''),
             )
 
         return
@@ -1344,6 +1368,8 @@ class DecideMemoryCandidate:
         candidate: MemoryCandidate,
         claim: WorkClaim,
         scope: EffectiveCandidateScope,
+        view: SanitizedCandidateView,
+        embedding: tuple[float, ...],
         verdict: object,
         evidence: CurationEvidenceContext,
         shortlist: CurationShortlist,
@@ -1363,6 +1389,7 @@ class DecideMemoryCandidate:
                 )
 
                 return
+            self._revalidate_shortlist(work, view, scope, embedding, shortlist)
             if locked.status == CandidateStatus.PROPOSED:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
@@ -1380,6 +1407,7 @@ class DecideMemoryCandidate:
                 conflict=None,
                 judge=judge_result,
                 redacted_reason=redact_text(verdict.reason)[:500],
+                applicability=getattr(verdict, 'applicability', ''),
             )
 
         return
@@ -1559,21 +1587,16 @@ class DecideMemoryCandidate:
 
         return build_memory_fence(memory)
 
-    def _target_memory_fence(self, target_version_id: uuid.UUID | None, candidate: MemoryCandidate) -> MemoryFence:
+    def _target_memory_fence(self, target_version_id: uuid.UUID | None) -> MemoryFence:
         if target_version_id is None:
             raise _operational('stale_decision', 'deterministic merge requires a target version')
         try:
-            memory_id = MemoryVersion.objects.values_list('memory_id', flat=True).get(id=target_version_id)
+            version = MemoryVersion.objects.select_for_update().select_related('memory').get(id=target_version_id)
         except MemoryVersion.DoesNotExist as error:
             raise _operational('stale_decision', 'deterministic merge target no longer exists') from error
-
-        return self._memory_fence(memory_id)
-
-    def _memory_fence(self, memory_id: uuid.UUID) -> MemoryFence:
-        try:
-            memory = Memory.objects.get(id=memory_id)
-        except Memory.DoesNotExist as error:
-            raise _operational('stale_decision', 'target memory no longer exists') from error
+        memory = version.memory
+        if memory.current_version != version.version or memory.stale or memory.refuted:
+            raise _operational('stale_decision', 'deterministic merge target advanced after gate evaluation')
 
         return build_memory_fence(memory)
 
@@ -1644,6 +1667,42 @@ class DecideMemoryCandidate:
             trace_id=f'curation-decision:{work.id}',
         )
 
+    def _decision_evidence_membership(
+        self,
+        candidate: MemoryCandidate,
+        target_memory_version_id: uuid.UUID | None,
+    ) -> dict[str, object]:
+        candidate_sources = [
+            {
+                'reference_id': str(source.id),
+                'source_kind': source.source_kind,
+                'observation_id': str(source.observation_id),
+            }
+            for source in candidate.sources.order_by('id')[:_MAX_EVIDENCE_MEMBERSHIP]
+        ]
+        targets: list[dict[str, object]] = []
+        if target_memory_version_id is not None:
+            target_sources = [
+                {
+                    'reference_id': str(row.candidate_source_id),
+                    'source_kind': row.candidate_source.source_kind,
+                    'observation_id': str(row.candidate_source.observation_id),
+                }
+                for row in (
+                    MemoryVersionSource.objects.select_related('candidate_source')
+                    .filter(memory_version_id=target_memory_version_id, candidate_source__isnull=False)
+                    .order_by('id')[:_MAX_EVIDENCE_MEMBERSHIP]
+                )
+            ]
+            targets.append(
+                {
+                    'memory_version_id': str(target_memory_version_id),
+                    'sources': target_sources,
+                }
+            )
+
+        return {'candidate': candidate_sources, 'targets': targets}
+
     def _write_decision(
         self,
         *,
@@ -1659,8 +1718,10 @@ class DecideMemoryCandidate:
         conflict: object | None,
         judge: CurationJudgeResult | None,
         redacted_reason: str,
+        applicability: str = '',
     ) -> CurationDecision:
         evidence_manifest_hash = work.input_snapshot['evidence_manifest_hash']
+        evidence_membership = self._decision_evidence_membership(candidate, target_memory_version_id)
         if judge is not None:
             judge_status = 'succeeded'
             provider_call_record_id = judge.provider_call_record_id
@@ -1689,6 +1750,8 @@ class DecideMemoryCandidate:
             'evidence_tier': getattr(evidence_tier, 'value', evidence_tier),
             'evidence_manifest_hash': evidence_manifest_hash,
             'comparison_manifest_hash': comparison_manifest_hash,
+            'applicability': applicability,
+            'evidence_membership': evidence_membership,
             'judge': {
                 'status': judge_status,
                 'provider_call_record_id': (
@@ -1722,5 +1785,7 @@ class DecideMemoryCandidate:
             policy_version=policy_version,
             transition=transition,
             conflict=conflict,
+            applicability=applicability,
+            evidence_membership=evidence_membership,
             payload_hash=payload_hash,
         )

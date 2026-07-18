@@ -438,11 +438,11 @@ def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
     assert instructions == (
         'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
         'The object must contain exactly these keys and no additional properties: '
-        'memories (array of at most 12 objects); '
+        'memories (array of at most 8 objects); '
         'no_signal_observation_ids (array of observation ids, unique, may be empty). '
         'Each memories entry must contain exactly these keys and no additional properties: '
         'title (non-blank string, at most 255 characters); '
-        'body (non-blank string, at most 3000 characters); '
+        'body (non-blank string, at most 2000 characters); '
         'confidence (a JSON number between 0 and 1, never a string); '
         'supporting_observation_ids (non-empty array of unique observation ids); '
         'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
@@ -773,7 +773,7 @@ def test_distill_extract_tool_schema_matches_provider_contract() -> None:
 
     memories = schema['properties']['memories']
     assert memories['type'] == 'array'
-    assert memories['maxItems'] == 12
+    assert memories['maxItems'] == 8
     memory = memories['items']
     assert memory['type'] == 'object'
     assert memory['additionalProperties'] is False
@@ -786,7 +786,7 @@ def test_distill_extract_tool_schema_matches_provider_contract() -> None:
         'kind',
     }
     assert memory['properties']['title'] == {'type': 'string', 'minLength': 1, 'maxLength': 255}
-    assert memory['properties']['body'] == {'type': 'string', 'minLength': 1, 'maxLength': 3000}
+    assert memory['properties']['body'] == {'type': 'string', 'minLength': 1, 'maxLength': 2000}
     assert memory['properties']['confidence'] == {'type': 'number', 'minimum': 0, 'maximum': 1}
     assert memory['properties']['supporting_observation_ids'] == {
         'type': 'array',

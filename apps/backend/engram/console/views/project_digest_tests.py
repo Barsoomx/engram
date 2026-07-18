@@ -27,6 +27,7 @@ from engram.core.models import (
     Project,
     VisibilityScope,
     WorkflowRun,
+    WorkflowRunFailureClass,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowWork,
@@ -236,6 +237,9 @@ def test_post_digest_run_reuses_work_across_manual_requests_with_distinct_runs(
 
     WorkflowRun.objects.filter(id=run_one.id).update(
         status=WorkflowRunStatus.SUCCEEDED,
+        fencing_token=1,
+        lease_owner='manual-digest-test',
+        started_at=timezone.now(),
         finished_at=timezone.now(),
     )
 
@@ -439,6 +443,9 @@ def test_post_digest_run_reports_already_built_when_occurrence_complete(
     resolve_work_succeeded(work.id, organization_id=f_org.id, project_id=f_project.id)
     WorkflowRun.objects.filter(id=run.id).update(
         status=WorkflowRunStatus.SUCCEEDED,
+        fencing_token=1,
+        lease_owner='manual-digest-test',
+        started_at=timezone.now(),
         finished_at=timezone.now(),
     )
 
@@ -448,6 +455,75 @@ def test_post_digest_run_reports_already_built_when_occurrence_complete(
     assert second.data['enqueued'] is False
     assert second.data['reason'] == 'already_built'
     assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.DAILY_DIGEST).count() == 1
+
+
+@pytest.mark.django_db
+def test_post_digest_run_empty_losing_proposal_cannot_settle_required_winner(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _make_approved_memory(f_org, f_project)
+
+    first = f_admin_client.post(_endpoint(f_project.id))
+    assert first.status_code == 202
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+    winning_snapshot = work.input_snapshot
+    assert winning_snapshot['sources']
+
+    run = WorkflowRun.objects.get(work=work)
+    WorkflowRun.objects.filter(id=run.id).update(
+        status=WorkflowRunStatus.FAILED,
+        fencing_token=1,
+        lease_owner='manual-digest-test',
+        started_at=timezone.now(),
+        finished_at=timezone.now(),
+        failure_class=WorkflowRunFailureClass.PROVIDER_TRANSIENT,
+        failure_code='manual_terminal',
+    )
+    monkeypatch.setenv('ENGRAM_DIGEST_MAX_SOURCES', '0')
+
+    second = f_admin_client.post(_endpoint(f_project.id))
+
+    work.refresh_from_db()
+    assert work.input_snapshot == winning_snapshot
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.resolution_reason == ''
+    assert second.status_code == 202
+    assert second.data['enqueued'] is True
+    assert WorkflowRun.objects.filter(work=work).count() == 2
+
+
+@pytest.mark.django_db
+def test_post_digest_run_empty_losing_proposal_reports_completed_winner(
+    f_admin_client: APIClient,
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.workflow_work import resolve_work_succeeded
+
+    _make_approved_memory(f_org, f_project)
+
+    first = f_admin_client.post(_endpoint(f_project.id))
+    assert first.status_code == 202
+
+    work = WorkflowWork.objects.get(work_type=WorkflowWorkType.DAILY_DIGEST)
+    assert work.input_snapshot['sources']
+    run = WorkflowRun.objects.get(work=work)
+    resolve_work_succeeded(work.id, organization_id=f_org.id, project_id=f_project.id)
+    WorkflowRun.objects.filter(id=run.id).update(
+        status=WorkflowRunStatus.SUCCEEDED,
+        finished_at=timezone.now(),
+    )
+    monkeypatch.setenv('ENGRAM_DIGEST_MAX_SOURCES', '0')
+
+    second = f_admin_client.post(_endpoint(f_project.id))
+
+    assert second.status_code == 200
+    assert second.data == {'enqueued': False, 'reason': 'already_built'}
 
 
 @pytest.mark.django_db

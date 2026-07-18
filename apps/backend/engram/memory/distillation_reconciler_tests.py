@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 from django.db import close_old_connections, connection, transaction
+from django.db.models.query import QuerySet
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
 from structlog.testing import capture_logs
@@ -812,7 +813,7 @@ def test_latest_v1_running_run_stays_suppressed_without_resignal(
 
 
 @pytest.mark.django_db
-def test_blocked_work_with_stale_v1_queued_run_still_resignals(
+def test_blocked_work_with_stale_v1_queued_run_is_not_resignaled(
     f_org: Organization,
     f_team: Team,
     f_project: Project,
@@ -841,16 +842,304 @@ def test_blocked_work_with_stale_v1_queued_run_still_resignals(
     result = RetryFailedDistillations().execute()
 
     assert WorkflowRun.objects.filter(work=work).count() == 2
-
-    outbox = CeleryOutbox.objects.get()
-    assert outbox.task_name == _DISTILL_WORK_TASK_NAME
-    assert outbox.task_id == f'workflow-work:{work.id}:run:{queued.id}'
-    assert outbox.args == [str(work.id), str(queued.id)]
+    assert CeleryOutbox.objects.count() == 0
 
     queued.refresh_from_db()
-    assert queued.dispatched_at > original_dispatched_at
+    assert queued.dispatched_at == original_dispatched_at
 
     assert result.retried == ()
-    assert len(result.resignaled) == 1
-    assert result.resignaled[0].work_id == work.id
-    assert result.resignaled[0].run_id == queued.id
+    assert result.resignaled == ()
+
+
+@pytest.mark.django_db(transaction=True)
+def test_poisoned_cleanup_does_not_overwrite_concurrent_legacy_success(
+    monkeypatch: pytest.MonkeyPatch,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    if connection.vendor != 'postgresql':
+        pytest.skip('requires PostgreSQL concurrency semantics')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=2),
+        finished_at=now - timedelta(hours=2),
+        failure_reason='provider returned 402',
+    )
+    poisoned = create_poisoned_legacy_run(
+        work,
+        created_at=now - timedelta(hours=1),
+    )
+
+    poison_ids_selected = Event()
+    success_committed = Event()
+    real_update = QuerySet.update
+
+    def pause_poison_update(queryset: QuerySet, **kwargs: object) -> int:
+        if kwargs.get('failure_reason') == _POISONED_RUN_FAILURE_REASON:
+            poison_ids_selected.set()
+            assert success_committed.wait(timeout=10)
+
+        return real_update(queryset, **kwargs)
+
+    monkeypatch.setattr(QuerySet, 'update', pause_poison_update)
+
+    def reconcile() -> object:
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                return RetryFailedDistillations().execute()
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reconcile)
+        assert poison_ids_selected.wait(timeout=10)
+
+        succeeded_at = timezone.now()
+        try:
+            with transaction.atomic():
+                completed = WorkflowRun.objects.filter(
+                    id=poisoned.id,
+                    status=WorkflowRunStatus.QUEUED,
+                ).update(
+                    status=WorkflowRunStatus.SUCCEEDED,
+                    failure_reason='',
+                    finished_at=succeeded_at,
+                    updated_at=succeeded_at,
+                )
+                assert completed == 1
+        finally:
+            success_committed.set()
+
+        result = future.result(timeout=15)
+
+    poisoned.refresh_from_db()
+    assert poisoned.status == WorkflowRunStatus.SUCCEEDED
+    assert poisoned.failure_reason == ''
+    assert poisoned.finished_at == succeeded_at
+    assert result.retried == ()
+    assert fresh_v1_runs(work) == []
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_legacy_reconciler_reclaims_expired_lease_stuck_running_work(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import claim_work
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    claimed_at = now - timedelta(hours=2)
+    queued = queue_work_attempt(
+        work_id=work.id,
+        now=claimed_at,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='stuck-worker',
+        now=claimed_at,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=queued.id,
+    )
+    assert claimed.claim is not None
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.lease_expires_at is not None
+    assert work.lease_expires_at < now
+    CeleryOutbox.objects.all().delete()
+
+    result = RetryFailedDistillations().execute()
+
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+    assert (
+        WorkflowRun.objects.filter(
+            work=work,
+            status=WorkflowRunStatus.QUEUED,
+            execution_contract_version=1,
+        ).count()
+        == 1
+    )
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1
+
+
+@pytest.mark.django_db
+def test_v1_provider_transient_failure_class_uses_transient_retry_cap(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.core.models import WorkflowWorkDisposition
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import claim_work, fail_work_claim
+    from engram.memory.work_failures import PROVIDER_TRANSIENT, ClassifiedWorkFailure
+
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_COOLDOWN_MINUTES', '30')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_MAX_ATTEMPTS', '2')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_TRANSIENT_MAX_ATTEMPTS', '10')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    create_linked_run(
+        work,
+        created_at=now - timedelta(hours=3),
+        finished_at=now - timedelta(hours=3),
+        failure_reason='provider timed out',
+    )
+
+    for index, attempt_started_at in enumerate(
+        (
+            now - timedelta(hours=2),
+            now - timedelta(minutes=41),
+        ),
+        start=1,
+    ):
+        queued = queue_work_attempt(
+            work_id=work.id,
+            now=attempt_started_at,
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        )
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            lease_owner=f'distill-retry:{index}',
+            now=attempt_started_at,
+            lease_for=timedelta(minutes=5),
+            workflow_run_id=queued.id,
+        )
+        assert claimed.claim is not None
+        fail_work_claim(
+            claim=claimed.claim,
+            now=attempt_started_at + timedelta(minutes=1),
+            failure=ClassifiedWorkFailure(
+                failure_class=PROVIDER_TRANSIENT,
+                code='provider_timeout',
+            ),
+        )
+
+    work.refresh_from_db()
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.next_retry_at is not None
+    assert work.next_retry_at < now
+
+    failed_v1 = list(
+        WorkflowRun.objects.filter(
+            work=work,
+            execution_contract_version=1,
+        ).order_by('created_at', 'id')
+    )
+    assert len(failed_v1) == 2
+    assert all(run.failure_class == PROVIDER_TRANSIENT for run in failed_v1)
+    assert all(run.failure_reason == '' for run in failed_v1)
+    CeleryOutbox.objects.all().delete()
+
+    with capture_logs() as logs:
+        result = RetryFailedDistillations().execute()
+
+    abandoned_counts = [
+        (entry['failed_count'], entry['transient_count'])
+        for entry in logs
+        if entry['event'] == 'distillation_reconciler_abandoned'
+    ]
+    observed = (
+        len(result.retried),
+        abandoned_counts,
+        len(fresh_v1_runs(work)),
+        CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count(),
+    )
+    assert observed == (1, [], 1, 1)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('failure_class', 'expected_state'),
+    (
+        ('invalid_input', WorkflowWorkExecutionState.TERMINAL_FAILURE),
+        ('configuration', WorkflowWorkExecutionState.BLOCKED),
+    ),
+)
+def test_legacy_reconciler_does_not_queue_terminal_or_unchanged_blocked_work(
+    failure_class: str,
+    expected_state: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import (
+        claim_work,
+        execution_configuration_fingerprint,
+        fail_work_claim,
+    )
+    from engram.memory.work_failures import ClassifiedWorkFailure
+
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_COOLDOWN_MINUTES', '30')
+    monkeypatch.setenv('ENGRAM_DISTILL_RECONCILE_MAX_ATTEMPTS', '2')
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    attempt_at = now - timedelta(hours=2)
+    failed_at = attempt_at + timedelta(minutes=1)
+    queued = queue_work_attempt(
+        work_id=work.id,
+        now=attempt_at,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='item-29-initial-attempt',
+        now=attempt_at,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=queued.id,
+    )
+    assert claimed.claim is not None
+
+    failure_kwargs: dict[str, str] = {}
+    if failure_class == 'configuration':
+        failure_kwargs['configuration_fingerprint'] = execution_configuration_fingerprint(work)
+    fail_work_claim(
+        claim=claimed.claim,
+        now=failed_at,
+        failure=ClassifiedWorkFailure(
+            failure_class=failure_class,
+            code=('model_policy_unavailable' if failure_class == 'configuration' else 'work_contract_invalid'),
+            **failure_kwargs,
+        ),
+    )
+    CeleryOutbox.objects.all().delete()
+
+    stored = WorkflowWork.objects.get(id=work.id)
+    assert stored.execution_state == expected_state
+    runs_before = WorkflowRun.objects.filter(work=work).count()
+
+    result = RetryFailedDistillations().execute()
+
+    assert result.retried == ()
+    assert result.resignaled == ()
+    assert WorkflowRun.objects.filter(work=work).count() == runs_before
+    assert CeleryOutbox.objects.count() == 0

@@ -226,6 +226,20 @@ def test_running_twice_decays_exactly_once(f_org: Organization, f_project: Proje
 
 
 @pytest.mark.django_db
+def test_decay_does_not_change_updated_at(f_org: Organization, f_project: Project) -> None:
+    memory = _make_memory(f_org, f_project, confidence='0.900')
+    updated_at_before = memory.updated_at
+
+    DecayMemoryConfidence().execute()
+
+    memory.refresh_from_db()
+
+    assert memory.confidence == Decimal('0.850')
+    assert memory.confidence_decayed_at is not None
+    assert memory.updated_at == updated_at_before
+
+
+@pytest.mark.django_db
 def test_execute_returns_summary_counts(f_org: Organization, f_project: Project) -> None:
     _make_memory(f_org, f_project, confidence='0.900')
 

@@ -62,6 +62,7 @@ from engram.memory.work_execution import (
     claim_work,
     execution_configuration_fingerprint,
     fail_work_claim,
+    finish_work_claim,
     lock_work_fence,
 )
 from engram.memory.work_failures import (
@@ -985,6 +986,37 @@ def test_distill_session_work_v1_settled_work_is_absorbed_as_terminal_without_ex
     m_execute.assert_not_called()
     assert result == str(work.id)
     assert WorkflowRun.objects.filter(work=work, execution_contract_version=1).count() == 0
+
+
+@pytest.mark.django_db
+def test_distill_session_work_v1_explicit_redelivery_of_succeeded_run_absorbs_as_terminal(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = create_required_work(session, work_type=WorkflowWorkType.SESSION_DISTILLATION)
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='redeliver:worker',
+        now=now,
+        lease_for=timedelta(seconds=720),
+    )
+    run_id = claimed.claim.workflow_run_id
+    lock_work_fence(claim=claimed.claim, now=now)
+    finish_work_claim(claim=claimed.claim, now=now, completion='product_succeeded')
+
+    with mock.patch('engram.memory.tasks.run_complete_distillation_attempt') as m_execute:
+        result = tasks_module.distill_session_work_v1(str(work.id), str(run_id))
+
+    m_execute.assert_not_called()
+    assert result == str(work.id)
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.RUNNING).count() == 0
 
 
 @pytest.mark.django_db
@@ -1959,3 +1991,292 @@ def test_observation_processing_does_not_curate_synchronously() -> None:
 
     assert 'CurateMemoryCandidate' not in source
     assert 'DecideMemoryCandidate' not in source
+
+
+def _unreferenced_embedding_work(
+    organization: Organization,
+    team: Team,
+    project: Project,
+) -> tuple[RetrievalDocument, WorkflowWork, WorkflowRun]:
+    from engram.memory.projections import create_embedding_work_and_signal
+
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Subject validation memory',
+        body='Subject validation body',
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='a' * 64,
+    )
+    document = RetrievalDocument.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory=memory,
+        memory_version=version,
+        full_text='Subject validation memory\n\nSubject validation body',
+        projection_contract_version=1,
+        exact_projection_hash='b' * 64,
+    )
+    with mock.patch('engram.memory.work_dispatch.app.send_task'):
+        with transaction.atomic():
+            work, created = create_embedding_work_and_signal(document=document)
+    assert created is True
+    queued_run = WorkflowRun.objects.get(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.QUEUED,
+    )
+
+    return document, work, queued_run
+
+
+def _settle_for_late_delivery(
+    work: WorkflowWork,
+    *,
+    work_type: str,
+    workflow_run_id: uuid.UUID | None = None,
+) -> None:
+    from engram.memory.work_execution import finish_work_claim
+
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=work_type,
+        lease_owner=f'subject-validation:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=workflow_run_id,
+    )
+    assert claimed.claim is not None
+    finish_work_claim(
+        claim=claimed.claim,
+        now=now,
+        completion='product_succeeded',
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('subject_failure', 'expected_code'),
+    [
+        ('missing', 'work_scope_invalid'),
+        ('out_of_scope', 'work_scope_invalid'),
+        ('frozen_mismatch', 'work_fingerprint_mismatch'),
+    ],
+)
+def test_observation_subject_failure_records_typed_terminal_attempt(
+    subject_failure: str,
+    expected_code: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    observation = Observation.objects.get(id=work.subject_id)
+
+    if subject_failure == 'missing':
+        observation.delete()
+    elif subject_failure == 'out_of_scope':
+        other_project = Project.objects.create(
+            organization=f_org,
+            name='Other subject project',
+            slug='other-subject-project',
+        )
+        Observation.objects.filter(id=observation.id).update(project_id=other_project.id)
+    else:
+        Observation.objects.filter(id=observation.id).update(body='drifted after work creation')
+
+    with pytest.raises(MemoryWorkerError):
+        process_observation_work_v1(str(work.id))
+
+    work.refresh_from_db()
+    failed = WorkflowRun.objects.filter(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.FAILED,
+        failure_class=INVALID_INPUT,
+    ).first()
+    assert (
+        work.disposition,
+        work.execution_state,
+        failed.failure_code if failed is not None else None,
+    ) == (
+        WorkflowWorkDisposition.REQUIRED,
+        WorkflowWorkExecutionState.TERMINAL_FAILURE,
+        expected_code,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('subject_failure', 'expected_code'),
+    [
+        ('missing', 'work_scope_invalid'),
+        ('out_of_scope', 'work_scope_invalid'),
+        ('frozen_mismatch', 'work_fingerprint_mismatch'),
+    ],
+)
+def test_embedding_subject_failure_records_typed_terminal_attempt(
+    subject_failure: str,
+    expected_code: str,
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    document, work, queued_run = _unreferenced_embedding_work(f_org, f_team, f_project)
+
+    if subject_failure == 'missing':
+        document.delete()
+    elif subject_failure == 'out_of_scope':
+        other_project = Project.objects.create(
+            organization=f_org,
+            name='Other embedding project',
+            slug='other-embedding-project',
+        )
+        RetrievalDocument.objects.filter(id=document.id).update(project_id=other_project.id)
+    else:
+        next_version = MemoryVersion.objects.create(
+            organization=f_org,
+            project=f_project,
+            memory=document.memory,
+            version=2,
+            body='Drifted version',
+            content_hash='c' * 64,
+        )
+        RetrievalDocument.objects.filter(id=document.id).update(memory_version_id=next_version.id)
+
+    with pytest.raises(MemoryWorkerError):
+        tasks_module.embed_memory_projection_work_v1(
+            str(work.id),
+            str(queued_run.id),
+        )
+
+    work.refresh_from_db()
+    failed = WorkflowRun.objects.filter(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.FAILED,
+        failure_class=INVALID_INPUT,
+    ).first()
+    assert (
+        work.disposition,
+        work.execution_state,
+        failed.failure_code if failed is not None else None,
+    ) == (
+        WorkflowWorkDisposition.REQUIRED,
+        WorkflowWorkExecutionState.TERMINAL_FAILURE,
+        expected_code,
+    )
+
+
+@pytest.mark.django_db
+def test_late_settled_observation_delivery_is_absorbed_before_subject_lookup(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    session = create_session(f_org, f_team, f_project, f_agent)
+    work = _observation_work(session)
+    _settle_for_late_delivery(
+        work,
+        work_type=WorkflowWorkType.OBSERVATION_PROCESSING,
+    )
+    Observation.objects.get(id=work.subject_id).delete()
+    run_count = WorkflowRun.objects.filter(work=work).count()
+
+    assert process_observation_work_v1(str(work.id)) == str(work.id)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work).count() == run_count
+
+
+@pytest.mark.django_db
+def test_late_settled_embedding_delivery_is_absorbed_before_subject_lookup(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+) -> None:
+    document, work, queued_run = _unreferenced_embedding_work(f_org, f_team, f_project)
+    _settle_for_late_delivery(
+        work,
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        workflow_run_id=queued_run.id,
+    )
+    document.delete()
+    run_count = WorkflowRun.objects.filter(work=work).count()
+
+    assert tasks_module.embed_memory_projection_work_v1(str(work.id)) == str(work.id)
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert WorkflowRun.objects.filter(work=work).count() == run_count
+
+
+@pytest.mark.django_db
+def test_candidate_decision_off_switch_recovery_requeues_blocked_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
+
+    monkeypatch.setenv('ENGRAM_CANDIDATE_DECISION_ENABLED', 'off')
+    scope = orch.orchestrator_scope('env-off-recovery')
+    candidate, work, run = orch.subject_candidate(scope, suffix='env-off-recovery')
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    work.refresh_from_db()
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    blocked_fingerprint = work.blocked_configuration_fingerprint
+
+    monkeypatch.delenv('ENGRAM_CANDIDATE_DECISION_ENABLED')
+    enabled_fingerprint = execution_configuration_fingerprint(work)
+    sent: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        'engram.memory.work_dispatch.app.send_task',
+        lambda task_name, *, args, **_kwargs: sent.append((task_name, tuple(args))),
+    )
+
+    result = ReconcileCandidateDecisionWork().execute(as_of=timezone.now())
+    reconciliation_runs = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+
+    assert (
+        enabled_fingerprint != blocked_fingerprint,
+        result.queued,
+        reconciliation_runs.count(),
+        len(sent),
+    ) == (True, 1, 1, 1)
+
+
+@pytest.mark.django_db
+def test_candidate_configuration_fingerprint_tracks_primary_curation_policy() -> None:
+    scope = orch.orchestrator_scope('candidate-primary-fingerprint')
+    _candidate, work, _run = orch.subject_candidate(
+        scope,
+        suffix='candidate-primary-fingerprint',
+    )
+    before = execution_configuration_fingerprint(work)
+
+    orch.curation_policy(scope)
+
+    assert execution_configuration_fingerprint(work) != before

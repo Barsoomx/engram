@@ -9,7 +9,7 @@ from typing import Any
 
 import structlog
 from django.db import IntegrityError, transaction
-from django.db.models import Exists, Min, OuterRef, Q
+from django.db.models import Exists, OuterRef, Q, Subquery
 from django.utils import timezone
 from rest_framework import status
 
@@ -24,6 +24,7 @@ from engram.access.models import (
     Role,
 )
 from engram.access.services import (
+    EffectiveScope,
     api_key_fingerprint,
     api_key_prefix,
     hash_api_key,
@@ -38,6 +39,7 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
+    CurationDecision,
     Memory,
     MemoryCandidate,
     MemoryConflict,
@@ -45,6 +47,7 @@ from engram.core.models import (
     MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
+    Observation,
     Organization,
     Project,
     Team,
@@ -1024,8 +1027,15 @@ CONFLICT_RESOLUTION_ACTIONS = (
 _CONFLICT_TARGET_ACTIONS = ('merge_candidate', 'supersede_memory')
 
 
+def _scope_conflict_candidates(queryset: Any, scope: EffectiveScope) -> Any:
+    return queryset.filter(project_id__in=scope.project_ids).filter(
+        Q(team_id__isnull=True) | Q(team_id__in=scope.team_ids),
+    )
+
+
 def open_conflict_candidates(
     organization: Organization,
+    scope: EffectiveScope,
     *,
     project_id: uuid.UUID | None = None,
     team_id: uuid.UUID | None = None,
@@ -1037,7 +1047,10 @@ def open_conflict_candidates(
         resolved_transition__isnull=True,
     )
 
-    queryset = MemoryCandidate.objects.filter(organization=organization).filter(Exists(unresolved))
+    queryset = _scope_conflict_candidates(
+        MemoryCandidate.objects.filter(organization=organization).filter(Exists(unresolved)),
+        scope,
+    )
 
     if project_id is not None:
         queryset = queryset.filter(project_id=project_id)
@@ -1046,19 +1059,33 @@ def open_conflict_candidates(
         queryset = queryset.filter(team_id=team_id)
 
     if search:
-        queryset = queryset.filter(Q(title__icontains=search) | Q(body__icontains=search))
+        queryset = queryset.filter(_conflict_search_predicate(search))
 
-    queryset = queryset.annotate(
-        opened_at=Min(
-            'memory_conflicts__created_at',
-            filter=Q(memory_conflicts__resolved_transition__isnull=True),
-        ),
+    opened_at_subquery = (
+        MemoryConflict.objects.filter(
+            candidate_id=OuterRef('pk'),
+            resolved_transition__isnull=True,
+        )
+        .order_by('created_at')
+        .values('created_at')[:1]
     )
+
+    queryset = queryset.annotate(opened_at=Subquery(opened_at_subquery))
 
     if opened_at__gte is not None:
         queryset = queryset.filter(opened_at__gte=opened_at__gte)
 
     return queryset
+
+
+def _conflict_search_predicate(search: str) -> Q:
+    compared = MemoryConflict.objects.filter(
+        candidate_id=OuterRef('pk'),
+        resolved_transition__isnull=True,
+        memory_version__body__icontains=search,
+    )
+
+    return Q(title__icontains=search) | Q(body__icontains=search) | Exists(compared)
 
 
 def open_conflicts_for_candidates(
@@ -1071,7 +1098,7 @@ def open_conflicts_for_candidates(
             candidate_id__in=list(candidate_ids),
             resolved_transition__isnull=True,
         )
-        .select_related('memory', 'memory_version')
+        .select_related('memory', 'memory_version', 'opened_transition')
         .order_by('candidate_id', 'id')
     )
 
@@ -1083,9 +1110,45 @@ def open_conflicts_for_candidates(
     return grouped
 
 
+def conflict_decision_context(
+    conflicts: list[MemoryConflict],
+) -> tuple[dict[uuid.UUID, CurationDecision], CurationDecision | None, dict[str, Observation]]:
+    conflict_ids = [conflict.id for conflict in conflicts]
+    decisions_by_conflict: dict[uuid.UUID, CurationDecision] = {}
+    for decision in (
+        CurationDecision.objects.filter(conflict_id__in=conflict_ids)
+        .select_related('provider_call_record', 'policy')
+        .order_by('created_at', 'id')
+    ):
+        decisions_by_conflict.setdefault(decision.conflict_id, decision)
+
+    primary: CurationDecision | None = None
+    for conflict in sorted(conflicts, key=lambda item: str(item.id)):
+        if conflict.id in decisions_by_conflict:
+            primary = decisions_by_conflict[conflict.id]
+            break
+
+    observation_ids: set[str] = set()
+    for decision in decisions_by_conflict.values():
+        membership = decision.evidence_membership or {}
+        for entry in membership.get('candidate', []):
+            observation_ids.add(entry.get('observation_id'))
+        for target in membership.get('targets', []):
+            for entry in target.get('sources', []):
+                observation_ids.add(entry.get('observation_id'))
+
+    observations = {
+        str(observation.id): observation
+        for observation in Observation.objects.filter(id__in=[value for value in observation_ids if value])
+    }
+
+    return decisions_by_conflict, primary, observations
+
+
 def get_conflict_candidate_or_404(
     organization: Organization,
     candidate_id: uuid.UUID,
+    scope: EffectiveScope,
 ) -> MemoryCandidate:
     unresolved = MemoryConflict.objects.filter(
         candidate_id=OuterRef('pk'),
@@ -1093,9 +1156,12 @@ def get_conflict_candidate_or_404(
     )
 
     candidate = (
-        MemoryCandidate.objects.filter(
-            organization=organization,
-            id=candidate_id,
+        _scope_conflict_candidates(
+            MemoryCandidate.objects.filter(
+                organization=organization,
+                id=candidate_id,
+            ),
+            scope,
         )
         .filter(Exists(unresolved))
         .first()
@@ -1141,7 +1207,20 @@ def resolve_candidate_conflicts(
     target_memory_id: uuid.UUID | None = None,
     merged_title: str | None = None,
     merged_body: str | None = None,
+    expected_etag: str | None = None,
 ) -> dict[str, Any]:
+    candidate = MemoryCandidate.objects.select_for_update().filter(organization=organization, id=candidate.id).first()
+
+    if candidate is None:
+        raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
+    title_limit = Memory._meta.get_field('title').max_length
+    if merged_title is not None and len(merged_title) > title_limit:
+        raise MemoryReviewError('invalid_title', 'merged_title exceeds the maximum length', status=400)
+
+    if expected_etag is not None and expected_etag != conflict_set_etag(candidate):
+        raise MemoryReviewError('stale_conflict_set', 'conflict set has changed', status=412)
+
     open_conflicts = list(
         MemoryConflict.objects.filter(
             candidate=candidate,

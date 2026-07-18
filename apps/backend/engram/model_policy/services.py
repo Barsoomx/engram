@@ -1258,11 +1258,11 @@ _MEMORY_KIND_VALUES = ('decision', 'convention', 'gotcha', 'architecture', 'inci
 _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
     'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
     'The object must contain exactly these keys and no additional properties: '
-    'memories (array of at most 12 objects); '
+    'memories (array of at most 8 objects); '
     'no_signal_observation_ids (array of observation ids, unique, may be empty). '
     'Each memories entry must contain exactly these keys and no additional properties: '
     'title (non-blank string, at most 255 characters); '
-    'body (non-blank string, at most 3000 characters); '
+    'body (non-blank string, at most 2000 characters); '
     'confidence (a JSON number between 0 and 1, never a string); '
     'supporting_observation_ids (non-empty array of unique observation ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
@@ -1349,12 +1349,12 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'properties': {
                 'memories': {
                     'type': 'array',
-                    'maxItems': 12,
+                    'maxItems': 8,
                     'items': {
                         'type': 'object',
                         'properties': {
                             'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
-                            'body': {'type': 'string', 'minLength': 1, 'maxLength': 3000},
+                            'body': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                             'supporting_observation_ids': {
                                 'type': 'array',
