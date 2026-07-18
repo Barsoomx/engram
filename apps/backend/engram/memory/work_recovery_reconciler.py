@@ -49,13 +49,24 @@ def _due_predicate(as_of: datetime) -> Q:
     return retry_due | lease_expired
 
 
+def _settled_embedding_release_predicate(as_of: datetime) -> Q:
+    return Q(
+        work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        disposition=WorkflowWorkDisposition.COMPLETE,
+        execution_state=WorkflowWorkExecutionState.LEASED,
+        lease_expires_at__isnull=False,
+        lease_expires_at__lt=as_of,
+    )
+
+
 def _strand_ids(as_of: datetime) -> list[uuid.UUID]:
+    required = Q(
+        work_type__in=_RECOVERABLE_WORK_TYPES,
+        disposition=WorkflowWorkDisposition.REQUIRED,
+    ) & _due_predicate(as_of)
+
     return list(
-        WorkflowWork.objects.filter(
-            work_type__in=_RECOVERABLE_WORK_TYPES,
-            disposition=WorkflowWorkDisposition.REQUIRED,
-        )
-        .filter(_due_predicate(as_of))
+        WorkflowWork.objects.filter(required | _settled_embedding_release_predicate(as_of))
         .order_by('created_at', 'id')
         .values_list('id', flat=True)
     )
@@ -95,19 +106,44 @@ def _blocking_attempt_exists(work: WorkflowWork, as_of: datetime) -> bool:
     return runs.filter(status=WorkflowRunStatus.QUEUED).exists()
 
 
+def _settled_embedding_release(work: WorkflowWork, as_of: datetime) -> bool:
+    return (
+        work.work_type == WorkflowWorkType.MEMORY_EMBEDDING
+        and work.disposition == WorkflowWorkDisposition.COMPLETE
+        and work.execution_state == WorkflowWorkExecutionState.LEASED
+        and work.lease_expires_at is not None
+        and work.lease_expires_at < as_of
+    )
+
+
+def _is_recoverable(work: WorkflowWork, as_of: datetime) -> bool:
+    if work.work_type not in _RECOVERABLE_WORK_TYPES:
+        return False
+
+    if work.disposition == WorkflowWorkDisposition.REQUIRED:
+        return _is_due(work, as_of)
+
+    return _settled_embedding_release(work, as_of)
+
+
+def _recovery_origin(work: WorkflowWork) -> str:
+    if work.disposition == WorkflowWorkDisposition.COMPLETE:
+        return WorkflowRunOrigin.MANUAL
+
+    return WorkflowRunOrigin.RECONCILIATION
+
+
 def _recover_one(work_id: uuid.UUID, as_of: datetime) -> bool:
     with transaction.atomic():
         try:
             work = WorkflowWork.objects.select_for_update().get(id=work_id)
         except WorkflowWork.DoesNotExist:
             return False
-        if work.work_type not in _RECOVERABLE_WORK_TYPES or work.disposition != WorkflowWorkDisposition.REQUIRED:
-            return False
-        if not _is_due(work, as_of):
+        if not _is_recoverable(work, as_of):
             return False
         if _blocking_attempt_exists(work, as_of):
             return False
-        run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
+        run = queue_work_attempt(work_id=work.id, now=as_of, origin=_recovery_origin(work))
 
         return run.dispatched_at == as_of
 
