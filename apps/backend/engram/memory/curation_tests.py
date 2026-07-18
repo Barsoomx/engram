@@ -744,6 +744,29 @@ def test_curation_judge_prompt_redacts_secrets() -> None:
     assert '[REDACTED]' in prompt
 
 
+def test_curation_judge_prompt_teaches_redaction_uncertainty_fallback() -> None:
+    prompt = curation_judge_prompt(
+        MemoryCandidate(title='c', body='c body'),
+        Memory(title='m', body='m body'),
+    )
+
+    assert '"keep_both"' in prompt
+    assert '<new_candidate_memory>' in prompt
+    assert '<existing_near_duplicate_memory>' in prompt
+
+
+def test_curation_judge_prompts_share_decision_enum() -> None:
+    system_prompt = curation_judge_system_prompt()
+    user_prompt = curation_judge_prompt(
+        MemoryCandidate(title='c', body='c body'),
+        Memory(title='m', body='m body'),
+    )
+
+    for decision in ('merge', 'keep_both', 'reject', 'contradicts'):
+        assert decision in system_prompt
+        assert decision in user_prompt
+
+
 @pytest.mark.django_db
 def test_curate_judge_keep_both_promotes_clean_without_supersede() -> None:
     organization, team, project = create_scope()
