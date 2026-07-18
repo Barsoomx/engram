@@ -39,6 +39,7 @@ from engram.core.models import (
     AuditEvent,
     AuditResult,
     CandidateStatus,
+    CurationDecision,
     Memory,
     MemoryCandidate,
     MemoryConflict,
@@ -46,6 +47,7 @@ from engram.core.models import (
     MemoryReviewExample,
     MemoryStatus,
     MemoryVersion,
+    Observation,
     Organization,
     Project,
     Team,
@@ -1082,7 +1084,7 @@ def open_conflicts_for_candidates(
             candidate_id__in=list(candidate_ids),
             resolved_transition__isnull=True,
         )
-        .select_related('memory', 'memory_version')
+        .select_related('memory', 'memory_version', 'opened_transition')
         .order_by('candidate_id', 'id')
     )
 
@@ -1092,6 +1094,41 @@ def open_conflicts_for_candidates(
         grouped[conflict.candidate_id].append(conflict)
 
     return grouped
+
+
+def conflict_decision_context(
+    conflicts: list[MemoryConflict],
+) -> tuple[dict[uuid.UUID, CurationDecision], CurationDecision | None, dict[str, Observation]]:
+    conflict_ids = [conflict.id for conflict in conflicts]
+    decisions_by_conflict: dict[uuid.UUID, CurationDecision] = {}
+    for decision in (
+        CurationDecision.objects.filter(conflict_id__in=conflict_ids)
+        .select_related('provider_call_record', 'policy')
+        .order_by('created_at', 'id')
+    ):
+        decisions_by_conflict.setdefault(decision.conflict_id, decision)
+
+    primary: CurationDecision | None = None
+    for conflict in sorted(conflicts, key=lambda item: str(item.id)):
+        if conflict.id in decisions_by_conflict:
+            primary = decisions_by_conflict[conflict.id]
+            break
+
+    observation_ids: set[str] = set()
+    for decision in decisions_by_conflict.values():
+        membership = decision.evidence_membership or {}
+        for entry in membership.get('candidate', []):
+            observation_ids.add(entry.get('observation_id'))
+        for target in membership.get('targets', []):
+            for entry in target.get('sources', []):
+                observation_ids.add(entry.get('observation_id'))
+
+    observations = {
+        str(observation.id): observation
+        for observation in Observation.objects.filter(id__in=[value for value in observation_ids if value])
+    }
+
+    return decisions_by_conflict, primary, observations
 
 
 def get_conflict_candidate_or_404(

@@ -469,6 +469,285 @@ def test_conflict_detail_contains_candidate_and_all_compared_claims(
 
 
 @pytest.mark.django_db
+def test_conflict_detail_exposes_decision_and_bounded_evidence_context(
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    from engram.core.models import (
+        CurationDecision,
+        CurationOutcome,
+        CurationReasonCode,
+        EvidenceTier,
+        MemoryCandidateSource,
+        WorkflowSubjectType,
+        WorkflowWork,
+        WorkflowWorkType,
+    )
+    from engram.memory.candidate_decision_work import evidence_manifest
+    from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
+
+    candidate, memories, conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='detail-evidence-context',
+    )
+    memory = memories[0]
+    conflict = conflicts[0]
+    candidate_source = candidate.sources.select_related('observation').get()
+    version_source = (
+        conflict.memory_version.provenance_sources.select_related(
+            'candidate_source__observation',
+        )
+        .get()
+    )
+    assert version_source.candidate_source_id is not None
+
+    manifest_entries, manifest_hash = evidence_manifest(candidate)
+    assert [entry['observation_id'] for entry in manifest_entries] == [
+        str(candidate_source.observation_id),
+    ]
+    evidence_membership = {
+        'candidate': [
+            {
+                'reference_id': str(candidate_source.id),
+                'source_kind': candidate_source.source_kind,
+                'observation_id': str(candidate_source.observation_id),
+            },
+        ],
+        'targets': [
+            {
+                'memory_version_id': str(conflict.memory_version_id),
+                'sources': [
+                    {
+                        'reference_id': str(version_source.candidate_source_id),
+                        'source_kind': version_source.candidate_source.source_kind,
+                        'observation_id': str(version_source.candidate_source.observation_id),
+                    },
+                ],
+            },
+        ],
+    }
+
+    work = WorkflowWork.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+        subject_id=candidate.id,
+        contract_version=1,
+        occurrence_key='',
+        input_fingerprint='a' * 64,
+        input_snapshot={
+            'schema': 'candidate_decision_input/v1',
+            'candidate_id': str(candidate.id),
+            'evidence_manifest_hash': manifest_hash,
+        },
+    )
+    secret = ProviderSecret.objects.create(
+        organization=f_admin_org,
+        name='Conflict detail curation secret',
+        provider='openai',
+        scope='organization',
+    )
+    policy = ModelPolicy.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        secret=secret,
+        name='Conflict detail curation policy',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        version=7,
+    )
+    provider_call = ProviderCallRecord.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        policy=policy,
+        secret=secret,
+        provider='openai',
+        model='gpt-4.1-mini',
+        task_type='curation',
+        policy_version=7,
+        request_id='conflict-detail-curation-call',
+        redaction_state='redacted',
+    )
+    judge_reason = 'Both supported claims apply to the same project and cannot both be true.'
+    decision = CurationDecision.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        work=work,
+        candidate=candidate,
+        input_fingerprint=work.input_fingerprint,
+        evidence_manifest_hash=manifest_hash,
+        comparison_manifest_hash='b' * 64,
+        outcome=CurationOutcome.OPEN_CONFLICT,
+        reason_code=CurationReasonCode.SAME_SCOPE_CONTRADICTION,
+        redacted_reason=judge_reason,
+        effective_visibility_scope=VisibilityScope.PROJECT,
+        target_memory_version=conflict.memory_version,
+        evidence_tier=EvidenceTier.SUPPORTED,
+        provider_call_record=provider_call,
+        policy=policy,
+        policy_version=7,
+        transition=conflict.opened_transition,
+        conflict=conflict,
+        payload_hash='c' * 64,
+        applicability='same',
+        evidence_membership=evidence_membership,
+    )
+
+    _late_candidate, late_template, _late_session = provenanced_candidate_in_scope(
+        f_admin_org,
+        f_project,
+        None,
+        suffix='detail-evidence-late',
+        title='Late evidence template',
+        body='This source arrived only after the conflict decision.',
+    )
+    late_source = MemoryCandidateSource.objects.create(
+        organization=f_admin_org,
+        project=f_project,
+        candidate=candidate,
+        window=late_template.window,
+        observation=late_template.observation,
+        stage=late_template.stage,
+        anchors=late_template.anchors,
+        anchors_hash=late_template.anchors_hash,
+    )
+    _current_entries, current_manifest_hash = evidence_manifest(candidate)
+    assert current_manifest_hash != decision.evidence_manifest_hash
+
+    client = _auth_client(f_admin_token, f_admin_org)
+    response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+
+    assert response.status_code == 200
+    body = response.data
+    assert {
+        'conflicts',
+        'decision',
+        'effective_applicability',
+    } <= set(body)
+
+    def assert_semantic_subset(actual: dict[str, Any], expected: dict[str, Any]) -> None:
+        for key, expected_value in expected.items():
+            assert key in actual
+            actual_value = actual[key]
+            if isinstance(expected_value, dict):
+                assert isinstance(actual_value, dict)
+                assert_semantic_subset(actual_value, expected_value)
+            else:
+                assert actual_value == expected_value
+
+    conflict_payload = next(
+        item for item in body['conflicts'] if str(item['id']) == str(conflict.id)
+    )
+    assert_semantic_subset(
+        conflict_payload,
+        {
+            'id': str(conflict.id),
+            'opened_transition_id': str(conflict.opened_transition_id),
+            'decision_id': str(decision.id),
+            'evidence_hash': conflict.evidence_hash,
+        },
+    )
+    assert_semantic_subset(
+        body['decision'],
+        {
+            'id': str(decision.id),
+            'work_id': str(work.id),
+            'outcome': 'open_conflict',
+            'reason_code': 'same_scope_contradiction',
+            'target_memory_version_id': str(conflict.memory_version_id),
+            'transition_id': str(conflict.opened_transition_id),
+            'conflict_id': str(conflict.id),
+            'evidence_tier': 'supported',
+            'evidence_manifest_hash': manifest_hash,
+            'comparison_manifest_hash': 'b' * 64,
+            'effective_scope': {
+                'project_id': str(f_project.id),
+                'visibility_scope': 'project',
+                'team_id': None,
+            },
+            'judge': {
+                'status': 'succeeded',
+                'reason': judge_reason,
+                'provider_call_record_id': str(provider_call.id),
+                'policy_id': str(policy.id),
+                'policy_version': 7,
+                'provider': 'openai',
+                'model': 'gpt-4.1-mini',
+            },
+        },
+    )
+    assert_semantic_subset(
+        body['effective_applicability'],
+        {
+            'verdict': 'same',
+            'candidate': {
+                'project_id': str(f_project.id),
+                'visibility_scope': 'project',
+                'team_id': None,
+            },
+        },
+    )
+    applicability_target = next(
+        item
+        for item in body['effective_applicability']['targets']
+        if str(item['memory_id']) == str(memory.id)
+    )
+    assert_semantic_subset(
+        applicability_target,
+        {
+            'memory_id': str(memory.id),
+            'version_id': str(conflict.memory_version_id),
+            'project_id': str(f_project.id),
+            'visibility_scope': 'project',
+            'team_id': None,
+        },
+    )
+
+    candidate_evidence = body['candidate_claim']['evidence']
+    assert [str(item['reference_id']) for item in candidate_evidence] == [
+        str(candidate_source.id),
+    ]
+    assert_semantic_subset(
+        candidate_evidence[0],
+        {
+            'source_kind': candidate_source.source_kind,
+            'observation_id': str(candidate_source.observation_id),
+        },
+    )
+    assert candidate_evidence[0]['summary']
+
+    existing_claim = next(
+        item
+        for item in body['existing_claims']
+        if str(item['version_id']) == str(conflict.memory_version_id)
+    )
+    target_evidence = existing_claim['evidence']
+    assert [str(item['reference_id']) for item in target_evidence] == [
+        str(version_source.candidate_source_id),
+    ]
+    assert_semantic_subset(
+        target_evidence[0],
+        {
+            'source_kind': version_source.candidate_source.source_kind,
+            'observation_id': str(version_source.candidate_source.observation_id),
+        },
+    )
+    assert target_evidence[0]['summary']
+
+    returned_reference_ids = {
+        str(item['reference_id'])
+        for claim in [body['candidate_claim'], *body['existing_claims']]
+        for item in claim['evidence']
+    }
+    assert str(late_source.id) not in returned_reference_ids
+
+
+@pytest.mark.django_db
 def test_conflict_resolution_requires_current_etag(
     f_admin_token: str,
     f_admin_org: Organization,

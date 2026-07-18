@@ -2835,6 +2835,8 @@ class CurationDecision(ImmutableCreatedModel):
         null=True,
         blank=True,
     )
+    applicability = models.CharField(max_length=20, blank=True, default='')
+    evidence_membership = models.JSONField(default=dict, blank=True)
     payload_hash = models.CharField(max_length=64)
 
     _IMMUTABLE_FIELDS = (
@@ -2859,6 +2861,8 @@ class CurationDecision(ImmutableCreatedModel):
         ('policy_version', 'policy_version'),
         ('transition_id', 'transition'),
         ('conflict_id', 'conflict'),
+        ('applicability', 'applicability'),
+        ('evidence_membership', 'evidence_membership'),
         ('payload_hash', 'payload_hash'),
     )
 

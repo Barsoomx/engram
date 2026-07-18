@@ -25,6 +25,7 @@ from engram.console.serializers.memory_review import (
 )
 from engram.console.services import (
     MemoryReviewError,
+    conflict_decision_context,
     conflict_set_etag,
     get_conflict_candidate_or_404,
     open_conflict_candidates,
@@ -95,7 +96,19 @@ class MemoryReviewViewSet(
 
         etag = conflict_set_etag(candidate)
 
-        response = Response(conflict_detail_payload(candidate, conflicts, etag), status=HTTP_200_OK)
+        decisions_by_conflict, primary_decision, observations = conflict_decision_context(conflicts)
+
+        response = Response(
+            conflict_detail_payload(
+                candidate,
+                conflicts,
+                etag,
+                decisions_by_conflict,
+                primary_decision,
+                observations,
+            ),
+            status=HTTP_200_OK,
+        )
 
         response['ETag'] = etag
 

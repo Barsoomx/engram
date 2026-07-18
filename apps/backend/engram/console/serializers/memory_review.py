@@ -204,7 +204,37 @@ def _body_hash(value: str) -> str:
     return hashlib.sha256((value or '').encode()).hexdigest()
 
 
-def _candidate_claim(candidate: MemoryCandidate, *, include_body: bool) -> dict[str, Any]:
+def _scope_of(instance: Any) -> dict[str, Any]:
+    return {
+        'project_id': str(instance.project_id),
+        'visibility_scope': instance.visibility_scope,
+        'team_id': str(instance.team_id) if instance.team_id else None,
+    }
+
+
+def _evidence_entries(entries: Any, observations: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for entry in entries or []:
+        observation = observations.get(entry.get('observation_id'))
+        summary = _redacted(observation.title) if observation is not None else ''
+        result.append(
+            {
+                'reference_id': entry.get('reference_id'),
+                'source_kind': entry.get('source_kind'),
+                'observation_id': entry.get('observation_id'),
+                'summary': summary or (entry.get('observation_id') or ''),
+            }
+        )
+
+    return result
+
+
+def _candidate_claim(
+    candidate: MemoryCandidate,
+    *,
+    include_body: bool,
+    evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     claim = {
         'title': _redacted(candidate.title),
         'kind': candidate.kind,
@@ -214,10 +244,18 @@ def _candidate_claim(candidate: MemoryCandidate, *, include_body: bool) -> dict[
     if include_body:
         claim['body'] = _redacted(candidate.body)
 
+    if evidence is not None:
+        claim['evidence'] = evidence
+
     return claim
 
 
-def _existing_claim(conflict: MemoryConflict, *, include_body: bool) -> dict[str, Any]:
+def _existing_claim(
+    conflict: MemoryConflict,
+    *,
+    include_body: bool,
+    evidence: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     memory = conflict.memory
 
     claim = {
@@ -231,7 +269,58 @@ def _existing_claim(conflict: MemoryConflict, *, include_body: bool) -> dict[str
     if include_body:
         claim['body'] = _redacted(memory.body)
 
+    if evidence is not None:
+        claim['evidence'] = evidence
+
     return claim
+
+
+def _target_evidence(decision: Any, version_id: Any, observations: dict[str, Any]) -> list[dict[str, Any]]:
+    if decision is None:
+        return []
+    for target in (decision.evidence_membership or {}).get('targets', []):
+        if str(target.get('memory_version_id')) == str(version_id):
+            return _evidence_entries(target.get('sources', []), observations)
+
+    return []
+
+
+def _decision_payload(decision: Any) -> dict[str, Any] | None:
+    if decision is None:
+        return None
+    provider_call = decision.provider_call_record
+    judge_status = 'succeeded' if decision.provider_call_record_id else 'not_required'
+
+    return {
+        'id': str(decision.id),
+        'work_id': str(decision.work_id),
+        'outcome': decision.outcome,
+        'reason_code': decision.reason_code,
+        'target_memory_version_id': (
+            str(decision.target_memory_version_id) if decision.target_memory_version_id else None
+        ),
+        'transition_id': str(decision.transition_id) if decision.transition_id else None,
+        'conflict_id': str(decision.conflict_id) if decision.conflict_id else None,
+        'evidence_tier': decision.evidence_tier,
+        'evidence_manifest_hash': decision.evidence_manifest_hash,
+        'comparison_manifest_hash': decision.comparison_manifest_hash,
+        'effective_scope': {
+            'project_id': str(decision.project_id),
+            'visibility_scope': decision.effective_visibility_scope,
+            'team_id': str(decision.effective_team_id) if decision.effective_team_id else None,
+        },
+        'judge': {
+            'status': judge_status,
+            'reason': decision.redacted_reason,
+            'provider_call_record_id': (
+                str(decision.provider_call_record_id) if decision.provider_call_record_id else None
+            ),
+            'policy_id': str(decision.policy_id) if decision.policy_id else None,
+            'policy_version': decision.policy_version,
+            'provider': provider_call.provider if provider_call is not None else None,
+            'model': provider_call.model if provider_call is not None else None,
+        },
+    }
 
 
 def conflict_list_item(
@@ -259,12 +348,33 @@ def conflict_detail_payload(
     candidate: MemoryCandidate,
     conflicts: list[MemoryConflict],
     etag: str,
+    decisions_by_conflict: dict[Any, Any] | None = None,
+    primary_decision: Any | None = None,
+    observations: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ordered = sorted(conflicts, key=lambda conflict: str(conflict.id))
+    decisions_by_conflict = decisions_by_conflict or {}
+    observations = observations or {}
+
+    candidate_evidence = _evidence_entries(
+        (primary_decision.evidence_membership or {}).get('candidate', []) if primary_decision is not None else [],
+        observations,
+    )
 
     payload = conflict_list_item(candidate, ordered)
-    payload['candidate_claim'] = _candidate_claim(candidate, include_body=True)
-    payload['existing_claims'] = [_existing_claim(conflict, include_body=True) for conflict in ordered]
+    payload['candidate_claim'] = _candidate_claim(candidate, include_body=True, evidence=candidate_evidence)
+    payload['existing_claims'] = [
+        _existing_claim(
+            conflict,
+            include_body=True,
+            evidence=_target_evidence(
+                decisions_by_conflict.get(conflict.id),
+                conflict.memory_version_id,
+                observations,
+            ),
+        )
+        for conflict in ordered
+    ]
     payload['candidate_id'] = str(candidate.id)
     payload['etag'] = etag
     payload['resolution_actions'] = [
@@ -273,5 +383,31 @@ def conflict_detail_payload(
         'supersede_memory',
         'reject_candidate',
     ]
+    payload['conflicts'] = [
+        {
+            'id': str(conflict.id),
+            'opened_transition_id': (
+                str(conflict.opened_transition_id) if conflict.opened_transition_id else None
+            ),
+            'decision_id': (
+                str(decisions_by_conflict[conflict.id].id) if conflict.id in decisions_by_conflict else None
+            ),
+            'evidence_hash': conflict.evidence_hash,
+        }
+        for conflict in ordered
+    ]
+    payload['decision'] = _decision_payload(primary_decision)
+    payload['effective_applicability'] = {
+        'verdict': primary_decision.applicability if primary_decision is not None else '',
+        'candidate': _scope_of(candidate),
+        'targets': [
+            {
+                'memory_id': str(conflict.memory_id),
+                'version_id': str(conflict.memory_version_id),
+                **_scope_of(conflict.memory),
+            }
+            for conflict in ordered
+        ],
+    }
 
     return payload

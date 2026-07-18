@@ -23,8 +23,10 @@ from engram.core.models import (
     EvidenceTier,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
     MemoryConflict,
     MemoryVersion,
+    MemoryVersionSource,
     Organization,
     OrganizationSettings,
     RetrievalDocument,
@@ -990,6 +992,7 @@ class CurateMemoryCandidate:
 
 
 _DETERMINISTIC_COMPARISON_HASH = hashlib.sha256(b'curation_decision.deterministic_no_comparison.v1').hexdigest()
+_MAX_EVIDENCE_MEMBERSHIP = 32
 
 _VERDICT_OUTCOME = {
     'publish_new': CurationOutcome.PUBLISH_NEW,
@@ -1354,6 +1357,7 @@ class DecideMemoryCandidate:
                 conflict=conflict,
                 judge=judge_result,
                 redacted_reason=redact_text(verdict.reason)[:500],
+                applicability=getattr(verdict, 'applicability', ''),
             )
 
         return
@@ -1404,6 +1408,7 @@ class DecideMemoryCandidate:
                 conflict=None,
                 judge=judge_result,
                 redacted_reason=redact_text(verdict.reason)[:500],
+                applicability=getattr(verdict, 'applicability', ''),
             )
 
         return
@@ -1665,6 +1670,42 @@ class DecideMemoryCandidate:
             trace_id=f'curation-decision:{work.id}',
         )
 
+    def _decision_evidence_membership(
+        self,
+        candidate: MemoryCandidate,
+        target_memory_version_id: uuid.UUID | None,
+    ) -> dict[str, object]:
+        candidate_sources = [
+            {
+                'reference_id': str(source.id),
+                'source_kind': source.source_kind,
+                'observation_id': str(source.observation_id),
+            }
+            for source in candidate.sources.order_by('id')[:_MAX_EVIDENCE_MEMBERSHIP]
+        ]
+        targets: list[dict[str, object]] = []
+        if target_memory_version_id is not None:
+            target_sources = [
+                {
+                    'reference_id': str(row.candidate_source_id),
+                    'source_kind': row.candidate_source.source_kind,
+                    'observation_id': str(row.candidate_source.observation_id),
+                }
+                for row in (
+                    MemoryVersionSource.objects.select_related('candidate_source')
+                    .filter(memory_version_id=target_memory_version_id, candidate_source__isnull=False)
+                    .order_by('id')[:_MAX_EVIDENCE_MEMBERSHIP]
+                )
+            ]
+            targets.append(
+                {
+                    'memory_version_id': str(target_memory_version_id),
+                    'sources': target_sources,
+                }
+            )
+
+        return {'candidate': candidate_sources, 'targets': targets}
+
     def _write_decision(
         self,
         *,
@@ -1680,8 +1721,10 @@ class DecideMemoryCandidate:
         conflict: object | None,
         judge: CurationJudgeResult | None,
         redacted_reason: str,
+        applicability: str = '',
     ) -> CurationDecision:
         evidence_manifest_hash = work.input_snapshot['evidence_manifest_hash']
+        evidence_membership = self._decision_evidence_membership(candidate, target_memory_version_id)
         if judge is not None:
             judge_status = 'succeeded'
             provider_call_record_id = judge.provider_call_record_id
@@ -1710,6 +1753,8 @@ class DecideMemoryCandidate:
             'evidence_tier': getattr(evidence_tier, 'value', evidence_tier),
             'evidence_manifest_hash': evidence_manifest_hash,
             'comparison_manifest_hash': comparison_manifest_hash,
+            'applicability': applicability,
+            'evidence_membership': evidence_membership,
             'judge': {
                 'status': judge_status,
                 'provider_call_record_id': (
@@ -1743,5 +1788,7 @@ class DecideMemoryCandidate:
             policy_version=policy_version,
             transition=transition,
             conflict=conflict,
+            applicability=applicability,
+            evidence_membership=evidence_membership,
             payload_hash=payload_hash,
         )
