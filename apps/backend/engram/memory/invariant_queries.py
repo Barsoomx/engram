@@ -1126,6 +1126,15 @@ def _evaluate_p6(project: Project, as_of: datetime) -> InvariantResult:
         project_id=project.id,
         as_of=as_of,
     )
+    if not findings:
+        return InvariantResult(
+            invariant_id=InvariantId.P6,
+            state=InvariantState.HEALTHY,
+            reason='candidate_decision_work_relation_consistent',
+            violation_count=0,
+            target_checkpoint='CP2/CP3/CP5',
+        )
+
     sample_ids = tuple(
         sorted(
             {f'candidate:{finding.entity_id}' for finding in findings},
@@ -1133,10 +1142,13 @@ def _evaluate_p6(project: Project, as_of: datetime) -> InvariantResult:
         )[:_SAMPLE_LIMIT]
     )
 
-    return _missing(
-        InvariantId.P6,
-        proxy_count=len(findings),
+    return InvariantResult(
+        invariant_id=InvariantId.P6,
+        state=InvariantState.VIOLATED,
+        reason='candidate_decision_work_relation_violated',
+        violation_count=len(findings),
         sample_ids=sample_ids,
+        target_checkpoint='CP2/CP3/CP5',
     )
 
 

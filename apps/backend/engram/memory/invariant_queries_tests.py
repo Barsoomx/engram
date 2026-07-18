@@ -91,6 +91,16 @@ from engram.memory.workflow_work import (
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
+
+@pytest.fixture(autouse=True)
+def _reset_candidate_decision_work_builder() -> None:
+    from engram.memory import candidate_work_reconciler
+
+    candidate_work_reconciler.set_candidate_decision_work_builder(None)
+    yield
+    candidate_work_reconciler.set_candidate_decision_work_builder(None)
+
+
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
 EXPECTED_CASES = {
     'no_run_session',
@@ -2206,8 +2216,8 @@ def test_p6_is_builder_aware_and_counts_only_missing_or_inactive_or_mismatched()
     finally:
         candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
-    assert p6.state == InvariantState.MISSING_OBSERVABILITY
-    assert p6.proxy_count == 1
+    assert p6.state == InvariantState.VIOLATED
+    assert p6.violation_count == 1
     assert any(str(missing.id) in sample for sample in p6.sample_ids)
     assert all(str(satisfied.id) not in sample for sample in p6.sample_ids)
 
@@ -2969,3 +2979,67 @@ def test_p9_complete_conflict_set_resolution_is_healthy() -> None:
     assert p8.violation_count == 0
     assert p9.state == InvariantState.HEALTHY
     assert p9.violation_count == 0
+
+
+@pytest.mark.django_db
+def test_p6_registered_builder_reports_exact_cp5_states() -> None:
+    from engram.memory import candidate_work_reconciler
+
+    healthy_scope = create_scope('p6-exact-healthy')
+    violated_scope = create_scope('p6-exact-violated')
+    healthy_organization, healthy_project, healthy_session = healthy_scope
+    violated_organization, violated_project, violated_session = violated_scope
+    satisfied = MemoryCandidate.objects.create(
+        organization=healthy_organization,
+        project=healthy_project,
+        team=healthy_session.team,
+        title='p6 exact satisfied',
+        body='p6 exact satisfied body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='p6-exact-satisfied-hash',
+        confidence=Decimal('0.900'),
+    )
+    missing = MemoryCandidate.objects.create(
+        organization=violated_organization,
+        project=violated_project,
+        team=violated_session.team,
+        title='p6 exact missing',
+        body='p6 exact missing body',
+        status=CandidateStatus.PROPOSED,
+        content_hash='p6-exact-missing-hash',
+        confidence=Decimal('0.900'),
+    )
+    active_work = ended_session_work(healthy_scope, sequence=1)
+    builder = StubBuilder(
+        inputs={
+            satisfied.id: _candidate_input(satisfied, manifest='manifest-satisfied'),
+            missing.id: _candidate_input(missing, manifest='manifest-missing'),
+        },
+        works_by_manifest={
+            'manifest-satisfied': active_work,
+            'manifest-missing': None,
+        },
+    )
+    previous_builder = candidate_work_reconciler.get_candidate_decision_work_builder()
+    candidate_work_reconciler.set_candidate_decision_work_builder(builder)
+    try:
+        healthy = _exact_results(healthy_scope, timezone.now())['P6']
+        violated = _exact_results(violated_scope, timezone.now())['P6']
+    finally:
+        candidate_work_reconciler.set_candidate_decision_work_builder(previous_builder)
+
+    assert (
+        healthy.state,
+        healthy.violation_count,
+        healthy.proxy_count,
+        violated.state,
+        violated.violation_count,
+        violated.proxy_count,
+    ) == (
+        InvariantState.HEALTHY,
+        0,
+        None,
+        InvariantState.VIOLATED,
+        1,
+        None,
+    )
