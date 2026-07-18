@@ -2234,3 +2234,17 @@ def test_candidate_decision_off_switch_recovery_requeues_blocked_work(
         reconciliation_runs.count(),
         len(sent),
     ) == (True, 1, 1, 1)
+
+
+@pytest.mark.django_db
+def test_candidate_configuration_fingerprint_tracks_primary_curation_policy() -> None:
+    scope = orch.orchestrator_scope('candidate-primary-fingerprint')
+    _candidate, work, _run = orch.subject_candidate(
+        scope,
+        suffix='candidate-primary-fingerprint',
+    )
+    before = execution_configuration_fingerprint(work)
+
+    orch.curation_policy(scope)
+
+    assert execution_configuration_fingerprint(work) != before

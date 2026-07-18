@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -125,8 +126,7 @@ def _unavailable_marker(
     }
 
 
-def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
-    task_type = _TASK_TYPE_BY_WORK.get(work.work_type, '')
+def _policy_role_section(work: WorkflowWork, task_type: str) -> dict[str, object]:
     try:
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
@@ -168,6 +168,10 @@ def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
     }
 
 
+def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
+    return _policy_role_section(work, _TASK_TYPE_BY_WORK.get(work.work_type, ''))
+
+
 def _settings_section(work: WorkflowWork) -> dict[str, object]:
     updated_at = (
         OrganizationSettings.objects.filter(organization_id=work.organization_id)
@@ -180,13 +184,41 @@ def _settings_section(work: WorkflowWork) -> dict[str, object]:
     return {'updated_at': updated_at}
 
 
+_CANDIDATE_DECISION_POLICY_ROLES = ('curation', 'embedding', 'generation')
+
+
 def _candidate_decision_enabled(work: WorkflowWork) -> bool:
     from engram.memory.curation import candidate_decision_enabled
 
     return candidate_decision_enabled(work)
 
 
+def _distillation_settings_section() -> dict[str, object]:
+    return {
+        'chunk_char_budget': os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET'),
+        'reduction_target': os.environ.get('ENGRAM_DISTILL_REDUCE_TARGET'),
+        'max_provider_calls_per_attempt': os.environ.get('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT'),
+    }
+
+
+def _candidate_decision_fingerprint_payload(work: WorkflowWork) -> dict[str, object]:
+    return {
+        'schema': 'execution_configuration/v1',
+        'work_type': work.work_type,
+        'organization_id': str(work.organization_id),
+        'project_id': str(work.project_id),
+        'team_id': str(work.team_id) if work.team_id else None,
+        'policy_roles': {role: _policy_role_section(work, role) for role in _CANDIDATE_DECISION_POLICY_ROLES},
+        'candidate_decision_enabled': _candidate_decision_enabled(work),
+        'organization_settings': _settings_section(work),
+        'execution_contract_version': 1,
+    }
+
+
 def execution_configuration_fingerprint(work: WorkflowWork) -> str:
+    if work.work_type == WorkflowWorkType.CANDIDATE_DECISION:
+        return hashlib.sha256(canonical_json_bytes(_candidate_decision_fingerprint_payload(work))).hexdigest()
+
     sections = _configuration_sections(work)
     payload = {
         'schema': 'execution_configuration/v1',
@@ -201,8 +233,8 @@ def execution_configuration_fingerprint(work: WorkflowWork) -> str:
         'organization_settings': _settings_section(work),
         'execution_contract_version': 1,
     }
-    if work.work_type == WorkflowWorkType.CANDIDATE_DECISION:
-        payload['candidate_decision_enabled'] = _candidate_decision_enabled(work)
+    if work.work_type == WorkflowWorkType.SESSION_DISTILLATION:
+        payload['distillation_settings'] = _distillation_settings_section()
 
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
