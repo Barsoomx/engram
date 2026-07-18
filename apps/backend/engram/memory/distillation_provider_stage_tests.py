@@ -1497,9 +1497,12 @@ def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> 
     }
 
     assert instructions
-    assert str(dps._MAX_MEMORIES) in instructions
+    assert 'at most 8 objects' in instructions
     assert str(dps._MAX_TITLE) in instructions
-    assert str(dps._MAX_BODY) in instructions
+    assert 'at most 2000 characters' in instructions
+    # Instructed caps are intentionally stricter than the parser caps (safe direction).
+    assert 8 <= dps._MAX_MEMORIES
+    assert 2000 <= dps._MAX_BODY
     for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
         assert kind in instructions
 
