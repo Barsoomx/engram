@@ -46,12 +46,6 @@ from engram.memory.workflow_work import (
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
 
-@pytest.fixture(autouse=True)
-def f_reset_candidate_builder() -> None:
-    yield
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
-
-
 def _scope(suffix: str) -> tuple[Organization, Team, Project, Agent, AgentSession]:
     organization = Organization.objects.create(name=f'Organization {suffix}', slug=f'organization-{suffix}')
     team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')

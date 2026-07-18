@@ -92,15 +92,6 @@ from engram.memory.workflow_work import (
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
 
-@pytest.fixture(autouse=True)
-def _reset_candidate_decision_work_builder() -> None:
-    from engram.memory import candidate_work_reconciler
-
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
-    yield
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
-
-
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
 EXPECTED_CASES = {
     'no_run_session',
