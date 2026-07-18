@@ -195,6 +195,99 @@ def test_provider_prompt_includes_facts_narrative_concepts() -> None:
     assert 'Concepts:' in prompt
 
 
+def test_provider_prompt_omits_empty_optional_fields() -> None:
+    observation = Observation(
+        title='T',
+        body='B',
+        facts=[],
+        narrative='',
+        concepts=[],
+        files_read=[],
+        files_modified=[],
+        source_metadata={},
+    )
+
+    prompt = provider_prompt(observation)
+
+    assert 'Facts:' not in prompt
+    assert 'Narrative:' not in prompt
+    assert 'Concepts:' not in prompt
+    assert 'Files read:' not in prompt
+    assert 'Files modified:' not in prompt
+    assert 'Source metadata' not in prompt
+
+
+def test_provider_prompt_declares_empty_memories_fallback() -> None:
+    observation = Observation(
+        title='T',
+        body='B',
+        facts=[],
+        narrative='',
+        concepts=[],
+        files_read=[],
+        files_modified=[],
+        source_metadata={},
+    )
+
+    assert '{"memories": []}' in provider_prompt(observation)
+
+
+def test_provider_prompt_renders_body_last() -> None:
+    observation = Observation(
+        title='T',
+        body='B',
+        facts=['fact one'],
+        narrative='narrative text',
+        concepts=['gotcha'],
+        files_read=['a/b.py'],
+        files_modified=['c/d.py'],
+        source_metadata={'event': 'x'},
+    )
+
+    prompt = provider_prompt(observation)
+    body_index = prompt.rindex('Body:')
+
+    for label in ('Title:', 'Facts:', 'Narrative:', 'Concepts:', 'Files read:', 'Files modified:', 'Source metadata'):
+        assert prompt.index(label) < body_index
+
+
+def test_realtime_provider_prompt_keeps_files_when_body_huge() -> None:
+    observation = Observation(
+        title='T',
+        body='x' * 20000,
+        facts=[],
+        narrative='',
+        concepts=[],
+        files_read=['apps/backend/engram/memory/services.py'],
+        files_modified=[],
+        source_metadata={'event': 'hook'},
+    )
+
+    prompt = realtime_provider_prompt(observation, 500)
+
+    assert 'Files read:' in prompt
+    assert 'Source metadata' in prompt
+    assert '[truncated' in prompt
+
+
+def test_provider_prompt_caps_source_metadata() -> None:
+    observation = Observation(
+        title='T',
+        body='B',
+        facts=[],
+        narrative='',
+        concepts=[],
+        files_read=[],
+        files_modified=[],
+        source_metadata={'blob': 'y' * 5000},
+    )
+
+    prompt = provider_prompt(observation)
+    metadata_segment = prompt.split('Source metadata', 1)[1].split('\nBody:', 1)[0]
+
+    assert '[truncated' in metadata_segment
+
+
 def test_distillation_system_prompt_declares_skip_protocol() -> None:
     assert 'SKIP' in distillation_system_prompt()
 

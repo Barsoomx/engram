@@ -651,19 +651,33 @@ def distillation_system_prompt() -> str:
     )
 
 
+_SOURCE_METADATA_CHAR_CAP = 2000
+
+
 def provider_prompt(observation: Observation) -> str:
-    return '\n'.join(
-        [
-            f'Title: {redact_text(observation.title)}',
-            f'Body: {redact_text(observation.body)}',
-            f'Facts: {redact_value(observation.facts)}',
-            f'Narrative: {redact_text(observation.narrative)}',
-            f'Concepts: {redact_value(observation.concepts)}',
-            f'Files read: {redact_value(observation.files_read)}',
-            f'Files modified: {redact_value(observation.files_modified)}',
-            f'Source metadata: {redact_value(observation.source_metadata)}',
-        ],
-    )
+    lines = [
+        'Single observation follows. If it carries no durable engineering signal, output {"memories": []}.',
+        f'Title: {redact_text(observation.title)}',
+    ]
+    if observation.facts:
+        lines.append(f'Facts: {redact_value(observation.facts)}')
+    if observation.narrative:
+        lines.append(f'Narrative: {redact_text(observation.narrative)}')
+    if observation.concepts:
+        lines.append(f'Concepts: {redact_value(observation.concepts)}')
+    if observation.files_read:
+        lines.append(f'Files read: {redact_value(observation.files_read)}')
+    if observation.files_modified:
+        lines.append(f'Files modified: {redact_value(observation.files_modified)}')
+    if observation.source_metadata:
+        metadata_dump = truncate_with_marker(
+            str(redact_value(observation.source_metadata)),
+            _SOURCE_METADATA_CHAR_CAP,
+        )
+        lines.append(f'Source metadata (event provenance, not durable signal): {metadata_dump}')
+    lines.append(f'Body: {redact_text(observation.body)}')
+
+    return '\n'.join(lines)
 
 
 def realtime_provider_prompt(observation: Observation, cap: int) -> str:
