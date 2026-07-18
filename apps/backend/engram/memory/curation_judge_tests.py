@@ -436,6 +436,18 @@ def test_open_conflict_opens_with_genuinely_unordered_evidence() -> None:
 
 
 @pytest.mark.django_db
+def test_parse_judge_verdict_strips_markdown_json_fence() -> None:
+    module, data, entry, candidate = _fixture()
+    payload = _payload(entry)
+    fenced = f'```json\n{json.dumps(payload)}\n```'
+
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(fenced, data)
+
+    assert verdict.outcome == 'publish_new'
+
+
+@pytest.mark.django_db
 def test_open_conflict_denied_when_comparison_incomplete() -> None:
     module, data, entry, candidate = _fixture()
     data = _conflict_data(

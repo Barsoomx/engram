@@ -13,7 +13,7 @@ from engram.core.models import (
     MemoryVersionSource,
 )
 from engram.core.redaction import SECRET_STRING_RE, redact_value
-from engram.memory.candidate_parsing import truncate_with_marker
+from engram.memory.candidate_parsing import strip_json_fence, truncate_with_marker
 from engram.memory.curation_shortlist import CurationShortlist, CurationShortlistEntry
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
 from engram.memory.distillation_provenance import ProvenanceContractError, canonical_source_manifest
@@ -468,7 +468,7 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
 
 def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:  # noqa: C901
     try:
-        payload = json.loads(raw)
+        payload = json.loads(strip_json_fence(raw))
     except (json.JSONDecodeError, TypeError, ValueError) as error:
         raise CurationJudgeError('judge_invalid_output') from error
 
