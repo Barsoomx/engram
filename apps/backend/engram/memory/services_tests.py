@@ -462,6 +462,12 @@ def test_realtime_generation_system_prompt_declares_memories_contract() -> None:
     assert '"memories"' in prompt
     assert '{"memories": []}' in prompt
     assert 'confidence' in prompt
+    assert 'single structured observation' in prompt
+    assert 'no markdown code fences' in prompt
+    assert 'digest' not in prompt.lower()
+    assert 'synthesis engine' not in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
 
 
 def test_realtime_provider_prompt_truncates_huge_body() -> None:
