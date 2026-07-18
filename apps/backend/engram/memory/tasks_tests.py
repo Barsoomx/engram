@@ -2190,3 +2190,47 @@ def test_late_settled_embedding_delivery_is_absorbed_before_subject_lookup(
     work.refresh_from_db()
     assert work.execution_state == WorkflowWorkExecutionState.SETTLED
     assert WorkflowRun.objects.filter(work=work).count() == run_count
+
+
+@pytest.mark.django_db
+def test_candidate_decision_off_switch_recovery_requeues_blocked_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
+
+    monkeypatch.setenv('ENGRAM_CANDIDATE_DECISION_ENABLED', 'off')
+    scope = orch.orchestrator_scope('env-off-recovery')
+    candidate, work, run = orch.subject_candidate(scope, suffix='env-off-recovery')
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    work.refresh_from_db()
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert work.disposition == WorkflowWorkDisposition.REQUIRED
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    blocked_fingerprint = work.blocked_configuration_fingerprint
+
+    monkeypatch.delenv('ENGRAM_CANDIDATE_DECISION_ENABLED')
+    enabled_fingerprint = execution_configuration_fingerprint(work)
+    sent: list[tuple[str, tuple[object, ...]]] = []
+    monkeypatch.setattr(
+        'engram.memory.work_dispatch.app.send_task',
+        lambda task_name, *, args, **_kwargs: sent.append((task_name, tuple(args))),
+    )
+
+    result = ReconcileCandidateDecisionWork().execute(as_of=timezone.now())
+    reconciliation_runs = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+
+    assert (
+        enabled_fingerprint != blocked_fingerprint,
+        result.queued,
+        reconciliation_runs.count(),
+        len(sent),
+    ) == (True, 1, 1, 1)

@@ -180,6 +180,12 @@ def _settings_section(work: WorkflowWork) -> dict[str, object]:
     return {'updated_at': updated_at}
 
 
+def _candidate_decision_enabled(work: WorkflowWork) -> bool:
+    from engram.memory.curation import candidate_decision_enabled
+
+    return candidate_decision_enabled(work)
+
+
 def execution_configuration_fingerprint(work: WorkflowWork) -> str:
     sections = _configuration_sections(work)
     payload = {
@@ -195,6 +201,8 @@ def execution_configuration_fingerprint(work: WorkflowWork) -> str:
         'organization_settings': _settings_section(work),
         'execution_contract_version': 1,
     }
+    if work.work_type == WorkflowWorkType.CANDIDATE_DECISION:
+        payload['candidate_decision_enabled'] = _candidate_decision_enabled(work)
 
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 

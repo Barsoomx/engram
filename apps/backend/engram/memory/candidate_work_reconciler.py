@@ -31,6 +31,7 @@ from engram.memory.candidate_decision_work import (
 )
 from engram.memory.session_work_reconciler import SessionWorkFinding
 from engram.memory.work_dispatch import queue_work_attempt
+from engram.memory.work_execution import execution_configuration_fingerprint
 
 CandidateDecisionWorkInput = _CandidateDecisionWorkInput
 
@@ -303,9 +304,32 @@ def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
         if not sources:
             return False
         work, _created = ensure_candidate_decision_work_locked(locked, sources=sources)
-        if work.disposition != WorkflowWorkDisposition.REQUIRED or not _requeue_eligible(work, as_of):
+        if work.disposition != WorkflowWorkDisposition.REQUIRED:
+            return False
+        if work.execution_state == WorkflowWorkExecutionState.BLOCKED:
+            if execution_configuration_fingerprint(work) == work.blocked_configuration_fingerprint:
+                return False
+
+            _clear_candidate_block(work)
+        elif not _requeue_eligible(work, as_of):
             return False
         if _blocking_attempt_exists(work, as_of):
             return False
         run = queue_work_attempt(work_id=work.id, now=as_of, origin=WorkflowRunOrigin.RECONCILIATION)
         return run.dispatched_at == as_of
+
+
+def _clear_candidate_block(work: WorkflowWork) -> None:
+    work.execution_state = WorkflowWorkExecutionState.READY
+    work.blocked_configuration_fingerprint = ''
+    work.failure_streak = 0
+    work.save(
+        update_fields=[
+            'execution_state',
+            'blocked_configuration_fingerprint',
+            'failure_streak',
+            'updated_at',
+        ]
+    )
+
+    return

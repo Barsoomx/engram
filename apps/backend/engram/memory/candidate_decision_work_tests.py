@@ -35,7 +35,7 @@ from engram.memory.candidate_decision_work import (
     ensure_candidate_decision_work_locked,
     get_candidate_decision_work_builder,
 )
-from engram.memory.work_execution import claim_work, fail_work_claim
+from engram.memory.work_execution import claim_work, execution_configuration_fingerprint, fail_work_claim
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -515,13 +515,15 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     candidate = _candidate(scope, '1')
     _mark_cp3_candidate(scope, candidate)
     now = timezone.now()
+    prepared, _created = ensure_candidate_decision_work(candidate.id)
+    blocked_fingerprint = execution_configuration_fingerprint(prepared)
     work = _fail_candidate_decision_work(
         candidate,
         now=now,
         failure=ClassifiedWorkFailure(
             failure_class=CONFIGURATION,
             code='model_policy_unavailable',
-            configuration_fingerprint='a' * 64,
+            configuration_fingerprint=blocked_fingerprint,
         ),
     )
     assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
