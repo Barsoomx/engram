@@ -2428,9 +2428,9 @@ def test_existing_open_conflict_pair_settles_idempotently_across_generations(mon
     assert open_pairs.count() == 1
     generation.refresh_from_db()
     assert generation.disposition == WorkflowWorkDisposition.COMPLETE
-    assert generation.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert generation.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
     decisions = orch.curation_decisions_for(candidate)
-    assert len(decisions) == 2
+    assert len(decisions) == 1
     assert {decision.outcome for decision in decisions} == {CurationOutcome.OPEN_CONFLICT}
 
 
@@ -2888,3 +2888,218 @@ def test_concurrent_targetless_publications_serialize_and_relist_loser(
     assert len(errors) == 1
     assert isinstance(errors[0], MemoryTransitionError)
     assert errors[0].code == 'stale_decision'
+
+
+def _append_late_candidate_source(
+    candidate: MemoryCandidate,
+    scope: orch.OrchestratorScope,
+    *,
+    suffix: str,
+) -> MemoryCandidateSource:
+    _donor, source, _session = provenanced_candidate_in_scope(
+        scope.organization,
+        scope.project,
+        scope.team,
+        suffix=f'late-source-{suffix}',
+        title=f'Late source donor {suffix}',
+        body=_LONG_BODY,
+    )
+
+    return MemoryCandidateSource.objects.create(
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        candidate=candidate,
+        window=source.window,
+        observation=source.observation,
+        stage=source.stage,
+        anchors=source.anchors,
+        anchors_hash=source.anchors_hash,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_on_rejected_candidate_does_not_create_another_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-rejected')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, first_work, first_run = orch.subject_candidate(scope, suffix='late-rejected')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='none')
+    judge = orch.stub_judge_result(_reject_verdict(), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.REJECTED
+    assert len(orch.curation_decisions_for(candidate)) == 1
+
+    _append_late_candidate_source(candidate, scope, suffix='late-rejected')
+    late_work, late_run = orch.next_generation_work(candidate)
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    candidate.refresh_from_db()
+    late_work.refresh_from_db()
+    assert (
+        candidate.status,
+        len(orch.curation_decisions_for(candidate)),
+        late_work.resolution_reason,
+    ) == (
+        CandidateStatus.REJECTED,
+        1,
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_cannot_reject_candidate_with_open_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-conflict-reject')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='late-conflict-reject',
+        title='Primary region',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='late-conflict-reject',
+        title='Primary region',
+        body='The primary region is now the eastern zone.',
+    )
+    first_shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    first_evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    first_verdict = orch.stub_verdict('open_conflict', target=target_version)
+    first_judge = orch.stub_judge_result(first_verdict, call, policy, first_shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=first_shortlist,
+        evidence=first_evidence,
+        judge_result=first_judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.resolved_transition_id is None
+
+    _append_late_candidate_source(candidate, scope, suffix='late-conflict-reject')
+    late_work, late_run = orch.next_generation_work(candidate)
+    late_shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    late_evidence = orch.stub_evidence(candidate_tier='none')
+    late_judge = orch.stub_judge_result(_reject_verdict(), call, policy, late_shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=late_shortlist,
+        evidence=late_evidence,
+        judge_result=late_judge,
+    )
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    candidate.refresh_from_db()
+    conflict.refresh_from_db()
+    late_work.refresh_from_db()
+    assert (
+        candidate.status,
+        conflict.resolved_transition_id,
+        len(orch.curation_decisions_for(candidate)),
+        late_work.resolution_reason,
+    ) == (
+        CandidateStatus.PROPOSED,
+        None,
+        1,
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_does_not_record_transitionless_repeat_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-repeat-conflict')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='late-repeat-conflict',
+        title='Retention policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='late-repeat-conflict',
+        title='Retention policy',
+        body='Logs are now retained for thirty days.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.opened_transition_id is not None
+
+    _append_late_candidate_source(candidate, scope, suffix='late-repeat-conflict')
+    late_work, late_run = orch.next_generation_work(candidate)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    late_work.refresh_from_db()
+    decisions = orch.curation_decisions_for(candidate)
+    assert (
+        len(decisions),
+        [decision.transition_id is None for decision in decisions],
+        late_work.resolution_reason,
+    ) == (
+        1,
+        [False],
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )

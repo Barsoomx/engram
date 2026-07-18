@@ -1071,6 +1071,11 @@ class DecideMemoryCandidate:
 
             return
 
+        if self._candidate_is_terminally_settled(candidate):
+            self._settle_superseded_generation(claim)
+
+            return
+
         gate = EvaluateDeterministicCandidateGates().execute(work.id)
         if gate.disposition == DeterministicGateDisposition.RETRY:
             raise _operational(gate.operational_reason or 'stale_decision', 'deterministic gate requires retry')
@@ -1099,6 +1104,12 @@ class DecideMemoryCandidate:
             )
         except MemoryCandidate.DoesNotExist as error:
             raise MemoryWorkerError('candidate is outside workflow work scope', code='work_scope_invalid') from error
+
+    def _candidate_is_terminally_settled(self, candidate: MemoryCandidate) -> bool:
+        if candidate.status != CandidateStatus.PROPOSED or candidate.promoted_memory_id is not None:
+            return True
+
+        return MemoryConflict.objects.filter(candidate_id=candidate.id, resolved_transition__isnull=True).exists()
 
     def _is_superseded_generation(self, work: WorkflowWork, candidate: MemoryCandidate) -> bool:
         try:
