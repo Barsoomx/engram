@@ -411,9 +411,7 @@ def conflict_detail_payload(
     payload['conflicts'] = [
         {
             'id': str(conflict.id),
-            'opened_transition_id': (
-                str(conflict.opened_transition_id) if conflict.opened_transition_id else None
-            ),
+            'opened_transition_id': (str(conflict.opened_transition_id) if conflict.opened_transition_id else None),
             'decision_id': (
                 str(decisions_by_conflict[conflict.id].id) if conflict.id in decisions_by_conflict else None
             ),

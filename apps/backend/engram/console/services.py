@@ -1209,11 +1209,7 @@ def resolve_candidate_conflicts(
     merged_body: str | None = None,
     expected_etag: str | None = None,
 ) -> dict[str, Any]:
-    candidate = (
-        MemoryCandidate.objects.select_for_update()
-        .filter(organization=organization, id=candidate.id)
-        .first()
-    )
+    candidate = MemoryCandidate.objects.select_for_update().filter(organization=organization, id=candidate.id).first()
 
     if candidate is None:
         raise MemoryReviewError('not_found', 'conflict not found', status=404)

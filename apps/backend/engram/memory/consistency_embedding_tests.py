@@ -324,9 +324,7 @@ def test_embedding_rebuild_resignals_settled_same_hash_work_after_projection_los
     )
     document.refresh_from_db()
 
-    report = MemoryConsistencyReporter().execute(
-        _report_input(document.organization_id, document.project_id)
-    )
+    report = MemoryConsistencyReporter().execute(_report_input(document.organization_id, document.project_id))
     issue = next(issue for issue in report.issues if issue.memory_id == document.memory_id)
     assert issue.code == 'embedding_projection_missing'
     assert issue.classification == 'enqueue_embedding'

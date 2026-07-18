@@ -500,12 +500,9 @@ def test_conflict_detail_exposes_decision_and_bounded_evidence_context(
     memory = memories[0]
     conflict = conflicts[0]
     candidate_source = candidate.sources.select_related('observation').get()
-    version_source = (
-        conflict.memory_version.provenance_sources.select_related(
-            'candidate_source__observation',
-        )
-        .get()
-    )
+    version_source = conflict.memory_version.provenance_sources.select_related(
+        'candidate_source__observation',
+    ).get()
     assert version_source.candidate_source_id is not None
 
     manifest_entries, manifest_hash = evidence_manifest(candidate)
@@ -645,9 +642,7 @@ def test_conflict_detail_exposes_decision_and_bounded_evidence_context(
             else:
                 assert actual_value == expected_value
 
-    conflict_payload = next(
-        item for item in body['conflicts'] if str(item['id']) == str(conflict.id)
-    )
+    conflict_payload = next(item for item in body['conflicts'] if str(item['id']) == str(conflict.id))
     assert_semantic_subset(
         conflict_payload,
         {
@@ -698,9 +693,7 @@ def test_conflict_detail_exposes_decision_and_bounded_evidence_context(
         },
     )
     applicability_target = next(
-        item
-        for item in body['effective_applicability']['targets']
-        if str(item['memory_id']) == str(memory.id)
+        item for item in body['effective_applicability']['targets'] if str(item['memory_id']) == str(memory.id)
     )
     assert_semantic_subset(
         applicability_target,
@@ -727,9 +720,7 @@ def test_conflict_detail_exposes_decision_and_bounded_evidence_context(
     assert candidate_evidence[0]['summary']
 
     existing_claim = next(
-        item
-        for item in body['existing_claims']
-        if str(item['version_id']) == str(conflict.memory_version_id)
+        item for item in body['existing_claims'] if str(item['version_id']) == str(conflict.memory_version_id)
     )
     target_evidence = existing_claim['evidence']
     assert [str(item['reference_id']) for item in target_evidence] == [
@@ -1171,10 +1162,7 @@ def test_conflict_list_cursor_reaches_candidate_after_first_fifty(
     second = client.get(first.data['next'])
 
     assert second.status_code == 200
-    returned_ids = {
-        str(item['id'])
-        for item in [*first.data['results'], *second.data['results']]
-    }
+    returned_ids = {str(item['id']) for item in [*first.data['results'], *second.data['results']]}
     assert returned_ids == candidate_ids
 
 
@@ -1223,10 +1211,7 @@ def test_conflict_search_matches_compared_claim_body(
     response = client.get('/v1/admin/memory-review/', {'search': token})
 
     assert response.status_code == 200
-    assert str(candidate.id) in {
-        str(item['id'])
-        for item in _list_items(response.data)
-    }
+    assert str(candidate.id) in {str(item['id']) for item in _list_items(response.data)}
 
 
 def test_conflict_resolve_rejects_title_above_memory_column_limit() -> None:
@@ -1272,11 +1257,7 @@ def test_conflict_detail_body_matches_its_pinned_version_id(
     response = client.get(f'/v1/admin/memory-review/{candidate.id}/')
 
     assert response.status_code == 200
-    claim = next(
-        item
-        for item in response.data['existing_claims']
-        if str(item['memory_id']) == str(memory.id)
-    )
+    claim = next(item for item in response.data['existing_claims'] if str(item['memory_id']) == str(memory.id))
     assert str(claim['version_id']) == str(pinned_version.id)
     assert claim['body'] == pinned_version.body
     assert claim['body_hash'] == hashlib.sha256(pinned_version.body.encode()).hexdigest()
@@ -1294,10 +1275,7 @@ def _resolve_conflicts_during_read(
             request=transition_request_for(candidate, key=key),
             candidate_fence=candidate_fence_for(candidate),
             conflict_ids=tuple(conflict.id for conflict in conflicts),
-            conflict_memory_fences=tuple(
-                build_memory_fence(memory)
-                for memory in memories
-            ),
+            conflict_memory_fences=tuple(build_memory_fence(memory) for memory in memories),
             resolution='reject_candidate',
         ),
     )
@@ -1345,10 +1323,7 @@ def test_conflict_list_skips_candidate_resolved_between_read_queries(
     response = client.get('/v1/admin/memory-review/')
 
     assert response.status_code == 200
-    assert str(candidate.id) not in {
-        str(item['id'])
-        for item in _list_items(response.data)
-    }
+    assert str(candidate.id) not in {str(item['id']) for item in _list_items(response.data)}
 
 
 @pytest.mark.django_db

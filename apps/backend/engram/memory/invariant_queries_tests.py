@@ -91,7 +91,6 @@ from engram.memory.workflow_work import (
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
-
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'autonomous_memory_loop_baseline.json'
 EXPECTED_CASES = {
     'no_run_session',

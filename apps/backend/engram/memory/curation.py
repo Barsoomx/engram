@@ -23,7 +23,6 @@ from engram.core.models import (
     EvidenceTier,
     Memory,
     MemoryCandidate,
-    MemoryCandidateSource,
     MemoryConflict,
     MemoryVersion,
     MemoryVersionSource,
@@ -1592,9 +1591,7 @@ class DecideMemoryCandidate:
         if target_version_id is None:
             raise _operational('stale_decision', 'deterministic merge requires a target version')
         try:
-            version = (
-                MemoryVersion.objects.select_for_update().select_related('memory').get(id=target_version_id)
-            )
+            version = MemoryVersion.objects.select_for_update().select_related('memory').get(id=target_version_id)
         except MemoryVersion.DoesNotExist as error:
             raise _operational('stale_decision', 'deterministic merge target no longer exists') from error
         memory = version.memory

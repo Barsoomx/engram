@@ -1127,11 +1127,7 @@ def test_legacy_reconciler_does_not_queue_terminal_or_unchanged_blocked_work(
         now=failed_at,
         failure=ClassifiedWorkFailure(
             failure_class=failure_class,
-            code=(
-                'model_policy_unavailable'
-                if failure_class == 'configuration'
-                else 'work_contract_invalid'
-            ),
+            code=('model_policy_unavailable' if failure_class == 'configuration' else 'work_contract_invalid'),
             **failure_kwargs,
         ),
     )

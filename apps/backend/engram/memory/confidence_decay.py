@@ -74,10 +74,7 @@ class DecayMemoryConfidence:
                 confidence__isnull=False,
                 confidence__gt=floor,
             )
-            .filter(
-                Q(confidence_decayed_at__lt=cutoff)
-                | Q(confidence_decayed_at__isnull=True, updated_at__lt=cutoff)
-            )
+            .filter(Q(confidence_decayed_at__lt=cutoff) | Q(confidence_decayed_at__isnull=True, updated_at__lt=cutoff))
             .exclude(kind='digest')
         )
 

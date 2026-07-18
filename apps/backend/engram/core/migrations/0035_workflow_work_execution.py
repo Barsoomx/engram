@@ -45,9 +45,7 @@ def guard_reverse_execution_history(apps: Apps, schema_editor: BaseDatabaseSchem
     run_model = apps.get_model('core', 'WorkflowRun')
     v1_run = run_model.objects.using(alias).filter(execution_contract_version=1).order_by('id').first()
     if v1_run is not None:
-        raise RuntimeError(
-            f'cannot reverse 0035 while v1 workflow run {v1_run.id} execution history exists'
-        )
+        raise RuntimeError(f'cannot reverse 0035 while v1 workflow run {v1_run.id} execution history exists')
 
     work_model = apps.get_model('core', 'WorkflowWork')
     offending_work = (
@@ -66,9 +64,7 @@ def guard_reverse_execution_history(apps: Apps, schema_editor: BaseDatabaseSchem
         .first()
     )
     if offending_work is not None:
-        raise RuntimeError(
-            f'cannot reverse 0035 while v1 workflow work {offending_work.id} execution state exists'
-        )
+        raise RuntimeError(f'cannot reverse 0035 while v1 workflow work {offending_work.id} execution state exists')
 
     return
 

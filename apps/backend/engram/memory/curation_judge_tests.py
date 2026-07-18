@@ -9,7 +9,6 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
-
 from django.utils import timezone
 
 from engram.core.models import (

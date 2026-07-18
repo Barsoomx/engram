@@ -40,6 +40,7 @@ _DEFAULT_FAILURE_STREAK_LIMIT = 12
 def _failure_streak_limit() -> int:
     return int(os.getenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', str(_DEFAULT_FAILURE_STREAK_LIMIT)))
 
+
 _TASK_TYPE_BY_WORK = {
     WorkflowWorkType.OBSERVATION_PROCESSING: 'generation',
     WorkflowWorkType.SESSION_DISTILLATION: 'generation',
@@ -540,9 +541,7 @@ def claim_work(
         is_automatic = workflow_run_id is None
 
         supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
-        absorb_terminal = is_automatic or (
-            supplied_run is not None and supplied_run.origin != WorkflowRunOrigin.MANUAL
-        )
+        absorb_terminal = is_automatic or (supplied_run is not None and supplied_run.origin != WorkflowRunOrigin.MANUAL)
 
         short_circuit = _short_circuit_state(work, now=now, absorb_terminal=absorb_terminal)
         if short_circuit is not None:
