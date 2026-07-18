@@ -1156,7 +1156,20 @@ def resolve_candidate_conflicts(
     target_memory_id: uuid.UUID | None = None,
     merged_title: str | None = None,
     merged_body: str | None = None,
+    expected_etag: str | None = None,
 ) -> dict[str, Any]:
+    candidate = (
+        MemoryCandidate.objects.select_for_update()
+        .filter(organization=organization, id=candidate.id)
+        .first()
+    )
+
+    if candidate is None:
+        raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
+    if expected_etag is not None and expected_etag != conflict_set_etag(candidate):
+        raise MemoryReviewError('stale_conflict_set', 'conflict set has changed', status=412)
+
     open_conflicts = list(
         MemoryConflict.objects.filter(
             candidate=candidate,

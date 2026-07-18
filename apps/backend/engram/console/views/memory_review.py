@@ -140,6 +140,7 @@ class MemoryReviewViewSet(
             target_memory_id=data.get('target_memory_id'),
             merged_title=data.get('merged_title'),
             merged_body=data.get('merged_body'),
+            expected_etag=if_match,
         )
 
         return Response(payload, status=HTTP_200_OK)

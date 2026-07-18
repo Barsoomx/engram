@@ -502,6 +502,95 @@ def test_conflict_resolution_requires_current_etag(
         assert conflict.resolved_transition_id is None
 
 
+@pytest.mark.django_db(transaction=True)
+def test_conflict_resolution_rechecks_if_match_after_candidate_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    f_admin_token: str,
+    f_admin_org: Organization,
+    f_project: Project,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from django.db import close_old_connections
+
+    from engram.console.views import memory_review as memory_review_view
+
+    candidate, _memories, reviewed_conflicts = _open_conflicts_for_candidate(
+        f_admin_org,
+        f_project,
+        suffix='etag-toctou',
+    )
+    late_memory_candidate = _make_candidate(
+        f_admin_org,
+        f_project,
+        typed=True,
+        candidate_title='Late compared claim',
+        candidate_body='This compared claim was not present in the reviewed conflict set.',
+    )
+    late_memory = PromoteMemoryCandidate().execute(transition_request(late_memory_candidate)).memory
+
+    client = _auth_client(f_admin_token, f_admin_org)
+    detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+    assert detail.status_code == 200
+    reviewed_etag = detail.get('ETag')
+    assert reviewed_etag
+
+    after_precondition = Event()
+    continue_resolution = Event()
+    original_resolve = memory_review_view.resolve_candidate_conflicts
+
+    def pause_before_transaction(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        after_precondition.set()
+        assert continue_resolution.wait(timeout=10)
+        return original_resolve(*args, **kwargs)
+
+    monkeypatch.setattr(memory_review_view, 'resolve_candidate_conflicts', pause_before_transaction)
+
+    def post_resolution() -> Any:
+        close_old_connections()
+        try:
+            request_client = _auth_client(f_admin_token, f_admin_org)
+            return request_client.post(
+                f'/v1/admin/memory-review/{candidate.id}/resolve/',
+                {'action': 'reject_candidate', 'reason': 'resolve only the reviewed conflict set'},
+                format='json',
+                HTTP_IF_MATCH=reviewed_etag,
+            )
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        response_future = executor.submit(post_resolution)
+        assert after_precondition.wait(timeout=10)
+
+        try:
+            late_conflict = OpenMemoryConflict().execute(
+                OpenMemoryConflictInput(
+                    request=transition_request_for(
+                        candidate,
+                        key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:late:v1',
+                    ),
+                    candidate_fence=candidate_fence_for(candidate),
+                    memory_fence=build_memory_fence(late_memory),
+                    evidence_hash='f' * 64,
+                    redacted_reason='conflict opened after If-Match validation',
+                )
+            )
+            changed_detail = client.get(f'/v1/admin/memory-review/{candidate.id}/')
+            assert changed_detail.status_code == 200
+            assert changed_detail.get('ETag') != reviewed_etag
+        finally:
+            continue_resolution.set()
+
+        response = response_future.result(timeout=10)
+
+    assert response.status_code == 412
+    for conflict in [*reviewed_conflicts, late_conflict]:
+        conflict.refresh_from_db()
+        assert conflict.resolved_transition_id is None
+
+
 @pytest.mark.django_db
 def test_conflict_resolution_closes_complete_candidate_set_in_one_cp4_transition(
     f_admin_token: str,
