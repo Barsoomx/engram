@@ -1040,6 +1040,9 @@ def test_digest_system_prompt_contains_instructions() -> None:
     assert 'Body' in prompt
     assert 'de-duplicate' in prompt
     assert 'invent' in prompt
+    assert 'synthesis engine' in prompt
+    assert '200' in prompt
+    assert 'verbatim' in prompt
 
 
 def test_digest_system_prompt_is_runtime_neutral() -> None:
