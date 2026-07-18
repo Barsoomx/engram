@@ -1512,3 +1512,19 @@ def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> 
     assert parsed.memories[0].supporting_observation_ids == (supported,)
     assert parsed.memories[0].confidence == Decimal('0.9')
     assert parsed.no_signal_observation_ids == (no_signal,)
+
+
+def test_extract_system_prompt_states_contract_marker_and_parser_rules() -> None:
+    prompt = dps._EXTRACT_SYSTEM_PROMPT
+
+    assert 'distill_extract.v1' in prompt
+    assert 'at most 8 objects' in prompt
+    assert 'at most 255 characters' in prompt
+    assert 'at most 2000 characters' in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
+    assert 'no id may appear in both' in prompt
+    assert 'copied verbatim' in prompt
+    # Instructed caps are intentionally stricter than the parser caps (safe direction).
+    assert 8 <= dps._MAX_MEMORIES
+    assert 2000 <= dps._MAX_BODY

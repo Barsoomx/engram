@@ -9,6 +9,7 @@ from django.utils import timezone
 from engram.core.models import DistillationStage, DistillationWindow
 from engram.memory.distillation_provider_stage import ProviderStageOutputError
 from engram.memory.distillation_reduction import (
+    _REDUCE_SYSTEM_PROMPT,
     MAX_BODY,
     MAX_TITLE,
     REDUCTION_MANIFEST_SCHEMA,
@@ -493,6 +494,21 @@ def test_reduce_schema_instructions_describe_a_payload_the_parser_accepts() -> N
     assert parsed.memories[0].kind == 'decision'
     assert parsed.memories[0].source_ids == tuple(draft.draft_id for draft in inputs)
     assert parsed.memories[0].confidence == Decimal('0.9')
+
+
+def test_reduce_system_prompt_states_contract_marker_and_parser_rules() -> None:
+    prompt = _REDUCE_SYSTEM_PROMPT
+
+    assert 'distill_reduce.v1' in prompt
+    assert 'distill_extract.v1' not in prompt
+    assert str(MAX_TITLE) in prompt
+    assert str(MAX_BODY) in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
+    assert 'reduction_target' in prompt
+    assert 'strictly fewer' in prompt
+    assert 'copied verbatim' in prompt
+    assert 'no additional properties' in prompt
 
 
 @pytest.mark.django_db
