@@ -31,6 +31,7 @@ from engram.memory.services import (
     render_weekly_digest_body,
     weekly_digest_content_hash,
 )
+from engram.memory.source_eligibility import exclude_unresolved_conflicts, has_unresolved_conflict
 from engram.memory.tasks import _verify_work_fingerprint, dispatch_work_task
 from engram.memory.work_execution import (
     WorkClaim,
@@ -154,18 +155,19 @@ def freeze_daily_digest_input(
     start = _to_utc(window_start, 'window_start')
     end = _to_utc(window_end, 'window_end')
 
-    memories = list(
-        _admitted(
-            Memory.objects.filter(
-                organization_id=organization_id,
-                project_id=project_id,
-                status=MemoryStatus.APPROVED,
-                updated_at__gte=start,
-                updated_at__lt=end,
-            ),
-            None,
-        ).order_by('-updated_at', 'id')
+    eligible = exclude_unresolved_conflicts(
+        Memory.objects.filter(
+            organization_id=organization_id,
+            project_id=project_id,
+            status=MemoryStatus.APPROVED,
+            stale=False,
+            refuted=False,
+            updated_at__gte=start,
+            updated_at__lt=end,
+        ),
+        outer_memory_field='id',
     )
+    memories = list(_admitted(eligible, None).order_by('-updated_at', 'id'))
     eligible_count = len(memories)
     cap = max(0, max_sources)
     selected = memories[:cap]
@@ -536,6 +538,11 @@ def _validate_frozen_source(
         )
     if not allowed:
         raise MemoryWorkerError('digest source is outside the frozen visibility scope', code='work_scope_invalid')
+    if work.work_type == WorkflowWorkType.DAILY_DIGEST:
+        if memory.status != MemoryStatus.APPROVED or memory.stale or memory.refuted:
+            raise MemoryWorkerError('digest source is no longer active', code='work_scope_invalid')
+        if has_unresolved_conflict(memory.id):
+            raise MemoryWorkerError('digest source has an unresolved conflict', code='work_scope_invalid')
 
 
 def _visibility_block_matches(block: object, expected: dict[str, object]) -> bool:
