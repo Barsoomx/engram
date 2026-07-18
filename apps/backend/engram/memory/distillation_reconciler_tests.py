@@ -932,3 +932,53 @@ def test_poisoned_cleanup_does_not_overwrite_concurrent_legacy_success(
     assert result.retried == ()
     assert fresh_v1_runs(work) == []
     assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 0
+
+
+@pytest.mark.django_db
+def test_legacy_reconciler_reclaims_expired_lease_stuck_running_work(
+    f_org: Organization,
+    f_team: Team,
+    f_project: Project,
+    f_agent: Agent,
+) -> None:
+    from engram.memory.work_dispatch import queue_work_attempt
+    from engram.memory.work_execution import claim_work
+
+    session = create_session(f_org, f_team, f_project, f_agent)
+    assert session.end_work_contract_version == 0
+    work = create_required_session_work(session)
+    now = timezone.now()
+    claimed_at = now - timedelta(hours=2)
+    queued = queue_work_attempt(
+        work_id=work.id,
+        now=claimed_at,
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='stuck-worker',
+        now=claimed_at,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=queued.id,
+    )
+    assert claimed.claim is not None
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.LEASED
+    assert work.lease_expires_at is not None
+    assert work.lease_expires_at < now
+    CeleryOutbox.objects.all().delete()
+
+    result = RetryFailedDistillations().execute()
+
+    assert len(result.retried) == 1
+    assert result.retried[0].work_id == work.id
+    assert (
+        WorkflowRun.objects.filter(
+            work=work,
+            status=WorkflowRunStatus.QUEUED,
+            execution_contract_version=1,
+        ).count()
+        == 1
+    )
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_WORK_TASK_NAME).count() == 1

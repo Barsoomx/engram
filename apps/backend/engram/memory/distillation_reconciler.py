@@ -18,6 +18,7 @@ from engram.core.models import (
     WorkflowRunType,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory.work_dispatch import queue_work_attempt
@@ -110,7 +111,9 @@ class RetryFailedDistillations:
         resignaled: list[ResignaledWork] = []
         for work in required_works:
             evaluation = self._evaluate(
+                work,
                 runs_by_work.get(work.id, []),
+                now,
                 cutoff,
                 max_attempts,
                 transient_max_attempts,
@@ -231,7 +234,7 @@ class RetryFailedDistillations:
                     run_type=WorkflowRunType.SESSION_DISTILLATION,
                 ).order_by('created_at', 'id'),
             )
-            evaluation = self._evaluate(runs, cutoff, max_attempts, transient_max_attempts)
+            evaluation = self._evaluate(work, runs, now, cutoff, max_attempts, transient_max_attempts)
             if not evaluation.retriable:
                 return None
 
@@ -271,7 +274,7 @@ class RetryFailedDistillations:
                     run_type=WorkflowRunType.SESSION_DISTILLATION,
                 ).order_by('created_at', 'id'),
             )
-            evaluation = self._evaluate(runs, cutoff, max_attempts, transient_max_attempts)
+            evaluation = self._evaluate(work, runs, now, cutoff, max_attempts, transient_max_attempts)
             if not evaluation.resignal_queued:
                 return None
 
@@ -287,7 +290,9 @@ class RetryFailedDistillations:
 
     def _evaluate(
         self,
+        work: WorkflowWork,
         work_runs: list[WorkflowRun],
+        now: datetime,
         cutoff: object,
         max_attempts: int,
         transient_max_attempts: int,
@@ -325,6 +330,15 @@ class RetryFailedDistillations:
                 transient_count=transient_count,
             )
 
+        if self._lease_expired(work, now):
+            return _WorkEvaluation(
+                retriable=True,
+                abandoned=False,
+                resignal_queued=False,
+                failed_count=failed_count,
+                transient_count=transient_count,
+            )
+
         latest_run = attempts[-1]
         if latest_run.status != WorkflowRunStatus.FAILED:
             resignal_queued = (
@@ -354,6 +368,13 @@ class RetryFailedDistillations:
             resignal_queued=False,
             failed_count=failed_count,
             transient_count=transient_count,
+        )
+
+    def _lease_expired(self, work: WorkflowWork, now: datetime) -> bool:
+        return (
+            work.execution_state == WorkflowWorkExecutionState.LEASED
+            and work.lease_expires_at is not None
+            and work.lease_expires_at < now
         )
 
     def _is_poisoned_cleanup(self, run: WorkflowRun) -> bool:

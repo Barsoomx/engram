@@ -879,6 +879,20 @@ def reconcile_candidate_decision_work() -> dict[str, int]:
     return {'scanned': result.scanned, 'queued': result.queued}
 
 
+@app.task(name='engram.memory.recover_stranded_work')
+def recover_stranded_work() -> dict[str, int]:
+    from engram.memory.work_recovery_reconciler import RecoverStrandedWork
+
+    result = RecoverStrandedWork().execute(as_of=timezone.now())
+    logger.info(
+        'recover_stranded_work_completed',
+        scanned=result.scanned,
+        queued=result.queued,
+    )
+
+    return {'scanned': result.scanned, 'queued': result.queued}
+
+
 @app.task(name='engram.memory.expire_stale_candidates')
 def expire_stale_candidates() -> dict[str, int]:
     result = ExpireStaleCandidates().execute()

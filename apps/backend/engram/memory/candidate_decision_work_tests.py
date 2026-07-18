@@ -537,3 +537,46 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
     assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.BLOCKED
     assert sent == []
+
+
+@pytest.mark.django_db
+def test_reconcile_expired_candidate_lease_queues_recovery_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('expired-lease')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, created = ensure_candidate_decision_work(candidate.id)
+    assert created is True
+
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_owner=f'host:worker:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(seconds=1),
+    )
+    assert claimed.outcome == 'claimed'
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(seconds=2),
+    )
+
+    assert result.queued == 1
+    queued = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert sent == [
+        (
+            'engram.memory.process_candidate_decision_work_v1',
+            (str(work.id), str(queued.get().id)),
+        )
+    ]
