@@ -16,6 +16,7 @@ from engram.core.models import (
     DistillationWindow,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     Observation,
     Organization,
     Project,
@@ -33,8 +34,10 @@ from engram.memory.candidate_decision_work import (
     build_candidate_decision_input,
     ensure_candidate_decision_work,
     ensure_candidate_decision_work_locked,
+    evidence_manifest,
     get_candidate_decision_work_builder,
 )
+from engram.memory.import_provenance import agent_proposal_evidence_manifest
 from engram.memory.work_execution import claim_work, fail_work_claim
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
@@ -537,3 +540,94 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
     assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.BLOCKED
     assert sent == []
+
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _agent_candidate_and_source(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    scope = _scope(suffix)
+    organization, team, project, _agent, _session = scope
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_agent_only_matches_agent_manifest() -> None:
+    candidate, source = _agent_candidate_and_source('agentmanifest')
+
+    entries, digest = evidence_manifest(candidate, sources=[source])
+    agent_entries, agent_digest = agent_proposal_evidence_manifest(candidate, sources=[source])
+
+    assert digest == agent_digest
+    assert entries == agent_entries
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_still_accepts_mapping_sources() -> None:
+    scope = _scope('mappingsrc')
+    organization, team, project, _agent, _session = scope
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Mapping candidate',
+        body='Mapping body',
+        content_hash=hashlib.sha256(b'mapping').hexdigest(),
+    )
+    sources = [
+        {
+            'window_input_hash': 'a' * 64,
+            'session_sequence': 1,
+            'observation_id': str(uuid.uuid4()),
+            'observation_digest': 'c' * 64,
+            'stage_key': 'a' * 64,
+            'anchors_hash': 'b' * 64,
+        },
+    ]
+
+    _entries, digest = evidence_manifest(candidate, sources=sources)
+
+    assert len(digest) == 64
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_mixed_mapping_and_agent_raises() -> None:
+    candidate, source = _agent_candidate_and_source('mixedmap')
+    mapping_source = {
+        'window_input_hash': 'a' * 64,
+        'session_sequence': 1,
+        'observation_id': str(uuid.uuid4()),
+        'observation_digest': 'c' * 64,
+        'stage_key': 'a' * 64,
+        'anchors_hash': 'b' * 64,
+    }
+
+    with pytest.raises(ValueError):
+        evidence_manifest(candidate, sources=[mapping_source, source])
