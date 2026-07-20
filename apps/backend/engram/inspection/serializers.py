@@ -17,6 +17,8 @@ class InspectionQuerySerializer(serializers.Serializer):
     session_id = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
     event_type = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
     correlation_id = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+    target_id = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
+    target_type = serializers.CharField(required=False, allow_null=True, allow_blank=True, default=None)
     since = serializers.DateTimeField(required=False, allow_null=True, default=None)
     until = serializers.DateTimeField(required=False, allow_null=True, default=None)
 

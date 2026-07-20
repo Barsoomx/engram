@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from typing import Any
 
@@ -7,10 +8,12 @@ import pytest
 from django.utils import timezone
 
 from django.db import connection
+from rest_framework.test import APIClient
 
-from engram.context.context_api_tests import create_approved_memory_document, create_project_scope
-from engram.core.models import Agent, AgentSession, AuditEvent, ContextBundle, Memory, MemoryStatus, Runtime
+from engram.context.context_api_tests import auth_headers, create_approved_memory_document, create_project_scope
+from engram.core.models import Agent, AgentSession, AuditEvent, AuditResult, ContextBundle, Memory, MemoryStatus, Runtime
 from engram.inspection.filters import InspectionContextBundleFilterSet, InspectionMemoryFilterSet
+from engram.inspection.inspection_api_tests import AUDIT_RAW_KEY, create_audit_key
 
 
 def _create_context_bundle(organization: Any, team: Any, project: Any, *, request_id: str) -> ContextBundle:
@@ -86,6 +89,62 @@ def test_auditevent_target_index_present_in_migrated_schema() -> None:
     )
 
     assert present
+
+
+@pytest.mark.django_db
+def test_audit_list_filter_by_target_id_and_target_type() -> None:
+    scope = create_project_scope()
+    organization, _team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    shared_id = str(uuid.uuid4())
+    memory_event = AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryTransitionCommitted',
+        actor_type='api_key',
+        actor_id='actor-target',
+        target_type='memory',
+        target_id=shared_id,
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        request_id='req-target-memory',
+    )
+    AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryLinkCreated',
+        actor_type='api_key',
+        actor_id='actor-target',
+        target_type='memory_link',
+        target_id=shared_id,
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        request_id='req-target-link',
+    )
+    AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryTransitionCommitted',
+        actor_type='api_key',
+        actor_id='actor-other',
+        target_type='memory',
+        target_id=str(uuid.uuid4()),
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        request_id='req-target-unrelated',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id), 'target_id': shared_id, 'target_type': 'memory'},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body['count'] == 1
+    assert body['items'][0]['id'] == str(memory_event.id)
 
 
 @pytest.mark.django_db

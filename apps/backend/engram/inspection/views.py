@@ -72,6 +72,8 @@ class InspectionBaseView(APIView):
             session_id=data.get('session_id') or None,
             event_type=data.get('event_type') or None,
             correlation_id=data.get('correlation_id') or None,
+            target_id=data.get('target_id') or None,
+            target_type=data.get('target_type') or None,
             since=data.get('since'),
             until=data.get('until'),
         )

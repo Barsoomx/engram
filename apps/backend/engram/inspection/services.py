@@ -45,6 +45,8 @@ class InspectionScope:
     session_id: str | None = None
     event_type: str | None = None
     correlation_id: str | None = None
+    target_id: str | None = None
+    target_type: str | None = None
     since: datetime | None = None
     until: datetime | None = None
 
@@ -265,6 +267,8 @@ class ListInspectionAuditEvents:
         filter_data = {
             'event_type': inspection_scope.event_type,
             'correlation_id': inspection_scope.correlation_id,
+            'target_id': inspection_scope.target_id,
+            'target_type': inspection_scope.target_type,
             'since': inspection_scope.since,
             'until': inspection_scope.until,
         }
