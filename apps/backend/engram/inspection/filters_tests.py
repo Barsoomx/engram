@@ -6,8 +6,10 @@ from typing import Any
 import pytest
 from django.utils import timezone
 
+from django.db import connection
+
 from engram.context.context_api_tests import create_approved_memory_document, create_project_scope
-from engram.core.models import Agent, AgentSession, ContextBundle, Memory, MemoryStatus, Runtime
+from engram.core.models import Agent, AgentSession, AuditEvent, ContextBundle, Memory, MemoryStatus, Runtime
 from engram.inspection.filters import InspectionContextBundleFilterSet, InspectionMemoryFilterSet
 
 
@@ -70,6 +72,20 @@ def test_memory_filterset_filters_by_status_and_kind() -> None:
     by_kind = InspectionMemoryFilterSet(data={'kind': 'digest'}, queryset=queryset).qs
 
     assert {m.id for m in by_kind} == {archived.id}
+
+
+@pytest.mark.django_db
+def test_auditevent_target_index_present_in_migrated_schema() -> None:
+    expected_columns = ['organization_id', 'project_id', 'target_type', 'target_id', 'created_at']
+    with connection.cursor() as cursor:
+        constraints = connection.introspection.get_constraints(cursor, AuditEvent._meta.db_table)
+
+    present = any(
+        entry.get('columns') == expected_columns and entry.get('index')
+        for entry in constraints.values()
+    )
+
+    assert present
 
 
 @pytest.mark.django_db
