@@ -1466,3 +1466,105 @@ def test_candidate_fence_accepts_agent_under_non_promotion_kinds() -> None:
             [source],
             allowed_source_kinds=_transitions()._NON_PROMOTION_SOURCE_KINDS,
         )
+
+
+def _agent_candidate_in_scope(
+    base: MemoryCandidate,
+    suffix: str,
+    *,
+    title: str,
+    body: str,
+) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    import hashlib
+
+    from engram.memory.import_provenance import agent_proposal_candidate_content_hash
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    candidate = MemoryCandidate.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        title=title,
+        body=body,
+        kind='',
+        status=CandidateStatus.PROPOSED,
+        content_hash=agent_proposal_candidate_content_hash(title, body, '', base.team_id),
+        decision_work_contract_version=1,
+    )
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': f'req-{suffix}',
+        'correlation_id': '',
+    }
+    source = MemoryCandidateSource.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_merge_evidence_transition_accepts_agent_candidate() -> None:
+    base, _base_source = _promotable_agent_candidate('agent-merge-base')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    candidate, source = _agent_candidate_in_scope(
+        base,
+        'agent-merge',
+        title='Agent merge fact',
+        body='The staging deploy pipeline also requires a manual approval step.',
+    )
+
+    result = MergeMemoryCandidate().execute(
+        MergeMemoryCandidateInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:merge-agent:{candidate.id}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title=candidate.title,
+            body=candidate.body,
+        )
+    )
+
+    assert result.transition.transition_type == 'merge'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == promoted.memory.id
+    version_source = _model('MemoryVersionSource').objects.get(
+        memory_version_id=result.memory_version.id,
+        candidate_source_id=source.id,
+    )
+    assert version_source.source_content_hash == source.anchors_hash
+
+
+@pytest.mark.django_db
+def test_open_conflict_transition_accepts_agent_candidate() -> None:
+    base, _base_source = _promotable_agent_candidate('agent-conflict-base')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    candidate, _source = _agent_candidate_in_scope(
+        base,
+        'agent-conflict',
+        title='Agent conflict fact',
+        body='The deploy pipeline forbids any manual approval step before release.',
+    )
+
+    conflict = OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-agent:{candidate.id}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            evidence_hash='a' * 64,
+            redacted_reason='agent contradicts existing memory',
+        )
+    )
+
+    assert conflict.opened_transition.transition_type == 'conflict_open'
+    assert conflict.candidate_id == candidate.id
+    assert conflict.memory_id == promoted.memory.id
