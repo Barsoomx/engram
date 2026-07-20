@@ -194,7 +194,7 @@ def fetch_context(
         {
             "agent_runtime": runtime.agent_runtime,
             "session_id": session_id,
-            "request_id": _new_request_id(arguments),
+            "request_id": f"mcp-{uuid.uuid4()}",
             "query": as_string(arguments.get("query")),
             "file_paths": arguments.get("file_paths") or [],
             "symbols": arguments.get("symbols") or [],
@@ -204,6 +204,9 @@ def fetch_context(
     kinds = _optional_kinds(arguments)
     if kinds is not None:
         payload["kinds"] = kinds
+    token_budget = _optional_token_budget(arguments)
+    if token_budget is not None:
+        payload["token_budget"] = token_budget
     status, body = post_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -405,6 +408,16 @@ def _optional_kinds(arguments: dict[str, Any]) -> list[Any] | None:
         return value
 
     raise ValueError("kinds must be an array of strings")
+
+
+def _optional_token_budget(arguments: dict[str, Any]) -> int | None:
+    value = arguments.get("token_budget")
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+
+    raise ValueError("token_budget must be an integer")
 
 
 def _new_request_id(arguments: dict[str, Any]) -> str:

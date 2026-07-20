@@ -392,6 +392,73 @@ class McpToolsTests(unittest.TestCase):
                 StubTransport(body={"rendered_context": "bundle"}),
             )
 
+    def test_context_sends_token_budget_when_int(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "token_budget": 1200},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(1200, transport.calls[0][3]["token_budget"])
+
+    def test_context_forwards_zero_token_budget(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "token_budget": 0},
+            self.config_dir,
+            transport,
+        )
+
+        payload = transport.calls[0][3]
+        self.assertIn("token_budget", payload)
+        self.assertEqual(0, payload["token_budget"])
+
+    def test_context_omits_token_budget_when_none(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"session_id": "s"},
+            {"session_id": "s", "token_budget": None},
+        ):
+            transport = StubTransport(body={"rendered_context": "bundle"})
+            mcp_tools.fetch_context(arguments, self.config_dir, transport)
+
+            self.assertNotIn("token_budget", transport.calls[0][3])
+
+    def test_context_raises_on_bool_or_string_token_budget(self) -> None:
+        self.write_local_config()
+        for value in (True, "5"):
+            with self.assertRaises(ValueError):
+                mcp_tools.fetch_context(
+                    {"session_id": "s", "token_budget": value},
+                    self.config_dir,
+                    StubTransport(body={"rendered_context": "bundle"}),
+                )
+
+    def test_context_always_mints_fresh_request_id(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "request_id": "fixed-1", "kinds": ["convention", "gotcha"]},
+            self.config_dir,
+            transport,
+        )
+        mcp_tools.fetch_context(
+            {"session_id": "s", "request_id": "fixed-1", "kinds": ["gotcha"]},
+            self.config_dir,
+            transport,
+        )
+
+        first = transport.calls[0][3]["request_id"]
+        second = transport.calls[1][3]["request_id"]
+        self.assertTrue(first.startswith("mcp-"))
+        self.assertTrue(second.startswith("mcp-"))
+        self.assertNotEqual("fixed-1", first)
+        self.assertNotEqual("fixed-1", second)
+        self.assertNotEqual(first, second)
+
     def test_context_requires_session_id(self) -> None:
         text = mcp_tools.fetch_context({}, self.config_dir, StubTransport())
 
