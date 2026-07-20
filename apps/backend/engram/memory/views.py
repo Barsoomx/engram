@@ -214,6 +214,16 @@ class MemoryLinksView(APIView):
             repository_url=data.get('repository_url', ''),
         )
 
+        memory = Memory.objects.filter(
+            organization_id=scope.organization_id,
+            project_id=project.id,
+            id=memory_id,
+        ).first()
+        if memory is None or digest_visibility_failure(memory) is not None:
+            return Response({'count': 0, 'items': []})
+
+        ensure_memory_visibility_scope(memory, scope)
+
         links = list(
             MemoryLink.objects.filter(
                 organization_id=scope.organization_id,
