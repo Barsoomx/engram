@@ -1664,7 +1664,30 @@ def require_dry_run_ok(
     return body
 
 
+_ALLOWED_KINDS = (
+    "decision",
+    "convention",
+    "gotcha",
+    "architecture",
+    "incident",
+    "digest",
+)
+KINDS_ERROR_MESSAGE = (
+    "Invalid kind filter. Allowed kinds: " + ", ".join(_ALLOWED_KINDS) + "."
+)
+
+
+def is_kinds_error_body(body: object) -> bool:
+    return isinstance(body, dict) and "kinds" in body
+
+
 def error_from_body(body: dict[str, object], fallback: str) -> CliError:
+    if is_kinds_error_body(body):
+        return CliError(
+            "invalid_kind_filter",
+            KINDS_ERROR_MESSAGE,
+            remediation_for("invalid_kind_filter"),
+        )
     code = as_string(body.get("code")) or fallback
     detail = as_string(body.get("detail")) or code
 
@@ -1948,6 +1971,7 @@ def build_search_payload(
     limit: int,
     repository_url: str,
     project_id: str = "",
+    kinds: list[str] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "query": query,
@@ -1955,6 +1979,8 @@ def build_search_payload(
         "symbols": symbols,
         "limit": limit,
     }
+    if kinds:
+        payload["kinds"] = kinds
     if project_id:
         payload["project_id"] = project_id
     elif repository_url:
@@ -2007,6 +2033,81 @@ def search_item_suffix(item: dict[str, object]) -> str:
     return f" [{', '.join(parts)}]"
 
 
+def search_match_line(item: dict[str, object]) -> str:
+    reason = as_string(item.get("inclusion_reason"))
+    terms = item.get("matched_terms")
+    terms_text = ""
+    if isinstance(terms, (list, tuple)) and terms:
+        terms_text = ", ".join(str(term) for term in terms)
+    if reason and terms_text:
+        return f"  match: {reason} | terms: {terms_text}"
+    if reason:
+        return f"  match: {reason}"
+    if terms_text:
+        return f"  terms: {terms_text}"
+
+    return ""
+
+
+def render_warnings(warnings: object) -> str:
+    if not isinstance(warnings, list) or not warnings:
+        return ""
+    lines: list[str] = []
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        code = as_string(warning.get("code"))
+        if not code:
+            continue
+        line = f"  [{code}]"
+        message = as_string(warning.get("message"))
+        if message:
+            line += f" {message}"
+        memory_id = as_string(warning.get("memory_id"))
+        if memory_id:
+            line += f" (memory_id={memory_id})"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Warnings:\n" + "\n".join(lines)
+
+
+def observation_meta_line(item: dict[str, object]) -> str:
+    observed_at = as_string(item.get("observed_at"))
+    session_id = as_string(item.get("session_id"))
+    segments: list[str] = []
+    if observed_at:
+        segments.append(f"observed_at={observed_at}")
+    if session_id:
+        segments.append(f"session_id={session_id}")
+    if not segments:
+        return ""
+
+    return "  " + " ".join(segments)
+
+
+def render_citations(items: object) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        line = f"  [{as_string(item.get('citation'))}] memory_id={as_string(item.get('memory_id'))}"
+        kind = as_string(item.get("kind"))
+        if kind:
+            line += f" kind={kind}"
+        confidence = item.get("confidence")
+        if confidence is not None:
+            line += f" confidence={confidence}"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Citations:\n" + "\n".join(lines)
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,
@@ -2039,6 +2140,7 @@ def run_search(
             limit=args.limit,
             project_id=project_id,
             repository_url=repository_url,
+            kinds=list(getattr(args, "kinds", None) or []),
         )
         active_transport = transport or urllib_transport
         status, body = post_json(
@@ -2056,14 +2158,22 @@ def run_search(
 
             return 0
 
+        warnings_block = render_warnings(body.get("warnings"))
         if not items:
             stdout.write("No memory matched the search.\n")
+            if warnings_block:
+                stdout.write(warnings_block + "\n")
 
             return 0
 
         for item in items:
             stdout.write(f"{item.get('citation')}: {item.get('title')}{search_item_suffix(item)}\n")
+            match_line = search_match_line(item)
+            if match_line:
+                stdout.write(match_line + "\n")
             stdout.write(f"  {item.get('body')}\n")
+        if warnings_block:
+            stdout.write(warnings_block + "\n")
 
         return 0
     except CliError as error:
@@ -2253,6 +2363,16 @@ def run_observations(
         team_id = as_string(config.get("team_id"))
         if team_id:
             params["team_id"] = team_id
+        if args.observation_type:
+            params["observation_type"] = args.observation_type
+        if args.session_id:
+            params["session_id"] = args.session_id
+        if args.since:
+            params["since"] = args.since
+        if args.until:
+            params["until"] = args.until
+        if args.offset:
+            params["offset"] = str(args.offset)
         active_transport = transport or urllib_transport
         status, body = get_json(
             transport=active_transport,
@@ -2270,6 +2390,9 @@ def run_observations(
             return 0
         for item in items:
             stdout.write(f"{item.get('observation_type')}: {item.get('title')}\n")
+            meta = observation_meta_line(item)
+            if meta:
+                stdout.write(meta + "\n")
             stdout.write(f"  {item.get('body')}\n")
 
         return 0
