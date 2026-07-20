@@ -2275,6 +2275,63 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(0, len(transport.calls))
             self.assertIn("missing_project", stderr)
 
+    def test_memory_propose_posts_and_prints_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "candidate_id": "cand-1",
+                "status": "proposed",
+                "decision_work_queued": True,
+                "request_id": "req-1",
+            }
+            transport = FakeTransport([(202, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "propose",
+                    "--title",
+                    "Deploy gate",
+                    "--body",
+                    "Requires approval",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("https://engram.example/v1/memories/propose", call["url"])
+            self.assertEqual("Deploy gate", call["payload"]["title"])
+            self.assertEqual("Requires approval", call["payload"]["body"])
+            self.assertEqual(PROJECT_ID, call["payload"]["project_id"])
+            self.assertIn("candidate_id=cand-1", stdout)
+            self.assertIn("status=proposed", stdout)
+
+    def test_memory_propose_missing_capability_shows_reissue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(403, {"code": "missing_capability", "detail": "denied"})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "propose",
+                    "--title",
+                    "Deploy gate",
+                    "--body",
+                    "Requires approval",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("memories:propose", stderr)
+            self.assertNotIn("observations:write for hook", stderr)
+
     def test_memory_link_posts_link_and_prints_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -2929,7 +2986,9 @@ class WizardTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "memories:read",
+                    "memories:propose",
                     "observations:write",
+                    "projects:agent",
                     "search:query",
                 ],
                 issue_call["payload"]["capabilities"],
@@ -3529,7 +3588,7 @@ class McpInstallTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stderr.getvalue())
             self.assertEqual(2, len(lines))
-            self.assertEqual(6, len(lines[1]["result"]["tools"]))
+            self.assertEqual(7, len(lines[1]["result"]["tools"]))
 
     def test_build_engram_mcp_entry_omits_config_dir_flag_when_absent(self) -> None:
         with mock.patch(
