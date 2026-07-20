@@ -2963,18 +2963,23 @@ class CurationDecision(ImmutableCreatedModel):
             check_project_scope(errors, 'target_memory', target_memory, self.organization_id, self.project_id)
             if target_memory.team_id:
                 check_organization_scope(errors, 'target_memory_team', target_memory.team, self.organization_id)
-            if self.effective_visibility_scope == VisibilityScope.TEAM:
-                if target_memory.visibility_scope != VisibilityScope.TEAM:
-                    add_scope_error(errors, 'target_memory_version', 'team-effective target must be team-visible')
-                if target_memory.team_id != self.effective_team_id:
-                    add_scope_error(
-                        errors,
-                        'target_memory_version',
-                        'team-effective target team must match effective team',
-                    )
-            elif self.effective_visibility_scope == VisibilityScope.PROJECT:
-                if target_memory.visibility_scope != VisibilityScope.PROJECT:
-                    add_scope_error(errors, 'target_memory_version', 'project-effective target must be project-visible')
+            if self.outcome != CurationOutcome.REJECT_CANDIDATE:
+                if self.effective_visibility_scope == VisibilityScope.TEAM:
+                    if target_memory.visibility_scope != VisibilityScope.TEAM:
+                        add_scope_error(errors, 'target_memory_version', 'team-effective target must be team-visible')
+                    if target_memory.team_id != self.effective_team_id:
+                        add_scope_error(
+                            errors,
+                            'target_memory_version',
+                            'team-effective target team must match effective team',
+                        )
+                elif self.effective_visibility_scope == VisibilityScope.PROJECT:
+                    if target_memory.visibility_scope != VisibilityScope.PROJECT:
+                        add_scope_error(
+                            errors,
+                            'target_memory_version',
+                            'project-effective target must be project-visible',
+                        )
 
         if self.transition is not None:
             if self.transition.candidate_id != self.candidate_id:

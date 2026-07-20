@@ -302,7 +302,7 @@ def test_project_effective_target_allows_same_project_provenance_team(
 
 
 @pytest.mark.django_db
-def test_team_effective_target_requires_team_visibility_and_matching_team(
+def test_team_effective_mutation_target_requires_team_visibility_and_matching_team(
     candidate_and_work: tuple[MemoryCandidate, WorkflowWork],
 ) -> None:
     candidate, _work = candidate_and_work
@@ -324,12 +324,48 @@ def test_team_effective_target_requires_team_visibility_and_matching_team(
     )
     kwargs = decision_kwargs(candidate_and_work)
     kwargs.update(
+        outcome=CurationOutcome.MERGE_EVIDENCE,
+        reason_code=CurationReasonCode.EQUIVALENT_CLAIM,
+        evidence_tier=EvidenceTier.SUPPORTED,
         effective_visibility_scope=VisibilityScope.TEAM,
         effective_team=candidate.team,
         target_memory_version=version,
     )
 
     assert_decision_rejected(kwargs)
+
+
+@pytest.mark.django_db
+def test_team_effective_reject_permits_project_visible_target(
+    candidate_and_work: tuple[MemoryCandidate, WorkflowWork],
+) -> None:
+    candidate, _work = candidate_and_work
+    memory = Memory.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        title='Project global memory',
+        body='Project global memory body',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='f' * 64,
+    )
+    kwargs = decision_kwargs(candidate_and_work)
+    kwargs.update(
+        outcome=CurationOutcome.REJECT_CANDIDATE,
+        reason_code=CurationReasonCode.REDUNDANT_CLAIM,
+        evidence_tier=EvidenceTier.SUPPORTED,
+        effective_visibility_scope=VisibilityScope.TEAM,
+        effective_team=candidate.team,
+        target_memory_version=version,
+    )
+
+    CurationDecision(**kwargs).full_clean()
 
 
 @pytest.mark.django_db
@@ -549,7 +585,7 @@ def test_curation_decision_rejects_duplicate_transition(
 
 
 @pytest.fixture
-def agent_candidate(scope: tuple[Organization, Team, Project]) -> MemoryCandidate:
+def f_agent_candidate(scope: tuple[Organization, Team, Project]) -> MemoryCandidate:
     organization, team, project = scope
     return MemoryCandidate.objects.create(
         organization=organization,
@@ -564,14 +600,14 @@ def agent_candidate(scope: tuple[Organization, Team, Project]) -> MemoryCandidat
 @pytest.mark.django_db
 def test_agent_proposal_source_saves_with_null_lineage(
     scope: tuple[Organization, Team, Project],
-    agent_candidate: MemoryCandidate,
+    f_agent_candidate: MemoryCandidate,
 ) -> None:
     organization, team, project = scope
     source = MemoryCandidateSource(
         organization=organization,
         project=project,
         team=team,
-        candidate=agent_candidate,
+        candidate=f_agent_candidate,
         source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
         anchors=AGENT_ANCHORS,
         anchors_hash=HEX64,
@@ -632,14 +668,14 @@ def test_agent_proposal_source_rejects_any_lineage_field() -> None:
 @pytest.mark.django_db
 def test_two_agent_proposal_sources_violate_uniqueness(
     scope: tuple[Organization, Team, Project],
-    agent_candidate: MemoryCandidate,
+    f_agent_candidate: MemoryCandidate,
 ) -> None:
     organization, team, project = scope
     MemoryCandidateSource.objects.create(
         organization=organization,
         project=project,
         team=team,
-        candidate=agent_candidate,
+        candidate=f_agent_candidate,
         source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
         anchors=AGENT_ANCHORS,
         anchors_hash=HEX64,
@@ -649,7 +685,7 @@ def test_two_agent_proposal_sources_violate_uniqueness(
             organization=organization,
             project=project,
             team=team,
-            candidate=agent_candidate,
+            candidate=f_agent_candidate,
             source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
             anchors=AGENT_ANCHORS,
             anchors_hash='b' * 64,
