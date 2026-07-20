@@ -24,7 +24,7 @@ The MCP server:
 
 ## Shipped Tool Set (V1)
 
-Six tools ship in `engram mcp serve`
+Seven tools ship in `engram mcp serve`
 (`packages/cli/engram_cli/mcp_tools.py` + `mcp_server.py`), delivered
 automatically with the Claude Code plugin, via `engram mcp install` for Claude
 Desktop, or directly over stdio for any other client.
@@ -37,10 +37,11 @@ Desktop, or directly over stdio for any other client.
 | `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the resolved project                |
 | `engram_memory_version`   | shipped extra, beyond the original catalog      | update an approved memory body, creating a new reviewed version   |
 | `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | mark an injected memory stale or refuted, with a reason         |
+| `engram_memory_propose`   | `memory.propose`                                | deliberately record a durable fact; routed through curation, not instantly retrievable |
 
-All six are developer-scoped. Any actor whose API key resolves read/write
+All seven are developer-scoped. Any actor whose API key resolves read/write
 capability for the target memory can call them; there is no separate
-lead/curator tool set yet. All six also accept an optional per-call
+lead/curator tool set yet. All seven also accept an optional per-call
 `project_id` argument and fall back to a repository-derived project when
 neither it nor `ENGRAM_PROJECT_ID`/config resolve one - see
 [guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
@@ -61,10 +62,6 @@ with the reason each is deferred:
 - `memory.observe` - submit an explicit observation. Hooks already submit
   observations automatically on every tool call; no MCP-specific gap has been
   identified yet.
-- `memory.propose` - propose a memory update for review, distinct from the
-  direct write `engram_memory_version` performs today. Superseded by
-  `engram_memory_version` for V1; a review-gated propose flow can follow if
-  direct writes prove too permissive in practice.
 - `memory.explain` - explain why a memory was returned or excluded from a
   bundle. No ranking-explanation endpoint exists server-side yet.
 - `team.digest.latest` - show the latest team/project digest. Lead/curator
