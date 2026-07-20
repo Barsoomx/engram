@@ -7,6 +7,7 @@ from engram.core.models import LinkType
 MEMORY_FEEDBACK_REASON_MAX_LENGTH = 2000
 MEMORY_FEEDBACK_METADATA_MAX_LENGTH = 255
 MEMORY_REPOSITORY_URL_MAX_LENGTH = 1024
+MEMORY_PROPOSE_BODY_MAX_LENGTH = 16000
 
 
 def _limit_error(code: str, detail: str) -> dict[str, list[str]]:
