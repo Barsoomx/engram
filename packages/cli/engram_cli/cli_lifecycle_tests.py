@@ -3529,7 +3529,10 @@ class McpInstallTests(unittest.TestCase):
 
             self.assertEqual(0, exit_code, stderr.getvalue())
             self.assertEqual(2, len(lines))
-            self.assertEqual(6, len(lines[1]["result"]["tools"]))
+            tool_names = {tool["name"] for tool in lines[1]["result"]["tools"]}
+            self.assertEqual(8, len(lines[1]["result"]["tools"]))
+            self.assertIn("engram_memory_get", tool_names)
+            self.assertIn("engram_audit", tool_names)
 
     def test_build_engram_mcp_entry_omits_config_dir_flag_when_absent(self) -> None:
         with mock.patch(

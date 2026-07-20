@@ -102,6 +102,8 @@ class McpContractTests(unittest.TestCase):
                 "engram_observations",
                 "engram_memory_version",
                 "engram_memory_feedback",
+                "engram_memory_get",
+                "engram_audit",
             ],
         )
         link_schema = response["result"]["tools"][2]["inputSchema"]
@@ -110,14 +112,37 @@ class McpContractTests(unittest.TestCase):
         self.assertEqual([], observations_schema["required"])
         version_schema = response["result"]["tools"][4]["inputSchema"]
         self.assertEqual(["memory_id", "body"], version_schema["required"])
+        tools_by_name = {tool["name"]: tool for tool in response["result"]["tools"]}
+        memory_get_schema = tools_by_name["engram_memory_get"]["inputSchema"]
+        self.assertEqual(["memory_id"], memory_get_schema["required"])
+        self.assertEqual(
+            {"memory_id", "project_id", "from_version", "to_version"},
+            set(memory_get_schema["properties"]),
+        )
+        audit_schema = tools_by_name["engram_audit"]["inputSchema"]
+        self.assertEqual([], audit_schema["required"])
+        self.assertEqual(
+            {
+                "memory_id",
+                "target_id",
+                "target_type",
+                "event_type",
+                "correlation_id",
+                "since",
+                "until",
+                "limit",
+                "project_id",
+            },
+            set(audit_schema["properties"]),
+        )
 
-    def test_tools_list_all_six_schemas_expose_optional_project_id(self) -> None:
+    def test_tools_list_all_eight_schemas_expose_optional_project_id(self) -> None:
         response = handle_request(
             {"jsonrpc": "2.0", "id": 11, "method": "tools/list"}, build_tools()
         )
         tools = response["result"]["tools"]
 
-        self.assertEqual(6, len(tools))
+        self.assertEqual(8, len(tools))
         for tool in tools:
             properties = tool["inputSchema"]["properties"]
             self.assertIn(
@@ -173,6 +198,25 @@ class McpContractTests(unittest.TestCase):
             descriptions["engram_memory_version"],
             "Update an approved memory body, creating a new reviewed version. Use when you verified materially better information than what the memory states.",
         )
+
+    def test_tools_list_read_tool_descriptions_are_verbatim_and_unnumbered(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/list"}, build_tools()
+        )
+        descriptions = {
+            tool["name"]: tool["description"] for tool in response["result"]["tools"]
+        }
+
+        self.assertEqual(
+            descriptions["engram_memory_get"],
+            "Read one memory in full by memory_id — the complete untruncated current body, version history, and links, not the 400-char session-start preview. Use before revising, linking, or giving feedback so you act on the full stored text. Kind, confidence, and conflict/stale/refuted validity come from engram_search, not this tool.",
+        )
+        self.assertEqual(
+            descriptions["engram_audit"],
+            "Show a memory's own recorded audit events — every transition committed against it (promotion, revise, refute, stale, restore, supersede, archive, a candidate merged into it, and a merge where it is the source), most recent first. Use to explain why a memory is in its current state. Not returned: the winner side of a supersession (a direct merge is recorded under the source memory; a candidate supersession that creates a new winner is recorded under the superseded loser), confidence-decay, and link add/remove events — those are keyed to a different audit target.",
+        )
+        self.assertFalse(descriptions["engram_memory_get"].startswith("Step "))
+        self.assertFalse(descriptions["engram_audit"].startswith("Step "))
 
     def test_tools_call_search_returns_text_content(self) -> None:
         response = handle_request(
@@ -452,7 +496,7 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual(3, len(lines))
         self.assertEqual(PROTOCOL_VERSION, lines[0]["result"]["protocolVersion"])
-        self.assertEqual(6, len(lines[1]["result"]["tools"]))
+        self.assertEqual(8, len(lines[1]["result"]["tools"]))
         self.assertIn("searched: auth", lines[2]["result"]["content"][0]["text"])
 
     def test_run_server_skips_malformed_lines(self) -> None:
@@ -501,7 +545,7 @@ class RunMcpServeTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(2, len(lines))
-        self.assertEqual(6, len(lines[1]["result"]["tools"]))
+        self.assertEqual(8, len(lines[1]["result"]["tools"]))
 
 
 if __name__ == "__main__":

@@ -199,6 +199,57 @@ def list_tools() -> list[dict[str, object]]:
                 "required": ["memory_id", "action", "reason"],
             },
         },
+        {
+            "name": "engram_memory_get",
+            "description": (
+                "Read one memory in full by memory_id — the complete "
+                "untruncated current body, version history, and links, not the "
+                "400-char session-start preview. Use before revising, linking, "
+                "or giving feedback so you act on the full stored text. Kind, "
+                "confidence, and conflict/stale/refuted validity come from "
+                "engram_search, not this tool."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "project_id": {"type": "string"},
+                    "from_version": {"type": "integer"},
+                    "to_version": {"type": "integer"},
+                },
+                "required": ["memory_id"],
+            },
+        },
+        {
+            "name": "engram_audit",
+            "description": (
+                "Show a memory's own recorded audit events — every transition "
+                "committed against it (promotion, revise, refute, stale, "
+                "restore, supersede, archive, a candidate merged into it, and a "
+                "merge where it is the source), most recent first. Use to "
+                "explain why a memory is in its current state. Not returned: "
+                "the winner side of a supersession (a direct merge is recorded "
+                "under the source memory; a candidate supersession that creates "
+                "a new winner is recorded under the superseded loser), "
+                "confidence-decay, and link add/remove events — those are keyed "
+                "to a different audit target."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": "string"},
+                    "target_id": {"type": "string"},
+                    "target_type": {"type": "string"},
+                    "event_type": {"type": "string"},
+                    "correlation_id": {"type": "string"},
+                    "since": {"type": "string"},
+                    "until": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "project_id": {"type": "string"},
+                },
+                "required": [],
+            },
+        },
     ]
 
 
