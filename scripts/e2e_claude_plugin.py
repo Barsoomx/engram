@@ -251,8 +251,8 @@ def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path, repo: Path) -
         raise E2EError(f'plugin mcp initialize failed: {lines[0]}')
 
     tools = lines[1].get('result', {}).get('tools') or []
-    if len(tools) != 6:
-        raise E2EError(f'plugin mcp tools/list did not return 6 tools: {tools}')
+    if len(tools) != 7:
+        raise E2EError(f'plugin mcp tools/list did not return 7 tools: {tools}')
 
     content = lines[2].get('result', {}).get('content') or []
     search_text = content[0].get('text', '') if content else ''

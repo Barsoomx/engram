@@ -14,6 +14,7 @@ from engram_cli.commands import (
     run_mcp_install,
     run_memory_link,
     run_memory_links,
+    run_memory_propose,
     run_memory_version,
     run_observations,
     run_search,
@@ -69,6 +70,8 @@ def main(
             return run_memory_link(args, output, errors, transport)
         if args.memory_command == "links":
             return run_memory_links(args, output, errors, transport)
+        if args.memory_command == "propose":
+            return run_memory_propose(args, output, errors, transport)
 
     parser.print_help(file=errors)
 
@@ -197,6 +200,14 @@ def build_parser() -> argparse.ArgumentParser:
     memory_links.add_argument("memory_id")
     memory_links.add_argument("--config-dir")
     memory_links.add_argument("--project", default="")
+
+    memory_propose = memory_subparsers.add_parser("propose")
+    memory_propose.add_argument("--title", required=True)
+    memory_propose.add_argument("--body", required=True)
+    memory_propose.add_argument("--kind", default="")
+    memory_propose.add_argument("--request-id", dest="request_id", default="")
+    memory_propose.add_argument("--config-dir")
+    memory_propose.add_argument("--project", default="")
 
     observations = subparsers.add_parser("observations")
     observations.add_argument("--limit", type=int, default=20)
