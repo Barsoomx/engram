@@ -50,6 +50,7 @@ class EffectiveScope:
     actor_type: str
     actor_id: str
     project_bound: bool
+    team_bound: bool = False
 
 
 ACCESS_STATUS = {
@@ -213,6 +214,7 @@ class ResolveApiKeyScope:
                 actor_type='api_key',
                 actor_id=str(key.id),
                 project_bound=bool(key.project_id),
+                team_bound=bool(key.team_id),
             )
 
     def _find_key(self, raw_key: str) -> ApiKey | None:
