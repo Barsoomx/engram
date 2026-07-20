@@ -271,6 +271,7 @@ class RecordMemoryFeedback:
                 confirmed_at=str(prior.metadata.get('confirmed_at') or ''),
             )
 
+        self._ensure_confirmable(memory, scope)
         memory.last_confirmed_at = timezone.now()
         memory.save(update_fields=['last_confirmed_at'])
         self._write_confirm_audit(memory, scope, data)
@@ -283,6 +284,38 @@ class RecordMemoryFeedback:
             already_applied=False,
             confirmed_at=memory.last_confirmed_at.isoformat(),
         )
+
+    def _ensure_confirmable(self, memory: Memory, scope: EffectiveScope) -> None:
+        floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
+        caller_retrievable = (
+            RetrievalDocument.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                memory_id=memory.id,
+                stale=False,
+                refuted=False,
+            )
+            .filter(
+                Q(visibility_scope=VisibilityScope.PROJECT)
+                | Q(visibility_scope=VisibilityScope.TEAM, team_id__in=scope.team_ids)
+            )
+            .exists()
+        )
+        if (
+            memory.status != MemoryStatus.APPROVED
+            or memory.stale
+            or memory.refuted
+            or memory.confidence is None
+            or memory.confidence <= floor
+            or memory.kind == 'digest'
+            or MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists()
+            or not caller_retrievable
+        ):
+            raise MemoryFeedbackError(
+                'memory_not_confirmable',
+                'Only an approved, non-stale, non-refuted, above-floor, non-digest, non-conflicted, '
+                'retrieval-injectable memory can be confirmed',
+            )
 
     def _write_confirm_audit(self, memory: Memory, scope: EffectiveScope, data: MemoryFeedbackInput) -> None:
         AuditEvent.objects.create(
