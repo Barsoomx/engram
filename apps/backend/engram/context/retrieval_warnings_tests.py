@@ -368,7 +368,7 @@ def test_conflict_excluded_excludes_memory_outside_team_scope() -> None:
 def test_conflict_excluded_message_redacts_secret_shaped_title() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     leaked_token = 'egk_memory_secret_0123456789abcdefghijklmnopqrstuvwxyz'
-    memory, _candidate, _conflict = _open_conflict_in_scope(
+    _memory, _candidate, _conflict = _open_conflict_in_scope(
         organization,
         project,
         team,
@@ -393,4 +393,3 @@ def test_conflict_excluded_message_redacts_secret_shaped_title() -> None:
     conflict_warnings = _conflict_excluded(warnings)
     assert len(conflict_warnings) == 1
     assert leaked_token not in conflict_warnings[0].message
-    _ = memory

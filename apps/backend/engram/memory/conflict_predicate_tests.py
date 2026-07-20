@@ -76,9 +76,7 @@ def test_open_memory_conflict_exists_false_when_no_conflict() -> None:
     result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
 
     memory = (
-        Memory.objects.filter(pk=result.memory.id)
-        .annotate(has_open_conflict=open_memory_conflict_exists('pk'))
-        .first()
+        Memory.objects.filter(pk=result.memory.id).annotate(has_open_conflict=open_memory_conflict_exists('pk')).first()
     )
 
     assert memory.has_open_conflict is False

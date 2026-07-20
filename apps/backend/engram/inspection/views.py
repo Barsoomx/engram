@@ -242,10 +242,7 @@ def memory_response(
     confidence_percent: float | None = round(float(confidence) * 100, 1) if confidence is not None else None
     has_open_conflict = bool(memory.has_open_conflict)
     authorized_for_injection = (
-        memory.status == MemoryStatus.APPROVED
-        and not memory.stale
-        and not memory.refuted
-        and not has_open_conflict
+        memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted and not has_open_conflict
     )
 
     response: dict[str, object] = {

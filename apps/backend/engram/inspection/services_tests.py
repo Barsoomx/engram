@@ -567,7 +567,7 @@ def test_authorized_for_injection_false_when_memory_has_open_conflict() -> None:
 
     memory = ListInspectionMemories().detail(scope, conflict.memory_id)
 
-    assert getattr(memory, 'has_open_conflict') is True
+    assert memory.has_open_conflict is True
 
     resp = memory_response(memory, include_detail=True, inspection_scope=scope)
 
