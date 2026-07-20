@@ -37,6 +37,8 @@ class RetrievalWarning:
 STALE_REFUTED_WARNING_CAP = 3
 STALE_REFUTED_MIN_SCORE = 60
 CONFLICTING_MEMORY_WARNING_CAP = 5
+CONFLICT_EXCLUDED_WARNING_CAP = 3
+CONFLICT_EXCLUDED_MIN_SCORE = 60
 
 
 def budget_dropped_warning(dropped_count: int) -> RetrievalWarning | None:
@@ -116,6 +118,61 @@ def stale_and_refuted_warnings(
                     memory_id=str(memory.id),
                 ),
             )
+
+    return warnings
+
+
+def conflict_excluded_warnings(
+    organization: Organization,
+    project: Project,
+    scope: EffectiveScope,
+    query: str,
+    file_paths: tuple[str, ...],
+    symbols: tuple[str, ...],
+    has_request_terms: bool,
+    kinds: tuple[str, ...] = (),
+) -> list[RetrievalWarning]:
+    from engram.context.services import filter_documents_by_team_visibility, redact_text, score_retrieval_document
+    from engram.memory.conflict_predicate import open_memory_conflict_exists
+
+    if not has_request_terms:
+        return []
+
+    documents = RetrievalDocument.objects.filter(
+        organization=organization,
+        project=project,
+        memory__status=MemoryStatus.APPROVED,
+        memory__stale=False,
+        memory__refuted=False,
+        stale=False,
+        refuted=False,
+    ).filter(open_memory_conflict_exists('memory_id'))
+    if kinds:
+        documents = documents.filter(memory__kind__in=kinds)
+    documents = documents.select_related('memory').defer(*retrieval_embedding_deferred_fields())[:200]
+    authorized_documents = filter_documents_by_team_visibility(documents, scope)
+
+    warnings: list[RetrievalWarning] = []
+    seen_memory_ids: set[uuid.UUID] = set()
+    for document in authorized_documents:
+        if len(warnings) >= CONFLICT_EXCLUDED_WARNING_CAP:
+            break
+        if document.memory_id in seen_memory_ids:
+            continue
+
+        match = score_retrieval_document(document, query, file_paths, symbols, has_request_terms)
+        if match is None or match.score < CONFLICT_EXCLUDED_MIN_SCORE:
+            continue
+
+        memory = document.memory
+        seen_memory_ids.add(memory.id)
+        warnings.append(
+            RetrievalWarning(
+                code='conflict_excluded',
+                message=f'conflict-excluded memory matched: "{redact_text(memory.title)}"',
+                memory_id=str(memory.id),
+            ),
+        )
 
     return warnings
 
@@ -202,6 +259,18 @@ def compute_retrieval_warnings(
 
     warnings.extend(
         stale_and_refuted_warnings(
+            organization,
+            project,
+            scope,
+            query,
+            file_paths,
+            symbols,
+            has_request_terms,
+            kinds,
+        ),
+    )
+    warnings.extend(
+        conflict_excluded_warnings(
             organization,
             project,
             scope,
