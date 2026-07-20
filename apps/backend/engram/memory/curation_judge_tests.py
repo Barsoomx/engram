@@ -15,10 +15,15 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryTransition,
+    MemoryVersion,
     MemoryVersionSource,
     Observation,
+    Organization,
+    Project,
+    Team,
     VisibilityScope,
 )
 from engram.memory.curation_test_support import create_curation_policy
@@ -31,8 +36,119 @@ from engram.memory.transitions_test_support import (
     transition_request,
     transitions_module,
 )
-from engram.memory.workflow_work import observation_content_digest
+from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.services import ProviderCallResult
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _agent_anchors_hash(anchors: dict[str, object]) -> str:
+    import hashlib
+
+    return hashlib.sha256(canonical_json_bytes(anchors)).hexdigest()
+
+
+def _agent_scope(suffix: str) -> tuple[Organization, Team, Project]:
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+
+    return organization, team, project
+
+
+def _agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource, tuple[Organization, Team, Project]]:
+    import hashlib
+
+    organization, team, project = _agent_scope(suffix)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        status='proposed',
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+        evidence=[],
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=_agent_anchors_hash(anchors),
+    )
+
+    return candidate, source, (organization, team, project)
+
+
+def _agent_target_version(
+    scope: tuple[Organization, Team, Project],
+    *,
+    anchors: dict[str, object],
+    anchors_hash: str,
+) -> tuple[Memory, MemoryVersion]:
+    import hashlib
+
+    organization, team, project = scope
+    target_candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Target agent memory',
+        body='Target agent memory body',
+        status='promoted',
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    target_source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=target_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=anchors_hash,
+    )
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Target agent memory',
+        body='Target agent memory body',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+    )
+    MemoryVersionSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory_version=version,
+        candidate_source=target_source,
+        source_content_hash=target_source.anchors_hash,
+    )
+
+    return memory, version
+
 
 _CANDIDATE_EVIDENCE_AT = datetime(2026, 2, 1, tzinfo=UTC)
 _TARGET_EVIDENCE_AT = datetime(2026, 1, 1, tzinfo=UTC)
@@ -998,3 +1114,80 @@ def test_cyclic_target_provenance_is_detected_without_infinite_recursion() -> No
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
     assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_agent_only_candidate_tier_supported_with_none_evidence_time() -> None:
+    module = _judge_module()
+    candidate, _source, _scope = _agent_candidate('judge-agent-tier')
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'supported'
+    assert context.candidate.latest_evidence_at is None
+    assert len(context.candidate.refs) == 1
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_returns_agent_anchors_hash() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-hash')
+
+    assert module._eligible_group_hash(source) == source.anchors_hash
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_corrupted_agent_hash() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-corrupt')
+    source.anchors_hash = 'f' * 64
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_hash(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_empty_agent_anchors() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-empty')
+    source.anchors = {}
+    source.anchors_hash = _agent_anchors_hash({})
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_hash(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_wrong_shape_agent_source() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-shape')
+    source.observation_id = uuid.uuid4()
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_hash(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('malformation', ['corrupted_hash', 'wrong_schema'])
+def test_target_traversal_rejects_malformed_agent_source(malformation: str) -> None:
+    module = _judge_module()
+    candidate, _source, scope = _agent_candidate(f'judge-agent-target-{malformation}')
+    if malformation == 'corrupted_hash':
+        anchors = dict(_AGENT_ANCHORS)
+        anchors_hash = 'f' * 64
+    else:
+        anchors = dict(_AGENT_ANCHORS, schema='other.v1')
+        anchors_hash = _agent_anchors_hash(anchors)
+    memory, version = _agent_target_version(scope, anchors=anchors, anchors_hash=anchors_hash)
+    shortlist = _shortlist_for(memory, version)
+
+    with pytest.raises(ValueError) as error:
+        module.build_curation_evidence_context(candidate.id, shortlist)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'

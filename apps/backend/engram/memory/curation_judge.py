@@ -179,6 +179,9 @@ def _claim_evidence(hashes: set[str], latest_evidence_at: datetime | None) -> Cl
 
 
 def _source_evidence_time(source: MemoryCandidateSource) -> datetime | None:
+    if source.observation_id is None:
+        return None
+
     observation = source.observation
 
     return observation.observed_at or observation.created_at
@@ -194,6 +197,15 @@ def _newer(current: datetime | None, candidate: datetime | None) -> datetime | N
 
 
 def _eligible_group_hash(source: MemoryCandidateSource) -> str | None:
+    if source.source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+        from engram.memory.import_provenance import ImportProvenanceError, _validated_agent_anchors
+
+        try:
+            _validated_agent_anchors(source)
+        except ImportProvenanceError as error:
+            raise CurationJudgeError('transition_dependency_unavailable') from error
+
+        return source.anchors_hash
     if source.source_kind != MemoryCandidateSourceKind.DISTILLATION:
         return None
     if source.window_id is None or source.stage_id is None:
