@@ -2050,6 +2050,20 @@ def render_warnings(warnings: object) -> str:
     return "Warnings:\n" + "\n".join(lines)
 
 
+def observation_meta_line(item: dict[str, object]) -> str:
+    observed_at = as_string(item.get("observed_at"))
+    session_id = as_string(item.get("session_id"))
+    segments: list[str] = []
+    if observed_at:
+        segments.append(f"observed_at={observed_at}")
+    if session_id:
+        segments.append(f"session_id={session_id}")
+    if not segments:
+        return ""
+
+    return "  " + " ".join(segments)
+
+
 def render_citations(items: object) -> str:
     if not isinstance(items, list) or not items:
         return ""
@@ -2353,6 +2367,9 @@ def run_observations(
             return 0
         for item in items:
             stdout.write(f"{item.get('observation_type')}: {item.get('title')}\n")
+            meta = observation_meta_line(item)
+            if meta:
+                stdout.write(meta + "\n")
             stdout.write(f"  {item.get('body')}\n")
 
         return 0

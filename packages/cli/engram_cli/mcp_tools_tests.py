@@ -879,6 +879,47 @@ class McpToolsTests(unittest.TestCase):
                 StubTransport(body={"items": []}),
             )
 
+    def test_observations_render_includes_meta_line(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "observation_type": "user_prompt",
+                        "title": "T",
+                        "body": "B",
+                        "observed_at": "2026-07-18T20:15:03+00:00",
+                        "session_id": "9f2c",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.list_observations({}, self.config_dir, transport)
+
+        self.assertIn(
+            "  observed_at=2026-07-18T20:15:03+00:00 session_id=9f2c", text
+        )
+
+    def test_observations_render_session_only_meta_line(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "observation_type": "user_prompt",
+                        "title": "T",
+                        "body": "B",
+                        "observed_at": None,
+                        "session_id": "9f2c",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.list_observations({}, self.config_dir, transport)
+
+        self.assertIn("  session_id=9f2c", text)
+        self.assertNotIn("observed_at=", text)
+
     def test_feedback_validates_action(self) -> None:
         self.write_local_config()
         text = mcp_tools.submit_memory_feedback(

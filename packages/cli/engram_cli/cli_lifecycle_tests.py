@@ -2763,6 +2763,33 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertIn("inclusive", help_text)
         self.assertIn("exclusive", help_text)
 
+    def test_observations_render_shows_meta_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "items": [
+                    {
+                        "observation_type": "tool_use",
+                        "title": "Obs one",
+                        "body": "Obs body one.",
+                        "observed_at": "2026-07-18T20:15:03+00:00",
+                        "session_id": "9f2c",
+                    },
+                ],
+                "warnings": [],
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["observations", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn(
+                "  observed_at=2026-07-18T20:15:03+00:00 session_id=9f2c", stdout
+            )
+
     def test_observations_project_flag_wins_over_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

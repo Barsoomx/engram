@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from engram_cli.commands import (
+    observation_meta_line,
     render_citations,
     render_warnings,
     search_item_suffix,
@@ -327,6 +328,9 @@ def list_observations(
         if not isinstance(item, dict):
             continue
         lines.append(f"[{item.get('observation_type')}] {item.get('title')}")
+        meta = observation_meta_line(item)
+        if meta:
+            lines.append(meta)
         body_text = as_string(item.get("body"))
         if body_text:
             lines.append(f"  {body_text}")
