@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -31,6 +32,7 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryConflict,
     MemoryLink,
     MemoryStatus,
     MemoryVersion,
@@ -48,8 +50,19 @@ from engram.core.models import (
 )
 from engram.memory.digest_visibility_tests import make_source_memory
 from engram.memory.tasks import embed_memory_projection_work_v1, generate_weekly_digest_work_v1
-from engram.memory.transitions import PromoteMemoryCandidate
-from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
+from engram.memory.transitions import (
+    OpenMemoryConflict,
+    OpenMemoryConflictInput,
+    PromoteMemoryCandidate,
+    build_memory_fence,
+)
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    candidate_in_scope,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
+)
 from engram.memory.workflow_work import CreateWorkflowWorkInput
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
 
@@ -239,6 +252,43 @@ def create_approved_memory_document(
     )
 
     return memory, version, document
+
+
+def open_conflict_in_authenticated_scope(
+    organization: Organization,
+    project: Project,
+    team: Team | None,
+    *,
+    suffix: str,
+    title: str,
+    body: str,
+) -> tuple[Memory, MemoryConflict]:
+    base_candidate, source, _session = provenanced_candidate_in_scope(
+        organization,
+        project,
+        team,
+        suffix=suffix,
+        title=title,
+        body=body,
+    )
+    memory_result = PromoteMemoryCandidate().execute(transition_request(base_candidate))
+    candidate, _candidate_source = candidate_in_scope(
+        base_candidate,
+        source,
+        title=f'Resolution {suffix}',
+        body=f'Resolution body {suffix}',
+    )
+    conflict = OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=transition_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-open:{candidate.id}:v1'),
+            candidate_fence=candidate_fence_for(candidate),
+            memory_fence=build_memory_fence(memory_result.memory),
+            evidence_hash='e' * 64,
+            redacted_reason='resolution outcome contract',
+        ),
+    )
+
+    return memory_result.memory, MemoryConflict.objects.get(id=conflict.id)
 
 
 def create_transition_memory(
@@ -2154,6 +2204,48 @@ def test_session_start_warns_about_unresolved_conflicting_memory() -> None:
 
     assert response_after_resolution.status_code == 200
     assert response_after_resolution.json()['warnings'] == []
+
+
+@pytest.mark.django_db
+def test_context_warns_about_conflict_excluded_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    memory, conflict = open_conflict_in_authenticated_scope(
+        organization,
+        project,
+        team,
+        suffix='ctx-conflict-excluded',
+        title='Conflict excluded context memory',
+        body='Conflict excluded context body',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/context',
+        valid_context_payload(
+            project,
+            team,
+            query=memory.title,
+            file_paths=[],
+            symbols=[],
+            request_id='req-warn-conflict-excluded',
+        ),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    expected_message = f'conflict-excluded memory matched: "{memory.title}"'
+    conflict_warnings = [warning for warning in body['warnings'] if warning['code'] == 'conflict_excluded']
+    assert len(conflict_warnings) == 1
+    assert conflict_warnings[0]['memory_id'] == str(conflict.memory_id)
+    assert conflict_warnings[0]['message'] == expected_message
+    assert expected_message in body['rendered_context']
+
+    bundle = ContextBundle.objects.get(request_id='req-warn-conflict-excluded')
+    persisted_codes = {warning['code'] for warning in bundle.metadata['warnings']}
+    assert 'conflict_excluded' in persisted_codes
 
 
 @pytest.mark.django_db
