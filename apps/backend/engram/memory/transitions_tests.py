@@ -1468,6 +1468,29 @@ def test_candidate_fence_accepts_agent_under_non_promotion_kinds() -> None:
         )
 
 
+@pytest.mark.django_db
+def test_candidate_fence_agent_source_observation_is_non_retryable_provenance() -> None:
+    candidate, source = _promotable_agent_candidate('agent-source-obs-fence')
+    fence = _transitions().CandidateFence(
+        candidate_id=candidate.id,
+        candidate_content_hash=candidate.content_hash,
+        evidence_manifest_hash='0' * 64,
+    )
+    candidate.source_observation_id = uuid.uuid4()
+
+    with pytest.raises(_transitions().MemoryTransitionError) as error:
+        _transitions()._candidate_fence(
+            candidate,
+            fence,
+            [source],
+            allowed_source_kinds=_transitions()._NON_PROMOTION_SOURCE_KINDS,
+        )
+
+    assert error.value.code == 'provenance'
+    assert error.value.retryable is False
+    assert 'source observation' in str(error.value)
+
+
 def _agent_candidate_in_scope(
     base: MemoryCandidate,
     suffix: str,

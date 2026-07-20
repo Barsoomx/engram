@@ -315,12 +315,12 @@ def _candidate_fence(
 
     if any(source.source_kind not in allowed_source_kinds for source in sources):
         raise MemoryTransitionError('provenance', 'candidate provenance source kind is not allowed')
+    source_kind = next(iter(kinds)) if kinds else None
+    canonical_content_hash = _canonical_candidate_content_hash(candidate, source_kind, sources)
     try:
         _entries, manifest_hash = candidate_evidence_manifest(candidate, sources=sources)
     except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
         raise MemoryTransitionError('stale_decision', 'candidate provenance is invalid', retryable=True) from error
-    source_kind = next(iter(kinds)) if kinds else None
-    canonical_content_hash = _canonical_candidate_content_hash(candidate, source_kind, sources)
     if (
         candidate.content_hash != canonical_content_hash
         or fence.candidate_content_hash != canonical_content_hash

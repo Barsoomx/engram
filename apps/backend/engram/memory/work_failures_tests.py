@@ -422,3 +422,15 @@ def test_translate_failure_judge_policy_denied_stays_provider_transient() -> Non
 
     assert failure.failure_class == 'provider_transient'
     assert failure.code == 'judge_policy_denied'
+
+
+def test_translate_failure_maps_provenance_to_invalid_input() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(
+        MemoryTransitionError('provenance', 'agent candidate must not have a source observation'),
+    )
+
+    assert failure.failure_class == 'invalid_input'
+    assert failure.code == 'provenance'
+    assert failure.configuration_fingerprint == ''
