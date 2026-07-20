@@ -72,10 +72,13 @@ class ProposeMemory:
             raise ProposeMemoryError('content_too_long', 'Proposed memory content is too long after redaction.')
 
         clamped_kind = clamp_memory_kind(data.kind)
-        if effective_team_id is not None and not ProjectTeam.objects.filter(
-            project_id=data.project.id,
-            team_id=effective_team_id,
-        ).exists():
+        if (
+            effective_team_id is not None
+            and not ProjectTeam.objects.filter(
+                project_id=data.project.id,
+                team_id=effective_team_id,
+            ).exists()
+        ):
             raise ProposeMemoryError('team_not_in_project', 'Team is not linked to this project.')
 
         content_hash = agent_proposal_candidate_content_hash(title, body, clamped_kind, effective_team_id)

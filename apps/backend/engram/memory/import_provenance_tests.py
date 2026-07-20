@@ -44,7 +44,9 @@ def _expected_hash(title: str, body: str, kind: str, team: str | None) -> str:
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
-def _agent_source(anchors: dict[str, object] | object, anchors_hash: str | None = None, **overrides: object) -> SimpleNamespace:
+def _agent_source(
+    anchors: dict[str, object] | object, anchors_hash: str | None = None, **overrides: object
+) -> SimpleNamespace:
     if anchors_hash is None and isinstance(anchors, dict):
         anchors_hash = hashlib.sha256(canonical_json_bytes(anchors)).hexdigest()
     base: dict[str, object] = {

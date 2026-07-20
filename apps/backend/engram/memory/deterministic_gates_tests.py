@@ -38,7 +38,6 @@ from engram.memory.deterministic_gates import (
     SanitizedCandidateView,
     _validate_sources,
 )
-from engram.memory.workflow_work import canonical_json_bytes
 from engram.memory.escalation import escalation_reason
 from engram.memory.transitions import PromoteMemoryCandidate
 from engram.memory.transitions_test_support import (
@@ -47,6 +46,7 @@ from engram.memory.transitions_test_support import (
     provenanced_candidate_in_scope,
     transition_request,
 )
+from engram.memory.workflow_work import canonical_json_bytes
 from engram.model_policy.models import ProviderCallRecord
 
 

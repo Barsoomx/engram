@@ -1286,9 +1286,7 @@ _MUTATION_VERDICTS = (
 
 @pytest.mark.django_db
 @pytest.mark.parametrize(('outcome', 'relation', 'temporal_order'), _MUTATION_VERDICTS)
-def test_cross_visibility_mutation_denied_with_distinct_code(
-    outcome: str, relation: str, temporal_order: str
-) -> None:
+def test_cross_visibility_mutation_denied_with_distinct_code(outcome: str, relation: str, temporal_order: str) -> None:
     module, data, target_id = _agent_policy_data(cross=True)
     verdict = _verdict(module, outcome=outcome, relation=relation, target=target_id, temporal_order=temporal_order)
 
@@ -1375,8 +1373,6 @@ def test_same_visibility_baseline_forbids_revise_supersede_and_unsupported(
     assert getattr(error.value, 'code', None) == 'judge_policy_denied'
 
 
-
-
 class _FakeResponse:
     def __init__(self, body: bytes) -> None:
         self._body = body
@@ -1384,7 +1380,7 @@ class _FakeResponse:
     def read(self) -> bytes:
         return self._body
 
-    def __enter__(self) -> '_FakeResponse':
+    def __enter__(self) -> _FakeResponse:
         return self
 
     def __exit__(self, *_args: object) -> bool:

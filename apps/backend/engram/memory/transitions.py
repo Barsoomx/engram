@@ -320,32 +320,40 @@ def _candidate_fence(
     except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
         raise MemoryTransitionError('stale_decision', 'candidate provenance is invalid', retryable=True) from error
     source_kind = next(iter(kinds)) if kinds else None
-    if source_kind == MemoryCandidateSourceKind.IMPORT:
-        canonical_content_hash = candidate.content_hash
-    elif source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
-        if candidate.source_observation_id is not None:
-            raise MemoryTransitionError('provenance', 'agent candidate must not have a source observation')
-
-        canonical_content_hash = agent_proposal_candidate_content_hash(
-            candidate.title, candidate.body, candidate.kind, candidate.team_id
-        )
-    else:
-        session_id = candidate.source_observation.session_id if candidate.source_observation_id else None
-        if session_id is None and sources:
-            session_id = sources[0].observation.session_id
-        if session_id is None:
-            raise MemoryTransitionError(
-                'stale_decision',
-                'candidate content session cannot be reconstructed',
-                retryable=True,
-            )
-        canonical_content_hash = session_candidate_content_hash(session_id, candidate.title, candidate.body)
+    canonical_content_hash = _canonical_candidate_content_hash(candidate, source_kind, sources)
     if (
         candidate.content_hash != canonical_content_hash
         or fence.candidate_content_hash != canonical_content_hash
         or manifest_hash != fence.evidence_manifest_hash
     ):
         raise MemoryTransitionError('stale_decision', 'candidate fence no longer matches', retryable=True)
+
+
+def _canonical_candidate_content_hash(
+    candidate: MemoryCandidate,
+    source_kind: str | None,
+    sources: list[MemoryCandidateSource],
+) -> str:
+    if source_kind == MemoryCandidateSourceKind.IMPORT:
+        return candidate.content_hash
+
+    if source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+        if candidate.source_observation_id is not None:
+            raise MemoryTransitionError('provenance', 'agent candidate must not have a source observation')
+
+        return agent_proposal_candidate_content_hash(candidate.title, candidate.body, candidate.kind, candidate.team_id)
+
+    session_id = candidate.source_observation.session_id if candidate.source_observation_id else None
+    if session_id is None and sources:
+        session_id = sources[0].observation.session_id
+    if session_id is None:
+        raise MemoryTransitionError(
+            'stale_decision',
+            'candidate content session cannot be reconstructed',
+            retryable=True,
+        )
+
+    return session_candidate_content_hash(session_id, candidate.title, candidate.body)
 
 
 def _candidate_fence_value(fence: CandidateFence) -> dict[str, object]:

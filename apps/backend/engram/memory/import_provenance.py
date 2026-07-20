@@ -196,9 +196,7 @@ def validated_agent_candidate_source(
     sources: Iterable[MemoryCandidateSource] | None = None,
 ) -> tuple[MemoryCandidateSource, dict[str, object]]:
     selected = (
-        list(sources)
-        if sources is not None
-        else list(MemoryCandidateSource.objects.filter(candidate_id=candidate.id))
+        list(sources) if sources is not None else list(MemoryCandidateSource.objects.filter(candidate_id=candidate.id))
     )
     if len(selected) != 1:
         raise ImportProvenanceError('agent candidate must have exactly one source')
