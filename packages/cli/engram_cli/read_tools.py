@@ -43,6 +43,10 @@ def team_scope_denied_message(team_id: str, memory_id: str) -> str:
     )
 
 
+def audit_needs_project_message() -> str:
+    return 'engram_audit needs a project_id — pass project_id or connect a project.'
+
+
 def audit_missing_capability_message() -> str:
     return (
         'This key cannot read audit events. Re-issue the API key with the audit:read '

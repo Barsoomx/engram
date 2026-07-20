@@ -554,10 +554,12 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("project_id=arg-project", transport.calls[0][1])
         self.assertNotIn("repository_url=", transport.calls[0][1])
 
-    def test_build_tools_exposes_memory_get(self) -> None:
+    def test_build_tools_exposes_eight_tools(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())
 
+        self.assertEqual(8, len(tools))
         self.assertIn("engram_memory_get", tools)
+        self.assertIn("engram_audit", tools)
 
     def test_build_tools_forwards_config_dir_and_transport(self) -> None:
         self.write_local_config()
@@ -767,6 +769,256 @@ class MemoryGetToolTests(unittest.TestCase):
 
         self.assertNotIn("links:", text)
         self.assertNotIn("unavailable", text)
+
+
+class AuditToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._env = {key: os.environ.pop(key, None) for key in ENV_KEYS}
+        self._tmp = tempfile.TemporaryDirectory(prefix="engram-mcp-audit-tests-")
+        self.config_dir = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        for key, value in self._env.items():
+            if value is not None:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+
+    def write_local_config(self, *, project_id: str = "11111111-1111-1111-1111-111111111111") -> None:
+        root = Path(self.config_dir)
+        config: dict[str, object] = {"server_url": "http://server.local"}
+        if project_id:
+            config["project_id"] = project_id
+        root.joinpath("config.json").write_text(json.dumps(config), encoding="utf-8")
+        root.joinpath("credentials.json").write_text(
+            json.dumps({"api_key": "egk_file_key"}), encoding="utf-8"
+        )
+
+    def _event(self, **overrides: object) -> dict:
+        event = {
+            "event_type": "MemoryTransitionCommitted",
+            "metadata": {"transition_type": "refute", "reason": "contradicted"},
+            "actor_id": "actor-uuid",
+            "actor_display": "Alice",
+            "result": "recorded",
+            "target_id": "m-1",
+            "target_display": "Some Title",
+            "target_type": "memory",
+            "capability": "memories:write",
+            "created_at": "2026-07-03T00:00:00Z",
+        }
+        event.update(overrides)
+
+        return event
+
+    def test_audit_happy_path_with_metadata(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"count": 1, "items": [self._event()]})
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("audit trace for memory m-1", text)
+        self.assertIn("MemoryTransitionCommitted", text)
+        self.assertIn("(refute)", text)
+        self.assertIn("actor=actor-uuid (Alice)", text)
+        self.assertIn("result=recorded", text)
+        self.assertIn("target=m-1 (Some Title)", text)
+        self.assertIn("target_type=memory", text)
+        self.assertIn("capability=memories:write", text)
+        self.assertIn("reason=contradicted", text)
+        self.assertNotIn("showing most recent", text)
+        url = transport.calls[0][1]
+        self.assertIn("target_id=m-1", url)
+        self.assertIn("target_type=memory", url)
+        self.assertIn("ordering=-created_at", url)
+
+    def test_audit_null_displays_have_no_empty_parens(self) -> None:
+        self.write_local_config()
+        event = self._event(actor_display=None, target_display=None)
+        transport = StubTransport(body={"count": 1, "items": [event]})
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("actor=actor-uuid result=", text)
+        self.assertIn("target=m-1 target_type=memory", text)
+
+    def test_audit_conditional_headers(self) -> None:
+        self.write_local_config()
+        project_wide = StubTransport(body={"count": 0, "items": []})
+        text = mcp_tools.audit({}, self.config_dir, project_wide)
+        self.assertIn("project-wide audit events", text)
+        self.assertNotIn("audit trace for memory", text)
+
+        link_trace = StubTransport(body={"count": 0, "items": []})
+        text = mcp_tools.audit(
+            {"target_id": "X", "target_type": "memory_link"}, self.config_dir, link_trace
+        )
+        self.assertIn("audit trace for memory_link X", text)
+
+    def test_audit_event_without_metadata_is_clean(self) -> None:
+        self.write_local_config()
+        event = self._event(metadata={})
+        transport = StubTransport(body={"count": 1, "items": [event]})
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertNotIn("(refute)", text)
+        self.assertNotIn("reason=", text)
+        self.assertNotIn("None", text)
+
+    def test_audit_multiline_injection_guard(self) -> None:
+        self.write_local_config()
+        injected = "\n2099-01-01 EvilEvent fake record"
+        event = self._event(
+            metadata={"transition_type": "refute", "reason": "line1" + injected},
+            actor_id="actor" + injected,
+            target_id="m-1" + injected,
+            target_type="memory" + injected,
+            actor_display="Alice" + injected,
+            target_display="Title" + injected,
+        )
+        transport = StubTransport(body={"count": 1, "items": [event]})
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        event_lines = [line for line in text.splitlines() if line.startswith("2026-07-03")]
+        self.assertEqual(1, len(event_lines))
+        self.assertNotIn("EvilEvent", "".join(l for l in text.splitlines() if "2099" in l and l != event_lines[0]) or "")
+
+        header_stub = StubTransport(body={"count": 0, "items": []})
+        header_text = mcp_tools.audit(
+            {"target_id": "X" + injected, "target_type": "memory_link" + injected},
+            self.config_dir,
+            header_stub,
+        )
+        header_lines = [line for line in header_text.splitlines() if line.startswith("audit trace")]
+        self.assertEqual(1, len(header_lines))
+
+    def test_audit_memory_get_links_injection_guard(self) -> None:
+        self.write_local_config()
+        injected = "\nfake links line"
+        transport = RouteStubTransport(
+            {
+                "/version": (
+                    200,
+                    {"count": 1, "items": [{"version": 1, "body": "body", "created_at": "2026-07-01T00:00:00Z"}]},
+                ),
+                "/links": (
+                    200,
+                    {
+                        "count": 1,
+                        "items": [
+                            {
+                                "link_id": "l-1",
+                                "link_type": "file",
+                                "target": "path" + injected,
+                                "label": "label" + injected,
+                                "created_at": "2026-07-01T00:00:00Z",
+                            }
+                        ],
+                    },
+                ),
+            }
+        )
+
+        text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        links_lines = [line for line in text.splitlines() if line.startswith("links:")]
+        self.assertEqual(1, len(links_lines))
+
+    def test_audit_single_request_and_truncation_note(self) -> None:
+        self.write_local_config()
+        items = [self._event(created_at=f"2026-07-{index:02d}T00:00:00Z", actor_id=f"a-{index}") for index in range(20)]
+        transport = StubTransport(body={"count": 25, "items": items})
+
+        text = mcp_tools.audit({"memory_id": "m-1", "limit": 20}, self.config_dir, transport)
+
+        self.assertEqual(1, len(transport.calls))
+        url = transport.calls[0][1]
+        self.assertNotIn("offset", url)
+        self.assertIn("ordering=-created_at", url)
+        self.assertIn("limit=20", url)
+        self.assertIn(
+            "(showing most recent 20 of 25 events; 5 older omitted — narrow with since/until/event_type)",
+            text,
+        )
+        event_lines = [line for line in text.splitlines() if line.startswith("2026-07-")]
+        self.assertEqual([f"a-{index}" for index in range(20)], [line.split("actor=")[1].split(" ")[0] for line in event_lines])
+
+    def test_audit_no_note_when_count_le_limit(self) -> None:
+        self.write_local_config()
+        for count in (12, 20):
+            items = [self._event(actor_id=f"a-{index}") for index in range(count)]
+            transport = StubTransport(body={"count": count, "items": items})
+
+            text = mcp_tools.audit({"memory_id": "m-1", "limit": 20}, self.config_dir, transport)
+
+            self.assertEqual(1, len(transport.calls))
+            self.assertNotIn("showing most recent", text)
+
+    def test_audit_missing_capability(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            status=403,
+            body={"code": "missing_capability", "error_code": "missing_capability", "detail": "no"},
+        )
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("audit:read", text)
+
+    def test_audit_and_memory_get_project_scope_denied(self) -> None:
+        self.write_local_config()
+        body = {"code": "project_scope_denied", "error_code": "project_scope_denied", "detail": "no"}
+
+        audit_text = mcp_tools.audit(
+            {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+        )
+        get_text = mcp_tools.memory_get(
+            {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+        )
+
+        for text in (audit_text, get_text):
+            self.assertIn("cannot resolve project", text)
+            self.assertNotIn("audit:read", text)
+            self.assertNotIn("memories:read", text)
+
+    def test_audit_and_memory_get_team_scope_denied(self) -> None:
+        self.write_local_config()
+        body = {"code": "team_scope_denied", "error_code": "team_scope_denied", "detail": "no"}
+
+        audit_text = mcp_tools.audit(
+            {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+        )
+        get_text = mcp_tools.memory_get(
+            {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+        )
+
+        for text in (audit_text, get_text):
+            self.assertIn("cannot access team", text)
+            self.assertNotIn("audit:read", text)
+            self.assertNotIn("cannot resolve project", text)
+
+    def test_audit_missing_project_id_makes_no_call(self) -> None:
+        self.write_local_config(project_id="")
+        transport = StubTransport(body={"count": 0, "items": []})
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("needs a project_id", text)
+        self.assertEqual([], transport.calls)
+
+    def test_audit_empty_result(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"count": 0, "items": []})
+
+        text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("audit trace for memory m-1", text)
+        self.assertIn("No audit events found.", text)
 
 
 if __name__ == "__main__":

@@ -131,6 +131,7 @@ def build_tools(
         "engram_memory_version": bind(update_memory_version),
         "engram_memory_feedback": bind(submit_memory_feedback),
         "engram_memory_get": bind(memory_get),
+        "engram_audit": bind(audit),
     }
 
 
@@ -440,6 +441,58 @@ def memory_get(
         diff,
         diff_error,
     )
+
+
+def audit(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    if not runtime.project_id:
+        return read_tools.audit_needs_project_message()
+
+    limit = _as_int(arguments.get("limit")) or 20
+    target_id = as_string(arguments.get("target_id")) or as_string(arguments.get("memory_id"))
+    target_type = ""
+    if target_id:
+        target_type = as_string(arguments.get("target_type")) or "memory"
+
+    params: dict[str, str] = {
+        "project_id": runtime.project_id,
+        "ordering": "-created_at",
+        "limit": str(limit),
+    }
+    if target_id:
+        params["target_id"] = target_id
+        params["target_type"] = target_type
+    for key in ("event_type", "correlation_id", "since", "until"):
+        value = as_string(arguments.get(key))
+        if value:
+            params[key] = value
+    if runtime.team_id:
+        params["team_id"] = runtime.team_id
+
+    status, body = get_json(
+        transport=transport,
+        server_url=runtime.server_url,
+        path="/v1/inspection/audit-events",
+        api_key=runtime.api_key,
+        params=params,
+    )
+    if status == 403:
+        code = as_string(body.get("code"))
+        if code == "missing_capability":
+            return read_tools.audit_missing_capability_message()
+        if code == "project_scope_denied":
+            return read_tools.project_scope_denied_message(runtime.project_id)
+        if code == "team_scope_denied":
+            return read_tools.team_scope_denied_message(runtime.team_id, target_id)
+    if status != 200:
+        return _error_text(status, body)
+
+    return read_tools.render_audit(target_id, target_type, limit, body)
 
 
 def _read_optional_json(path: Path) -> dict[str, object]:
