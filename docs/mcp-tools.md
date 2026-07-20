@@ -36,11 +36,12 @@ Desktop, or directly over stdio for any other client.
 | `engram_memory_link`      | shipped extra, beyond the original catalog      | attach a file/symbol/commit/issue link to an approved memory      |
 | `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the resolved project                |
 | `engram_memory_version`   | shipped extra, beyond the original catalog      | update an approved memory body, creating a new reviewed version   |
-| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | mark an injected memory stale or refuted, with a reason         |
+| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted`/`confirmed`) | mark an injected memory stale/refuted, or confirm it is still accurate, with a reason |
 
 All six are developer-scoped. Any actor whose API key resolves read/write
-capability for the target memory can call them; there is no separate
-lead/curator tool set yet. All six also accept an optional per-call
+capability for the target memory can call them, except
+`engram_memory_feedback`, which requires the `memories:review` capability (a read/write key alone gets 403);
+there is no separate lead/curator tool set yet. All six also accept an optional per-call
 `project_id` argument and fall back to a repository-derived project when
 neither it nor `ENGRAM_PROJECT_ID`/config resolve one - see
 [guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
