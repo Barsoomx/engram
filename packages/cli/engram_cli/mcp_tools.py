@@ -146,6 +146,7 @@ def search_memory(
             "file_paths": arguments.get("file_paths") or [],
             "symbols": arguments.get("symbols") or [],
             "limit": arguments.get("limit") or 5,
+            "request_id": _new_request_id(arguments),
         },
     )
     status, body = post_json(
@@ -261,6 +262,7 @@ def list_observations(
         return error
 
     params: dict[str, str] = {"limit": str(arguments.get("limit") or 10)}
+    params["request_id"] = _new_request_id(arguments)
     if runtime.project_id:
         params["project_id"] = runtime.project_id
     elif runtime.repository_url:

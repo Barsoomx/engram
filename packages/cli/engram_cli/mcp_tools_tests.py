@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -422,6 +423,42 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("/v1/observations/", url)
         self.assertIn("limit=3", url)
         self.assertIsNone(payload)
+
+    def test_search_forwards_request_id_argument(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "request_id": "req-1"}, self.config_dir, transport
+        )
+
+        self.assertEqual("req-1", transport.calls[0][3]["request_id"])
+
+    def test_search_generates_request_id_when_absent(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertTrue(transport.calls[0][3]["request_id"].startswith("mcp-"))
+
+    def test_observations_forwards_request_id_argument(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations(
+            {"request_id": "req-2"}, self.config_dir, transport
+        )
+
+        self.assertIn("request_id=req-2", transport.calls[0][1])
+        self.assertIsNone(transport.calls[0][3])
+
+    def test_observations_generates_request_id_when_absent(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations({}, self.config_dir, transport)
+
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(transport.calls[0][1]).query
+        )
+        self.assertTrue(query["request_id"][0].startswith("mcp-"))
 
     def test_feedback_validates_action(self) -> None:
         self.write_local_config()
