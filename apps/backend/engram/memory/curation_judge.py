@@ -486,10 +486,15 @@ def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> Curation
         selected = next((item for item in comparisons if item.memory_version_id == target_id), None)
         if selected is None or selected.relation != payload['relation']:
             raise CurationJudgeError('judge_invalid_output')
-    elif payload['outcome'] in _TARGETLESS_OUTCOMES and any(
-        comparison.relation in _IDENTITY_RELATIONS for comparison in comparisons
-    ):
-        raise CurationJudgeError('judge_invalid_output')
+    elif payload['outcome'] in _TARGETLESS_OUTCOMES:
+        candidate_pair = (data.effective_scope.visibility_scope, data.effective_scope.team_id)
+        entries_by_version = {entry.memory_version_id: entry for entry in data.shortlist.entries}
+        for comparison in comparisons:
+            if comparison.relation not in _IDENTITY_RELATIONS:
+                continue
+            entry = entries_by_version.get(comparison.memory_version_id)
+            if entry is None or (entry.visibility_scope, entry.team_id) == candidate_pair:
+                raise CurationJudgeError('judge_invalid_output')
 
     reason = payload['reason']
     if not isinstance(reason, str) or not (1 <= len(reason) <= 500) or SECRET_STRING_RE.search(reason):

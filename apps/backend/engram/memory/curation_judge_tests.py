@@ -1373,3 +1373,267 @@ def test_same_visibility_baseline_forbids_revise_supersede_and_unsupported(
         module._apply_evidence_policy(verdict, data)
 
     assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> '_FakeResponse':
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+
+def _opener_returning(body: bytes) -> object:
+    def opener(request: object, timeout: float = 30) -> _FakeResponse:
+        opener.requests.append(request)
+
+        return _FakeResponse(body)
+
+    opener.requests = []
+
+    return opener
+
+
+def _completion_bytes(payload: dict[str, object]) -> bytes:
+    return json.dumps({'choices': [{'message': {'content': json.dumps(payload)}}]}).encode()
+
+
+def _agent_parse_data_for(
+    candidate: MemoryCandidate,
+    scope: tuple[object, object, object],
+    target_specs: list[tuple[str, bool]],
+) -> tuple[object, object, list[object]]:
+    module = _judge_module()
+    shortlist_module = _shortlist_module()
+    team_id = candidate.team_id
+    entries: list[object] = []
+    targets: dict[uuid.UUID, object] = {}
+    for index, (visibility, use_candidate_team) in enumerate(target_specs):
+        version_id = uuid.uuid4()
+        target_team = team_id if use_candidate_team else None
+        entries.append(
+            shortlist_module.CurationShortlistEntry(
+                memory_id=uuid.uuid4(),
+                memory_version_id=version_id,
+                current_transition_id=uuid.uuid4(),
+                visibility_scope=visibility,
+                team_id=target_team,
+                title=f'Target {index}',
+                body=f'Target body {index}',
+                kind='decision',
+                body_hash='a' * 64,
+                exact_overlap=0,
+                vector_distance=0.1,
+                lexical_rank=0.0,
+                trigram_similarity=0.0,
+                has_open_conflict=False,
+            )
+        )
+        targets[version_id] = module.ClaimEvidence(
+            tier='supported', refs=(f'target-ref-{index}',), latest_evidence_at=None
+        )
+    shortlist = shortlist_module.CurationShortlist(
+        entries=tuple(entries),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=len(entries),
+        comparison_complete=True,
+    )
+    evidence = module.CurationEvidenceContext(
+        candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',), latest_evidence_at=None),
+        targets=targets,
+    )
+    data = module.CurationJudgeInput(
+        organization_id=scope[0].id,
+        project_id=scope[1].id,
+        candidate_id=candidate.id,
+        candidate=SanitizedCandidateView(
+            title='Agent title',
+            body='Agent body',
+            kind='decision',
+            evidence=(),
+            content_hash='c' * 64,
+            redaction_codes=(),
+        ),
+        effective_scope=EffectiveCandidateScope(VisibilityScope.TEAM, team_id),
+        shortlist=shortlist,
+        evidence=evidence,
+        request_id='judge-agent-parse',
+        trace_id='judge-agent-parse-trace',
+    )
+    return module, data, entries
+
+
+def _agent_parse_data(target_specs: list[tuple[str, bool]]) -> tuple[object, object, list[object]]:
+    candidate, _source, scope = provenanced_candidate(f'judge-agent-parse-{uuid.uuid4().hex[:8]}')
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+
+    return _agent_parse_data_for(candidate, scope, target_specs)
+
+
+@pytest.mark.django_db
+def test_publish_new_allows_cross_visibility_identity_comparison() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'distinct claim against a project-global target',
+    }
+
+    verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'publish_new'
+    assert verdict.relation == 'compatible_distinct'
+    assert verdict.target_memory_version_id is None
+
+
+@pytest.mark.django_db
+def test_publish_new_still_rejects_same_visibility_identity_comparison() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.TEAM, True)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'same-visibility identity should block targetless publish',
+    }
+
+    with pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+
+
+@pytest.mark.django_db
+def test_same_visibility_target_merges_over_targetless_publish() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False), (VisibilityScope.TEAM, True)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'merge_evidence',
+        'relation': 'equivalent',
+        'target_memory_version_id': str(entries[1].memory_version_id),
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            },
+            {
+                'memory_version_id': str(entries[1].memory_version_id),
+                'relation': 'equivalent',
+                'target_evidence_refs': ['target-ref-1'],
+            },
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'equivalent_claim',
+        'reason': 'equivalent to same-visibility target',
+    }
+
+    verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'merge_evidence'
+    assert verdict.target_memory_version_id == entries[1].memory_version_id
+
+
+@pytest.mark.django_db
+def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engram.model_policy.services import OpenAICompatibleGateway
+
+    module = _judge_module()
+    candidate, _source, scope = provenanced_candidate('judge-agent-provider')
+    organization, project, session = scope
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+    create_curation_policy(organization, session.team, project, task_type='curation')
+    _module, data, entries = _agent_parse_data_for(candidate, scope, [(VisibilityScope.PROJECT, False)])
+
+    publish_payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'distinct claim',
+    }
+    opener = _opener_returning(_completion_bytes(publish_payload))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_a, **_k: gateway)
+
+    result = module.JudgeCurationCandidate().execute(data)
+
+    assert b'cross-visibility' in opener.requests[0].data.lower()
+    assert result.verdict.outcome == 'publish_new'
+    assert result.verdict.target_memory_version_id is None
+
+    conflict_payload = {
+        'schema_version': 1,
+        'outcome': 'open_conflict',
+        'relation': 'mutually_incompatible',
+        'target_memory_version_id': str(entries[0].memory_version_id),
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'unordered',
+        'reason_code': 'same_scope_contradiction',
+        'reason': 'rule-ignoring conflict',
+    }
+    opener_conflict = _opener_returning(_completion_bytes(conflict_payload))
+    gateway_conflict = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1', api_key='key', opener=opener_conflict
+    )
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_a, **_k: gateway_conflict)
+
+    with pytest.raises(ValueError) as error:
+        module.JudgeCurationCandidate().execute(data)
+
+    assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'

@@ -1222,7 +1222,17 @@ _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
     'reason (a short redacted explanation, at most 500 characters). '
     'Only reference memory_version_id values and evidence tokens present in the input. '
     'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
-    'must equal the top-level relation.'
+    'must equal the top-level relation. '
+    'Cross-visibility rule: the shortlist may include targets at a wider visibility than the candidate '
+    '(for a team candidate, project-global targets have a different team_id). Never select such a '
+    'cross-visibility target as target_memory_version_id for merge_evidence, revise_memory, '
+    'supersede_memory, or open_conflict. When a same-visibility target (same team_id as the candidate) '
+    'carries an identity relation (equivalent, candidate_revises, candidate_supersedes, '
+    'mutually_incompatible), act on that same-visibility target with its normal targeted outcome. '
+    'Only when no same-visibility target carries an identity relation, fall back to '
+    'outcome=publish_new, relation=compatible_distinct, reason_code=distinct_claim, '
+    'target_memory_version_id=null, and report the honest per-target relation (including '
+    'mutually_incompatible against a cross-visibility target) only inside the comparisons array.'
 )
 
 
