@@ -1,7 +1,7 @@
 # Engram for Codex
 
 Native Codex plugin for Engram's shared engineering memory. It bundles the thin
-Engram connector, four lifecycle hooks, six MCP tools, and three memory skills.
+Engram connector, four lifecycle hooks, seven MCP tools, and three memory skills.
 
 ## Install
 

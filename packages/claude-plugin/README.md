@@ -16,7 +16,8 @@ Claude Code into that memory:
 - Forwards each event to the Engram server via the bundled hook runtime
   (`hooks/hook.py`, which vendors the thin `engram_cli` client).
 - Registers the bundled Engram MCP server (`hooks/mcp.py`) so Claude Code can
-  call memory tools (search, context, link, observations, version, feedback)
+  call memory tools (search, context, link, observations, version, feedback,
+  propose)
   directly during a session.
 - Lets future Claude Code sessions recall relevant, server-backed context.
 
