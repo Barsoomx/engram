@@ -304,27 +304,57 @@ def _clear_block(work: WorkflowWork) -> None:
     work.execution_state = WorkflowWorkExecutionState.READY
     work.blocked_configuration_fingerprint = ''
     work.failure_streak = 0
-    work.save(
-        update_fields=['execution_state', 'blocked_configuration_fingerprint', 'failure_streak', 'updated_at']
-    )
+    work.save(update_fields=['execution_state', 'blocked_configuration_fingerprint', 'failure_streak', 'updated_at'])
 
     return
 
 
-def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
+def _resolve_repair_target(candidate_id: uuid.UUID) -> tuple[uuid.UUID, set[uuid.UUID]] | None:
     try:
-        MemoryCandidate.objects.get(
+        candidate = MemoryCandidate.objects.get(
             id=candidate_id,
             status=CandidateStatus.PROPOSED,
             decision_work_contract_version=1,
         )
     except MemoryCandidate.DoesNotExist:
-        return False
-    pre_source_ids = set(
-        MemoryCandidateSource.objects.filter(candidate_id=candidate_id).values_list('id', flat=True)
+        return None
+    sources = list(
+        MemoryCandidateSource.objects.filter(candidate_id=candidate_id)
+        .select_related('window', 'observation', 'stage')
+        .order_by('window_id', 'observation_id', 'id')
+    )
+    if {source.source_kind for source in sources} not in _SUPPORTED_SOURCE_KINDS:
+        return None
+    with transaction.atomic():
+        work, _created = ensure_candidate_decision_work_locked(candidate, sources=sources)
+
+    return work.id, {source.id for source in sources}
+
+
+def _lock_work_and_runs(work_id: uuid.UUID) -> tuple[WorkflowWork | None, list[WorkflowRun]]:
+    try:
+        work = WorkflowWork.objects.select_for_update().get(id=work_id)
+    except WorkflowWork.DoesNotExist:
+        return None, []
+    runs = list(
+        WorkflowRun.objects.select_for_update()
+        .filter(work_id=work.id, execution_contract_version=1)
+        .order_by('created_at', 'id')
     )
 
+    return work, runs
+
+
+def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
+    resolved = _resolve_repair_target(candidate_id)
+    if resolved is None:
+        return False
+    work_id, pre_source_ids = resolved
+
     with transaction.atomic():
+        work, runs = _lock_work_and_runs(work_id)
+        if work is None:
+            return False
         try:
             locked = MemoryCandidate.objects.select_for_update().get(
                 id=candidate_id,
@@ -342,19 +372,10 @@ def _repair_candidate(*, candidate_id: uuid.UUID, as_of: datetime) -> bool:
         )
         if {source.id for source in all_sources} != pre_source_ids:
             return False
-
-        kinds = {source.source_kind for source in all_sources}
-        if kinds not in _SUPPORTED_SOURCE_KINDS:
+        if {source.source_kind for source in all_sources} not in _SUPPORTED_SOURCE_KINDS:
             return False
-
-        work, _created = ensure_candidate_decision_work_locked(locked, sources=all_sources)
         if work.disposition != WorkflowWorkDisposition.REQUIRED:
             return False
-        runs = list(
-            WorkflowRun.objects.select_for_update()
-            .filter(work_id=work.id, execution_contract_version=1)
-            .order_by('created_at', 'id')
-        )
         action = _repair_action(work, runs, as_of)
         if action == 'skip':
             return False
