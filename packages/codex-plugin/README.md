@@ -1,7 +1,7 @@
 # Engram for Codex
 
 Native Codex plugin for Engram's shared engineering memory. It bundles the thin
-Engram connector, four lifecycle hooks, six MCP tools, and three memory skills.
+Engram connector, four lifecycle hooks, eight MCP tools, and three memory skills.
 
 ## Install
 
@@ -38,8 +38,10 @@ event. Hook HTTP calls keep an explicit 10-second network timeout inside the
 larger Codex handler budgets.
 
 The bundled MCP bridge exposes `engram_search`, `engram_context`,
-`engram_memory_link`, `engram_observations`, `engram_memory_version`, and
-`engram_memory_feedback` without a separate MCP installation.
+`engram_memory_link`, `engram_observations`, `engram_memory_version`,
+`engram_memory_feedback`, `engram_memory_get`, and `engram_audit` without a
+separate MCP installation. `engram_audit` needs a resolved `project_id` and has
+no repository-URL fallback; the other seven accept a repository-derived project.
 
 Codex starts bundled MCP processes from its plugin cache. Engram scopes each
 tool call from Codex's matching per-turn workspace metadata instead of that

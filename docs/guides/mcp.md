@@ -105,8 +105,8 @@ plain-text message telling the caller to run `engram connect` or set
 
 ### Project precedence ladder
 
-All six tools resolve which project a call targets with the same ladder, in
-order:
+Seven of the eight tools resolve which project a call targets with the same
+ladder, in order (`engram_audit` is the exception — see below):
 
 1. the tool's own optional `project_id` argument (a per-call override);
 2. `ENGRAM_PROJECT_ID`;
@@ -116,12 +116,15 @@ order:
    `repository_url` instead of `project_id`.
 
 Rung 4 is the default in the plug-and-play setup (org-wide agent key,
-`engram connect` run without `--project`), and all six tools - including
-`engram_memory_link`, `engram_observations`, `engram_memory_version`, and
-`engram_memory_feedback` - work in that mode. The server always
-re-authorizes whichever project a request resolves to, so no rung can expand
-scope beyond the key's own binding. This is the one place the ladder is
-documented; [mcp-tools.md](../mcp-tools.md), [cli.md](cli.md), and
+`engram connect` run without `--project`), and seven of the eight tools -
+including `engram_memory_link`, `engram_observations`, `engram_memory_version`,
+`engram_memory_feedback`, and `engram_memory_get` - work in that mode.
+`engram_audit` is the exception: it reads the inspection audit-events endpoint,
+which requires a resolved `project_id`, so rung 4 (repository-URL only) does not
+satisfy it — it returns a friendly "needs a project_id" message instead. The
+server always re-authorizes whichever project a request resolves to, so no rung
+can expand scope beyond the key's own binding. This is the one place the ladder
+is documented; [mcp-tools.md](../mcp-tools.md), [cli.md](cli.md), and
 [backend-contracts.md](../backend-contracts.md) reference it instead of
 restating it.
 
@@ -163,7 +166,7 @@ fails closed unless the tool call or local connection supplies an explicit
 
 ## Tool set
 
-Six tools ship today. See [../mcp-tools.md](../mcp-tools.md) for the full
+Eight tools ship today. See [../mcp-tools.md](../mcp-tools.md) for the full
 catalog, the mapping to the original conceptual tool names, and the tools that
 are explicitly deferred.
 
@@ -175,6 +178,8 @@ are explicitly deferred.
 | `engram_observations`     | `GET /v1/observations/`               |
 | `engram_memory_version`   | `POST /v1/memories/{id}/version`      |
 | `engram_memory_feedback`  | `POST /v1/memories/{id}/feedback`     |
+| `engram_memory_get`       | `GET /v1/memories/{id}/version` + `/links` (+ `/diff`) |
+| `engram_audit`            | `GET /v1/inspection/audit-events` (project-scoped only) |
 
 ## Authorization
 

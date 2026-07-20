@@ -24,7 +24,7 @@ The MCP server:
 
 ## Shipped Tool Set (V1)
 
-Six tools ship in `engram mcp serve`
+Eight tools ship in `engram mcp serve`
 (`packages/cli/engram_cli/mcp_tools.py` + `mcp_server.py`), delivered
 automatically with the Claude Code plugin, via `engram mcp install` for Claude
 Desktop, or directly over stdio for any other client.
@@ -37,13 +37,18 @@ Desktop, or directly over stdio for any other client.
 | `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the resolved project                |
 | `engram_memory_version`   | shipped extra, beyond the original catalog      | update an approved memory body, creating a new reviewed version   |
 | `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | mark an injected memory stale or refuted, with a reason         |
+| `engram_memory_get`       | shipped extra, beyond the original catalog      | read one memory in full (untruncated body, versions, links) by id |
+| `engram_audit`            | shipped extra, beyond the original catalog      | list a memory's own recorded audit events (project-scoped only)   |
 
-All six are developer-scoped. Any actor whose API key resolves read/write
+All eight are developer-scoped. Any actor whose API key resolves read/write
 capability for the target memory can call them; there is no separate
-lead/curator tool set yet. All six also accept an optional per-call
+lead/curator tool set yet. Seven of the eight also accept an optional per-call
 `project_id` argument and fall back to a repository-derived project when
 neither it nor `ENGRAM_PROJECT_ID`/config resolve one - see
 [guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
+`engram_audit` is the exception: it reads the inspection audit-events endpoint,
+which requires a resolved `project_id`, so it has no repository-URL fallback and
+returns a friendly "needs a project_id" message when only a repository resolves.
 
 `engram_search` renders each result line as
 `[<citation>] <title> (memory_id=<id>) [<kind>, conf <confidence>]`. The
