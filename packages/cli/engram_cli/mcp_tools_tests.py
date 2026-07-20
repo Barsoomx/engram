@@ -29,6 +29,32 @@ class StubTransport:
         return self.status, self.body
 
 
+class RouteStubTransport:
+    def __init__(
+        self,
+        routes: dict[str, tuple[int, dict]],
+        default: tuple[int, dict] = (404, {}),
+    ) -> None:
+        self.routes = routes
+        self.default = default
+        self.calls: list[tuple[str, str, dict, dict | None, float]] = []
+
+    def __call__(
+        self,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, object] | None,
+        timeout: float,
+    ) -> tuple[int, dict[str, object]]:
+        self.calls.append((method, url, headers, payload, timeout))
+        for substring, response in self.routes.items():
+            if substring in url:
+                return response
+
+        return self.default
+
+
 ENV_KEYS = (
     "ENGRAM_SERVER_URL",
     "ENGRAM_API_KEY",
@@ -528,20 +554,10 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("project_id=arg-project", transport.calls[0][1])
         self.assertNotIn("repository_url=", transport.calls[0][1])
 
-    def test_build_tools_exposes_six_tools(self) -> None:
+    def test_build_tools_exposes_memory_get(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())
 
-        self.assertEqual(
-            [
-                "engram_search",
-                "engram_context",
-                "engram_memory_link",
-                "engram_observations",
-                "engram_memory_version",
-                "engram_memory_feedback",
-            ],
-            list(tools.keys()),
-        )
+        self.assertIn("engram_memory_get", tools)
 
     def test_build_tools_forwards_config_dir_and_transport(self) -> None:
         self.write_local_config()
@@ -551,6 +567,206 @@ class McpToolsTests(unittest.TestCase):
 
         self.assertEqual(1, len(transport.calls))
         self.assertTrue(transport.calls[0][1].endswith("/v1/search/"))
+
+
+class MemoryGetToolTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._env = {key: os.environ.pop(key, None) for key in ENV_KEYS}
+        self._tmp = tempfile.TemporaryDirectory(prefix="engram-mcp-get-tests-")
+        self.config_dir = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+        for key, value in self._env.items():
+            if value is not None:
+                os.environ[key] = value
+            else:
+                os.environ.pop(key, None)
+
+    def write_local_config(self, *, project_id: str = "11111111-1111-1111-1111-111111111111") -> None:
+        root = Path(self.config_dir)
+        config: dict[str, object] = {"server_url": "http://server.local"}
+        if project_id:
+            config["project_id"] = project_id
+        root.joinpath("config.json").write_text(json.dumps(config), encoding="utf-8")
+        root.joinpath("credentials.json").write_text(
+            json.dumps({"api_key": "egk_file_key"}), encoding="utf-8"
+        )
+
+    def _version_body(self) -> dict:
+        return {
+            "count": 3,
+            "items": [
+                {"version": 3, "body": "C" * 500, "created_at": "2026-07-03T00:00:00Z"},
+                {"version": 2, "body": "older v2", "created_at": "2026-07-02T00:00:00Z"},
+                {"version": 1, "body": "older v1", "created_at": "2026-07-01T00:00:00Z"},
+            ],
+        }
+
+    def _links_body(self) -> dict:
+        return {
+            "count": 2,
+            "items": [
+                {
+                    "link_id": "l-1",
+                    "link_type": "narrowed_by",
+                    "target": "memory-target-1",
+                    "label": "narrowing label",
+                    "created_at": "2026-07-03T00:00:00Z",
+                },
+                {
+                    "link_id": "l-2",
+                    "link_type": "file",
+                    "target": "apps/backend/x.py",
+                    "label": "",
+                    "created_at": "2026-07-03T00:00:00Z",
+                },
+            ],
+        }
+
+    def test_memory_get_renders_body_versions_and_links(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (200, self._links_body()),
+            }
+        )
+
+        text = mcp_tools.memory_get(
+            {"memory_id": "m-1"}, self.config_dir, transport
+        )
+
+        self.assertIn("C" * 500, text)
+        self.assertIn("versions: v3 (2026-07-03T00:00:00Z), v2 (2026-07-02T00:00:00Z), v1 (2026-07-01T00:00:00Z)", text)
+        self.assertIn("narrowed_by: memory-target-1 (narrowing label)", text)
+        self.assertIn("file: apps/backend/x.py", text)
+        self.assertNotIn("file: apps/backend/x.py ()", text)
+        self.assertIn("engram_search", text)
+        self.assertFalse(any("/v1/inspection/memories/" in call[1] for call in transport.calls))
+
+    def test_memory_get_repo_only_routing(self) -> None:
+        self.write_local_config(project_id="")
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (200, self._links_body()),
+            }
+        )
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("C" * 500, text)
+        self.assertIn("versions: v3", text)
+        self.assertIn("links:", text)
+        version_calls = [c for c in transport.calls if "/version" in c[1]]
+        links_calls = [c for c in transport.calls if "/links" in c[1]]
+        self.assertTrue(version_calls and "repository_url=https" in version_calls[0][1])
+        self.assertTrue(links_calls and "repository_url=https" in links_calls[0][1])
+        self.assertFalse(any("/v1/inspection/memories/" in call[1] for call in transport.calls))
+
+    def test_memory_get_diff_addendum(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (200, self._links_body()),
+                "/diff": (
+                    200,
+                    {
+                        "from": {"version": 1, "body": "from body", "created_at": "2026-07-01T00:00:00Z"},
+                        "to": {"version": 2, "body": "to body", "created_at": "2026-07-02T00:00:00Z"},
+                    },
+                ),
+            }
+        )
+
+        text = mcp_tools.memory_get(
+            {"memory_id": "m-1", "from_version": 1, "to_version": 2}, self.config_dir, transport
+        )
+
+        self.assertIn("from body", text)
+        self.assertIn("to body", text)
+        diff_calls = [c for c in transport.calls if "/diff" in c[1]]
+        self.assertEqual(1, len(diff_calls))
+        self.assertIn("from_version=1", diff_calls[0][1])
+        self.assertIn("to_version=2", diff_calls[0][1])
+
+    def test_memory_get_no_diff_for_one_sided_or_nonpositive(self) -> None:
+        for from_version, to_version in ((3, 0), (0, 3), (0, 0), (-1, 2)):
+            self.write_local_config()
+            transport = RouteStubTransport(
+                {
+                    "/version": (200, self._version_body()),
+                    "/links": (200, self._links_body()),
+                }
+            )
+
+            text = mcp_tools.memory_get(
+                {"memory_id": "m-1", "from_version": from_version, "to_version": to_version},
+                self.config_dir,
+                transport,
+            )
+
+            self.assertFalse(any("/diff" in c[1] for c in transport.calls), (from_version, to_version))
+            self.assertIn("C" * 500, text)
+
+    def test_memory_get_diff_404_tolerated(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (200, self._links_body()),
+                "/diff": (404, {"code": "version_not_found"}),
+            }
+        )
+
+        text = mcp_tools.memory_get(
+            {"memory_id": "m-1", "from_version": 1, "to_version": 2}, self.config_dir, transport
+        )
+
+        self.assertIn("C" * 500, text)
+        self.assertIn("diff unavailable", text)
+        self.assertNotIn("Engram call failed", text)
+
+    def test_memory_get_empty_version_returns_not_found_and_skips_links(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport({"/version": (200, {"count": 0, "items": []})})
+
+        text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("not found", text.lower())
+        self.assertFalse(any("/links" in c[1] for c in transport.calls))
+
+    def test_memory_get_links_failure_surfaced(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (503, {}),
+            }
+        )
+
+        text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("C" * 500, text)
+        self.assertIn("links: unavailable (HTTP 503", text)
+
+    def test_memory_get_links_empty_omits_line(self) -> None:
+        self.write_local_config()
+        transport = RouteStubTransport(
+            {
+                "/version": (200, self._version_body()),
+                "/links": (200, {"count": 0, "items": []}),
+            }
+        )
+
+        text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertNotIn("links:", text)
+        self.assertNotIn("unavailable", text)
 
 
 if __name__ == "__main__":
