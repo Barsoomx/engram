@@ -434,3 +434,15 @@ def test_translate_failure_maps_provenance_to_invalid_input() -> None:
     assert failure.failure_class == 'invalid_input'
     assert failure.code == 'provenance'
     assert failure.configuration_fingerprint == ''
+
+
+def test_translate_failure_maps_scope_to_invalid_input() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(
+        MemoryTransitionError('scope', 'candidate is outside the declared scope'),
+    )
+
+    assert failure.failure_class == 'invalid_input'
+    assert failure.code == 'scope'
+    assert failure.configuration_fingerprint == ''

@@ -52,6 +52,7 @@ _CURATION_TRANSITION_CODE_MAP = {
     'judge_policy_denied': (PROVIDER_TRANSIENT, 'judge_policy_denied'),
     'judge_cross_visibility_denied': (INVALID_INPUT, 'judge_cross_visibility_denied'),
     'provenance': (INVALID_INPUT, 'provenance'),
+    'scope': (INVALID_INPUT, 'scope'),
     'embedding_policy_unavailable': (CONFIGURATION, 'embedding_policy_unavailable'),
     'judge_policy_unavailable': (CONFIGURATION, 'judge_policy_unavailable'),
     'candidate_decision_capability_unavailable': (CONFIGURATION, 'candidate_decision_capability_unavailable'),
