@@ -23,6 +23,7 @@ from engram.inspection.filters import (
     InspectionContextBundleFilterSet,
     InspectionMemoryFilterSet,
 )
+from engram.memory.conflict_predicate import open_memory_conflict_exists
 from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 
@@ -187,6 +188,7 @@ class ListInspectionMemories:
             )
             .filter(inspection_scope.team_filter)
             .select_related('project')
+            .annotate(has_open_conflict=open_memory_conflict_exists('pk'))
             .prefetch_related(
                 Prefetch(
                     'versions',
