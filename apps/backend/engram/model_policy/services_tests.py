@@ -471,6 +471,18 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
     )
 
 
+def test_curation_decision_prefix_lists_every_parser_identity_relation() -> None:
+    from engram.memory.curation_judge import _IDENTITY_RELATIONS
+
+    instructions = curation_schema_prompt_prefix('curation_decision_v1')
+    marker = 'carries an identity relation ('
+    start = instructions.index(marker) + len(marker)
+    end = instructions.index(')', start)
+    listed = {relation.strip() for relation in instructions[start:end].split(',')}
+
+    assert listed == set(_IDENTITY_RELATIONS)
+
+
 @pytest.mark.django_db
 def test_openai_single_kind_prompt_has_no_curation_schema_instructions() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
