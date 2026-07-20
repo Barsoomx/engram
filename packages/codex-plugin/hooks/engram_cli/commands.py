@@ -1808,12 +1808,19 @@ def run_mcp_install(
                 remediation_for("missing_credential"),
             )
         server_url = as_string(config.get("server_url"))
-        project_id = as_string(config.get("project_id"))
-        if not server_url or not project_id:
+        if not server_url:
             raise CliError(
                 "missing_config",
                 "Engram config is incomplete",
                 remediation_for("missing_config"),
+            )
+        project_id = as_string(config.get("project_id"))
+        if not project_id:
+            stderr.write(
+                "warning: no project_id configured; MCP memory will route by the "
+                "git remote of the working directory unless a project is selected "
+                "at serve time (ENGRAM_PROJECT_ID, or a per-call project_id "
+                "argument).\n"
             )
         targets = resolve_mcp_targets(args)
         entry = build_engram_mcp_entry(config_dir=args.config_dir)
