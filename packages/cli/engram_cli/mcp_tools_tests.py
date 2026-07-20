@@ -815,18 +815,24 @@ class McpToolsTests(unittest.TestCase):
 
     def test_observations_omits_string_filters_when_absent(self) -> None:
         self.write_local_config()
-        transport = StubTransport(body={"items": []})
-        mcp_tools.list_observations(
-            {"observation_type": "", "session_id": None},
-            self.config_dir,
-            transport,
-        )
+        for absent in (None, "", [], {}, ()):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.list_observations(
+                {
+                    "observation_type": absent,
+                    "session_id": absent,
+                    "since": absent,
+                    "until": absent,
+                },
+                self.config_dir,
+                transport,
+            )
 
-        params = query_params(transport.calls[0][1])
-        self.assertNotIn("observation_type", params)
-        self.assertNotIn("session_id", params)
-        self.assertNotIn("since", params)
-        self.assertNotIn("until", params)
+            params = query_params(transport.calls[0][1])
+            self.assertNotIn("observation_type", params)
+            self.assertNotIn("session_id", params)
+            self.assertNotIn("since", params)
+            self.assertNotIn("until", params)
 
     def test_observations_forwards_offset_when_non_zero(self) -> None:
         self.write_local_config()

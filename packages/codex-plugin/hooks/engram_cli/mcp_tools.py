@@ -460,10 +460,10 @@ def _optional_token_budget(arguments: dict[str, Any]) -> int | None:
 
 def _optional_string_param(arguments: dict[str, Any], name: str) -> str | None:
     value = arguments.get(name)
-    if value in (None, ""):
-        return None
     if isinstance(value, str):
-        return value
+        return value or None
+    if value is None or (isinstance(value, (list, tuple, set, dict)) and not value):
+        return None
 
     raise ValueError(f"{name} must be a string")
 
