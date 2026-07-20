@@ -51,6 +51,7 @@ from engram.memory.deterministic_gates import (
 from engram.memory.distillation_provenance import session_candidate_content_hash
 from engram.memory.import_provenance import (
     ImportProvenanceError,
+    agent_proposal_candidate_content_hash,
     candidate_evidence_manifest,
     import_source_metadata,
 )
@@ -285,25 +286,49 @@ def _scope_matches(
     )
 
 
+_PROMOTION_SOURCE_KINDS = frozenset(
+    {
+        MemoryCandidateSourceKind.DISTILLATION,
+        MemoryCandidateSourceKind.IMPORT,
+        MemoryCandidateSourceKind.AGENT_PROPOSAL,
+    }
+)
+_NON_PROMOTION_SOURCE_KINDS = frozenset(
+    {MemoryCandidateSourceKind.DISTILLATION, MemoryCandidateSourceKind.AGENT_PROPOSAL}
+)
+
+
 def _candidate_fence(
     candidate: MemoryCandidate,
     fence: CandidateFence,
     sources: list[MemoryCandidateSource],
     *,
-    allowed_source_kind: MemoryCandidateSourceKind,
+    allowed_source_kinds: frozenset[str],
 ) -> None:
     if candidate.id != fence.candidate_id:
         raise MemoryTransitionError(
             'stale_decision', 'candidate fence does not identify the locked candidate', retryable=True
         )
-    if any(source.source_kind != allowed_source_kind for source in sources):
+    kinds = {source.source_kind for source in sources}
+    if len(kinds) > 1:
+        raise MemoryTransitionError('provenance', 'candidate provenance has mixed source kinds')
+
+    if any(source.source_kind not in allowed_source_kinds for source in sources):
         raise MemoryTransitionError('provenance', 'candidate provenance source kind is not allowed')
     try:
         _entries, manifest_hash = candidate_evidence_manifest(candidate, sources=sources)
     except (ImportProvenanceError, ValueError, TypeError, AttributeError) as error:
         raise MemoryTransitionError('stale_decision', 'candidate provenance is invalid', retryable=True) from error
-    if allowed_source_kind == MemoryCandidateSourceKind.IMPORT:
+    source_kind = next(iter(kinds)) if kinds else None
+    if source_kind == MemoryCandidateSourceKind.IMPORT:
         canonical_content_hash = candidate.content_hash
+    elif source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+        if candidate.source_observation_id is not None:
+            raise MemoryTransitionError('provenance', 'agent candidate must not have a source observation')
+
+        canonical_content_hash = agent_proposal_candidate_content_hash(
+            candidate.title, candidate.body, candidate.kind, candidate.team_id
+        )
     else:
         session_id = candidate.source_observation.session_id if candidate.source_observation_id else None
         if session_id is None and sources:
@@ -1328,7 +1353,7 @@ def _promotion_uses_import_source(
                 'import promotion does not accept candidate decision work',
                 retryable=True,
             )
-    elif any(source.source_kind != MemoryCandidateSourceKind.DISTILLATION for source in sources):
+    elif any(source.source_kind not in _NON_PROMOTION_SOURCE_KINDS for source in sources):
         raise MemoryTransitionError('provenance', 'candidate provenance has mixed source kinds')
     if claimed_work is not None and not import_only:
         _require_claimed_candidate_work(claimed_work, candidate)
@@ -1422,9 +1447,7 @@ class PromoteMemoryCandidate:
                 candidate,
                 data.candidate_fence,
                 sources,
-                allowed_source_kind=(
-                    MemoryCandidateSourceKind.IMPORT if import_only else MemoryCandidateSourceKind.DISTILLATION
-                ),
+                allowed_source_kinds=_PROMOTION_SOURCE_KINDS,
             )
             _require_no_open_conflict(candidate)
             sanitized_view = _revalidated_sanitized_view(
@@ -1607,7 +1630,7 @@ class AttachPromotedCandidateSource:
                 candidate,
                 data.candidate_fence,
                 candidate_sources,
-                allowed_source_kind=MemoryCandidateSourceKind.DISTILLATION,
+                allowed_source_kinds=_NON_PROMOTION_SOURCE_KINDS,
             )
             if candidate.status != CandidateStatus.PROMOTED or candidate.promoted_memory_id is None:
                 raise MemoryTransitionError('candidate_state', 'candidate is not promoted')
@@ -1927,7 +1950,7 @@ def _execute_candidate_revision(
             candidate,
             data.candidate_fence,
             candidate_sources,
-            allowed_source_kind=MemoryCandidateSourceKind.DISTILLATION,
+            allowed_source_kinds=_NON_PROMOTION_SOURCE_KINDS,
         )
         _require_no_open_conflict(candidate)
         _require_proposed_candidate(candidate)
@@ -2115,7 +2138,7 @@ class SupersedeMemoryWithCandidate:
                 candidate,
                 data.candidate_fence,
                 candidate_sources,
-                allowed_source_kind=MemoryCandidateSourceKind.DISTILLATION,
+                allowed_source_kinds=_NON_PROMOTION_SOURCE_KINDS,
             )
             _require_no_open_conflict(candidate)
             _require_proposed_candidate(candidate)
@@ -2408,7 +2431,7 @@ class OpenMemoryConflict:
                 candidate,
                 data.candidate_fence,
                 candidate_sources,
-                allowed_source_kind=MemoryCandidateSourceKind.DISTILLATION,
+                allowed_source_kinds=_NON_PROMOTION_SOURCE_KINDS,
             )
             _require_proposed_candidate(candidate)
             if not candidate_sources:
@@ -2570,7 +2593,7 @@ def _validate_conflict_resolution_rows(
         locked.candidate,
         data.candidate_fence,
         locked.candidate_sources,
-        allowed_source_kind=MemoryCandidateSourceKind.DISTILLATION,
+        allowed_source_kinds=_NON_PROMOTION_SOURCE_KINDS,
     )
     _require_proposed_candidate(locked.candidate)
     if not locked.candidate_sources:
