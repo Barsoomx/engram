@@ -61,6 +61,9 @@ DEFAULT_MEMORY_ORDERING = '-created_at'
 CONTEXT_BUNDLE_ORDERING_FIELDS = ('created_at', '-created_at')
 DEFAULT_CONTEXT_BUNDLE_ORDERING = '-created_at'
 
+AUDIT_ORDERING_FIELDS = ('created_at', '-created_at')
+DEFAULT_AUDIT_ORDERING = 'created_at'
+
 
 class ListInspectionMemories:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[Memory]:
@@ -251,6 +254,8 @@ class ListInspectionContextBundles:
 
 class ListInspectionAuditEvents:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[AuditEvent]:
+        ordering = self._ordering(inspection_scope.ordering)
+        id_tiebreaker = '-id' if ordering.startswith('-') else 'id'
         qs = (
             AuditEvent.objects.filter(
                 organization_id=inspection_scope.scope.organization_id,
@@ -262,7 +267,7 @@ class ListInspectionAuditEvents:
                 target_type='audit_event',
                 capability='audit:read',
             )
-            .order_by('created_at', 'id')
+            .order_by(ordering, id_tiebreaker)
         )
         filter_data = {
             'event_type': inspection_scope.event_type,
@@ -274,6 +279,12 @@ class ListInspectionAuditEvents:
         }
 
         return InspectionAuditEventFilterSet(data=filter_data, queryset=qs).qs
+
+    def _ordering(self, ordering: str | None) -> str:
+        if ordering in AUDIT_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_AUDIT_ORDERING
 
     def detail(self, inspection_scope: InspectionScope, audit_event_id: uuid.UUID) -> AuditEvent:
         ae = (
