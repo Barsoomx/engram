@@ -4,6 +4,7 @@ import hashlib
 import uuid
 
 import pytest
+from django.db import transaction
 from django_celery_outbox.models import CeleryOutbox
 
 from engram.access.services import EffectiveScope
@@ -124,16 +125,32 @@ def test_propose_creates_proposed_candidate_with_agent_source(f_scope: tuple[Org
 
 
 @pytest.mark.django_db
-def test_propose_dispatches_within_transaction_via_outbox(f_scope: tuple[Organization, Project, Team]) -> None:
+def test_propose_dispatch_is_written_in_transaction_and_rolls_back_atomically(
+    f_scope: tuple[Organization, Project, Team],
+) -> None:
     organization, project, _team = f_scope
-    before = CeleryOutbox.objects.count()
+    before_outbox = CeleryOutbox.objects.count()
+    before_candidates = MemoryCandidate.objects.count()
 
-    result = ProposeMemory().execute(_input(_bearer_scope(organization), project))
+    class _RollbackError(Exception):
+        pass
 
-    candidate = MemoryCandidate.objects.get(id=result.candidate_id)
-    work = WorkflowWork.objects.get(subject_id=candidate.id, work_type=WorkflowWorkType.CANDIDATE_DECISION)
-    assert WorkflowRun.objects.filter(work_id=work.id).exists()
-    assert CeleryOutbox.objects.count() == before + 1
+    with pytest.raises(_RollbackError):
+        with transaction.atomic():
+            result = ProposeMemory().execute(_input(_bearer_scope(organization), project))
+            candidate = MemoryCandidate.objects.get(id=result.candidate_id)
+            work = WorkflowWork.objects.get(
+                subject_id=candidate.id,
+                work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            )
+            assert WorkflowRun.objects.filter(work_id=work.id).exists()
+            assert CeleryOutbox.objects.count() == before_outbox + 1
+
+            raise _RollbackError
+
+    assert MemoryCandidate.objects.count() == before_candidates
+    assert WorkflowWork.objects.filter(work_type=WorkflowWorkType.CANDIDATE_DECISION).count() == 0
+    assert CeleryOutbox.objects.count() == before_outbox
 
 
 @pytest.mark.django_db
