@@ -38,7 +38,7 @@ from engram.memory.candidate_decision_work import (
     get_candidate_decision_work_builder,
 )
 from engram.memory.import_provenance import agent_proposal_evidence_manifest
-from engram.memory.work_execution import claim_work, fail_work_claim
+from engram.memory.work_execution import claim_work, execution_configuration_fingerprint, fail_work_claim
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -528,6 +528,8 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
         ),
     )
     assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = execution_configuration_fingerprint(work)
+    work.save(update_fields=['blocked_configuration_fingerprint', 'updated_at'])
     sent = _collect_sent(monkeypatch)
 
     result = candidate_work_reconciler.reconcile_candidate_work(
