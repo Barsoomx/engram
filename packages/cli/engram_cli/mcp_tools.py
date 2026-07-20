@@ -40,6 +40,7 @@ def resolve_runtime(
     *,
     project_override: str = "",
     repository_override: str | None = None,
+    team_override: str = "",
 ) -> McpRuntime | None:
     paths = local_paths(config_dir)
     config = _read_optional_json(paths.config)
@@ -53,7 +54,11 @@ def resolve_runtime(
         or os.environ.get("ENGRAM_PROJECT_ID")
         or as_string(config.get("project_id"))
     )
-    team_id = os.environ.get("ENGRAM_TEAM_ID") or as_string(config.get("team_id"))
+    team_id = (
+        team_override
+        or os.environ.get("ENGRAM_TEAM_ID")
+        or as_string(config.get("team_id"))
+    )
     agent_runtime = os.environ.get("ENGRAM_AGENT_RUNTIME") or "codex"
     if project_id:
         repository_url = ""
@@ -82,11 +87,13 @@ def _require_runtime(
     *,
     project_override: str = "",
     repository_override: str | None = None,
+    team_override: str = "",
 ) -> tuple[McpRuntime | None, str]:
     runtime = resolve_runtime(
         config_dir,
         project_override=project_override,
         repository_override=repository_override,
+        team_override=team_override,
     )
     if runtime is None:
         return None, NOT_CONFIGURED_MESSAGE
@@ -108,6 +115,7 @@ def _require_runtime_for_arguments(
         config_dir,
         project_override=as_string(arguments.get("project_id")),
         repository_override=repository_override,
+        team_override=as_string(arguments.get("team_id")),
     )
 
 

@@ -39,6 +39,10 @@ ENV_KEYS = (
     "ENGRAM_HOME",
 )
 
+CFG = "11111111-1111-1111-1111-111111111111"
+CALL = "22222222-2222-2222-2222-222222222222"
+ENVT = "33333333-3333-3333-3333-333333333333"
+
 
 class McpToolsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -459,6 +463,58 @@ class McpToolsTests(unittest.TestCase):
             urllib.parse.urlparse(transport.calls[0][1]).query
         )
         self.assertTrue(query["request_id"][0].startswith("mcp-"))
+
+    def test_team_id_argument_overrides_config(self) -> None:
+        self.write_local_config(team_id=CFG)
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "team_id": CALL}, self.config_dir, transport
+        )
+
+        self.assertEqual(CALL, transport.calls[0][3]["team_id"])
+
+    def test_team_id_blank_argument_falls_back_to_config(self) -> None:
+        self.write_local_config(team_id=CFG)
+        blank_transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "team_id": ""}, self.config_dir, blank_transport
+        )
+        none_transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "team_id": None}, self.config_dir, none_transport
+        )
+
+        self.assertEqual(CFG, blank_transport.calls[0][3]["team_id"])
+        self.assertEqual(CFG, none_transport.calls[0][3]["team_id"])
+
+    def test_team_id_falls_back_to_config_when_absent(self) -> None:
+        self.write_local_config(team_id=CFG)
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertEqual(CFG, transport.calls[0][3]["team_id"])
+
+    def test_team_id_env_wins_over_config_and_loses_to_argument(self) -> None:
+        self.write_local_config(team_id=CFG)
+        os.environ["ENGRAM_TEAM_ID"] = ENVT
+        arg_transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "x", "team_id": CALL}, self.config_dir, arg_transport
+        )
+        env_transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory({"query": "x"}, self.config_dir, env_transport)
+
+        self.assertEqual(CALL, arg_transport.calls[0][3]["team_id"])
+        self.assertEqual(ENVT, env_transport.calls[0][3]["team_id"])
+
+    def test_observations_team_id_argument_overrides_config(self) -> None:
+        self.write_local_config(team_id=CFG)
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations(
+            {"team_id": CALL}, self.config_dir, transport
+        )
+
+        self.assertIn(f"team_id={CALL}", transport.calls[0][1])
 
     def test_feedback_validates_action(self) -> None:
         self.write_local_config()
