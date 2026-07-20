@@ -1,14 +1,27 @@
 import hashlib
 import json
+import uuid
 from types import SimpleNamespace
 
 import pytest
 
+from engram.core.models import (
+    MemoryCandidate,
+    MemoryCandidateSource,
+    MemoryCandidateSourceKind,
+    Organization,
+    Project,
+    Team,
+)
 from engram.memory.import_provenance import (
     ImportProvenanceError,
     _validated_agent_anchors,
     agent_proposal_candidate_content_hash,
+    agent_proposal_evidence_manifest,
+    candidate_evidence_manifest,
+    validated_agent_candidate_source,
 )
+from engram.memory.transitions_test_support import provenanced_candidate
 from engram.memory.workflow_work import canonical_json_bytes
 
 VALID_ANCHORS = {
@@ -106,3 +119,147 @@ def test_validated_agent_anchors_rejects_hash_mismatch() -> None:
     source = _agent_source(VALID_ANCHORS, anchors_hash='b' * 64)
     with pytest.raises(ImportProvenanceError):
         _validated_agent_anchors(source)
+
+
+def _anchors_hash(anchors: dict[str, object]) -> str:
+    return hashlib.sha256(canonical_json_bytes(anchors)).hexdigest()
+
+
+@pytest.fixture
+def f_agent_scope() -> tuple[Organization, Team, Project]:
+    organization = Organization.objects.create(name='Engram', slug='engram')
+    team = Team.objects.create(organization=organization, name='Platform', slug='platform')
+    project = Project.objects.create(organization=organization, name='Backend', slug='backend')
+
+    return organization, team, project
+
+
+def _build_agent_candidate(
+    scope: tuple[Organization, Team, Project],
+) -> tuple[MemoryCandidate, MemoryCandidateSource, dict[str, object]]:
+    organization, team, project = scope
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Agent fact',
+        body='Agent proposal body',
+        content_hash=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = dict(VALID_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=_anchors_hash(anchors),
+    )
+
+    return candidate, source, anchors
+
+
+@pytest.mark.django_db
+def test_candidate_evidence_manifest_agent_only_single_entry(
+    f_agent_scope: tuple[Organization, Team, Project],
+) -> None:
+    candidate, source, anchors = _build_agent_candidate(f_agent_scope)
+
+    entries, digest = candidate_evidence_manifest(candidate, sources=[source])
+
+    assert entries == [{'anchors': anchors, 'anchors_hash': source.anchors_hash}]
+    assert digest == hashlib.sha256(canonical_json_bytes(entries)).hexdigest()
+
+    manifest_entries, manifest_digest = agent_proposal_evidence_manifest(candidate, sources=[source])
+    assert manifest_entries == entries
+    assert manifest_digest == digest
+
+    query_entries, query_digest = candidate_evidence_manifest(candidate)
+    assert query_digest == digest
+
+
+@pytest.mark.django_db
+def test_agent_manifest_rejects_corrupted_hash(
+    f_agent_scope: tuple[Organization, Team, Project],
+) -> None:
+    candidate, source, _ = _build_agent_candidate(f_agent_scope)
+    MemoryCandidateSource.objects.filter(id=source.id).update(anchors_hash='b' * 64)
+    source.refresh_from_db()
+
+    with pytest.raises(ImportProvenanceError):
+        validated_agent_candidate_source(candidate, sources=[source])
+    with pytest.raises(ImportProvenanceError):
+        agent_proposal_evidence_manifest(candidate, sources=[source])
+
+
+@pytest.mark.django_db
+def test_agent_manifest_rejects_wrong_shape(
+    f_agent_scope: tuple[Organization, Team, Project],
+) -> None:
+    candidate, _source, anchors = _build_agent_candidate(f_agent_scope)
+    organization, team, project = f_agent_scope
+    malformed = MemoryCandidateSource(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        observation_id=uuid.uuid4(),
+        anchors=anchors,
+        anchors_hash=_anchors_hash(anchors),
+    )
+
+    with pytest.raises(ImportProvenanceError):
+        validated_agent_candidate_source(candidate, sources=[malformed])
+
+
+@pytest.mark.django_db
+def test_agent_manifest_rejects_foreign_scope(
+    f_agent_scope: tuple[Organization, Team, Project],
+) -> None:
+    candidate, _source, anchors = _build_agent_candidate(f_agent_scope)
+    _organization, team, project = f_agent_scope
+    foreign = MemoryCandidateSource(
+        organization_id=uuid.uuid4(),
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=_anchors_hash(anchors),
+    )
+
+    with pytest.raises(ImportProvenanceError):
+        validated_agent_candidate_source(candidate, sources=[foreign])
+
+
+@pytest.mark.django_db
+def test_agent_manifest_rejects_foreign_candidate(
+    f_agent_scope: tuple[Organization, Team, Project],
+) -> None:
+    candidate, _source, _ = _build_agent_candidate(f_agent_scope)
+    other_candidate, other_source, _ = _build_agent_candidate(f_agent_scope)
+
+    assert other_source.candidate_id != candidate.id
+    with pytest.raises(ImportProvenanceError):
+        validated_agent_candidate_source(candidate, sources=[other_source])
+
+
+@pytest.mark.django_db
+def test_candidate_evidence_manifest_rejects_mixed_kinds() -> None:
+    distill_candidate, distill_source, _ = provenanced_candidate('mixedmanifest')
+    anchors = dict(VALID_ANCHORS)
+    agent_source = MemoryCandidateSource(
+        organization=distill_candidate.organization,
+        project=distill_candidate.project,
+        team=distill_candidate.team,
+        candidate=distill_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=_anchors_hash(anchors),
+    )
+
+    with pytest.raises(ImportProvenanceError):
+        candidate_evidence_manifest(distill_candidate, sources=[distill_source, agent_source])

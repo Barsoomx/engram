@@ -190,6 +190,49 @@ def is_validated_import_candidate(
     return True
 
 
+def validated_agent_candidate_source(
+    candidate: MemoryCandidate,
+    *,
+    sources: Iterable[MemoryCandidateSource] | None = None,
+) -> tuple[MemoryCandidateSource, dict[str, object]]:
+    selected = (
+        list(sources)
+        if sources is not None
+        else list(MemoryCandidateSource.objects.filter(candidate_id=candidate.id))
+    )
+    if len(selected) != 1:
+        raise ImportProvenanceError('agent candidate must have exactly one source')
+
+    source = selected[0]
+    anchors = _validated_agent_anchors(source)
+    if source.candidate_id != candidate.id:
+        raise ImportProvenanceError('candidate source belongs to another candidate')
+
+    if (
+        source.organization_id,
+        source.project_id,
+        source.team_id,
+    ) != (candidate.organization_id, candidate.project_id, candidate.team_id):
+        raise ImportProvenanceError('agent candidate source scope mismatch')
+
+    if candidate.source_observation_id is not None:
+        raise ImportProvenanceError('agent candidate must not have a source observation')
+
+    return source, anchors
+
+
+def agent_proposal_evidence_manifest(
+    candidate: MemoryCandidate,
+    *,
+    sources: Iterable[MemoryCandidateSource] | None = None,
+) -> tuple[list[dict[str, object]], str]:
+    source, _anchors = validated_agent_candidate_source(candidate, sources=sources)
+    entry = {'anchors': source.anchors, 'anchors_hash': source.anchors_hash}
+    entries = [entry]
+
+    return entries, hashlib.sha256(canonical_json_bytes(entries)).hexdigest()
+
+
 def import_memory_metadata(anchors: dict[str, object]) -> dict[str, object]:
     if not isinstance(anchors, dict) or anchors.get('schema') != 'import_candidate_source.v1':
         raise ImportProvenanceError('invalid import anchors')
@@ -218,6 +261,8 @@ def candidate_evidence_manifest(
     if not selected:
         raise ImportProvenanceError('candidate provenance is empty')
     kinds = {source.source_kind for source in selected}
+    if kinds == {'agent_proposal'}:
+        return agent_proposal_evidence_manifest(candidate, sources=selected)
     if kinds == {'distillation'}:
         from engram.memory.candidate_decision_work import evidence_manifest
 
