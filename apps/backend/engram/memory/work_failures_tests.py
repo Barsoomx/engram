@@ -400,3 +400,25 @@ def test_translate_failure_redacts_secret_shaped_detail() -> None:
 
     assert 'sk-abcdefghijklmnop' not in failure.redacted_detail
     assert '[REDACTED]' in failure.redacted_detail
+
+
+def test_translate_failure_maps_judge_cross_visibility_denied_to_invalid_input() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(
+        MemoryTransitionError('judge_cross_visibility_denied', 'cross visibility target', retryable=True),
+    )
+
+    assert failure.failure_class == 'invalid_input'
+    assert failure.code == 'judge_cross_visibility_denied'
+
+
+def test_translate_failure_judge_policy_denied_stays_provider_transient() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(
+        MemoryTransitionError('judge_policy_denied', 'policy denied', retryable=True),
+    )
+
+    assert failure.failure_class == 'provider_transient'
+    assert failure.code == 'judge_policy_denied'
