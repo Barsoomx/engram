@@ -395,3 +395,206 @@ def test_non_proposed_candidates_are_ignored() -> None:
     candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
     assert _inspect(scope, as_of=timezone.now()) == []
+
+
+import hashlib
+from datetime import timedelta
+
+from engram.core.models import (
+    MemoryCandidateSource,
+    MemoryCandidateSourceKind,
+    WorkflowRun,
+    WorkflowRunOrigin,
+    WorkflowRunStatus,
+)
+from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
+from engram.memory.transitions_test_support import provenanced_candidate
+from engram.memory.work_dispatch import RESIGNAL_WINDOW, queue_work_attempt
+from engram.memory.work_execution import execution_configuration_fingerprint
+from engram.memory.workflow_work import canonical_json_bytes
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _make_agent_candidate(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    suffix: str,
+) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        status=CandidateStatus.PROPOSED,
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+def _create_work(candidate: MemoryCandidate, source: MemoryCandidateSource) -> WorkflowWork:
+    from django.db import transaction
+
+    with transaction.atomic():
+        work, _created = ensure_candidate_decision_work_locked(candidate, sources=[source])
+
+    return work
+
+
+def _reconcile(organization: Organization, project: Project, as_of: object) -> object:
+    return candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=as_of,
+    )
+
+
+@pytest.mark.django_db
+def test_agent_candidate_without_run_is_redispatched() -> None:
+    organization, project, session = create_scope('agent-a')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-a')
+    work = _create_work(candidate, source)
+    assert not WorkflowRun.objects.filter(work_id=work.id).exists()
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    assert WorkflowRun.objects.filter(work_id=work.id, status=WorkflowRunStatus.QUEUED).count() == 1
+
+
+@pytest.mark.django_db
+def test_stale_queued_run_is_resignaled_without_new_run() -> None:
+    organization, project, session = create_scope('agent-b')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-b')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    old = now - RESIGNAL_WINDOW - timedelta(minutes=1)
+    run = queue_work_attempt(work_id=work.id, now=old, origin=WorkflowRunOrigin.MANUAL)
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    assert WorkflowRun.objects.filter(work_id=work.id).count() == 1
+    run.refresh_from_db()
+    assert run.dispatched_at == now
+
+
+@pytest.mark.django_db
+def test_fresh_queued_run_is_left_alone() -> None:
+    organization, project, session = create_scope('agent-c')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-c')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    run = queue_work_attempt(work_id=work.id, now=now, origin=WorkflowRunOrigin.MANUAL)
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 0
+    run.refresh_from_db()
+    assert run.dispatched_at == now
+
+
+@pytest.mark.django_db
+def test_config_changed_blocked_is_cleared_and_redispatched() -> None:
+    organization, project, session = create_scope('agent-e')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-e')
+    work = _create_work(candidate, source)
+    stale_fingerprint = 'f' * 64
+    assert execution_configuration_fingerprint(work) != stale_fingerprint
+    work.execution_state = WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = stale_fingerprint
+    work.save(update_fields=['execution_state', 'blocked_configuration_fingerprint', 'updated_at'])
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+
+
+@pytest.mark.django_db
+def test_unchanged_blocked_is_left_blocked() -> None:
+    organization, project, session = create_scope('agent-e2')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-e2')
+    work = _create_work(candidate, source)
+    work.execution_state = WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = execution_configuration_fingerprint(work)
+    work.save(update_fields=['execution_state', 'blocked_configuration_fingerprint', 'updated_at'])
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 0
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+
+
+@pytest.mark.django_db
+def test_expired_lease_is_reclaimed() -> None:
+    organization, project, session = create_scope('agent-d')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-d')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    work.execution_state = WorkflowWorkExecutionState.LEASED
+    work.lease_owner = 'worker-1'
+    work.heartbeat_at = now - timedelta(minutes=2)
+    work.lease_expires_at = now - timedelta(minutes=1)
+    work.save(
+        update_fields=['execution_state', 'lease_owner', 'heartbeat_at', 'lease_expires_at', 'updated_at']
+    )
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+
+
+@pytest.mark.django_db
+def test_mixed_provenance_candidate_is_skipped_without_aborting_loop() -> None:
+    distill_candidate, distill_source, scope = provenanced_candidate('reconcile-mixed')
+    organization, project, session = scope
+    distill_candidate.decision_work_contract_version = 1
+    distill_candidate.save(update_fields=['decision_work_contract_version', 'updated_at'])
+    anchors = dict(_AGENT_ANCHORS)
+    MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=distill_candidate.team,
+        candidate=distill_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    eligible_candidate, eligible_source = _make_agent_candidate(
+        organization, project, distill_candidate.team, 'reconcile-eligible'
+    )
+    eligible_work = _create_work(eligible_candidate, eligible_source)
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert str(distill_candidate.id) not in result.applied
+    assert str(eligible_candidate.id) in result.applied
+    assert WorkflowRun.objects.filter(work_id=eligible_work.id, status=WorkflowRunStatus.QUEUED).exists()
