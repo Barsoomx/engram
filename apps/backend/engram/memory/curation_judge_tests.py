@@ -1191,3 +1191,185 @@ def test_target_traversal_rejects_malformed_agent_source(malformation: str) -> N
         module.build_curation_evidence_context(candidate.id, shortlist)
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+def _agent_policy_data(cross: bool) -> tuple[object, object, uuid.UUID]:
+    module = _judge_module()
+    shortlist_module = _shortlist_module()
+    candidate, _source, scope = provenanced_candidate(f'judge-agent-policy-{uuid.uuid4().hex[:8]}')
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+    team_id = candidate.team_id
+    target_id = uuid.uuid4()
+    if cross:
+        target_visibility, target_team = VisibilityScope.PROJECT, None
+    else:
+        target_visibility, target_team = VisibilityScope.TEAM, team_id
+    entry = shortlist_module.CurationShortlistEntry(
+        memory_id=uuid.uuid4(),
+        memory_version_id=target_id,
+        current_transition_id=uuid.uuid4(),
+        visibility_scope=target_visibility,
+        team_id=target_team,
+        title='Target title',
+        body='Target body',
+        kind='decision',
+        body_hash='a' * 64,
+        exact_overlap=0,
+        vector_distance=0.1,
+        lexical_rank=0.0,
+        trigram_similarity=0.0,
+        has_open_conflict=False,
+    )
+    shortlist = shortlist_module.CurationShortlist(
+        entries=(entry,),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=1,
+        comparison_complete=True,
+    )
+    evidence = module.CurationEvidenceContext(
+        candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',), latest_evidence_at=None),
+        targets={target_id: module.ClaimEvidence(tier='supported', refs=('target-ref',), latest_evidence_at=None)},
+    )
+    data = module.CurationJudgeInput(
+        organization_id=scope[0].id,
+        project_id=scope[1].id,
+        candidate_id=candidate.id,
+        candidate=SanitizedCandidateView(
+            title='Agent title',
+            body='Agent body',
+            kind='decision',
+            evidence=(),
+            content_hash='c' * 64,
+            redaction_codes=(),
+        ),
+        effective_scope=EffectiveCandidateScope(VisibilityScope.TEAM, team_id),
+        shortlist=shortlist,
+        evidence=evidence,
+        request_id='judge-agent-policy',
+        trace_id='judge-agent-policy-trace',
+    )
+    return module, data, target_id
+
+
+def _verdict(
+    module: object,
+    *,
+    outcome: str,
+    relation: str,
+    target: uuid.UUID | None,
+    applicability: str = 'same',
+    temporal_order: str = 'not_applicable',
+    reason_code: str = 'distinct_claim',
+) -> object:
+    return module.CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome=outcome,
+        relation=relation,
+        target_memory_version_id=target,
+        candidate_evidence_refs=('candidate-ref',),
+        comparisons=(),
+        applicability=applicability,
+        temporal_order=temporal_order,
+        reason_code=reason_code,
+        reason='reason',
+    )
+
+
+_MUTATION_VERDICTS = (
+    ('merge_evidence', 'equivalent', 'not_applicable'),
+    ('open_conflict', 'mutually_incompatible', 'unordered'),
+    ('revise_memory', 'candidate_revises', 'candidate_newer'),
+    ('supersede_memory', 'candidate_supersedes', 'candidate_newer'),
+)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(('outcome', 'relation', 'temporal_order'), _MUTATION_VERDICTS)
+def test_cross_visibility_mutation_denied_with_distinct_code(
+    outcome: str, relation: str, temporal_order: str
+) -> None:
+    module, data, target_id = _agent_policy_data(cross=True)
+    verdict = _verdict(module, outcome=outcome, relation=relation, target=target_id, temporal_order=temporal_order)
+
+    with pytest.raises(ValueError) as error:
+        module._apply_evidence_policy(verdict, data)
+
+    assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'
+
+
+@pytest.mark.django_db
+def test_cross_visibility_reject_redundant_is_permitted() -> None:
+    module, data, target_id = _agent_policy_data(cross=True)
+    verdict = _verdict(
+        module,
+        outcome='reject_candidate',
+        relation='redundant',
+        target=target_id,
+        reason_code='redundant_claim',
+    )
+
+    module._apply_evidence_policy(verdict, data)
+
+
+@pytest.mark.django_db
+def test_same_visibility_baseline_permits_supported_outcomes() -> None:
+    module, data, target_id = _agent_policy_data(cross=False)
+
+    module._apply_evidence_policy(
+        _verdict(module, outcome='publish_new', relation='compatible_distinct', target=None),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(module, outcome='merge_evidence', relation='equivalent', target=target_id),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(
+            module,
+            outcome='reject_candidate',
+            relation='redundant',
+            target=target_id,
+            reason_code='redundant_claim',
+        ),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(
+            module,
+            outcome='open_conflict',
+            relation='mutually_incompatible',
+            target=target_id,
+            temporal_order='unordered',
+        ),
+        data,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('outcome', 'relation', 'temporal_order', 'reason_code'),
+    [
+        ('revise_memory', 'candidate_revises', 'candidate_newer', 'same_subject_revision'),
+        ('supersede_memory', 'candidate_supersedes', 'candidate_newer', 'ordered_replacement'),
+        ('reject_candidate', 'unsupported', 'not_applicable', 'unsupported_claim'),
+    ],
+)
+def test_same_visibility_baseline_forbids_revise_supersede_and_unsupported(
+    outcome: str, relation: str, temporal_order: str, reason_code: str
+) -> None:
+    module, data, target_id = _agent_policy_data(cross=False)
+    target = None if outcome == 'reject_candidate' else target_id
+    verdict = _verdict(
+        module,
+        outcome=outcome,
+        relation=relation,
+        target=target,
+        temporal_order=temporal_order,
+        reason_code=reason_code,
+    )
+
+    with pytest.raises(ValueError) as error:
+        module._apply_evidence_policy(verdict, data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'

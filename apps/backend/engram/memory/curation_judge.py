@@ -152,6 +152,7 @@ _ALLOWED_COMBINATIONS = {
     ('open_conflict', 'mutually_incompatible'): True,
 }
 _SUPPORTED_TIERS = frozenset({'supported', 'corroborated'})
+_MUTATION_OUTCOMES = frozenset({'merge_evidence', 'open_conflict', 'revise_memory', 'supersede_memory'})
 _IDENTITY_RELATIONS = frozenset(
     {'equivalent', 'candidate_revises', 'candidate_supersedes', 'redundant', 'mutually_incompatible'}
 )
@@ -398,6 +399,11 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
         entry = next((item for item in data.shortlist.entries if item.memory_version_id == target_id), None)
 
     outcome = verdict.outcome
+    if outcome in _MUTATION_OUTCOMES and entry is not None:
+        candidate_pair = (data.effective_scope.visibility_scope, data.effective_scope.team_id)
+        if (entry.visibility_scope, entry.team_id) != candidate_pair:
+            raise CurationJudgeError('judge_cross_visibility_denied')
+
     if outcome == 'publish_new':
         ok = candidate_tier in _SUPPORTED_TIERS and complete
     elif outcome == 'merge_evidence':
