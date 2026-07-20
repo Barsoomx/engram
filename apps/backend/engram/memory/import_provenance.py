@@ -22,6 +22,49 @@ def import_candidate_content_hash(source_id: str, observation_content_hash: str)
     return hashlib.sha256(serialized.encode()).hexdigest()
 
 
+def agent_proposal_candidate_content_hash(title: str, body: str, kind: str, team_id: object) -> str:
+    serialized = json.dumps(
+        (
+            'agent_proposal_candidate',
+            title,
+            body,
+            kind,
+            str(team_id) if team_id is not None else None,
+        ),
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+    return hashlib.sha256(serialized.encode()).hexdigest()
+
+
+_AGENT_ANCHOR_REQUIRED_KEYS = ('actor_type', 'actor_id', 'api_key_id', 'request_id', 'correlation_id')
+
+
+def _validated_agent_anchors(source: MemoryCandidateSource) -> dict[str, object]:
+    if (
+        source.source_kind != 'agent_proposal'
+        or source.window_id is not None
+        or source.stage_id is not None
+        or source.import_source_id is not None
+        or source.observation_id is not None
+    ):
+        raise ImportProvenanceError('candidate source is not agent-only')
+
+    anchors = source.anchors
+    if not isinstance(anchors, dict) or anchors.get('schema') != 'agent_proposal_source.v1':
+        raise ImportProvenanceError('agent anchors schema is invalid')
+
+    for key in _AGENT_ANCHOR_REQUIRED_KEYS:
+        if key not in anchors:
+            raise ImportProvenanceError('agent anchors missing required key')
+
+    if source.anchors_hash != hashlib.sha256(canonical_json_bytes(anchors)).hexdigest():
+        raise ImportProvenanceError('agent anchors are not immutable')
+
+    return anchors
+
+
 def _source_metadata(import_source: ObservationSource, event_type: str, source_store_id: str) -> None:
     if import_source.source_type != 'claude_mem' or not import_source.source_id:
         raise ImportProvenanceError('invalid import source identity')
