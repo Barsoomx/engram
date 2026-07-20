@@ -102,6 +102,7 @@ class McpContractTests(unittest.TestCase):
                 "engram_observations",
                 "engram_memory_version",
                 "engram_memory_feedback",
+                "engram_memory_propose",
             ],
         )
         link_schema = response["result"]["tools"][2]["inputSchema"]
@@ -110,14 +111,22 @@ class McpContractTests(unittest.TestCase):
         self.assertEqual([], observations_schema["required"])
         version_schema = response["result"]["tools"][4]["inputSchema"]
         self.assertEqual(["memory_id", "body"], version_schema["required"])
+        propose_schema = response["result"]["tools"][6]["inputSchema"]
+        self.assertEqual(["title", "body"], propose_schema["required"])
+        self.assertEqual(
+            {"title", "body", "kind", "project_id"}, set(propose_schema["properties"])
+        )
+        propose_description = response["result"]["tools"][6]["description"]
+        self.assertIn("curation", propose_description)
+        self.assertIn("not", propose_description.lower())
 
-    def test_tools_list_all_six_schemas_expose_optional_project_id(self) -> None:
+    def test_tools_list_all_seven_schemas_expose_optional_project_id(self) -> None:
         response = handle_request(
             {"jsonrpc": "2.0", "id": 11, "method": "tools/list"}, build_tools()
         )
         tools = response["result"]["tools"]
 
-        self.assertEqual(6, len(tools))
+        self.assertEqual(7, len(tools))
         for tool in tools:
             properties = tool["inputSchema"]["properties"]
             self.assertIn(
@@ -452,7 +461,7 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual(3, len(lines))
         self.assertEqual(PROTOCOL_VERSION, lines[0]["result"]["protocolVersion"])
-        self.assertEqual(6, len(lines[1]["result"]["tools"]))
+        self.assertEqual(7, len(lines[1]["result"]["tools"]))
         self.assertIn("searched: auth", lines[2]["result"]["content"][0]["text"])
 
     def test_run_server_skips_malformed_lines(self) -> None:
@@ -501,7 +510,7 @@ class RunMcpServeTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertEqual(2, len(lines))
-        self.assertEqual(6, len(lines[1]["result"]["tools"]))
+        self.assertEqual(7, len(lines[1]["result"]["tools"]))
 
 
 if __name__ == "__main__":
