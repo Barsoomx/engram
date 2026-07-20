@@ -20,12 +20,16 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryLink,
     MemoryStatus,
     Observation,
     ObservationSource,
+    Organization,
+    Project,
     RetrievalDocument,
+    Team,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowWork,
@@ -64,6 +68,7 @@ from engram.memory.transitions import (
     SupersedeMemoriesInput,
     SupersedeMemoryWithCandidate,
     SupersedeMemoryWithCandidateInput,
+    _source_rows,
 )
 from engram.memory.transitions_test_support import (
     candidate_fence_for as _candidate_fence_for,
@@ -1267,3 +1272,54 @@ def test_remaining_typed_lineage_commands_commit_named_transitions() -> None:
         .count()
         >= 7
     )
+
+
+def _build_agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    import hashlib
+
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': 'req-1',
+        'correlation_id': '',
+    }
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_source_rows_hydrates_agent_only_candidate() -> None:
+    candidate, source = _build_agent_candidate('source-rows-agent')
+
+    with transaction.atomic():
+        rows = _source_rows(candidate)
+
+    assert len(rows) == 1
+    assert rows[0].id == source.id
+    assert rows[0].source_kind == 'agent_proposal'
+    assert rows[0].observation_id is None

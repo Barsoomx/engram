@@ -401,7 +401,7 @@ def _source_rows(candidate: MemoryCandidate) -> list[MemoryCandidateSource]:
         .order_by('id'),
     )
 
-    observation_ids = {source.observation_id for source in sources}
+    observation_ids = {source.observation_id for source in sources if source.observation_id is not None}
     if candidate.source_observation_id is not None:
         observation_ids.add(candidate.source_observation_id)
     observations = {
@@ -416,11 +416,14 @@ def _source_rows(candidate: MemoryCandidate) -> list[MemoryCandidateSource]:
     if candidate.source_observation_id is not None and candidate.source_observation_id in observations:
         candidate.source_observation = observations[candidate.source_observation_id]
     for source in sources:
-        source.observation = observations[source.observation_id]
+        if source.observation_id is not None:
+            source.observation = observations[source.observation_id]
         if source.import_source_id is not None:
             source.import_source = import_sources[source.import_source_id]
 
     def sort_key(source: MemoryCandidateSource) -> tuple[object, ...]:
+        if source.source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+            return ('agent_proposal', source.anchors_hash)
         if source.source_kind == MemoryCandidateSourceKind.IMPORT:
             return (
                 'import',
