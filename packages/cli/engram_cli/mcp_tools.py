@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from engram_cli.commands import (
+    KINDS_ERROR_MESSAGE,
+    is_kinds_error_body,
     observation_meta_line,
     render_citations,
     render_warnings,
@@ -486,6 +488,9 @@ def _error_text(status: int, body: dict[str, object]) -> str:
     code = as_string(body.get("code")) or "error"
     if status == 404 and code == "project_not_found":
         return PROJECT_NOT_FOUND_MESSAGE
+
+    if is_kinds_error_body(body):
+        return KINDS_ERROR_MESSAGE
 
     detail = as_string(body.get("detail")) or "request failed"
 

@@ -1664,7 +1664,30 @@ def require_dry_run_ok(
     return body
 
 
+_ALLOWED_KINDS = (
+    "decision",
+    "convention",
+    "gotcha",
+    "architecture",
+    "incident",
+    "digest",
+)
+KINDS_ERROR_MESSAGE = (
+    "Invalid kind filter. Allowed kinds: " + ", ".join(_ALLOWED_KINDS) + "."
+)
+
+
+def is_kinds_error_body(body: object) -> bool:
+    return isinstance(body, dict) and "kinds" in body
+
+
 def error_from_body(body: dict[str, object], fallback: str) -> CliError:
+    if is_kinds_error_body(body):
+        return CliError(
+            "invalid_kind_filter",
+            KINDS_ERROR_MESSAGE,
+            remediation_for("invalid_kind_filter"),
+        )
     code = as_string(body.get("code")) or fallback
     detail = as_string(body.get("detail")) or code
 

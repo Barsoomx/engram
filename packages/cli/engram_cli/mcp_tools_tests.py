@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -8,11 +9,19 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
 
-from engram_cli import mcp_tools
+from engram_cli import commands, mcp_tools
 
 
 def query_params(url: str) -> dict[str, list[str]]:
     return parse_qs(urlsplit(url).query)
+
+
+def cli_error_text(body: dict) -> str:
+    error = commands.error_from_body(body, "http_error")
+    stream = io.StringIO()
+    commands.emit_error(stream, error)
+
+    return stream.getvalue()
 
 
 class StubTransport:
@@ -1024,6 +1033,73 @@ class McpToolsTests(unittest.TestCase):
 
         self.assertIn("project_id=arg-project", transport.calls[0][1])
         self.assertNotIn("repository_url=", transport.calls[0][1])
+
+    def test_error_text_kinds_membership_renders_fixed_message(self) -> None:
+        for code in ("search_kinds_invalid", "context_kinds_invalid"):
+            body = {
+                "kinds": {
+                    "code": [code],
+                    "detail": ["Invalid kind(s): egk_abcdefghijklmnop."],
+                }
+            }
+            text = mcp_tools._error_text(400, body)
+
+            for kind in commands._ALLOWED_KINDS:
+                self.assertIn(kind, text)
+            self.assertIn("Invalid kind filter", text)
+            self.assertNotIn("egk_abcdefghijklmnop", text)
+            self.assertNotIn("Invalid kind(s)", text)
+
+    def test_error_text_kinds_list_length_renders_fixed_message(self) -> None:
+        body = {"kinds": ["Ensure this field has no more than 6 elements."]}
+        text = mcp_tools._error_text(400, body)
+
+        for kind in commands._ALLOWED_KINDS:
+            self.assertIn(kind, text)
+        self.assertNotIn("Ensure this field", text)
+
+    def test_error_text_kinds_item_length_renders_fixed_message(self) -> None:
+        body = {"kinds": {"0": ["Ensure this field has no more than 40 characters."]}}
+        text = mcp_tools._error_text(400, body)
+
+        for kind in commands._ALLOWED_KINDS:
+            self.assertIn(kind, text)
+        self.assertNotIn("Ensure this field", text)
+
+    def test_error_text_non_kinds_body_degrades_to_generic(self) -> None:
+        body = {"token_budget": ["Ensure this value is greater than or equal to 1."]}
+        text = mcp_tools._error_text(400, body)
+
+        self.assertNotIn("Invalid kind filter", text)
+        self.assertIn("request failed", text)
+
+    def test_cli_error_kinds_all_shapes_render_fixed_message(self) -> None:
+        bodies = [
+            {
+                "kinds": {
+                    "code": ["search_kinds_invalid"],
+                    "detail": ["Invalid kind(s): egk_abcdefghijklmnop."],
+                }
+            },
+            {"kinds": ["Ensure this field has no more than 6 elements."]},
+            {"kinds": {"0": ["Ensure this field has no more than 40 characters."]}},
+        ]
+        for body in bodies:
+            text = cli_error_text(body)
+
+            for kind in commands._ALLOWED_KINDS:
+                self.assertIn(kind, text)
+            self.assertIn("Invalid kind filter", text)
+            self.assertNotIn("egk_abcdefghijklmnop", text)
+            self.assertNotIn("Invalid kind(s)", text)
+            self.assertNotIn("Ensure this field", text)
+
+    def test_cli_error_non_kinds_body_degrades_to_generic(self) -> None:
+        body = {"token_budget": ["Ensure this value is greater than or equal to 1."]}
+        error = commands.error_from_body(body, "http_error")
+
+        self.assertNotEqual("invalid_kind_filter", error.code)
+        self.assertNotIn("Invalid kind filter", error.detail)
 
     def test_build_tools_exposes_six_tools(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())
