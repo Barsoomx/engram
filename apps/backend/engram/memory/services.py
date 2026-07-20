@@ -199,6 +199,7 @@ class MemoryFeedbackResult:
     action: str
     retrieval_documents_updated: int
     already_applied: bool
+    confirmed_at: str
 
     def to_response(self) -> dict[str, object]:
         return {
@@ -208,6 +209,7 @@ class MemoryFeedbackResult:
             'action': self.action,
             'stale': self.memory.stale,
             'refuted': self.memory.refuted,
+            'confirmed_at': self.confirmed_at,
             'retrieval_documents_updated': self.retrieval_documents_updated,
             'already_applied': self.already_applied,
         }
@@ -237,6 +239,7 @@ class RecordMemoryFeedback:
             action=data.action,
             retrieval_documents_updated=updated,
             already_applied=already_applied,
+            confirmed_at=memory.last_confirmed_at.isoformat() if memory.last_confirmed_at else '',
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:

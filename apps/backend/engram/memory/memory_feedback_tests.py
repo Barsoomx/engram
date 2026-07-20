@@ -4,6 +4,7 @@ from typing import Any
 
 import pytest
 import structlog
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.access.models import (
@@ -709,3 +710,44 @@ def test_memory_feedback_rejects_oversized_correlation_id_before_mutating_memory
         event_type='MemoryTransitionCommitted',
         request_id='request-memory-feedback-oversized-correlation',
     ).exists()
+
+
+@pytest.mark.django_db
+def test_memory_feedback_stale_response_includes_confirmed_at() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    confirmed_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Confirmed then stale',
+        body='Confirmed then stale body.',
+    )
+    Memory.objects.filter(id=confirmed_memory.id).update(last_confirmed_at=timezone.now())
+    confirmed_memory.refresh_from_db()
+    expected_confirmed_at = confirmed_memory.last_confirmed_at.isoformat()
+    never_confirmed_memory, _v2, _d2 = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Never confirmed',
+        body='Never confirmed body.',
+    )
+    client = APIClient()
+
+    confirmed_response = client.post(
+        f'/v1/memories/{confirmed_memory.id}/feedback',
+        valid_feedback_payload(project, team, request_id='request-memory-feedback-confirmed-then-stale'),
+        format='json',
+        **auth_headers(),
+    )
+    never_confirmed_response = client.post(
+        f'/v1/memories/{never_confirmed_memory.id}/feedback',
+        valid_feedback_payload(project, team, request_id='request-memory-feedback-never-confirmed-stale'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert confirmed_response.status_code == 200, confirmed_response.json()
+    assert never_confirmed_response.status_code == 200, never_confirmed_response.json()
+    assert confirmed_response.json()['confirmed_at'] == expected_confirmed_at
+    assert never_confirmed_response.json()['confirmed_at'] == ''
