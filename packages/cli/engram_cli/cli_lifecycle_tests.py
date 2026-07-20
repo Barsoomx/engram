@@ -2711,6 +2711,236 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("missing_project", stderr)
 
 
+    def connect_without_project(self, config_dir: Path) -> None:
+        connect_transport = FakeTransport([(200, dry_run_ok()), (200, dry_run_ok())])
+        exit_code, _stdout, stderr = self.run_cli(
+            [
+                "connect",
+                "--server",
+                "https://engram.example",
+                "--api-key",
+                RAW_KEY,
+                "--config-dir",
+                str(config_dir),
+            ],
+            connect_transport,
+        )
+        self.assertEqual(0, exit_code, stderr)
+
+    def _version_body(self) -> dict:
+        return {
+            "count": 2,
+            "items": [
+                {"version": 2, "body": "full untruncated body two", "created_at": "2026-07-02T00:00:00Z"},
+                {"version": 1, "body": "body one", "created_at": "2026-07-01T00:00:00Z"},
+            ],
+        }
+
+    def _links_body(self) -> dict:
+        return {
+            "count": 1,
+            "items": [
+                {
+                    "link_id": "l-1",
+                    "link_type": "file",
+                    "target": "apps/x.py",
+                    "label": "",
+                    "created_at": "2026-07-02T00:00:00Z",
+                }
+            ],
+        }
+
+    def test_memory_get_and_audit_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+
+            get_transport = FakeTransport([(200, self._version_body()), (200, self._links_body())])
+            exit_code, stdout, stderr = self.run_cli(
+                ["memory", "get", "mem-1", "--config-dir", str(config_dir)],
+                get_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("full untruncated body two", stdout)
+
+            audit_transport = FakeTransport([(200, {"count": 0, "items": []})])
+            exit_code, stdout, stderr = self.run_cli(
+                ["audit", "--memory-id", "mem-1", "--config-dir", str(config_dir)],
+                audit_transport,
+            )
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("audit trace for memory mem-1", stdout)
+
+    def test_memory_get_repo_only_renders_body_versions_links(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect_without_project(config_dir)
+            transport = FakeTransport([(200, self._version_body()), (200, self._links_body())])
+            with mock.patch(
+                "engram_cli.commands.git_remote_url",
+                return_value="git@github.com:acme/x.git",
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["memory", "get", "mem-1", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("full untruncated body two", stdout)
+            self.assertIn("versions: v2 (2026-07-02T00:00:00Z), v1 (2026-07-01T00:00:00Z)", stdout)
+            self.assertIn("links:", stdout)
+            self.assertIn("engram_search", stdout)
+            self.assertFalse(any("/v1/inspection/memories/" in call["url"] for call in transport.calls))
+
+    def test_memory_get_not_found_returns_1_with_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"count": 0, "items": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                ["memory", "get", "mem-1", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("not found", stderr.lower())
+
+    def test_audit_capability_denied_returns_1_with_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [(403, {"code": "missing_capability", "error_code": "missing_capability", "detail": "no"})]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                ["audit", "--memory-id", "mem-1", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("audit:read", stderr)
+
+    def test_audit_missing_project_returns_1_no_http(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect_without_project(config_dir)
+            transport = FakeTransport([])
+            with mock.patch("engram_cli.commands.git_remote_url", return_value="git@github.com:acme/x.git"):
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["audit", "--memory-id", "mem-1", "--config-dir", str(config_dir)],
+                    transport,
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("needs a project_id", stderr)
+            self.assertEqual(0, len(transport.calls))
+
+    def test_audit_alias_precedence_and_target_type(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+
+            transport = FakeTransport([(200, {"count": 0, "items": []})])
+            self.run_cli(
+                [
+                    "audit",
+                    "--memory-id",
+                    "mem-1",
+                    "--target-id",
+                    "target-wins",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+            url = transport.calls[0]["url"]
+            self.assertIn("target_id=target-wins", url)
+            self.assertIn("target_type=memory", url)
+
+            transport = FakeTransport([(200, {"count": 0, "items": []})])
+            self.run_cli(
+                [
+                    "audit",
+                    "--target-id",
+                    "X",
+                    "--target-type",
+                    "memory_link",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+            url = transport.calls[0]["url"]
+            self.assertIn("target_type=memory_link", url)
+
+    def test_memory_get_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            diff_body = {
+                "from": {"version": 1, "body": "diff from body", "created_at": "2026-07-01T00:00:00Z"},
+                "to": {"version": 2, "body": "diff to body", "created_at": "2026-07-02T00:00:00Z"},
+            }
+            transport = FakeTransport(
+                [(200, self._version_body()), (200, self._links_body()), (200, diff_body)]
+            )
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "get",
+                    "mem-1",
+                    "--from-version",
+                    "1",
+                    "--to-version",
+                    "2",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("diff from body", stdout)
+            self.assertIn("diff to body", stdout)
+            diff_calls = [c for c in transport.calls if "/diff" in c["url"]]
+            self.assertEqual(1, len(diff_calls))
+            self.assertIn("from_version=1", diff_calls[0]["url"])
+            self.assertIn("to_version=2", diff_calls[0]["url"])
+
+            one_sided = FakeTransport([(200, self._version_body()), (200, self._links_body())])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "get",
+                    "mem-1",
+                    "--from-version",
+                    "1",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                one_sided,
+            )
+            self.assertEqual(0, exit_code, stderr)
+            self.assertFalse(any("/diff" in c["url"] for c in one_sided.calls))
+
+    def test_memory_get_project_scope_denied_returns_1_with_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [(403, {"code": "project_scope_denied", "error_code": "project_scope_denied", "detail": "no"})]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                ["memory", "get", "mem-1", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("cannot resolve project", stderr)
+            self.assertNotIn("memories:read", stderr)
+            self.assertNotIn("audit:read", stderr)
+
+
 class WorkspaceRepositoryUrlTests(unittest.TestCase):
     def setUp(self) -> None:
         self._claude_project_dir = os.environ.pop("CLAUDE_PROJECT_DIR", None)

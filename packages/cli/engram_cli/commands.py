@@ -28,6 +28,7 @@ from engram_cli.config import (
     write_json,
     write_secret_json,
 )
+from engram_cli import read_tools
 from engram_cli.http import (
     Transport,
     admin_get,
@@ -2213,6 +2214,173 @@ def run_memory_links(
             return 0
         for item in items:
             stdout.write(f"{item.get('link_type')}: {item.get('target')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def _read_cli_error(
+    status: int,
+    body: dict[str, object],
+    *,
+    project_id: str,
+    team_id: str,
+    memory_id: str,
+    capability_message: str,
+) -> CliError:
+    if status == 403:
+        code = as_string(body.get("code"))
+        if code == "project_scope_denied":
+            return CliError("project_scope_denied", read_tools.project_scope_denied_message(project_id), "")
+        if code == "team_scope_denied":
+            return CliError("team_scope_denied", read_tools.team_scope_denied_message(team_id, memory_id), "")
+        if code == "missing_capability" and capability_message:
+            return CliError("missing_capability", capability_message, "")
+
+    return error_from_body(body, fallback="http_error")
+
+
+def run_memory_get(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
+        params: dict[str, str] = {}
+        if project_id:
+            params["project_id"] = project_id
+        elif repository_url:
+            params["repository_url"] = repository_url
+        if team_id:
+            params["team_id"] = team_id
+        active_transport = transport or urllib_transport
+        version_status, version_body = get_json(
+            transport=active_transport,
+            server_url=server_url,
+            path=f"/v1/memories/{args.memory_id}/version",
+            api_key=api_key,
+            params=dict(params),
+        )
+        if version_status < 200 or version_status >= 300:
+            raise _read_cli_error(
+                version_status,
+                version_body,
+                project_id=project_id,
+                team_id=team_id,
+                memory_id=args.memory_id,
+                capability_message="",
+            )
+        items = version_body.get("items")
+        if not isinstance(items, list) or not items:
+            raise CliError(
+                "memory_not_found",
+                read_tools.memory_not_found_message(args.memory_id),
+                remediation_for("memory_not_found"),
+            )
+        links_status, links_body = get_json(
+            transport=active_transport,
+            server_url=server_url,
+            path=f"/v1/memories/{args.memory_id}/links",
+            api_key=api_key,
+            params=dict(params),
+        )
+        diff: dict[str, object] | None = None
+        diff_error: str | None = None
+        from_version = args.from_version
+        to_version = args.to_version
+        if from_version >= 1 and to_version >= 1:
+            diff_params = dict(params)
+            diff_params["from_version"] = str(from_version)
+            diff_params["to_version"] = str(to_version)
+            diff_status, diff_body = get_json(
+                transport=active_transport,
+                server_url=server_url,
+                path=f"/v1/memories/{args.memory_id}/diff",
+                api_key=api_key,
+                params=diff_params,
+            )
+            if diff_status == 200:
+                diff = diff_body
+            else:
+                diff_error = read_tools.diff_unavailable_note(from_version, to_version)
+        text = read_tools.render_memory_get(
+            args.memory_id,
+            version_body,
+            links_status,
+            links_body,
+            diff,
+            diff_error,
+        )
+        stdout.write(text + "\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_audit(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id = _ladder_project_id(args, config)
+        if not project_id:
+            raise CliError(
+                "missing_project",
+                read_tools.audit_needs_project_message(),
+                remediation_for("missing_project"),
+            )
+        limit = args.limit or 20
+        target_id = as_string(args.target_id) or as_string(args.memory_id)
+        target_type = ""
+        if target_id:
+            target_type = as_string(args.target_type) or "memory"
+        params: dict[str, str] = {
+            "project_id": project_id,
+            "ordering": "-created_at",
+            "limit": str(limit),
+        }
+        if target_id:
+            params["target_id"] = target_id
+            params["target_type"] = target_type
+        for key in ("event_type", "correlation_id", "since", "until"):
+            value = as_string(getattr(args, key, ""))
+            if value:
+                params[key] = value
+        if team_id:
+            params["team_id"] = team_id
+        active_transport = transport or urllib_transport
+        status, body = get_json(
+            transport=active_transport,
+            server_url=server_url,
+            path="/v1/inspection/audit-events",
+            api_key=api_key,
+            params=params,
+        )
+        if status == 403:
+            code = as_string(body.get("code"))
+            if code == "missing_capability":
+                raise CliError("missing_capability", read_tools.audit_missing_capability_message(), "")
+            if code == "project_scope_denied":
+                raise CliError("project_scope_denied", read_tools.project_scope_denied_message(project_id), "")
+            if code == "team_scope_denied":
+                raise CliError("team_scope_denied", read_tools.team_scope_denied_message(team_id, target_id), "")
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback="http_error")
+        stdout.write(read_tools.render_audit(target_id, target_type, limit, body) + "\n")
 
         return 0
     except CliError as error:
