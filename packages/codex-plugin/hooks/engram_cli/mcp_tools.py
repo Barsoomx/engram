@@ -336,10 +336,10 @@ def submit_memory_feedback(
     memory_id = as_string(arguments.get("memory_id"))
     action = as_string(arguments.get("action"))
     reason = as_string(arguments.get("reason"))
-    if not memory_id or action not in ("stale", "refuted") or not reason:
+    if not memory_id or action not in ("stale", "refuted", "confirmed") or not reason:
         return (
             "engram_memory_feedback requires memory_id, action "
-            "(stale or refuted), and reason."
+            "(stale, refuted, or confirmed), and reason."
         )
 
     runtime, error = _require_runtime_for_arguments(config_dir, arguments)
@@ -368,6 +368,7 @@ def submit_memory_feedback(
         f"memory_id={body.get('memory_id') or memory_id} "
         f"action={body.get('action')} stale={body.get('stale')} "
         f"refuted={body.get('refuted')} "
+        f"confirmed_at={body.get('confirmed_at')} "
         f"already_applied={body.get('already_applied')}"
     )
 
