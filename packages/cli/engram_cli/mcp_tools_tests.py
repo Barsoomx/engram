@@ -301,6 +301,119 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("[c-1] T (memory_id=m-1)", text)
         self.assertNotIn("garbage", text)
 
+    def test_search_renders_match_line_reason_and_terms(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "exact match: gitlab",
+                        "matched_terms": ["gitlab", "workflow"],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  match: exact match: gitlab | terms: gitlab, workflow", text)
+
+    def test_search_renders_filter_only_match_without_terms(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "filter-only authorized memory",
+                        "matched_terms": [],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  match: filter-only authorized memory", text)
+        self.assertNotIn("| terms:", text)
+
+    def test_search_renders_terms_only_without_match_prefix(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "",
+                        "matched_terms": ["gitlab", "workflow"],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  terms: gitlab, workflow", text)
+        self.assertNotIn("match:", text)
+
+    def test_search_renders_warnings_block(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {"citation": "M1", "title": "T", "body": "B", "memory_id": "m-1"}
+                ],
+                "warnings": [
+                    {
+                        "code": "stale_match",
+                        "message": "stale memory matched",
+                        "memory_id": "m-1",
+                    }
+                ],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("Warnings:", text)
+        self.assertIn("  [stale_match] stale memory matched (memory_id=m-1)", text)
+
+    def test_search_renders_no_warnings_block_when_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {"citation": "M1", "title": "T", "body": "B", "memory_id": "m-1"}
+                ],
+                "warnings": [],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertNotIn("Warnings:", text)
+
+    def test_search_empty_items_still_renders_warnings(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [],
+                "warnings": [{"code": "stale_match", "message": "stale"}],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("No memory matched the search.", text)
+        self.assertIn("Warnings:", text)
+        self.assertLess(
+            text.index("No memory matched the search."), text.index("Warnings:")
+        )
+
     def test_search_uses_repository_url_when_no_project(self) -> None:
         self.write_local_config(project_id="")
         transport = StubTransport(body={"items": []})

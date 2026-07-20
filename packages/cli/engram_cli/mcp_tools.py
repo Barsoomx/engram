@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram_cli.commands import search_item_suffix, workspace_repository_url
+from engram_cli.commands import (
+    render_warnings,
+    search_item_suffix,
+    search_match_line,
+    workspace_repository_url,
+)
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
@@ -161,9 +166,14 @@ def search_memory(
     if status != 200:
         return _error_text(status, body)
 
+    warnings_block = render_warnings(body.get("warnings"))
     items = body.get("items")
     if not isinstance(items, list) or not items:
-        return "No memory matched the search."
+        message = "No memory matched the search."
+        if warnings_block:
+            return f"{message}\n{warnings_block}"
+
+        return message
 
     lines: list[str] = []
     for item in items:
@@ -173,7 +183,12 @@ def search_memory(
             f"[{item.get('citation')}] {item.get('title')} (memory_id={item.get('memory_id')})"
             f"{search_item_suffix(item)}"
         )
+        match_line = search_match_line(item)
+        if match_line:
+            lines.append(match_line)
         lines.append(f"  {item.get('body')}")
+    if warnings_block:
+        lines.append(warnings_block)
 
     return "\n".join(lines)
 

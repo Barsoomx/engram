@@ -2010,6 +2010,46 @@ def search_item_suffix(item: dict[str, object]) -> str:
     return f" [{', '.join(parts)}]"
 
 
+def search_match_line(item: dict[str, object]) -> str:
+    reason = as_string(item.get("inclusion_reason"))
+    terms = item.get("matched_terms")
+    terms_text = ""
+    if isinstance(terms, (list, tuple)) and terms:
+        terms_text = ", ".join(str(term) for term in terms)
+    if reason and terms_text:
+        return f"  match: {reason} | terms: {terms_text}"
+    if reason:
+        return f"  match: {reason}"
+    if terms_text:
+        return f"  terms: {terms_text}"
+
+    return ""
+
+
+def render_warnings(warnings: object) -> str:
+    if not isinstance(warnings, list) or not warnings:
+        return ""
+    lines: list[str] = []
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        code = as_string(warning.get("code"))
+        if not code:
+            continue
+        line = f"  [{code}]"
+        message = as_string(warning.get("message"))
+        if message:
+            line += f" {message}"
+        memory_id = as_string(warning.get("memory_id"))
+        if memory_id:
+            line += f" (memory_id={memory_id})"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Warnings:\n" + "\n".join(lines)
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,
@@ -2060,14 +2100,22 @@ def run_search(
 
             return 0
 
+        warnings_block = render_warnings(body.get("warnings"))
         if not items:
             stdout.write("No memory matched the search.\n")
+            if warnings_block:
+                stdout.write(warnings_block + "\n")
 
             return 0
 
         for item in items:
             stdout.write(f"{item.get('citation')}: {item.get('title')}{search_item_suffix(item)}\n")
+            match_line = search_match_line(item)
+            if match_line:
+                stdout.write(match_line + "\n")
             stdout.write(f"  {item.get('body')}\n")
+        if warnings_block:
+            stdout.write(warnings_block + "\n")
 
         return 0
     except CliError as error:

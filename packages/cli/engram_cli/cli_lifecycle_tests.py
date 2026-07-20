@@ -2015,6 +2015,67 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(0, exit_code, stderr)
             self.assertNotIn("kinds", transport.calls[0]["payload"])
 
+    def test_search_prints_match_line_and_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "items": [
+                    {
+                        "citation": "M1",
+                        "memory_id": "mem-1",
+                        "title": "Gitlab workflow convention",
+                        "body": "Use draft MRs.",
+                        "inclusion_reason": "exact match: gitlab",
+                        "matched_terms": ["gitlab", "workflow"],
+                    },
+                ],
+                "warnings": [
+                    {
+                        "code": "stale_match",
+                        "message": "stale memory matched",
+                        "memory_id": "mem-1",
+                    }
+                ],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["search", "--query", "gitlab", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn(
+                "  match: exact match: gitlab | terms: gitlab, workflow", stdout
+            )
+            self.assertIn("Warnings:", stdout)
+            self.assertIn(
+                "  [stale_match] stale memory matched (memory_id=mem-1)", stdout
+            )
+
+    def test_search_empty_items_prints_warnings_and_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "items": [],
+                "warnings": [{"code": "stale_match", "message": "stale"}],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["search", "--query", "gitlab", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("No memory matched the search.", stdout)
+            self.assertIn("Warnings:", stdout)
+            self.assertIn("  [stale_match] stale", stdout)
+            self.assertLess(
+                stdout.index("No memory matched the search."),
+                stdout.index("Warnings:"),
+            )
+
     def test_search_prints_kind_and_confidence_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
