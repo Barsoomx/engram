@@ -3037,7 +3037,11 @@ def test_0040_curation_decision_round_trip_preserves_schema() -> None:
         MigrationExecutor(connection).migrate(leaf_nodes)
 
 
-def _create_historical_0041_memory(historical_apps: Apps, scope: dict[str, object], **overrides: object) -> models.Model:
+def _create_historical_0041_memory(
+    historical_apps: Apps,
+    scope: dict[str, object],
+    **overrides: object,
+) -> models.Model:
     memory_model = historical_apps.get_model('core', 'Memory')
     kwargs: dict[str, object] = {
         'organization': scope['organization'],
@@ -3067,9 +3071,7 @@ def test_reverse_0041_allowed_when_no_confirmation_history() -> None:
         executor = MigrationExecutor(connection)
         executor.migrate(MIGRATE_0040)
         apps_0040 = executor.loader.project_state(MIGRATE_0040).apps
-        assert 'last_confirmed_at' not in {
-            field.name for field in apps_0040.get_model('core', 'Memory')._meta.fields
-        }
+        assert 'last_confirmed_at' not in {field.name for field in apps_0040.get_model('core', 'Memory')._meta.fields}
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)
 
@@ -3091,9 +3093,7 @@ def test_reverse_0041_blocked_when_last_confirmed_at_set() -> None:
             MigrationExecutor(connection).migrate(MIGRATE_0040)
 
         apps_still_0041 = MigrationExecutor(connection).loader.project_state(MIGRATE_0041).apps
-        assert 'last_confirmed_at' in {
-            field.name for field in apps_still_0041.get_model('core', 'Memory')._meta.fields
-        }
+        assert 'last_confirmed_at' in {field.name for field in apps_still_0041.get_model('core', 'Memory')._meta.fields}
         reloaded = apps_still_0041.get_model('core', 'Memory').objects.get(id=memory.id)
         assert reloaded.last_confirmed_at == confirmed_at
     finally:

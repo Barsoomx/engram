@@ -880,9 +880,7 @@ def test_memory_feedback_confirmed_sets_last_confirmed_at_and_audit() -> None:
     assert body['refuted'] is False
     assert body['already_applied'] is False
     assert memory.last_confirmed_at is not None
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
 
 
 @pytest.mark.django_db
@@ -923,9 +921,7 @@ def test_memory_feedback_confirmed_idempotent_same_request_id() -> None:
     assert first.json()['already_applied'] is False
     assert second.json()['already_applied'] is True
     assert memory.last_confirmed_at == first_confirmed_at
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
 
 
 @pytest.mark.django_db
@@ -951,9 +947,7 @@ def test_memory_feedback_confirmed_new_request_id_refreshes_timestamp() -> None:
     memory.refresh_from_db()
 
     assert memory.last_confirmed_at > first_confirmed_at
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
 
 
 @pytest.mark.django_db
@@ -1121,9 +1115,7 @@ def test_memory_feedback_confirmed_isolated_per_actor() -> None:
     assert second.status_code == 200, second.json()
     assert first.json()['already_applied'] is False
     assert second.json()['already_applied'] is False
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
     assert second_confirmed_at is not None
     assert replay.json()['already_applied'] is True
 
@@ -1149,9 +1141,7 @@ def test_memory_feedback_confirmed_uses_current_at_processing_semantics() -> Non
     assert response.status_code == 200, response.json()
     assert memory.last_confirmed_at is not None
     assert memory.last_confirmed_at >= memory.updated_at
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
 
 
 def _assert_not_confirmable(response: Any, memory: Memory) -> None:
@@ -1257,9 +1247,7 @@ def test_memory_feedback_confirmed_allowed_when_org_decay_disabled() -> None:
     memory.refresh_from_db()
     assert response.status_code == 200, response.json()
     assert memory.last_confirmed_at is not None
-    assert (
-        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
-    )
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
 
 
 @pytest.mark.django_db
@@ -1298,7 +1286,15 @@ def test_memory_feedback_confirmed_rejected_on_open_conflict() -> None:
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     'scenario',
-    ['no_document', 'stale_document', 'refuted_document', 'session_scope', 'organization_scope', 'unseen_team_scope', 'org_project_drift'],
+    [
+        'no_document',
+        'stale_document',
+        'refuted_document',
+        'session_scope',
+        'organization_scope',
+        'unseen_team_scope',
+        'org_project_drift',
+    ],
 )
 def test_memory_feedback_confirmed_rejected_when_no_caller_retrievable_document(scenario: str) -> None:
     organization, team, project, _owner, _api_key = create_project_scope()

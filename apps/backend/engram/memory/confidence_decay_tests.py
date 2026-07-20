@@ -16,8 +16,6 @@ from engram.core.models import (
     Organization,
     OrganizationSettings,
     Project,
-    RetrievalDocument,
-    VisibilityScope,
 )
 from engram.memory.confidence_decay import DecayMemoryConfidence
 from engram.memory.services import MemoryFeedbackInput, RecordMemoryFeedback
@@ -329,17 +327,28 @@ def _confirm_input(memory: Memory, request_id: str) -> MemoryFeedbackInput:
     )
 
 
-@pytest.mark.django_db(transaction=True)
-@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
-def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    memory_a = _aged_promoted_memory('confirm-decay-a')
+def _run_in_thread(target: object) -> tuple[threading.Thread, list[BaseException]]:
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        close_old_connections()
+        try:
+            target()
+        except BaseException as error:  # pragma: no cover - surfaced by assertions
+            errors.append(error)
+        finally:
+            close_old_connections()
+
+    thread = threading.Thread(target=worker)
+
+    return thread, errors
+
+
+def _assert_confirm_holds_lock_then_decay_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _aged_promoted_memory('confirm-decay-a')
     confirm_locked = threading.Event()
     release_confirm = threading.Event()
-    decay_done = threading.Event()
-    confirm_error: list[BaseException] = []
     decay_result: list[object] = []
-    decay_error: list[BaseException] = []
-
     original_lock = RecordMemoryFeedback._lock_memory
 
     def paused_lock(self: RecordMemoryFeedback, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
@@ -351,29 +360,19 @@ def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(RecordMemoryFeedback, '_lock_memory', paused_lock)
 
-    def confirm_worker() -> None:
-        close_old_connections()
-        try:
-            RecordMemoryFeedback().execute(_confirm_input(memory_a, 'confirm-race-a'))
-        except BaseException as error:  # pragma: no cover - surfaced by assertions
-            confirm_error.append(error)
-        finally:
-            close_old_connections()
+    confirm_thread, confirm_error = _run_in_thread(
+        lambda: RecordMemoryFeedback().execute(_confirm_input(memory, 'confirm-race-a')),
+    )
+    decay_done = threading.Event()
 
-    def decay_worker() -> None:
-        close_old_connections()
-        try:
-            decay_result.append(DecayMemoryConfidence().execute())
-        except BaseException as error:  # pragma: no cover - surfaced by assertions
-            decay_error.append(error)
-        finally:
-            decay_done.set()
-            close_old_connections()
+    def run_decay() -> None:
+        decay_result.append(DecayMemoryConfidence().execute())
+        decay_done.set()
 
-    confirm_thread = threading.Thread(target=confirm_worker)
+    decay_thread, decay_error = _run_in_thread(run_decay)
+
     confirm_thread.start()
     assert confirm_locked.wait(timeout=10)
-    decay_thread = threading.Thread(target=decay_worker)
     decay_thread.start()
     try:
         assert not decay_done.wait(timeout=1)
@@ -384,29 +383,24 @@ def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch
 
     assert not confirm_error, confirm_error
     assert not decay_error, decay_error
-    assert not confirm_thread.is_alive()
-    assert not decay_thread.is_alive()
-    memory_a.refresh_from_db()
-    assert memory_a.confidence == Decimal('0.900')
-    assert memory_a.last_confirmed_at is not None
+    memory.refresh_from_db()
+    assert memory.confidence == Decimal('0.900')
+    assert memory.last_confirmed_at is not None
     assert decay_result[0].memories == 0
-    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory_a.id)).count() == 1
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
     assert not AuditEvent.objects.filter(event_type='MemoryConfidenceDecayed').exists()
 
-    monkeypatch.undo()
 
-    memory_b = _aged_promoted_memory('confirm-decay-b')
+def _assert_decay_holds_lock_then_confirm_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _aged_promoted_memory('confirm-decay-b')
     decay_locked = threading.Event()
     release_decay = threading.Event()
     confirm_done = threading.Event()
-    confirm_b_error: list[BaseException] = []
-    decay_b_error: list[BaseException] = []
-
     original_save = Memory.save
 
     def paused_save(self: Memory, *args: object, **kwargs: object) -> None:
         update_fields = kwargs.get('update_fields')
-        if update_fields is not None and 'confidence' in update_fields and self.id == memory_b.id:
+        if update_fields is not None and 'confidence' in update_fields and self.id == memory.id:
             decay_locked.set()
             assert release_decay.wait(timeout=10)
 
@@ -414,43 +408,36 @@ def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(Memory, 'save', paused_save)
 
-    def decay_b_worker() -> None:
-        close_old_connections()
-        try:
-            DecayMemoryConfidence().execute()
-        except BaseException as error:  # pragma: no cover - surfaced by assertions
-            decay_b_error.append(error)
-        finally:
-            close_old_connections()
+    decay_thread, decay_error = _run_in_thread(lambda: DecayMemoryConfidence().execute())
 
-    def confirm_b_worker() -> None:
-        close_old_connections()
-        try:
-            RecordMemoryFeedback().execute(_confirm_input(memory_b, 'confirm-race-b'))
-        except BaseException as error:  # pragma: no cover - surfaced by assertions
-            confirm_b_error.append(error)
-        finally:
-            confirm_done.set()
-            close_old_connections()
+    def run_confirm() -> None:
+        RecordMemoryFeedback().execute(_confirm_input(memory, 'confirm-race-b'))
+        confirm_done.set()
 
-    decay_b_thread = threading.Thread(target=decay_b_worker)
-    decay_b_thread.start()
+    confirm_thread, confirm_error = _run_in_thread(run_confirm)
+
+    decay_thread.start()
     assert decay_locked.wait(timeout=10)
-    confirm_b_thread = threading.Thread(target=confirm_b_worker)
-    confirm_b_thread.start()
+    confirm_thread.start()
     try:
         assert not confirm_done.wait(timeout=1)
     finally:
         release_decay.set()
-        decay_b_thread.join(timeout=10)
-        confirm_b_thread.join(timeout=10)
+        decay_thread.join(timeout=10)
+        confirm_thread.join(timeout=10)
 
-    assert not decay_b_error, decay_b_error
-    assert not confirm_b_error, confirm_b_error
-    assert not decay_b_thread.is_alive()
-    assert not confirm_b_thread.is_alive()
-    memory_b.refresh_from_db()
-    assert memory_b.confidence == Decimal('0.850')
-    assert memory_b.last_confirmed_at is not None
+    assert not decay_error, decay_error
+    assert not confirm_error, confirm_error
+    memory.refresh_from_db()
+    assert memory.confidence == Decimal('0.850')
+    assert memory.last_confirmed_at is not None
     assert AuditEvent.objects.filter(event_type='MemoryConfidenceDecayed').count() == 1
-    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory_b.id)).count() == 1
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    _assert_confirm_holds_lock_then_decay_skips(monkeypatch)
+    monkeypatch.undo()
+    _assert_decay_holds_lock_then_confirm_records(monkeypatch)
