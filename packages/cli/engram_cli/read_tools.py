@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
+
+from engram_cli.http import Transport, get_json
 
 _CONTROL_CHARS = re.compile(r'[\x00-\x1f]+')
 
@@ -29,17 +32,30 @@ def memory_not_found_message(memory_id: str) -> str:
     return f'Memory {memory_id} was not found (or not visible with this key/project).'
 
 
-def project_scope_denied_message(project_id: str) -> str:
+def project_scope_denied_message(project_id: str, repository_url: str = '') -> str:
+    if project_id:
+        target = f'project {project_id}'
+    elif repository_url:
+        target = f'the project for repository {repository_url}'
+    else:
+        target = 'the requested project'
+
     return (
-        f'This key cannot resolve project {project_id}. Use a project-bound key, or the '
+        f'This key cannot resolve {target}. Use a project-bound key, or the '
         'projects:agent key from the Connect-agent modal, then retry.'
     )
 
 
 def team_scope_denied_message(team_id: str, memory_id: str) -> str:
+    if team_id:
+        return (
+            f'This key cannot access team {team_id} for memory {memory_id}. Use a key bound to '
+            'that team (or one with team admin), then retry.'
+        )
+
     return (
-        f'This key cannot access team {team_id} for memory {memory_id}. Use a key bound to '
-        'that team (or one with team admin), then retry.'
+        f'This key cannot access the team scope of memory {memory_id}. Use a key bound to that '
+        "memory's team (or one with team admin), then retry."
     )
 
 
@@ -213,3 +229,189 @@ def render_audit(
             lines.append(note)
 
     return '\n'.join(lines)
+
+
+@dataclass(frozen=True)
+class ReadScope:
+    server_url: str
+    api_key: str
+    project_id: str = ''
+    repository_url: str = ''
+    team_id: str = ''
+
+
+@dataclass(frozen=True)
+class ReadError:
+    code: str
+    message: str = ''
+    status: int = 0
+    body: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ReadOutcome:
+    text: str | None = None
+    error: ReadError | None = None
+
+
+def scope_params(scope: ReadScope) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if scope.project_id:
+        params['project_id'] = scope.project_id
+    elif scope.repository_url:
+        params['repository_url'] = scope.repository_url
+    if scope.team_id:
+        params['team_id'] = scope.team_id
+
+    return params
+
+
+def resolve_audit_target(target_id_arg: str, memory_id_arg: str, target_type_arg: str) -> tuple[str, str]:
+    target_id = target_id_arg or memory_id_arg
+    target_type = ''
+    if target_id:
+        target_type = target_type_arg or 'memory'
+
+    return target_id, target_type
+
+
+def _body_code(body: dict[str, Any] | None) -> str:
+    if isinstance(body, dict):
+        value = body.get('code')
+        if isinstance(value, str):
+            return value
+
+    return ''
+
+
+def _memory_read_denial(
+    status: int,
+    body: dict[str, Any] | None,
+    scope: ReadScope,
+    memory_id: str,
+) -> ReadError | None:
+    if status != 403:
+        return None
+
+    code = _body_code(body)
+    if code == 'project_scope_denied':
+        return ReadError('project_scope_denied', project_scope_denied_message(scope.project_id, scope.repository_url))
+
+    if code == 'team_scope_denied':
+        return ReadError('team_scope_denied', team_scope_denied_message(scope.team_id, memory_id))
+
+    return None
+
+
+def fetch_memory_get(
+    transport: Transport,
+    scope: ReadScope,
+    memory_id: str,
+    from_version: int,
+    to_version: int,
+) -> ReadOutcome:
+    params = scope_params(scope)
+    version_status, version_body = get_json(
+        transport=transport,
+        server_url=scope.server_url,
+        path=f'/v1/memories/{memory_id}/version',
+        api_key=scope.api_key,
+        params=dict(params),
+    )
+    if version_status != 200:
+        denial = _memory_read_denial(version_status, version_body, scope, memory_id)
+        if denial is not None:
+            return ReadOutcome(error=denial)
+
+        return ReadOutcome(error=ReadError('http_error', status=version_status, body=version_body))
+
+    items = version_body.get('items')
+    if not isinstance(items, list) or not items:
+        return ReadOutcome(error=ReadError('memory_not_found', memory_not_found_message(memory_id)))
+
+    links_status, links_body = get_json(
+        transport=transport,
+        server_url=scope.server_url,
+        path=f'/v1/memories/{memory_id}/links',
+        api_key=scope.api_key,
+        params=dict(params),
+    )
+
+    diff: dict[str, Any] | None = None
+    diff_error: str | None = None
+    if from_version >= 1 and to_version >= 1:
+        diff_params = dict(params)
+        diff_params['from_version'] = str(from_version)
+        diff_params['to_version'] = str(to_version)
+        diff_status, diff_body = get_json(
+            transport=transport,
+            server_url=scope.server_url,
+            path=f'/v1/memories/{memory_id}/diff',
+            api_key=scope.api_key,
+            params=diff_params,
+        )
+        if diff_status == 200:
+            diff = diff_body
+        elif diff_status == 404:
+            diff_error = diff_unavailable_note(from_version, to_version)
+        else:
+            return ReadOutcome(error=ReadError('http_error', status=diff_status, body=diff_body))
+
+    text = render_memory_get(memory_id, version_body, links_status, links_body, diff, diff_error)
+
+    return ReadOutcome(text=text)
+
+
+def fetch_audit(
+    transport: Transport,
+    scope: ReadScope,
+    target_id: str,
+    target_type: str,
+    limit: int,
+    filters: dict[str, str],
+) -> ReadOutcome:
+    params: dict[str, str] = {
+        'project_id': scope.project_id,
+        'ordering': '-created_at',
+        'limit': str(limit),
+    }
+    if target_id:
+        params['target_id'] = target_id
+        params['target_type'] = target_type
+    for key, value in filters.items():
+        if value:
+            params[key] = value
+    if scope.team_id:
+        params['team_id'] = scope.team_id
+
+    status, body = get_json(
+        transport=transport,
+        server_url=scope.server_url,
+        path='/v1/inspection/audit-events',
+        api_key=scope.api_key,
+        params=params,
+    )
+    if status == 403:
+        code = _body_code(body)
+        if code == 'missing_capability':
+            return ReadOutcome(error=ReadError('missing_capability', audit_missing_capability_message()))
+
+        if code == 'project_scope_denied':
+            return ReadOutcome(
+                error=ReadError(
+                    'project_scope_denied',
+                    project_scope_denied_message(scope.project_id, scope.repository_url),
+                ),
+            )
+
+        if code == 'team_scope_denied':
+            return ReadOutcome(
+                error=ReadError('team_scope_denied', team_scope_denied_message(scope.team_id, target_id)),
+            )
+
+    if status != 200:
+        return ReadOutcome(error=ReadError('http_error', status=status, body=body))
+
+    text = render_audit(target_id, target_type, limit, body)
+
+    return ReadOutcome(text=text)

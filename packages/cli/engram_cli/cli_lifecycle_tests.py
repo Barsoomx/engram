@@ -2923,6 +2923,36 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(0, exit_code, stderr)
             self.assertFalse(any("/diff" in c["url"] for c in one_sided.calls))
 
+    def test_memory_get_diff_non_404_returns_1_with_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [
+                    (200, self._version_body()),
+                    (200, self._links_body()),
+                    (503, {"code": "boom", "detail": "kaput"}),
+                ]
+            )
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "get",
+                    "mem-1",
+                    "--from-version",
+                    "1",
+                    "--to-version",
+                    "2",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertNotIn("diff unavailable", stdout)
+            self.assertNotIn("diff from body", stdout)
+
     def test_memory_get_project_scope_denied_returns_1_with_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

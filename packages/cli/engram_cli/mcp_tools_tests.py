@@ -733,6 +733,25 @@ class MemoryGetToolTests(unittest.TestCase):
         self.assertIn("diff unavailable", text)
         self.assertNotIn("Engram call failed", text)
 
+    def test_memory_get_diff_non_404_surfaces_error_not_success(self) -> None:
+        for diff_status in (403, 500, 503):
+            self.write_local_config()
+            transport = RouteStubTransport(
+                {
+                    "/version": (200, self._version_body()),
+                    "/links": (200, self._links_body()),
+                    "/diff": (diff_status, {"code": "boom", "detail": "kaput"}),
+                }
+            )
+
+            text = mcp_tools.memory_get(
+                {"memory_id": "m-1", "from_version": 1, "to_version": 2}, self.config_dir, transport
+            )
+
+            self.assertIn(f"HTTP {diff_status}", text, diff_status)
+            self.assertNotIn("diff unavailable", text)
+            self.assertNotIn("C" * 500, text)
+
     def test_memory_get_empty_version_returns_not_found_and_skips_links(self) -> None:
         self.write_local_config()
         transport = RouteStubTransport({"/version": (200, {"count": 0, "items": []})})
@@ -785,11 +804,15 @@ class AuditToolTests(unittest.TestCase):
             else:
                 os.environ.pop(key, None)
 
-    def write_local_config(self, *, project_id: str = "11111111-1111-1111-1111-111111111111") -> None:
+    def write_local_config(
+        self, *, project_id: str = "11111111-1111-1111-1111-111111111111", team_id: str = ""
+    ) -> None:
         root = Path(self.config_dir)
         config: dict[str, object] = {"server_url": "http://server.local"}
         if project_id:
             config["project_id"] = project_id
+        if team_id:
+            config["team_id"] = team_id
         root.joinpath("config.json").write_text(json.dumps(config), encoding="utf-8")
         root.joinpath("credentials.json").write_text(
             json.dumps({"api_key": "egk_file_key"}), encoding="utf-8"
@@ -892,8 +915,10 @@ class AuditToolTests(unittest.TestCase):
             self.config_dir,
             header_stub,
         )
-        header_lines = [line for line in header_text.splitlines() if line.startswith("audit trace")]
-        self.assertEqual(1, len(header_lines))
+        header_lines = header_text.splitlines()
+        self.assertEqual(2, len(header_lines))
+        self.assertTrue(header_lines[0].startswith("audit trace"))
+        self.assertEqual(1, len([line for line in header_lines if "EvilEvent" in line]))
 
     def test_audit_memory_get_links_injection_guard(self) -> None:
         self.write_local_config()
@@ -924,8 +949,10 @@ class AuditToolTests(unittest.TestCase):
 
         text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
 
-        links_lines = [line for line in text.splitlines() if line.startswith("links:")]
+        lines = text.splitlines()
+        links_lines = [line for line in lines if line.startswith("links:")]
         self.assertEqual(1, len(links_lines))
+        self.assertEqual(1, len([line for line in lines if "fake links line" in line]))
 
     def test_audit_single_request_and_truncation_note(self) -> None:
         self.write_local_config()
@@ -984,8 +1011,8 @@ class AuditToolTests(unittest.TestCase):
             self.assertNotIn("audit:read", text)
             self.assertNotIn("memories:read", text)
 
-    def test_audit_and_memory_get_team_scope_denied(self) -> None:
-        self.write_local_config()
+    def test_team_scope_denied_names_forwarded_team(self) -> None:
+        self.write_local_config(team_id="team-42")
         body = {"code": "team_scope_denied", "error_code": "team_scope_denied", "detail": "no"}
 
         audit_text = mcp_tools.audit(
@@ -996,9 +1023,36 @@ class AuditToolTests(unittest.TestCase):
         )
 
         for text in (audit_text, get_text):
-            self.assertIn("cannot access team", text)
+            self.assertIn("cannot access team team-42 for memory m-1", text)
             self.assertNotIn("audit:read", text)
             self.assertNotIn("cannot resolve project", text)
+
+    def test_team_scope_denied_without_forwarded_team_is_truthful(self) -> None:
+        self.write_local_config(team_id="")
+        body = {"code": "team_scope_denied", "error_code": "team_scope_denied", "detail": "no"}
+
+        get_text = mcp_tools.memory_get(
+            {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+        )
+
+        self.assertIn("team scope of memory m-1", get_text)
+        self.assertNotIn("access team  ", get_text)
+        self.assertNotIn("team  for memory", get_text)
+        self.assertNotIn("cannot resolve project", get_text)
+
+    def test_memory_get_project_scope_denied_repo_routed_names_repository(self) -> None:
+        self.write_local_config(project_id="")
+        body = {"code": "project_scope_denied", "error_code": "project_scope_denied", "detail": "no"}
+        with mock.patch.object(
+            mcp_tools, "workspace_repository_url", return_value="https://github.com/a/b"
+        ):
+            text = mcp_tools.memory_get(
+                {"memory_id": "m-1"}, self.config_dir, StubTransport(status=403, body=body)
+            )
+
+        self.assertIn("repository https://github.com/a/b", text)
+        self.assertNotIn("resolve project .", text)
+        self.assertNotIn("resolve project.", text)
 
     def test_audit_missing_project_id_makes_no_call(self) -> None:
         self.write_local_config(project_id="")
