@@ -13,12 +13,14 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryTransition,
     MemoryVersion,
     MemoryVersionSource,
     Organization,
     Project,
+    Team,
     VisibilityScope,
     WorkflowRun,
     WorkflowWork,
@@ -27,13 +29,16 @@ from engram.core.redaction import REDACTED_VALUE, RedactionResult
 from engram.memory.candidate_decision_work import ensure_candidate_decision_work
 from engram.memory.deterministic_gates import (
     DETERMINISTIC_POLICY_VERSION,
+    CandidateDecisionWorkScopeError,
     DeterministicGateDisposition,
     DeterministicGateResult,
     DeterministicTerminalOutcome,
     EffectiveCandidateScope,
     EvaluateDeterministicCandidateGates,
     SanitizedCandidateView,
+    _validate_sources,
 )
+from engram.memory.workflow_work import canonical_json_bytes
 from engram.memory.escalation import escalation_reason
 from engram.memory.transitions import PromoteMemoryCandidate
 from engram.memory.transitions_test_support import (
@@ -522,3 +527,69 @@ def test_unknown_terminal_outcome_is_rejected_at_runtime() -> None:
             terminal_outcome='unknown',
             reason_code='noise_empty',
         )
+
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Durable agent fact {suffix}',
+        body=f'The deploy pipeline requires manual approval {suffix}',
+        status='proposed',
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=hashlib.sha256(uuid4().bytes).hexdigest(),
+        decision_work_contract_version=1,
+        evidence=[],
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_validate_sources_accepts_agent_only_candidate() -> None:
+    candidate, source = _agent_candidate('validate-agent')
+
+    _validate_sources(candidate, [source])
+
+
+@pytest.mark.django_db
+def test_validate_sources_rejects_mixed_agent_and_distillation() -> None:
+    candidate, source = _agent_candidate('validate-mixed')
+    distill_candidate, distill_source, _scope = provenanced_candidate('validate-mixed-distill')
+
+    with pytest.raises(CandidateDecisionWorkScopeError):
+        _validate_sources(candidate, [source, distill_source])
+
+
+@pytest.mark.django_db
+def test_deterministic_gates_accept_agent_only_candidate() -> None:
+    candidate, _source = _agent_candidate('gate-agent')
+    work, _created = ensure_candidate_decision_work(candidate.id)
+
+    result = EvaluateDeterministicCandidateGates().execute(work.id)
+
+    assert result.disposition == DeterministicGateDisposition.CONTINUE

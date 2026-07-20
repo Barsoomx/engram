@@ -262,10 +262,10 @@ def _validate_sources(candidate: MemoryCandidate, sources: list[MemoryCandidateS
             or (source.organization_id, source.project_id, source.team_id) != expected_scope
         ):
             raise CandidateDecisionWorkScopeError('candidate source has foreign scope')
-        observation = source.observation
-        if (observation.organization_id, observation.project_id, observation.team_id) != expected_scope:
-            raise CandidateDecisionWorkScopeError('candidate source observation has foreign scope')
         if source.source_kind == 'distillation':
+            observation = source.observation
+            if (observation.organization_id, observation.project_id, observation.team_id) != expected_scope:
+                raise CandidateDecisionWorkScopeError('candidate source observation has foreign scope')
             if source.window is None or source.stage is None or source.import_source is not None:
                 raise CandidateDecisionWorkScopeError('invalid distillation source relation')
             if (source.window.organization_id, source.window.project_id, source.window.team_id) != expected_scope:
@@ -275,12 +275,23 @@ def _validate_sources(candidate: MemoryCandidate, sources: list[MemoryCandidateS
             if source.stage.window_id != source.window_id:
                 raise CandidateDecisionWorkScopeError('candidate source stage has impossible window relation')
         elif source.source_kind == 'import':
+            observation = source.observation
+            if (observation.organization_id, observation.project_id, observation.team_id) != expected_scope:
+                raise CandidateDecisionWorkScopeError('candidate source observation has foreign scope')
             if source.window is not None or source.stage is not None or source.import_source is None:
                 raise CandidateDecisionWorkScopeError('invalid import source relation')
             if (source.import_source.organization_id, source.import_source.project_id) != expected_scope[:2]:
                 raise CandidateDecisionWorkScopeError('candidate import source has foreign scope')
             if source.import_source.observation_id != source.observation_id:
                 raise CandidateDecisionWorkScopeError('candidate import source has impossible observation relation')
+        elif source.source_kind == 'agent_proposal':
+            if (
+                source.window is not None
+                or source.stage is not None
+                or source.import_source is not None
+                or source.observation_id is not None
+            ):
+                raise CandidateDecisionWorkScopeError('invalid agent proposal source relation')
         else:
             raise CandidateDecisionWorkScopeError('unsupported candidate source kind')
 
@@ -517,10 +528,11 @@ class EvaluateDeterministicCandidateGates:
                 matching = any(str(item) == str(source.observation_id) for item in values for source in sources)
                 if not matching:
                     return self._reject(view, scope, CurationReasonCode.NOISE_PARSE_WRAPPER)
-        if sources and all(
+        lifecycle_sources = [source for source in sources if source.observation_id is not None]
+        if lifecycle_sources and all(
             source.observation.observation_type in _LIFECYCLE_TYPES
             or source.observation.source_metadata.get('event_type') in _LIFECYCLE_TYPES
-            for source in sources
+            for source in lifecycle_sources
         ):
             return self._reject(view, scope, CurationReasonCode.NOISE_LIFECYCLE_ONLY)
         return None
