@@ -100,6 +100,7 @@ class CandidateStatus(models.TextChoices):
 class MemoryCandidateSourceKind(models.TextChoices):
     DISTILLATION = 'distillation', 'Distillation'
     IMPORT = 'import', 'Import'
+    AGENT_PROPOSAL = 'agent_proposal', 'Agent Proposal'
 
 
 class MemoryStatus(models.TextChoices):
@@ -2241,7 +2242,13 @@ class MemoryCandidateSource(TimestampedModel):
         null=True,
         blank=True,
     )
-    observation = models.ForeignKey(Observation, on_delete=models.PROTECT, related_name='candidate_sources')
+    observation = models.ForeignKey(
+        Observation,
+        on_delete=models.PROTECT,
+        related_name='candidate_sources',
+        null=True,
+        blank=True,
+    )
     stage = models.ForeignKey(
         DistillationStage,
         on_delete=models.PROTECT,
@@ -2285,6 +2292,11 @@ class MemoryCandidateSource(TimestampedModel):
                 condition=models.Q(source_kind=MemoryCandidateSourceKind.IMPORT),
                 name='core_candidate_source_import_uniq',
             ),
+            models.UniqueConstraint(
+                fields=['candidate'],
+                condition=models.Q(source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL),
+                name='core_candidate_source_agent_uniq',
+            ),
             models.CheckConstraint(
                 condition=(
                     models.Q(
@@ -2292,12 +2304,21 @@ class MemoryCandidateSource(TimestampedModel):
                         window__isnull=False,
                         stage__isnull=False,
                         import_source__isnull=True,
+                        observation__isnull=False,
                     )
                     | models.Q(
                         source_kind=MemoryCandidateSourceKind.IMPORT,
                         window__isnull=True,
                         stage__isnull=True,
                         import_source__isnull=False,
+                        observation__isnull=False,
+                    )
+                    | models.Q(
+                        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+                        window__isnull=True,
+                        stage__isnull=True,
+                        import_source__isnull=True,
+                        observation__isnull=True,
                     )
                 ),
                 name='core_candidate_source_shape_ck',
@@ -2351,11 +2372,29 @@ class MemoryCandidateSource(TimestampedModel):
 
     def _validate_source_shape(self, errors: dict[str, list[str]]) -> None:
         if self.source_kind == MemoryCandidateSourceKind.DISTILLATION:
-            if self.window_id is None or self.stage_id is None or self.import_source_id is not None:
+            if (
+                self.window_id is None
+                or self.stage_id is None
+                or self.import_source_id is not None
+                or self.observation_id is None
+            ):
                 add_scope_error(errors, 'source_kind', 'distillation source requires window and stage only')
         elif self.source_kind == MemoryCandidateSourceKind.IMPORT:
-            if self.window_id is not None or self.stage_id is not None or self.import_source_id is None:
+            if (
+                self.window_id is not None
+                or self.stage_id is not None
+                or self.import_source_id is None
+                or self.observation_id is None
+            ):
                 add_scope_error(errors, 'source_kind', 'import source requires import_source only')
+        elif self.source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+            if (
+                self.window_id is not None
+                or self.stage_id is not None
+                or self.import_source_id is not None
+                or self.observation_id is not None
+            ):
+                add_scope_error(errors, 'source_kind', 'agent proposal source requires no lineage')
         else:
             add_scope_error(errors, 'source_kind', 'invalid source kind')
 

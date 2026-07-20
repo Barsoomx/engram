@@ -1716,7 +1716,7 @@ def _candidate_source_model_contract() -> tuple[type[models.Model], type[models.
     assert fields['window'].null is True
     assert fields['stage'].null is True
     assert fields['import_source'].null is True
-    assert {value for value, _label in source_kind.choices} == {'distillation', 'import'}
+    assert {value for value, _label in source_kind.choices} == {'distillation', 'import', 'agent_proposal'}
     return source_model, source_kind
 
 
