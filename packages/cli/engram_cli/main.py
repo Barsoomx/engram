@@ -163,6 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--query", default="")
     search.add_argument("--file-path", action="append", default=[])
     search.add_argument("--symbol", action="append", default=[])
+    search.add_argument("--kind", action="append", default=[], dest="kinds")
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--config-dir")
     search.add_argument("--json", action="store_true", dest="as_json")

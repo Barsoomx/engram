@@ -1976,6 +1976,44 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_search_sends_kinds_from_kind_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "search",
+                    "--query",
+                    "auth",
+                    "--kind",
+                    "convention",
+                    "--kind",
+                    "decision",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(
+                ["convention", "decision"], transport.calls[0]["payload"]["kinds"]
+            )
+
+    def test_search_omits_kinds_without_kind_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                ["search", "--query", "auth", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertNotIn("kinds", transport.calls[0]["payload"])
+
     def test_search_prints_kind_and_confidence_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

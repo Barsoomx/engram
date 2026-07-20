@@ -328,6 +328,70 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("Engram call failed: HTTP 403 forbidden: denied", text)
         self.assertNotIn("egk_file_key", text)
 
+    def test_search_sends_kinds_when_non_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "auth", "kinds": ["gotcha", "decision"]},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(["gotcha", "decision"], transport.calls[0][3]["kinds"])
+
+    def test_search_omits_kinds_when_absent_or_empty(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"query": "auth"},
+            {"query": "auth", "kinds": []},
+            {"query": "auth", "kinds": None},
+        ):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.search_memory(arguments, self.config_dir, transport)
+
+            self.assertNotIn("kinds", transport.calls[0][3])
+
+    def test_search_raises_on_bare_string_kinds(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.search_memory(
+                {"query": "auth", "kinds": "convention"},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_context_sends_kinds_when_non_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "kinds": ["convention"]},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(["convention"], transport.calls[0][3]["kinds"])
+
+    def test_context_omits_kinds_when_absent_or_empty(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"session_id": "s"},
+            {"session_id": "s", "kinds": []},
+            {"session_id": "s", "kinds": None},
+        ):
+            transport = StubTransport(body={"rendered_context": "bundle"})
+            mcp_tools.fetch_context(arguments, self.config_dir, transport)
+
+            self.assertNotIn("kinds", transport.calls[0][3])
+
+    def test_context_raises_on_bare_string_kinds(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.fetch_context(
+                {"session_id": "s", "kinds": "convention"},
+                self.config_dir,
+                StubTransport(body={"rendered_context": "bundle"}),
+            )
+
     def test_context_requires_session_id(self) -> None:
         text = mcp_tools.fetch_context({}, self.config_dir, StubTransport())
 

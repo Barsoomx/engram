@@ -1948,6 +1948,7 @@ def build_search_payload(
     limit: int,
     repository_url: str,
     project_id: str = "",
+    kinds: list[str] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "query": query,
@@ -1955,6 +1956,8 @@ def build_search_payload(
         "symbols": symbols,
         "limit": limit,
     }
+    if kinds:
+        payload["kinds"] = kinds
     if project_id:
         payload["project_id"] = project_id
     elif repository_url:
@@ -2039,6 +2042,7 @@ def run_search(
             limit=args.limit,
             project_id=project_id,
             repository_url=repository_url,
+            kinds=list(getattr(args, "kinds", None) or []),
         )
         active_transport = transport or urllib_transport
         status, body = post_json(

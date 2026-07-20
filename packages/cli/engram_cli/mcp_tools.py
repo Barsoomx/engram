@@ -148,6 +148,9 @@ def search_memory(
             "limit": arguments.get("limit") or 5,
         },
     )
+    kinds = _optional_kinds(arguments)
+    if kinds is not None:
+        payload["kinds"] = kinds
     status, body = post_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -198,6 +201,9 @@ def fetch_context(
             "limit": arguments.get("limit") or 5,
         },
     )
+    kinds = _optional_kinds(arguments)
+    if kinds is not None:
+        payload["kinds"] = kinds
     status, body = post_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -389,6 +395,16 @@ def _scope_payload(runtime: McpRuntime) -> dict[str, object]:
         payload["team_id"] = runtime.team_id
 
     return payload
+
+
+def _optional_kinds(arguments: dict[str, Any]) -> list[Any] | None:
+    value = arguments.get("kinds")
+    if value in (None, [], ""):
+        return None
+    if isinstance(value, list):
+        return value
+
+    raise ValueError("kinds must be an array of strings")
 
 
 def _new_request_id(arguments: dict[str, Any]) -> str:
