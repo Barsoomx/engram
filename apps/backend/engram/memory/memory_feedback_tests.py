@@ -18,7 +18,7 @@ from engram.access.models import (
     Role,
     RoleCapability,
 )
-from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
+from engram.access.services import EffectiveScope, api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.context.context_api_tests import valid_context_payload
 from engram.core.models import (
     AuditEvent,
@@ -31,14 +31,44 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.inspection.services import InspectionScope, ListInspectionAuditEvents
 from engram.memory.transitions import PromoteMemoryCandidate
 from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
 
 RAW_KEY = 'egk_test_memory_feedback_0123456789abcdefghijklmnopqrstuvwxyz'
 READ_ONLY_RAW_KEY = 'egk_test_memory_feedback_read_0123456789abcdefghijklmnopqrstuvwxyz'
 PROJECT_RAW_KEY = 'egk_test_memory_feedback_project_0123456789abcdefghijklmnopqrstuvwxyz'
+SECOND_RAW_KEY = 'egk_test_memory_feedback_second_0123456789abcdefghijklmnopqrstuv'
 AGENT_RAW_KEY = 'egk_test_memory_feedback_agent_0123456789abcdefghijklmnopqrstuv'
 AGENT_CAPS = ('memories:review', 'memories:read', 'projects:agent')
+
+
+def _reader_scope(organization: Organization, project: Project, team_ids: tuple) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=organization.id,
+        identity_id=organization.id,
+        api_key_id=organization.id,
+        project_ids=(project.id,),
+        team_ids=team_ids,
+        capabilities=('memories:review',),
+        actor_type='api_key',
+        actor_id=str(organization.id),
+        project_bound=False,
+    )
+
+
+def _confirmed_events_for_reader(
+    organization: Organization,
+    project: Project,
+    team_ids: tuple,
+    memory: Memory,
+) -> list[AuditEvent]:
+    inspection_scope = InspectionScope(project=project, scope=_reader_scope(organization, project, team_ids))
+    return [
+        event
+        for event in ListInspectionAuditEvents().execute(inspection_scope)
+        if event.event_type == 'MemoryConfirmed' and event.target_id == str(memory.id)
+    ]
 
 
 def create_org_agent_key(organization: Organization) -> None:
@@ -751,3 +781,299 @@ def test_memory_feedback_stale_response_includes_confirmed_at() -> None:
     assert never_confirmed_response.status_code == 200, never_confirmed_response.json()
     assert confirmed_response.json()['confirmed_at'] == expected_confirmed_at
     assert never_confirmed_response.json()['confirmed_at'] == ''
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_sets_last_confirmed_at_and_audit() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-1'),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body['action'] == 'confirmed'
+    assert body['confirmed_at'] != ''
+    assert body['stale'] is False
+    assert body['refuted'] is False
+    assert body['already_applied'] is False
+    assert memory.last_confirmed_at is not None
+    assert (
+        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+    )
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_does_not_bump_updated_at() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    updated_at_before = memory.updated_at
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-no-bump'),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    assert response.status_code == 200, response.json()
+    assert memory.updated_at == updated_at_before
+    assert memory.last_confirmed_at is not None
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_idempotent_same_request_id() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+    payload = valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-idempotent')
+
+    first = client.post(f'/v1/memories/{memory.id}/feedback', payload, format='json', **auth_headers())
+    memory.refresh_from_db()
+    first_confirmed_at = memory.last_confirmed_at
+    second = client.post(f'/v1/memories/{memory.id}/feedback', payload, format='json', **auth_headers())
+    memory.refresh_from_db()
+
+    assert first.status_code == 200, first.json()
+    assert second.status_code == 200, second.json()
+    assert first.json()['already_applied'] is False
+    assert second.json()['already_applied'] is True
+    assert memory.last_confirmed_at == first_confirmed_at
+    assert (
+        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+    )
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_new_request_id_refreshes_timestamp() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-first'),
+        format='json',
+        **auth_headers(),
+    )
+    memory.refresh_from_db()
+    first_confirmed_at = memory.last_confirmed_at
+    client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-second'),
+        format='json',
+        **auth_headers(),
+    )
+    memory.refresh_from_db()
+
+    assert memory.last_confirmed_at > first_confirmed_at
+    assert (
+        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
+    )
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_replay_after_stale_returns_original_success() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    first = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-replay-stale'),
+        format='json',
+        **auth_headers(),
+    )
+    original_confirmed_at = first.json()['confirmed_at']
+    stale = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='stale', request_id='request-confirm-replay-mark-stale'),
+        format='json',
+        **auth_headers(),
+    )
+    replay = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-replay-stale'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 200, first.json()
+    assert stale.status_code == 200, stale.json()
+    assert replay.status_code == 200, replay.json()
+    replay_body = replay.json()
+    assert replay_body['already_applied'] is True
+    assert replay_body['confirmed_at'] == original_confirmed_at
+    assert replay_body['stale'] is True
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_replay_reports_original_timestamp() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+
+    first = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-r1'),
+        format='json',
+        **auth_headers(),
+    )
+    second = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-r2'),
+        format='json',
+        **auth_headers(),
+    )
+    replay = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-r1'),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert replay.json()['confirmed_at'] == first.json()['confirmed_at']
+    assert replay.json()['confirmed_at'] != second.json()['confirmed_at']
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_audit_has_team_and_redacted_reason() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Infra', slug='infra-confirm-audit')
+    ProjectTeam.objects.create(organization=organization, team=other_team, project=project)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-team-audit'),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    assert response.status_code == 200, response.json()
+    event = AuditEvent.objects.get(event_type='MemoryConfirmed', target_id=str(memory.id))
+    assert event.team_id == memory.team_id
+    assert event.team_id is not None
+    assert RAW_KEY not in event.metadata['reason']
+    assert event.metadata['reason'] != ''
+    outside_team_events = _confirmed_events_for_reader(organization, project, (other_team.id,), memory)
+    assert event.id not in [visible.id for visible in outside_team_events]
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_audit_visibility_follows_project_scope() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Infra', slug='infra-confirm-project')
+    ProjectTeam.objects.create(organization=organization, team=other_team, project=project)
+    memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-project-audit'),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    assert response.status_code == 200, response.json()
+    assert memory.visibility_scope == VisibilityScope.PROJECT
+    assert memory.team_id is not None
+    event = AuditEvent.objects.get(event_type='MemoryConfirmed', target_id=str(memory.id))
+    assert event.team_id is None
+    outside_team_events = _confirmed_events_for_reader(organization, project, (other_team.id,), memory)
+    assert event.id in [visible.id for visible in outside_team_events]
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_isolated_per_actor() -> None:
+    organization, team, project, owner, _api_key = create_project_scope()
+    create_scoped_api_key(
+        organization,
+        team,
+        project,
+        owner,
+        raw_key=SECOND_RAW_KEY,
+        capabilities=('memories:review', 'memories:read'),
+    )
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    client = APIClient()
+    pinned = 'request-confirm-shared-key'
+
+    first = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id=pinned),
+        format='json',
+        **auth_headers(),
+    )
+    second = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id=pinned),
+        format='json',
+        **auth_headers(SECOND_RAW_KEY),
+    )
+    memory.refresh_from_db()
+    second_confirmed_at = memory.last_confirmed_at
+    replay = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id=pinned),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert first.status_code == 200, first.json()
+    assert second.status_code == 200, second.json()
+    assert first.json()['already_applied'] is False
+    assert second.json()['already_applied'] is False
+    assert (
+        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 2
+    )
+    assert second_confirmed_at is not None
+    assert replay.json()['already_applied'] is True
+
+
+@pytest.mark.django_db
+def test_memory_feedback_confirmed_uses_current_at_processing_semantics() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    memory, _version, _document = create_approved_memory_document(organization, team, project)
+    memory.current_version = 2
+    memory.body = 'Revised authorization body after new evidence.'
+    memory.save(update_fields=['current_version', 'body', 'updated_at'])
+    memory.refresh_from_db()
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/feedback',
+        valid_feedback_payload(project, team, action='confirmed', request_id='request-confirm-current-version'),
+        format='json',
+        **auth_headers(),
+    )
+
+    memory.refresh_from_db()
+    assert response.status_code == 200, response.json()
+    assert memory.last_confirmed_at is not None
+    assert memory.last_confirmed_at >= memory.updated_at
+    assert (
+        AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+    )
