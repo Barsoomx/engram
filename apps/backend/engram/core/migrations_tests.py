@@ -29,6 +29,8 @@ MIGRATE_0040 = [
     ('model_policy', '0004_alter_providercallrecord_result'),
 ]
 MIGRATION_0040_NODE = ('core', '0040_curation_decision')
+MIGRATE_0041 = [('core', '0041_memory_last_confirmed_at')]
+MIGRATION_0041_NODE = ('core', '0041_memory_last_confirmed_at')
 
 
 def _end_work_contract_column() -> tuple[str | None, str]:
@@ -3031,5 +3033,94 @@ def test_0040_curation_decision_round_trip_preserves_schema() -> None:
         with connection.cursor() as cursor:
             cursor.execute("SELECT to_regclass('public.core_curationdecision')")
             assert cursor.fetchone()[0] is None
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+def _create_historical_0041_memory(historical_apps: Apps, scope: dict[str, object], **overrides: object) -> models.Model:
+    memory_model = historical_apps.get_model('core', 'Memory')
+    kwargs: dict[str, object] = {
+        'organization': scope['organization'],
+        'project': scope['project'],
+        'title': 'Reverse 0041 memory',
+        'body': 'Reverse 0041 body',
+    }
+    kwargs.update(overrides)
+
+    return memory_model.objects.create(**kwargs)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_0041_allowed_when_no_confirmation_history() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0041_NODE in executor.loader.graph.nodes
+    try:
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0041)
+        apps_0041 = executor.loader.project_state(MIGRATE_0041).apps
+        scope = _create_historical_0032b_scope(apps_0041)
+        _create_historical_0041_memory(apps_0041, scope)
+        migration = executor.loader.graph.nodes[MIGRATION_0041_NODE]
+        assert migration.operations[-1].__class__.__name__ == 'RunPython'
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0040)
+        apps_0040 = executor.loader.project_state(MIGRATE_0040).apps
+        assert 'last_confirmed_at' not in {
+            field.name for field in apps_0040.get_model('core', 'Memory')._meta.fields
+        }
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_0041_blocked_when_last_confirmed_at_set() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0041_NODE in executor.loader.graph.nodes
+    confirmed_at = timezone.now()
+    try:
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0041)
+        apps_0041 = executor.loader.project_state(MIGRATE_0041).apps
+        scope = _create_historical_0032b_scope(apps_0041)
+        memory = _create_historical_0041_memory(apps_0041, scope, last_confirmed_at=confirmed_at)
+
+        with pytest.raises(RuntimeError, match='0041'):
+            MigrationExecutor(connection).migrate(MIGRATE_0040)
+
+        apps_still_0041 = MigrationExecutor(connection).loader.project_state(MIGRATE_0041).apps
+        assert 'last_confirmed_at' in {
+            field.name for field in apps_still_0041.get_model('core', 'Memory')._meta.fields
+        }
+        reloaded = apps_still_0041.get_model('core', 'Memory').objects.get(id=memory.id)
+        assert reloaded.last_confirmed_at == confirmed_at
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_reverse_0041_blocked_when_memoryconfirmed_ledger_exists() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0041_NODE in executor.loader.graph.nodes
+    try:
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0041)
+        apps_0041 = executor.loader.project_state(MIGRATE_0041).apps
+        scope = _create_historical_0032b_scope(apps_0041)
+        apps_0041.get_model('core', 'AuditEvent').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            event_type='MemoryConfirmed',
+            actor_type='agent',
+            actor_id='reverse-0041-actor',
+            target_type='memory',
+            target_id=str(uuid.uuid4()),
+        )
+
+        with pytest.raises(RuntimeError, match='0041'):
+            MigrationExecutor(connection).migrate(MIGRATE_0040)
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)
