@@ -844,6 +844,16 @@ def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
         raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
 
 
+def ensure_memory_visibility_scope(memory: Memory, scope: EffectiveScope) -> None:
+    if memory.visibility_scope == VisibilityScope.PROJECT:
+        return
+
+    if memory.visibility_scope == VisibilityScope.TEAM and memory.team_id in scope.team_ids:
+        return
+
+    raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
         from engram.memory.transitions import (
