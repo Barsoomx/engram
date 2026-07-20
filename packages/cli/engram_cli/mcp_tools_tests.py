@@ -6,8 +6,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 from engram_cli import mcp_tools
+
+
+def query_params(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(url).query)
 
 
 class StubTransport:
@@ -553,6 +558,101 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("/v1/observations/", url)
         self.assertIn("limit=3", url)
         self.assertIsNone(payload)
+
+    def test_observations_forwards_string_filters(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations(
+            {
+                "observation_type": "user_prompt",
+                "session_id": "sess-9",
+                "since": "2026-07-18T00:00:00+00:00",
+                "until": "2026-07-19T00:00:00+00:00",
+            },
+            self.config_dir,
+            transport,
+        )
+
+        params = query_params(transport.calls[0][1])
+        self.assertEqual(["user_prompt"], params["observation_type"])
+        self.assertEqual(["sess-9"], params["session_id"])
+        self.assertEqual(["2026-07-18T00:00:00+00:00"], params["since"])
+        self.assertEqual(["2026-07-19T00:00:00+00:00"], params["until"])
+
+    def test_observations_omits_string_filters_when_absent(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations(
+            {"observation_type": "", "session_id": None},
+            self.config_dir,
+            transport,
+        )
+
+        params = query_params(transport.calls[0][1])
+        self.assertNotIn("observation_type", params)
+        self.assertNotIn("session_id", params)
+        self.assertNotIn("since", params)
+        self.assertNotIn("until", params)
+
+    def test_observations_forwards_offset_when_non_zero(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations({"offset": 5}, self.config_dir, transport)
+
+        self.assertEqual(["5"], query_params(transport.calls[0][1])["offset"])
+
+    def test_observations_omits_offset_when_zero_or_absent(self) -> None:
+        self.write_local_config()
+        for arguments in ({"offset": 0}, {"offset": None}, {}):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.list_observations(arguments, self.config_dir, transport)
+
+            self.assertNotIn("offset", query_params(transport.calls[0][1]))
+
+    def test_observations_raises_on_non_string_observation_type(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"observation_type": ["tool_use"]},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_session_id(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"session_id": 123},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_since(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"since": 123},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_until(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"until": ["x"]},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_bool_offset(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"offset": True},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
 
     def test_feedback_validates_action(self) -> None:
         self.write_local_config()

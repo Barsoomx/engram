@@ -2257,6 +2257,16 @@ def run_observations(
         team_id = as_string(config.get("team_id"))
         if team_id:
             params["team_id"] = team_id
+        if args.observation_type:
+            params["observation_type"] = args.observation_type
+        if args.session_id:
+            params["session_id"] = args.session_id
+        if args.since:
+            params["since"] = args.since
+        if args.until:
+            params["until"] = args.until
+        if args.offset:
+            params["offset"] = str(args.offset)
         active_transport = transport or urllib_transport
         status, body = get_json(
             transport=active_transport,

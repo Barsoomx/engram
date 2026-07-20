@@ -276,6 +276,13 @@ def list_observations(
         params["repository_url"] = runtime.repository_url
     if runtime.team_id:
         params["team_id"] = runtime.team_id
+    for name in ("observation_type", "session_id", "since", "until"):
+        value = _optional_string_param(arguments, name)
+        if value is not None:
+            params[name] = value
+    offset = _optional_offset(arguments)
+    if offset is not None:
+        params["offset"] = str(offset)
     status, body = get_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -418,6 +425,26 @@ def _optional_token_budget(arguments: dict[str, Any]) -> int | None:
         return value
 
     raise ValueError("token_budget must be an integer")
+
+
+def _optional_string_param(arguments: dict[str, Any], name: str) -> str | None:
+    value = arguments.get(name)
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        return value
+
+    raise ValueError(f"{name} must be a string")
+
+
+def _optional_offset(arguments: dict[str, Any]) -> int | None:
+    value = arguments.get("offset")
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value != 0 else None
+
+    raise ValueError("offset must be an integer")
 
 
 def _new_request_id(arguments: dict[str, Any]) -> str:

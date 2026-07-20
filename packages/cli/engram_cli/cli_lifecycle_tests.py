@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 from engram_cli.config import credential_fingerprint
 from engram_cli import main
@@ -2646,6 +2647,60 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("/v1/observations/", call["url"])
             self.assertIn("project_id=", call["url"])
             self.assertIn("Obs one", stdout)
+
+    def test_observations_sends_filter_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "observations",
+                    "--session-id",
+                    "sess-9",
+                    "--type",
+                    "user_prompt",
+                    "--since",
+                    "2026-07-18T00:00:00+00:00",
+                    "--until",
+                    "2026-07-19T00:00:00+00:00",
+                    "--offset",
+                    "5",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            params = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+            self.assertEqual(["user_prompt"], params["observation_type"])
+            self.assertEqual(["sess-9"], params["session_id"])
+            self.assertEqual(["2026-07-18T00:00:00+00:00"], params["since"])
+            self.assertEqual(["2026-07-19T00:00:00+00:00"], params["until"])
+            self.assertEqual(["5"], params["offset"])
+
+    def test_observations_omits_filters_without_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                ["observations", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            params = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+            for key in ("observation_type", "session_id", "since", "until", "offset"):
+                self.assertNotIn(key, params)
+
+    def test_observations_since_until_help_states_bounds(self) -> None:
+        help_text = main._SINCE_UNTIL_HELP
+
+        self.assertIn("created_at", help_text)
+        self.assertIn("inclusive", help_text)
+        self.assertIn("exclusive", help_text)
 
     def test_observations_project_flag_wins_over_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
