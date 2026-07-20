@@ -126,3 +126,24 @@ class MemoryDiffQuerySerializer(_RepositoryUrlMixin, serializers.Serializer):
     project_id = serializers.UUIDField(required=False, allow_null=True)
     repository_url = serializers.CharField(required=False, allow_blank=True, default='')
     team_id = serializers.UUIDField(required=False, allow_null=True)
+
+
+class MemoryProposeSerializer(_RepositoryUrlMixin, serializers.Serializer):
+    title = serializers.CharField(max_length=255, allow_blank=False, trim_whitespace=True)
+    body = serializers.CharField(max_length=MEMORY_PROPOSE_BODY_MAX_LENGTH, allow_blank=False, trim_whitespace=True)
+    kind = serializers.CharField(required=False, allow_blank=True, default='', max_length=40)
+    request_id = serializers.CharField(allow_blank=False, max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH)
+    project_id = serializers.UUIDField(required=False, allow_null=True)
+    repository_url = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        max_length=MEMORY_REPOSITORY_URL_MAX_LENGTH,
+    )
+    team_id = serializers.UUIDField(required=False, allow_null=True)
+    correlation_id = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default='',
+        max_length=MEMORY_FEEDBACK_METADATA_MAX_LENGTH,
+    )
