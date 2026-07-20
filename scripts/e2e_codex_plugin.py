@@ -29,8 +29,10 @@ SESSION_CONTEXT_MARKER = 'ENGRAM_SESSION_CONTEXT_MARKER'
 PROMPT_CONTEXT_MARKER = 'ENGRAM_PROMPT_CONTEXT_MARKER'
 MCP_RESULT_MARKER = 'ENGRAM_MCP_RESULT_MARKER'
 EXPECTED_MCP_TOOLS = {
+    'engram_audit',
     'engram_context',
     'engram_memory_feedback',
+    'engram_memory_get',
     'engram_memory_link',
     'engram_memory_version',
     'engram_observations',
@@ -653,9 +655,9 @@ def run_inside_container() -> int:
             with (code_home / 'config.toml').open('a', encoding='utf-8') as handle:
                 handle.write(policy)
 
-            progress('initializing the installed MCP bridge and checking all six tools')
+            progress('initializing the installed MCP bridge and checking all eight tools')
             if mcp_tool_names(plugin_root, env) != EXPECTED_MCP_TOOLS:
-                raise E2EError('installed MCP bridge did not expose the exact six Engram tools')
+                raise E2EError('installed MCP bridge did not expose the exact eight Engram tools')
             mcp_completed = run(['codex', 'mcp', 'list', '--json'], cwd=demo_repo, env=env)
             mcp_listing = json.loads(mcp_completed.stdout)
             if not isinstance(mcp_listing, list) or not any(

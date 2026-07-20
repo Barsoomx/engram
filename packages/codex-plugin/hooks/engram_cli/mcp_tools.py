@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from engram_cli import read_tools
 from engram_cli.commands import search_item_suffix, workspace_repository_url
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
@@ -129,6 +130,8 @@ def build_tools(
         "engram_observations": bind(list_observations),
         "engram_memory_version": bind(update_memory_version),
         "engram_memory_feedback": bind(submit_memory_feedback),
+        "engram_memory_get": bind(memory_get),
+        "engram_audit": bind(audit),
     }
 
 
@@ -372,6 +375,126 @@ def submit_memory_feedback(
     )
 
 
+def memory_get(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    memory_id = as_string(arguments.get("memory_id"))
+    if not memory_id:
+        return "engram_memory_get requires memory_id."
+
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    params = _scope_params(runtime)
+    version_status, version_body = get_json(
+        transport=transport,
+        server_url=runtime.server_url,
+        path=f"/v1/memories/{memory_id}/version",
+        api_key=runtime.api_key,
+        params=dict(params),
+    )
+    if version_status != 200:
+        denial = _read_tool_403(version_status, version_body, runtime, memory_id)
+        if denial is not None:
+            return denial
+
+        return _error_text(version_status, version_body)
+
+    items = version_body.get("items")
+    if not isinstance(items, list) or not items:
+        return read_tools.memory_not_found_message(memory_id)
+
+    links_status, links_body = get_json(
+        transport=transport,
+        server_url=runtime.server_url,
+        path=f"/v1/memories/{memory_id}/links",
+        api_key=runtime.api_key,
+        params=dict(params),
+    )
+
+    diff: dict[str, object] | None = None
+    diff_error: str | None = None
+    from_version = _as_int(arguments.get("from_version"))
+    to_version = _as_int(arguments.get("to_version"))
+    if from_version >= 1 and to_version >= 1:
+        diff_params = dict(params)
+        diff_params["from_version"] = str(from_version)
+        diff_params["to_version"] = str(to_version)
+        diff_status, diff_body = get_json(
+            transport=transport,
+            server_url=runtime.server_url,
+            path=f"/v1/memories/{memory_id}/diff",
+            api_key=runtime.api_key,
+            params=diff_params,
+        )
+        if diff_status == 200:
+            diff = diff_body
+        else:
+            diff_error = read_tools.diff_unavailable_note(from_version, to_version)
+
+    return read_tools.render_memory_get(
+        memory_id,
+        version_body,
+        links_status,
+        links_body,
+        diff,
+        diff_error,
+    )
+
+
+def audit(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    if not runtime.project_id:
+        return read_tools.audit_needs_project_message()
+
+    limit = _as_int(arguments.get("limit")) or 20
+    target_id = as_string(arguments.get("target_id")) or as_string(arguments.get("memory_id"))
+    target_type = ""
+    if target_id:
+        target_type = as_string(arguments.get("target_type")) or "memory"
+
+    params: dict[str, str] = {
+        "project_id": runtime.project_id,
+        "ordering": "-created_at",
+        "limit": str(limit),
+    }
+    if target_id:
+        params["target_id"] = target_id
+        params["target_type"] = target_type
+    for key in ("event_type", "correlation_id", "since", "until"):
+        value = as_string(arguments.get(key))
+        if value:
+            params[key] = value
+    if runtime.team_id:
+        params["team_id"] = runtime.team_id
+
+    status, body = get_json(
+        transport=transport,
+        server_url=runtime.server_url,
+        path="/v1/inspection/audit-events",
+        api_key=runtime.api_key,
+        params=params,
+    )
+    if status == 403:
+        code = as_string(body.get("code"))
+        if code == "missing_capability":
+            return read_tools.audit_missing_capability_message()
+        if code == "project_scope_denied":
+            return read_tools.project_scope_denied_message(runtime.project_id)
+        if code == "team_scope_denied":
+            return read_tools.team_scope_denied_message(runtime.team_id, target_id)
+    if status != 200:
+        return _error_text(status, body)
+
+    return read_tools.render_audit(target_id, target_type, limit, body)
+
+
 def _read_optional_json(path: Path) -> dict[str, object]:
     try:
         return read_json(path)
@@ -389,6 +512,43 @@ def _scope_payload(runtime: McpRuntime) -> dict[str, object]:
         payload["team_id"] = runtime.team_id
 
     return payload
+
+
+def _scope_params(runtime: McpRuntime) -> dict[str, str]:
+    params: dict[str, str] = {}
+    if runtime.project_id:
+        params["project_id"] = runtime.project_id
+    elif runtime.repository_url:
+        params["repository_url"] = runtime.repository_url
+    if runtime.team_id:
+        params["team_id"] = runtime.team_id
+
+    return params
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_tool_403(
+    status: int,
+    body: dict[str, object],
+    runtime: McpRuntime,
+    memory_id: str,
+) -> str | None:
+    if status != 403:
+        return None
+
+    code = as_string(body.get("code"))
+    if code == "project_scope_denied":
+        return read_tools.project_scope_denied_message(runtime.project_id)
+    if code == "team_scope_denied":
+        return read_tools.team_scope_denied_message(runtime.team_id, memory_id)
+
+    return None
 
 
 def _new_request_id(arguments: dict[str, Any]) -> str:
