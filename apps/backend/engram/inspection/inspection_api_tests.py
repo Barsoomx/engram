@@ -43,7 +43,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
-from engram.memory.digest_visibility_tests import build_proven_weekly_digest
+from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
 
 AUDIT_RAW_KEY = 'egk_test_inspection_audit_0123456789abcdefghijklmnopqrstuvwxyz'
 INSPECTION_RAW_KEY = 'egk_test_inspection_admin_0123456789abcdefghijklmnopqrstuvwxyz'
@@ -921,6 +921,88 @@ def test_audit_inspection_resolves_target_display_name_for_memory() -> None:
     item = next(i for i in response.json()['items'] if i['id'] == str(audit.id))
     assert item['target_display'] == 'Target memory title'
     assert item['actor_display'] is None
+
+
+def _make_memory_target_audit(organization: object, project: object, *, target_memory_id: str, request_id: str) -> AuditEvent:
+    return AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryTransitionCommitted',
+        actor_type='api_key',
+        actor_id='actor-p2c',
+        target_type='memory',
+        target_id=target_memory_id,
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        request_id=request_id,
+    )
+
+
+@pytest.mark.django_db
+def test_audit_target_display_scoped_and_quarantined() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    other_project = Project.objects.create(organization=organization, name='Foreign', slug='foreign-p2c')
+
+    cross_scope_memory, _cv, _cd = create_approved_memory_document(
+        organization,
+        team,
+        other_project,
+        title='Cross scope title',
+    )
+    session_memory, _sv, _sd = create_approved_memory_document(
+        organization,
+        None,
+        project,
+        visibility_scope=VisibilityScope.SESSION,
+        title='Session scoped title',
+    )
+    null_team_memory, _nv, _nd = create_approved_memory_document(
+        organization,
+        None,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+        title='Null team title',
+    )
+    digest = build_legacy_digest(organization, project, title='Unproven digest title')
+    proven, _pv, _pd = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Proven in scope title',
+    )
+
+    cross_event = _make_memory_target_audit(
+        organization, project, target_memory_id=str(cross_scope_memory.id), request_id='req-p2c-cross'
+    )
+    session_event = _make_memory_target_audit(
+        organization, project, target_memory_id=str(session_memory.id), request_id='req-p2c-session'
+    )
+    null_team_event = _make_memory_target_audit(
+        organization, project, target_memory_id=str(null_team_memory.id), request_id='req-p2c-null-team'
+    )
+    digest_event = _make_memory_target_audit(
+        organization, project, target_memory_id=str(digest.id), request_id='req-p2c-digest'
+    )
+    proven_event = _make_memory_target_audit(
+        organization, project, target_memory_id=str(proven.id), request_id='req-p2c-proven'
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    items = {item['id']: item for item in response.json()['items']}
+    assert items[str(cross_event.id)]['target_display'] is None
+    assert items[str(session_event.id)]['target_display'] is None
+    assert items[str(null_team_event.id)]['target_display'] is None
+    assert items[str(digest_event.id)]['target_display'] is None
+    assert items[str(proven_event.id)]['target_display'] == 'Proven in scope title'
 
 
 @pytest.mark.django_db
