@@ -2050,6 +2050,27 @@ def render_warnings(warnings: object) -> str:
     return "Warnings:\n" + "\n".join(lines)
 
 
+def render_citations(items: object) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        line = f"  [{as_string(item.get('citation'))}] memory_id={as_string(item.get('memory_id'))}"
+        kind = as_string(item.get("kind"))
+        if kind:
+            line += f" kind={kind}"
+        confidence = item.get("confidence")
+        if confidence is not None:
+            line += f" confidence={confidence}"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Citations:\n" + "\n".join(lines)
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,

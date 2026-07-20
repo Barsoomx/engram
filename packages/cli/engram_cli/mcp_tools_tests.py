@@ -594,6 +594,118 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("sess-1", payload["session_id"])
         self.assertTrue(payload["request_id"].startswith("mcp-"))
 
+    def _context_body(self, item: dict, rendered: str = "ctx") -> dict:
+        return {"rendered_context": rendered, "items": [item]}
+
+    def test_context_citation_renders_kind_and_confidence(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "convention",
+                    "confidence": "0.920",
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("ctx", text)
+        self.assertIn("Citations:", text)
+        self.assertIn("  [M1] memory_id=abc-123 kind=convention confidence=0.920", text)
+
+    def test_context_citation_omits_both_when_absent(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {"citation": "M1", "memory_id": "abc-123", "kind": "", "confidence": None}
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123", text)
+        self.assertNotIn("kind=", text)
+        self.assertNotIn("confidence=", text)
+
+    def test_context_citation_kind_only(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "gotcha",
+                    "confidence": None,
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123 kind=gotcha", text)
+        self.assertNotIn("confidence=", text)
+
+    def test_context_citation_confidence_only(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "",
+                    "confidence": "0.780",
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123 confidence=0.780", text)
+        self.assertNotIn("kind=", text)
+
+    def test_context_empty_items_renders_bundle_verbatim(self) -> None:
+        self.write_local_config()
+        bundle = "# Engram context\n\nNo approved memory matched this request."
+        transport = StubTransport(body={"rendered_context": bundle, "items": []})
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertEqual(bundle, text)
+        self.assertNotIn("Citations:", text)
+        self.assertNotIn("Warnings:", text)
+
+    def test_context_non_empty_path_does_not_add_warnings_block(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "rendered_context": "ctx",
+                "items": [{"citation": "M1", "memory_id": "abc-123"}],
+                "warnings": [{"code": "stale_match", "message": "x"}],
+            }
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertNotIn("Warnings:", text)
+
+    def test_context_empty_render_appends_quarantine_warning(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "rendered_context": "",
+                "items": [],
+                "warnings": [
+                    {"code": "context_bundle_digest_visibility_unproven"}
+                ],
+            }
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("Engram returned no context for this session.", text)
+        self.assertIn("  [context_bundle_digest_visibility_unproven]", text)
+        self.assertNotIn("Citations:", text)
+        self.assertNotIn("None", text)
+        self.assertLess(
+            text.index("Engram returned no context"), text.index("Warnings:")
+        )
+
     def test_memory_version_renders_current_version_fields(self) -> None:
         self.write_local_config()
         transport = StubTransport(

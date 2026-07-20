@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from engram_cli.commands import (
+    render_citations,
     render_warnings,
     search_item_suffix,
     search_match_line,
@@ -234,7 +235,16 @@ def fetch_context(
 
     rendered = as_string(body.get("rendered_context"))
     if not rendered:
-        return "Engram returned no context for this session."
+        message = "Engram returned no context for this session."
+        warnings_block = render_warnings(body.get("warnings"))
+        if warnings_block:
+            return f"{message}\n{warnings_block}"
+
+        return message
+
+    citations = render_citations(body.get("items"))
+    if citations:
+        return f"{rendered}\n{citations}"
 
     return rendered
 
