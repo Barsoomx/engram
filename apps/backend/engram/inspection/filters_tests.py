@@ -5,13 +5,21 @@ from datetime import timedelta
 from typing import Any
 
 import pytest
-from django.utils import timezone
-
 from django.db import connection
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from engram.context.context_api_tests import auth_headers, create_approved_memory_document, create_project_scope
-from engram.core.models import Agent, AgentSession, AuditEvent, AuditResult, ContextBundle, Memory, MemoryStatus, Runtime
+from engram.core.models import (
+    Agent,
+    AgentSession,
+    AuditEvent,
+    AuditResult,
+    ContextBundle,
+    Memory,
+    MemoryStatus,
+    Runtime,
+)
 from engram.inspection.filters import InspectionContextBundleFilterSet, InspectionMemoryFilterSet
 from engram.inspection.inspection_api_tests import AUDIT_RAW_KEY, create_audit_key
 
@@ -83,10 +91,7 @@ def test_auditevent_target_index_present_in_migrated_schema() -> None:
     with connection.cursor() as cursor:
         constraints = connection.introspection.get_constraints(cursor, AuditEvent._meta.db_table)
 
-    present = any(
-        entry.get('columns') == expected_columns and entry.get('index')
-        for entry in constraints.values()
-    )
+    present = any(entry.get('columns') == expected_columns and entry.get('index') for entry in constraints.values())
 
     assert present
 

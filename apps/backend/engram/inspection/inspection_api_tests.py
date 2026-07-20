@@ -923,7 +923,9 @@ def test_audit_inspection_resolves_target_display_name_for_memory() -> None:
     assert item['actor_display'] is None
 
 
-def _make_memory_target_audit(organization: object, project: object, *, target_memory_id: str, request_id: str) -> AuditEvent:
+def _make_memory_target_audit(
+    organization: object, project: object, *, target_memory_id: str, request_id: str
+) -> AuditEvent:
     return AuditEvent.objects.create(
         organization=organization,
         project=project,
@@ -1003,6 +1005,37 @@ def test_audit_target_display_scoped_and_quarantined() -> None:
     assert items[str(null_team_event.id)]['target_display'] is None
     assert items[str(digest_event.id)]['target_display'] is None
     assert items[str(proven_event.id)]['target_display'] == 'Proven in scope title'
+
+
+@pytest.mark.django_db
+def test_audit_target_display_quarantines_cross_team_project_digest() -> None:
+    scope = create_project_scope()
+    organization, team, project, _owner, _api_key = scope
+    create_audit_key(scope)
+    other_team = Team.objects.create(organization=organization, name='Other P2c', slug='other-p2c')
+    ProjectTeam.objects.create(organization=organization, project=project, team=other_team)
+
+    cross_team_digest = build_legacy_digest(organization, project, title='Cross team project digest title')
+    cross_team_digest.team = other_team
+    cross_team_digest.save(update_fields=['team', 'updated_at'])
+
+    digest_event = _make_memory_target_audit(
+        organization,
+        project,
+        target_memory_id=str(cross_team_digest.id),
+        request_id='req-p2c-cross-team-digest',
+    )
+    client = APIClient()
+
+    response = client.get(
+        '/v1/inspection/audit-events',
+        {'project_id': str(project.id)},
+        **auth_headers(AUDIT_RAW_KEY),
+    )
+
+    assert response.status_code == 200
+    items = {item['id']: item for item in response.json()['items']}
+    assert items[str(digest_event.id)]['target_display'] is None
 
 
 @pytest.mark.django_db

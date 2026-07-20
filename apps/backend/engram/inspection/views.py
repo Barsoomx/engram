@@ -3,13 +3,12 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
-from django.db.models import Q
 
 from engram.access.models import ApiKey, Identity
 from engram.access.request_scope import resolve_request_scope
@@ -27,7 +26,6 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.inspection.serializers import InspectionQuerySerializer
-from engram.memory.digest_visibility import unproven_digest_memory_ids
 from engram.inspection.services import (
     InspectionNotFoundError,
     InspectionScope,
@@ -35,6 +33,7 @@ from engram.inspection.services import (
     ListInspectionContextBundles,
     ListInspectionMemories,
 )
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 NOT_FOUND_STATUS = {
     'memory_not_found': status.HTTP_404_NOT_FOUND,
@@ -473,16 +472,16 @@ def _resolve_memory_targets(
         visibility_scope=VisibilityScope.TEAM,
         team_id__in=scope.team_ids,
     )
-    memories = (
-        Memory.objects.filter(organization_id=organization_id, project=project, id__in=ids)
-        .filter(visibility_whitelist)
+    memories = Memory.objects.filter(organization_id=organization_id, project=project, id__in=ids).filter(
+        visibility_whitelist
     )
 
     digests = Memory.objects.filter(
         organization_id=organization_id,
         project=project,
         kind='digest',
-    ).filter(inspection_scope.team_filter)
+        id__in=ids,
+    ).filter(visibility_whitelist)
     unproven = unproven_digest_memory_ids(digests)
     if unproven:
         memories = memories.exclude(id__in=unproven)

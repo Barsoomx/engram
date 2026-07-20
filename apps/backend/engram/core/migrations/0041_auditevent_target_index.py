@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('core', '0040_curation_decision'),
     ]
@@ -12,6 +11,9 @@ class Migration(migrations.Migration):
     operations = [
         migrations.AddIndex(
             model_name='auditevent',
-            index=models.Index(fields=['organization', 'project', 'target_type', 'target_id', 'created_at'], name='core_audit_target_idx'),
+            index=models.Index(
+                fields=['organization', 'project', 'target_type', 'target_id', 'created_at'],
+                name='core_audit_target_idx',
+            ),
         ),
     ]
