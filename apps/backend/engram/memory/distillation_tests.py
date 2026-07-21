@@ -62,7 +62,12 @@ from engram.memory.distillation_provenance import (
 from engram.memory.distillation_provenance import (
     session_candidate_content_hash as provenance_session_candidate_content_hash,
 )
-from engram.memory.distillation_provider_stage import PROVIDER_OUTPUT_TRUNCATED, stage_key, stage_target_key
+from engram.memory.distillation_provider_stage import (
+    PROVIDER_OUTPUT_MALFORMED,
+    PROVIDER_OUTPUT_TRUNCATED,
+    stage_key,
+    stage_target_key,
+)
 from engram.memory.distillation_window import materialize_distillation_window, render_observation_block
 from engram.memory.services import MemoryWorkerError
 from engram.memory.tasks import distill_session_work_v1
@@ -1465,5 +1470,94 @@ def test_reduce_truncation_bumps_generation_to_disjoint_level_band(
     marker.refresh_from_db()
     assert marker.status == 'required'
 
+    work.refresh_from_db()
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_large_session_distills_without_malformed_or_truncated_and_covers_every_observation(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='large-session')
+    create_curation_policy(organization, team, project)
+    observations = [
+        create_observation(
+            organization, project, team, agent, session, index=index, body='x' * 4500, narrative='y' * 4500
+        )
+        for index in range(1, 101)
+    ]
+    work = create_session_distillation_work(session, upper=100)
+    gateway = _SignalReductionStageGateway()
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '40')
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+
+    now = timezone.now()
+    attempts = 0
+    while WorkflowWork.objects.get(id=work.id).disposition == WorkflowWorkDisposition.REQUIRED:
+        queued = (
+            WorkflowRun.objects.filter(work=work, execution_contract_version=1, status=WorkflowRunStatus.QUEUED)
+            .order_by('created_at', 'id')
+            .first()
+        )
+        claim_result = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            lease_owner=f'test:{uuid.uuid4()}',
+            now=now,
+            lease_for=timedelta(minutes=12),
+            workflow_run_id=queued.id if queued is not None else None,
+        )
+        assert claim_result.claim is not None
+        run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+        attempts += 1
+        assert attempts < 60
+        now += timedelta(seconds=1)
+
+    window = DistillationWindow.objects.get(work=work)
+    assert not DistillationStage.objects.filter(
+        window=window, last_failure_class=PROVIDER_OUTPUT_MALFORMED
+    ).exists()
+    assert not DistillationStage.objects.filter(
+        window=window, last_failure_class=PROVIDER_OUTPUT_TRUNCATED
+    ).exists()
+    coverage = DistillationObservationCoverage.objects.filter(window=window)
+    assert set(coverage.values_list('observation_id', flat=True)) == {item.id for item in observations}
+    assert set(coverage.values_list('outcome', flat=True)) == {'signal'}
+    candidate_count = MemoryCandidate.objects.filter(project=project).count()
+    assert 1 <= candidate_count <= 25
+    work.refresh_from_db()
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_small_session_never_calls_reduce(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='small-session')
+    create_curation_policy(organization, team, project)
+    observations = [
+        create_observation(
+            organization, project, team, agent, session, index=index, body='x' * 4500, narrative='y' * 4500
+        )
+        for index in range(1, 4)
+    ]
+    work = create_session_distillation_work(session, upper=3)
+    gateway = _SignalReductionStageGateway()
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+
+    distill_session_work_v1(str(work.id))
+
+    window = DistillationWindow.objects.get(work=work)
+    assert DistillationStage.objects.filter(window=window, stage_kind='extract', status='complete').count() == 3
+    assert DistillationStage.objects.filter(window=window, stage_kind='reduce').count() == 0
+    coverage = DistillationObservationCoverage.objects.filter(window=window)
+    assert set(coverage.values_list('observation_id', flat=True)) == {item.id for item in observations}
+    assert MemoryCandidate.objects.filter(project=project).count() == 3
     work.refresh_from_db()
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
