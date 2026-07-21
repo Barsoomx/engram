@@ -23,6 +23,33 @@ MAX_BODY = 3000
 REDUCTION_MANIFEST_SCHEMA = 'distillation_reduce_manifest.v1'
 REDUCE_PROMPT_CONTRACT = 'distill_reduce.v1'
 
+_REDUCE_SYSTEM_PROMPT = (
+    'You consolidate engineering memory drafts following the distill_reduce.v1 contract. '
+    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
+    'The object must contain exactly the key memories (array of objects) and no additional properties. '
+    'Each memories entry must contain exactly these keys and no additional properties: '
+    f'title (non-blank string, at most {MAX_TITLE} characters); '
+    f'body (non-blank string, at most {MAX_BODY} characters); '
+    'confidence (a JSON number between 0 and 1, never a string); '
+    'source_ids (non-empty array of unique draft ids); '
+    'kind (optional, one of: decision, convention, gotcha, architecture, incident; omit it when none applies). '
+    'Every source_ids value must be an id copied verbatim from the input drafts. '
+    'Group each input draft id into the source_ids of the memory that consolidates it; '
+    'the same draft id may appear in more than one entry. '
+    'memories must never be empty. '
+    'The user message is one JSON object: drafts (array of {id, title, body, confidence, kind?}) '
+    'and reduction_target (a number). '
+    'Task: merge drafts that record the same or closely related durable fact, decision, or behavior into one '
+    'memory whose title and body preserve the concrete details (identifiers, paths, versions, numbers) of '
+    'every merged draft; never invent facts absent from the drafts. '
+    'A draft unrelated to every other draft may pass through as its own entry with that single source id. '
+    'Return strictly fewer memories than there are input drafts and at most reduction_target memories; '
+    'if consolidating to reduction_target would force unrelated drafts into one memory, you may instead '
+    'return up to half the number of input drafts, rounded up. '
+    'Give each entry a confidence no higher than the highest confidence among its source drafts. '
+    'When unsure how to group, merge the most closely related drafts first and repeat until the count rules hold.'
+)
+
 
 def _json(value: object) -> bytes:
     return canonical_json_bytes(value)
@@ -197,9 +224,9 @@ def parse_reduction_output(  # noqa: C901
         ):
             raise ReductionContractError('memory has malformed keys')
         title, body = item['title'], item['body']
-        if not isinstance(title, str) or not title or len(title) > MAX_TITLE:
+        if not isinstance(title, str) or not title.strip() or len(title) > MAX_TITLE:
             raise ReductionContractError('title is invalid')
-        if not isinstance(body, str) or not body or len(body) > MAX_BODY:
+        if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
             raise ReductionContractError('body is invalid')
         source_ids = item['source_ids']
         if not isinstance(source_ids, list) or not source_ids:
@@ -208,20 +235,22 @@ def parse_reduction_output(  # noqa: C901
             raise ReductionContractError('source_ids must contain strings')
         if len(set(source_ids)) != len(source_ids):
             raise ReductionContractError('source_ids must be duplicate-free')
-        if not set(source_ids) <= known:
-            raise ReductionContractError('source_ids references an unknown draft')
+        valid_source_ids = tuple(source_id for source_id in source_ids if source_id in known)
         kind = item.get('kind', '')
         if not isinstance(kind, str) or (
             kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
         ):
             raise ReductionContractError('kind is unknown or not permitted')
-        memories.append(ReducedMemory(title, body, _confidence(item['confidence']), tuple(source_ids), kind))
+        confidence_value = item['confidence']
+        if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
+            raise ReductionContractError('confidence must be numeric')
+        if not valid_source_ids:
+            continue
+
+        memories.append(ReducedMemory(title, body, _confidence(confidence_value), valid_source_ids, kind))
     if inputs and not memories:
         raise ReductionContractError('reduction output is empty')
     if inputs:
-        covered = {source_id for memory in memories for source_id in memory.source_ids}
-        if covered != known:
-            raise ReductionContractError('reduction output does not cover every input')
         target = reduction_target if reduction_target is not None else len(inputs) - 1
         if len(inputs) > 1 and len(memories) >= len(inputs):
             raise ReductionContractError('reduction output must shrink')
@@ -235,14 +264,16 @@ parse_reduction_json = parse_reduction_output
 
 
 def _draft_payload(draft: ReductionDraft) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         'id': draft.draft_id,
         'title': draft.title,
         'body': draft.body,
         'confidence': str(draft.confidence),
-        'source_ids': list(draft.source_ids),
-        'kind': draft.kind,
     }
+    if draft.kind:
+        payload['kind'] = draft.kind
+
+    return payload
 
 
 def reduction_input_hash(refs: Sequence[DraftRef]) -> str:
@@ -698,7 +729,7 @@ class ReductionStageContract:
         )
         return PreparedProviderStageCall(
             prompt=prompt,
-            system_prompt='Return exactly a JSON object with the memories key following distill_reduce.v1.',
+            system_prompt=_REDUCE_SYSTEM_PROMPT,
             response_kind=self.response_kind,
         )
 

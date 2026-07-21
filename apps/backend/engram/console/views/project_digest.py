@@ -21,6 +21,7 @@ from engram.core.models import (
     Organization,
     Project,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowSubjectType,
@@ -29,7 +30,7 @@ from engram.core.models import (
 )
 from engram.memory.digest_work import freeze_daily_digest_input
 from engram.memory.services import DAILY_DIGEST_WINDOW_DAYS
-from engram.memory.tasks import dispatch_work_task, generate_daily_digest_work_v1
+from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
     create_work,
@@ -108,12 +109,13 @@ class ProjectDigestRunView(APIView):
             occurrence_key=schedule_key,
         )
 
-        work, _created = create_work(data)
+        work, created = create_work(data)
 
-        sources = snapshot.get('sources') or []
+        winning_snapshot = work.input_snapshot if isinstance(work.input_snapshot, dict) else {}
+        sources = winning_snapshot.get('sources') or []
 
         if not sources:
-            if work.disposition == WorkflowWorkDisposition.REQUIRED:
+            if created and work.disposition == WorkflowWorkDisposition.REQUIRED:
                 resolve_work_no_input(
                     work.id,
                     organization_id=organization.id,
@@ -136,13 +138,10 @@ class ProjectDigestRunView(APIView):
         request_id = f'daily-digest:{project.id}:{uuid.uuid4().hex[:8]}'
 
         try:
-            run = WorkflowRun.objects.create(
-                organization=organization,
-                project=project,
-                work=work,
-                run_type=WorkflowRunType.DAILY_DIGEST,
-                status=WorkflowRunStatus.QUEUED,
-                input_snapshot=work.input_snapshot,
+            run = queue_work_attempt(
+                work_id=work.id,
+                now=datetime.now(UTC),
+                origin=WorkflowRunOrigin.MANUAL,
                 request_id=request_id,
                 correlation_id=request_id,
             )
@@ -150,8 +149,6 @@ class ProjectDigestRunView(APIView):
             raise DailyDigestAlreadyRunningError(
                 'a daily digest is already queued or running for this project',
             ) from error
-
-        dispatch_work_task(generate_daily_digest_work_v1, work.id, run.id)
 
         audit_admin_action(
             organization=organization,

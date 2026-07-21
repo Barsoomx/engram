@@ -682,6 +682,21 @@ def test_crash_after_provider_response_replays_to_one_durable_decision(
     assert complete_targets.count() == 1
 
 
+def _flip_last_hex_digit(observation_id: str) -> str:
+    last = observation_id[-1]
+    replacement = '0' if last != '0' else '1'
+
+    return observation_id[:-1] + replacement
+
+
+def _typo_supporting_body(chunk: DistillationChunk) -> str:
+    observation_ids = _chunk_observation_ids(chunk)
+    valid, typo = observation_ids[0], _flip_last_hex_digit(observation_ids[1])
+    memory = {'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [valid, typo]}
+
+    return json.dumps({'memories': [memory], 'no_signal_observation_ids': []})
+
+
 def _malformed_body(chunk: DistillationChunk, variant: str) -> str:
     observation_ids = _chunk_observation_ids(chunk)
     first, second = observation_ids[0], observation_ids[1]
@@ -693,28 +708,10 @@ def _malformed_body(chunk: DistillationChunk, variant: str) -> str:
             {'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [first]}]}
         )
 
-    if variant == 'invalid_confidence':
-        return json.dumps(
-            {
-                'memories': [{'title': 'T', 'body': 'B', 'confidence': 1.5, 'supporting_observation_ids': [first]}],
-                'no_signal_observation_ids': [second],
-            }
-        )
-
-    if variant == 'unknown_ids':
-        return json.dumps(
-            {
-                'memories': [
-                    {'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [str(uuid.uuid4())]}
-                ],
-                'no_signal_observation_ids': [first, second],
-            }
-        )
-
     return json.dumps(
         {
-            'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [first]}],
-            'no_signal_observation_ids': [],
+            'memories': [{'title': 'T', 'body': 'B', 'confidence': 1.5, 'supporting_observation_ids': [first]}],
+            'no_signal_observation_ids': [second],
         }
     )
 
@@ -722,7 +719,7 @@ def _malformed_body(chunk: DistillationChunk, variant: str) -> str:
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     'variant',
-    ('invalid_json', 'missing_keys', 'invalid_confidence', 'unknown_ids', 'incomplete_coverage'),
+    ('invalid_json', 'missing_keys', 'invalid_confidence'),
 )
 def test_malformed_extraction_never_creates_candidate_or_coverage(
     m_monkeypatch: pytest.MonkeyPatch,
@@ -755,6 +752,30 @@ def test_malformed_extraction_never_creates_candidate_or_coverage(
     assert refreshed.last_failure_at is not None
     assert MemoryCandidate.objects.filter(organization=scope[0]).count() == 0
     assert DistillationObservationCoverage.objects.filter(window__work=work).count() == 0
+
+
+@pytest.mark.django_db
+def test_typoed_supporting_id_completes_stage_and_derives_no_signal(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-typo-tolerant')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_typo_supporting_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'completed'
+    observation_ids = _chunk_observation_ids(chunk)
+    completed = DistillationStage.objects.get(id=stage.id)
+    assert completed.status == 'complete'
+    snapshot = completed.output_snapshot
+    assert [memory['supporting_observation_ids'] for memory in snapshot['memories']] == [[observation_ids[0]]]
+    assert snapshot['no_signal_observation_ids'] == [observation_ids[1]]
 
 
 @pytest.mark.django_db
@@ -1170,6 +1191,80 @@ def test_parse_extraction_rejects_non_json_fence_wrappers() -> None:
         dps.parse_extraction_output(f'```json\n{body}\n```', chunk_observation_ids=frozenset())
 
 
+_ID_A = '11111111-1111-4111-8111-111111111111'
+_ID_B = '22222222-2222-4222-8222-222222222222'
+_ID_C = '33333333-3333-4333-8333-333333333333'
+_ID_B_TYPO = '22222222-2222-4222-8222-222222222229'
+_ID_UNKNOWN = 'ffffffff-ffff-4fff-8fff-ffffffffffff'
+
+
+def test_parse_extraction_drops_typoed_supporting_id_and_derives_coverage() -> None:
+    chunk = frozenset({_ID_A, _ID_B, _ID_C})
+    payload = {
+        'memories': [
+            {'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [_ID_A, _ID_B_TYPO]},
+        ],
+        'no_signal_observation_ids': [_ID_C],
+    }
+
+    parsed = dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=chunk)
+
+    assert len(parsed.memories) == 1
+    assert parsed.memories[0].supporting_observation_ids == (_ID_A,)
+    assert parsed.no_signal_observation_ids == (_ID_B, _ID_C)
+
+
+def test_parse_extraction_discards_memory_with_only_unknown_supporting_ids() -> None:
+    chunk = frozenset({_ID_A, _ID_B})
+    payload = {
+        'memories': [
+            {'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [_ID_UNKNOWN]},
+        ],
+        'no_signal_observation_ids': [_ID_A, _ID_B],
+    }
+
+    parsed = dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=chunk)
+
+    assert parsed.memories == ()
+    assert parsed.no_signal_observation_ids == (_ID_A, _ID_B)
+
+
+def test_parse_extraction_overlap_resolves_in_favor_of_supporting() -> None:
+    chunk = frozenset({_ID_A, _ID_B})
+    payload = {
+        'memories': [
+            {'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [_ID_A]},
+        ],
+        'no_signal_observation_ids': [_ID_A, _ID_B],
+    }
+
+    parsed = dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=chunk)
+
+    assert parsed.memories[0].supporting_observation_ids == (_ID_A,)
+    assert parsed.no_signal_observation_ids == (_ID_B,)
+
+
+def test_parse_extraction_ignores_unknown_no_signal_ids() -> None:
+    chunk = frozenset({_ID_A})
+    payload = {'memories': [], 'no_signal_observation_ids': [_ID_UNKNOWN]}
+
+    parsed = dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=chunk)
+
+    assert parsed.memories == ()
+    assert parsed.no_signal_observation_ids == (_ID_A,)
+
+
+def test_parse_extraction_still_rejects_structurally_empty_supporting() -> None:
+    chunk = frozenset({_ID_A})
+    payload = {
+        'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': []}],
+        'no_signal_observation_ids': [_ID_A],
+    }
+
+    with pytest.raises(dps.ExtractionContractError):
+        dps.parse_extraction_output(json.dumps(payload), chunk_observation_ids=chunk)
+
+
 @pytest.mark.django_db
 def test_malformed_result_records_response_diagnostics_and_provider_call_id(
     m_monkeypatch: pytest.MonkeyPatch,
@@ -1497,9 +1592,12 @@ def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> 
     }
 
     assert instructions
-    assert str(dps._MAX_MEMORIES) in instructions
+    assert 'at most 8 objects' in instructions
     assert str(dps._MAX_TITLE) in instructions
-    assert str(dps._MAX_BODY) in instructions
+    assert 'at most 2000 characters' in instructions
+    # Instructed caps are intentionally stricter than the parser caps (safe direction).
+    assert 8 <= dps._MAX_MEMORIES
+    assert 2000 <= dps._MAX_BODY
     for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
         assert kind in instructions
 
@@ -1509,3 +1607,20 @@ def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> 
     assert parsed.memories[0].supporting_observation_ids == (supported,)
     assert parsed.memories[0].confidence == Decimal('0.9')
     assert parsed.no_signal_observation_ids == (no_signal,)
+
+
+def test_extract_system_prompt_states_contract_marker_and_parser_rules() -> None:
+    prompt = dps._EXTRACT_SYSTEM_PROMPT
+
+    assert 'distill_extract.v1' in prompt
+    assert 'at most 8 objects' in prompt
+    assert 'at most 255 characters' in prompt
+    assert 'at most 2000 characters' in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
+    assert 'no id may appear in both' not in prompt
+    assert 'none may be omitted' not in prompt
+    assert 'copied verbatim' in prompt
+    # Instructed caps are intentionally stricter than the parser caps (safe direction).
+    assert 8 <= dps._MAX_MEMORIES
+    assert 2000 <= dps._MAX_BODY

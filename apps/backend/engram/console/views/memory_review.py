@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 from typing import Any
 
+from django.db.models import Q
 from django.utils.dateparse import parse_datetime
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
@@ -25,6 +28,7 @@ from engram.console.serializers.memory_review import (
 )
 from engram.console.services import (
     MemoryReviewError,
+    conflict_decision_context,
     conflict_set_etag,
     get_conflict_candidate_or_404,
     open_conflict_candidates,
@@ -64,21 +68,33 @@ class MemoryReviewViewSet(
 
         ordering = self._ordering(request)
 
-        base = open_conflict_candidates(organization, **filters)
+        base = open_conflict_candidates(organization, request.effective_scope, **filters)
 
-        candidates = list(base.order_by(*ordering)[:PAGE_SIZE])
+        cursor = self._decode_cursor(request)
+
+        page_queryset = self._apply_cursor(base.order_by(*ordering), ordering, cursor)
+
+        rows = list(page_queryset[: PAGE_SIZE + 1])
+
+        has_more = len(rows) > PAGE_SIZE
+
+        candidates = rows[:PAGE_SIZE]
 
         conflicts_by_candidate = open_conflicts_for_candidates(
             organization,
             [candidate.id for candidate in candidates],
         )
 
-        results = [conflict_list_item(candidate, conflicts_by_candidate[candidate.id]) for candidate in candidates]
+        results = [
+            conflict_list_item(candidate, conflicts_by_candidate[candidate.id])
+            for candidate in candidates
+            if conflicts_by_candidate[candidate.id]
+        ]
 
         return Response(
             {
                 'count': base.count(),
-                'next': None,
+                'next': self._next_url(request, candidates, has_more),
                 'previous': None,
                 'results': results,
             },
@@ -89,13 +105,28 @@ class MemoryReviewViewSet(
 
         candidate_id = self._uuid_kwarg(kwargs)
 
-        candidate = get_conflict_candidate_or_404(organization, candidate_id)
+        candidate = get_conflict_candidate_or_404(organization, candidate_id, request.effective_scope)
 
         conflicts = open_conflicts_for_candidates(organization, [candidate.id])[candidate.id]
 
+        if not conflicts:
+            raise MemoryReviewError('not_found', 'conflict not found', status=404)
+
         etag = conflict_set_etag(candidate)
 
-        response = Response(conflict_detail_payload(candidate, conflicts, etag), status=HTTP_200_OK)
+        decisions_by_conflict, primary_decision, observations = conflict_decision_context(conflicts)
+
+        response = Response(
+            conflict_detail_payload(
+                candidate,
+                conflicts,
+                etag,
+                decisions_by_conflict,
+                primary_decision,
+                observations,
+            ),
+            status=HTTP_200_OK,
+        )
 
         response['ETag'] = etag
 
@@ -109,7 +140,7 @@ class MemoryReviewViewSet(
 
         candidate_id = self._uuid_kwarg(kwargs)
 
-        candidate = get_conflict_candidate_or_404(organization, candidate_id)
+        candidate = get_conflict_candidate_or_404(organization, candidate_id, request.effective_scope)
 
         if_match = request.META.get('HTTP_IF_MATCH')
 
@@ -140,6 +171,7 @@ class MemoryReviewViewSet(
             target_memory_id=data.get('target_memory_id'),
             merged_title=data.get('merged_title'),
             merged_body=data.get('merged_body'),
+            expected_etag=if_match,
         )
 
         return Response(payload, status=HTTP_200_OK)
@@ -159,6 +191,65 @@ class MemoryReviewViewSet(
             return ('opened_at', 'id')
 
         return ('-opened_at', '-id')
+
+    def _decode_cursor(self, request: Request) -> tuple[Any, uuid.UUID] | None:
+        raw = request.query_params.get('cursor')
+
+        if not raw:
+            return None
+
+        try:
+            decoded = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
+            opened_at = parse_datetime(decoded['opened_at'])
+            cursor_id = uuid.UUID(str(decoded['id']))
+
+        except (ValueError, KeyError, TypeError) as error:
+            raise MemoryReviewError(
+                'invalid_cursor',
+                'cursor is not valid',
+                status=HTTP_400_BAD_REQUEST,
+            ) from error
+
+        if opened_at is None:
+            raise MemoryReviewError('invalid_cursor', 'cursor is not valid', status=HTTP_400_BAD_REQUEST)
+
+        return (opened_at, cursor_id)
+
+    def _apply_cursor(
+        self,
+        queryset: Any,
+        ordering: tuple[str, ...],
+        cursor: tuple[Any, uuid.UUID] | None,
+    ) -> Any:
+        if cursor is None:
+            return queryset
+
+        opened_at, cursor_id = cursor
+
+        if ordering[0].startswith('-'):
+            condition = Q(opened_at__lt=opened_at) | Q(opened_at=opened_at, id__lt=cursor_id)
+
+        else:
+            condition = Q(opened_at__gt=opened_at) | Q(opened_at=opened_at, id__gt=cursor_id)
+
+        return queryset.filter(condition)
+
+    def _next_url(self, request: Request, candidates: list[Any], has_more: bool) -> str | None:
+        if not has_more or not candidates:
+            return None
+
+        last = candidates[-1]
+
+        query = request.query_params.copy()
+
+        query['cursor'] = self._encode_cursor(last.opened_at, last.id)
+
+        return request.build_absolute_uri(f'{request.path}?{query.urlencode()}')
+
+    def _encode_cursor(self, opened_at: Any, cursor_id: uuid.UUID) -> str:
+        payload = json.dumps({'opened_at': opened_at.isoformat(), 'id': str(cursor_id)})
+
+        return base64.urlsafe_b64encode(payload.encode()).decode()
 
     def _uuid_query(self, request: Request, name: str) -> uuid.UUID | None:
         raw = request.query_params.get(name)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -33,6 +34,12 @@ from engram.model_policy.services import ResolveModelPolicy, ResolveModelPolicyI
 
 _MAX_OWNER_LENGTH = 255
 _LEASE_EXPIRED_CODE = 'lease_expired'
+_DEFAULT_FAILURE_STREAK_LIMIT = 12
+
+
+def _failure_streak_limit() -> int:
+    return int(os.getenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', str(_DEFAULT_FAILURE_STREAK_LIMIT)))
+
 
 _TASK_TYPE_BY_WORK = {
     WorkflowWorkType.OBSERVATION_PROCESSING: 'generation',
@@ -125,8 +132,7 @@ def _unavailable_marker(
     }
 
 
-def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
-    task_type = _TASK_TYPE_BY_WORK.get(work.work_type, '')
+def _policy_role_section(work: WorkflowWork, task_type: str) -> dict[str, object]:
     try:
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
@@ -168,6 +174,10 @@ def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
     }
 
 
+def _configuration_sections(work: WorkflowWork) -> dict[str, object]:
+    return _policy_role_section(work, _TASK_TYPE_BY_WORK.get(work.work_type, ''))
+
+
 def _settings_section(work: WorkflowWork) -> dict[str, object]:
     updated_at = (
         OrganizationSettings.objects.filter(organization_id=work.organization_id)
@@ -180,7 +190,41 @@ def _settings_section(work: WorkflowWork) -> dict[str, object]:
     return {'updated_at': updated_at}
 
 
+_CANDIDATE_DECISION_POLICY_ROLES = ('curation', 'embedding', 'generation')
+
+
+def _candidate_decision_enabled(work: WorkflowWork) -> bool:
+    from engram.memory.curation import candidate_decision_enabled
+
+    return candidate_decision_enabled(work)
+
+
+def _distillation_settings_section() -> dict[str, object]:
+    return {
+        'chunk_char_budget': os.environ.get('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET'),
+        'reduction_target': os.environ.get('ENGRAM_DISTILL_REDUCE_TARGET'),
+        'max_provider_calls_per_attempt': os.environ.get('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT'),
+    }
+
+
+def _candidate_decision_fingerprint_payload(work: WorkflowWork) -> dict[str, object]:
+    return {
+        'schema': 'execution_configuration/v1',
+        'work_type': work.work_type,
+        'organization_id': str(work.organization_id),
+        'project_id': str(work.project_id),
+        'team_id': str(work.team_id) if work.team_id else None,
+        'policy_roles': {role: _policy_role_section(work, role) for role in _CANDIDATE_DECISION_POLICY_ROLES},
+        'candidate_decision_enabled': _candidate_decision_enabled(work),
+        'organization_settings': _settings_section(work),
+        'execution_contract_version': 1,
+    }
+
+
 def execution_configuration_fingerprint(work: WorkflowWork) -> str:
+    if work.work_type == WorkflowWorkType.CANDIDATE_DECISION:
+        return hashlib.sha256(canonical_json_bytes(_candidate_decision_fingerprint_payload(work))).hexdigest()
+
     sections = _configuration_sections(work)
     payload = {
         'schema': 'execution_configuration/v1',
@@ -195,6 +239,8 @@ def execution_configuration_fingerprint(work: WorkflowWork) -> str:
         'organization_settings': _settings_section(work),
         'execution_contract_version': 1,
     }
+    if work.work_type == WorkflowWorkType.SESSION_DISTILLATION:
+        payload['distillation_settings'] = _distillation_settings_section()
 
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
@@ -411,10 +457,10 @@ def _do_claim(
     )
 
 
-def _short_circuit_state(work: WorkflowWork, *, now: datetime, is_automatic: bool) -> ClaimResult | None:
+def _short_circuit_state(work: WorkflowWork, *, now: datetime, absorb_terminal: bool) -> ClaimResult | None:
     state = work.execution_state
 
-    if state in _TERMINAL_EXECUTION_STATES and is_automatic:
+    if state in _TERMINAL_EXECUTION_STATES and absorb_terminal:
         return ClaimResult(outcome='terminal', claim=None)
 
     if state == WorkflowWorkExecutionState.RETRY_WAIT and now < work.next_retry_at:
@@ -476,6 +522,21 @@ def _resolve_supplied_run(
         return None, error
 
 
+def _absorbs_redelivered_terminal_run(
+    work: WorkflowWork,
+    runs: list[WorkflowRun],
+    workflow_run_id: uuid.UUID | None,
+) -> bool:
+    if work.execution_state not in _TERMINAL_EXECUTION_STATES:
+        return False
+
+    for run in runs:
+        if run.id == workflow_run_id:
+            return run.status in (WorkflowRunStatus.SUCCEEDED, WorkflowRunStatus.FAILED)
+
+    return False
+
+
 def claim_work(
     *,
     work_id: uuid.UUID,
@@ -494,7 +555,13 @@ def claim_work(
         runs = _locked_v1_runs(work)
         is_automatic = workflow_run_id is None
 
-        short_circuit = _short_circuit_state(work, now=now, is_automatic=is_automatic)
+        supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
+        absorb_terminal = is_automatic or (supplied_run is not None and supplied_run.origin != WorkflowRunOrigin.MANUAL)
+
+        if pending_error is not None and _absorbs_redelivered_terminal_run(work, runs, workflow_run_id):
+            return ClaimResult(outcome='terminal', claim=None)
+
+        short_circuit = _short_circuit_state(work, now=now, absorb_terminal=absorb_terminal)
         if short_circuit is not None:
             return short_circuit
 
@@ -513,7 +580,6 @@ def claim_work(
             if leased is not None:
                 return leased
 
-        supplied_run, pending_error = _resolve_supplied_run(runs, workflow_run_id, is_automatic=is_automatic)
         if pending_error is None:
             return _do_claim(work, supplied_run, lease_owner=lease_owner, now=now, lease_for=lease_for)
 
@@ -593,12 +659,15 @@ def _lock_claim_rows(claim: WorkClaim) -> tuple[WorkflowWork, WorkflowRun]:
     return work, run
 
 
-def _require_claim_fence(work: WorkflowWork, run: WorkflowRun, claim: WorkClaim) -> None:
+def _require_claim_fence(work: WorkflowWork, run: WorkflowRun, claim: WorkClaim, now: datetime) -> None:
     if (
         run.fencing_token != claim.fencing_token
         or run.lease_owner != claim.lease_owner
         or work.fencing_token != claim.fencing_token
+        or work.lease_owner != claim.lease_owner
         or work.execution_state != WorkflowWorkExecutionState.LEASED
+        or work.lease_expires_at is None
+        or now >= work.lease_expires_at
     ):
         raise StaleWorkFenceError('workflow run no longer matches the claim')
 
@@ -738,7 +807,7 @@ def finish_work_claim(
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a completable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
         _apply_finish(
             work,
             run,
@@ -762,7 +831,7 @@ def finish_claim_resolved_elsewhere(*, claim: WorkClaim, now: datetime) -> None:
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a completable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
 
         run.status = WorkflowRunStatus.SUCCEEDED
         run.finished_at = now
@@ -815,6 +884,10 @@ def _apply_failure_work(work: WorkflowWork, *, now: datetime, failure: Classifie
         work.execution_state = WorkflowWorkExecutionState.TERMINAL_FAILURE
         work.blocked_configuration_fingerprint = ''
         work.next_retry_at = None
+    elif streak >= _failure_streak_limit():
+        work.execution_state = WorkflowWorkExecutionState.TERMINAL_FAILURE
+        work.blocked_configuration_fingerprint = ''
+        work.next_retry_at = None
     else:
         work.execution_state = WorkflowWorkExecutionState.RETRY_WAIT
         work.blocked_configuration_fingerprint = ''
@@ -843,7 +916,7 @@ def fail_work_claim(*, claim: WorkClaim, now: datetime, failure: ClassifiedWorkF
         if run.status != WorkflowRunStatus.RUNNING:
             raise ValueError('workflow run is not in a failable state')
 
-        _require_claim_fence(work, run, claim)
+        _require_claim_fence(work, run, claim, now)
         _apply_failure_run(run, now=now, failure=failure)
         _apply_failure_work(work, now=now, failure=failure)
 

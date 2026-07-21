@@ -744,6 +744,29 @@ def test_curation_judge_prompt_redacts_secrets() -> None:
     assert '[REDACTED]' in prompt
 
 
+def test_curation_judge_prompt_teaches_redaction_uncertainty_fallback() -> None:
+    prompt = curation_judge_prompt(
+        MemoryCandidate(title='c', body='c body'),
+        Memory(title='m', body='m body'),
+    )
+
+    assert '"keep_both"' in prompt
+    assert '<new_candidate_memory>' in prompt
+    assert '<existing_near_duplicate_memory>' in prompt
+
+
+def test_curation_judge_prompts_share_decision_enum() -> None:
+    system_prompt = curation_judge_system_prompt()
+    user_prompt = curation_judge_prompt(
+        MemoryCandidate(title='c', body='c body'),
+        Memory(title='m', body='m body'),
+    )
+
+    for decision in ('merge', 'keep_both', 'reject', 'contradicts'):
+        assert decision in system_prompt
+        assert decision in user_prompt
+
+
 @pytest.mark.django_db
 def test_curate_judge_keep_both_promotes_clean_without_supersede() -> None:
     organization, team, project = create_scope()
@@ -2428,9 +2451,9 @@ def test_existing_open_conflict_pair_settles_idempotently_across_generations(mon
     assert open_pairs.count() == 1
     generation.refresh_from_db()
     assert generation.disposition == WorkflowWorkDisposition.COMPLETE
-    assert generation.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert generation.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
     decisions = orch.curation_decisions_for(candidate)
-    assert len(decisions) == 2
+    assert len(decisions) == 1
     assert {decision.outcome for decision in decisions} == {CurationOutcome.OPEN_CONFLICT}
 
 
@@ -2577,3 +2600,529 @@ def test_model_reject_of_superseded_generation_settles_without_rejecting(monkeyp
     assert candidate.status == CandidateStatus.PROPOSED
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED
+
+
+@pytest.mark.django_db
+def test_model_redundant_rejection_retries_when_shortlist_target_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('reject-stale-target')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='reject-stale-target',
+        title='Retry backoff policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='reject-stale-target',
+        title='Retry backoff policy duplicate',
+        body='The same retry backoff policy is repeated here.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='reject_candidate',
+        relation='redundant',
+        target_memory_version_id=target_version.id,
+        candidate_evidence_refs=('cref-1',),
+        comparisons=(
+            CurationJudgeComparisonV1(
+                memory_version_id=target_version.id,
+                relation='redundant',
+                target_evidence_refs=('tref-1',),
+            ),
+        ),
+        applicability='same',
+        temporal_order='not_applicable',
+        reason_code='redundant_claim',
+        reason='the frozen target already contains this claim',
+    )
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    def advance() -> None:
+        orch.advance_target_memory(
+            memory,
+            title='Retry backoff policy v2',
+            body='The target changed after the redundant verdict.',
+        )
+
+    orch.install_fault(monkeypatch, 'before_transition', advance)
+
+    _result, error = orch.run_decision(work, run)
+
+    candidate.refresh_from_db()
+    observed = (
+        getattr(error, 'code', None),
+        len(orch.curation_decisions_for(candidate)),
+        candidate.status,
+    )
+    assert observed == (
+        'stale_decision',
+        0,
+        CandidateStatus.PROPOSED,
+    )
+
+
+@pytest.mark.django_db
+def test_deterministic_exact_identity_does_not_rebase_onto_advanced_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('deterministic-stale-target')
+    memory = orch.target_memory(
+        scope,
+        suffix='deterministic-stale-target',
+        title='Cache eviction policy',
+        body=_LONG_BODY,
+    )
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='deterministic-stale-target',
+        title='Cache eviction policy',
+        body=_LONG_BODY,
+    )
+    module = orch.curation_module()
+    original_gate = module.EvaluateDeterministicCandidateGates
+    orch.install_deterministic_only(monkeypatch)
+
+    class AdvancingDeterministicGate:
+        def execute(self, work_id: uuid.UUID) -> object:
+            result = original_gate().execute(work_id)
+            orch.advance_target_memory(
+                memory,
+                title='Cache eviction policy v2',
+                body='A concurrent revision changed eviction to frequency-based admission.',
+            )
+
+            return result
+
+    monkeypatch.setattr(
+        module,
+        'EvaluateDeterministicCandidateGates',
+        AdvancingDeterministicGate,
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    memory.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+    assert memory.title == 'Cache eviction policy v2'
+    assert memory.body == 'A concurrent revision changed eviction to frequency-based admission.'
+    assert memory.current_version == 2
+
+
+@pytest.mark.django_db
+def test_redundant_rejection_revalidates_target_before_settlement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('redundant-stale-target')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='redundant-stale-target',
+        title='Retry backoff policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope,
+        suffix='redundant-stale-target',
+        title='Retry backoff policy restatement',
+        body='The retry policy uses the same bounded exponential backoff.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome='reject_candidate',
+        relation='redundant',
+        target_memory_version_id=target_version.id,
+        candidate_evidence_refs=('cref-1',),
+        comparisons=(
+            CurationJudgeComparisonV1(
+                target_version.id,
+                'redundant',
+                ('tref-1',),
+            ),
+        ),
+        applicability='same',
+        temporal_order='not_applicable',
+        reason_code='redundant_claim',
+        reason='the candidate is redundant with the selected current target',
+    )
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    def advance() -> None:
+        orch.advance_target_memory(
+            memory,
+            title='Retry backoff policy v2',
+            body='The current policy now uses fixed-delay retries without backoff.',
+        )
+
+    orch.install_fault(monkeypatch, 'before_transition', advance)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    memory.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+    assert work.execution_state != WorkflowWorkExecutionState.SETTLED
+    assert memory.current_version == 2
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL transaction semantics')
+def test_concurrent_targetless_publications_serialize_and_relist_loser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    from django.db import close_old_connections
+
+    scope = orch.orchestrator_scope('targetless-race')
+    policy = orch.curation_policy(scope)
+    first_candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='targetless-race-a',
+        title='Retry ceiling policy',
+        body='The retry ceiling is four attempts.',
+    )
+    second_candidate, second_work, second_run = orch.subject_candidate(
+        scope,
+        suffix='targetless-race-b',
+        title='Retry ceiling policy',
+        body='The retry ceiling is four attempts.',
+    )
+    assert first_candidate.content_hash != second_candidate.content_hash
+
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge_results = {
+        candidate.id: orch.stub_judge_result(
+            verdict,
+            orch.provider_call_record(scope, policy),
+            policy,
+            shortlist,
+        )
+        for candidate in (first_candidate, second_candidate)
+    }
+    module = orch.curation_module()
+    orch.enable_rollout(monkeypatch)
+    monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: _EMBEDDING)
+    monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist)
+    monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence)
+    monkeypatch.setattr(
+        module,
+        'judge_curation_candidate',
+        lambda data: judge_results[data.candidate_id],
+    )
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', orch._stub_revalidate)
+
+    real_revalidate = module.revalidate_curation_shortlist
+    revalidated = threading.Barrier(2)
+
+    def synchronized_revalidate(data: object, frozen: object) -> bool:
+        unchanged = real_revalidate(data, frozen)
+        try:
+            revalidated.wait(timeout=5)
+        except threading.BrokenBarrierError:
+            pass
+
+        return unchanged
+
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', synchronized_revalidate)
+    start = threading.Barrier(2)
+
+    def worker(item: tuple[WorkflowWork, WorkflowRun]) -> tuple[str | None, BaseException | None]:
+        work, run = item
+        close_old_connections()
+        try:
+            start.wait(timeout=10)
+
+            return orch.run_decision(work, run)
+        finally:
+            close_old_connections()
+
+    pairs = ((first_work, first_run), (second_work, second_run))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(worker, pairs))
+
+    candidates = (first_candidate, second_candidate)
+    works = (first_work, second_work)
+    for candidate in candidates:
+        candidate.refresh_from_db()
+    for work in works:
+        work.refresh_from_db()
+    errors = [error for _result, error in results if error is not None]
+    active = Memory.objects.filter(
+        organization=scope.organization,
+        project=scope.project,
+        status=MemoryStatus.APPROVED,
+        stale=False,
+        refuted=False,
+        transition_contract_version=1,
+    )
+
+    assert active.count() == 1
+    assert sum(len(orch.curation_decisions_for(candidate)) for candidate in candidates) == 1
+    assert sum(candidate.status == CandidateStatus.PROMOTED for candidate in candidates) == 1
+    assert sum(candidate.status == CandidateStatus.PROPOSED for candidate in candidates) == 1
+    assert sum(work.execution_state == WorkflowWorkExecutionState.SETTLED for work in works) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], MemoryTransitionError)
+    assert errors[0].code == 'stale_decision'
+
+
+def _append_late_candidate_source(
+    candidate: MemoryCandidate,
+    scope: orch.OrchestratorScope,
+    *,
+    suffix: str,
+) -> MemoryCandidateSource:
+    _donor, source, _session = provenanced_candidate_in_scope(
+        scope.organization,
+        scope.project,
+        scope.team,
+        suffix=f'late-source-{suffix}',
+        title=f'Late source donor {suffix}',
+        body=_LONG_BODY,
+    )
+
+    return MemoryCandidateSource.objects.create(
+        organization=scope.organization,
+        project=scope.project,
+        team=scope.team,
+        candidate=candidate,
+        window=source.window,
+        observation=source.observation,
+        stage=source.stage,
+        anchors=source.anchors,
+        anchors_hash=source.anchors_hash,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_on_rejected_candidate_does_not_create_another_decision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-rejected')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, first_work, first_run = orch.subject_candidate(scope, suffix='late-rejected')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='none')
+    judge = orch.stub_judge_result(_reject_verdict(), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.REJECTED
+    assert len(orch.curation_decisions_for(candidate)) == 1
+
+    _append_late_candidate_source(candidate, scope, suffix='late-rejected')
+    late_work, late_run = orch.next_generation_work(candidate)
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    candidate.refresh_from_db()
+    late_work.refresh_from_db()
+    assert (
+        candidate.status,
+        len(orch.curation_decisions_for(candidate)),
+        late_work.resolution_reason,
+    ) == (
+        CandidateStatus.REJECTED,
+        1,
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_cannot_reject_candidate_with_open_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-conflict-reject')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='late-conflict-reject',
+        title='Primary region',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='late-conflict-reject',
+        title='Primary region',
+        body='The primary region is now the eastern zone.',
+    )
+    first_shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    first_evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    first_verdict = orch.stub_verdict('open_conflict', target=target_version)
+    first_judge = orch.stub_judge_result(first_verdict, call, policy, first_shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=first_shortlist,
+        evidence=first_evidence,
+        judge_result=first_judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.resolved_transition_id is None
+
+    _append_late_candidate_source(candidate, scope, suffix='late-conflict-reject')
+    late_work, late_run = orch.next_generation_work(candidate)
+    late_shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    late_evidence = orch.stub_evidence(candidate_tier='none')
+    late_judge = orch.stub_judge_result(_reject_verdict(), call, policy, late_shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=late_shortlist,
+        evidence=late_evidence,
+        judge_result=late_judge,
+    )
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    candidate.refresh_from_db()
+    conflict.refresh_from_db()
+    late_work.refresh_from_db()
+    assert (
+        candidate.status,
+        conflict.resolved_transition_id,
+        len(orch.curation_decisions_for(candidate)),
+        late_work.resolution_reason,
+    ) == (
+        CandidateStatus.PROPOSED,
+        None,
+        1,
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
+
+
+@pytest.mark.django_db
+def test_late_evidence_does_not_record_transitionless_repeat_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('late-repeat-conflict')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='late-repeat-conflict',
+        title='Retention policy',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, first_work, first_run = orch.subject_candidate(
+        scope,
+        suffix='late-repeat-conflict',
+        title='Retention policy',
+        body='Logs are now retained for thirty days.',
+    )
+    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    evidence = orch.stub_evidence(
+        candidate_tier='supported',
+        target=target_version,
+        target_tier='supported',
+    )
+    verdict = orch.stub_verdict('open_conflict', target=target_version)
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _first_result, first_error = orch.run_decision(first_work, first_run)
+
+    assert first_error is None
+    conflict = MemoryConflict.objects.get(candidate=candidate, memory=memory)
+    assert conflict.opened_transition_id is not None
+
+    _append_late_candidate_source(candidate, scope, suffix='late-repeat-conflict')
+    late_work, late_run = orch.next_generation_work(candidate)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=judge,
+    )
+
+    _late_result, late_error = orch.run_decision(late_work, late_run)
+
+    assert late_error is None
+    late_work.refresh_from_db()
+    decisions = orch.curation_decisions_for(candidate)
+    assert (
+        len(decisions),
+        [decision.transition_id is None for decision in decisions],
+        late_work.resolution_reason,
+    ) == (
+        1,
+        [False],
+        WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
+    )
