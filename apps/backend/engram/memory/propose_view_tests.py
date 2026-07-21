@@ -17,6 +17,7 @@ from engram.access.models import (
 )
 from engram.access.services import api_key_fingerprint, api_key_prefix, hash_api_key
 from engram.core.models import MemoryCandidate, Organization, Project, ProjectTeam, Team, VisibilityScope
+from engram.memory.memory_propose_service import ProposeMemoryError
 
 _URL = '/v1/memories/propose'
 
@@ -288,3 +289,31 @@ def test_idempotent_repost_returns_same_candidate(
     assert first.status_code == 202
     assert second.status_code == 202
     assert first.json()['candidate_id'] == second.json()['candidate_id']
+
+
+@pytest.mark.django_db
+def test_propose_blank_detail_error_returns_static_message_without_exception_text(
+    f_scope: tuple[Organization, Team, Project, Identity],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, _team, project, owner = f_scope
+    raw_key = _key_material('blankdetail')
+    _make_key(organization, owner, raw_key=raw_key, capabilities=('memories:propose',), project=project)
+
+    def m_raise(_self: object, _data: object) -> None:
+        raise ProposeMemoryError('internal_failure')
+
+    monkeypatch.setattr('engram.memory.propose_view.ProposeMemory.execute', m_raise)
+
+    response = APIClient().post(
+        _URL,
+        _payload(project_id=str(project.id)),
+        format='json',
+        **_headers(raw_key),
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body['code'] == 'internal_failure'
+    assert body['detail'] == 'Memory propose failed.'
+    assert 'internal_failure' not in body['detail']

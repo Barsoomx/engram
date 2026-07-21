@@ -61,7 +61,7 @@ class MemoryProposeView(APIView):
             )
         except ProposeMemoryError as error:
             return Response(
-                {'code': error.code, 'detail': error.detail or str(error)},
+                {'code': error.code, 'detail': error.detail or 'Memory propose failed.'},
                 status=PROPOSE_STATUS.get(error.code, status.HTTP_400_BAD_REQUEST),
             )
 
