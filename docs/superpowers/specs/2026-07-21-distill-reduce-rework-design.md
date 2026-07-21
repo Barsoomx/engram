@@ -87,10 +87,18 @@ Three binding decisions, expanded. Karpathy simplicity: the primary fix is (A); 
 
 Batch fan-in is chosen from a **worst-case OUTPUT** estimate, not input chars. A batch of
 `n` drafts can, in the worst case, produce `n` full-size memories (pass-through, no
-merge). We size `n` so that worst-case output fits under the provider's real completion
-cap minus a 30% margin. Because reduce output bodies are hard-capped at `MAX_BODY` and the
-count can never exceed the input count, truncation is impossible for any contract-
-respecting output.
+merge). We size `n` so that the estimated worst-case output fits under the provider's real
+completion cap minus a 30% margin. This makes truncation **rare-by-planning**, not
+impossible: `_OUTPUT_TOKENS_PER_CHAR = 0.4` (~2.5 chars/token) is a conservative estimate
+for JSON+English, but it is NOT a true upper bound — CJK-dense bodies and heavy JSON
+escaping (quotes, backslashes, control chars) can push real tokens/char above 0.4 and make
+an in-limit-by-estimate batch still truncate. Progress does not depend on the estimate
+being an upper bound: the decision-C split-backstop guarantees forward progress regardless.
+A truncation is detected as a first-class outcome, bumps the generation (halving the budget
+and fan-in), and at the floor a two-draft batch that still would not fit is emitted as two
+size-1 pass-throughs with no provider call, after which no-shrink termination fires. So the
+estimator's job is to make truncation uncommon; the backstop, not the estimator, is what
+makes the loop converge.
 
 Draft identity on the wire changes from a verbatim 64-hex id echo to **1-based integer
 indices**. Drafts are numbered `1..n` in the prompt; the model returns integer `source_refs`;
@@ -367,10 +375,15 @@ response_kind)` so the request never asks for more than the estimator assumed.
 PROVIDER_OUTPUT_TRUNCATED = 'provider_output_truncated'
 ```
 
-New `_TruncatedOutcome(response_hash, response_size, response_prefix, provider_call_ids,
-started_calls=1)` and the existing `_MalformedOutcome` gains a `response_prefix` field. In
-`_attempt_stage` (`:911-917`), after obtaining `result` and before `normalize_output`,
-compute the redacted prefix and check truncation:
+Both outcomes are frozen dataclasses whose implemented field order is authoritative
+(`memory/distillation_provider_stage.py:181-197`):
+`_MalformedOutcome(response_hash, response_size, response_prefix='', error_detail='',
+provider_call_ids=(), started_calls=1)` — the existing malformed outcome gains BOTH a
+`response_prefix` and an `error_detail` field — and
+`_TruncatedOutcome(response_hash, response_size, response_prefix, provider_call_ids=(),
+started_calls=1)`. In `_attempt_stage` (`:920-951`), after obtaining `result` and before
+`normalize_output`, compute the redacted prefix (capped at `_RESPONSE_PREFIX_LIMIT = 2000`)
+and check truncation:
 
 ```
 prefix = str(redact_value(result.generated_body).value)[:2000]
@@ -379,8 +392,13 @@ if is_truncated_finish_reason(result.finish_reason):
 ```
 
 `normalize_output` failures return `_MalformedOutcome(response_hash, response_size, prefix,
-(str(result.call_record_id),), error_detail)` (the `ProviderStageOutputError` message is
-captured for `redacted_detail`).
+str(error), (str(result.call_record_id),))` — positional order `(response_hash,
+response_size, response_prefix, error_detail, provider_call_ids)` matching the dataclass;
+the `ProviderStageOutputError` message is captured in `error_detail` and threaded into
+`_malformed_failure(outcome.error_detail).redacted_detail`, which becomes
+`WorkflowRun.failure_reason`. The redacted `response_prefix` is persisted to
+`ProviderCallRecord.metadata['response_prefix']` by `_record_stage_failure_diagnostics`
+(shared by `_record_malformed`/`_record_truncated`).
 
 `_run_stage` (`memory/distillation_provider_stage.py:1107-1191`) MUST gain an explicit
 `_TruncatedOutcome` branch, placed after the `_MalformedOutcome` branch and BEFORE the final
@@ -779,7 +797,9 @@ docker compose -p engram-r1 run --rm app pytest -q \
   re-claimed (`_short_circuit_state`/`_absorbs_redelivered_terminal_run`,
   `work_execution.py:463/530`). The reduce fix only changes forward behavior. Recovering
   them is a separate explicit ops step: reset the affected distillation works
-  (`execution_state = PENDING`, `failure_streak = 0`, clear `next_retry_at`), after which the
+  (`execution_state = READY` — the `WorkflowWorkExecutionState.READY` enum value at
+  `core/models.py:1216`, there is no `PENDING` member — `failure_streak = 0`, clear
+  `next_retry_at`), after which the
   new plan re-runs them. That reset is out of scope for SLICE R1 (see §8) and, under the
   dogfood directive, dropping the terminalized sessions entirely is also acceptable.
 - Observability: `provider_output_truncated` is a distinct failure code in
@@ -890,3 +910,49 @@ Round 4 (2026-07-21, adversarial spec review):
   so it is not a regression from a working state. §3.2 now records the magnitude explicitly
   (~75 calls for a 100-draft deepseek session, bounded per attempt by
   `max_provider_calls_per_attempt`, mitigated by the §7 fan-in lever) so the plan is honest.
+
+Round 5 (2026-07-21, codex cross-check of the implemented slice):
+
+- Finding 1 [BLOCKER] v1/v2 reduce stage coordinate collision: `core_distill_stage_coord_uniq`
+  (`core/models.py:2041`) excluded `prompt_contract`, so the v2 planner's `get_or_create`
+  (`distillation_provider_stage.py:562`, keyed on the v2 `stage_key`) misses a residual COMPLETE
+  v1 reduce stage sharing `(window, stage_kind, level, ordinal, policy, policy_version,
+  policy_role)` and the INSERT raises `IntegrityError` on any re-driven window — CONFIRMED, FIXED.
+  Migration `0047_distill_stage_coord_prompt_contract` (verified next free number on this branch;
+  leaf was `0046_merge_20260721_1032`) rebuilds the constraint with `prompt_contract` added, so v1
+  and v2 rows coexist at one coordinate; the v2 accepted-set filter (§3.7) already ignores v1 rows.
+  Tests: `core/migrations_tests.py::test_0047_coord_uniqueness_admits_distinct_prompt_contracts_at_one_coordinate`
+  (MigrationExecutor: pre-0047 duplicate-contract INSERT raises IntegrityError, post-0047 distinct
+  contracts coexist while a same-contract duplicate still collides);
+  `distillation_tests.py::test_reduce_stage_coordinate_permits_distinct_prompt_contracts` (ORM
+  coexistence at one coordinate) and `::test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly`
+  (full redrive over a residual v1 stage finalizes SUCCEEDED with a fresh v2 gen-0 stage at the same
+  coordinate). Red before the migration was the IntegrityError those tests now avoid.
+- Finding 2 [MAJOR] Confidence provenance was model-trusted, not enforced — FIXED. `parse_reduction_output`
+  (`distillation_reduction.py`) now deterministically CLAMPS each memory's confidence to
+  `min(model_confidence, max(source draft confidences))` — a clamp, never a reject; the reduce schema
+  prefix `_DISTILL_REDUCE_SCHEMA_INSTRUCTIONS` (`model_policy/services.py`) mirrors the system-prompt
+  rule sentence ("Give each memory a confidence no higher than the highest confidence among its source
+  drafts"). Tests: `distillation_reduction_tests.py::test_parse_reduction_output_clamps_confidence_to_source_draft_ceiling_without_rejecting`
+  and the updated `services_tests.py::test_distill_reduce_schema_prefix_states_parser_enforced_rules`.
+- Finding 3 [MAJOR] No fingerprint pin on the prompt contract — FIXED. `services_tests.py` adds
+  `test_reduce_prompt_contract_components_are_fingerprint_pinned_editing_them_requires_a_contract_version_bump`
+  and `test_extract_..._requires_a_contract_version_bump`, pinning sha256 of `_REDUCE_SYSTEM_PROMPT`,
+  `_DISTILL_REDUCE_SCHEMA_INSTRUCTIONS`, `_EXTRACT_SYSTEM_PROMPT`, `_DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS`
+  against literal constants; the test names carry the contract-version-bump obligation (no comments).
+- Finding 4 [MAJOR] Spec overclaimed truncation is impossible — FIXED (spec wording) + test. §2.A now
+  states truncation is made rare-by-planning (0.4 tokens/char is not a true upper bound: CJK density
+  and JSON escaping can exceed it) and the split-backstop, not the estimator, guarantees progress.
+  `distillation_tests.py::test_escape_heavy_reduce_batch_truncates_once_then_recovers_via_split_backstop`
+  drives an escape-heavy batch that truncates once and recovers to SUCCEEDED via a generation bump.
+- Finding 5 [MINOR] Spec used a non-existent `execution_state = PENDING` — FIXED. §7 recovery step now
+  uses the real `WorkflowWorkExecutionState.READY` value (`core/models.py:1216`; there is no PENDING member).
+- Finding 6 [MINOR] `_MalformedOutcome` final shape / spec drift — FIXED (spec) + verified sound (code).
+  The implemented truncation-as-first-class code is the source of truth: `_MalformedOutcome` carries
+  `response_prefix` + `error_detail`; `error_detail` is threaded through
+  `_malformed_failure(...).redacted_detail` into `WorkflowRun.failure_reason` (`work_execution.py:849`),
+  and the ~2k redacted `response_prefix` is written to `ProviderCallRecord.metadata['response_prefix']`
+  by `_record_stage_failure_diagnostics`. §3.4 realigned to the exact dataclass field order (including
+  the corrected `_MalformedOutcome(response_hash, response_size, response_prefix, error_detail,
+  provider_call_ids)` positional order) and to the error_detail->failure_reason threading. No code
+  change required.
