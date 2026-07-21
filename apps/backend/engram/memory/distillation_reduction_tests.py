@@ -14,6 +14,7 @@ from engram.memory.distillation_reduction import (
     _REDUCE_SYSTEM_PROMPT,
     MAX_BODY,
     MAX_TITLE,
+    REDUCE_PROMPT_CONTRACT,
     REDUCTION_MANIFEST_SCHEMA,
     ReductionBatch,
     ReductionContractError,
@@ -285,8 +286,8 @@ def test_reduction_levels_start_at_one() -> None:
 def test_reduction_contract_exposes_provider_seam_methods() -> None:
     contract = ReductionStageContract()
     assert contract.stage_kind == 'reduce'
-    assert contract.prompt_contract == 'distill_reduce.v1'
-    assert contract.response_kind == 'distill_reduce.v1'
+    assert contract.prompt_contract == 'distill_reduce.v2'
+    assert contract.response_kind == 'distill_reduce.v2'
     with pytest.raises(ProviderStageOutputError):
         contract.normalize_output('{"memories": []}', stage=object())
 
@@ -473,57 +474,66 @@ def f_reduce_stage() -> DistillationStage:
     )
 
 
-def test_reduce_schema_instructions_describe_a_payload_the_parser_accepts() -> None:
-    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
-    inputs = [_draft(index) for index in range(4)]
-    payload = {
-        'memories': [
-            {
-                'title': 'Consolidated durable fact',
-                'body': 'One reduced fact preserving every input draft.',
-                'confidence': 0.9,
-                'source_ids': [draft.draft_id for draft in inputs],
-                'kind': 'decision',
-            }
-        ]
-    }
-
-    assert instructions
-    assert str(MAX_TITLE) in instructions
-    assert str(MAX_BODY) in instructions
-    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
-        assert kind in instructions
-
-    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
-
-    assert len(parsed.memories) == 1
-    assert parsed.memories[0].kind == 'decision'
-    assert parsed.memories[0].source_ids == tuple(draft.draft_id for draft in inputs)
-    assert parsed.memories[0].confidence == Decimal('0.9')
-
-
-def test_reduce_system_prompt_states_contract_marker_and_parser_rules() -> None:
+def test_reduce_prompt_contract_and_system_prompt_are_v2() -> None:
+    assert REDUCE_PROMPT_CONTRACT == 'distill_reduce.v2'
     prompt = _REDUCE_SYSTEM_PROMPT
 
-    assert 'distill_reduce.v1' in prompt
+    assert 'distill_reduce.v2' in prompt
+    assert 'distill_reduce.v1' not in prompt
     assert 'distill_extract.v1' not in prompt
+    assert 'reduction_target' not in prompt
     assert str(MAX_TITLE) in prompt
     assert str(MAX_BODY) in prompt
     for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
         assert kind in prompt
-    assert 'reduction_target' in prompt
-    assert 'strictly fewer' in prompt
+    assert 'source_refs' in prompt
+    assert 'Partition the drafts' in prompt
     assert 'copied verbatim' in prompt
     assert 'no additional properties' in prompt
 
 
 @pytest.mark.django_db
-def test_prepare_call_prompt_carries_the_stage_reduction_target(f_reduce_stage: DistillationStage) -> None:
+def test_prepare_call_prompt_carries_one_based_index_and_no_reduction_target(
+    f_reduce_stage: DistillationStage,
+) -> None:
     prepared = ReductionStageContract().prepare_call(f_reduce_stage)
     prompt = json.loads(prepared.prompt)
 
-    assert prompt['reduction_target'] == REDUCTION_TARGET
-    assert [draft['id'] for draft in prompt['drafts']] == [
+    assert prepared.response_kind == 'distill_reduce.v2'
+    assert 'reduction_target' not in prompt
+    assert [draft['index'] for draft in prompt['drafts']] == list(range(1, len(prompt['drafts']) + 1))
+    for draft in prompt['drafts']:
+        assert isinstance(draft['confidence'], str)
+        assert 'id' not in draft
+
+
+@pytest.mark.django_db
+def test_normalize_output_parses_partition_body_to_persisted_snapshot(
+    f_reduce_stage: DistillationStage,
+) -> None:
+    prepared = ReductionStageContract().prepare_call(f_reduce_stage)
+    drafts = json.loads(prepared.prompt)['drafts']
+    raw_body = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Consolidated fact',
+                    'body': 'A durable consolidated fact.',
+                    'confidence': 0.9,
+                    'source_refs': [draft['index'] for draft in drafts],
+                    'kind': 'decision',
+                }
+            ]
+        }
+    )
+
+    snapshot = ReductionStageContract().normalize_output(raw_body, stage=f_reduce_stage)
+
+    assert set(snapshot) == {'memories'}
+    memory = snapshot['memories'][0]
+    assert set(memory) == {'title', 'body', 'confidence', 'source_ids', 'kind'}
+    assert memory['confidence'] == '0.9'
+    assert memory['source_ids'] == [
         draft.draft_id for draft in _snapshot_drafts(f_reduce_stage.window.stages.get(level=1))
     ]
 

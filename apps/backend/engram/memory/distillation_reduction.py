@@ -21,33 +21,28 @@ class ReductionContractError(ValueError):
 MAX_TITLE = 255
 MAX_BODY = 3000
 REDUCTION_MANIFEST_SCHEMA = 'distillation_reduce_manifest.v1'
-REDUCE_PROMPT_CONTRACT = 'distill_reduce.v1'
+REDUCE_PROMPT_CONTRACT = 'distill_reduce.v2'
 
 _REDUCE_SYSTEM_PROMPT = (
-    'You consolidate engineering memory drafts following the distill_reduce.v1 contract. '
-    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-    'The object must contain exactly the key memories (array of objects) and no additional properties. '
-    'Each memories entry must contain exactly these keys and no additional properties: '
-    f'title (non-blank string, at most {MAX_TITLE} characters); '
-    f'body (non-blank string, at most {MAX_BODY} characters); '
-    'confidence (a JSON number between 0 and 1, never a string); '
-    'source_ids (non-empty array of unique draft ids); '
-    'kind (optional, one of: decision, convention, gotcha, architecture, incident; omit it when none applies). '
-    'Every source_ids value must be an id copied verbatim from the input drafts. '
-    'Group each input draft id into the source_ids of the memory that consolidates it; '
-    'the same draft id may appear in more than one entry. '
-    'memories must never be empty. '
-    'The user message is one JSON object: drafts (array of {id, title, body, confidence, kind?}) '
-    'and reduction_target (a number). '
-    'Task: merge drafts that record the same or closely related durable fact, decision, or behavior into one '
-    'memory whose title and body preserve the concrete details (identifiers, paths, versions, numbers) of '
-    'every merged draft; never invent facts absent from the drafts. '
-    'A draft unrelated to every other draft may pass through as its own entry with that single source id. '
-    'Return strictly fewer memories than there are input drafts and at most reduction_target memories; '
-    'if consolidating to reduction_target would force unrelated drafts into one memory, you may instead '
-    'return up to half the number of input drafts, rounded up. '
-    'Give each entry a confidence no higher than the highest confidence among its source drafts. '
-    'When unsure how to group, merge the most closely related drafts first and repeat until the count rules hold.'
+    'You consolidate engineering-memory drafts under the distill_reduce.v2 contract. Return '
+    'exactly one JSON object and nothing else: no prose, no markdown code fences. The object '
+    'must contain exactly the key memories (array of objects) and no additional properties. '
+    'Each memories entry must contain exactly these keys and no additional properties: title '
+    f'(non-blank string, at most {MAX_TITLE} characters); body (non-blank string, at most {MAX_BODY} '
+    'characters); confidence (a JSON number between 0 and 1, never a string); source_refs '
+    '(non-empty array of unique positive integers); kind (optional, one of: decision, '
+    'convention, gotcha, architecture, incident; omit it when none applies). The user message is '
+    'one JSON object with the single key drafts: an array of {index, title, body, confidence, '
+    'kind?} where index is a positive integer. Every source_refs value must be a draft index '
+    'copied verbatim from the input. Partition the drafts: assign every input index to exactly '
+    'one memory, never repeat an index across memories or within one memory, and never omit an '
+    'index. Task: merge only drafts that record the same or a near-duplicate durable fact, '
+    'decision, or behavior into one memory whose title and body preserve the concrete details '
+    '(identifiers, paths, versions, numbers) of every merged draft; never invent facts absent '
+    'from the drafts. A draft that is distinct from every other draft must pass through as its '
+    'own memory referencing that single index; do not force unrelated drafts together and do not '
+    'drop any draft. The number of memories may therefore equal the number of drafts. Give each '
+    'memory a confidence no higher than the highest confidence among its source drafts.'
 )
 
 
@@ -741,17 +736,17 @@ def derive_final_reduction_drafts(
 @dataclass(frozen=True, slots=True)
 class ReductionStageContract:
     stage_kind: str = 'reduce'
-    prompt_contract: str = 'distill_reduce.v1'
-    response_kind: str = 'distill_reduce.v1'
+    prompt_contract: str = 'distill_reduce.v2'
+    response_kind: str = 'distill_reduce.v2'
 
     def prepare_call(self, stage: DistillationStage) -> object:
         from engram.memory.distillation_provider_stage import PreparedProviderStageCall
 
         inputs = _hydrate_input_drafts(stage)
         drafts = []
-        for draft in inputs:
+        for index, draft in enumerate(inputs, start=1):
             entry = {
-                'id': draft.draft_id,
+                'index': index,
                 'title': draft.title,
                 'body': draft.body,
                 'confidence': str(draft.confidence),
@@ -760,7 +755,7 @@ class ReductionStageContract:
                 entry['kind'] = draft.kind
             drafts.append(entry)
         prompt = json.dumps(
-            {'drafts': drafts, 'reduction_target': stage.window.reduction_target},
+            {'drafts': drafts},
             ensure_ascii=False,
             separators=(',', ':'),
         )
@@ -776,9 +771,7 @@ class ReductionStageContract:
         try:
             payload = json.loads(raw_body)
             inputs = _hydrate_input_drafts(stage)
-            stage = _require_stage(stage)
-            reduction_target = stage.window.reduction_target
-            parsed = parse_reduction_output(payload, inputs, reduction_target=reduction_target)
+            parsed = parse_reduction_output(payload, inputs)
             memories: list[dict[str, object]] = []
             for memory in parsed.memories:
                 entry: dict[str, object] = {
