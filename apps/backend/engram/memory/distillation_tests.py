@@ -1517,9 +1517,12 @@ def test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly(m_monkeypatch
                     generation=0,
                 )
                 assert first_batch is not None
-                assert first_batch.input_hash != hashlib.sha256(
-                    canonical_json_bytes({'schema': 'distillation_reduce_manifest.v1', 'refs': []})
-                ).hexdigest()
+                assert (
+                    first_batch.input_hash
+                    != hashlib.sha256(
+                        canonical_json_bytes({'schema': 'distillation_reduce_manifest.v1', 'refs': []})
+                    ).hexdigest()
+                )
                 residual = _valid_residual_v1_reduce_stage(
                     window,
                     work,
