@@ -7,12 +7,12 @@ from django.db.backends.base.schema import BaseDatabaseSchemaEditor
 def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
     source_model = apps.get_model('core', 'MemoryCandidateSource')
     if source_model.objects.filter(source_kind='agent_proposal').exists():
-        raise RuntimeError('cannot reverse 0044 while agent proposal sources exist')
+        raise RuntimeError('cannot reverse 0045 while agent proposal sources exist')
 
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('core', '0043_curation_decision_evidence_context'),
+        ('core', '0044_memory_last_confirmed_at'),
     ]
 
     operations = [

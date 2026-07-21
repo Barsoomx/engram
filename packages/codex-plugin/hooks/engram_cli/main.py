@@ -24,6 +24,12 @@ from engram_cli.import_claude_mem import run_import_claude_mem
 from engram_cli.mcp_server import run_mcp_serve
 
 
+_SINCE_UNTIL_HELP = (
+    "Filter on ingestion time (created_at), not the displayed observed_at. "
+    "--since is inclusive (>=); --until is exclusive (<)."
+)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -166,6 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--query", default="")
     search.add_argument("--file-path", action="append", default=[])
     search.add_argument("--symbol", action="append", default=[])
+    search.add_argument("--kind", action="append", default=[], dest="kinds")
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--config-dir")
     search.add_argument("--json", action="store_true", dest="as_json")
@@ -211,6 +218,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     observations = subparsers.add_parser("observations")
     observations.add_argument("--limit", type=int, default=20)
+    observations.add_argument("--session-id", dest="session_id", default="")
+    observations.add_argument("--type", dest="observation_type", default="")
+    observations.add_argument("--since", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--until", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--offset", type=int, default=0)
     observations.add_argument("--config-dir")
     observations.add_argument("--project", default="")
 
