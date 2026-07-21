@@ -48,8 +48,9 @@ read a memory and need `memories:read`; `engram_observations` needs
 `engram_memory_version`, `engram_memory_feedback`) write through the review
 path and need `memories:review`; and `engram_audit` reads the inspection
 audit-events endpoint and needs `audit:read`. A key that lacks the capability a
-given tool requires receives `403 missing_capability` and a prompt to re-issue
-the key with that capability.
+given tool requires receives `403 missing_capability`; `engram_memory_get` and
+`engram_audit` additionally name the missing capability and suggest re-issuing
+the key with it, while the other tools surface the generic error text.
 Seven of the eight also accept an optional per-call `project_id` argument and
 fall back to a repository-derived project when neither it nor
 `ENGRAM_PROJECT_ID`/config resolve one - see

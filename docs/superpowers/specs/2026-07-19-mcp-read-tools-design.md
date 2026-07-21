@@ -1137,8 +1137,12 @@ Scope params mirror the existing helpers: `_scope_payload`
 - **Either tool 403 `team_scope_denied`** (a `team_id` was forwarded that the
   key cannot grant — cross-team key or non-team-admin requesting a team; also
   raised by P1 on the version fallback for a team-scoped memory; evidence §5/§6)
-  → `'This key cannot access team <tid> for memory <id>. Use a key bound to that
-  team (or one with team admin), then retry.'`
+  → context-aware remediation: memory_get names the memory
+  (`'This key cannot access the team scope of memory <id> ... that memory's
+  team'` when no team was forwarded, or names the forwarded `<tid>` when one
+  was); audit names the actual scope — `'for project <id>'` on a project-wide
+  call, `'for <target_type> <target_id>'` when a target was given (never a
+  bare `'for memory .'`).
   (Detected via `status == 403 and body.get('code') == 'team_scope_denied'`,
   checked alongside the other two 403 codes so it is not swallowed by the
   generic `_error_text` path.) This terminal handling applies to the primary
@@ -2481,3 +2485,5 @@ manual checklist items. Runs alongside the E2E tool-set gate (order-item 15).
   `:476,489` target); extended test 9b to inject a newline into both
   `actor_display` and `target_display` and assert the annotated line stays one
   physical record.
+- code-review round 3, finding 1, verdict fixed — docs/mcp-tools.md scoped the capability-specific reissue remediation to memory_get/audit only (other tools use generic _error_text by design).
+- code-review round 3, finding 2, verdict fixed — stale acceptance line for team_scope_denied replaced with the context-aware contract implemented in read_tools.py:69 (project-wide/target_type-labelled audit denials, memory-labelled memory_get denials).
