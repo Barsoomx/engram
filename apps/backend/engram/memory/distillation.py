@@ -45,13 +45,20 @@ from engram.memory.distillation_provider_stage import (
     stage_target_key,
 )
 from engram.memory.distillation_provider_stage import (
+    PROVIDER_OUTPUT_TRUNCATED,
+    resolve_reduction_policy,
+)
+from engram.memory.distillation_provider_stage import (
     stage_key as provider_stage_key,
 )
 from engram.memory.distillation_reduction import (
     ReductionContractError,
+    ReductionTruncationExhausted,
+    compute_reduction_generation,
     derive_final_reduction_drafts,
     derive_first_pending_reduction_target,
     execute_reduction_stage,
+    output_budget_tokens,
     provider_stage_target,
     resolve_reduction_stage,
 )
@@ -81,6 +88,8 @@ from engram.memory.work_execution import (
 )
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, ClassifiedWorkFailure
 from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
+from engram.model_policy.errors import ModelPolicyError
+from engram.model_policy.services import effective_completion_cap
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,13 +641,19 @@ def _invalid_distillation_failure(code: str, detail: str) -> DistillationStageEr
     )
 
 
-def _accepted_stage_rows(window: DistillationWindow, stage_kind: str) -> list[DistillationStage]:
+def _accepted_stage_rows(
+    window: DistillationWindow, stage_kind: str, *, prompt_contract: str | None = None
+) -> list[DistillationStage]:
+    filters: dict[str, object] = {
+        'window': window,
+        'stage_kind': stage_kind,
+        'status': DistillationStageStatus.COMPLETE,
+    }
+    if prompt_contract is not None:
+        filters['prompt_contract'] = prompt_contract
+
     return list(
-        DistillationStage.objects.filter(
-            window=window,
-            stage_kind=stage_kind,
-            status=DistillationStageStatus.COMPLETE,
-        )
+        DistillationStage.objects.filter(**filters)
         .select_related('chunk', 'window')
         .order_by('level', 'ordinal', 'stage_key')
     )
@@ -770,14 +785,37 @@ def run_complete_distillation_attempt(  # noqa: C901
             continue
 
         extraction_stages = _accepted_stage_rows(window, DistillationStageKind.EXTRACT)
-        reduction_stages = _accepted_stage_rows(window, DistillationStageKind.REDUCE)
+        reduction_stages = _accepted_stage_rows(
+            window, DistillationStageKind.REDUCE, prompt_contract='distill_reduce.v2'
+        )
         try:
+            reduce_policy = resolve_reduction_policy(window)
+        except ModelPolicyError as error:
+            raise _configuration_failure(work, error) from error
+        output_budget = output_budget_tokens(effective_completion_cap(reduce_policy, 'distill_reduce.v2'))
+        truncated_levels = list(
+            DistillationStage.objects.filter(
+                window=window,
+                stage_kind=DistillationStageKind.REDUCE,
+                status=DistillationStageStatus.REQUIRED,
+                prompt_contract='distill_reduce.v2',
+                last_failure_class=PROVIDER_OUTPUT_TRUNCATED,
+            ).values_list('level', flat=True)
+        )
+        try:
+            generation = compute_reduction_generation(truncated_levels)
             pending_reduction = derive_first_pending_reduction_target(
                 extraction_stages,
                 reduction_stages,
-                reduction_target=window.reduction_target,
-                prompt_budget=window.chunk_char_budget,
+                reduction_target_floor=window.reduction_target,
+                output_budget_tokens=output_budget,
+                generation=generation,
             )
+        except ReductionTruncationExhausted as error:
+            raise _invalid_distillation_failure(
+                'distillation_reduction_truncation_exhausted',
+                str(error),
+            ) from error
         except ReductionContractError as error:
             raise _invalid_distillation_failure(
                 'distillation_reduction_plan_invalid',
@@ -810,8 +848,9 @@ def run_complete_distillation_attempt(  # noqa: C901
             final_drafts = derive_final_reduction_drafts(
                 extraction_stages,
                 reduction_stages,
-                reduction_target=window.reduction_target,
-                prompt_budget=window.chunk_char_budget,
+                reduction_target_floor=window.reduction_target,
+                output_budget_tokens=output_budget,
+                generation=generation,
             )
             leaf_count = sum(len(stage.output_snapshot['memories']) for stage in extraction_stages)
             if leaf_count and not final_drafts:

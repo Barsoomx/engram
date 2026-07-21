@@ -403,6 +403,10 @@ def _resolve_primary_policy(window: DistillationWindow) -> ModelPolicy:
     raise ModelPolicyError('model_policy_not_found', 'no distillation policy resolves for the stage scope')
 
 
+def resolve_reduction_policy(window: DistillationWindow) -> ModelPolicy:
+    return _resolve_primary_policy(window)
+
+
 def _resolve_fallback_policy(stage: DistillationStage) -> ModelPolicy | None:
     try:
         return _resolve_policy(stage, 'generation')
