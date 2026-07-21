@@ -32,7 +32,7 @@ bundles, prompt/tool-output bodies, persistent queues.
 
 ## Project resolution
 
-`engram search`, `engram observations`, `engram memory version|link|links`,
+`engram search`, `engram observations`, `engram memory version|link|links|get`,
 and hook ingest all resolve which project a call targets with the same
 precedence ladder, in order:
 
@@ -50,9 +50,14 @@ precedence ladder, in order:
 `engram search` never fails client-side on an unresolved project: if nothing
 in the ladder resolves, it sends the request with neither `project_id` nor
 `repository_url`, and the server answers `400 project_or_repository_required`.
-`engram observations` and `engram memory version|link|links` fail fast
+`engram observations` and `engram memory version|link|links|get` fail fast
 client-side instead - `missing_project: Set --project, ENGRAM_PROJECT_ID, or
-run inside a git repository` - with no network call.
+run inside a git repository` - with no network call. `engram audit` resolves a
+project through rungs 1-3 only (explicit `--project`, `ENGRAM_PROJECT_ID`, then
+config `project_id`) and has no rung-4 repository fallback: it reads the
+inspection audit-events endpoint, which has no repository-URL routing, so a
+repository-only scope fails client-side with `missing_project` and makes no
+network call.
 
 The server always re-authorizes whichever project a `repository_url`-derived
 request resolves to, inside the caller's own organization; see
@@ -263,6 +268,8 @@ subcommand accepts `--project` as ladder rung 1):
 engram memory version <memory_id> --body "Updated body" --reason "fix"
 engram memory link <memory_id> --link-type file --target src/auth.py --label "rotate"
 engram memory links <memory_id>
+engram memory get <memory_id>
+engram memory get <memory_id> --from-version 1 --to-version 2
 engram memory version <memory_id> --body "Updated body" --project <project_id>
 ```
 
@@ -271,6 +278,29 @@ engram memory version <memory_id> --body "Updated body" --project <project_id>
 | `version`  | `POST /v1/memories/{id}/version`       | Create/retrieve a memory version   |
 | `link`     | `POST /v1/memories/{id}/links`         | `--link-type` in `file`, `symbol`, `commit`, `issue` |
 | `links`    | `GET /v1/memories/{id}/links`          | List links                         |
+| `get`      | `GET /v1/memories/{id}/version` + `/links` (+ `/diff`) | Read one memory in full (untruncated body, all versions, links); `--from-version`/`--to-version` add a diff |
+
+## `engram audit`
+
+List a memory's own recorded audit events (project-scoped only — requires a
+resolved `project_id`, no repository-URL fallback):
+
+```bash
+engram audit --memory-id <memory_id>
+engram audit --target-id <id> --target-type memory_link
+engram audit --memory-id <memory_id> --event-type MemoryTransitionCommitted --limit 20
+```
+
+| Flag             | Default | Description                                              |
+|------------------|---------|----------------------------------------------------------|
+| `--memory-id`    | empty   | Memory whose events to trace (maps to `target_id`)       |
+| `--target-id`    | empty   | Explicit target id (wins over `--memory-id`)             |
+| `--target-type`  | empty   | Target type; defaults to `memory` when an id is set      |
+| `--event-type`   | empty   | Filter by event type                                     |
+| `--correlation-id` | empty | Filter by correlation id                                 |
+| `--since`/`--until` | empty | ISO-8601 time bounds                                     |
+| `--limit`        | 20      | Max newest-first events                                  |
+| `--project`      | empty   | Project id override (ladder rung 1; required)            |
 
 ## Error model
 

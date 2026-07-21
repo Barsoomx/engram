@@ -105,6 +105,53 @@ def test_list_audit_events_filters_by_correlation_id_field() -> None:
     assert [ae.id for ae in results] == [matching.id]
 
 
+def _make_audit_event(organization: object, project: object, *, actor_id: str) -> AuditEvent:
+    return AuditEvent.objects.create(
+        organization=organization,
+        project=project,
+        event_type='MemoryTransitionCommitted',
+        actor_type='api_key',
+        actor_id=actor_id,
+        target_type='memory',
+        target_id='target-ordering',
+        capability='memories:write',
+        result=AuditResult.RECORDED,
+        request_id=f'req-{actor_id}',
+    )
+
+
+@pytest.mark.django_db
+def test_list_audit_events_honors_whitelisted_ordering() -> None:
+    organization, team, project = create_inspection_scope_models()
+    now = timezone.now()
+    oldest = _make_audit_event(organization, project, actor_id='oldest')
+    tie_a = _make_audit_event(organization, project, actor_id='tie-a')
+    tie_b = _make_audit_event(organization, project, actor_id='tie-b')
+    newest = _make_audit_event(organization, project, actor_id='newest')
+    AuditEvent.objects.filter(id=oldest.id).update(created_at=now - timedelta(days=3))
+    shared = now - timedelta(days=1)
+    AuditEvent.objects.filter(id=tie_a.id).update(created_at=shared)
+    AuditEvent.objects.filter(id=tie_b.id).update(created_at=shared)
+    AuditEvent.objects.filter(id=newest.id).update(created_at=now)
+    tie_desc = sorted([tie_a.id, tie_b.id], reverse=True)
+    tie_asc = sorted([tie_a.id, tie_b.id])
+
+    def order(ordering: str | None) -> list[uuid.UUID]:
+        inspection_scope = InspectionScope(
+            project=project,
+            scope=_effective_scope(organization, team),
+            ordering=ordering,
+        )
+
+        return [ae.id for ae in ListInspectionAuditEvents().execute(inspection_scope)]
+
+    assert order('-created_at') == [newest.id, *tie_desc, oldest.id]
+    assert order('created_at') == [oldest.id, *tie_asc, newest.id]
+    assert order(None) == [oldest.id, *tie_asc, newest.id]
+    assert order('bogus') == [oldest.id, *tie_asc, newest.id]
+    assert order('title') == [oldest.id, *tie_asc, newest.id]
+
+
 @pytest.mark.django_db
 def test_list_inspection_memories_defaults_to_newest_first() -> None:
     organization, team, project = create_inspection_scope_models()

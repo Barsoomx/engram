@@ -373,6 +373,135 @@ def test_list_memory_versions_denies_other_project() -> None:
     assert response.json()['code'] == 'project_scope_denied'
 
 
+def _raw_memory_with_visibility(
+    organization: Organization,
+    project: Project,
+    *,
+    visibility_scope: str,
+    team: Team | None,
+    title: str,
+) -> tuple[Memory, MemoryVersion]:
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=title,
+        body=f'body for {title}',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=visibility_scope,
+        current_version=1,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash=f'{title}-hash',
+    )
+
+    return memory, version
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_denies_non_whitelisted_visibility() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Other', slug='other-team-vlist-deny')
+    client = APIClient()
+
+    cases = [
+        (VisibilityScope.TEAM, other_team, 'foreign team'),
+        (VisibilityScope.TEAM, None, 'null team'),
+        (VisibilityScope.SESSION, None, 'session'),
+        (VisibilityScope.ORGANIZATION, None, 'organization'),
+    ]
+    for index, (visibility, memory_team, label) in enumerate(cases):
+        memory, _version = _raw_memory_with_visibility(
+            organization,
+            project,
+            visibility_scope=visibility,
+            team=memory_team,
+            title=f'Whitelist deny {index} {label}',
+        )
+
+        response = client.get(
+            f'/v1/memories/{memory.id}/version',
+            {'project_id': str(project.id)},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 403, label
+        assert response.json()['code'] == 'team_scope_denied', label
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_admits_project_and_authorized_team() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    project_memory, _pv = _raw_memory_with_visibility(
+        organization,
+        project,
+        visibility_scope=VisibilityScope.PROJECT,
+        team=None,
+        title='Whitelist admit project',
+    )
+    team_memory, _tv = _raw_memory_with_visibility(
+        organization,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+        team=team,
+        title='Whitelist admit team',
+    )
+
+    for memory in (project_memory, team_memory):
+        response = client.get(
+            f'/v1/memories/{memory.id}/version',
+            {'project_id': str(project.id)},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 200
+        assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_list_memory_versions_missing_parent_returns_empty() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_project = Project.objects.create(organization=organization, name='Foreign', slug='foreign-vlist')
+    foreign_memory = Memory.objects.create(
+        organization=organization,
+        project=other_project,
+        team=team,
+        title='Mis-projected parent',
+        body='foreign body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+        current_version=1,
+    )
+    MemoryVersion.objects.bulk_create(
+        [
+            MemoryVersion(
+                organization=organization,
+                project=project,
+                memory=foreign_memory,
+                version=1,
+                body='leaked foreign version body',
+                content_hash='mis-projected-hash',
+            ),
+        ],
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{foreign_memory.id}/version',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {'count': 0, 'items': []}
+
+
 @pytest.mark.django_db
 @pytest.mark.parametrize('stale_field', ['stale', 'refuted'])
 def test_update_memory_body_rejects_stale_or_refuted_memory(stale_field: str) -> None:

@@ -28,6 +28,7 @@ from engram_cli.config import (
     write_json,
     write_secret_json,
 )
+from engram_cli import read_tools
 from engram_cli.http import (
     Transport,
     admin_get,
@@ -2380,6 +2381,98 @@ def run_memory_links(
             return 0
         for item in items:
             stdout.write(f"{item.get('link_type')}: {item.get('target')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def _cli_error_from_read(error: read_tools.ReadError, *, memory_id: str) -> CliError:
+    if error.code == "memory_not_found":
+        return CliError("memory_not_found", error.message, remediation_for("memory_not_found"))
+
+    if error.code in ("project_scope_denied", "team_scope_denied", "missing_capability"):
+        return CliError(error.code, error.message, "")
+
+    return error_from_body(error.body or {}, fallback="http_error")
+
+
+def run_memory_get(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
+        scope = read_tools.ReadScope(
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            repository_url=repository_url,
+            team_id=team_id,
+        )
+        outcome = read_tools.fetch_memory_get(
+            transport or urllib_transport,
+            scope,
+            args.memory_id,
+            args.from_version,
+            args.to_version,
+        )
+        if outcome.error is not None:
+            raise _cli_error_from_read(outcome.error, memory_id=args.memory_id)
+        stdout.write(outcome.text + "\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_audit(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id = _ladder_project_id(args, config)
+        if not project_id:
+            raise CliError(
+                "missing_project",
+                read_tools.audit_needs_project_message(),
+                remediation_for("missing_project"),
+            )
+        target_id, target_type = read_tools.resolve_audit_target(
+            as_string(args.target_id),
+            as_string(args.memory_id),
+            as_string(args.target_type),
+        )
+        filters = {key: as_string(getattr(args, key, "")) for key in ("event_type", "correlation_id", "since", "until")}
+        scope = read_tools.ReadScope(
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            team_id=team_id,
+        )
+        outcome = read_tools.fetch_audit(
+            transport or urllib_transport,
+            scope,
+            target_id,
+            target_type,
+            args.limit or 20,
+            filters,
+        )
+        if outcome.error is not None:
+            raise _cli_error_from_read(outcome.error, memory_id=target_id)
+        stdout.write(outcome.text + "\n")
 
         return 0
     except CliError as error:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.request import Request
@@ -21,6 +22,7 @@ from engram.core.models import (
     Project,
     RetrievalDocument,
     Team,
+    VisibilityScope,
 )
 from engram.core.redaction import redact_value
 from engram.inspection.serializers import InspectionQuerySerializer
@@ -31,6 +33,7 @@ from engram.inspection.services import (
     ListInspectionContextBundles,
     ListInspectionMemories,
 )
+from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 NOT_FOUND_STATUS = {
     'memory_not_found': status.HTTP_404_NOT_FOUND,
@@ -72,6 +75,8 @@ class InspectionBaseView(APIView):
             session_id=data.get('session_id') or None,
             event_type=data.get('event_type') or None,
             correlation_id=data.get('correlation_id') or None,
+            target_id=data.get('target_id') or None,
+            target_type=data.get('target_type') or None,
             since=data.get('since'),
             until=data.get('until'),
         )
@@ -161,7 +166,7 @@ class AuditEventInspectionListView(InspectionBaseView):
         audit_events = list(qs[offset : offset + limit])
         org_id = inspection_scope.scope.organization_id
         actor_name_map = _batch_resolve_actor_names(audit_events, org_id)
-        target_name_map = _batch_resolve_target_names(audit_events, org_id)
+        target_name_map = _batch_resolve_target_names(audit_events, org_id, inspection_scope)
 
         items = [
             audit_event_response(ae, actor_name_map=actor_name_map, target_name_map=target_name_map)
@@ -184,7 +189,7 @@ class AuditEventInspectionDetailView(InspectionBaseView):
 
         org_id = inspection_scope.scope.organization_id
         actor_name_map = _batch_resolve_actor_names([ae], org_id)
-        target_name_map = _batch_resolve_target_names([ae], org_id)
+        target_name_map = _batch_resolve_target_names([ae], org_id, inspection_scope)
 
         return Response(audit_event_response(ae, actor_name_map=actor_name_map, target_name_map=target_name_map))
 
@@ -439,6 +444,7 @@ def _batch_resolve_actor_names(
 def _batch_resolve_target_names(
     events: list[AuditEvent],
     organization_id: uuid.UUID,
+    inspection_scope: InspectionScope,
 ) -> dict[tuple[str, str], str | None]:
     by_type: dict[str, set[str]] = {}
     for e in events:
@@ -446,7 +452,7 @@ def _batch_resolve_target_names(
             by_type.setdefault(e.target_type, set()).add(e.target_id)
 
     name_map: dict[tuple[str, str], str | None] = {}
-    _resolve_memory_targets(by_type, organization_id, name_map)
+    _resolve_memory_targets(by_type, organization_id, name_map, inspection_scope)
     _resolve_project_targets(by_type, organization_id, name_map)
     _resolve_team_targets(by_type, organization_id, name_map)
     _resolve_identity_targets(by_type, organization_id, name_map)
@@ -458,12 +464,33 @@ def _resolve_memory_targets(
     by_type: dict[str, set[str]],
     organization_id: uuid.UUID,
     name_map: dict[tuple[str, str], str | None],
+    inspection_scope: InspectionScope,
 ) -> None:
     ids = _valid_uuids(by_type.get('memory', set()))
     if not ids:
         return
 
-    for m in Memory.objects.filter(organization_id=organization_id, id__in=ids).only('id', 'title'):
+    scope = inspection_scope.scope
+    project = inspection_scope.project
+    visibility_whitelist = Q(visibility_scope=VisibilityScope.PROJECT) | Q(
+        visibility_scope=VisibilityScope.TEAM,
+        team_id__in=scope.team_ids,
+    )
+    memories = Memory.objects.filter(organization_id=organization_id, project=project, id__in=ids).filter(
+        visibility_whitelist
+    )
+
+    digests = Memory.objects.filter(
+        organization_id=organization_id,
+        project=project,
+        kind='digest',
+        id__in=ids,
+    ).filter(visibility_whitelist)
+    unproven = unproven_digest_memory_ids(digests)
+    if unproven:
+        memories = memories.exclude(id__in=unproven)
+
+    for m in memories.only('id', 'title'):
         name_map[('memory', str(m.id))] = redacted_text(m.title)
 
 

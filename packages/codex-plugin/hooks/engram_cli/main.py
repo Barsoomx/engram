@@ -6,12 +6,14 @@ from collections.abc import Sequence
 from typing import TextIO
 
 from engram_cli.commands import (
+    run_audit,
     run_connect,
     run_disconnect,
     run_doctor,
     run_hook,
     run_install,
     run_mcp_install,
+    run_memory_get,
     run_memory_link,
     run_memory_links,
     run_memory_propose,
@@ -66,6 +68,8 @@ def main(
         return run_search(args, output, errors, transport)
     if args.command == "observations":
         return run_observations(args, output, errors, transport)
+    if args.command == "audit":
+        return run_audit(args, output, errors, transport)
     if args.command == "import":
         if args.import_command == "claude-mem":
             return run_import_claude_mem(args, output, errors, transport)
@@ -76,6 +80,8 @@ def main(
             return run_memory_link(args, output, errors, transport)
         if args.memory_command == "links":
             return run_memory_links(args, output, errors, transport)
+        if args.memory_command == "get":
+            return run_memory_get(args, output, errors, transport)
         if args.memory_command == "propose":
             return run_memory_propose(args, output, errors, transport)
 
@@ -208,6 +214,13 @@ def build_parser() -> argparse.ArgumentParser:
     memory_links.add_argument("--config-dir")
     memory_links.add_argument("--project", default="")
 
+    memory_get = memory_subparsers.add_parser("get")
+    memory_get.add_argument("memory_id")
+    memory_get.add_argument("--from-version", dest="from_version", type=int, default=0)
+    memory_get.add_argument("--to-version", dest="to_version", type=int, default=0)
+    memory_get.add_argument("--config-dir")
+    memory_get.add_argument("--project", default="")
+
     memory_propose = memory_subparsers.add_parser("propose")
     memory_propose.add_argument("--title", required=True)
     memory_propose.add_argument("--body", required=True)
@@ -225,6 +238,18 @@ def build_parser() -> argparse.ArgumentParser:
     observations.add_argument("--offset", type=int, default=0)
     observations.add_argument("--config-dir")
     observations.add_argument("--project", default="")
+
+    audit = subparsers.add_parser("audit")
+    audit.add_argument("--memory-id", dest="memory_id", default="")
+    audit.add_argument("--target-id", dest="target_id", default="")
+    audit.add_argument("--target-type", dest="target_type", default="")
+    audit.add_argument("--event-type", dest="event_type", default="")
+    audit.add_argument("--correlation-id", dest="correlation_id", default="")
+    audit.add_argument("--since", default="")
+    audit.add_argument("--until", default="")
+    audit.add_argument("--limit", type=int, default=20)
+    audit.add_argument("--config-dir")
+    audit.add_argument("--project", default="")
 
     importer = subparsers.add_parser("import")
     import_subparsers = importer.add_subparsers(dest="import_command")

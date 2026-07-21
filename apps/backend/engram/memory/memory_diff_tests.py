@@ -274,6 +274,105 @@ def test_memory_diff_team_scoped_denied_for_other_team() -> None:
 
 
 @pytest.mark.django_db
+def test_memory_diff_denies_non_whitelisted_visibility() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_read_capability()
+    client = APIClient()
+
+    cases = [
+        (VisibilityScope.TEAM, None, 'null team'),
+        (VisibilityScope.SESSION, None, 'session'),
+        (VisibilityScope.ORGANIZATION, None, 'organization'),
+    ]
+    for index, (visibility, memory_team, label) in enumerate(cases):
+        memory, _v1, _doc = create_approved_memory_document(
+            organization,
+            memory_team,
+            project,
+            visibility_scope=visibility,
+            title=f'Diff whitelist deny {index} {label}',
+        )
+        _create_version(memory, organization, project, 2, f'v2 {label}')
+
+        response = client.get(
+            f'/v1/memories/{memory.id}/diff',
+            {'project_id': str(project.id), 'from_version': 1, 'to_version': 2},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 403, label
+        assert response.json()['code'] == 'team_scope_denied', label
+
+
+@pytest.mark.django_db
+def test_memory_diff_admits_project_and_authorized_team() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_read_capability()
+    client = APIClient()
+    project_memory, _pv, _pd = create_approved_memory_document(
+        organization,
+        None,
+        project,
+        visibility_scope=VisibilityScope.PROJECT,
+        title='Diff admit project',
+    )
+    team_memory, _tv, _td = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+        title='Diff admit team',
+    )
+    for memory in (project_memory, team_memory):
+        _create_version(memory, organization, project, 2, f'v2 for {memory.id}')
+
+        response = client.get(
+            f'/v1/memories/{memory.id}/diff',
+            {'project_id': str(project.id), 'from_version': 1, 'to_version': 2},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 200
+        assert response.json()['to']['version'] == 2
+
+
+@pytest.mark.django_db
+def test_memory_diff_misprojected_version_returns_not_found() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_read_capability()
+    other_project = Project.objects.create(organization=organization, name='Foreign', slug='foreign-diff-version')
+    memory, _v1, _doc = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        body='In-scope original body',
+        title='Diff mis-projected version',
+    )
+    MemoryVersion.objects.bulk_create(
+        [
+            MemoryVersion(
+                organization=organization,
+                project=other_project,
+                memory=memory,
+                version=2,
+                body='leaked foreign version body',
+                content_hash='misprojected-diff-hash',
+            ),
+        ],
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{memory.id}/diff',
+        {'project_id': str(project.id), 'from_version': 1, 'to_version': 2},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 404
+    assert response.json()['code'] == 'version_not_found'
+
+
+@pytest.mark.django_db
 def test_memory_diff_routes_by_repository_url_with_org_agent_key() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     create_org_agent_key(organization)

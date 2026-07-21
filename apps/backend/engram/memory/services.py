@@ -971,6 +971,16 @@ def ensure_memory_team_scope(memory: Memory, scope: EffectiveScope) -> None:
         raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
 
 
+def ensure_memory_visibility_scope(memory: Memory, scope: EffectiveScope) -> None:
+    if memory.visibility_scope == VisibilityScope.PROJECT:
+        return
+
+    if memory.visibility_scope == VisibilityScope.TEAM and memory.team_id in scope.team_ids:
+        return
+
+    raise AccessDeniedError('team_scope_denied', 'Memory is outside effective team scope')
+
+
 class UpdateMemoryBody:
     def execute(self, data: UpdateMemoryBodyInput) -> UpdateMemoryBodyResult:
         from engram.memory.transitions import (
@@ -1070,7 +1080,7 @@ class ResolveMemoryDiff:
         if memory is None:
             raise MemoryDiffError('memory_not_found', 'Memory was not found')
 
-        ensure_memory_team_scope(memory, scope)
+        ensure_memory_visibility_scope(memory, scope)
         from_slice = self._get_version(memory, data.from_version)
         to_slice = self._get_version(memory, data.to_version)
 
@@ -1080,7 +1090,12 @@ class ResolveMemoryDiff:
         }
 
     def _get_version(self, memory: Memory, version_number: int) -> MemoryVersion:
-        version = MemoryVersion.objects.filter(memory=memory, version=version_number).first()
+        version = MemoryVersion.objects.filter(
+            organization_id=memory.organization_id,
+            project_id=memory.project_id,
+            memory=memory,
+            version=version_number,
+        ).first()
         if version is None:
             raise MemoryDiffError('version_not_found', f'Memory version {version_number} was not found')
 

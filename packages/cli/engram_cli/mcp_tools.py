@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from engram_cli import read_tools
 from engram_cli.commands import (
     KINDS_ERROR_MESSAGE,
     is_kinds_error_body,
@@ -143,6 +144,8 @@ def build_tools(
         "engram_memory_version": bind(update_memory_version),
         "engram_memory_feedback": bind(submit_memory_feedback),
         "engram_memory_propose": bind(propose_memory),
+        "engram_memory_get": bind(memory_get),
+        "engram_audit": bind(audit),
     }
 
 
@@ -465,6 +468,80 @@ def propose_memory(
     )
 
 
+def memory_get(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    memory_id = as_string(arguments.get("memory_id"))
+    if not memory_id:
+        return "engram_memory_get requires memory_id."
+
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    outcome = read_tools.fetch_memory_get(
+        transport,
+        _read_scope(runtime),
+        memory_id,
+        _as_int(arguments.get("from_version")),
+        _as_int(arguments.get("to_version")),
+    )
+
+    return _mcp_read_text(outcome)
+
+
+def audit(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    if not runtime.project_id:
+        return read_tools.audit_needs_project_message()
+
+    target_id, target_type = read_tools.resolve_audit_target(
+        as_string(arguments.get("target_id")),
+        as_string(arguments.get("memory_id")),
+        as_string(arguments.get("target_type")),
+    )
+    filters = {key: as_string(arguments.get(key)) for key in ("event_type", "correlation_id", "since", "until")}
+    outcome = read_tools.fetch_audit(
+        transport,
+        _read_scope(runtime),
+        target_id,
+        target_type,
+        _as_int(arguments.get("limit")) or 20,
+        filters,
+    )
+
+    return _mcp_read_text(outcome)
+
+
+def _read_scope(runtime: McpRuntime) -> read_tools.ReadScope:
+    return read_tools.ReadScope(
+        server_url=runtime.server_url,
+        api_key=runtime.api_key,
+        project_id=runtime.project_id,
+        repository_url=runtime.repository_url,
+        team_id=runtime.team_id,
+    )
+
+
+def _mcp_read_text(outcome: read_tools.ReadOutcome) -> str:
+    if outcome.text is not None:
+        return outcome.text
+
+    error = outcome.error
+    if error is None:
+        return _error_text(0, {})
+
+    if error.code == "http_error":
+        return _error_text(error.status, error.body or {})
+
+    return error.message
+
+
 def _read_optional_json(path: Path) -> dict[str, object]:
     try:
         return read_json(path)
@@ -482,6 +559,13 @@ def _scope_payload(runtime: McpRuntime) -> dict[str, object]:
         payload["team_id"] = runtime.team_id
 
     return payload
+
+
+def _as_int(value: object) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _optional_kinds(arguments: dict[str, Any]) -> list[Any] | None:

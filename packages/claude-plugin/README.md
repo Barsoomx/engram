@@ -116,11 +116,14 @@ Engram MCP server with Claude Code automatically - no separate
 `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/mcp.py"`, a `sys.path` shim (mirroring
 `hooks/hook.py`) that starts the vendored `engram_cli` MCP server over stdio.
 
-Seven tools are exposed: `engram_search`, `engram_context`,
+Nine tools are exposed: `engram_search`, `engram_context`,
 `engram_memory_link`, `engram_observations`, `engram_memory_version`,
-`engram_memory_feedback`, and `engram_memory_propose`. Each resolves server URL, API key, and project/team
-scope from `~/.engram` the same way the hooks do, and calls the Engram server
-under the connected project's RBAC scope. See
+`engram_memory_feedback`, `engram_memory_propose`, `engram_memory_get`, and
+`engram_audit`. Each resolves server URL, API key, and project/team scope from
+`~/.engram` the same way the hooks do, and calls the Engram server under the
+connected project's RBAC scope. `engram_audit` requires a resolved `project_id`
+(it has no repository-URL fallback); the other eight accept a repository-derived
+project. See
 [../../docs/guides/mcp.md](../../docs/guides/mcp.md) and
 [../../docs/mcp-tools.md](../../docs/mcp-tools.md) for the full contract.
 

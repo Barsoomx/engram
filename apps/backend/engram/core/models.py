@@ -1084,6 +1084,10 @@ class AuditEvent(TimestampedModel):
                 fields=['organization', 'project', 'created_at'],
                 name='core_audit_proj_created_idx',
             ),
+            models.Index(
+                fields=['organization', 'project', 'target_type', 'target_id', 'created_at'],
+                name='core_audit_target_idx',
+            ),
         ]
         ordering = ['organization_id', 'created_at']
 

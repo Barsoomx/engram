@@ -109,6 +109,8 @@ Explicit tools:
 - `engram_observations`
 - `engram_memory_version`
 - `engram_memory_feedback`
+- `engram_memory_get`
+- `engram_audit` (project-scoped only; no repository-URL fallback)
 
 ## Server-Only Contract
 
