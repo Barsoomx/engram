@@ -160,6 +160,7 @@ def _install(
     monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: orch.EMBEDDING_1536, raising=False)
     monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist, raising=False)
     monkeypatch.setattr(module, 'judge_curation_candidate', lambda *_a, **_k: judge_result, raising=False)
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', orch._stub_revalidate, raising=False)
 
 
 @pytest.mark.django_db
