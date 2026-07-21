@@ -16,9 +16,14 @@ from engram.core.models import (
     ContextBundle,
     ContextBundleStatus,
     Memory,
+    MemoryCandidate,
+    MemoryConflict,
     MemoryStatus,
+    Organization,
+    Project,
     Runtime,
     SessionStatus,
+    Team,
 )
 from engram.inspection.services import (
     InspectionNotFoundError,
@@ -27,7 +32,15 @@ from engram.inspection.services import (
     ListInspectionContextBundles,
     ListInspectionMemories,
 )
+from engram.inspection.views import memory_response
 from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    open_single_conflict,
+    provenanced_candidate,
+    transition_request,
+    transitions_module,
+)
 
 
 def create_inspection_scope_models() -> tuple[object, object, object]:
@@ -496,3 +509,118 @@ def test_inspection_memory_count_and_detail_withhold_unproven_digest() -> None:
     assert ListInspectionMemories().detail(inspection_scope, proven.id).id == proven.id
     with pytest.raises(InspectionNotFoundError):
         ListInspectionMemories().detail(inspection_scope, legacy.id)
+
+
+# open-conflict visibility — authorized_for_injection + has_open_conflict
+
+
+def _inspection_scope_for_memory(memory: Memory) -> InspectionScope:
+    project = Project.objects.get(id=memory.project_id)
+    team_ids = (memory.team_id,) if memory.team_id else ()
+    scope = EffectiveScope(
+        organization_id=memory.organization_id,
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=team_ids,
+        capabilities=(),
+        actor_type='api_key',
+        actor_id='svc-inspection-test',
+        project_bound=False,
+    )
+
+    return InspectionScope(project=project, scope=scope)
+
+
+def _resolve_conflict(candidate: MemoryCandidate, conflict: MemoryConflict) -> None:
+    transitions = transitions_module()
+    request = transitions.TransitionRequest(
+        scope=transitions.TransitionScope(
+            organization_id=candidate.organization_id,
+            project_id=candidate.project_id,
+            team_id=candidate.team_id,
+        ),
+        idempotency_key=f'candidate:{candidate.id}:conflict-resolve:v1',
+        actor_type='system',
+        actor_id='inspection-tests',
+        capability='memories:admin',
+        request_id=str(uuid.uuid4()),
+        correlation_id=str(uuid.uuid4()),
+        reason='resolved by test',
+        origin='inspection-tests',
+    )
+    transitions.ResolveMemoryConflict().execute(
+        transitions.ResolveMemoryConflictInput(
+            request=request,
+            candidate_fence=candidate_fence_for(candidate),
+            conflict_ids=(conflict.id,),
+            conflict_memory_fences=(transitions.build_memory_fence(conflict.memory),),
+            resolution='reject_candidate',
+        ),
+    )
+
+
+@pytest.mark.django_db
+def test_authorized_for_injection_false_when_memory_has_open_conflict() -> None:
+    _candidate, conflict = open_single_conflict('insp-open')
+    scope = _inspection_scope_for_memory(conflict.memory)
+
+    memory = ListInspectionMemories().detail(scope, conflict.memory_id)
+
+    assert memory.has_open_conflict is True
+
+    resp = memory_response(memory, include_detail=True, inspection_scope=scope)
+
+    assert resp['authorized_for_injection'] is False
+    assert resp['has_open_conflict'] is True
+
+
+@pytest.mark.django_db
+def test_authorized_for_injection_true_after_conflict_resolved() -> None:
+    candidate, conflict = open_single_conflict('insp-resolved')
+    _resolve_conflict(candidate, conflict)
+    scope = _inspection_scope_for_memory(conflict.memory)
+
+    memory = ListInspectionMemories().detail(scope, conflict.memory_id)
+    resp = memory_response(memory, include_detail=True, inspection_scope=scope)
+
+    assert resp['authorized_for_injection'] is True
+    assert resp['has_open_conflict'] is False
+
+
+@pytest.mark.django_db
+def test_list_authorized_for_injection_reflects_open_conflict() -> None:
+    _candidate, conflict = open_single_conflict('insp-list')
+    organization = Organization.objects.get(id=conflict.memory.organization_id)
+    project = Project.objects.get(id=conflict.memory.project_id)
+    team = Team.objects.get(id=conflict.memory.team_id) if conflict.memory.team_id else None
+    clean_memory, _version, _document = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        title='Clean injectable memory',
+    )
+    scope = _inspection_scope_for_memory(conflict.memory)
+
+    responses = {
+        str(memory.id): memory_response(memory, include_detail=False)
+        for memory in ListInspectionMemories().execute(scope)
+    }
+
+    conflicted = responses[str(conflict.memory_id)]
+    clean = responses[str(clean_memory.id)]
+
+    assert conflicted['authorized_for_injection'] is False
+    assert conflicted['has_open_conflict'] is True
+    assert clean['authorized_for_injection'] is True
+    assert clean['has_open_conflict'] is False
+
+
+@pytest.mark.django_db
+def test_memory_response_without_annotation_raises() -> None:
+    candidate, _source, _scope = provenanced_candidate('insp-unannotated')
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    memory = Memory.objects.get(pk=result.memory.id)
+
+    with pytest.raises(AttributeError):
+        memory_response(memory, include_detail=False)
