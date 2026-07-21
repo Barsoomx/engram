@@ -435,6 +435,7 @@ def test_stage_coordinate_constraint_includes_policy_role() -> None:
         'stage_kind',
         'level',
         'ordinal',
+        'prompt_contract',
         'policy',
         'policy_version',
         'policy_role',
