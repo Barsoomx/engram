@@ -16,6 +16,7 @@ from engram_cli.commands import (
     run_memory_get,
     run_memory_link,
     run_memory_links,
+    run_memory_propose,
     run_memory_version,
     run_observations,
     run_search,
@@ -23,6 +24,12 @@ from engram_cli.commands import (
 from engram_cli.http import Transport
 from engram_cli.import_claude_mem import run_import_claude_mem
 from engram_cli.mcp_server import run_mcp_serve
+
+
+_SINCE_UNTIL_HELP = (
+    "Filter on ingestion time (created_at), not the displayed observed_at. "
+    "--since is inclusive (>=); --until is exclusive (<)."
+)
 
 
 def main(
@@ -75,6 +82,8 @@ def main(
             return run_memory_links(args, output, errors, transport)
         if args.memory_command == "get":
             return run_memory_get(args, output, errors, transport)
+        if args.memory_command == "propose":
+            return run_memory_propose(args, output, errors, transport)
 
     parser.print_help(file=errors)
 
@@ -169,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--query", default="")
     search.add_argument("--file-path", action="append", default=[])
     search.add_argument("--symbol", action="append", default=[])
+    search.add_argument("--kind", action="append", default=[], dest="kinds")
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--config-dir")
     search.add_argument("--json", action="store_true", dest="as_json")
@@ -211,8 +221,21 @@ def build_parser() -> argparse.ArgumentParser:
     memory_get.add_argument("--config-dir")
     memory_get.add_argument("--project", default="")
 
+    memory_propose = memory_subparsers.add_parser("propose")
+    memory_propose.add_argument("--title", required=True)
+    memory_propose.add_argument("--body", required=True)
+    memory_propose.add_argument("--kind", default="")
+    memory_propose.add_argument("--request-id", dest="request_id", default="")
+    memory_propose.add_argument("--config-dir")
+    memory_propose.add_argument("--project", default="")
+
     observations = subparsers.add_parser("observations")
     observations.add_argument("--limit", type=int, default=20)
+    observations.add_argument("--session-id", dest="session_id", default="")
+    observations.add_argument("--type", dest="observation_type", default="")
+    observations.add_argument("--since", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--until", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--offset", type=int, default=0)
     observations.add_argument("--config-dir")
     observations.add_argument("--project", default="")
 

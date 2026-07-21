@@ -21,6 +21,7 @@ from engram.access.models import (
 )
 from engram.access.services import (
     AccessDeniedError,
+    EffectiveScope,
     ResolveApiKeyScope,
     api_key_fingerprint,
     api_key_prefix,
@@ -524,3 +525,58 @@ def test_access_models_reject_cross_scope_foreign_keys_on_create() -> None:
             team=unlinked_team,
             project=project,
         )
+
+
+@pytest.mark.django_db
+def test_team_scoped_api_key_is_team_bound() -> None:
+    organization, team, project = create_project_scope()
+    owner = create_owner(organization)
+    grant_project_access(organization, project, owner)
+    create_scoped_api_key(organization, team, project, owner)
+
+    scope = ResolveApiKeyScope().execute(
+        raw_key=RAW_KEY,
+        required_capability='observations:write',
+        requested_project_id=project.id,
+        request_id='request-team-bound-1',
+    )
+
+    assert scope.team_bound is True
+
+
+@pytest.mark.django_db
+def test_unbound_api_key_is_not_team_bound() -> None:
+    organization, _team, project = create_project_scope()
+    owner = create_owner(organization, role_code='organization_admin')
+    create_scoped_api_key(
+        organization,
+        team=None,
+        project=None,
+        owner=owner,
+        capabilities=('memories:read', 'projects:*'),
+    )
+
+    scope = ResolveApiKeyScope().execute(
+        raw_key=RAW_KEY,
+        required_capability='memories:read',
+        requested_project_id=project.id,
+        request_id='request-unbound-not-team-bound-1',
+    )
+
+    assert scope.team_bound is False
+
+
+def test_effective_scope_defaults_team_bound_false() -> None:
+    scope = EffectiveScope(
+        organization_id=None,
+        identity_id=None,
+        api_key_id=None,
+        project_ids=(),
+        team_ids=(),
+        capabilities=(),
+        actor_type='user',
+        actor_id='user-1',
+        project_bound=False,
+    )
+
+    assert scope.team_bound is False

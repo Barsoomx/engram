@@ -24,7 +24,7 @@ The MCP server:
 
 ## Shipped Tool Set (V1)
 
-Eight tools ship in `engram mcp serve`
+Nine tools ship in `engram mcp serve`
 (`packages/cli/engram_cli/mcp_tools.py` + `mcp_server.py`), delivered
 automatically with the Claude Code plugin, via `engram mcp install` for Claude
 Desktop, or directly over stdio for any other client.
@@ -36,22 +36,25 @@ Desktop, or directly over stdio for any other client.
 | `engram_memory_link`      | shipped extra, beyond the original catalog      | `memories:review`   | attach a file/symbol/commit/issue link to an approved memory      |
 | `engram_observations`     | shipped extra, beyond the original catalog      | `observations:read` | list recent observations for the resolved project                |
 | `engram_memory_version`   | shipped extra, beyond the original catalog      | `memories:review`   | update an approved memory body, creating a new reviewed version   |
-| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | `memories:review` | mark an injected memory stale or refuted, with a reason         |
+| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted`/`confirmed`) | `memories:review` | mark an injected memory stale/refuted, or confirm it is still accurate, with a reason |
+| `engram_memory_propose`   | `memory.propose`                                | `memories:propose`  | deliberately record a durable fact; routed through curation, not instantly retrievable |
 | `engram_memory_get`       | shipped extra, beyond the original catalog      | `memories:read`     | read one memory in full (untruncated body, versions, links) by id |
 | `engram_audit`            | shipped extra, beyond the original catalog      | `audit:read`        | list a memory's own recorded audit events (project-scoped only)   |
 
-All eight are developer-scoped; there is no separate lead/curator tool set yet.
+All nine are developer-scoped; there is no separate lead/curator tool set yet.
 Each tool checks exactly one capability, shown in the table above:
 `engram_search` needs `search:query`; `engram_context` and `engram_memory_get`
 read a memory and need `memories:read`; `engram_observations` needs
 `observations:read`; the three mutation tools (`engram_memory_link`,
 `engram_memory_version`, `engram_memory_feedback`) write through the review
-path and need `memories:review`; and `engram_audit` reads the inspection
-audit-events endpoint and needs `audit:read`. A key that lacks the capability a
-given tool requires receives `403 missing_capability`; `engram_memory_get` and
-`engram_audit` additionally name the missing capability and suggest re-issuing
-the key with it, while the other tools surface the generic error text.
-Seven of the eight also accept an optional per-call `project_id` argument and
+path and need `memories:review`; `engram_memory_propose` records a durable fact
+through curation and needs `memories:propose`; and `engram_audit` reads the
+inspection audit-events endpoint and needs `audit:read`. A key that lacks the
+capability a given tool requires receives `403 missing_capability`;
+`engram_memory_get`, `engram_audit`, and `engram_memory_propose` additionally
+name the missing capability and suggest re-issuing the key with it, while the
+other tools surface the generic error text.
+Eight of the nine also accept an optional per-call `project_id` argument and
 fall back to a repository-derived project when neither it nor
 `ENGRAM_PROJECT_ID`/config resolve one - see
 [guides/mcp.md](guides/mcp.md#project-precedence-ladder) for the ladder.
@@ -75,10 +78,6 @@ with the reason each is deferred:
 - `memory.observe` - submit an explicit observation. Hooks already submit
   observations automatically on every tool call; no MCP-specific gap has been
   identified yet.
-- `memory.propose` - propose a memory update for review, distinct from the
-  direct write `engram_memory_version` performs today. Superseded by
-  `engram_memory_version` for V1; a review-gated propose flow can follow if
-  direct writes prove too permissive in practice.
 - `memory.explain` - explain why a memory was returned or excluded from a
   bundle. No ranking-explanation endpoint exists server-side yet.
 - `team.digest.latest` - show the latest team/project digest. Lead/curator

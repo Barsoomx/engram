@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from datetime import timedelta
+import threading
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 
+from engram.access.services import EffectiveScope
 from engram.core.models import (
     AuditEvent,
     Memory,
@@ -15,6 +18,8 @@ from engram.core.models import (
     Project,
 )
 from engram.memory.confidence_decay import DecayMemoryConfidence
+from engram.memory.services import MemoryFeedbackInput, RecordMemoryFeedback
+from engram.memory.transitions_test_support import provenanced_candidate, transition_request, transitions_module
 
 _AGED_DAYS = 40
 _YOUNG_DAYS = 5
@@ -40,6 +45,7 @@ def _make_memory(
     refuted: bool = False,
     kind: str = '',
     age_days: int = _AGED_DAYS,
+    last_confirmed_at: datetime | None = None,
 ) -> Memory:
     memory = Memory.objects.create(
         organization=organization,
@@ -53,7 +59,10 @@ def _make_memory(
         metadata={'kind': kind} if kind else {},
     )
 
-    Memory.objects.filter(id=memory.id).update(updated_at=timezone.now() - timedelta(days=age_days))
+    Memory.objects.filter(id=memory.id).update(
+        updated_at=timezone.now() - timedelta(days=age_days),
+        last_confirmed_at=last_confirmed_at,
+    )
     memory.refresh_from_db()
 
     return memory
@@ -226,6 +235,20 @@ def test_running_twice_decays_exactly_once(f_org: Organization, f_project: Proje
 
 
 @pytest.mark.django_db
+def test_decay_does_not_change_updated_at(f_org: Organization, f_project: Project) -> None:
+    memory = _make_memory(f_org, f_project, confidence='0.900')
+    updated_at_before = memory.updated_at
+
+    DecayMemoryConfidence().execute()
+
+    memory.refresh_from_db()
+
+    assert memory.confidence == Decimal('0.850')
+    assert memory.confidence_decayed_at is not None
+    assert memory.updated_at == updated_at_before
+
+
+@pytest.mark.django_db
 def test_execute_returns_summary_counts(f_org: Organization, f_project: Project) -> None:
     _make_memory(f_org, f_project, confidence='0.900')
 
@@ -234,3 +257,201 @@ def test_execute_returns_summary_counts(f_org: Organization, f_project: Project)
     assert result.organizations == 1
     assert result.projects == 1
     assert result.memories == 1
+
+
+@pytest.mark.django_db
+def test_recently_confirmed_memory_is_not_decayed(f_org: Organization, f_project: Project) -> None:
+    memory = _make_memory(f_org, f_project, confidence='0.900', last_confirmed_at=timezone.now())
+
+    DecayMemoryConfidence().execute()
+
+    memory.refresh_from_db()
+
+    assert memory.confidence == Decimal('0.900')
+
+
+@pytest.mark.django_db
+def test_unconfirmed_aged_memory_still_decays(f_org: Organization, f_project: Project) -> None:
+    memory = _make_memory(f_org, f_project, confidence='0.900', last_confirmed_at=None)
+
+    DecayMemoryConfidence().execute()
+
+    memory.refresh_from_db()
+
+    assert memory.confidence == Decimal('0.850')
+
+
+@pytest.mark.django_db
+def test_decay_rechecks_anchor_under_lock(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    memory = _make_memory(f_org, f_project, confidence='0.900', last_confirmed_at=None)
+    real_atomic = transaction.atomic
+    advanced = {'done': False}
+
+    def patched_atomic(*args: object, **kwargs: object) -> object:
+        if not advanced['done']:
+            advanced['done'] = True
+            Memory.objects.filter(id=memory.id).update(last_confirmed_at=timezone.now())
+
+        return real_atomic(*args, **kwargs)
+
+    monkeypatch.setattr(transaction, 'atomic', patched_atomic)
+
+    DecayMemoryConfidence().execute()
+
+    memory.refresh_from_db()
+
+    assert memory.confidence == Decimal('0.900')
+
+
+def _aged_promoted_memory(suffix: str) -> Memory:
+    candidate, _source, _scope = provenanced_candidate(suffix)
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    Memory.objects.filter(id=result.memory.id).update(updated_at=timezone.now() - timedelta(days=_AGED_DAYS))
+    result.memory.refresh_from_db()
+
+    return result.memory
+
+
+def _confirm_input(memory: Memory, request_id: str) -> MemoryFeedbackInput:
+    scope = EffectiveScope(
+        organization_id=memory.organization_id,
+        identity_id=memory.organization_id,
+        api_key_id=memory.organization_id,
+        project_ids=(memory.project_id,),
+        team_ids=() if memory.team_id is None else (memory.team_id,),
+        capabilities=('memories:review',),
+        actor_type='api_key',
+        actor_id='confirm-race-actor',
+        project_bound=False,
+    )
+
+    return MemoryFeedbackInput(
+        scope=scope,
+        memory_id=memory.id,
+        project_id=memory.project_id,
+        team_id=memory.team_id,
+        action='confirmed',
+        reason='verified still accurate',
+        request_id=request_id,
+        correlation_id='',
+    )
+
+
+def _run_in_thread(target: object) -> tuple[threading.Thread, list[BaseException]]:
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        close_old_connections()
+        try:
+            target()
+        except BaseException as error:  # pragma: no cover - surfaced by assertions
+            errors.append(error)
+        finally:
+            close_old_connections()
+
+    thread = threading.Thread(target=worker)
+
+    return thread, errors
+
+
+def _assert_confirm_holds_lock_then_decay_skips(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _aged_promoted_memory('confirm-decay-a')
+    confirm_locked = threading.Event()
+    release_confirm = threading.Event()
+    decay_result: list[object] = []
+    original_lock = RecordMemoryFeedback._lock_memory
+
+    def paused_lock(self: RecordMemoryFeedback, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
+        locked = original_lock(self, data, scope)
+        confirm_locked.set()
+        assert release_confirm.wait(timeout=10)
+
+        return locked
+
+    monkeypatch.setattr(RecordMemoryFeedback, '_lock_memory', paused_lock)
+
+    confirm_thread, confirm_error = _run_in_thread(
+        lambda: RecordMemoryFeedback().execute(_confirm_input(memory, 'confirm-race-a')),
+    )
+    decay_done = threading.Event()
+
+    def run_decay() -> None:
+        decay_result.append(DecayMemoryConfidence().execute())
+        decay_done.set()
+
+    decay_thread, decay_error = _run_in_thread(run_decay)
+
+    confirm_thread.start()
+    assert confirm_locked.wait(timeout=10)
+    decay_thread.start()
+    try:
+        assert not decay_done.wait(timeout=1)
+    finally:
+        release_confirm.set()
+        confirm_thread.join(timeout=10)
+        decay_thread.join(timeout=10)
+
+    assert not confirm_error, confirm_error
+    assert not decay_error, decay_error
+    memory.refresh_from_db()
+    assert memory.confidence == Decimal('0.900')
+    assert memory.last_confirmed_at is not None
+    assert decay_result[0].memories == 0
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+    assert not AuditEvent.objects.filter(event_type='MemoryConfidenceDecayed').exists()
+
+
+def _assert_decay_holds_lock_then_confirm_records(monkeypatch: pytest.MonkeyPatch) -> None:
+    memory = _aged_promoted_memory('confirm-decay-b')
+    decay_locked = threading.Event()
+    release_decay = threading.Event()
+    confirm_done = threading.Event()
+    original_save = Memory.save
+
+    def paused_save(self: Memory, *args: object, **kwargs: object) -> None:
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'confidence' in update_fields and self.id == memory.id:
+            decay_locked.set()
+            assert release_decay.wait(timeout=10)
+
+        return original_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(Memory, 'save', paused_save)
+
+    decay_thread, decay_error = _run_in_thread(lambda: DecayMemoryConfidence().execute())
+
+    def run_confirm() -> None:
+        RecordMemoryFeedback().execute(_confirm_input(memory, 'confirm-race-b'))
+        confirm_done.set()
+
+    confirm_thread, confirm_error = _run_in_thread(run_confirm)
+
+    decay_thread.start()
+    assert decay_locked.wait(timeout=10)
+    confirm_thread.start()
+    try:
+        assert not confirm_done.wait(timeout=1)
+    finally:
+        release_decay.set()
+        decay_thread.join(timeout=10)
+        confirm_thread.join(timeout=10)
+
+    assert not decay_error, decay_error
+    assert not confirm_error, confirm_error
+    memory.refresh_from_db()
+    assert memory.confidence == Decimal('0.850')
+    assert memory.last_confirmed_at is not None
+    assert AuditEvent.objects.filter(event_type='MemoryConfidenceDecayed').count() == 1
+    assert AuditEvent.objects.filter(event_type='MemoryConfirmed', target_id=str(memory.id)).count() == 1
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_confirm_and_decay_serialize_on_row_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    _assert_confirm_holds_lock_then_decay_skips(monkeypatch)
+    monkeypatch.undo()
+    _assert_decay_holds_lock_then_confirm_records(monkeypatch)

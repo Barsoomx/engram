@@ -140,7 +140,16 @@ def evidence_manifest(
     *,
     sources: Iterable[MemoryCandidateSource | Mapping[str, object]] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
-    selected_sources = sources if sources is not None else _candidate_sources(candidate)
+    selected_sources = list(sources) if sources is not None else _candidate_sources(candidate)
+    kinds = {source.source_kind for source in selected_sources if isinstance(source, MemoryCandidateSource)}
+    has_mapping = any(not isinstance(source, MemoryCandidateSource) for source in selected_sources)
+    if kinds == {'agent_proposal'} and not has_mapping:
+        from engram.memory.import_provenance import agent_proposal_evidence_manifest
+
+        return agent_proposal_evidence_manifest(candidate, sources=selected_sources)
+    if 'agent_proposal' in kinds:
+        raise ValueError('candidate provenance has mixed source kinds')
+
     entries = [_source_value(source, candidate) for source in selected_sources]
     entries.sort(key=lambda value: tuple(value[field] for field in _SOURCE_KEYS))
     ordered = list(entries)

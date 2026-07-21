@@ -90,7 +90,15 @@ def _eligible_queued_run(work: WorkflowWork) -> WorkflowRun | None:
     )
 
 
-def queue_work_attempt(*, work_id: uuid.UUID, now: datetime, origin: str) -> WorkflowRun:
+def queue_work_attempt(
+    *,
+    work_id: uuid.UUID,
+    now: datetime,
+    origin: str,
+    request_id: str = '',
+    correlation_id: str = '',
+    rerun_of_id: uuid.UUID | None = None,
+) -> WorkflowRun:
     require_aware(now, field='now')
 
     with transaction.atomic():
@@ -123,6 +131,9 @@ def queue_work_attempt(*, work_id: uuid.UUID, now: datetime, origin: str) -> Wor
             origin=origin,
             dispatched_at=now,
             input_snapshot=work.input_snapshot,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            rerun_of_id=rerun_of_id,
         )
         _signal_package(task_name, work.id, run.id)
 

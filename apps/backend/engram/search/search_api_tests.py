@@ -17,6 +17,7 @@ from engram.context.context_api_tests import (
     create_embedding_policy,
     create_project_scope,
     create_scoped_api_key,
+    open_conflict_in_authenticated_scope,
 )
 from engram.context.services import IndexMemoryVersion, IndexMemoryVersionInput
 from engram.core.models import (
@@ -522,6 +523,36 @@ def test_search_warns_about_stale_matching_memory() -> None:
             'memory_id': str(stale_memory.id),
         },
     ]
+
+
+@pytest.mark.django_db
+def test_search_warns_about_conflict_excluded_memory() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    grant_search_capability(RAW_KEY)
+    create_embedding_policy(organization, team, project)
+    memory, conflict = open_conflict_in_authenticated_scope(
+        organization,
+        project,
+        team,
+        suffix='search-conflict-excluded',
+        title='Conflict excluded search memory',
+        body='Conflict excluded search body',
+    )
+    client = APIClient()
+
+    response = client.post(
+        '/v1/search/',
+        search_payload(project, query=memory.title, file_paths=[], symbols=[]),
+        format='json',
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    conflict_warnings = [warning for warning in body['warnings'] if warning['code'] == 'conflict_excluded']
+    assert len(conflict_warnings) == 1
+    assert conflict_warnings[0]['memory_id'] == str(conflict.memory_id)
+    assert memory.title in conflict_warnings[0]['message']
 
 
 @pytest.mark.django_db

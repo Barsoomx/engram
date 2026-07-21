@@ -13,11 +13,14 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryLink,
     MemoryTransition,
     MemoryTransitionType,
     MemoryVersion,
+    ObservationSource,
     Organization,
     Project,
     RetrievalDocument,
@@ -27,9 +30,19 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkType,
 )
+from engram.memory.transitions_test_support import provenanced_candidate
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
 HEX64 = 'a' * 64
+
+AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
 
 
 @pytest.fixture
@@ -289,7 +302,7 @@ def test_project_effective_target_allows_same_project_provenance_team(
 
 
 @pytest.mark.django_db
-def test_team_effective_target_requires_team_visibility_and_matching_team(
+def test_team_effective_mutation_target_requires_team_visibility_and_matching_team(
     candidate_and_work: tuple[MemoryCandidate, WorkflowWork],
 ) -> None:
     candidate, _work = candidate_and_work
@@ -311,12 +324,48 @@ def test_team_effective_target_requires_team_visibility_and_matching_team(
     )
     kwargs = decision_kwargs(candidate_and_work)
     kwargs.update(
+        outcome=CurationOutcome.MERGE_EVIDENCE,
+        reason_code=CurationReasonCode.EQUIVALENT_CLAIM,
+        evidence_tier=EvidenceTier.SUPPORTED,
         effective_visibility_scope=VisibilityScope.TEAM,
         effective_team=candidate.team,
         target_memory_version=version,
     )
 
     assert_decision_rejected(kwargs)
+
+
+@pytest.mark.django_db
+def test_team_effective_reject_permits_project_visible_target(
+    candidate_and_work: tuple[MemoryCandidate, WorkflowWork],
+) -> None:
+    candidate, _work = candidate_and_work
+    memory = Memory.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        title='Project global memory',
+        body='Project global memory body',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash='f' * 64,
+    )
+    kwargs = decision_kwargs(candidate_and_work)
+    kwargs.update(
+        outcome=CurationOutcome.REJECT_CANDIDATE,
+        reason_code=CurationReasonCode.REDUNDANT_CLAIM,
+        evidence_tier=EvidenceTier.SUPPORTED,
+        effective_visibility_scope=VisibilityScope.TEAM,
+        effective_team=candidate.team,
+        target_memory_version=version,
+    )
+
+    CurationDecision(**kwargs).full_clean()
 
 
 @pytest.mark.django_db
@@ -533,3 +582,155 @@ def test_curation_decision_rejects_duplicate_transition(
     )
     with pytest.raises(IntegrityError), transaction.atomic():
         CurationDecision.objects.create(**second_kwargs)
+
+
+@pytest.fixture
+def f_agent_candidate(scope: tuple[Organization, Team, Project]) -> MemoryCandidate:
+    organization, team, project = scope
+    return MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Agent fact',
+        body='Agent proposal body',
+        content_hash=hashlib.sha256(b'agent-fact').hexdigest(),
+    )
+
+
+@pytest.mark.django_db
+def test_agent_proposal_source_saves_with_null_lineage(
+    scope: tuple[Organization, Team, Project],
+    f_agent_candidate: MemoryCandidate,
+) -> None:
+    organization, team, project = scope
+    source = MemoryCandidateSource(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=f_agent_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=AGENT_ANCHORS,
+        anchors_hash=HEX64,
+    )
+    source.full_clean()
+    source.save()
+
+    source.refresh_from_db()
+    assert source.source_kind == 'agent_proposal'
+    assert source.observation_id is None
+    assert source.window_id is None
+    assert source.stage_id is None
+    assert source.import_source_id is None
+
+
+@pytest.mark.django_db
+def test_agent_proposal_source_rejects_any_lineage_field() -> None:
+    candidate, distill_source, _ = provenanced_candidate('agentshape')
+    organization = candidate.organization
+    project = candidate.project
+    team = candidate.team
+    import_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=distill_source.observation,
+        source_type='claude_mem',
+        source_id='claude-mem:agentshape:observation:1',
+    )
+    agent = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Agent shape',
+        body='Agent shape body',
+        content_hash=hashlib.sha256(b'agent-shape').hexdigest(),
+    )
+    lineage_overrides = (
+        {'window': distill_source.window},
+        {'stage': distill_source.stage},
+        {'import_source': import_source},
+        {'observation': distill_source.observation},
+    )
+    for overrides in lineage_overrides:
+        values = {
+            'organization': organization,
+            'project': project,
+            'team': team,
+            'candidate': agent,
+            'source_kind': MemoryCandidateSourceKind.AGENT_PROPOSAL,
+            'anchors': AGENT_ANCHORS,
+            'anchors_hash': HEX64,
+        }
+        values.update(overrides)
+        with pytest.raises(ValidationError):
+            MemoryCandidateSource(**values).full_clean()
+
+
+@pytest.mark.django_db
+def test_two_agent_proposal_sources_violate_uniqueness(
+    scope: tuple[Organization, Team, Project],
+    f_agent_candidate: MemoryCandidate,
+) -> None:
+    organization, team, project = scope
+    MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=f_agent_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=AGENT_ANCHORS,
+        anchors_hash=HEX64,
+    )
+    with pytest.raises(IntegrityError), transaction.atomic():
+        MemoryCandidateSource.objects.create(
+            organization=organization,
+            project=project,
+            team=team,
+            candidate=f_agent_candidate,
+            source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+            anchors=AGENT_ANCHORS,
+            anchors_hash='b' * 64,
+        )
+
+
+@pytest.mark.django_db
+def test_distillation_and_import_sources_require_non_null_observation() -> None:
+    candidate, distill_source, _ = provenanced_candidate('nullobs')
+    organization = candidate.organization
+    project = candidate.project
+    team = candidate.team
+
+    assert distill_source.observation_id is not None
+
+    with pytest.raises(ValidationError):
+        MemoryCandidateSource(
+            organization=organization,
+            project=project,
+            team=team,
+            candidate=candidate,
+            source_kind=MemoryCandidateSourceKind.DISTILLATION,
+            window=distill_source.window,
+            stage=distill_source.stage,
+            observation=None,
+            anchors=distill_source.anchors,
+            anchors_hash=HEX64,
+        ).full_clean()
+
+    import_source = ObservationSource.objects.create(
+        organization=organization,
+        project=project,
+        observation=distill_source.observation,
+        source_type='claude_mem',
+        source_id='claude-mem:nullobs:observation:1',
+    )
+    with pytest.raises(ValidationError):
+        MemoryCandidateSource(
+            organization=organization,
+            project=project,
+            team=team,
+            candidate=candidate,
+            source_kind=MemoryCandidateSourceKind.IMPORT,
+            import_source=import_source,
+            observation=None,
+            anchors={'schema': 'import_candidate_source.v1'},
+            anchors_hash='c' * 64,
+        ).full_clean()

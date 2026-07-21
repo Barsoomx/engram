@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from typing import Any
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
 from engram_cli.config import credential_fingerprint
 from engram_cli import main
@@ -1976,6 +1977,105 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertNotIn(RAW_KEY, stdout)
             self.assertNotIn(RAW_KEY, stderr)
 
+    def test_search_sends_kinds_from_kind_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "search",
+                    "--query",
+                    "auth",
+                    "--kind",
+                    "convention",
+                    "--kind",
+                    "decision",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertEqual(
+                ["convention", "decision"], transport.calls[0]["payload"]["kinds"]
+            )
+
+    def test_search_omits_kinds_without_kind_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                ["search", "--query", "auth", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertNotIn("kinds", transport.calls[0]["payload"])
+
+    def test_search_prints_match_line_and_warnings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "items": [
+                    {
+                        "citation": "M1",
+                        "memory_id": "mem-1",
+                        "title": "Gitlab workflow convention",
+                        "body": "Use draft MRs.",
+                        "inclusion_reason": "exact match: gitlab",
+                        "matched_terms": ["gitlab", "workflow"],
+                    },
+                ],
+                "warnings": [
+                    {
+                        "code": "stale_match",
+                        "message": "stale memory matched",
+                        "memory_id": "mem-1",
+                    }
+                ],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["search", "--query", "gitlab", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn(
+                "  match: exact match: gitlab | terms: gitlab, workflow", stdout
+            )
+            self.assertIn("Warnings:", stdout)
+            self.assertIn(
+                "  [stale_match] stale memory matched (memory_id=mem-1)", stdout
+            )
+
+    def test_search_empty_items_prints_warnings_and_returns_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            search_response = {
+                "items": [],
+                "warnings": [{"code": "stale_match", "message": "stale"}],
+            }
+            transport = FakeTransport([(200, search_response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["search", "--query", "gitlab", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn("No memory matched the search.", stdout)
+            self.assertIn("Warnings:", stdout)
+            self.assertIn("  [stale_match] stale", stdout)
+            self.assertLess(
+                stdout.index("No memory matched the search."),
+                stdout.index("Warnings:"),
+            )
+
     def test_search_prints_kind_and_confidence_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)
@@ -2274,6 +2374,63 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertEqual(0, len(transport.calls))
             self.assertIn("missing_project", stderr)
+
+    def test_memory_propose_posts_and_prints_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "candidate_id": "cand-1",
+                "status": "proposed",
+                "decision_work_queued": True,
+                "request_id": "req-1",
+            }
+            transport = FakeTransport([(202, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "propose",
+                    "--title",
+                    "Deploy gate",
+                    "--body",
+                    "Requires approval",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            call = transport.calls[0]
+            self.assertEqual("https://engram.example/v1/memories/propose", call["url"])
+            self.assertEqual("Deploy gate", call["payload"]["title"])
+            self.assertEqual("Requires approval", call["payload"]["body"])
+            self.assertEqual(PROJECT_ID, call["payload"]["project_id"])
+            self.assertIn("candidate_id=cand-1", stdout)
+            self.assertIn("status=proposed", stdout)
+
+    def test_memory_propose_missing_capability_shows_reissue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(403, {"code": "missing_capability", "detail": "denied"})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "memory",
+                    "propose",
+                    "--title",
+                    "Deploy gate",
+                    "--body",
+                    "Requires approval",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("memories:propose", stderr)
+            self.assertNotIn("observations:write for hook", stderr)
 
     def test_memory_link_posts_link_and_prints_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2608,6 +2765,87 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertIn("/v1/observations/", call["url"])
             self.assertIn("project_id=", call["url"])
             self.assertIn("Obs one", stdout)
+
+    def test_observations_sends_filter_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                [
+                    "observations",
+                    "--session-id",
+                    "sess-9",
+                    "--type",
+                    "user_prompt",
+                    "--since",
+                    "2026-07-18T00:00:00+00:00",
+                    "--until",
+                    "2026-07-19T00:00:00+00:00",
+                    "--offset",
+                    "5",
+                    "--config-dir",
+                    str(config_dir),
+                ],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            params = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+            self.assertEqual(["user_prompt"], params["observation_type"])
+            self.assertEqual(["sess-9"], params["session_id"])
+            self.assertEqual(["2026-07-18T00:00:00+00:00"], params["since"])
+            self.assertEqual(["2026-07-19T00:00:00+00:00"], params["until"])
+            self.assertEqual(["5"], params["offset"])
+
+    def test_observations_omits_filters_without_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport([(200, {"items": [], "warnings": []})])
+            exit_code, _stdout, stderr = self.run_cli(
+                ["observations", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            params = parse_qs(urlsplit(transport.calls[0]["url"]).query)
+            for key in ("observation_type", "session_id", "since", "until", "offset"):
+                self.assertNotIn(key, params)
+
+    def test_observations_since_until_help_states_bounds(self) -> None:
+        help_text = main._SINCE_UNTIL_HELP
+
+        self.assertIn("created_at", help_text)
+        self.assertIn("inclusive", help_text)
+        self.assertIn("exclusive", help_text)
+
+    def test_observations_render_shows_meta_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            response = {
+                "items": [
+                    {
+                        "observation_type": "tool_use",
+                        "title": "Obs one",
+                        "body": "Obs body one.",
+                        "observed_at": "2026-07-18T20:15:03+00:00",
+                        "session_id": "9f2c",
+                    },
+                ],
+                "warnings": [],
+            }
+            transport = FakeTransport([(200, response)])
+            exit_code, stdout, stderr = self.run_cli(
+                ["observations", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(0, exit_code, stderr)
+            self.assertIn(
+                "  observed_at=2026-07-18T20:15:03+00:00 session_id=9f2c", stdout
+            )
 
     def test_observations_project_flag_wins_over_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3205,7 +3443,9 @@ class WizardTests(unittest.TestCase):
             self.assertEqual(
                 [
                     "memories:read",
+                    "memories:propose",
                     "observations:write",
+                    "projects:agent",
                     "search:query",
                 ],
                 issue_call["payload"]["capabilities"],
@@ -3806,7 +4046,8 @@ class McpInstallTests(unittest.TestCase):
             self.assertEqual(0, exit_code, stderr.getvalue())
             self.assertEqual(2, len(lines))
             tool_names = {tool["name"] for tool in lines[1]["result"]["tools"]}
-            self.assertEqual(8, len(lines[1]["result"]["tools"]))
+            self.assertEqual(9, len(lines[1]["result"]["tools"]))
+            self.assertIn("engram_memory_propose", tool_names)
             self.assertIn("engram_memory_get", tool_names)
             self.assertIn("engram_audit", tool_names)
 

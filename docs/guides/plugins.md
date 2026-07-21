@@ -78,7 +78,7 @@ The hooks call the same thin Python CLI with `--agent codex` (or
 shape and must not emit fields Codex does not support.
 
 The package uses Codex's native `hooks/hooks.json`, bundles the same connector
-and eight MCP tools as the Claude Code package, and ships the three shared memory
+and nine MCP tools as the Claude Code package, and ships the three shared memory
 skills. Install it with the one-step command above or directly:
 
 ```bash

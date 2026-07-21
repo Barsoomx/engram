@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import threading
+import time
 import uuid
+from datetime import timedelta
 from decimal import Decimal
 
 import pytest
-from django.db import connection
+from django.db import close_old_connections, connection, transaction
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
@@ -13,12 +17,17 @@ from engram.core.models import (
     LinkType,
     Memory,
     MemoryCandidate,
+    MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryLink,
     MemoryStatus,
     Organization,
     Project,
     Team,
     VisibilityScope,
+    WorkflowRun,
+    WorkflowRunOrigin,
+    WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
     WorkflowWorkDisposition,
@@ -27,22 +36,21 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory import candidate_work_reconciler
+from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked
 from engram.memory.candidate_work_reconciler import CandidateDecisionWorkInput
 from engram.memory.conflict_links import conflict_candidate_target
 from engram.memory.observation_work_tests import create_scope
 from engram.memory.reconciler_test_support import StubBuilder
+from engram.memory.transitions_test_support import provenanced_candidate
+from engram.memory.work_dispatch import RESIGNAL_WINDOW, queue_work_attempt
+from engram.memory.work_execution import execution_configuration_fingerprint
+from engram.memory.workflow_work import canonical_json_bytes
 
 Scope = tuple[Organization, Project, object]
 
 _HEX_A = 'a' * 64
 _MANIFEST_OLD = 'ordered-manifest-old'
 _MANIFEST_NEW = 'ordered-manifest-new'
-
-
-@pytest.fixture(autouse=True)
-def f_reset_builder() -> object:
-    yield None
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
 
 def _candidate(
@@ -395,3 +403,267 @@ def test_non_proposed_candidates_are_ignored() -> None:
     candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
     assert _inspect(scope, as_of=timezone.now()) == []
+
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _make_agent_candidate(
+    organization: Organization,
+    project: Project,
+    team: Team,
+    suffix: str,
+) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        status=CandidateStatus.PROPOSED,
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+def _create_work(candidate: MemoryCandidate, source: MemoryCandidateSource) -> WorkflowWork:
+    with transaction.atomic():
+        work, _created = ensure_candidate_decision_work_locked(candidate, sources=[source])
+
+    return work
+
+
+def _reconcile(organization: Organization, project: Project, as_of: object) -> object:
+    return candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=as_of,
+    )
+
+
+@pytest.mark.django_db
+def test_agent_candidate_without_run_is_redispatched() -> None:
+    organization, project, session = create_scope('agent-a')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-a')
+    work = _create_work(candidate, source)
+    assert not WorkflowRun.objects.filter(work_id=work.id).exists()
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    assert WorkflowRun.objects.filter(work_id=work.id, status=WorkflowRunStatus.QUEUED).count() == 1
+
+
+@pytest.mark.django_db
+def test_stale_queued_run_is_resignaled_without_new_run() -> None:
+    organization, project, session = create_scope('agent-b')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-b')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    old = now - RESIGNAL_WINDOW - timedelta(minutes=1)
+    run = queue_work_attempt(work_id=work.id, now=old, origin=WorkflowRunOrigin.MANUAL)
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    assert WorkflowRun.objects.filter(work_id=work.id).count() == 1
+    run.refresh_from_db()
+    assert run.dispatched_at == now
+
+
+@pytest.mark.django_db
+def test_fresh_queued_run_is_left_alone() -> None:
+    organization, project, session = create_scope('agent-c')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-c')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    run = queue_work_attempt(work_id=work.id, now=now, origin=WorkflowRunOrigin.MANUAL)
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 0
+    run.refresh_from_db()
+    assert run.dispatched_at == now
+
+
+@pytest.mark.django_db
+def test_config_changed_blocked_is_cleared_and_redispatched() -> None:
+    organization, project, session = create_scope('agent-e')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-e')
+    work = _create_work(candidate, source)
+    stale_fingerprint = 'f' * 64
+    assert execution_configuration_fingerprint(work) != stale_fingerprint
+    work.execution_state = WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = stale_fingerprint
+    work.save(update_fields=['execution_state', 'blocked_configuration_fingerprint', 'updated_at'])
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+
+
+@pytest.mark.django_db
+def test_unchanged_blocked_is_left_blocked() -> None:
+    organization, project, session = create_scope('agent-e2')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-e2')
+    work = _create_work(candidate, source)
+    work.execution_state = WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = execution_configuration_fingerprint(work)
+    work.save(update_fields=['execution_state', 'blocked_configuration_fingerprint', 'updated_at'])
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 0
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+
+
+@pytest.mark.django_db
+def test_expired_lease_is_reclaimed() -> None:
+    organization, project, session = create_scope('agent-d')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-d')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+    work.execution_state = WorkflowWorkExecutionState.LEASED
+    work.lease_owner = 'worker-1'
+    work.heartbeat_at = now - timedelta(minutes=2)
+    work.lease_expires_at = now - timedelta(minutes=1)
+    work.save(update_fields=['execution_state', 'lease_owner', 'heartbeat_at', 'lease_expires_at', 'updated_at'])
+
+    result = _reconcile(organization, project, now)
+
+    assert result.queued == 1
+
+
+@pytest.mark.django_db
+def test_mixed_provenance_candidate_is_skipped_without_aborting_loop() -> None:
+    distill_candidate, distill_source, scope = provenanced_candidate('reconcile-mixed')
+    organization, project, session = scope
+    distill_candidate.decision_work_contract_version = 1
+    distill_candidate.save(update_fields=['decision_work_contract_version', 'updated_at'])
+    anchors = dict(_AGENT_ANCHORS)
+    MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=distill_candidate.team,
+        candidate=distill_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    eligible_candidate, eligible_source = _make_agent_candidate(
+        organization, project, distill_candidate.team, 'reconcile-eligible'
+    )
+    eligible_work = _create_work(eligible_candidate, eligible_source)
+    now = timezone.now()
+
+    result = _reconcile(organization, project, now)
+
+    assert str(distill_candidate.id) not in result.applied
+    assert str(eligible_candidate.id) in result.applied
+    assert WorkflowRun.objects.filter(work_id=eligible_work.id, status=WorkflowRunStatus.QUEUED).exists()
+
+
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(connection.vendor != 'postgresql', reason='requires PostgreSQL row-lock semantics')
+def test_reconciler_locks_work_before_candidate_and_is_deadlock_free() -> None:
+    organization, project, session = create_scope('agent-lock-order')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-lock-order')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+
+    work_locked = threading.Event()
+    release_settler = threading.Event()
+    settlement_error: list[BaseException] = []
+
+    def settle_work_then_candidate() -> None:
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                WorkflowWork.objects.select_for_update().get(id=work.id)
+                work_locked.set()
+                assert release_settler.wait(timeout=10)
+                MemoryCandidate.objects.select_for_update().get(id=candidate.id)
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            settlement_error.append(error)
+        finally:
+            close_old_connections()
+
+    reconcile_result: list[object] = []
+    reconcile_error: list[BaseException] = []
+
+    def reconcile() -> None:
+        close_old_connections()
+        try:
+            reconcile_result.append(_reconcile(organization, project, now))
+        except BaseException as error:  # pragma: no cover - surfaced by assertions below
+            reconcile_error.append(error)
+        finally:
+            close_old_connections()
+
+    settler = threading.Thread(target=settle_work_then_candidate)
+    settler.start()
+    assert work_locked.wait(timeout=10)
+    reconciler = threading.Thread(target=reconcile)
+    reconciler.start()
+    time.sleep(0.5)
+    release_settler.set()
+    settler.join(timeout=10)
+    reconciler.join(timeout=10)
+
+    assert not settler.is_alive()
+    assert not reconciler.is_alive()
+    assert settlement_error == []
+    assert reconcile_error == []
+    assert reconcile_result[0].queued == 1
+    assert WorkflowRun.objects.filter(work_id=work.id, status=WorkflowRunStatus.QUEUED).count() == 1
+
+
+@pytest.mark.django_db
+def test_reconciler_no_ops_when_candidate_leaves_proposed_in_read_to_lock_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project, session = create_scope('agent-read-lock-gap')
+    candidate, source = _make_agent_candidate(organization, project, session.team, 'agent-read-lock-gap')
+    work = _create_work(candidate, source)
+    now = timezone.now()
+
+    original_lock = candidate_work_reconciler._lock_work_and_runs
+
+    def m_lock(work_id: uuid.UUID) -> object:
+        locked = original_lock(work_id)
+        MemoryCandidate.objects.filter(id=candidate.id).update(status=CandidateStatus.PROMOTED)
+
+        return locked
+
+    monkeypatch.setattr(candidate_work_reconciler, '_lock_work_and_runs', m_lock)
+
+    result = _reconcile(organization, project, now)
+
+    assert str(candidate.id) not in result.applied
+    assert result.queued == 0
+    assert not WorkflowRun.objects.filter(work_id=work.id).exists()

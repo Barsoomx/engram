@@ -88,7 +88,9 @@ def list_tools() -> list[dict[str, object]]:
                 "past work ('did we', 'last time', 'as before'), names a "
                 "subsystem, or reports an error you have not seen this "
                 "session. Prefer short 2-4 word queries (symptom, component, "
-                "error text)."
+                "error text). Filter by kinds=[convention,decision] to fetch "
+                "project conventions or decisions on a topic (e.g. gitlab "
+                "workflow)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -96,6 +98,7 @@ def list_tools() -> list[dict[str, object]]:
                     "query": {"type": "string"},
                     "file_paths": {"type": "array", "items": {"type": "string"}},
                     "symbols": {"type": "array", "items": {"type": "string"}},
+                    "kinds": {"type": "array", "items": {"type": "string"}},
                     "limit": {"type": "integer"},
                     "project_id": {"type": "string"},
                 },
@@ -108,7 +111,9 @@ def list_tools() -> list[dict[str, object]]:
                 "Re-request the memory context bundle that is injected at "
                 "session start (recent and relevant approved memories for "
                 "this project). Use after /clear or context compaction, or "
-                "when the injected Engram context looks stale."
+                "when the injected Engram context looks stale. Filter by "
+                "kinds=[convention,decision] to fetch project conventions or "
+                "decisions on a topic (e.g. gitlab workflow)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -117,6 +122,8 @@ def list_tools() -> list[dict[str, object]]:
                     "query": {"type": "string"},
                     "file_paths": {"type": "array", "items": {"type": "string"}},
                     "symbols": {"type": "array", "items": {"type": "string"}},
+                    "kinds": {"type": "array", "items": {"type": "string"}},
+                    "token_budget": {"type": "integer"},
                     "limit": {"type": "integer"},
                     "project_id": {"type": "string"},
                 },
@@ -151,12 +158,34 @@ def list_tools() -> list[dict[str, object]]:
                 "Step 2 - list recent raw observations (prompts, tool "
                 "activity, hook events) captured for the connected project. "
                 "Use to corroborate a memory found via engram_search with "
-                "ground-truth detail, or to audit what Engram captured."
+                "ground-truth detail, or to audit what Engram captured. Time "
+                "filters since/until bound ingestion time (created_at, until "
+                "exclusive); results still display and sort by observed_at."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "limit": {"type": "integer"},
+                    "observation_type": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "since": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 lower bound (inclusive) on ingestion time "
+                            "(created_at), NOT the displayed observed_at. With "
+                            "delayed ingestion a returned row's observed_at may "
+                            "fall outside this window."
+                        ),
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": (
+                            "ISO-8601 upper bound (exclusive) on ingestion time "
+                            "(created_at), NOT the displayed observed_at. A row "
+                            "whose created_at equals until is excluded."
+                        ),
+                    },
+                    "offset": {"type": "integer"},
                     "project_id": {"type": "string"},
                 },
                 "required": [],
@@ -185,18 +214,42 @@ def list_tools() -> list[dict[str, object]]:
             "description": (
                 "Step 3 - close the loop: the moment you discover an "
                 "injected or retrieved memory is outdated or wrong, mark it "
-                "stale or refuted with a reason. Clean memory improves every "
+                "stale or refuted with a reason. Confirm a memory when you "
+                "have verified it is still accurate — this resets its "
+                "confidence decay clock. Clean memory improves every "
                 "future session; do not silently ignore bad memory."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string"},
-                    "action": {"type": "string", "enum": ["stale", "refuted"]},
+                    "action": {
+                        "type": "string",
+                        "enum": ["stale", "refuted", "confirmed"],
+                    },
                     "reason": {"type": "string"},
                     "project_id": {"type": "string"},
                 },
                 "required": ["memory_id", "action", "reason"],
+            },
+        },
+        {
+            "name": "engram_memory_propose",
+            "description": (
+                "Deliberately record a durable fact you have verified. The "
+                "proposal goes through curation (dedup, conflict, judge) and is "
+                "NOT instantly retrievable — it becomes a memory only after "
+                "curation promotes it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "project_id": {"type": "string"},
+                },
+                "required": ["title", "body"],
             },
         },
         {

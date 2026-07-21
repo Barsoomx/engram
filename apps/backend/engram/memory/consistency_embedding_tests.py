@@ -272,3 +272,86 @@ def test_embedding_rebuild_missing_work_creates_one_work_and_signal() -> None:
         == 1
     )
     assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == 1
+
+
+@pytest.mark.transactional
+@pytest.mark.django_db(transaction=True)
+@pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
+def test_embedding_rebuild_resignals_settled_same_hash_work_after_projection_loss() -> None:
+    from engram.core.models import WorkflowRun, WorkflowRunStatus
+
+    document, work = _promoted_embedding_fixture('consistency-settled-repair')
+    queued_run = WorkflowRun.objects.get(
+        work=work,
+        execution_contract_version=1,
+        status=WorkflowRunStatus.QUEUED,
+    )
+    claimed_at = timezone.now()
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+        lease_owner='embedding:settled-repair-initial',
+        now=claimed_at,
+        lease_for=timedelta(minutes=5),
+        workflow_run_id=queued_run.id,
+    )
+    assert claim_result.claim is not None
+    assert (
+        complete_embedding_projection(
+            claim=claim_result.claim,
+            expected_projection_hash=document.exact_projection_hash,
+            embedding=_vector(0.4),
+            provider_call_id=uuid.uuid4(),
+            now=claimed_at + timedelta(minutes=1),
+        )
+        is not None
+    )
+
+    work.refresh_from_db()
+    queued_run.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert work.disposition == WorkflowWorkDisposition.COMPLETE
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    assert queued_run.status == WorkflowRunStatus.SUCCEEDED
+
+    CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).delete()
+    RetrievalDocument.objects.filter(id=document.id).update(
+        embedding_reference='',
+        embedding_vector=[],
+        embedding_pgvector=None,
+        embedding_projection_hash='',
+        embedding_projected_at=None,
+    )
+    document.refresh_from_db()
+
+    report = MemoryConsistencyReporter().execute(_report_input(document.organization_id, document.project_id))
+    issue = next(issue for issue in report.issues if issue.memory_id == document.memory_id)
+    assert issue.code == 'embedding_projection_missing'
+    assert issue.classification == 'enqueue_embedding'
+
+    before_run_count = WorkflowRun.objects.filter(work=work).count()
+    repaired = RebuildMemoryProjections().execute(
+        _rebuild_input(document.organization_id, document.project_id, apply=True)
+    )
+
+    work.refresh_from_db()
+    assert repaired.changed == 1
+    assert repaired.skipped == 0
+    assert (
+        WorkflowWork.objects.filter(
+            subject_id=document.id,
+            work_type=WorkflowWorkType.MEMORY_EMBEDDING,
+            input_snapshot__exact_projection_hash=document.exact_projection_hash,
+        ).count()
+        == 1
+    )
+    assert WorkflowRun.objects.filter(work=work).count() == before_run_count + 1
+    assert (
+        WorkflowRun.objects.filter(
+            work=work,
+            execution_contract_version=1,
+            status=WorkflowRunStatus.QUEUED,
+        ).count()
+        == 1
+    )
+    assert CeleryOutbox.objects.filter(task_name=_EMBEDDING_TASK).count() == 1

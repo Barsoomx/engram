@@ -199,6 +199,7 @@ class MemoryFeedbackResult:
     action: str
     retrieval_documents_updated: int
     already_applied: bool
+    confirmed_at: str
 
     def to_response(self) -> dict[str, object]:
         return {
@@ -208,6 +209,7 @@ class MemoryFeedbackResult:
             'action': self.action,
             'stale': self.memory.stale,
             'refuted': self.memory.refuted,
+            'confirmed_at': self.confirmed_at,
             'retrieval_documents_updated': self.retrieval_documents_updated,
             'already_applied': self.already_applied,
         }
@@ -225,6 +227,9 @@ class RecordMemoryFeedback:
         with transaction.atomic():
             memory = self._lock_memory(data, scope)
             self._ensure_team_scope(memory, scope)
+            if data.action == 'confirmed':
+                return self._confirm(memory, scope, data)
+
             already_applied = self._already_applied(memory, data.action)
             if already_applied:
                 updated = self._matching_retrieval_documents(memory, data.action)
@@ -237,6 +242,100 @@ class RecordMemoryFeedback:
             action=data.action,
             retrieval_documents_updated=updated,
             already_applied=already_applied,
+            confirmed_at=memory.last_confirmed_at.isoformat() if memory.last_confirmed_at else '',
+        )
+
+    def _confirm(self, memory: Memory, scope: EffectiveScope, data: MemoryFeedbackInput) -> MemoryFeedbackResult:
+        prior = (
+            AuditEvent.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                event_type='MemoryConfirmed',
+                target_type='memory',
+                target_id=str(memory.id),
+                actor_type=scope.actor_type,
+                actor_id=scope.actor_id,
+                request_id=data.request_id,
+            )
+            .order_by('created_at', 'id')
+            .first()
+        )
+        if prior is not None:
+            self._log(memory, data.action, 0, True)
+
+            return MemoryFeedbackResult(
+                memory=memory,
+                action='confirmed',
+                retrieval_documents_updated=0,
+                already_applied=True,
+                confirmed_at=str(prior.metadata.get('confirmed_at') or ''),
+            )
+
+        self._ensure_confirmable(memory, scope)
+        memory.last_confirmed_at = timezone.now()
+        memory.save(update_fields=['last_confirmed_at'])
+        self._write_confirm_audit(memory, scope, data)
+        self._log(memory, data.action, 0, False)
+
+        return MemoryFeedbackResult(
+            memory=memory,
+            action='confirmed',
+            retrieval_documents_updated=0,
+            already_applied=False,
+            confirmed_at=memory.last_confirmed_at.isoformat(),
+        )
+
+    def _ensure_confirmable(self, memory: Memory, scope: EffectiveScope) -> None:
+        floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
+        caller_retrievable = (
+            RetrievalDocument.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                memory_id=memory.id,
+                stale=False,
+                refuted=False,
+            )
+            .filter(
+                Q(visibility_scope=VisibilityScope.PROJECT)
+                | Q(visibility_scope=VisibilityScope.TEAM, team_id__in=scope.team_ids)
+            )
+            .exists()
+        )
+        if (
+            memory.status != MemoryStatus.APPROVED
+            or memory.stale
+            or memory.refuted
+            or memory.confidence is None
+            or memory.confidence <= floor
+            or memory.kind == 'digest'
+            or MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists()
+            or not caller_retrievable
+        ):
+            raise MemoryFeedbackError(
+                'memory_not_confirmable',
+                'Only an approved, non-stale, non-refuted, above-floor, non-digest, non-conflicted, '
+                'retrieval-injectable memory can be confirmed',
+            )
+
+    def _write_confirm_audit(self, memory: Memory, scope: EffectiveScope, data: MemoryFeedbackInput) -> None:
+        AuditEvent.objects.create(
+            organization_id=memory.organization_id,
+            project_id=memory.project_id,
+            team_id=memory.team_id if memory.visibility_scope == VisibilityScope.TEAM else None,
+            event_type='MemoryConfirmed',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory',
+            target_id=str(memory.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'memory_id': str(memory.id),
+                'confirmed_at': memory.last_confirmed_at.isoformat(),
+                'reason': str(redact_value(data.reason))[:1024],
+            },
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
@@ -651,19 +750,33 @@ def distillation_system_prompt() -> str:
     )
 
 
+_SOURCE_METADATA_CHAR_CAP = 2000
+
+
 def provider_prompt(observation: Observation) -> str:
-    return '\n'.join(
-        [
-            f'Title: {redact_text(observation.title)}',
-            f'Body: {redact_text(observation.body)}',
-            f'Facts: {redact_value(observation.facts)}',
-            f'Narrative: {redact_text(observation.narrative)}',
-            f'Concepts: {redact_value(observation.concepts)}',
-            f'Files read: {redact_value(observation.files_read)}',
-            f'Files modified: {redact_value(observation.files_modified)}',
-            f'Source metadata: {redact_value(observation.source_metadata)}',
-        ],
-    )
+    lines = [
+        'Single observation follows. If it carries no durable engineering signal, output {"memories": []}.',
+        f'Title: {redact_text(observation.title)}',
+    ]
+    if observation.facts:
+        lines.append(f'Facts: {redact_value(observation.facts)}')
+    if observation.narrative:
+        lines.append(f'Narrative: {redact_text(observation.narrative)}')
+    if observation.concepts:
+        lines.append(f'Concepts: {redact_value(observation.concepts)}')
+    if observation.files_read:
+        lines.append(f'Files read: {redact_value(observation.files_read)}')
+    if observation.files_modified:
+        lines.append(f'Files modified: {redact_value(observation.files_modified)}')
+    if observation.source_metadata:
+        metadata_dump = truncate_with_marker(
+            str(redact_value(observation.source_metadata)),
+            _SOURCE_METADATA_CHAR_CAP,
+        )
+        lines.append(f'Source metadata (event provenance, not durable signal): {metadata_dump}')
+    lines.append(f'Body: {redact_text(observation.body)}')
+
+    return '\n'.join(lines)
 
 
 def realtime_provider_prompt(observation: Observation, cap: int) -> str:
@@ -672,26 +785,40 @@ def realtime_provider_prompt(observation: Observation, cap: int) -> str:
 
 def realtime_generation_system_prompt() -> str:
     return (
-        'You are a memory distillation engine for software engineering sessions.\n'
+        'You are a memory distillation engine for software engineering sessions. '
         'Given a single structured observation, decide whether it carries a durable, '
         'runtime-neutral engineering memory.\n'
         '\n'
-        'Rules:\n'
-        '- Output a single JSON object only, with exactly one key "memories".\n'
-        '- "memories" is an array with at most one object with the keys '
-        '"title", "body", "confidence", and optionally "kind".\n'
+        'Output format:\n'
+        '- Return exactly one JSON object and nothing else: no prose, no markdown code fences.\n'
+        '- The object must contain exactly the key "memories" (array) and no additional properties.\n'
+        '- "memories" holds at most one object; never more than one. If several memories seem '
+        'possible, keep only the single most durable one.\n'
+        '- The memory object must contain exactly these keys and no additional properties: '
+        '"title" (non-blank string, at most 255 characters); '
+        '"body" (non-blank string, at most 3000 characters); '
+        '"confidence" (a JSON number between 0 and 1, never a string, never omitted); '
+        '"kind" (optional, exactly one of "decision", "convention", "gotcha", "architecture", '
+        '"incident"; omit the key when none clearly fits).\n'
         '- If the observation carries no durable engineering signal (routine status checks, empty '
-        'search results, plain acknowledgements), output {"memories": []}.\n'
-        '- "confidence" is a number between 0 and 1: 0.9 or higher for verified facts with direct '
-        'evidence, 0.6-0.8 for plausible conclusions, 0.3-0.5 for unverified hypotheses, below 0.3 '
-        'for speculation.\n'
-        '- "kind" is optional: one of "decision", "convention", "gotcha", "architecture", "incident" '
-        'when the memory clearly fits one of those categories, omitted otherwise.\n'
-        '- Preserve exact identifiers verbatim: file paths, function names, class names, '
+        'search results, plain acknowledgements), or you are unsure the signal is durable, output '
+        '{"memories": []}.\n'
+        '\n'
+        'Confidence for a single observation:\n'
+        '- 0.9 or higher: the observation itself shows direct evidence (command output, error '
+        'text, diff, config value).\n'
+        '- 0.6-0.8: a plausible conclusion the observation supports but does not prove.\n'
+        '- 0.3-0.5: an unverified hypothesis.\n'
+        '- Below 0.3: speculation; output {"memories": []} instead.\n'
+        '\n'
+        'Content rules:\n'
+        '- Copy identifiers verbatim from the input: file paths, function names, class names, '
         'CLI commands, error strings, ticket identifiers, URLs, and config keys.\n'
         '- Drop session chatter, acknowledgements, timestamps, and credential-shaped values.\n'
         '- Do not invent facts not present in the input.\n'
-        '- Do not name any AI assistant, tool, or product by brand.'
+        '- Do not name any AI assistant, tool, or product by brand.\n'
+        '- The title must stand alone as a searchable summary; the body must be self-contained '
+        'for future retrieval.'
     )
 
 
@@ -871,6 +998,10 @@ class UpdateMemoryBody:
             ensure_memory_team_scope(memory, scope)
             if memory.stale or memory.refuted:
                 raise MemoryVersionError('memory_not_editable', 'Memory is stale or refuted and cannot be edited')
+            if MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists():
+                raise MemoryVersionError(
+                    'memory_not_editable', 'Memory has an unresolved conflict and cannot be edited'
+                )
 
             latest_version = memory.versions.order_by('-version').first()
             if latest_version is not None and latest_version.body == data.body:
@@ -1235,18 +1366,30 @@ class DigestResult:
 
 def digest_system_prompt() -> str:
     return (
-        'You are a memory synthesis engine for software engineering sessions.\n'
+        'You are a memory synthesis engine for software engineering sessions. '
         'Given a list of approved engineering memories, produce a daily digest.\n'
         '\n'
-        'Rules:\n'
-        '- Output the Title on the first line (single line, under 255 characters) summarising the digest theme.\n'
-        '- Output the Body on the remaining lines.\n'
-        '- In the Body, consolidate and de-duplicate related memories. Group by theme.\n'
+        'Output format (parsed line by line, follow exactly):\n'
+        '- Line 1: the digest Title. Plain text, one line, at most 200 characters. '
+        'No markdown heading marks, no quotes, no label, nothing before it.\n'
+        '- Every following line: the digest Body.\n'
+        '- Output nothing except the Title line and the Body: no preamble, no closing remarks, no code fences.\n'
+        '- Blank lines are discarded by the parser; structure the Body with short theme lines '
+        'and "- " bullet lines instead of blank-line spacing.\n'
+        '- Never return an empty response. If the sources are empty or unusable, output the Title '
+        '"Daily digest" and one Body line stating there is no notable activity.\n'
+        '\n'
+        'Input format: each source memory is one line "- <title>: <body>". '
+        'A "[truncated N chars]" marker means the source was cut short; never treat the marker as content.\n'
+        '\n'
+        'Body rules:\n'
+        '- Consolidate and de-duplicate related memories. Group by theme.\n'
         '- Highlight decisions, changes, and risks explicitly.\n'
-        '- Be concise. Drop redundant detail.\n'
+        '- Be concise: keep the Body under roughly 600 words. Drop redundant detail.\n'
         '- Do not invent facts not present in the source memories.\n'
-        '- Do not name any AI assistant, tool, or product by brand.\n'
-        '- The output must be parseable: Title on the first non-empty line, Body on subsequent lines.'
+        '- Copy identifiers (file paths, branch names, error codes, ids) verbatim from the sources.\n'
+        '- Do not name any AI assistant or agent runtime by brand; technology names that appear '
+        'in the sources may be kept.'
     )
 
 
@@ -1778,6 +1921,7 @@ class BuildWeeklyStructuredDigest:
                     body=body,
                     metadata=metadata,
                     visibility_scope=visibility_scope,
+                    require_active_sources=False,
                 ),
             )
         except MemoryTransitionError as error:

@@ -147,7 +147,7 @@ class WeeklyDigestView(APIView):
                     signal_task=generate_weekly_digest_work_v1,
                 )
         except WorkflowWorkScopeError:
-            return Response({'detail': 'team not found'}, status=HTTP_404_NOT_FOUND)
+            return Response(_not_built_response(window_start, window_end, window_days))
 
         proven = _proven_output_for_work(organization, project, work)
 

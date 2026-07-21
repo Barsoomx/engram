@@ -16,6 +16,7 @@ from engram.core.models import (
     DistillationWindow,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     Observation,
     Organization,
     Project,
@@ -33,9 +34,11 @@ from engram.memory.candidate_decision_work import (
     build_candidate_decision_input,
     ensure_candidate_decision_work,
     ensure_candidate_decision_work_locked,
+    evidence_manifest,
     get_candidate_decision_work_builder,
 )
-from engram.memory.work_execution import claim_work, fail_work_claim
+from engram.memory.import_provenance import agent_proposal_evidence_manifest
+from engram.memory.work_execution import claim_work, execution_configuration_fingerprint, fail_work_claim
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -44,12 +47,6 @@ from engram.memory.workflow_work import (
     resolve_work_succeeded,
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
-
-
-@pytest.fixture(autouse=True)
-def f_reset_candidate_builder() -> None:
-    yield
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
 
 def _scope(suffix: str) -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -515,16 +512,20 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     candidate = _candidate(scope, '1')
     _mark_cp3_candidate(scope, candidate)
     now = timezone.now()
+    prepared, _created = ensure_candidate_decision_work(candidate.id)
+    blocked_fingerprint = execution_configuration_fingerprint(prepared)
     work = _fail_candidate_decision_work(
         candidate,
         now=now,
         failure=ClassifiedWorkFailure(
             failure_class=CONFIGURATION,
             code='model_policy_unavailable',
-            configuration_fingerprint='a' * 64,
+            configuration_fingerprint=blocked_fingerprint,
         ),
     )
     assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    work.blocked_configuration_fingerprint = execution_configuration_fingerprint(work)
+    work.save(update_fields=['blocked_configuration_fingerprint', 'updated_at'])
     sent = _collect_sent(monkeypatch)
 
     result = candidate_work_reconciler.reconcile_candidate_work(
@@ -536,4 +537,181 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     assert result.queued == 0
     assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
     assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert sent == []
+
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _agent_candidate_and_source(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    scope = _scope(suffix)
+    organization, team, project, _agent, _session = scope
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_agent_only_matches_agent_manifest() -> None:
+    candidate, source = _agent_candidate_and_source('agentmanifest')
+
+    entries, digest = evidence_manifest(candidate, sources=[source])
+    agent_entries, agent_digest = agent_proposal_evidence_manifest(candidate, sources=[source])
+
+    assert digest == agent_digest
+    assert entries == agent_entries
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_still_accepts_mapping_sources() -> None:
+    scope = _scope('mappingsrc')
+    organization, team, project, _agent, _session = scope
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Mapping candidate',
+        body='Mapping body',
+        content_hash=hashlib.sha256(b'mapping').hexdigest(),
+    )
+    sources = [
+        {
+            'window_input_hash': 'a' * 64,
+            'session_sequence': 1,
+            'observation_id': str(uuid.uuid4()),
+            'observation_digest': 'c' * 64,
+            'stage_key': 'a' * 64,
+            'anchors_hash': 'b' * 64,
+        },
+    ]
+
+    _entries, digest = evidence_manifest(candidate, sources=sources)
+
+    assert len(digest) == 64
+
+
+@pytest.mark.django_db
+def test_evidence_manifest_mixed_mapping_and_agent_raises() -> None:
+    candidate, source = _agent_candidate_and_source('mixedmap')
+    mapping_source = {
+        'window_input_hash': 'a' * 64,
+        'session_sequence': 1,
+        'observation_id': str(uuid.uuid4()),
+        'observation_digest': 'c' * 64,
+        'stage_key': 'a' * 64,
+        'anchors_hash': 'b' * 64,
+    }
+
+    with pytest.raises(ValueError):
+        evidence_manifest(candidate, sources=[mapping_source, source])
+
+
+@pytest.mark.django_db
+def test_reconcile_expired_candidate_lease_queues_recovery_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('expired-lease')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, created = ensure_candidate_decision_work(candidate.id)
+    assert created is True
+
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_owner=f'host:worker:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(seconds=1),
+    )
+    assert claimed.outcome == 'claimed'
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(seconds=2),
+    )
+
+    assert result.queued == 1
+    queued = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert sent == [
+        (
+            'engram.memory.process_candidate_decision_work_v1',
+            (str(work.id), str(queued.get().id)),
+        )
+    ]
+
+
+@pytest.mark.django_db
+def test_retry_streak_ceiling_parks_candidate_work_and_reconciler_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', '3')
+    scope = _scope('ceiling')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, _created = ensure_candidate_decision_work(candidate.id)
+    now = timezone.now()
+
+    for attempt in range(1, 4):
+        claim_now = now + timedelta(hours=attempt - 1)
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            lease_owner=f'ceiling:{attempt}',
+            now=claim_now,
+            lease_for=timedelta(minutes=5),
+        )
+        assert claimed.outcome == 'claimed'
+        fail_work_claim(
+            claim=claimed.claim,
+            now=claim_now,
+            failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='judge_policy_denied'),
+        )
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.failure_streak == 3
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(days=1),
+    )
+
+    assert result.queued == 0
     assert sent == []

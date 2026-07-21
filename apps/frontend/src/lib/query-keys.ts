@@ -46,21 +46,8 @@ export const adminQueryKeys = {
   memoryReview: (orgId: string | null, params?: ListParams) =>
     ['admin', orgId, 'memory-review', params ?? {}] as const,
 
-  memoryReviewDiff: (
-    orgId: string | null,
-    memoryId: string | null,
-    fromVersion: number | null,
-    toVersion: number | null,
-  ) =>
-    [
-      'admin',
-      orgId,
-      'memory-review',
-      'diff',
-      memoryId,
-      fromVersion,
-      toVersion,
-    ] as const,
+  memoryConflict: (orgId: string | null, candidateId: string | null) =>
+    ['admin', orgId, 'memory-review', 'conflict', candidateId] as const,
 
   metricsOverview: (orgId: string | null, scope?: MetricsScope) =>
     ['admin', orgId, 'metrics', 'overview', scope?.project_id ?? null, scope?.team_id ?? null] as const,

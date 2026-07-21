@@ -2,7 +2,17 @@
 
 import django.db.models.deletion
 import uuid
+from django.apps.registry import Apps
 from django.db import migrations, models
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+
+def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
+    decision_model = apps.get_model('core', 'CurationDecision')
+    if decision_model.objects.using(schema_editor.connection.alias).exists():
+        raise RuntimeError('cannot reverse 0040 while CurationDecision history exists')
+
+    return
 
 
 class Migration(migrations.Migration):
@@ -206,4 +216,5 @@ class Migration(migrations.Migration):
                 ],
             },
         ),
+        migrations.RunPython(migrations.RunPython.noop, _guard_reverse),
     ]

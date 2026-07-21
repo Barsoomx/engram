@@ -6,7 +6,7 @@ import pytest
 from django.utils import timezone
 
 from engram.context.context_api_tests import create_project_scope
-from engram.core.models import Observation
+from engram.core.models import Observation, Team
 from engram.observations.filters import ObservationFilterSet
 from engram.observations.observations_api_tests import create_observation, create_raw_event
 
@@ -15,9 +15,13 @@ from engram.observations.observations_api_tests import create_observation, creat
 def test_filterset_filters_by_team_id() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
 
+    other_team = Team.objects.create(organization=organization, name='Other', slug='other-team')
+
     matching = create_observation(organization, team, project, content_hash='team-match')
 
-    other_team_observation = create_observation(organization, None, project, content_hash='team-other')
+    null_team_observation = create_observation(organization, None, project, content_hash='team-null')
+
+    other_team_observation = create_observation(organization, other_team, project, content_hash='team-other')
 
     queryset = Observation.objects.filter(organization=organization, project=project)
 
@@ -26,6 +30,8 @@ def test_filterset_filters_by_team_id() -> None:
     ids = {obs.id for obs in filtered}
 
     assert matching.id in ids
+
+    assert null_team_observation.id in ids
 
     assert other_team_observation.id not in ids
 

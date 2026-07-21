@@ -245,7 +245,10 @@ def memory_response(
     file_paths = redacted(metadata.get('file_paths', []))
     confidence = memory.confidence
     confidence_percent: float | None = round(float(confidence) * 100, 1) if confidence is not None else None
-    authorized_for_injection = memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted
+    has_open_conflict = bool(memory.has_open_conflict)
+    authorized_for_injection = (
+        memory.status == MemoryStatus.APPROVED and not memory.stale and not memory.refuted and not has_open_conflict
+    )
 
     response: dict[str, object] = {
         'id': str(memory.id),
@@ -263,6 +266,7 @@ def memory_response(
         'stale': memory.stale,
         'refuted': memory.refuted,
         'authorized_for_injection': authorized_for_injection,
+        'has_open_conflict': has_open_conflict,
         'kind': kind,
         'tags': redacted(tags),
         'file_paths': file_paths,

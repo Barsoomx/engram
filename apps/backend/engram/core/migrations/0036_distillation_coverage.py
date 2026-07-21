@@ -3,7 +3,43 @@
 import uuid
 
 import django.db.models.deletion
+from django.apps.registry import Apps
 from django.db import migrations, models
+from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+_DISTILLATION_LEDGER_MODELS = (
+    'DistillationWindow',
+    'DistillationChunk',
+    'DistillationStage',
+    'DistillationObservationCoverage',
+    'MemoryCandidateSource',
+)
+
+
+def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
+    alias = schema_editor.connection.alias
+
+    for model_name in _DISTILLATION_LEDGER_MODELS:
+        if apps.get_model('core', model_name).objects.using(alias).exists():
+            raise RuntimeError(f'cannot reverse 0036 while distillation ledger {model_name} exists')
+
+    candidate_model = apps.get_model('core', 'MemoryCandidate')
+    if candidate_model.objects.using(alias).exclude(decision_work_contract_version=0).exists():
+        raise RuntimeError('cannot reverse 0036 while distillation candidate decision contract is activated')
+
+    work_model = apps.get_model('core', 'WorkflowWork')
+    if (
+        work_model.objects.using(alias)
+        .filter(models.Q(work_type='candidate_decision') | models.Q(subject_type='memory_candidate'))
+        .exists()
+    ):
+        raise RuntimeError('cannot reverse 0036 while distillation candidate-decision work exists')
+
+    run_model = apps.get_model('core', 'WorkflowRun')
+    if run_model.objects.using(alias).filter(run_type='candidate_decision').exists():
+        raise RuntimeError('cannot reverse 0036 while distillation candidate-decision run exists')
+
+    return
 
 
 class Migration(migrations.Migration):
@@ -710,4 +746,5 @@ class Migration(migrations.Migration):
                 condition=models.Q(('anchors_hash__regex', '^[0-9a-f]{64}$')), name='core_candidate_source_anchors_hex'
             ),
         ),
+        migrations.RunPython(migrations.RunPython.noop, _guard_reverse),
     ]

@@ -75,6 +75,10 @@ jobs:
           poetry run pip install coverage
           poetry run coverage run --source=engram --omit='*/*_tests.py,*/migrations/*' -m pytest -m "not transactional" -v --junitxml=junit.xml -o junit_family=legacy
 
+      - name: Run CP5 curator eval hermetic fixture gate
+        working-directory: apps/backend
+        run: poetry run python manage.py engram_curator_eval --engine fixture --format json
+
       - name: Generate coverage report
         working-directory: apps/backend
         run: |

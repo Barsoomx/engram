@@ -20,12 +20,16 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryLink,
     MemoryStatus,
     Observation,
     ObservationSource,
+    Organization,
+    Project,
     RetrievalDocument,
+    Team,
     WorkflowRun,
     WorkflowRunStatus,
     WorkflowWork,
@@ -64,6 +68,7 @@ from engram.memory.transitions import (
     SupersedeMemoriesInput,
     SupersedeMemoryWithCandidate,
     SupersedeMemoryWithCandidateInput,
+    _source_rows,
 )
 from engram.memory.transitions_test_support import (
     candidate_fence_for as _candidate_fence_for,
@@ -1267,3 +1272,345 @@ def test_remaining_typed_lineage_commands_commit_named_transitions() -> None:
         .count()
         >= 7
     )
+
+
+def _build_agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    import hashlib
+
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': 'req-1',
+        'correlation_id': '',
+    }
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_source_rows_hydrates_agent_only_candidate() -> None:
+    candidate, source = _build_agent_candidate('source-rows-agent')
+
+    with transaction.atomic():
+        rows = _source_rows(candidate)
+
+    assert len(rows) == 1
+    assert rows[0].id == source.id
+    assert rows[0].source_kind == 'agent_proposal'
+    assert rows[0].observation_id is None
+
+
+def _promotable_agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    import hashlib
+
+    from engram.memory.import_provenance import agent_proposal_candidate_content_hash
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+    title = f'Agent decision {suffix}'
+    body = f'The release pipeline requires manual approval {suffix}'
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=title,
+        body=body,
+        kind='',
+        status=CandidateStatus.PROPOSED,
+        content_hash=agent_proposal_candidate_content_hash(title, body, '', team.id),
+        decision_work_contract_version=1,
+    )
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': 'req-1',
+        'correlation_id': '',
+    }
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_promote_agent_candidate_creates_version_source_with_anchors_hash() -> None:
+    candidate, source = _promotable_agent_candidate('agent-promote')
+
+    result = _transitions().PromoteMemoryCandidate().execute(_request(candidate))
+
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    version_source = _model('MemoryVersionSource').objects.get(memory_version_id=result.memory_version.id)
+    assert version_source.candidate_source_id == source.id
+    assert version_source.source_content_hash == source.anchors_hash
+
+
+@pytest.mark.django_db
+def test_agent_promotion_is_stale_after_body_mutation() -> None:
+    candidate, _source = _promotable_agent_candidate('agent-stale-body')
+    request = _request(candidate)
+    MemoryCandidate.objects.filter(id=candidate.id).update(body='Mutated agent body after fence')
+
+    with pytest.raises(_transitions().MemoryTransitionError) as error:
+        _transitions().PromoteMemoryCandidate().execute(request)
+
+    assert error.value.code == 'stale_decision'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_agent_promotion_is_stale_after_kind_digest_mutation() -> None:
+    candidate, _source = _promotable_agent_candidate('agent-stale-kind')
+    request = _request(candidate)
+    MemoryCandidate.objects.filter(id=candidate.id).update(kind='digest')
+
+    with pytest.raises(_transitions().MemoryTransitionError) as error:
+        _transitions().PromoteMemoryCandidate().execute(request)
+
+    assert error.value.code == 'stale_decision'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_candidate_fence_rejects_mixed_agent_and_distillation() -> None:
+    import hashlib
+
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    distill_candidate, _distill_source, _scope = _provenanced_candidate('agent-mixed-fence')
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': 'req-1',
+        'correlation_id': '',
+    }
+    agent_source = MemoryCandidateSource.objects.create(
+        organization=distill_candidate.organization,
+        project=distill_candidate.project,
+        team=distill_candidate.team,
+        candidate=distill_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+    with transaction.atomic():
+        sources = _source_rows(distill_candidate)
+    fence = _transitions().CandidateFence(
+        candidate_id=distill_candidate.id,
+        candidate_content_hash=distill_candidate.content_hash,
+        evidence_manifest_hash='0' * 64,
+    )
+
+    with pytest.raises(_transitions().MemoryTransitionError) as error:
+        _transitions()._candidate_fence(
+            distill_candidate,
+            fence,
+            sources,
+            allowed_source_kinds=_transitions()._PROMOTION_SOURCE_KINDS,
+        )
+
+    assert error.value.code == 'provenance'
+    assert 'mixed source kinds' in str(error.value)
+    assert agent_source.id is not None
+
+
+@pytest.mark.django_db
+def test_candidate_fence_accepts_agent_under_non_promotion_kinds() -> None:
+    candidate, source = _promotable_agent_candidate('agent-nonpromo-fence')
+    fence = _candidate_fence_for(candidate)
+
+    with transaction.atomic():
+        _transitions()._candidate_fence(
+            candidate,
+            fence,
+            [source],
+            allowed_source_kinds=_transitions()._NON_PROMOTION_SOURCE_KINDS,
+        )
+
+
+@pytest.mark.django_db
+def test_candidate_fence_agent_source_observation_is_non_retryable_provenance() -> None:
+    candidate, source = _promotable_agent_candidate('agent-source-obs-fence')
+    fence = _transitions().CandidateFence(
+        candidate_id=candidate.id,
+        candidate_content_hash=candidate.content_hash,
+        evidence_manifest_hash='0' * 64,
+    )
+    candidate.source_observation_id = uuid.uuid4()
+
+    with pytest.raises(_transitions().MemoryTransitionError) as error:
+        _transitions()._candidate_fence(
+            candidate,
+            fence,
+            [source],
+            allowed_source_kinds=_transitions()._NON_PROMOTION_SOURCE_KINDS,
+        )
+
+    assert error.value.code == 'provenance'
+    assert error.value.retryable is False
+    assert 'source observation' in str(error.value)
+
+
+def _agent_candidate_in_scope(
+    base: MemoryCandidate,
+    suffix: str,
+    *,
+    title: str,
+    body: str,
+) -> tuple[MemoryCandidate, MemoryCandidateSource]:
+    import hashlib
+
+    from engram.memory.import_provenance import agent_proposal_candidate_content_hash
+    from engram.memory.workflow_work import canonical_json_bytes
+
+    candidate = MemoryCandidate.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        title=title,
+        body=body,
+        kind='',
+        status=CandidateStatus.PROPOSED,
+        content_hash=agent_proposal_candidate_content_hash(title, body, '', base.team_id),
+        decision_work_contract_version=1,
+    )
+    anchors = {
+        'schema': 'agent_proposal_source.v1',
+        'actor_type': 'api_key',
+        'actor_id': 'actor-1',
+        'api_key_id': 'key-1',
+        'request_id': f'req-{suffix}',
+        'correlation_id': '',
+    }
+    source = MemoryCandidateSource.objects.create(
+        organization=base.organization,
+        project=base.project,
+        team=base.team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=hashlib.sha256(canonical_json_bytes(anchors)).hexdigest(),
+    )
+
+    return candidate, source
+
+
+@pytest.mark.django_db
+def test_merge_evidence_transition_accepts_agent_candidate() -> None:
+    base, _base_source = _promotable_agent_candidate('agent-merge-base')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    candidate, source = _agent_candidate_in_scope(
+        base,
+        'agent-merge',
+        title='Agent merge fact',
+        body='The staging deploy pipeline also requires a manual approval step.',
+    )
+
+    result = MergeMemoryCandidate().execute(
+        MergeMemoryCandidateInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:merge-agent:{candidate.id}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title=candidate.title,
+            body=candidate.body,
+        )
+    )
+
+    assert result.transition.transition_type == 'merge'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id == promoted.memory.id
+    version_source = _model('MemoryVersionSource').objects.get(
+        memory_version_id=result.memory_version.id,
+        candidate_source_id=source.id,
+    )
+    assert version_source.source_content_hash == source.anchors_hash
+
+
+@pytest.mark.django_db
+def test_open_conflict_transition_accepts_agent_candidate() -> None:
+    base, _base_source = _promotable_agent_candidate('agent-conflict-base')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    candidate, _source = _agent_candidate_in_scope(
+        base,
+        'agent-conflict',
+        title='Agent conflict fact',
+        body='The deploy pipeline forbids any manual approval step before release.',
+    )
+
+    conflict = OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:conflict-agent:{candidate.id}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            evidence_hash='a' * 64,
+            redacted_reason='agent contradicts existing memory',
+        )
+    )
+
+    assert conflict.opened_transition.transition_type == 'conflict_open'
+    assert conflict.candidate_id == candidate.id
+    assert conflict.memory_id == promoted.memory.id
+
+
+@pytest.mark.django_db
+def test_publish_digest_rejects_source_pinned_by_open_conflict() -> None:
+    candidate, conflict = _open_single_conflict('digest-source-open-conflict')
+    transitions = _transitions()
+
+    with pytest.raises(transitions.MemoryTransitionError) as error:
+        PublishDigestMemory().execute(
+            PublishDigestMemoryInput(
+                request=_request_for(
+                    candidate,
+                    key=f'request:{uuid.uuid4()}:publish-digest-conflict:{conflict.memory_id}:v1',
+                ),
+                source_memory_fences=(transitions.build_memory_fence(conflict.memory),),
+                title='Digest over a conflicted source',
+                body='Digest over a conflicted source body',
+                work_claim=None,
+            )
+        )
+
+    assert error.value.code == 'memory_conflicted'
+    assert conflict.memory.versions.count() == 1
