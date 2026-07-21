@@ -1348,6 +1348,155 @@ def test_reduce_accepted_set_excludes_non_v2_prompt_contract_rows() -> None:
     assert {stage.id for stage in unfiltered} == {legacy.id, current.id}
 
 
+@pytest.mark.django_db
+def test_reduce_stage_coordinate_permits_distinct_prompt_contracts() -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='coord-prompt-contract')
+    policy = create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    work = create_session_distillation_work(session, upper=1)
+    window = materialize_distillation_window(work)
+
+    legacy = _complete_reduce_stage(window, policy, level=1, ordinal=0, prompt_contract='distill_reduce.v1')
+    current = _complete_reduce_stage(window, policy, level=1, ordinal=0, prompt_contract='distill_reduce.v2')
+
+    coordinate = {
+        'window': window,
+        'stage_kind': 'reduce',
+        'level': 1,
+        'ordinal': 0,
+        'policy': policy,
+        'policy_version': policy.version,
+        'policy_role': 'primary',
+    }
+    rows = DistillationStage.objects.filter(**coordinate)
+    assert {row.id for row in rows} == {legacy.id, current.id}
+    assert {row.prompt_contract for row in rows} == {'distill_reduce.v1', 'distill_reduce.v2'}
+
+
+def _valid_residual_v1_reduce_stage(
+    window: DistillationWindow,
+    work: WorkflowWork,
+    policy: ModelPolicy,
+    *,
+    level: int,
+    ordinal: int,
+) -> DistillationStage:
+    manifest = {'schema': 'distillation_reduce_manifest.v1', 'level': level, 'ordinal': ordinal, 'refs': []}
+    input_projection = {'schema': manifest['schema'], 'refs': manifest['refs']}
+    input_hash = hashlib.sha256(canonical_json_bytes(input_projection)).hexdigest()
+    snapshot = {'memories': []}
+    target_key = stage_target_key(
+        work_id=str(work.id),
+        work_input_fingerprint=work.input_fingerprint,
+        window_input_hash=window.input_hash,
+        stage_kind='reduce',
+        level=level,
+        ordinal=ordinal,
+        chunk_ordinal=None,
+        input_hash=input_hash,
+        prompt_contract='distill_reduce.v1',
+    )
+    call = ProviderCallRecord.objects.create(
+        organization=window.organization,
+        project=window.project,
+        team=window.team,
+        policy=policy,
+        secret=policy.secret,
+        provider=policy.provider,
+        model=policy.model,
+        task_type=policy.task_type,
+        policy_version=policy.version,
+        request_id=f'distill-stage:{uuid.uuid4()}',
+        redaction_state='redacted',
+    )
+
+    return DistillationStage.objects.create(
+        organization=window.organization,
+        project=window.project,
+        team=window.team,
+        window=window,
+        chunk=None,
+        stage_kind='reduce',
+        level=level,
+        ordinal=ordinal,
+        target_key=target_key,
+        stage_key=stage_key(
+            target_key=target_key,
+            policy_id=str(policy.id),
+            policy_version=policy.version,
+            policy_role='primary',
+        ),
+        input_hash=input_hash,
+        input_manifest=manifest,
+        prompt_contract='distill_reduce.v1',
+        policy=policy,
+        policy_version=policy.version,
+        policy_role='primary',
+        status='complete',
+        attempt_count=1,
+        accepted_provider_call=call,
+        response_hash='3' * 64,
+        response_size=32,
+        output_snapshot=snapshot,
+        output_hash=hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest(),
+        completed_at=timezone.now(),
+    )
+
+
+@pytest.mark.django_db
+def test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='redrive-residual-v1')
+    policy = create_curation_policy(organization, team, project)
+    observations = [
+        create_observation(
+            organization, project, team, agent, session, index=index, body='x' * 4500, narrative='y' * 4500
+        )
+        for index in range(1, 4)
+    ]
+    work = create_session_distillation_work(session, upper=3)
+    gateway = _SignalReductionStageGateway()
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+    window = materialize_distillation_window(work)
+    residual = _valid_residual_v1_reduce_stage(window, work, policy, level=1, ordinal=0)
+
+    now = timezone.now()
+    attempts = 0
+    while WorkflowWork.objects.get(id=work.id).disposition == WorkflowWorkDisposition.REQUIRED:
+        queued = (
+            WorkflowRun.objects.filter(work=work, execution_contract_version=1, status=WorkflowRunStatus.QUEUED)
+            .order_by('created_at', 'id')
+            .first()
+        )
+        claim_result = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            lease_owner=f'test:{uuid.uuid4()}',
+            now=now,
+            lease_for=timedelta(minutes=12),
+            workflow_run_id=queued.id if queued is not None else None,
+        )
+        assert claim_result.claim is not None
+        run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+        attempts += 1
+        assert attempts < 40
+        now += timedelta(seconds=1)
+
+    v2_first_batch = DistillationStage.objects.filter(
+        window=window, stage_kind='reduce', prompt_contract='distill_reduce.v2', level=1, ordinal=0
+    )
+    assert v2_first_batch.exists()
+    assert not v2_first_batch.filter(id=residual.id).exists()
+    coverage = DistillationObservationCoverage.objects.filter(window=window)
+    assert set(coverage.values_list('observation_id', flat=True)) == {item.id for item in observations}
+    work.refresh_from_db()
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
 class _TruncatingThenValidReductionGateway(_NoSignalStageGateway):
     def __init__(self) -> None:
         super().__init__()
@@ -1470,6 +1619,71 @@ def test_reduce_truncation_bumps_generation_to_disjoint_level_band(
     marker.refresh_from_db()
     assert marker.status == 'required'
 
+    work.refresh_from_db()
+    assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+@pytest.mark.django_db
+def test_escape_heavy_reduce_batch_truncates_once_then_recovers_via_split_backstop(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='escape-heavy-truncation')
+    create_curation_policy(organization, team, project)
+    escape_heavy = ('"quote"\\backslash\\\n\ttab' * 200)[:4500]
+    for index in range(1, 4):
+        create_observation(
+            organization, project, team, agent, session, index=index, body=escape_heavy, narrative=escape_heavy
+        )
+    work = create_session_distillation_work(session, upper=3)
+    gateway = _TruncatingThenValidReductionGateway()
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+
+    now = timezone.now()
+    first = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'test:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=12),
+    )
+    assert first.claim is not None
+    with pytest.raises(DistillationStageError):
+        run_complete_distillation_attempt(work=work, claim=first.claim, now=now)
+
+    window = DistillationWindow.objects.get(work=work)
+    assert DistillationStage.objects.filter(
+        window=window, stage_kind='reduce', status='required', last_failure_class=PROVIDER_OUTPUT_TRUNCATED
+    ).exists()
+
+    now += timedelta(minutes=13)
+    attempts = 0
+    while WorkflowWork.objects.get(id=work.id).disposition == WorkflowWorkDisposition.REQUIRED:
+        queued = (
+            WorkflowRun.objects.filter(work=work, execution_contract_version=1, status=WorkflowRunStatus.QUEUED)
+            .order_by('created_at', 'id')
+            .first()
+        )
+        claim_result = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            lease_owner=f'test:{uuid.uuid4()}',
+            now=now,
+            lease_for=timedelta(minutes=12),
+            workflow_run_id=queued.id if queued is not None else None,
+        )
+        assert claim_result.claim is not None
+        run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+        attempts += 1
+        assert attempts < 20
+        now += timedelta(seconds=1)
+
+    assert gateway.reduce_calls >= 2
+    assert not DistillationStage.objects.filter(window=window, stage_kind='reduce', level__gte=48).exists()
     work.refresh_from_db()
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
