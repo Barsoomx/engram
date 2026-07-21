@@ -65,10 +65,16 @@ from engram.memory.distillation_provenance import (
 from engram.memory.distillation_provider_stage import (
     PROVIDER_OUTPUT_MALFORMED,
     PROVIDER_OUTPUT_TRUNCATED,
+    resolve_reduction_policy,
     stage_key,
     stage_target_key,
 )
-from engram.memory.distillation_window import materialize_distillation_window, render_observation_block
+from engram.memory.distillation_reduction import derive_first_pending_reduction_target, output_budget_tokens
+from engram.memory.distillation_window import (
+    materialize_distillation_window,
+    next_distillation_stage,
+    render_observation_block,
+)
 from engram.memory.services import MemoryWorkerError
 from engram.memory.tasks import distill_session_work_v1
 from engram.memory.work_dispatch import queue_work_attempt
@@ -89,6 +95,7 @@ from engram.model_policy.services import (
     ProviderCallInput,
     ProviderCallResult,
     _completion_body,
+    effective_completion_cap,
 )
 
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
@@ -1380,8 +1387,14 @@ def _valid_residual_v1_reduce_stage(
     *,
     level: int,
     ordinal: int,
+    input_manifest: dict[str, object] | None = None,
 ) -> DistillationStage:
-    manifest = {'schema': 'distillation_reduce_manifest.v1', 'level': level, 'ordinal': ordinal, 'refs': []}
+    manifest = input_manifest or {
+        'schema': 'distillation_reduce_manifest.v1',
+        'level': level,
+        'ordinal': ordinal,
+        'refs': [],
+    }
     input_projection = {'schema': manifest['schema'], 'refs': manifest['refs']}
     input_hash = hashlib.sha256(canonical_json_bytes(input_projection)).hexdigest()
     snapshot = {'memories': []}
@@ -1457,15 +1470,16 @@ def test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly(m_monkeypatch
     gateway = _SignalReductionStageGateway()
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
     m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '1')
     m_monkeypatch.setattr(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
     )
     window = materialize_distillation_window(work)
-    residual = _valid_residual_v1_reduce_stage(window, work, policy, level=1, ordinal=0)
 
     now = timezone.now()
     attempts = 0
+    residual: DistillationStage | None = None
     while WorkflowWork.objects.get(id=work.id).disposition == WorkflowWorkDisposition.REQUIRED:
         queued = (
             WorkflowRun.objects.filter(work=work, execution_contract_version=1, status=WorkflowRunStatus.QUEUED)
@@ -1486,8 +1500,44 @@ def test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly(m_monkeypatch
         assert attempts < 40
         now += timedelta(seconds=1)
 
+        if residual is None and next_distillation_stage(window) is None:
+            extraction_stages = _accepted_stage_rows(window, 'extract')
+            reduce_started = DistillationStage.objects.filter(
+                window=window, stage_kind='reduce', prompt_contract='distill_reduce.v2'
+            ).exists()
+            if extraction_stages and not reduce_started:
+                reduce_policy = resolve_reduction_policy(window)
+                first_batch = derive_first_pending_reduction_target(
+                    extraction_stages,
+                    [],
+                    reduction_target_floor=window.reduction_target,
+                    output_budget_tokens=output_budget_tokens(
+                        effective_completion_cap(reduce_policy, 'distill_reduce.v2')
+                    ),
+                    generation=0,
+                )
+                assert first_batch is not None
+                assert first_batch.input_hash != hashlib.sha256(
+                    canonical_json_bytes({'schema': 'distillation_reduce_manifest.v1', 'refs': []})
+                ).hexdigest()
+                residual = _valid_residual_v1_reduce_stage(
+                    window,
+                    work,
+                    policy,
+                    level=first_batch.level,
+                    ordinal=first_batch.ordinal,
+                    input_manifest=first_batch.manifest,
+                )
+                assert residual.input_hash == first_batch.input_hash
+
+    assert residual is not None
     v2_first_batch = DistillationStage.objects.filter(
-        window=window, stage_kind='reduce', prompt_contract='distill_reduce.v2', level=1, ordinal=0
+        window=window,
+        stage_kind='reduce',
+        prompt_contract='distill_reduce.v2',
+        level=residual.level,
+        ordinal=residual.ordinal,
+        input_hash=residual.input_hash,
     )
     assert v2_first_batch.exists()
     assert not v2_first_batch.filter(id=residual.id).exists()
