@@ -1,5 +1,6 @@
 import json
 import math
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -308,6 +309,26 @@ def test_parse_reduction_output_allows_passthrough_without_forced_shrink() -> No
     inputs = [_draft(index) for index in range(3)]
     parsed = parse_reduction_output({'memories': [_memory([1]), _memory([2]), _memory([3])]}, inputs)
     assert len(parsed.memories) == len(inputs)
+
+
+def _draft_with_confidence(index: int, confidence: str) -> ReductionDraft:
+    draft = _draft(index)
+
+    return replace(draft, confidence=Decimal(confidence))
+
+
+def test_parse_reduction_output_clamps_confidence_to_source_draft_ceiling_without_rejecting() -> None:
+    inputs = [_draft_with_confidence(0, '0.50'), _draft_with_confidence(1, '0.40'), _draft_with_confidence(2, '0.90')]
+
+    merged = _memory([1, 2])
+    merged['confidence'] = 0.99
+    passthrough = _memory([3])
+    passthrough['confidence'] = 0.70
+
+    parsed = parse_reduction_output({'memories': [merged, passthrough]}, inputs)
+
+    assert parsed.memories[0].confidence == Decimal('0.50')
+    assert parsed.memories[1].confidence == Decimal('0.70')
 
 
 def test_final_drafts_wait_until_all_targets_accepted() -> None:

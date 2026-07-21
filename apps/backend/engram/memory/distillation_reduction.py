@@ -295,8 +295,10 @@ def parse_reduction_output(  # noqa: C901
         if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
             raise ReductionContractError('confidence must be numeric')
         source_ids = tuple(inputs[index - 1].draft_id for index in indices)
+        source_ceiling = max(inputs[index - 1].confidence for index in indices)
+        confidence = min(_confidence(confidence_value), source_ceiling)
         covered.extend(indices)
-        memories.append(ReducedMemory(title, body, _confidence(confidence_value), source_ids, kind))
+        memories.append(ReducedMemory(title, body, confidence, source_ids, kind))
     if n:
         if len(covered) != len(set(covered)):
             raise ReductionContractError('source_refs index repeats across memories')

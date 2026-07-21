@@ -1298,7 +1298,8 @@ _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'Only use draft indices copied verbatim from the input drafts. '
     'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
     'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
-    'own memory, so the number of memories may equal the number of input drafts.'
+    'own memory, so the number of memories may equal the number of input drafts. '
+    'Give each memory a confidence no higher than the highest confidence among its source drafts.'
 )
 
 
