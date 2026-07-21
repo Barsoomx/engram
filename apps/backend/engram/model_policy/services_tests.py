@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 from typing import Any
@@ -10,11 +11,15 @@ from structlog.testing import capture_logs
 from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
+from engram.memory.distillation_provider_stage import _EXTRACT_SYSTEM_PROMPT, EXTRACT_PROMPT_CONTRACT
+from engram.memory.distillation_reduction import _REDUCE_SYSTEM_PROMPT, REDUCE_PROMPT_CONTRACT
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
+    _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS,
+    _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS,
     _STRUCTURED_RESPONSE_KINDS,
     AnthropicMessagesGateway,
     CreateProviderSecret,
@@ -40,6 +45,28 @@ from engram.model_policy.services import (
 )
 
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
+
+
+def _fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+_REDUCE_SYSTEM_PROMPT_FINGERPRINT = '5178d5f24b0965171b7cdc9f333272795167de3fa3a5e0cd7dcb25da06b80574'
+_REDUCE_SCHEMA_INSTRUCTIONS_FINGERPRINT = '291cd38b28d36ca33b384ee36a4416bf4c4d931ac7336ef89b9aa1d76bdb8348'
+_EXTRACT_SYSTEM_PROMPT_FINGERPRINT = '40999ca6a885bb8257a8e08e89c15930febc209b5c6c38421cc60e6f32901e23'
+_EXTRACT_SCHEMA_INSTRUCTIONS_FINGERPRINT = 'b8ad77b18e8d39c474dde0b23819dff2647512e59e64f095f942c8ce977f63e2'
+
+
+def test_reduce_prompt_components_pinned_change_forces_contract_version_bump() -> None:
+    assert REDUCE_PROMPT_CONTRACT == 'distill_reduce.v2'
+    assert _fingerprint(_REDUCE_SYSTEM_PROMPT) == _REDUCE_SYSTEM_PROMPT_FINGERPRINT
+    assert _fingerprint(_DISTILL_REDUCE_SCHEMA_INSTRUCTIONS) == _REDUCE_SCHEMA_INSTRUCTIONS_FINGERPRINT
+
+
+def test_extract_prompt_components_pinned_change_forces_contract_version_bump() -> None:
+    assert EXTRACT_PROMPT_CONTRACT == 'distill_extract.v1'
+    assert _fingerprint(_EXTRACT_SYSTEM_PROMPT) == _EXTRACT_SYSTEM_PROMPT_FINGERPRINT
+    assert _fingerprint(_DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS) == _EXTRACT_SCHEMA_INSTRUCTIONS_FINGERPRINT
 
 
 def _openai_chat_body(content: str, usage: dict[str, int] | None = None, finish_reason: str | None = None) -> bytes:
@@ -479,7 +506,8 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
         'architecture, incident). Only use draft indices copied verbatim from the input drafts. '
         'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
         'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
-        'own memory, so the number of memories may equal the number of input drafts.'
+        'own memory, so the number of memories may equal the number of input drafts. '
+        'Give each memory a confidence no higher than the highest confidence among its source drafts.'
     )
     assert curation_schema_prompt_prefix('distill_reduce.v1') == ''
 
