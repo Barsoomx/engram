@@ -4,11 +4,9 @@ from django.db import migrations
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('core', '0041_auditevent_target_index'),
         ('core', '0045_agent_proposal_source'),
     ]
 
-    operations = [
-    ]
+    operations = []
