@@ -105,7 +105,7 @@ plain-text message telling the caller to run `engram connect` or set
 
 ### Project precedence ladder
 
-All six tools resolve which project a call targets with the same ladder, in
+All seven tools resolve which project a call targets with the same ladder, in
 order:
 
 1. the tool's own optional `project_id` argument (a per-call override);
@@ -116,9 +116,9 @@ order:
    `repository_url` instead of `project_id`.
 
 Rung 4 is the default in the plug-and-play setup (org-wide agent key,
-`engram connect` run without `--project`), and all six tools - including
-`engram_memory_link`, `engram_observations`, `engram_memory_version`, and
-`engram_memory_feedback` - work in that mode. The server always
+`engram connect` run without `--project`), and all seven tools - including
+`engram_memory_link`, `engram_observations`, `engram_memory_version`,
+`engram_memory_feedback`, and `engram_memory_propose` - work in that mode. The server always
 re-authorizes whichever project a request resolves to, so no rung can expand
 scope beyond the key's own binding. This is the one place the ladder is
 documented; [mcp-tools.md](../mcp-tools.md), [cli.md](cli.md), and
@@ -163,7 +163,7 @@ fails closed unless the tool call or local connection supplies an explicit
 
 ## Tool set
 
-Six tools ship today. See [../mcp-tools.md](../mcp-tools.md) for the full
+Seven tools ship today. See [../mcp-tools.md](../mcp-tools.md) for the full
 catalog, the mapping to the original conceptual tool names, and the tools that
 are explicitly deferred.
 
@@ -175,6 +175,7 @@ are explicitly deferred.
 | `engram_observations`     | `GET /v1/observations/`               |
 | `engram_memory_version`   | `POST /v1/memories/{id}/version`      |
 | `engram_memory_feedback`  | `POST /v1/memories/{id}/feedback`     |
+| `engram_memory_propose`   | `POST /v1/memories/propose`           |
 
 ## Authorization
 

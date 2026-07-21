@@ -16,11 +16,16 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryCandidateSourceKind,
     MemoryConflict,
     MemoryTransition,
+    MemoryVersion,
     MemoryVersionSource,
     Observation,
+    Organization,
+    Project,
     SessionStatus,
+    Team,
     VisibilityScope,
     WorkflowWork,
 )
@@ -37,8 +42,119 @@ from engram.memory.transitions_test_support import (
     transition_request,
     transitions_module,
 )
-from engram.memory.workflow_work import observation_content_digest
+from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.services import ProviderCallResult
+
+_AGENT_ANCHORS = {
+    'schema': 'agent_proposal_source.v1',
+    'actor_type': 'api_key',
+    'actor_id': 'actor-1',
+    'api_key_id': 'key-1',
+    'request_id': 'req-1',
+    'correlation_id': '',
+}
+
+
+def _agent_anchors_hash(anchors: dict[str, object]) -> str:
+    import hashlib
+
+    return hashlib.sha256(canonical_json_bytes(anchors)).hexdigest()
+
+
+def _agent_scope(suffix: str) -> tuple[Organization, Team, Project]:
+    organization = Organization.objects.create(name=f'Org {suffix}', slug=f'org-{suffix}')
+    team = Team.objects.create(organization=organization, name=f'Team {suffix}', slug=f'team-{suffix}')
+    project = Project.objects.create(organization=organization, name=f'Project {suffix}', slug=f'project-{suffix}')
+
+    return organization, team, project
+
+
+def _agent_candidate(suffix: str) -> tuple[MemoryCandidate, MemoryCandidateSource, tuple[Organization, Team, Project]]:
+    import hashlib
+
+    organization, team, project = _agent_scope(suffix)
+    candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title=f'Agent fact {suffix}',
+        body=f'Agent body {suffix}',
+        status='proposed',
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=hashlib.sha256(f'agent-{suffix}'.encode()).hexdigest(),
+        decision_work_contract_version=1,
+        evidence=[],
+    )
+    anchors = dict(_AGENT_ANCHORS)
+    source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=_agent_anchors_hash(anchors),
+    )
+
+    return candidate, source, (organization, team, project)
+
+
+def _agent_target_version(
+    scope: tuple[Organization, Team, Project],
+    *,
+    anchors: dict[str, object],
+    anchors_hash: str,
+) -> tuple[Memory, MemoryVersion]:
+    import hashlib
+
+    organization, team, project = scope
+    target_candidate = MemoryCandidate.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Target agent memory',
+        body='Target agent memory body',
+        status='promoted',
+        visibility_scope=VisibilityScope.PROJECT,
+        content_hash=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+        decision_work_contract_version=1,
+    )
+    target_source = MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        candidate=target_candidate,
+        source_kind=MemoryCandidateSourceKind.AGENT_PROPOSAL,
+        anchors=anchors,
+        anchors_hash=anchors_hash,
+    )
+    memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        title='Target agent memory',
+        body='Target agent memory body',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=memory,
+        version=1,
+        body=memory.body,
+        content_hash=hashlib.sha256(uuid.uuid4().bytes).hexdigest(),
+    )
+    MemoryVersionSource.objects.create(
+        organization=organization,
+        project=project,
+        team=team,
+        memory_version=version,
+        candidate_source=target_source,
+        source_content_hash=target_source.anchors_hash,
+    )
+
+    return memory, version
+
 
 _CANDIDATE_EVIDENCE_AT = datetime(2026, 2, 1, tzinfo=UTC)
 _TARGET_EVIDENCE_AT = datetime(2026, 1, 1, tzinfo=UTC)
@@ -1137,3 +1253,522 @@ def test_cyclic_target_provenance_is_detected_without_infinite_recursion() -> No
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
     assert _semantic_snapshot(candidate.project_id) == before
+
+
+@pytest.mark.django_db
+def test_agent_only_candidate_tier_supported_with_none_evidence_time() -> None:
+    module = _judge_module()
+    candidate, _source, _scope = _agent_candidate('judge-agent-tier')
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'supported'
+    assert context.candidate.latest_evidence_at is None
+    assert len(context.candidate.refs) == 1
+
+
+@pytest.mark.django_db
+def test_eligible_group_pair_returns_agent_anchors_hash() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-hash')
+
+    assert module._eligible_group_pair(source) == (source.anchors_hash, source.anchors_hash)
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_corrupted_agent_hash() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-corrupt')
+    source.anchors_hash = 'f' * 64
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_pair(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_empty_agent_anchors() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-empty')
+    source.anchors = {}
+    source.anchors_hash = _agent_anchors_hash({})
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_pair(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+def test_eligible_group_hash_rejects_wrong_shape_agent_source() -> None:
+    module = _judge_module()
+    _candidate, source, _scope = _agent_candidate('judge-agent-shape')
+    source.observation_id = uuid.uuid4()
+
+    with pytest.raises(ValueError) as error:
+        module._eligible_group_pair(source)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('malformation', ['corrupted_hash', 'wrong_schema'])
+def test_target_traversal_rejects_malformed_agent_source(malformation: str) -> None:
+    module = _judge_module()
+    candidate, _source, scope = _agent_candidate(f'judge-agent-target-{malformation}')
+    if malformation == 'corrupted_hash':
+        anchors = dict(_AGENT_ANCHORS)
+        anchors_hash = 'f' * 64
+    else:
+        anchors = dict(_AGENT_ANCHORS, schema='other.v1')
+        anchors_hash = _agent_anchors_hash(anchors)
+    memory, version = _agent_target_version(scope, anchors=anchors, anchors_hash=anchors_hash)
+    shortlist = _shortlist_for(memory, version)
+
+    with pytest.raises(ValueError) as error:
+        module.build_curation_evidence_context(candidate.id, shortlist)
+
+    assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
+
+
+def _agent_policy_data(cross: bool) -> tuple[object, object, uuid.UUID]:
+    module = _judge_module()
+    shortlist_module = _shortlist_module()
+    candidate, _source, scope = provenanced_candidate(f'judge-agent-policy-{uuid.uuid4().hex[:8]}')
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+    team_id = candidate.team_id
+    target_id = uuid.uuid4()
+    if cross:
+        target_visibility, target_team = VisibilityScope.PROJECT, None
+    else:
+        target_visibility, target_team = VisibilityScope.TEAM, team_id
+    entry = shortlist_module.CurationShortlistEntry(
+        memory_id=uuid.uuid4(),
+        memory_version_id=target_id,
+        current_transition_id=uuid.uuid4(),
+        visibility_scope=target_visibility,
+        team_id=target_team,
+        title='Target title',
+        body='Target body',
+        kind='decision',
+        body_hash='a' * 64,
+        exact_overlap=0,
+        vector_distance=0.1,
+        lexical_rank=0.0,
+        trigram_similarity=0.0,
+        has_open_conflict=False,
+    )
+    shortlist = shortlist_module.CurationShortlist(
+        entries=(entry,),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=1,
+        comparison_complete=True,
+    )
+    evidence = module.CurationEvidenceContext(
+        candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',), latest_evidence_at=None),
+        targets={target_id: module.ClaimEvidence(tier='supported', refs=('target-ref',), latest_evidence_at=None)},
+    )
+    data = module.CurationJudgeInput(
+        organization_id=scope[0].id,
+        project_id=scope[1].id,
+        candidate_id=candidate.id,
+        candidate=SanitizedCandidateView(
+            title='Agent title',
+            body='Agent body',
+            kind='decision',
+            evidence=(),
+            content_hash='c' * 64,
+            redaction_codes=(),
+        ),
+        effective_scope=EffectiveCandidateScope(VisibilityScope.TEAM, team_id),
+        shortlist=shortlist,
+        evidence=evidence,
+        request_id='judge-agent-policy',
+        trace_id='judge-agent-policy-trace',
+    )
+    return module, data, target_id
+
+
+def _verdict(
+    module: object,
+    *,
+    outcome: str,
+    relation: str,
+    target: uuid.UUID | None,
+    applicability: str = 'same',
+    temporal_order: str = 'not_applicable',
+    reason_code: str = 'distinct_claim',
+) -> object:
+    return module.CurationJudgeVerdictV1(
+        schema_version=1,
+        outcome=outcome,
+        relation=relation,
+        target_memory_version_id=target,
+        candidate_evidence_refs=('candidate-ref',),
+        comparisons=(),
+        applicability=applicability,
+        temporal_order=temporal_order,
+        reason_code=reason_code,
+        reason='reason',
+    )
+
+
+_MUTATION_VERDICTS = (
+    ('merge_evidence', 'equivalent', 'not_applicable'),
+    ('open_conflict', 'mutually_incompatible', 'unordered'),
+    ('revise_memory', 'candidate_revises', 'candidate_newer'),
+    ('supersede_memory', 'candidate_supersedes', 'candidate_newer'),
+)
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(('outcome', 'relation', 'temporal_order'), _MUTATION_VERDICTS)
+def test_cross_visibility_mutation_denied_with_distinct_code(outcome: str, relation: str, temporal_order: str) -> None:
+    module, data, target_id = _agent_policy_data(cross=True)
+    verdict = _verdict(module, outcome=outcome, relation=relation, target=target_id, temporal_order=temporal_order)
+
+    with pytest.raises(ValueError) as error:
+        module._apply_evidence_policy(verdict, data)
+
+    assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'
+
+
+@pytest.mark.django_db
+def test_cross_visibility_reject_redundant_is_permitted() -> None:
+    module, data, target_id = _agent_policy_data(cross=True)
+    verdict = _verdict(
+        module,
+        outcome='reject_candidate',
+        relation='redundant',
+        target=target_id,
+        reason_code='redundant_claim',
+    )
+
+    module._apply_evidence_policy(verdict, data)
+
+
+@pytest.mark.django_db
+def test_same_visibility_baseline_permits_supported_outcomes() -> None:
+    module, data, target_id = _agent_policy_data(cross=False)
+
+    module._apply_evidence_policy(
+        _verdict(module, outcome='publish_new', relation='compatible_distinct', target=None),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(module, outcome='merge_evidence', relation='equivalent', target=target_id),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(
+            module,
+            outcome='reject_candidate',
+            relation='redundant',
+            target=target_id,
+            reason_code='redundant_claim',
+        ),
+        data,
+    )
+    module._apply_evidence_policy(
+        _verdict(
+            module,
+            outcome='open_conflict',
+            relation='mutually_incompatible',
+            target=target_id,
+            temporal_order='unordered',
+        ),
+        data,
+    )
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('outcome', 'relation', 'temporal_order', 'reason_code'),
+    [
+        ('revise_memory', 'candidate_revises', 'candidate_newer', 'same_subject_revision'),
+        ('supersede_memory', 'candidate_supersedes', 'candidate_newer', 'ordered_replacement'),
+        ('reject_candidate', 'unsupported', 'not_applicable', 'unsupported_claim'),
+    ],
+)
+def test_same_visibility_baseline_forbids_revise_supersede_and_unsupported(
+    outcome: str, relation: str, temporal_order: str, reason_code: str
+) -> None:
+    module, data, target_id = _agent_policy_data(cross=False)
+    target = None if outcome == 'reject_candidate' else target_id
+    verdict = _verdict(
+        module,
+        outcome=outcome,
+        relation=relation,
+        target=target,
+        temporal_order=temporal_order,
+        reason_code=reason_code,
+    )
+
+    with pytest.raises(ValueError) as error:
+        module._apply_evidence_policy(verdict, data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
+class _FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> _FakeResponse:
+        return self
+
+    def __exit__(self, *_args: object) -> bool:
+        return False
+
+
+def _opener_returning(body: bytes) -> object:
+    def opener(request: object, timeout: float = 30) -> _FakeResponse:
+        opener.requests.append(request)
+
+        return _FakeResponse(body)
+
+    opener.requests = []
+
+    return opener
+
+
+def _completion_bytes(payload: dict[str, object]) -> bytes:
+    return json.dumps({'choices': [{'message': {'content': json.dumps(payload)}}]}).encode()
+
+
+def _agent_parse_data_for(
+    candidate: MemoryCandidate,
+    scope: tuple[object, object, object],
+    target_specs: list[tuple[str, bool]],
+) -> tuple[object, object, list[object]]:
+    module = _judge_module()
+    shortlist_module = _shortlist_module()
+    team_id = candidate.team_id
+    entries: list[object] = []
+    targets: dict[uuid.UUID, object] = {}
+    for index, (visibility, use_candidate_team) in enumerate(target_specs):
+        version_id = uuid.uuid4()
+        target_team = team_id if use_candidate_team else None
+        entries.append(
+            shortlist_module.CurationShortlistEntry(
+                memory_id=uuid.uuid4(),
+                memory_version_id=version_id,
+                current_transition_id=uuid.uuid4(),
+                visibility_scope=visibility,
+                team_id=target_team,
+                title=f'Target {index}',
+                body=f'Target body {index}',
+                kind='decision',
+                body_hash='a' * 64,
+                exact_overlap=0,
+                vector_distance=0.1,
+                lexical_rank=0.0,
+                trigram_similarity=0.0,
+                has_open_conflict=False,
+            )
+        )
+        targets[version_id] = module.ClaimEvidence(
+            tier='supported', refs=(f'target-ref-{index}',), latest_evidence_at=None
+        )
+    shortlist = shortlist_module.CurationShortlist(
+        entries=tuple(entries),
+        manifest_hash='b' * 64,
+        authorized_corpus_count=len(entries),
+        comparison_complete=True,
+    )
+    evidence = module.CurationEvidenceContext(
+        candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',), latest_evidence_at=None),
+        targets=targets,
+    )
+    data = module.CurationJudgeInput(
+        organization_id=scope[0].id,
+        project_id=scope[1].id,
+        candidate_id=candidate.id,
+        candidate=SanitizedCandidateView(
+            title='Agent title',
+            body='Agent body',
+            kind='decision',
+            evidence=(),
+            content_hash='c' * 64,
+            redaction_codes=(),
+        ),
+        effective_scope=EffectiveCandidateScope(VisibilityScope.TEAM, team_id),
+        shortlist=shortlist,
+        evidence=evidence,
+        request_id='judge-agent-parse',
+        trace_id='judge-agent-parse-trace',
+    )
+    return module, data, entries
+
+
+def _agent_parse_data(target_specs: list[tuple[str, bool]]) -> tuple[object, object, list[object]]:
+    candidate, _source, scope = provenanced_candidate(f'judge-agent-parse-{uuid.uuid4().hex[:8]}')
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+
+    return _agent_parse_data_for(candidate, scope, target_specs)
+
+
+@pytest.mark.django_db
+def test_publish_new_allows_cross_visibility_identity_comparison() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'distinct claim against a project-global target',
+    }
+
+    verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'publish_new'
+    assert verdict.relation == 'compatible_distinct'
+    assert verdict.target_memory_version_id is None
+
+
+@pytest.mark.django_db
+def test_publish_new_still_rejects_same_visibility_identity_comparison() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.TEAM, True)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'same-visibility identity should block targetless publish',
+    }
+
+    with pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+
+
+@pytest.mark.django_db
+def test_same_visibility_target_merges_over_targetless_publish() -> None:
+    module, data, entries = _agent_parse_data([(VisibilityScope.PROJECT, False), (VisibilityScope.TEAM, True)])
+    payload = {
+        'schema_version': 1,
+        'outcome': 'merge_evidence',
+        'relation': 'equivalent',
+        'target_memory_version_id': str(entries[1].memory_version_id),
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            },
+            {
+                'memory_version_id': str(entries[1].memory_version_id),
+                'relation': 'equivalent',
+                'target_evidence_refs': ['target-ref-1'],
+            },
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'equivalent_claim',
+        'reason': 'equivalent to same-visibility target',
+    }
+
+    verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert verdict.outcome == 'merge_evidence'
+    assert verdict.target_memory_version_id == entries[1].memory_version_id
+
+
+@pytest.mark.django_db
+def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engram.model_policy.services import OpenAICompatibleGateway
+
+    module = _judge_module()
+    candidate, _source, scope = provenanced_candidate('judge-agent-provider')
+    organization, project, session = scope
+    candidate.visibility_scope = VisibilityScope.TEAM
+    candidate.save(update_fields=['visibility_scope', 'updated_at'])
+    create_curation_policy(organization, session.team, project, task_type='curation')
+    _module, data, entries = _agent_parse_data_for(candidate, scope, [(VisibilityScope.PROJECT, False)])
+
+    publish_payload = {
+        'schema_version': 1,
+        'outcome': 'publish_new',
+        'relation': 'compatible_distinct',
+        'target_memory_version_id': None,
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'not_applicable',
+        'reason_code': 'distinct_claim',
+        'reason': 'distinct claim',
+    }
+    opener = _opener_returning(_completion_bytes(publish_payload))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_a, **_k: gateway)
+
+    result = module.JudgeCurationCandidate().execute(data)
+
+    assert b'cross-visibility' in opener.requests[0].data.lower()
+    assert result.verdict.outcome == 'publish_new'
+    assert result.verdict.target_memory_version_id is None
+
+    conflict_payload = {
+        'schema_version': 1,
+        'outcome': 'open_conflict',
+        'relation': 'mutually_incompatible',
+        'target_memory_version_id': str(entries[0].memory_version_id),
+        'candidate_evidence_refs': ['candidate-ref'],
+        'comparisons': [
+            {
+                'memory_version_id': str(entries[0].memory_version_id),
+                'relation': 'mutually_incompatible',
+                'target_evidence_refs': ['target-ref-0'],
+            }
+        ],
+        'applicability': 'same',
+        'temporal_order': 'unordered',
+        'reason_code': 'same_scope_contradiction',
+        'reason': 'rule-ignoring conflict',
+    }
+    opener_conflict = _opener_returning(_completion_bytes(conflict_payload))
+    gateway_conflict = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1', api_key='key', opener=opener_conflict
+    )
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_a, **_k: gateway_conflict)
+
+    with pytest.raises(ValueError) as error:
+        module.JudgeCurationCandidate().execute(data)
+
+    assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'

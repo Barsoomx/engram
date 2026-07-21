@@ -1,3 +1,4 @@
+import importlib
 import uuid
 from datetime import datetime, timedelta
 
@@ -27,6 +28,9 @@ MIGRATE_0043 = [
 ]
 MIGRATE_0044 = [('core', '0044_memory_last_confirmed_at')]
 MIGRATION_0044_NODE = ('core', '0044_memory_last_confirmed_at')
+MIGRATE_0045 = [('core', '0045_agent_proposal_source')]
+MIGRATION_0045_NODE = ('core', '0045_agent_proposal_source')
+MIGRATION_0045_MODULE = 'engram.core.migrations.0045_agent_proposal_source'
 
 
 def _create_historical_0032b_scope(historical_apps: Apps) -> dict[str, object]:
@@ -767,5 +771,145 @@ def test_reverse_0044_blocked_when_memoryconfirmed_ledger_exists() -> None:
 
         with pytest.raises(RuntimeError, match='0044'):
             MigrationExecutor(connection).migrate(MIGRATE_0040)
+    finally:
+        MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+def test_0045_reverse_guard_is_last_and_refuses_agent_proposals() -> None:
+    migration_module = importlib.import_module(MIGRATION_0045_MODULE)
+    migration = migration_module.Migration
+    operation = migration.operations[-1]
+    assert operation.__class__.__name__ == 'RunPython'
+
+    class _SourceManager:
+        @staticmethod
+        def filter(**kwargs: object) -> '_SourceManager':
+            assert kwargs == {'source_kind': 'agent_proposal'}
+            return _SourceManager()
+
+        @staticmethod
+        def exists() -> bool:
+            return True
+
+    class _SourceModel:
+        objects = _SourceManager()
+
+    class _Apps:
+        @staticmethod
+        def get_model(app_label: str, model_name: str) -> type[_SourceModel]:
+            assert (app_label, model_name) == ('core', 'MemoryCandidateSource')
+            return _SourceModel
+
+    assert operation.reverse_code is not None
+    with pytest.raises(RuntimeError, match='cannot reverse 0045'):
+        operation.reverse_code(_Apps(), None)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0045_forward_preserves_rows_and_reverse_guards_agent_proposal() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+    assert MIGRATION_0045_NODE in executor.loader.graph.nodes
+    try:
+        executor.migrate(MIGRATE_0044)
+        old_apps = executor.loader.project_state(MIGRATE_0044).apps
+        scope = _create_historical_0032b_scope(old_apps)
+        session = _create_historical_session(old_apps, scope, 'migration-0045-session')
+        observation = _create_historical_observation(
+            old_apps,
+            scope,
+            session,
+            'a' * 64,
+            timezone.now(),
+            session_sequence=1,
+        )
+        candidate_model = old_apps.get_model('core', 'MemoryCandidate')
+        distill_candidate = candidate_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Legacy distillation candidate',
+            body='Legacy distillation body',
+            content_hash='b' * 64,
+            decision_work_contract_version=1,
+        )
+        _stage_model, stage = _create_historical_0036_stage_fixture(old_apps, '0045')
+        source_model = old_apps.get_model('core', 'MemoryCandidateSource')
+        distill_source = source_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=distill_candidate,
+            window=stage.window,
+            observation=observation,
+            stage=stage,
+            anchors={'schema': 'distillation'},
+            anchors_hash='c' * 64,
+        )
+        observation_source = old_apps.get_model('core', 'ObservationSource').objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            observation=observation,
+            source_type='claude_mem',
+            source_id='migration-0045:import',
+        )
+        import_candidate = candidate_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            source_observation=observation,
+            title='Legacy import candidate',
+            body='Legacy import body',
+            content_hash='d' * 64,
+            decision_work_contract_version=1,
+        )
+        import_source = source_model.objects.create(
+            organization=scope['organization'],
+            project=scope['project'],
+            team=scope['team'],
+            candidate=import_candidate,
+            observation=observation,
+            source_kind='import',
+            import_source=observation_source,
+            anchors={'schema': 'import_candidate_source.v1'},
+            anchors_hash='e' * 64,
+        )
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0045)
+        new_apps = executor.loader.project_state(MIGRATE_0045).apps
+        new_source_model = new_apps.get_model('core', 'MemoryCandidateSource')
+        assert new_source_model.objects.filter(id=distill_source.id).exists()
+        assert new_source_model.objects.filter(id=import_source.id).exists()
+
+        agent_candidate = new_apps.get_model('core', 'MemoryCandidate').objects.create(
+            organization_id=scope['organization'].id,
+            project_id=scope['project'].id,
+            team_id=scope['team'].id,
+            title='Agent candidate',
+            body='Agent body',
+            content_hash='f' * 64,
+            decision_work_contract_version=1,
+        )
+        agent_source = new_source_model.objects.create(
+            organization_id=scope['organization'].id,
+            project_id=scope['project'].id,
+            team_id=scope['team'].id,
+            candidate=agent_candidate,
+            source_kind='agent_proposal',
+            anchors={'schema': 'agent_proposal_source.v1'},
+            anchors_hash='1' * 64,
+        )
+
+        with pytest.raises(RuntimeError, match='cannot reverse 0045'):
+            MigrationExecutor(connection).migrate(MIGRATE_0044)
+
+        agent_source.delete()
+        MigrationExecutor(connection).migrate(MIGRATE_0044)
+        reverted_apps = MigrationExecutor(connection).loader.project_state(MIGRATE_0044).apps
+        reverted_source_model = reverted_apps.get_model('core', 'MemoryCandidateSource')
+        assert reverted_source_model.objects.filter(id=distill_source.id).exists()
+        assert reverted_source_model.objects.filter(id=import_source.id).exists()
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)

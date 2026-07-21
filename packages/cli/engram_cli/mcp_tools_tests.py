@@ -793,6 +793,67 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("limit=3", url)
         self.assertIsNone(payload)
 
+    def test_propose_requires_title_and_body(self) -> None:
+        self.write_local_config()
+        text = mcp_tools.propose_memory({"title": "Only title"}, self.config_dir, StubTransport())
+
+        self.assertIn("title and body", text)
+
+    def test_propose_posts_and_renders(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            status=202,
+            body={"candidate_id": "c-1", "status": "proposed", "decision_work_queued": True},
+        )
+        text = mcp_tools.propose_memory(
+            {"title": "Deploy fact", "body": "Requires approval"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("candidate_id=c-1", text)
+        self.assertIn("status=proposed", text)
+        self.assertIn("decision_work_queued=True", text)
+        method, url, _headers, payload, _timeout = transport.calls[0]
+        self.assertEqual("POST", method)
+        self.assertTrue(url.endswith("/v1/memories/propose"))
+        self.assertIn("request_id", payload)
+
+    def test_propose_missing_capability_renders_hint(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(status=403, body={"code": "missing_capability"})
+        text = mcp_tools.propose_memory(
+            {"title": "Deploy fact", "body": "Requires approval"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(mcp_tools.MISSING_PROPOSE_CAPABILITY_MESSAGE, text)
+
+    def test_propose_other_error_uses_shared_error_text(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(status=400, body={"code": "empty_content", "detail": "blank"})
+        text = mcp_tools.propose_memory(
+            {"title": "Deploy fact", "body": "Requires approval"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("HTTP 400", text)
+        self.assertNotEqual(mcp_tools.MISSING_PROPOSE_CAPABILITY_MESSAGE, text)
+
+    def test_feedback_missing_capability_does_not_render_propose_hint(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(status=403, body={"code": "missing_capability"})
+        text = mcp_tools.submit_memory_feedback(
+            {"memory_id": "m-1", "action": "stale", "reason": "outdated"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertNotEqual(mcp_tools.MISSING_PROPOSE_CAPABILITY_MESSAGE, text)
+        self.assertIn("HTTP 403", text)
+
     def test_observations_forwards_string_filters(self) -> None:
         self.write_local_config()
         transport = StubTransport(body={"items": []})
@@ -1180,7 +1241,7 @@ class McpToolsTests(unittest.TestCase):
         self.assertNotEqual("invalid_kind_filter", error.code)
         self.assertNotIn("Invalid kind filter", error.detail)
 
-    def test_build_tools_exposes_six_tools(self) -> None:
+    def test_build_tools_exposes_seven_tools(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())
 
         self.assertEqual(
@@ -1191,6 +1252,7 @@ class McpToolsTests(unittest.TestCase):
                 "engram_observations",
                 "engram_memory_version",
                 "engram_memory_feedback",
+                "engram_memory_propose",
             ],
             list(tools.keys()),
         )

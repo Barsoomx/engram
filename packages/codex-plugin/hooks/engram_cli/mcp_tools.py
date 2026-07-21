@@ -32,6 +32,10 @@ PROJECT_NOT_FOUND_MESSAGE = (
     "No Engram project exists for this repository yet — it is created on the "
     "first hook ingest."
 )
+MISSING_PROPOSE_CAPABILITY_MESSAGE = (
+    "This Engram API key cannot propose memory. Re-issue an agent key that "
+    "includes the memories:propose capability (run `engram connect` again)."
+)
 
 
 @dataclass(frozen=True)
@@ -138,6 +142,7 @@ def build_tools(
         "engram_observations": bind(list_observations),
         "engram_memory_version": bind(update_memory_version),
         "engram_memory_feedback": bind(submit_memory_feedback),
+        "engram_memory_propose": bind(propose_memory),
     }
 
 
@@ -417,6 +422,46 @@ def submit_memory_feedback(
         f"refuted={body.get('refuted')} "
         f"confirmed_at={body.get('confirmed_at')} "
         f"already_applied={body.get('already_applied')}"
+    )
+
+
+def propose_memory(
+    arguments: dict[str, Any], config_dir: str | None, transport: Transport
+) -> str:
+    title = as_string(arguments.get("title"))
+    body_text = as_string(arguments.get("body"))
+    if not title or not body_text:
+        return "engram_memory_propose requires title and body."
+
+    runtime, error = _require_runtime_for_arguments(config_dir, arguments)
+    if runtime is None:
+        return error
+
+    payload = _scope_payload(runtime)
+    payload.update(
+        {
+            "title": title,
+            "body": body_text,
+            "kind": as_string(arguments.get("kind")),
+            "request_id": _new_request_id(arguments),
+        },
+    )
+    status, body = post_json(
+        transport=transport,
+        server_url=runtime.server_url,
+        path="/v1/memories/propose",
+        api_key=runtime.api_key,
+        payload=payload,
+    )
+    if status == 403 and as_string(body.get("code")) == "missing_capability":
+        return MISSING_PROPOSE_CAPABILITY_MESSAGE
+    if status != 202:
+        return _error_text(status, body)
+
+    return (
+        f"candidate_id={body.get('candidate_id')} "
+        f"status={body.get('status')} "
+        f"decision_work_queued={body.get('decision_work_queued')}"
     )
 
 

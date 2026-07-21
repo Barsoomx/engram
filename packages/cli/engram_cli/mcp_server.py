@@ -233,6 +233,25 @@ def list_tools() -> list[dict[str, object]]:
                 "required": ["memory_id", "action", "reason"],
             },
         },
+        {
+            "name": "engram_memory_propose",
+            "description": (
+                "Deliberately record a durable fact you have verified. The "
+                "proposal goes through curation (dedup, conflict, judge) and is "
+                "NOT instantly retrievable — it becomes a memory only after "
+                "curation promotes it."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "body": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "project_id": {"type": "string"},
+                },
+                "required": ["title", "body"],
+            },
+        },
     ]
 
 

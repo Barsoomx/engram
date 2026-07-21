@@ -25,7 +25,13 @@ def dry_run_ok() -> dict[str, object]:
             "organization_id": "org-1",
             "project_ids": [PROJECT_ID],
             "team_ids": [TEAM_ID],
-            "capabilities": ["observations:write", "memories:read"],
+            "capabilities": [
+                "observations:write",
+                "memories:read",
+                "memories:propose",
+                "projects:agent",
+                "search:query",
+            ],
         },
         "server": {"health": "ok"},
     }

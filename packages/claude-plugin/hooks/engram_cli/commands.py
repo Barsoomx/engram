@@ -56,8 +56,14 @@ Runner = Callable[[list[str]], tuple[int, str, str]]
 DEFAULT_SERVER_URL = "http://localhost:8000"
 WIZARD_API_KEY_CAPABILITIES = (
     "memories:read",
+    "memories:propose",
     "observations:write",
+    "projects:agent",
     "search:query",
+)
+PROPOSE_MISSING_CAPABILITY_REMEDIATION = (
+    "Re-issue an agent key that includes the memories:propose capability "
+    "(run `engram connect` again)."
 )
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
@@ -2237,6 +2243,57 @@ def run_memory_version(
         stdout.write(f"memory_id={body.get('memory_id')}\n")
         stdout.write(f"current_version={body.get('current_version')}\n")
         stdout.write(f"memory_version_id={body.get('memory_version_id')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_memory_propose(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
+        payload: dict[str, object] = {
+            "title": args.title,
+            "body": args.body,
+            "kind": args.kind,
+            "request_id": args.request_id or f"engram-cli-{uuid.uuid4()}",
+        }
+        if project_id:
+            payload["project_id"] = project_id
+        elif repository_url:
+            payload["repository_url"] = repository_url
+        if team_id:
+            payload["team_id"] = team_id
+        active_transport = transport or urllib_transport
+        status, body = post_json(
+            transport=active_transport,
+            server_url=server_url,
+            path="/v1/memories/propose",
+            api_key=api_key,
+            payload=payload,
+        )
+        if status == 403 and as_string(body.get("code")) == "missing_capability":
+            raise CliError(
+                "missing_capability",
+                as_string(body.get("detail")) or "missing_capability",
+                PROPOSE_MISSING_CAPABILITY_REMEDIATION,
+            )
+
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback="http_error")
+
+        stdout.write(f"candidate_id={body.get('candidate_id')}\n")
+        stdout.write(f"status={body.get('status')}\n")
+        stdout.write(f"decision_work_queued={body.get('decision_work_queued')}\n")
 
         return 0
     except CliError as error:

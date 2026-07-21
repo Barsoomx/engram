@@ -16,7 +16,8 @@ Claude Code into that memory:
 - Forwards each event to the Engram server via the bundled hook runtime
   (`hooks/hook.py`, which vendors the thin `engram_cli` client).
 - Registers the bundled Engram MCP server (`hooks/mcp.py`) so Claude Code can
-  call memory tools (search, context, link, observations, version, feedback)
+  call memory tools (search, context, link, observations, version, feedback,
+  propose)
   directly during a session.
 - Lets future Claude Code sessions recall relevant, server-backed context.
 
@@ -115,9 +116,9 @@ Engram MCP server with Claude Code automatically - no separate
 `python3 "${CLAUDE_PLUGIN_ROOT}/hooks/mcp.py"`, a `sys.path` shim (mirroring
 `hooks/hook.py`) that starts the vendored `engram_cli` MCP server over stdio.
 
-Six tools are exposed: `engram_search`, `engram_context`,
-`engram_memory_link`, `engram_observations`, `engram_memory_version`, and
-`engram_memory_feedback`. Each resolves server URL, API key, and project/team
+Seven tools are exposed: `engram_search`, `engram_context`,
+`engram_memory_link`, `engram_observations`, `engram_memory_version`,
+`engram_memory_feedback`, and `engram_memory_propose`. Each resolves server URL, API key, and project/team
 scope from `~/.engram` the same way the hooks do, and calls the Engram server
 under the connected project's RBAC scope. See
 [../../docs/guides/mcp.md](../../docs/guides/mcp.md) and
