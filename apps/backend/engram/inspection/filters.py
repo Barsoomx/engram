@@ -32,7 +32,9 @@ class InspectionContextBundleFilterSet(SinceUntilFilterSet):
 class InspectionAuditEventFilterSet(SinceUntilFilterSet):
     event_type = django_filters.CharFilter(field_name='event_type')
     correlation_id = django_filters.CharFilter(field_name='correlation_id')
+    target_id = django_filters.CharFilter(field_name='target_id')
+    target_type = django_filters.CharFilter(field_name='target_type')
 
     class Meta:
         model = AuditEvent
-        fields = ['event_type', 'correlation_id', 'since', 'until']
+        fields = ['event_type', 'correlation_id', 'target_id', 'target_type', 'since', 'until']

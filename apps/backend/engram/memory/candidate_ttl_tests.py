@@ -151,7 +151,7 @@ def test_reconciliation_creates_and_queues_missing_v1_work_once(
     as_of = timezone.now()
 
     first = ReconcileCandidateDecisionWork().execute(as_of=as_of)
-    second = ReconcileCandidateDecisionWork().execute(as_of=as_of + timedelta(minutes=31))
+    second = ReconcileCandidateDecisionWork().execute(as_of=as_of + timedelta(minutes=1))
 
     assert first.scanned == 1
     assert first.queued == 1

@@ -36,6 +36,7 @@ from engram.core.models import (
     Team,
     VisibilityScope,
 )
+from engram.memory.digest_visibility_tests import build_legacy_digest
 
 AGENT_RAW_KEY = 'egk_test_memory_link_agent_0123456789abcdefghijklmnopqrstuvwxyz'
 AGENT_CAPS = ('memories:review', 'memories:read', 'projects:agent')
@@ -517,6 +518,137 @@ def test_list_memory_links_denies_other_project() -> None:
 
     assert response.status_code == 403
     assert response.json()['code'] == 'project_scope_denied'
+
+
+@pytest.mark.django_db
+def test_list_memory_links_denies_non_whitelisted_visibility() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_team = Team.objects.create(organization=organization, name='Other', slug='other-team-links-deny')
+    client = APIClient()
+
+    cases = [
+        (VisibilityScope.TEAM, other_team, 'foreign team'),
+        (VisibilityScope.TEAM, None, 'null team'),
+        (VisibilityScope.SESSION, None, 'session'),
+        (VisibilityScope.ORGANIZATION, None, 'organization'),
+    ]
+    for index, (visibility, memory_team, label) in enumerate(cases):
+        memory, _version, _document = create_approved_memory_document(
+            organization,
+            memory_team,
+            project,
+            visibility_scope=visibility,
+            title=f'Links whitelist deny {index} {label}',
+        )
+        MemoryLink.objects.create(
+            organization=organization,
+            project=project,
+            memory=memory,
+            link_type='file',
+            target=f'target/{index}.py',
+        )
+
+        response = client.get(
+            f'/v1/memories/{memory.id}/links',
+            {'project_id': str(project.id)},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 403, label
+        assert response.json()['code'] == 'team_scope_denied', label
+
+
+@pytest.mark.django_db
+def test_list_memory_links_admits_project_and_authorized_team() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    client = APIClient()
+    project_memory, _pv, _pd = create_approved_memory_document(
+        organization,
+        None,
+        project,
+        visibility_scope=VisibilityScope.PROJECT,
+        title='Links admit project',
+    )
+    team_memory, _tv, _td = create_approved_memory_document(
+        organization,
+        team,
+        project,
+        visibility_scope=VisibilityScope.TEAM,
+        title='Links admit team',
+    )
+    for memory in (project_memory, team_memory):
+        MemoryLink.objects.create(
+            organization=organization,
+            project=project,
+            memory=memory,
+            link_type='file',
+            target=f'admit/{memory.id}.py',
+        )
+
+        response = client.get(
+            f'/v1/memories/{memory.id}/links',
+            {'project_id': str(project.id)},
+            **auth_headers(),
+        )
+
+        assert response.status_code == 200
+        assert response.json()['count'] == 1
+
+
+@pytest.mark.django_db
+def test_list_memory_links_quarantines_unproven_digest() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    digest = build_legacy_digest(organization, project)
+    MemoryLink.objects.create(
+        organization=organization,
+        project=project,
+        memory=digest,
+        link_type='file',
+        target='digest/link.py',
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{digest.id}/links',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {'count': 0, 'items': []}
+
+
+@pytest.mark.django_db
+def test_list_memory_links_missing_parent_returns_empty() -> None:
+    organization, team, project, _owner, _api_key = create_project_scope()
+    other_project = Project.objects.create(organization=organization, name='Foreign', slug='foreign-links')
+    foreign_memory, _fv, _fd = create_approved_memory_document(
+        organization,
+        team,
+        other_project,
+        title='Mis-projected link parent',
+    )
+    MemoryLink.objects.bulk_create(
+        [
+            MemoryLink(
+                organization=organization,
+                project=project,
+                memory=foreign_memory,
+                link_type='file',
+                target='leaked/foreign/link.py',
+            ),
+        ],
+    )
+    client = APIClient()
+
+    response = client.get(
+        f'/v1/memories/{foreign_memory.id}/links',
+        {'project_id': str(project.id)},
+        **auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {'count': 0, 'items': []}
 
 
 @pytest.mark.django_db

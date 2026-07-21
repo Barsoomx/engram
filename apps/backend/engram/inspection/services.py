@@ -23,6 +23,7 @@ from engram.inspection.filters import (
     InspectionContextBundleFilterSet,
     InspectionMemoryFilterSet,
 )
+from engram.memory.conflict_predicate import open_memory_conflict_exists
 from engram.memory.digest_visibility import unproven_digest_memory_ids
 
 
@@ -45,6 +46,8 @@ class InspectionScope:
     session_id: str | None = None
     event_type: str | None = None
     correlation_id: str | None = None
+    target_id: str | None = None
+    target_type: str | None = None
     since: datetime | None = None
     until: datetime | None = None
 
@@ -58,6 +61,9 @@ DEFAULT_MEMORY_ORDERING = '-created_at'
 
 CONTEXT_BUNDLE_ORDERING_FIELDS = ('created_at', '-created_at')
 DEFAULT_CONTEXT_BUNDLE_ORDERING = '-created_at'
+
+AUDIT_ORDERING_FIELDS = ('created_at', '-created_at')
+DEFAULT_AUDIT_ORDERING = 'created_at'
 
 
 class ListInspectionMemories:
@@ -187,6 +193,7 @@ class ListInspectionMemories:
             )
             .filter(inspection_scope.team_filter)
             .select_related('project')
+            .annotate(has_open_conflict=open_memory_conflict_exists('pk'))
             .prefetch_related(
                 Prefetch(
                     'versions',
@@ -249,6 +256,8 @@ class ListInspectionContextBundles:
 
 class ListInspectionAuditEvents:
     def execute(self, inspection_scope: InspectionScope) -> QuerySet[AuditEvent]:
+        ordering = self._ordering(inspection_scope.ordering)
+        id_tiebreaker = '-id' if ordering.startswith('-') else 'id'
         qs = (
             AuditEvent.objects.filter(
                 organization_id=inspection_scope.scope.organization_id,
@@ -260,16 +269,24 @@ class ListInspectionAuditEvents:
                 target_type='audit_event',
                 capability='audit:read',
             )
-            .order_by('created_at', 'id')
+            .order_by(ordering, id_tiebreaker)
         )
         filter_data = {
             'event_type': inspection_scope.event_type,
             'correlation_id': inspection_scope.correlation_id,
+            'target_id': inspection_scope.target_id,
+            'target_type': inspection_scope.target_type,
             'since': inspection_scope.since,
             'until': inspection_scope.until,
         }
 
         return InspectionAuditEventFilterSet(data=filter_data, queryset=qs).qs
+
+    def _ordering(self, ordering: str | None) -> str:
+        if ordering in AUDIT_ORDERING_FIELDS:
+            return ordering
+
+        return DEFAULT_AUDIT_ORDERING
 
     def detail(self, inspection_scope: InspectionScope, audit_event_id: uuid.UUID) -> AuditEvent:
         ae = (

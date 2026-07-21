@@ -6,7 +6,8 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.conf import settings
-from django.db.models import Q
+from django.db import transaction
+from django.db.models.functions import Coalesce, Greatest
 from django.utils import timezone
 
 from engram.core.models import (
@@ -64,6 +65,11 @@ class DecayMemoryConfidence:
         step = settings.ENGRAM_CONFIDENCE_DECAY_STEP
         floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
 
+        decay_anchor = Greatest(
+            Coalesce('confidence_decayed_at', 'updated_at'),
+            Coalesce('last_confirmed_at', 'updated_at'),
+        )
+
         candidates = (
             Memory.objects.filter(
                 organization=organization,
@@ -74,15 +80,35 @@ class DecayMemoryConfidence:
                 confidence__isnull=False,
                 confidence__gt=floor,
             )
-            .filter(Q(confidence_decayed_at__lt=cutoff) | Q(confidence_decayed_at__isnull=True, updated_at__lt=cutoff))
             .exclude(kind='digest')
+            .annotate(decay_anchor=decay_anchor)
+            .filter(decay_anchor__lt=cutoff)
         )
 
         decayed_ids: list[uuid.UUID] = []
-        for memory in candidates:
-            decayed = max(floor, memory.confidence - step).quantize(_CONFIDENCE_QUANTIZE)
-            Memory.objects.filter(id=memory.id).update(confidence=decayed, confidence_decayed_at=now)
-            decayed_ids.append(memory.id)
+        for candidate in candidates:
+            with transaction.atomic():
+                locked = (
+                    Memory.objects.select_for_update()
+                    .annotate(decay_anchor=decay_anchor)
+                    .filter(
+                        id=candidate.id,
+                        status=MemoryStatus.APPROVED,
+                        stale=False,
+                        refuted=False,
+                        confidence__gt=floor,
+                        decay_anchor__lt=cutoff,
+                    )
+                    .exclude(kind='digest')
+                    .first()
+                )
+                if locked is None:
+                    continue
+
+                locked.confidence = max(floor, locked.confidence - step).quantize(_CONFIDENCE_QUANTIZE)
+                locked.confidence_decayed_at = now
+                locked.save(update_fields=['confidence', 'confidence_decayed_at'])
+                decayed_ids.append(locked.id)
 
         return decayed_ids
 

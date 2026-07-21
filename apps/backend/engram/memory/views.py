@@ -37,6 +37,7 @@ from engram.memory.services import (
     ResolveMemoryDiff,
     UpdateMemoryBody,
     UpdateMemoryBodyInput,
+    ensure_memory_visibility_scope,
 )
 
 MEMORY_FEEDBACK_STATUS = {
@@ -128,8 +129,10 @@ class MemoryVersionView(APIView):
             project_id=project.id,
             id=memory_id,
         ).first()
-        if memory is not None and digest_visibility_failure(memory) is not None:
+        if memory is None or digest_visibility_failure(memory) is not None:
             return Response({'count': 0, 'items': []})
+
+        ensure_memory_visibility_scope(memory, scope)
 
         versions = list(
             MemoryVersion.objects.filter(
@@ -210,6 +213,16 @@ class MemoryLinksView(APIView):
             project_id=data.get('project_id'),
             repository_url=data.get('repository_url', ''),
         )
+
+        memory = Memory.objects.filter(
+            organization_id=scope.organization_id,
+            project_id=project.id,
+            id=memory_id,
+        ).first()
+        if memory is None or digest_visibility_failure(memory) is not None:
+            return Response({'count': 0, 'items': []})
+
+        ensure_memory_visibility_scope(memory, scope)
 
         links = list(
             MemoryLink.objects.filter(

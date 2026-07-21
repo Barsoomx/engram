@@ -152,6 +152,7 @@ _ALLOWED_COMBINATIONS = {
     ('open_conflict', 'mutually_incompatible'): True,
 }
 _SUPPORTED_TIERS = frozenset({'supported', 'corroborated'})
+_MUTATION_OUTCOMES = frozenset({'merge_evidence', 'open_conflict', 'revise_memory', 'supersede_memory'})
 _IDENTITY_RELATIONS = frozenset(
     {'equivalent', 'candidate_revises', 'candidate_supersedes', 'redundant', 'mutually_incompatible'}
 )
@@ -186,6 +187,9 @@ def _claim_evidence(hashes: set[str], latest_evidence_at: datetime | None) -> Cl
 
 
 def _source_evidence_time(source: MemoryCandidateSource) -> datetime | None:
+    if source.observation_id is None:
+        return None
+
     observation = source.observation
 
     return observation.observed_at or observation.created_at
@@ -201,6 +205,15 @@ def _newer(current: datetime | None, candidate: datetime | None) -> datetime | N
 
 
 def _eligible_group_pair(source: MemoryCandidateSource) -> tuple[str, str] | None:
+    if source.source_kind == MemoryCandidateSourceKind.AGENT_PROPOSAL:
+        from engram.memory.import_provenance import ImportProvenanceError, _validated_agent_anchors
+
+        try:
+            _validated_agent_anchors(source)
+        except ImportProvenanceError as error:
+            raise CurationJudgeError('transition_dependency_unavailable') from error
+
+        return source.anchors_hash, source.anchors_hash
     if source.source_kind != MemoryCandidateSourceKind.DISTILLATION:
         return None
     if source.window_id is None or source.stage_id is None:
@@ -425,6 +438,11 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
         entry = next((item for item in data.shortlist.entries if item.memory_version_id == target_id), None)
 
     outcome = verdict.outcome
+    if outcome in _MUTATION_OUTCOMES and entry is not None:
+        candidate_pair = (data.effective_scope.visibility_scope, data.effective_scope.team_id)
+        if (entry.visibility_scope, entry.team_id) != candidate_pair:
+            raise CurationJudgeError('judge_cross_visibility_denied')
+
     if outcome == 'publish_new':
         ok = candidate_tier in _SUPPORTED_TIERS and complete
     elif outcome == 'merge_evidence':
@@ -510,10 +528,15 @@ def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> Curation
         selected = next((item for item in comparisons if item.memory_version_id == target_id), None)
         if selected is None or selected.relation != payload['relation']:
             raise CurationJudgeError('judge_invalid_output')
-    elif payload['outcome'] in _TARGETLESS_OUTCOMES and any(
-        comparison.relation in _IDENTITY_RELATIONS for comparison in comparisons
-    ):
-        raise CurationJudgeError('judge_invalid_output')
+    elif payload['outcome'] in _TARGETLESS_OUTCOMES:
+        candidate_pair = (data.effective_scope.visibility_scope, data.effective_scope.team_id)
+        entries_by_version = {entry.memory_version_id: entry for entry in data.shortlist.entries}
+        for comparison in comparisons:
+            if comparison.relation not in _IDENTITY_RELATIONS:
+                continue
+            entry = entries_by_version.get(comparison.memory_version_id)
+            if entry is None or (entry.visibility_scope, entry.team_id) == candidate_pair:
+                raise CurationJudgeError('judge_invalid_output')
 
     reason = payload['reason']
     if not isinstance(reason, str) or not (1 <= len(reason) <= 500) or SECRET_STRING_RE.search(reason):

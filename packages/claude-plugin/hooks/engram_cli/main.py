@@ -6,14 +6,17 @@ from collections.abc import Sequence
 from typing import TextIO
 
 from engram_cli.commands import (
+    run_audit,
     run_connect,
     run_disconnect,
     run_doctor,
     run_hook,
     run_install,
     run_mcp_install,
+    run_memory_get,
     run_memory_link,
     run_memory_links,
+    run_memory_propose,
     run_memory_version,
     run_observations,
     run_search,
@@ -21,6 +24,12 @@ from engram_cli.commands import (
 from engram_cli.http import Transport
 from engram_cli.import_claude_mem import run_import_claude_mem
 from engram_cli.mcp_server import run_mcp_serve
+
+
+_SINCE_UNTIL_HELP = (
+    "Filter on ingestion time (created_at), not the displayed observed_at. "
+    "--since is inclusive (>=); --until is exclusive (<)."
+)
 
 
 def main(
@@ -59,6 +68,8 @@ def main(
         return run_search(args, output, errors, transport)
     if args.command == "observations":
         return run_observations(args, output, errors, transport)
+    if args.command == "audit":
+        return run_audit(args, output, errors, transport)
     if args.command == "import":
         if args.import_command == "claude-mem":
             return run_import_claude_mem(args, output, errors, transport)
@@ -69,6 +80,10 @@ def main(
             return run_memory_link(args, output, errors, transport)
         if args.memory_command == "links":
             return run_memory_links(args, output, errors, transport)
+        if args.memory_command == "get":
+            return run_memory_get(args, output, errors, transport)
+        if args.memory_command == "propose":
+            return run_memory_propose(args, output, errors, transport)
 
     parser.print_help(file=errors)
 
@@ -163,6 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--query", default="")
     search.add_argument("--file-path", action="append", default=[])
     search.add_argument("--symbol", action="append", default=[])
+    search.add_argument("--kind", action="append", default=[], dest="kinds")
     search.add_argument("--limit", type=int, default=5)
     search.add_argument("--config-dir")
     search.add_argument("--json", action="store_true", dest="as_json")
@@ -198,10 +214,42 @@ def build_parser() -> argparse.ArgumentParser:
     memory_links.add_argument("--config-dir")
     memory_links.add_argument("--project", default="")
 
+    memory_get = memory_subparsers.add_parser("get")
+    memory_get.add_argument("memory_id")
+    memory_get.add_argument("--from-version", dest="from_version", type=int, default=0)
+    memory_get.add_argument("--to-version", dest="to_version", type=int, default=0)
+    memory_get.add_argument("--config-dir")
+    memory_get.add_argument("--project", default="")
+
+    memory_propose = memory_subparsers.add_parser("propose")
+    memory_propose.add_argument("--title", required=True)
+    memory_propose.add_argument("--body", required=True)
+    memory_propose.add_argument("--kind", default="")
+    memory_propose.add_argument("--request-id", dest="request_id", default="")
+    memory_propose.add_argument("--config-dir")
+    memory_propose.add_argument("--project", default="")
+
     observations = subparsers.add_parser("observations")
     observations.add_argument("--limit", type=int, default=20)
+    observations.add_argument("--session-id", dest="session_id", default="")
+    observations.add_argument("--type", dest="observation_type", default="")
+    observations.add_argument("--since", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--until", default="", help=_SINCE_UNTIL_HELP)
+    observations.add_argument("--offset", type=int, default=0)
     observations.add_argument("--config-dir")
     observations.add_argument("--project", default="")
+
+    audit = subparsers.add_parser("audit")
+    audit.add_argument("--memory-id", dest="memory_id", default="")
+    audit.add_argument("--target-id", dest="target_id", default="")
+    audit.add_argument("--target-type", dest="target_type", default="")
+    audit.add_argument("--event-type", dest="event_type", default="")
+    audit.add_argument("--correlation-id", dest="correlation_id", default="")
+    audit.add_argument("--since", default="")
+    audit.add_argument("--until", default="")
+    audit.add_argument("--limit", type=int, default=20)
+    audit.add_argument("--config-dir")
+    audit.add_argument("--project", default="")
 
     importer = subparsers.add_parser("import")
     import_subparsers = importer.add_subparsers(dest="import_command")

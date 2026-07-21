@@ -251,8 +251,20 @@ def assert_plugin_mcp_bridge(plugin_root: Path, engram_home: Path, repo: Path) -
         raise E2EError(f'plugin mcp initialize failed: {lines[0]}')
 
     tools = lines[1].get('result', {}).get('tools') or []
-    if len(tools) != 6:
-        raise E2EError(f'plugin mcp tools/list did not return 6 tools: {tools}')
+    tool_names = {tool.get('name') for tool in tools}
+    expected_tool_names = {
+        'engram_audit',
+        'engram_context',
+        'engram_memory_feedback',
+        'engram_memory_get',
+        'engram_memory_link',
+        'engram_memory_propose',
+        'engram_memory_version',
+        'engram_observations',
+        'engram_search',
+    }
+    if tool_names != expected_tool_names:
+        raise E2EError(f'plugin mcp tools/list did not return the exact nine Engram tools: {tool_names}')
 
     content = lines[2].get('result', {}).get('content') or []
     search_text = content[0].get('text', '') if content else ''

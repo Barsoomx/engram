@@ -384,7 +384,10 @@ def drive_mcp_stdio(
         if 'id' in message:
             responses[message['id']] = message
     tool_names = [tool['name'] for tool in responses[2]['result']['tools']]
-    assert_equal(len(tool_names), 6, 'mcp tools count')
+    assert_equal(len(tool_names), 9, 'mcp tools count')
+    for expected_tool in ('engram_memory_propose', 'engram_memory_get', 'engram_audit'):
+        if expected_tool not in tool_names:
+            raise SystemExit(f'mcp tools/list missing {expected_tool}: {tool_names}')
     texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9, 10)}
     for rid, text in texts.items():
         for secret in secrets_list:

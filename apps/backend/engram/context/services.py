@@ -10,7 +10,7 @@ from decimal import Decimal
 import structlog
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVector, TrigramWordSimilarity
 from django.db import transaction
-from django.db.models import Exists, OuterRef, Q
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.access.services import AccessDeniedError, EffectiveScope, ResolveApiKeyScope
@@ -33,7 +33,6 @@ from engram.core.models import (
     ContextBundleItem,
     ContextBundleStatus,
     Memory,
-    MemoryConflict,
     MemoryStatus,
     MemoryTransition,
     MemoryVersion,
@@ -49,6 +48,7 @@ from engram.core.models import (
 )
 from engram.core.redaction import redact_value
 from engram.core.repository import resolve_project_for_scope
+from engram.memory.conflict_predicate import open_memory_conflict_exists
 from engram.memory.digest_visibility import unproven_digest_memory_ids
 from engram.memory.observation_work import lock_session_for_observation, session_has_observation_history
 from engram.memory.projections import create_embedding_work_and_signal, write_exact_memory_projection
@@ -312,14 +312,7 @@ def authorized_retrieval_documents(
         stale=False,
         refuted=False,
     )
-    documents = documents.filter(
-        ~Exists(
-            MemoryConflict.objects.filter(
-                memory_id=OuterRef('memory_id'),
-                resolved_transition__isnull=True,
-            ),
-        ),
-    )
+    documents = documents.filter(~open_memory_conflict_exists('memory_id'))
     if kinds:
         documents = documents.filter(memory__kind__in=kinds)
     if not include_embeddings:

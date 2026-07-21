@@ -7,15 +7,18 @@ from decimal import Decimal
 import pytest
 from django.db import connection
 
+from engram.access.services import AccessDeniedError, EffectiveScope
 from engram.core.models import (
     AuditEvent,
     CandidateStatus,
+    Memory,
     MemoryCandidate,
     Observation,
     Organization,
     Project,
     RetrievalDocument,
     Team,
+    VisibilityScope,
 )
 from engram.memory.memory_worker_tests import (
     create_embedding_policy,
@@ -32,6 +35,7 @@ from engram.memory.services import (
     PromoteMemoryCandidateInput,
     call_with_fallback,
     distillation_system_prompt,
+    ensure_memory_visibility_scope,
     provider_prompt,
     realtime_generation_system_prompt,
     realtime_provider_prompt,
@@ -785,3 +789,62 @@ def test_call_with_fallback_returns_primary_result_on_success(monkeypatch: pytes
     assert used_resolved is resolved
     assert fallback_calls == []
     assert not AuditEvent.objects.filter(event_type='ProviderFallbackUsed').exists()
+
+
+def _visibility_scope(team_ids: tuple[uuid.UUID, ...]) -> EffectiveScope:
+    return EffectiveScope(
+        organization_id=uuid.uuid4(),
+        identity_id=uuid.uuid4(),
+        api_key_id=uuid.uuid4(),
+        project_ids=(),
+        team_ids=team_ids,
+        capabilities=(),
+        actor_type='api_key',
+        actor_id='svc-visibility-test',
+        project_bound=False,
+    )
+
+
+def test_ensure_memory_visibility_scope_admits_project() -> None:
+    scope = _visibility_scope(())
+    memory = Memory(visibility_scope=VisibilityScope.PROJECT, team_id=None)
+
+    ensure_memory_visibility_scope(memory, scope)
+
+
+def test_ensure_memory_visibility_scope_admits_authorized_team() -> None:
+    team_id = uuid.uuid4()
+    scope = _visibility_scope((team_id,))
+    memory = Memory(visibility_scope=VisibilityScope.TEAM, team_id=team_id)
+
+    ensure_memory_visibility_scope(memory, scope)
+
+
+def test_ensure_memory_visibility_scope_denies_foreign_team() -> None:
+    scope = _visibility_scope((uuid.uuid4(),))
+    memory = Memory(visibility_scope=VisibilityScope.TEAM, team_id=uuid.uuid4())
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        ensure_memory_visibility_scope(memory, scope)
+
+    assert excinfo.value.code == 'team_scope_denied'
+
+
+def test_ensure_memory_visibility_scope_denies_null_team() -> None:
+    scope = _visibility_scope((uuid.uuid4(),))
+    memory = Memory(visibility_scope=VisibilityScope.TEAM, team_id=None)
+
+    with pytest.raises(AccessDeniedError) as excinfo:
+        ensure_memory_visibility_scope(memory, scope)
+
+    assert excinfo.value.code == 'team_scope_denied'
+
+
+def test_ensure_memory_visibility_scope_denies_session_and_organization() -> None:
+    scope = _visibility_scope(())
+    for visibility in (VisibilityScope.SESSION, VisibilityScope.ORGANIZATION):
+        memory = Memory(visibility_scope=visibility, team_id=None)
+        with pytest.raises(AccessDeniedError) as excinfo:
+            ensure_memory_visibility_scope(memory, scope)
+
+        assert excinfo.value.code == 'team_scope_denied'

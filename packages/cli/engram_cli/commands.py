@@ -28,6 +28,7 @@ from engram_cli.config import (
     write_json,
     write_secret_json,
 )
+from engram_cli import read_tools
 from engram_cli.http import (
     Transport,
     admin_get,
@@ -56,8 +57,14 @@ Runner = Callable[[list[str]], tuple[int, str, str]]
 DEFAULT_SERVER_URL = "http://localhost:8000"
 WIZARD_API_KEY_CAPABILITIES = (
     "memories:read",
+    "memories:propose",
     "observations:write",
+    "projects:agent",
     "search:query",
+)
+PROPOSE_MISSING_CAPABILITY_REMEDIATION = (
+    "Re-issue an agent key that includes the memories:propose capability "
+    "(run `engram connect` again)."
 )
 MAX_LOGIN_RETRIES = 3
 MAX_SERVER_RETRIES = 3
@@ -1664,7 +1671,30 @@ def require_dry_run_ok(
     return body
 
 
+_ALLOWED_KINDS = (
+    "decision",
+    "convention",
+    "gotcha",
+    "architecture",
+    "incident",
+    "digest",
+)
+KINDS_ERROR_MESSAGE = (
+    "Invalid kind filter. Allowed kinds: " + ", ".join(_ALLOWED_KINDS) + "."
+)
+
+
+def is_kinds_error_body(body: object) -> bool:
+    return isinstance(body, dict) and "kinds" in body
+
+
 def error_from_body(body: dict[str, object], fallback: str) -> CliError:
+    if is_kinds_error_body(body):
+        return CliError(
+            "invalid_kind_filter",
+            KINDS_ERROR_MESSAGE,
+            remediation_for("invalid_kind_filter"),
+        )
     code = as_string(body.get("code")) or fallback
     detail = as_string(body.get("detail")) or code
 
@@ -1955,6 +1985,7 @@ def build_search_payload(
     limit: int,
     repository_url: str,
     project_id: str = "",
+    kinds: list[str] | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "query": query,
@@ -1962,6 +1993,8 @@ def build_search_payload(
         "symbols": symbols,
         "limit": limit,
     }
+    if kinds:
+        payload["kinds"] = kinds
     if project_id:
         payload["project_id"] = project_id
     elif repository_url:
@@ -2014,6 +2047,81 @@ def search_item_suffix(item: dict[str, object]) -> str:
     return f" [{', '.join(parts)}]"
 
 
+def search_match_line(item: dict[str, object]) -> str:
+    reason = as_string(item.get("inclusion_reason"))
+    terms = item.get("matched_terms")
+    terms_text = ""
+    if isinstance(terms, (list, tuple)) and terms:
+        terms_text = ", ".join(str(term) for term in terms)
+    if reason and terms_text:
+        return f"  match: {reason} | terms: {terms_text}"
+    if reason:
+        return f"  match: {reason}"
+    if terms_text:
+        return f"  terms: {terms_text}"
+
+    return ""
+
+
+def render_warnings(warnings: object) -> str:
+    if not isinstance(warnings, list) or not warnings:
+        return ""
+    lines: list[str] = []
+    for warning in warnings:
+        if not isinstance(warning, dict):
+            continue
+        code = as_string(warning.get("code"))
+        if not code:
+            continue
+        line = f"  [{code}]"
+        message = as_string(warning.get("message"))
+        if message:
+            line += f" {message}"
+        memory_id = as_string(warning.get("memory_id"))
+        if memory_id:
+            line += f" (memory_id={memory_id})"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Warnings:\n" + "\n".join(lines)
+
+
+def observation_meta_line(item: dict[str, object]) -> str:
+    observed_at = as_string(item.get("observed_at"))
+    session_id = as_string(item.get("session_id"))
+    segments: list[str] = []
+    if observed_at:
+        segments.append(f"observed_at={observed_at}")
+    if session_id:
+        segments.append(f"session_id={session_id}")
+    if not segments:
+        return ""
+
+    return "  " + " ".join(segments)
+
+
+def render_citations(items: object) -> str:
+    if not isinstance(items, list) or not items:
+        return ""
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        line = f"  [{as_string(item.get('citation'))}] memory_id={as_string(item.get('memory_id'))}"
+        kind = as_string(item.get("kind"))
+        if kind:
+            line += f" kind={kind}"
+        confidence = item.get("confidence")
+        if confidence is not None:
+            line += f" confidence={confidence}"
+        lines.append(line)
+    if not lines:
+        return ""
+
+    return "Citations:\n" + "\n".join(lines)
+
+
 def run_search(
     args: Namespace,
     stdout: TextIO,
@@ -2046,6 +2154,7 @@ def run_search(
             limit=args.limit,
             project_id=project_id,
             repository_url=repository_url,
+            kinds=list(getattr(args, "kinds", None) or []),
         )
         active_transport = transport or urllib_transport
         status, body = post_json(
@@ -2063,14 +2172,22 @@ def run_search(
 
             return 0
 
+        warnings_block = render_warnings(body.get("warnings"))
         if not items:
             stdout.write("No memory matched the search.\n")
+            if warnings_block:
+                stdout.write(warnings_block + "\n")
 
             return 0
 
         for item in items:
             stdout.write(f"{item.get('citation')}: {item.get('title')}{search_item_suffix(item)}\n")
+            match_line = search_match_line(item)
+            if match_line:
+                stdout.write(match_line + "\n")
             stdout.write(f"  {item.get('body')}\n")
+        if warnings_block:
+            stdout.write(warnings_block + "\n")
 
         return 0
     except CliError as error:
@@ -2134,6 +2251,57 @@ def run_memory_version(
         stdout.write(f"memory_id={body.get('memory_id')}\n")
         stdout.write(f"current_version={body.get('current_version')}\n")
         stdout.write(f"memory_version_id={body.get('memory_version_id')}\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_memory_propose(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
+        payload: dict[str, object] = {
+            "title": args.title,
+            "body": args.body,
+            "kind": args.kind,
+            "request_id": args.request_id or f"engram-cli-{uuid.uuid4()}",
+        }
+        if project_id:
+            payload["project_id"] = project_id
+        elif repository_url:
+            payload["repository_url"] = repository_url
+        if team_id:
+            payload["team_id"] = team_id
+        active_transport = transport or urllib_transport
+        status, body = post_json(
+            transport=active_transport,
+            server_url=server_url,
+            path="/v1/memories/propose",
+            api_key=api_key,
+            payload=payload,
+        )
+        if status == 403 and as_string(body.get("code")) == "missing_capability":
+            raise CliError(
+                "missing_capability",
+                as_string(body.get("detail")) or "missing_capability",
+                PROPOSE_MISSING_CAPABILITY_REMEDIATION,
+            )
+
+        if status < 200 or status >= 300:
+            raise error_from_body(body, fallback="http_error")
+
+        stdout.write(f"candidate_id={body.get('candidate_id')}\n")
+        stdout.write(f"status={body.get('status')}\n")
+        stdout.write(f"decision_work_queued={body.get('decision_work_queued')}\n")
 
         return 0
     except CliError as error:
@@ -2228,6 +2396,98 @@ def run_memory_links(
         return 1
 
 
+def _cli_error_from_read(error: read_tools.ReadError, *, memory_id: str) -> CliError:
+    if error.code == "memory_not_found":
+        return CliError("memory_not_found", error.message, remediation_for("memory_not_found"))
+
+    if error.code in ("project_scope_denied", "team_scope_denied", "missing_capability"):
+        return CliError(error.code, error.message, "")
+
+    return error_from_body(error.body or {}, fallback="http_error")
+
+
+def run_memory_get(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id, repository_url = _require_repository_scope(args, config)
+        scope = read_tools.ReadScope(
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            repository_url=repository_url,
+            team_id=team_id,
+        )
+        outcome = read_tools.fetch_memory_get(
+            transport or urllib_transport,
+            scope,
+            args.memory_id,
+            args.from_version,
+            args.to_version,
+        )
+        if outcome.error is not None:
+            raise _cli_error_from_read(outcome.error, memory_id=args.memory_id)
+        stdout.write(outcome.text + "\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
+def run_audit(
+    args: Namespace,
+    stdout: TextIO,
+    stderr: TextIO,
+    transport: Transport | None = None,
+) -> int:
+    api_key = ""
+    try:
+        _paths, api_key, server_url, config, team_id = _load_cli_scope(args)
+        project_id = _ladder_project_id(args, config)
+        if not project_id:
+            raise CliError(
+                "missing_project",
+                read_tools.audit_needs_project_message(),
+                remediation_for("missing_project"),
+            )
+        target_id, target_type = read_tools.resolve_audit_target(
+            as_string(args.target_id),
+            as_string(args.memory_id),
+            as_string(args.target_type),
+        )
+        filters = {key: as_string(getattr(args, key, "")) for key in ("event_type", "correlation_id", "since", "until")}
+        scope = read_tools.ReadScope(
+            server_url=server_url,
+            api_key=api_key,
+            project_id=project_id,
+            team_id=team_id,
+        )
+        outcome = read_tools.fetch_audit(
+            transport or urllib_transport,
+            scope,
+            target_id,
+            target_type,
+            args.limit or 20,
+            filters,
+        )
+        if outcome.error is not None:
+            raise _cli_error_from_read(outcome.error, memory_id=target_id)
+        stdout.write(outcome.text + "\n")
+
+        return 0
+    except CliError as error:
+        emit_error(stderr, error, api_key)
+
+        return 1
+
+
 def run_observations(
     args: Namespace,
     stdout: TextIO,
@@ -2260,6 +2520,16 @@ def run_observations(
         team_id = as_string(config.get("team_id"))
         if team_id:
             params["team_id"] = team_id
+        if args.observation_type:
+            params["observation_type"] = args.observation_type
+        if args.session_id:
+            params["session_id"] = args.session_id
+        if args.since:
+            params["since"] = args.since
+        if args.until:
+            params["until"] = args.until
+        if args.offset:
+            params["offset"] = str(args.offset)
         active_transport = transport or urllib_transport
         status, body = get_json(
             transport=active_transport,
@@ -2277,6 +2547,9 @@ def run_observations(
             return 0
         for item in items:
             stdout.write(f"{item.get('observation_type')}: {item.get('title')}\n")
+            meta = observation_meta_line(item)
+            if meta:
+                stdout.write(meta + "\n")
             stdout.write(f"  {item.get('body')}\n")
 
         return 0
