@@ -20,8 +20,8 @@ from engram.memory.distillation_reduction import (
     ReductionContractError,
     ReductionDraft,
     ReductionStageContract,
-    _snapshot_drafts,
     ReductionTruncationExhausted,
+    _snapshot_drafts,
     build_reduction_batches,
     compute_reduction_generation,
     derive_final_reduction_drafts,
@@ -40,7 +40,6 @@ from engram.memory.distillation_reduction import (
 )
 from engram.memory.distillation_tests import create_session_distillation_work, create_session_scope
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
-from engram.model_policy.services import curation_schema_prompt_prefix
 
 
 def _draft(index: int, *, stage: str = 'extract-stage') -> ReductionDraft:

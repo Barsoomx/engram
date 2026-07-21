@@ -75,7 +75,7 @@ _GENERATION_LEVEL_STRIDE = 16
 _MAX_GENERATION = 3
 
 
-class ReductionTruncationExhausted(ReductionContractError):
+class ReductionTruncationExhausted(ReductionContractError):  # noqa: N818
     pass
 
 

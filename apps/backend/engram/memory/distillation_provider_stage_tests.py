@@ -563,9 +563,7 @@ def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
     malformed_gateway = _StubGateway(body='not reduction json')
     _install_gateway(m_monkeypatch, malformed_gateway)
     stage = dps.resolve_provider_stage(target, claim, now=now)
-    malformed = dps.execute_provider_stage(
-        stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now, max_provider_calls=1
-    )
+    malformed = dps.execute_provider_stage(stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now, max_provider_calls=1)
 
     assert malformed.failure.redacted_detail
     malformed_record = ProviderCallRecord.objects.get(id=malformed.provider_call_ids[0])

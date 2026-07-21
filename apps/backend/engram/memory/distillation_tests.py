@@ -1518,12 +1518,8 @@ def test_large_session_distills_without_malformed_or_truncated_and_covers_every_
         now += timedelta(seconds=1)
 
     window = DistillationWindow.objects.get(work=work)
-    assert not DistillationStage.objects.filter(
-        window=window, last_failure_class=PROVIDER_OUTPUT_MALFORMED
-    ).exists()
-    assert not DistillationStage.objects.filter(
-        window=window, last_failure_class=PROVIDER_OUTPUT_TRUNCATED
-    ).exists()
+    assert not DistillationStage.objects.filter(window=window, last_failure_class=PROVIDER_OUTPUT_MALFORMED).exists()
+    assert not DistillationStage.objects.filter(window=window, last_failure_class=PROVIDER_OUTPUT_TRUNCATED).exists()
     coverage = DistillationObservationCoverage.objects.filter(window=window)
     assert set(coverage.values_list('observation_id', flat=True)) == {item.id for item in observations}
     assert set(coverage.values_list('outcome', flat=True)) == {'signal'}

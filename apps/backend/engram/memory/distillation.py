@@ -36,17 +36,15 @@ from engram.memory.distillation_provenance import (
     session_candidate_content_hash,
 )
 from engram.memory.distillation_provider_stage import (
+    PROVIDER_OUTPUT_TRUNCATED,
     STAGE_BLOCKED,
     STAGE_COMPLETED,
     STAGE_CONTINUATION,
     STAGE_RETRY,
     execute_distillation_stage,
     resolve_extraction_stage,
-    stage_target_key,
-)
-from engram.memory.distillation_provider_stage import (
-    PROVIDER_OUTPUT_TRUNCATED,
     resolve_reduction_policy,
+    stage_target_key,
 )
 from engram.memory.distillation_provider_stage import (
     stage_key as provider_stage_key,

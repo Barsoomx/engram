@@ -24,6 +24,7 @@ from engram.core.models import (
     WorkflowWork,
     clamp_memory_kind,
 )
+from engram.core.redaction import redact_value
 from engram.memory import work_execution
 from engram.memory.distillation_window import max_provider_calls_per_attempt, render_observation_block
 from engram.memory.services import MemoryWorkerError
@@ -43,7 +44,6 @@ from engram.memory.work_failures import (
 from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord
-from engram.core.redaction import redact_value
 from engram.model_policy.services import (
     ProviderCallInput,
     ProviderCallResult,

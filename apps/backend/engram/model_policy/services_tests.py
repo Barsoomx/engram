@@ -15,6 +15,7 @@ from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
+    _STRUCTURED_RESPONSE_KINDS,
     AnthropicMessagesGateway,
     CreateProviderSecret,
     EmbeddingCallInput,
@@ -28,7 +29,6 @@ from engram.model_policy.services import (
     _completion_body,
     _completion_title,
     _split_completion,
-    _STRUCTURED_RESPONSE_KINDS,
     curation_schema_prompt_prefix,
     effective_completion_cap,
     generated_candidates_payload,
@@ -42,9 +42,7 @@ from engram.model_policy.services import (
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
 
 
-def _openai_chat_body(
-    content: str, usage: dict[str, int] | None = None, finish_reason: str | None = None
-) -> bytes:
+def _openai_chat_body(content: str, usage: dict[str, int] | None = None, finish_reason: str | None = None) -> bytes:
     choice: dict[str, Any] = {'message': {'content': content}}
     if finish_reason is not None:
         choice['finish_reason'] = finish_reason
@@ -55,9 +53,7 @@ def _openai_chat_body(
     return json.dumps(response).encode()
 
 
-def _anthropic_message_body(
-    content: str, usage: dict[str, int] | None = None, stop_reason: str | None = None
-) -> bytes:
+def _anthropic_message_body(content: str, usage: dict[str, int] | None = None, stop_reason: str | None = None) -> bytes:
     response: dict[str, Any] = {'content': [{'type': 'text', 'text': content}]}
     if stop_reason is not None:
         response['stop_reason'] = stop_reason
@@ -992,9 +988,7 @@ def test_generated_distill_reduce_payload_partitions_with_integer_source_refs() 
 
 
 def test_distill_reduce_v2_is_structured_kind_and_body_is_verbatim() -> None:
-    content = json.dumps(
-        {'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]}
-    )
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]})
 
     assert 'distill_reduce.v2' in _STRUCTURED_RESPONSE_KINDS
     assert _completion_body(content, 'distill_reduce.v2') == content
@@ -1007,9 +1001,7 @@ def test_openai_gateway_returns_verbatim_reduce_body_that_parses() -> None:
 
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)
-    content = json.dumps(
-        {'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]}
-    )
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]})
     opener = _opener_returning(_openai_chat_body(content))
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
 
