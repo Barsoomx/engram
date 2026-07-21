@@ -31,6 +31,8 @@ from engram.memory.distillation_reduction import (
     parse_reduction_output,
     provider_stage_target,
     reduce_multilevel,
+    reduction_input_hash,
+    reduction_target_key,
     resolve_reduction_stage,
     stable_draft_id,
     worst_case_output_tokens,
@@ -128,8 +130,8 @@ def test_nonshrinking_or_incomplete_reduction_is_retryable_not_union_fallback(pa
 
 def test_manifest_and_batches_are_deterministic_and_singletons_are_carried() -> None:
     leaves = [_draft(i) for i in range(3)]
-    first = build_reduction_batches(leaves, reduction_target=1, prompt_budget=350, level=0)
-    second = build_reduction_batches(leaves, reduction_target=1, prompt_budget=350, level=0)
+    first = build_reduction_batches(leaves, max_fanin=2, level=1)
+    second = build_reduction_batches(leaves, max_fanin=2, level=1)
 
     assert first == second
     assert len(first) == 2
@@ -138,9 +140,35 @@ def test_manifest_and_batches_are_deterministic_and_singletons_are_carried() -> 
     assert first[0].input_hash == second[0].input_hash
 
 
-def test_prompt_budget_rejects_two_drafts_that_cannot_fit() -> None:
-    with pytest.raises(ReductionContractError):
-        build_reduction_batches([_draft(0), _draft(1)], reduction_target=1, prompt_budget=1, level=0)
+def test_build_reduction_batches_groups_by_count_and_marks_passthrough() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    batches = build_reduction_batches(leaves, max_fanin=2, level=1)
+
+    assert [len(batch.input_drafts) for batch in batches] == [2, 2, 1]
+    assert batches[0].provider_required is True
+    assert batches[1].provider_required is True
+    assert batches[2].provider_required is False
+
+    singles = build_reduction_batches(leaves, max_fanin=1, level=1)
+    assert [len(batch.input_drafts) for batch in singles] == [1, 1, 1, 1, 1]
+    assert all(batch.provider_required is False for batch in singles)
+
+
+def test_build_reduction_batches_generation_band_is_disjoint() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    generation_zero = build_reduction_batches(leaves, max_fanin=2, level=2)
+    generation_one = build_reduction_batches(leaves, max_fanin=2, level=17)
+
+    assert all(batch.level == 17 for batch in generation_one)
+    assert [batch.ordinal for batch in generation_one] == [0, 1, 2]
+    for batch in generation_one:
+        assert batch.input_hash == reduction_input_hash(batch.input_refs)
+        assert batch.target_key == reduction_target_key(
+            level=batch.level, ordinal=batch.ordinal, input_hash=batch.input_hash
+        )
+    zero_keys = {batch.target_key for batch in generation_zero}
+    one_keys = {batch.target_key for batch in generation_one}
+    assert zero_keys.isdisjoint(one_keys)
 
 
 def test_parser_requires_exact_envelope_and_known_duplicate_free_ids() -> None:
@@ -195,66 +223,6 @@ def test_reduction_rejects_blank_text_and_string_confidence(field: str, value: o
 
     with pytest.raises(ReductionContractError):
         parse_reduction_output({'memories': [memory]}, inputs, reduction_target=1)
-
-
-def test_reduction_budget_does_not_charge_unprompted_observation_lineage() -> None:
-    observation_ids = tuple(f'{index:036d}' for index in range(100))
-    drafts = [
-        ReductionDraft(
-            draft_id=marker * 64,
-            title='T',
-            body='B',
-            confidence=Decimal('0.8'),
-            source_ids=observation_ids,
-        )
-        for marker in ('a', 'b')
-    ]
-    charged_payload = json.dumps(
-        [
-            {
-                'id': draft.draft_id,
-                'title': draft.title,
-                'body': draft.body,
-                'confidence': str(draft.confidence),
-                'source_ids': list(draft.source_ids),
-                'kind': draft.kind,
-            }
-            for draft in drafts
-        ],
-        ensure_ascii=False,
-        separators=(',', ':'),
-        sort_keys=True,
-    ).encode()
-    rendered_prompt = json.dumps(
-        {
-            'drafts': [
-                {
-                    'id': draft.draft_id,
-                    'title': draft.title,
-                    'body': draft.body,
-                    'confidence': str(draft.confidence),
-                }
-                for draft in drafts
-            ],
-            'reduction_target': 1,
-        },
-        ensure_ascii=False,
-        separators=(',', ':'),
-    ).encode()
-
-    assert len(charged_payload) == 8083
-    assert len(rendered_prompt) == 265
-    assert len(rendered_prompt) <= 8000 < len(charged_payload)
-
-    batches = build_reduction_batches(
-        drafts,
-        reduction_target=1,
-        prompt_budget=8000,
-    )
-
-    assert len(batches) == 1
-    assert batches[0].input_drafts == tuple(drafts)
-    assert batches[0].provider_required is True
 
 
 def test_reduction_accepts_spec_cap_above_twelve() -> None:
@@ -319,7 +287,7 @@ def test_final_drafts_wait_until_all_targets_accepted() -> None:
 
 
 def test_reduction_levels_start_at_one() -> None:
-    batch = build_reduction_batches([_draft(0), _draft(1)], reduction_target=1, prompt_budget=1000)
+    batch = build_reduction_batches([_draft(0), _draft(1)], max_fanin=2, level=1)
     assert batch[0].level == 1
 
 
@@ -369,7 +337,7 @@ def test_final_derivation_replays_singleton_carry_between_accepted_levels() -> N
 
 def test_provider_stage_target_has_reduction_shape_and_manifest() -> None:
     leaves = [_draft(0), _draft(1)]
-    batch = build_reduction_batches(leaves, reduction_target=1, prompt_budget=10000, level=1)[0]
+    batch = build_reduction_batches(leaves, max_fanin=2, level=1)[0]
     with pytest.raises(ReductionContractError):
         provider_stage_target({'id': UUID('00000000-0000-0000-0000-000000000001')}, batch)
 

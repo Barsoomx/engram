@@ -343,33 +343,18 @@ reduction_target_key = reduction_batch_key
 
 
 def build_reduction_batches(
-    drafts: Sequence[ReductionDraft], *, reduction_target: int, prompt_budget: int, level: int = 1
+    drafts: Sequence[ReductionDraft], *, max_fanin: int, level: int
 ) -> tuple[ReductionBatch, ...]:
-    if reduction_target <= 0 or prompt_budget <= 0:
-        raise ReductionContractError('reduction target and prompt budget must be positive')
+    if max_fanin < 1:
+        raise ReductionContractError('reduction fan-in must be positive')
     ordered = tuple(drafts)
     batches: list[ReductionBatch] = []
     index = 0
     while index < len(ordered):
-        remaining = len(ordered) - index
-        if remaining == 1:
-            group = (ordered[index],)
-            index += 1
-            provider_required = False
-        else:
-            group_list = [ordered[index]]
-            index += 1
-            while index < len(ordered):
-                candidate = tuple(group_list + [ordered[index]])
-                size = len(_json([_draft_payload(draft) for draft in candidate]))
-                if len(candidate) >= 2 and size > prompt_budget:
-                    break
-                group_list.append(ordered[index])
-                index += 1
-            if len(group_list) < 2:
-                raise ReductionContractError('two normalized drafts do not fit prompt budget')
-            group = tuple(group_list)
-            provider_required = True
+        size = min(max_fanin, len(ordered) - index)
+        group = ordered[index : index + size]
+        index += size
+        provider_required = len(group) >= 2
         refs = tuple(draft.ref for draft in group)
         input_hash = reduction_input_hash(refs)
         batches.append(
@@ -383,6 +368,7 @@ def build_reduction_batches(
                 provider_required,
             )
         )
+
     return tuple(batches)
 
 
