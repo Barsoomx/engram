@@ -20,9 +20,12 @@ from engram.memory.distillation_reduction import (
     ReductionDraft,
     ReductionStageContract,
     _snapshot_drafts,
+    ReductionTruncationExhausted,
     build_reduction_batches,
+    compute_reduction_generation,
     derive_final_reduction_drafts,
     derive_first_pending_reduction_target,
+    effective_reduction_target,
     max_reduction_fanin,
     output_budget_tokens,
     parse_reduction_output,
@@ -581,3 +584,20 @@ def test_output_budget_and_fanin_worked_values() -> None:
     assert max_reduction_fanin(2867) == 2
     assert max_reduction_fanin(5734) == 4
     assert max_reduction_fanin(worst_case_output_tokens(1) - 1) == 1
+
+
+def test_effective_reduction_target_scales_and_clamps() -> None:
+    assert effective_reduction_target(12, floor=12) == 12
+    assert effective_reduction_target(48, floor=12) == 12
+    assert effective_reduction_target(100, floor=12) == 25
+    assert effective_reduction_target(200, floor=12) == 48
+    assert effective_reduction_target(4, floor=12) == 12
+
+
+def test_compute_reduction_generation_bands_and_exhaustion() -> None:
+    assert issubclass(ReductionTruncationExhausted, ReductionContractError)
+    assert compute_reduction_generation([]) == 0
+    assert compute_reduction_generation([1, 4]) == 1
+    assert compute_reduction_generation([17, 20]) == 2
+    with pytest.raises(ReductionTruncationExhausted):
+        compute_reduction_generation([50])

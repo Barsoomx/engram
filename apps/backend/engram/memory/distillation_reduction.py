@@ -75,6 +75,30 @@ def max_reduction_fanin(budget: int) -> int:
     return n
 
 
+_MAX_TREE_LEVELS = 4
+_GENERATION_LEVEL_STRIDE = 16
+_MAX_GENERATION = 3
+
+
+class ReductionTruncationExhausted(ReductionContractError):
+    pass
+
+
+def effective_reduction_target(total_drafts: int, floor: int) -> int:
+    return min(48, max(floor, math.ceil(total_drafts / 4)))
+
+
+def compute_reduction_generation(truncated_levels: Sequence[int]) -> int:
+    if not truncated_levels:
+        return 0
+
+    generation = max(level // _GENERATION_LEVEL_STRIDE for level in truncated_levels) + 1
+    if generation > _MAX_GENERATION:
+        raise ReductionTruncationExhausted('reduction truncation generations exhausted')
+
+    return generation
+
+
 def _json(value: object) -> bytes:
     return canonical_json_bytes(value)
 
