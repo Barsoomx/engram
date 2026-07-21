@@ -33,6 +33,7 @@ from engram.model_policy.services import (
     effective_completion_cap,
     generated_candidates_payload,
     generated_distill_reduce_payload,
+    is_truncated_finish_reason,
     provider_completion_clamp,
     resolve_max_tokens,
     secret_fingerprint,
@@ -41,16 +42,25 @@ from engram.model_policy.services import (
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
 
 
-def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
-    response: dict[str, Any] = {'choices': [{'message': {'content': content}}]}
+def _openai_chat_body(
+    content: str, usage: dict[str, int] | None = None, finish_reason: str | None = None
+) -> bytes:
+    choice: dict[str, Any] = {'message': {'content': content}}
+    if finish_reason is not None:
+        choice['finish_reason'] = finish_reason
+    response: dict[str, Any] = {'choices': [choice]}
     if usage is not None:
         response['usage'] = usage
 
     return json.dumps(response).encode()
 
 
-def _anthropic_message_body(content: str, usage: dict[str, int] | None = None) -> bytes:
+def _anthropic_message_body(
+    content: str, usage: dict[str, int] | None = None, stop_reason: str | None = None
+) -> bytes:
     response: dict[str, Any] = {'content': [{'type': 'text', 'text': content}]}
+    if stop_reason is not None:
+        response['stop_reason'] = stop_reason
     if usage is not None:
         response['usage'] = usage
 
@@ -1046,3 +1056,83 @@ def test_effective_completion_cap_is_reduce_scoped() -> None:
     clamped = ModelPolicy(provider='deepseek', metadata={'completion_clamp': 1000})
     assert effective_completion_cap(clamped, 'distill_extract.v1') == resolve_max_tokens(clamped, 'distill_extract.v1')
     assert effective_completion_cap(clamped, 'distill_extract.v1') == 8192
+
+
+def test_is_truncated_finish_reason_predicate() -> None:
+    assert is_truncated_finish_reason('length') is True
+    assert is_truncated_finish_reason('max_tokens') is True
+    assert is_truncated_finish_reason('stop') is False
+    assert is_truncated_finish_reason('') is False
+
+
+@pytest.mark.django_db
+def test_openai_gateway_surfaces_finish_reason_and_sends_effective_cap() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek')
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1]}]})
+    opener = _opener_returning(_openai_chat_body(content, finish_reason='length'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='finish-reason-1',
+            trace_id='finish-reason-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v2',
+        ),
+    )
+
+    assert result.finish_reason == 'length'
+    sent = json.loads(opener.requests[0].data)
+    assert sent['max_tokens'] == effective_completion_cap(policy, 'distill_reduce.v2') == 4096
+
+
+@pytest.mark.django_db
+def test_openai_gateway_surfaces_non_truncating_finish_reason() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('Title: X\nBody: Y', finish_reason='stop'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='finish-reason-2',
+            trace_id='finish-reason-2',
+            prompt='a prompt',
+        ),
+    )
+
+    assert result.finish_reason == 'stop'
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_surfaces_stop_reason() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic')
+    gateway = AnthropicMessagesGateway(
+        base_url='https://api.anthropic.com',
+        api_key='key',
+        opener=_opener_returning(_anthropic_message_body('Title: X\nBody: Y', stop_reason='max_tokens')),
+    )
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='stop-reason-1',
+            trace_id='stop-reason-1',
+            prompt='a prompt',
+        ),
+    )
+
+    assert result.finish_reason == 'max_tokens'

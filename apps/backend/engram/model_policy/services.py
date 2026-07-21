@@ -141,6 +141,11 @@ class ProviderCallResult:
     redaction_state: str
     generated_title: str
     generated_body: str
+    finish_reason: str = ''
+
+
+def is_truncated_finish_reason(reason: str) -> bool:
+    return reason in {'length', 'max_tokens'}
 
 
 def encryption_key() -> bytes:
@@ -1593,10 +1598,10 @@ class OpenAICompatibleGateway:
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
-        extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
+        extra['max_tokens'] = effective_completion_cap(policy, data.response_kind)
         started_at = time.monotonic()
         try:
-            content, real_usage = self._chat_completion(
+            content, real_usage, finish_reason = self._chat_completion(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
@@ -1625,6 +1630,7 @@ class OpenAICompatibleGateway:
             redaction_state=record.redaction_state,
             generated_title=title,
             generated_body=body,
+            finish_reason=finish_reason,
         )
 
     def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
@@ -1727,7 +1733,7 @@ class OpenAICompatibleGateway:
         prompt: str,
         system_prompt: str = '',
         extra: dict[str, object] | None = None,
-    ) -> tuple[str, dict[str, int] | None]:
+    ) -> tuple[str, dict[str, int] | None, str]:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
@@ -1741,8 +1747,10 @@ class OpenAICompatibleGateway:
             payload_dict.update(extra)
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/chat/completions', payload, timeout=self._timeout)
+        choice = response['choices'][0]
+        finish_reason = str(choice.get('finish_reason') or '')
 
-        return str(response['choices'][0]['message']['content']), _parse_openai_usage(response)
+        return str(choice['message']['content']), _parse_openai_usage(response), finish_reason
 
     def _embeddings(self, model: str, text: str) -> tuple[tuple[float, ...], dict[str, int] | None]:
         payload = json.dumps({'model': model, 'input': text}).encode()
@@ -1855,12 +1863,12 @@ class AnthropicMessagesGateway:
 
         started_at = time.monotonic()
         try:
-            content, real_usage = self._messages(
+            content, real_usage, stop_reason = self._messages(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
                 response_kind=data.response_kind,
-                max_tokens=resolve_max_tokens(policy, data.response_kind),
+                max_tokens=effective_completion_cap(policy, data.response_kind),
             )
         except ModelPolicyError as error:
             self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
@@ -1885,6 +1893,7 @@ class AnthropicMessagesGateway:
             redaction_state=record.redaction_state,
             generated_title=title,
             generated_body=body,
+            finish_reason=stop_reason,
         )
 
     def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
@@ -1964,7 +1973,7 @@ class AnthropicMessagesGateway:
         *,
         response_kind: str = 'single',
         max_tokens: int = _DEFAULT_MAX_TOKENS,
-    ) -> tuple[str, dict[str, int] | None]:
+    ) -> tuple[str, dict[str, int] | None, str]:
         payload_dict: dict[str, object] = {
             'model': model,
             'max_tokens': max_tokens,
@@ -1978,8 +1987,9 @@ class AnthropicMessagesGateway:
             payload_dict['tool_choice'] = {'type': 'tool', 'name': tool['name']}
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/v1/messages', payload, timeout=self._timeout)
+        stop_reason = str(response.get('stop_reason') or '')
 
-        return _anthropic_content_text(response), _parse_anthropic_usage(response)
+        return _anthropic_content_text(response), _parse_anthropic_usage(response), stop_reason
 
     def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url
