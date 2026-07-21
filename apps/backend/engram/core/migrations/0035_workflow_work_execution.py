@@ -40,6 +40,35 @@ def noop(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
     return
 
 
+def guard_reverse_execution_history(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
+    alias = schema_editor.connection.alias
+    run_model = apps.get_model('core', 'WorkflowRun')
+    v1_run = run_model.objects.using(alias).filter(execution_contract_version=1).order_by('id').first()
+    if v1_run is not None:
+        raise RuntimeError(f'cannot reverse 0035 while v1 workflow run {v1_run.id} execution history exists')
+
+    work_model = apps.get_model('core', 'WorkflowWork')
+    offending_work = (
+        work_model.objects.using(alias)
+        .filter(
+            models.Q(fencing_token__gt=0)
+            | models.Q(failure_streak__gt=0)
+            | models.Q(lease_expires_at__isnull=False)
+            | models.Q(heartbeat_at__isnull=False)
+            | models.Q(next_retry_at__isnull=False)
+            | ~models.Q(lease_owner='')
+            | ~models.Q(blocked_configuration_fingerprint='')
+            | ~models.Q(execution_state__in=('ready', 'settled'))
+        )
+        .order_by('id')
+        .first()
+    )
+    if offending_work is not None:
+        raise RuntimeError(f'cannot reverse 0035 while v1 workflow work {offending_work.id} execution state exists')
+
+    return
+
+
 class Migration(migrations.Migration):
     dependencies = [
         ('core', '0034_memory_loop_input_contract'),
@@ -365,4 +394,5 @@ class Migration(migrations.Migration):
                 condition=models.Q(('failure_streak__gte', 0)), name='core_work_failure_streak_nonneg'
             ),
         ),
+        migrations.RunPython(noop, guard_reverse_execution_history),
     ]

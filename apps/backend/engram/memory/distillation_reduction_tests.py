@@ -9,6 +9,7 @@ from django.utils import timezone
 from engram.core.models import DistillationStage, DistillationWindow
 from engram.memory.distillation_provider_stage import ProviderStageOutputError
 from engram.memory.distillation_reduction import (
+    _REDUCE_SYSTEM_PROMPT,
     MAX_BODY,
     MAX_TITLE,
     REDUCTION_MANIFEST_SCHEMA,
@@ -171,6 +172,83 @@ def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
     return {'memories': [_memory(bucket) for bucket in buckets]}
 
 
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    [
+        ('title', ' \t '),
+        ('body', ' \n '),
+        ('confidence', '0.8'),
+    ],
+)
+def test_reduction_rejects_blank_text_and_string_confidence(field: str, value: object) -> None:
+    inputs = [_draft(0), _draft(1)]
+    memory = _memory([draft.draft_id for draft in inputs])
+    memory[field] = value
+
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [memory]}, inputs, reduction_target=1)
+
+
+def test_reduction_budget_does_not_charge_unprompted_observation_lineage() -> None:
+    observation_ids = tuple(f'{index:036d}' for index in range(100))
+    drafts = [
+        ReductionDraft(
+            draft_id=marker * 64,
+            title='T',
+            body='B',
+            confidence=Decimal('0.8'),
+            source_ids=observation_ids,
+        )
+        for marker in ('a', 'b')
+    ]
+    charged_payload = json.dumps(
+        [
+            {
+                'id': draft.draft_id,
+                'title': draft.title,
+                'body': draft.body,
+                'confidence': str(draft.confidence),
+                'source_ids': list(draft.source_ids),
+                'kind': draft.kind,
+            }
+            for draft in drafts
+        ],
+        ensure_ascii=False,
+        separators=(',', ':'),
+        sort_keys=True,
+    ).encode()
+    rendered_prompt = json.dumps(
+        {
+            'drafts': [
+                {
+                    'id': draft.draft_id,
+                    'title': draft.title,
+                    'body': draft.body,
+                    'confidence': str(draft.confidence),
+                }
+                for draft in drafts
+            ],
+            'reduction_target': 1,
+        },
+        ensure_ascii=False,
+        separators=(',', ':'),
+    ).encode()
+
+    assert len(charged_payload) == 8083
+    assert len(rendered_prompt) == 265
+    assert len(rendered_prompt) <= 8000 < len(charged_payload)
+
+    batches = build_reduction_batches(
+        drafts,
+        reduction_target=1,
+        prompt_budget=8000,
+    )
+
+    assert len(batches) == 1
+    assert batches[0].input_drafts == tuple(drafts)
+    assert batches[0].provider_required is True
+
+
 def test_reduction_accepts_spec_cap_above_twelve() -> None:
     inputs = [_draft(index) for index in range(40)]
     parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=12)
@@ -187,6 +265,45 @@ def test_reduction_target_twenty_accepts_twenty_memories() -> None:
     inputs = [_draft(index) for index in range(50)]
     parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=20)
     assert len(parsed.memories) == 20
+
+
+def _flip_last_hex_digit(source_id: str) -> str:
+    last = source_id[-1]
+    replacement = '0' if last != '0' else '1'
+
+    return source_id[:-1] + replacement
+
+
+def test_parse_reduction_drops_typoed_source_id_and_tolerates_uncovered_draft() -> None:
+    inputs = [_draft(index) for index in range(4)]
+    typo = _flip_last_hex_digit(inputs[1].draft_id)
+    payload = {
+        'memories': [
+            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, typo]},
+            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[2].draft_id, inputs[3].draft_id]},
+        ]
+    }
+
+    parsed = parse_reduction_output(payload, inputs, reduction_target=2)
+
+    assert len(parsed.memories) == 2
+    assert parsed.memories[0].source_ids == (inputs[0].draft_id,)
+    assert parsed.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
+
+
+def test_parse_reduction_discards_memory_with_only_unknown_source_ids() -> None:
+    inputs = [_draft(0), _draft(1)]
+    payload = {
+        'memories': [
+            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [_flip_last_hex_digit(inputs[0].draft_id)]},
+            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, inputs[1].draft_id]},
+        ]
+    }
+
+    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
+
+    assert len(parsed.memories) == 1
+    assert parsed.memories[0].source_ids == (inputs[0].draft_id, inputs[1].draft_id)
 
 
 def test_final_drafts_wait_until_all_targets_accepted() -> None:
@@ -416,6 +533,21 @@ def test_reduce_schema_instructions_describe_a_payload_the_parser_accepts() -> N
     assert parsed.memories[0].kind == 'decision'
     assert parsed.memories[0].source_ids == tuple(draft.draft_id for draft in inputs)
     assert parsed.memories[0].confidence == Decimal('0.9')
+
+
+def test_reduce_system_prompt_states_contract_marker_and_parser_rules() -> None:
+    prompt = _REDUCE_SYSTEM_PROMPT
+
+    assert 'distill_reduce.v1' in prompt
+    assert 'distill_extract.v1' not in prompt
+    assert str(MAX_TITLE) in prompt
+    assert str(MAX_BODY) in prompt
+    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
+        assert kind in prompt
+    assert 'reduction_target' in prompt
+    assert 'strictly fewer' in prompt
+    assert 'copied verbatim' in prompt
+    assert 'no additional properties' in prompt
 
 
 @pytest.mark.django_db

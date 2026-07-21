@@ -574,3 +574,36 @@ def test_window_owning_required_work_restores_signal_through_reconciler() -> Non
     )
     assert CeleryOutbox.objects.filter(task_name='engram.memory.distill_session_work_v1').count() == 1
     assert dw.DistillationWindow.objects.filter(work=work).count() == 1
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('changed_env', 'invalid_value'),
+    (
+        ('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '7999'),
+        ('ENGRAM_DISTILL_REDUCE_TARGET', '0'),
+    ),
+)
+def test_existing_window_replay_uses_frozen_planner_configuration(
+    changed_env: str,
+    invalid_value: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    suffix = 'frozen-replay-budget' if changed_env.endswith('BUDGET') else 'frozen-replay-target'
+    scope = _scope(suffix)
+    _observation(scope, sequence=1)
+    work = _session_work(scope, upper=1)
+
+    window = dw.materialize_distillation_window(work)
+    assert window.chunk_char_budget == 8000
+    assert window.reduction_target == 1
+
+    monkeypatch.setenv(changed_env, invalid_value)
+
+    replay = dw.materialize_distillation_window(work)
+
+    assert replay.id == window.id
+    assert replay.chunk_char_budget == 8000
+    assert replay.reduction_target == 1

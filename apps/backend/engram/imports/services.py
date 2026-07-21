@@ -445,28 +445,33 @@ class ClaudeMemImporter:
                 metadata__source_store_id=context.source_store_id,
             ).order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
         )
-        if modern_sessions:
-            return self._resolve_memory_session_candidates(context, modern_sessions)
-
         legacy_sessions = list(
             scoped_sessions.filter(metadata__source=_IMPORT_SESSION_SOURCE)
             .exclude(metadata__has_key='source_store_id')
             .order_by('created_at', 'id')[: _MAX_IMPORT_SESSION_CANDIDATES + 1],
         )
 
-        return self._resolve_memory_session_candidates(context, legacy_sessions)
+        return self._resolve_memory_session_candidates(context, modern_sessions, legacy_sessions)
 
     def _resolve_memory_session_candidates(
         self,
         context: ImportContext,
-        sessions: list[AgentSession],
+        modern_sessions: list[AgentSession],
+        legacy_sessions: list[AgentSession],
     ) -> AgentSession | None:
-        if len(sessions) > _MAX_IMPORT_SESSION_CANDIDATES:
+        if (
+            len(modern_sessions) > _MAX_IMPORT_SESSION_CANDIDATES
+            or len(legacy_sessions) > _MAX_IMPORT_SESSION_CANDIDATES
+        ):
             raise ValueError('import session identity collision')
+
+        combined: dict[UUID, AgentSession] = {}
+        for session in (*modern_sessions, *legacy_sessions):
+            combined[session.id] = session
 
         matches = [
             session
-            for session in sessions
+            for session in combined.values()
             if session.external_session_id == self._session_source_id(context, session.content_session_id)
         ]
         if len(matches) > 1:

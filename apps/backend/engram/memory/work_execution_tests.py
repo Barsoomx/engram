@@ -441,6 +441,115 @@ def test_valid_manual_queued_run_leases_settled_work() -> None:
 
 
 @pytest.mark.django_db
+@pytest.mark.parametrize(
+    'origin',
+    (
+        WorkflowRunOrigin.AUTOMATIC,
+        WorkflowRunOrigin.RECONCILIATION,
+        WorkflowRunOrigin.MEMORY_TRANSITION,
+    ),
+)
+def test_supplied_non_manual_run_does_not_reopen_settled_work(
+    origin: str,
+) -> None:
+    module = _we()
+    scope = create_scope(f'claim-settled-{origin}')
+    work = create_required_work(scope, suffix=f'claim-settled-{origin}')
+    settle_work(module, work)
+    settled = get_work(work)
+    settled_token = settled.fencing_token
+    queued = make_queued_run(
+        work,
+        origin=origin,
+        dispatched_at=NOW + timedelta(seconds=5),
+    )
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner(f'late-{origin}'),
+        now=NOW + timedelta(seconds=10),
+        run_id=queued.id,
+    )
+
+    stored = get_work(work)
+    stored_run = get_run(queued.id)
+    assert (
+        result.outcome,
+        result.claim,
+        stored.disposition,
+        stored.execution_state,
+        stored.fencing_token,
+        stored_run.status,
+        stored_run.fencing_token,
+    ) == (
+        'terminal',
+        None,
+        WorkflowWorkDisposition.COMPLETE,
+        WorkflowWorkExecutionState.SETTLED,
+        settled_token,
+        WorkflowRunStatus.QUEUED,
+        None,
+    )
+
+
+@pytest.mark.django_db
+def test_explicit_redelivery_of_succeeded_run_absorbs_as_terminal() -> None:
+    module = _we()
+    scope = create_scope('claim-redeliver-succeeded')
+    work = create_required_work(scope, suffix='claim-redeliver-succeeded')
+    claimed = claim(module, work, lease_owner=owner('worker'), now=NOW)
+    run_id = claimed.claim.workflow_run_id
+    module.lock_work_fence(claim=claimed.claim, now=NOW)
+    module.finish_work_claim(claim=claimed.claim, now=NOW, completion='product_succeeded')
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner('redeliver'),
+        now=NOW + timedelta(seconds=5),
+        run_id=run_id,
+    )
+
+    assert result.outcome == 'terminal'
+    assert result.claim is None
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.SETTLED
+    assert stored.disposition == WorkflowWorkDisposition.COMPLETE
+    assert get_run(run_id).status == WorkflowRunStatus.SUCCEEDED
+    assert running_v1_count(work) == 0
+
+
+@pytest.mark.django_db
+def test_explicit_redelivery_of_failed_run_absorbs_on_terminal_failure() -> None:
+    module = _we()
+    scope = create_scope('claim-redeliver-failed')
+    work = create_required_work(scope, suffix='claim-redeliver-failed')
+    first = claim(module, work, lease_owner=owner('worker'), now=NOW)
+    run_id = first.claim.workflow_run_id
+    module.fail_work_claim(
+        claim=first.claim,
+        now=NOW,
+        failure=ClassifiedWorkFailure(failure_class='invalid_input', code='work_contract_invalid'),
+    )
+
+    result = claim(
+        module,
+        work,
+        lease_owner=owner('redeliver'),
+        now=NOW + timedelta(seconds=5),
+        run_id=run_id,
+    )
+
+    assert result.outcome == 'terminal'
+    assert result.claim is None
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert get_run(run_id).status == WorkflowRunStatus.FAILED
+    assert running_v1_count(work) == 0
+
+
+@pytest.mark.django_db
 def test_claim_rejects_naive_now_blank_and_oversized_owner() -> None:
     module = _we()
     scope = create_scope('claim-inputs')
@@ -1165,3 +1274,74 @@ def test_execution_configuration_fingerprint_ignores_execution_state() -> None:
     claim(module, work, lease_owner=owner('state'), now=NOW)
 
     assert module.execution_configuration_fingerprint(get_work(work)) == before
+
+
+@pytest.mark.django_db
+def test_finish_rejects_claim_after_lease_expiry_before_reclaim() -> None:
+    module = _we()
+    scope = create_scope('finish-expired-before-reclaim')
+    work = create_required_work(scope, suffix='finish-expired-before-reclaim')
+    first = claim(module, work, lease_owner=owner('expired-finish'), now=NOW)
+    finish_at = first.claim.lease_expires_at + timedelta(microseconds=1)
+
+    with pytest.raises(module.StaleWorkFenceError):
+        module.finish_work_claim(
+            claim=first.claim,
+            now=finish_at,
+            completion='product_succeeded',
+        )
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.LEASED
+    assert stored.fencing_token == first.claim.fencing_token
+    assert stored.lease_owner == first.claim.lease_owner
+    assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.RUNNING
+
+
+@pytest.mark.django_db
+def test_fail_rejects_claim_after_lease_expiry_before_reclaim() -> None:
+    module = _we()
+    scope = create_scope('fail-expired-before-reclaim')
+    work = create_required_work(scope, suffix='fail-expired-before-reclaim')
+    first = claim(module, work, lease_owner=owner('expired-fail'), now=NOW)
+    fail_at = first.claim.lease_expires_at + timedelta(microseconds=1)
+
+    with pytest.raises(module.StaleWorkFenceError):
+        module.fail_work_claim(
+            claim=first.claim,
+            now=fail_at,
+            failure=ClassifiedWorkFailure(
+                failure_class='provider_transient',
+                code='provider_timeout',
+            ),
+        )
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.LEASED
+    assert stored.fencing_token == first.claim.fencing_token
+    assert stored.lease_owner == first.claim.lease_owner
+    assert get_run(first.claim.workflow_run_id).status == WorkflowRunStatus.RUNNING
+
+
+@pytest.mark.django_db
+def test_retry_streak_ceiling_parks_work_as_terminal_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _we()
+    monkeypatch.setenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', '3')
+    scope = create_scope('claim-ceiling')
+    work = create_required_work(scope, suffix='claim-ceiling')
+    failure = ClassifiedWorkFailure(failure_class='provider_transient', code='judge_policy_denied')
+
+    for attempt in range(1, 4):
+        claim_now = NOW + timedelta(hours=attempt - 1)
+        claimed = claim(module, work, lease_owner=owner(f'ceil-{attempt}'), now=claim_now)
+        assert claimed.outcome == 'claimed'
+        module.fail_work_claim(claim=claimed.claim, now=claim_now, failure=failure)
+        stored = get_work(work)
+        assert stored.failure_streak == attempt
+        if attempt < 3:
+            assert stored.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+
+    stored = get_work(work)
+    assert stored.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert stored.next_retry_at is None
+    assert stored.failure_streak == 3

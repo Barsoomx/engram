@@ -23,6 +23,7 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.memory.digest_visibility import unproven_digest_memory_ids
+from engram.memory.source_eligibility import conflicted_memory_ids
 
 DEFAULT_PACK_LIMIT = 20
 
@@ -116,7 +117,13 @@ class ReplaySearchDebug:
         unproven_digest_ids = unproven_digest_memory_ids(
             [doc.memory for doc in all_documents if doc.memory.kind == 'digest'],
         )
-        authorized, excluded = self._classify_documents(all_documents, allowed_team_ids, unproven_digest_ids)
+        conflicted_ids = conflicted_memory_ids([doc.memory_id for doc in all_documents])
+        authorized, excluded = self._classify_documents(
+            all_documents,
+            allowed_team_ids,
+            unproven_digest_ids,
+            conflicted_ids,
+        )
 
         has_request_terms = bool(query.strip() or file_paths or symbols)
         scored, scoring_excluded = self._score_authorized(authorized, query, file_paths, symbols, has_request_terms)
@@ -170,12 +177,13 @@ class ReplaySearchDebug:
         documents: list[RetrievalDocument],
         allowed_team_ids: set[uuid.UUID],
         unproven_digest_ids: set[uuid.UUID],
+        conflicted_ids: set[uuid.UUID],
     ) -> tuple[list[RetrievalDocument], list[DebugExcluded]]:
         authorized: list[RetrievalDocument] = []
         excluded: list[DebugExcluded] = []
 
         for doc in documents:
-            reason = self._exclusion_reason(doc, allowed_team_ids, unproven_digest_ids)
+            reason = self._exclusion_reason(doc, allowed_team_ids, unproven_digest_ids, conflicted_ids)
             if reason:
                 excluded.append(
                     DebugExcluded(
@@ -368,6 +376,7 @@ class ReplaySearchDebug:
         doc: RetrievalDocument,
         allowed_team_ids: set[uuid.UUID],
         unproven_digest_ids: set[uuid.UUID],
+        conflicted_ids: set[uuid.UUID],
     ) -> str:
         memory = doc.memory
 
@@ -382,6 +391,9 @@ class ReplaySearchDebug:
 
         if memory.refuted or doc.refuted:
             return 'refuted'
+
+        if doc.memory_id in conflicted_ids:
+            return 'unresolved_conflict'
 
         if doc.visibility_scope == VisibilityScope.PROJECT:
             return ''

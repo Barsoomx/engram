@@ -597,7 +597,9 @@ docker compose -f deploy/compose/docker-compose.yml run --rm frontend-ci `
   sh -ec "pnpm typecheck && pnpm lint && pnpm build && node --test src/lib/memory-conflict-actions.test.ts"
 ```
 
-`frontend-ci` is a test-only Compose service/target containing source plus dev dependencies; the production runner image is unchanged. The eval command exits nonzero on a threshold miss. CI also runs migration checks, `git diff --check`, P6/P8/P9/P12 tests, and the CP4 fault subset. No rollout flag may skip a contract/eval test.
+`frontend-ci` is a test-only Compose service/target containing source plus dev dependencies; the production runner image is unchanged. It is defined in `deploy/compose/docker-compose.yml` under the `ci` Compose profile so it is never started by a production `up`, and `apps/backend/engram/core/deployment_contract_tests.py` asserts its presence, profile, and gate command. The eval command exits nonzero on a threshold miss. CI also runs migration checks, `git diff --check`, P6/P8/P9/P12 tests, and the CP4 fault subset. No rollout flag may skip a contract/eval test.
+
+These three commands are consolidated in the blocking executable checkpoint gate `scripts/verify-cp5-acceptance.ps1`. That gate preflights the conflict frontend contract test, the `engram_curator_eval` management command (`apps/backend/engram/core/management/commands/engram_curator_eval.py`) and its tests, and the `frontend-ci` service, then runs the hermetic pytest subset, both evaluation modes (`--engine fixture` and `--responses apps/backend/engram/memory/evals/curation_v1/selected-policy-responses.jsonl`), and the frontend gate. CP5 cannot be closed and no active rollout may begin until this gate exits zero; it is a blocking closure requirement, not a post-closure follow-up.
 
 ## Rollout And Backlog Safety
 
@@ -730,7 +732,10 @@ C5 is complete only when all of the following are true:
 - the selected rollout policy's captured provider artifact meets the same quality gate;
 - the backlog shadow report exists and applied zero mutations;
 - no historical backlog was bulk promoted, rejected, or superseded;
-- Compose verification commands, counts, exit codes, and unresolved risks are recorded in the checkpoint report.
+- Compose verification commands, counts, exit codes, and unresolved risks are recorded in the checkpoint report;
+- `scripts/verify-cp5-acceptance.ps1` exits zero, exercising the conflict-only frontend gate and both evaluation modes.
+
+The conflict-only frontend and the hermetic and selected-provider evaluation gates are blocking closure requirements. They may not be reclassified as separate, non-blocking, post-closure slices; a checkpoint or deployment ledger that closes CP5 or authorizes active rollout without them contradicts this contract.
 
 ## Stop Conditions
 
