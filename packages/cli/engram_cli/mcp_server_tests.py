@@ -141,6 +141,45 @@ class McpContractTests(unittest.TestCase):
             feedback["inputSchema"]["properties"]["action"]["enum"],
         )
 
+    def test_tools_list_exposes_s1_filter_schema(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/list"}, build_tools()
+        )
+        tools = response["result"]["tools"]
+        search_props = tools[0]["inputSchema"]["properties"]
+        context_schema = tools[1]["inputSchema"]
+        context_props = context_schema["properties"]
+        observations_schema = tools[3]["inputSchema"]
+        observations_props = observations_schema["properties"]
+
+        self.assertEqual(
+            {"type": "array", "items": {"type": "string"}}, search_props["kinds"]
+        )
+        self.assertEqual(
+            {"type": "array", "items": {"type": "string"}}, context_props["kinds"]
+        )
+        self.assertEqual({"type": "integer"}, context_props["token_budget"])
+        self.assertEqual(["session_id"], context_schema["required"])
+
+        self.assertEqual({"type": "string"}, observations_props["observation_type"])
+        self.assertEqual({"type": "string"}, observations_props["session_id"])
+        self.assertEqual({"type": "integer"}, observations_props["offset"])
+        self.assertEqual([], observations_schema["required"])
+        self.assertEqual("string", observations_props["since"]["type"])
+        self.assertEqual("string", observations_props["until"]["type"])
+        self.assertEqual(
+            "ISO-8601 lower bound (inclusive) on ingestion time (created_at), "
+            "NOT the displayed observed_at. With delayed ingestion a returned "
+            "row's observed_at may fall outside this window.",
+            observations_props["since"]["description"],
+        )
+        self.assertEqual(
+            "ISO-8601 upper bound (exclusive) on ingestion time (created_at), "
+            "NOT the displayed observed_at. A row whose created_at equals until "
+            "is excluded.",
+            observations_props["until"]["description"],
+        )
+
     def test_tools_list_descriptions_direct_proactive_search(self) -> None:
         response = handle_request(
             {"jsonrpc": "2.0", "id": 12, "method": "tools/list"}, build_tools()
@@ -151,15 +190,15 @@ class McpContractTests(unittest.TestCase):
 
         self.assertEqual(
             descriptions["engram_search"],
-            "Step 1 - ALWAYS search project memory BEFORE starting any non-trivial task (bug fix, feature, refactor, debugging). Returns prior decisions, gotchas, incidents and architecture notes ranked by relevance. Call it when the user references past work ('did we', 'last time', 'as before'), names a subsystem, or reports an error you have not seen this session. Prefer short 2-4 word queries (symptom, component, error text).",
+            "Step 1 - ALWAYS search project memory BEFORE starting any non-trivial task (bug fix, feature, refactor, debugging). Returns prior decisions, gotchas, incidents and architecture notes ranked by relevance. Call it when the user references past work ('did we', 'last time', 'as before'), names a subsystem, or reports an error you have not seen this session. Prefer short 2-4 word queries (symptom, component, error text). Filter by kinds=[convention,decision] to fetch project conventions or decisions on a topic (e.g. gitlab workflow).",
         )
         self.assertEqual(
             descriptions["engram_observations"],
-            "Step 2 - list recent raw observations (prompts, tool activity, hook events) captured for the connected project. Use to corroborate a memory found via engram_search with ground-truth detail, or to audit what Engram captured.",
+            "Step 2 - list recent raw observations (prompts, tool activity, hook events) captured for the connected project. Use to corroborate a memory found via engram_search with ground-truth detail, or to audit what Engram captured. Time filters since/until bound ingestion time (created_at, until exclusive); results still display and sort by observed_at.",
         )
         self.assertEqual(
             descriptions["engram_context"],
-            "Re-request the memory context bundle that is injected at session start (recent and relevant approved memories for this project). Use after /clear or context compaction, or when the injected Engram context looks stale.",
+            "Re-request the memory context bundle that is injected at session start (recent and relevant approved memories for this project). Use after /clear or context compaction, or when the injected Engram context looks stale. Filter by kinds=[convention,decision] to fetch project conventions or decisions on a topic (e.g. gitlab workflow).",
         )
         self.assertEqual(
             descriptions["engram_memory_feedback"],

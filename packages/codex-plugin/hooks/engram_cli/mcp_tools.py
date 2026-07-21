@@ -7,7 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from engram_cli.commands import search_item_suffix, workspace_repository_url
+from engram_cli.commands import (
+    KINDS_ERROR_MESSAGE,
+    is_kinds_error_body,
+    observation_meta_line,
+    render_citations,
+    render_warnings,
+    search_item_suffix,
+    search_match_line,
+    workspace_repository_url,
+)
 from engram_cli.config import as_string, local_paths, read_json
 from engram_cli.http import Transport, get_json, post_json, urllib_transport
 
@@ -148,6 +157,9 @@ def search_memory(
             "limit": arguments.get("limit") or 5,
         },
     )
+    kinds = _optional_kinds(arguments)
+    if kinds is not None:
+        payload["kinds"] = kinds
     status, body = post_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -158,9 +170,14 @@ def search_memory(
     if status != 200:
         return _error_text(status, body)
 
+    warnings_block = render_warnings(body.get("warnings"))
     items = body.get("items")
     if not isinstance(items, list) or not items:
-        return "No memory matched the search."
+        message = "No memory matched the search."
+        if warnings_block:
+            return f"{message}\n{warnings_block}"
+
+        return message
 
     lines: list[str] = []
     for item in items:
@@ -170,7 +187,12 @@ def search_memory(
             f"[{item.get('citation')}] {item.get('title')} (memory_id={item.get('memory_id')})"
             f"{search_item_suffix(item)}"
         )
+        match_line = search_match_line(item)
+        if match_line:
+            lines.append(match_line)
         lines.append(f"  {item.get('body')}")
+    if warnings_block:
+        lines.append(warnings_block)
 
     return "\n".join(lines)
 
@@ -191,13 +213,19 @@ def fetch_context(
         {
             "agent_runtime": runtime.agent_runtime,
             "session_id": session_id,
-            "request_id": _new_request_id(arguments),
+            "request_id": f"mcp-{uuid.uuid4()}",
             "query": as_string(arguments.get("query")),
             "file_paths": arguments.get("file_paths") or [],
             "symbols": arguments.get("symbols") or [],
             "limit": arguments.get("limit") or 5,
         },
     )
+    kinds = _optional_kinds(arguments)
+    if kinds is not None:
+        payload["kinds"] = kinds
+    token_budget = _optional_token_budget(arguments)
+    if token_budget is not None:
+        payload["token_budget"] = token_budget
     status, body = post_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -210,7 +238,16 @@ def fetch_context(
 
     rendered = as_string(body.get("rendered_context"))
     if not rendered:
-        return "Engram returned no context for this session."
+        message = "Engram returned no context for this session."
+        warnings_block = render_warnings(body.get("warnings"))
+        if warnings_block:
+            return f"{message}\n{warnings_block}"
+
+        return message
+
+    citations = render_citations(body.get("items"))
+    if citations:
+        return f"{rendered}\n{citations}"
 
     return rendered
 
@@ -267,6 +304,13 @@ def list_observations(
         params["repository_url"] = runtime.repository_url
     if runtime.team_id:
         params["team_id"] = runtime.team_id
+    for name in ("observation_type", "session_id", "since", "until"):
+        value = _optional_string_param(arguments, name)
+        if value is not None:
+            params[name] = value
+    offset = _optional_offset(arguments)
+    if offset is not None:
+        params["offset"] = str(offset)
     status, body = get_json(
         transport=transport,
         server_url=runtime.server_url,
@@ -286,6 +330,9 @@ def list_observations(
         if not isinstance(item, dict):
             continue
         lines.append(f"[{item.get('observation_type')}] {item.get('title')}")
+        meta = observation_meta_line(item)
+        if meta:
+            lines.append(meta)
         body_text = as_string(item.get("body"))
         if body_text:
             lines.append(f"  {body_text}")
@@ -391,6 +438,46 @@ def _scope_payload(runtime: McpRuntime) -> dict[str, object]:
     return payload
 
 
+def _optional_kinds(arguments: dict[str, Any]) -> list[Any] | None:
+    value = arguments.get("kinds")
+    if value in (None, [], ""):
+        return None
+    if isinstance(value, list):
+        return value
+
+    raise ValueError("kinds must be an array of strings")
+
+
+def _optional_token_budget(arguments: dict[str, Any]) -> int | None:
+    value = arguments.get("token_budget")
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+
+    raise ValueError("token_budget must be an integer")
+
+
+def _optional_string_param(arguments: dict[str, Any], name: str) -> str | None:
+    value = arguments.get(name)
+    if isinstance(value, str):
+        return value or None
+    if value is None or (isinstance(value, (list, tuple, set, dict)) and not value):
+        return None
+
+    raise ValueError(f"{name} must be a string")
+
+
+def _optional_offset(arguments: dict[str, Any]) -> int | None:
+    value = arguments.get("offset")
+    if value is None:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value != 0 else None
+
+    raise ValueError("offset must be an integer")
+
+
 def _new_request_id(arguments: dict[str, Any]) -> str:
     provided = as_string(arguments.get("request_id"))
 
@@ -401,6 +488,9 @@ def _error_text(status: int, body: dict[str, object]) -> str:
     code = as_string(body.get("code")) or "error"
     if status == 404 and code == "project_not_found":
         return PROJECT_NOT_FOUND_MESSAGE
+
+    if is_kinds_error_body(body):
+        return KINDS_ERROR_MESSAGE
 
     detail = as_string(body.get("detail")) or "request failed"
 
