@@ -55,6 +55,15 @@ def test_bootstrap_agent_key_is_org_wide_with_agent_capabilities() -> None:
 
 
 @pytest.mark.django_db
+def test_bootstrap_agent_key_grants_mcp_read_and_propose_capabilities() -> None:
+    bootstrap_golden_path(RAW_KEY, agent_key=RAW_AGENT_KEY)
+
+    api_key = ApiKey.objects.get(key_hash=hash_api_key(RAW_AGENT_KEY))
+    capabilities = set(api_key.capability_links.values_list('capability__code', flat=True))
+    assert {'audit:read', 'memories:propose', 'memories:review'}.issubset(capabilities)
+
+
+@pytest.mark.django_db
 def test_bootstrap_creates_organization_scope_policies_for_auto_projects() -> None:
     result = bootstrap_golden_path(RAW_KEY, agent_key=RAW_AGENT_KEY)
 
