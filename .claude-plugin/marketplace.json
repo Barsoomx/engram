@@ -1,15 +1,22 @@
 {
   "name": "engram-marketplace",
-  "owner": { "name": "Engram" },
-  "metadata": { "description": "Engram agent memory plugins" },
+  "owner": {
+    "name": "Engram"
+  },
+  "metadata": {
+    "description": "Engram agent memory plugins"
+  },
   "plugins": [
     {
       "name": "engram",
       "source": "./packages/claude-plugin",
       "description": "Thin Engram hook adapter and MCP bridge for Claude Code.",
-      "version": "0.1.12",
+      "version": "0.1.13",
       "category": "Productivity",
-      "metadata": { "author": "Engram", "license": "MIT" }
+      "metadata": {
+        "author": "Engram",
+        "license": "MIT"
+      }
     }
   ]
 }
