@@ -214,3 +214,100 @@ def test_non_digest_memory_is_not_subject_to_predicate() -> None:
     assert memory.kind != 'digest'
     assert digest_visibility.proven_digest_memory(_reload(memory)) is True
     assert digest_visibility.digest_visibility_failure(_reload(memory)) is None
+
+
+@pytest.mark.django_db
+def test_proven_digest_without_retrieval_document_is_unproven() -> None:
+    digest_visibility = _load_digest_visibility()
+    organization, project = make_org_project('missing-document')
+    digest = build_proven_weekly_digest(
+        organization,
+        project,
+        schedule_key='weekly:missing-document',
+    )
+    unrelated = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Unrelated memory',
+        body='unrelated body',
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    RetrievalDocument.objects.filter(memory=digest).update(memory=unrelated)
+    digest = _reload(digest)
+
+    assert not RetrievalDocument.objects.filter(memory=digest).exists()
+    assert digest_visibility.digest_visibility_failure(digest) == _UNPROVEN
+    assert digest_visibility.proven_digest_memory(digest) is False
+    assert digest_visibility.unproven_digest_memory_ids([digest]) == {digest.id}
+
+
+@pytest.mark.django_db
+def test_digest_with_historical_only_retrieval_document_is_unproven() -> None:
+    digest_visibility = _load_digest_visibility()
+    organization, project = make_org_project('historical-document')
+    digest = build_proven_weekly_digest(
+        organization,
+        project,
+        schedule_key='weekly:historical-document',
+    )
+    document = RetrievalDocument.objects.select_related('memory_version').get(memory=digest)
+    current_body = 'current body without a current exact document'
+    current_version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=digest,
+        version=document.memory_version.version + 1,
+        body=current_body,
+        content_hash=hashlib.sha256(current_body.encode()).hexdigest(),
+    )
+    Memory.objects.filter(id=digest.id).update(
+        body=current_body,
+        current_version=current_version.version,
+    )
+    digest = _reload(digest)
+
+    assert document.memory_version_id != current_version.id
+    assert not RetrievalDocument.objects.filter(memory=digest, memory_version=current_version).exists()
+    assert digest_visibility.digest_visibility_failure(digest) == _UNPROVEN
+    assert digest_visibility.unproven_digest_memory_ids([digest]) == {digest.id}
+
+
+@pytest.mark.django_db
+def test_digest_with_foreign_memory_version_document_is_unproven() -> None:
+    digest_visibility = _load_digest_visibility()
+    organization, project = make_org_project('foreign-version-document')
+    digest = build_proven_weekly_digest(
+        organization,
+        project,
+        schedule_key='weekly:foreign-version-document',
+    )
+    foreign_body = 'body from a different memory version'
+    foreign_memory = Memory.objects.create(
+        organization=organization,
+        project=project,
+        title='Foreign memory',
+        body=foreign_body,
+        status=MemoryStatus.APPROVED,
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    foreign_version = MemoryVersion.objects.create(
+        organization=organization,
+        project=project,
+        memory=foreign_memory,
+        version=foreign_memory.current_version,
+        body=foreign_body,
+        content_hash=hashlib.sha256(foreign_body.encode()).hexdigest(),
+    )
+    document = RetrievalDocument.objects.get(memory=digest)
+    RetrievalDocument.objects.filter(id=document.id).update(
+        memory_version=foreign_version,
+        full_text=foreign_body,
+    )
+    document = RetrievalDocument.objects.select_related('memory_version').get(id=document.id)
+    digest = _reload(digest)
+
+    assert document.memory_id == digest.id
+    assert document.memory_version.memory_id != digest.id
+    assert digest_visibility.digest_visibility_failure(digest) == _UNPROVEN
+    assert digest_visibility.unproven_digest_memory_ids([digest]) == {digest.id}

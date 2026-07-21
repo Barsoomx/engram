@@ -1126,6 +1126,15 @@ def _evaluate_p6(project: Project, as_of: datetime) -> InvariantResult:
         project_id=project.id,
         as_of=as_of,
     )
+    if not findings:
+        return InvariantResult(
+            invariant_id=InvariantId.P6,
+            state=InvariantState.HEALTHY,
+            reason='candidate_decision_work_relation_consistent',
+            violation_count=0,
+            target_checkpoint='CP2/CP3/CP5',
+        )
+
     sample_ids = tuple(
         sorted(
             {f'candidate:{finding.entity_id}' for finding in findings},
@@ -1133,10 +1142,13 @@ def _evaluate_p6(project: Project, as_of: datetime) -> InvariantResult:
         )[:_SAMPLE_LIMIT]
     )
 
-    return _missing(
-        InvariantId.P6,
-        proxy_count=len(findings),
+    return InvariantResult(
+        invariant_id=InvariantId.P6,
+        state=InvariantState.VIOLATED,
+        reason='candidate_decision_work_relation_violated',
+        violation_count=len(findings),
         sample_ids=sample_ids,
+        target_checkpoint='CP2/CP3/CP5',
     )
 
 
@@ -1407,9 +1419,19 @@ def _p7_v1_document_is_valid(
     )
 
 
-def _p7_v1_audit_is_valid(memory: Memory, transition: MemoryTransition, document: RetrievalDocument) -> bool:
+def _p7_v1_audit_is_valid(
+    memory: Memory,
+    transition: MemoryTransition,
+    document: RetrievalDocument,
+    is_result_pointer: bool,
+) -> bool:
     if not transition.audit_event_id:
         return False
+
+    if is_result_pointer:
+        exact_id_key, exact_hash_key = 'result_exact_document_id', 'result_exact_projection_hash'
+    else:
+        exact_id_key, exact_hash_key = 'exact_document_id', 'exact_projection_hash'
 
     return AuditEvent.objects.filter(
         id=transition.audit_event_id,
@@ -1418,8 +1440,10 @@ def _p7_v1_audit_is_valid(memory: Memory, transition: MemoryTransition, document
         project_id=memory.project_id,
         metadata__schema='memory_transition/v1',
         metadata__transition_id=str(transition.id),
-        metadata__exact_document_id=str(document.id),
-        metadata__exact_projection_hash=document.exact_projection_hash,
+        **{
+            f'metadata__{exact_id_key}': str(document.id),
+            f'metadata__{exact_hash_key}': document.exact_projection_hash,
+        },
         metadata__provenance_hash=transition.provenance_hash,
     ).exists()
 
@@ -1524,14 +1548,13 @@ def _p7_v1_memory_is_coherent(memory: Memory) -> bool:
     )
     source_ok = _p7_v1_sources_are_valid(memory, version, sources)
     provenance_ok = transition.provenance_hash == memory_version_provenance_hash(sources)
-    pointer_document_id = (
-        transition.result_exact_document_id
-        if transition.result_memory_id == memory.id and transition.result_version_id == version.id
-        else transition.exact_document_id
-    )
+    affected_side = transition.memory_id == memory.id and transition.to_version_id == version.id
+    result_side = transition.result_memory_id == memory.id and transition.result_version_id == version.id
+    is_result_pointer = result_side and not affected_side
+    pointer_document_id = transition.result_exact_document_id if is_result_pointer else transition.exact_document_id
     document = RetrievalDocument.objects.filter(id=pointer_document_id, memory_version_id=version.id).first()
     document_ok = _p7_v1_document_is_valid(memory, transition, version, document, sources)
-    audit_ok = document is not None and _p7_v1_audit_is_valid(memory, transition, document)
+    audit_ok = document is not None and _p7_v1_audit_is_valid(memory, transition, document, is_result_pointer)
     inactive = bool(
         memory.stale
         or memory.refuted

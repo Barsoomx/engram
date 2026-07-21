@@ -536,125 +536,128 @@ export async function cancelImport(id: string): Promise<CancelImportResult> {
   return response.data;
 }
 
-export type MemoryReviewItemType = 'candidate' | 'memory';
-
-export type MemoryReviewSourceSummary = {
-  id: string;
-  title: string;
-  files_read: string[] | null;
-  files_modified: string[] | null;
+export type ConflictEvidenceEntry = {
+  reference_id: string | null;
+  source_kind: string | null;
+  observation_id: string | null;
+  summary: string;
 };
 
-export type MemoryReviewCitation = {
-  id: string;
-  link_type: string;
-  target: string;
-  label: string;
+export type ConflictCandidateClaim = {
+  title: string;
+  kind: string;
+  body_hash: string;
+  body?: string;
+  evidence?: ConflictEvidenceEntry[];
+};
+
+export type ConflictExistingClaim = ConflictCandidateClaim & {
+  memory_id: string;
+  version_id: string;
 };
 
 export type MemoryReviewItem = {
   id: string;
-  type: MemoryReviewItemType;
-  title: string;
-  body: string;
-  status: string;
-  current_version: number;
-  confidence: string | null;
-  visibility_scope: string;
-  team_id: string | null;
+  type: 'conflict';
+  state: 'open';
+  conflict_ids: string[];
   project_id: string;
-  evidence: unknown;
-  source_observation: MemoryReviewSourceSummary | null;
-  citations: MemoryReviewCitation[];
-  created_at: string;
+  team_id: string | null;
+  visibility_scope: string;
+  reason_code: string;
+  opened_at: string;
+  candidate_claim: ConflictCandidateClaim;
+  existing_claims: ConflictExistingClaim[];
 };
 
-export type MemoryReviewOrdering =
-  | 'confidence'
-  | '-confidence'
-  | 'created_at'
-  | '-created_at';
+export type ConflictResolutionAction =
+  | 'publish_candidate'
+  | 'merge_candidate'
+  | 'supersede_memory'
+  | 'reject_candidate';
+
+export type ConflictDecisionJudge = {
+  status: string;
+  reason: string;
+  provider_call_record_id: string | null;
+  policy_id: string | null;
+  policy_version: number | null;
+  provider: string | null;
+  model: string | null;
+};
+
+export type ConflictDecision = {
+  id: string;
+  work_id: string;
+  outcome: string;
+  reason_code: string;
+  target_memory_version_id: string | null;
+  transition_id: string | null;
+  conflict_id: string | null;
+  evidence_tier: string;
+  evidence_manifest_hash: string;
+  comparison_manifest_hash: string;
+  effective_scope: ConflictScope;
+  judge: ConflictDecisionJudge;
+};
+
+export type ConflictScope = {
+  project_id: string;
+  visibility_scope: string;
+  team_id: string | null;
+};
+
+export type ConflictApplicabilityTarget = ConflictScope & {
+  memory_id: string;
+  version_id: string;
+};
+
+export type ConflictRecord = {
+  id: string;
+  opened_transition_id: string | null;
+  decision_id: string | null;
+  evidence_hash: string;
+};
+
+export type MemoryConflictDetail = MemoryReviewItem & {
+  candidate_id: string;
+  etag: string;
+  resolution_actions: ConflictResolutionAction[];
+  conflicts: ConflictRecord[];
+  decision: ConflictDecision | null;
+  effective_applicability: {
+    verdict: string;
+    candidate: ConflictScope;
+    targets: ConflictApplicabilityTarget[];
+  };
+};
+
+export type MemoryReviewOrdering = 'opened_at' | '-opened_at';
 
 export type MemoryReviewListParams = ListParams & {
   team_id?: string;
   project_id?: string;
-  visibility_scope?: string;
-  confidence__gte?: string;
-  confidence__lte?: string;
-  status?: string;
-  age_days__gte?: number;
-  source_type?: string;
   ordering?: MemoryReviewOrdering;
-  page?: number;
+  cursor?: string;
 };
 
-export type MemoryReviewDiffSlice = {
-  version: number;
-  body: string;
-  created_at: string;
-};
-
-export type MemoryReviewDiff = {
-  from: MemoryReviewDiffSlice;
-  to: MemoryReviewDiffSlice;
-};
-
-export type MemoryReviewActionName =
-  | 'approve'
-  | 'edit'
-  | 'narrow'
-  | 'supersede'
-  | 'reject'
-  | 'archive'
-  | 'restore';
-
-export type MemoryReviewActionPayload = {
-  action: MemoryReviewActionName;
+export type ConflictResolvePayload = {
+  action: ConflictResolutionAction;
   reason: string;
-  body?: string;
   target_memory_id?: string;
+  merged_title?: string;
+  merged_body?: string;
 };
 
-export type MemoryReviewActionResult = {
-  action: MemoryReviewActionName;
-  candidate_id?: string;
-  memory_id?: string;
-  version?: number;
-  link_id?: string;
-};
-
-export type BulkArchiveMemoryReviewPayload = {
-  ids?: string[];
-  confidence__lte?: string;
-  project_id?: string;
-  team_id?: string;
-  reason: string;
-};
-
-export type BulkArchiveMemoryReviewResult = {
-  archived_count: number;
-  archived_ids: string[];
-};
-
-export type BulkReviewActionName = 'approve' | 'reject';
-
-export type BulkReviewActionOutcome = 'done' | 'invalid_state' | 'not_found';
-
-export type BulkReviewActionItemResult = {
+export type ConflictResolveResult = {
   id: string;
-  outcome: BulkReviewActionOutcome;
-};
-
-export type BulkReviewActionPayload = {
-  ids: string[];
-  action: BulkReviewActionName;
-  reason: string;
-};
-
-export type BulkReviewActionResult = {
-  results: BulkReviewActionItemResult[];
-  done_count: number;
-  skipped_count: number;
+  candidate_id: string;
+  state: string;
+  action: ConflictResolutionAction;
+  conflict_ids: string[];
+  transition_id: string;
+  memory_id: string | null;
+  version_id: string | null;
 };
 
 export async function listMemoryReview(
@@ -669,52 +672,27 @@ export async function listMemoryReview(
   return response.data;
 }
 
-export async function memoryReviewDiff(
+export async function getMemoryConflict(
   id: string,
-  fromVersion: number,
-  toVersion: number,
-): Promise<MemoryReviewDiff> {
+): Promise<MemoryConflictDetail> {
   const client = apiClient();
-  const response = await client.get<MemoryReviewDiff>(
-    `/v1/admin/memory-review/${id}/diff/`,
-    { params: { from_version: fromVersion, to_version: toVersion } },
+  const response = await client.get<MemoryConflictDetail>(
+    `/v1/admin/memory-review/${id}/`,
   );
 
   return response.data;
 }
 
-export async function memoryReviewAction(
+export async function resolveMemoryConflict(
   id: string,
-  payload: MemoryReviewActionPayload,
-): Promise<MemoryReviewActionResult> {
+  payload: ConflictResolvePayload,
+  ifMatch: string,
+): Promise<ConflictResolveResult> {
   const client = apiClient();
-  const response = await client.post<MemoryReviewActionResult>(
-    `/v1/admin/memory-review/${id}/action/`,
+  const response = await client.post<ConflictResolveResult>(
+    `/v1/admin/memory-review/${id}/resolve/`,
     payload,
-  );
-
-  return response.data;
-}
-
-export async function bulkArchiveMemoryReview(
-  payload: BulkArchiveMemoryReviewPayload,
-): Promise<BulkArchiveMemoryReviewResult> {
-  const client = apiClient();
-  const response = await client.post<BulkArchiveMemoryReviewResult>(
-    '/v1/admin/memory-review/bulk-archive/',
-    payload,
-  );
-
-  return response.data;
-}
-
-export async function bulkReviewAction(
-  payload: BulkReviewActionPayload,
-): Promise<BulkReviewActionResult> {
-  const client = apiClient();
-  const response = await client.post<BulkReviewActionResult>(
-    '/v1/admin/memory-review/bulk-action/',
-    payload,
+    { headers: { 'If-Match': ifMatch } },
   );
 
   return response.data;

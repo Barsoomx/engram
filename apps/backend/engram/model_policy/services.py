@@ -1140,7 +1140,10 @@ def default_base_url(provider: str) -> str:
     return 'https://api.openai.com/v1'
 
 
-def deepseek_thinking_override(provider: str, task_type: str) -> dict[str, object]:
+def deepseek_thinking_override(provider: str, task_type: str, response_kind: str) -> dict[str, object]:
+    if provider == 'deepseek' and response_kind == 'curation_decision_v1':
+        return {'thinking': {'type': 'enabled'}}
+
     if provider == 'deepseek' and task_type in ('curation', 'digest'):
         return {'thinking': {'type': 'disabled'}}
 
@@ -1175,7 +1178,7 @@ _MAX_TOKENS_BY_KIND = {
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
     'distill_reduce.v1': 8192,
-    'curation_decision_v1': 4096,
+    'curation_decision_v1': 16384,
 }
 _FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
 _CURATION_DECISION_OUTCOMES = (
@@ -1223,6 +1226,31 @@ _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
     'Only reference memory_version_id values and evidence tokens present in the input. '
     'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
     'must equal the top-level relation.'
+    ' Allowed outcome and relation combinations (any other combination is invalid): '
+    'publish_new with relation unrelated or compatible_distinct, target_memory_version_id null, '
+    'candidate evidence tier supported or corroborated and comparison_complete true; '
+    'merge_evidence with relation equivalent, a non-null target and both candidate and target evidence tiers '
+    'supported or corroborated; '
+    'revise_memory with relation candidate_revises, a non-null target, candidate evidence tier corroborated, '
+    'target evidence tier supported or corroborated and temporal_order candidate_newer used only when the '
+    'candidate evidence is clearly newer, which the system verifies; '
+    'supersede_memory with relation candidate_supersedes, a non-null target, candidate evidence tier '
+    'corroborated, target evidence tier supported or corroborated, temporal_order candidate_newer used only '
+    'when the candidate evidence is clearly newer, which the system verifies, and comparison_complete true; '
+    'reject_candidate with relation redundant, a non-null target and target evidence tier supported or '
+    'corroborated; '
+    'reject_candidate with relation unsupported, target null and the candidate having no supporting evidence, '
+    'evidence tier none; '
+    'open_conflict with relation mutually_incompatible, a non-null target, temporal_order unordered, both '
+    'candidate and target evidence tiers supported or corroborated, non-empty evidence refs on both sides, '
+    'comparison_complete true and applicability same. '
+    'The top-level relation describes the selected target; with a null target use unrelated, '
+    'compatible_distinct or unsupported. '
+    'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
+    'When comparison_complete is true, every shortlist comparison is unrelated or compatible_distinct and the '
+    'candidate evidence tier is supported or corroborated, choose publish_new with target null. '
+    'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
+    'candidate evidence.'
 )
 
 
@@ -1230,17 +1258,17 @@ _MEMORY_KIND_VALUES = ('decision', 'convention', 'gotcha', 'architecture', 'inci
 _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
     'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
     'The object must contain exactly these keys and no additional properties: '
-    'memories (array of at most 12 objects); '
+    'memories (array of at most 8 objects); '
     'no_signal_observation_ids (array of observation ids, unique, may be empty). '
     'Each memories entry must contain exactly these keys and no additional properties: '
     'title (non-blank string, at most 255 characters); '
-    'body (non-blank string, at most 3000 characters); '
+    'body (non-blank string, at most 2000 characters); '
     'confidence (a JSON number between 0 and 1, never a string); '
     'supporting_observation_ids (non-empty array of unique observation ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
     'Only use observation ids copied verbatim from the input observations. '
-    'Every input observation id must appear at least once across the memories supporting_observation_ids '
-    'and no_signal_observation_ids: none may be omitted, and no id may appear in both. '
+    'Put each observation id that supports a memory in that memory supporting_observation_ids, and list '
+    'observation ids that carry no durable signal in no_signal_observation_ids. '
     'The same observation id may support more than one memory.'
 )
 _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
@@ -1253,7 +1281,7 @@ _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'source_ids (non-empty array of unique draft ids); '
     f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
     'Only use draft ids copied verbatim from the input drafts. '
-    'Every input draft id must appear in the source_ids of at least one memories entry: none may be omitted. '
+    'Group each input draft id into the source_ids of the memory that consolidates it. '
     'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
     'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
 )
@@ -1321,12 +1349,12 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'properties': {
                 'memories': {
                     'type': 'array',
-                    'maxItems': 12,
+                    'maxItems': 8,
                     'items': {
                         'type': 'object',
                         'properties': {
                             'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
-                            'body': {'type': 'string', 'minLength': 1, 'maxLength': 3000},
+                            'body': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
                             'supporting_observation_ids': {
                                 'type': 'array',
@@ -1532,7 +1560,7 @@ class OpenAICompatibleGateway:
             prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
         extra: dict[str, object] = {}
-        extra.update(deepseek_thinking_override(policy.provider, policy.task_type))
+        extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
         extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
         started_at = time.monotonic()

@@ -11,7 +11,7 @@ def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
         or audit_model.objects.filter(event_type='MemoryConfirmed').exists()
     ):
         raise RuntimeError(
-            'cannot reverse 0041 while confirmation history exists '
+            'cannot reverse 0044 while confirmation history exists '
             '(dropping last_confirmed_at would orphan MemoryConfirmed receipts and '
             'silently resurrect decay on confirmed memories)'
         )
@@ -19,7 +19,7 @@ def _guard_reverse(apps: Apps, schema_editor: BaseDatabaseSchemaEditor) -> None:
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('core', '0040_curation_decision'),
+        ('core', '0043_curation_decision_evidence_context'),
     ]
 
     operations = [

@@ -60,9 +60,15 @@ class DecayMemoryConfidence:
         )
 
     def _decay_project(self, organization: Organization, project: Project) -> list[uuid.UUID]:
-        cutoff = timezone.now() - timedelta(days=settings.ENGRAM_CONFIDENCE_DECAY_MIN_AGE_DAYS)
+        now = timezone.now()
+        cutoff = now - timedelta(days=settings.ENGRAM_CONFIDENCE_DECAY_MIN_AGE_DAYS)
         step = settings.ENGRAM_CONFIDENCE_DECAY_STEP
         floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
+
+        decay_anchor = Greatest(
+            Coalesce('confidence_decayed_at', 'updated_at'),
+            Coalesce('last_confirmed_at', 'updated_at'),
+        )
 
         candidates = (
             Memory.objects.filter(
@@ -75,7 +81,7 @@ class DecayMemoryConfidence:
                 confidence__gt=floor,
             )
             .exclude(kind='digest')
-            .annotate(decay_anchor=Greatest('updated_at', Coalesce('last_confirmed_at', 'updated_at')))
+            .annotate(decay_anchor=decay_anchor)
             .filter(decay_anchor__lt=cutoff)
         )
 
@@ -84,7 +90,7 @@ class DecayMemoryConfidence:
             with transaction.atomic():
                 locked = (
                     Memory.objects.select_for_update()
-                    .annotate(decay_anchor=Greatest('updated_at', Coalesce('last_confirmed_at', 'updated_at')))
+                    .annotate(decay_anchor=decay_anchor)
                     .filter(
                         id=candidate.id,
                         status=MemoryStatus.APPROVED,
@@ -100,7 +106,8 @@ class DecayMemoryConfidence:
                     continue
 
                 locked.confidence = max(floor, locked.confidence - step).quantize(_CONFIDENCE_QUANTIZE)
-                locked.save(update_fields=['confidence', 'updated_at'])
+                locked.confidence_decayed_at = now
+                locked.save(update_fields=['confidence', 'confidence_decayed_at'])
                 decayed_ids.append(locked.id)
 
         return decayed_ids
