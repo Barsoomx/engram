@@ -473,16 +473,26 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
     )
 
 
-def test_curation_decision_prefix_lists_every_parser_identity_relation() -> None:
+def test_curation_decision_prefix_lists_every_mutating_identity_relation() -> None:
     from engram.memory.curation_judge import _IDENTITY_RELATIONS
 
     instructions = curation_schema_prompt_prefix('curation_decision_v1')
-    marker = 'carries an identity relation ('
+    marker = 'carries a mutating identity relation ('
     start = instructions.index(marker) + len(marker)
     end = instructions.index(')', start)
     listed = {relation.strip() for relation in instructions[start:end].split(',')}
 
-    assert listed == set(_IDENTITY_RELATIONS)
+    assert listed == set(_IDENTITY_RELATIONS) - {'redundant'}
+
+
+def test_curation_decision_prefix_routes_cross_visibility_redundant_to_rejection() -> None:
+    instructions = curation_schema_prompt_prefix('curation_decision_v1')
+
+    assert 'redundant with the candidate, choose outcome=reject_candidate' in instructions
+    condition, separator, fallback = instructions.partition('fall back to')
+    assert separator == 'fall back to'
+    assert 'no target is redundant' in condition
+    assert 'redundant' not in fallback.split('comparisons array', 1)[0]
 
 
 def test_curation_decision_schema_prefix_states_allowed_combination_table() -> None:
@@ -534,11 +544,13 @@ def test_curation_decision_schema_prefix_states_allowed_combination_table() -> N
         'Cross-visibility rule: the shortlist may include targets at a wider visibility than the candidate '
         '(for a team candidate, project-global targets have a different team_id). Never select such a '
         'cross-visibility target as target_memory_version_id for merge_evidence, revise_memory, '
-        'supersede_memory, or open_conflict. When a same-visibility target (same team_id as the candidate) '
-        'carries an identity relation (equivalent, candidate_revises, candidate_supersedes, '
-        'redundant, mutually_incompatible), act on that same-visibility target with its normal targeted outcome. '
-        'Only when no same-visibility target carries an identity relation, fall back to '
-        'outcome=publish_new, relation=compatible_distinct, reason_code=distinct_claim, '
+        'supersede_memory, or open_conflict. When any target at any visibility is redundant with the candidate, '
+        'choose outcome=reject_candidate, relation=redundant against that target instead of publishing a duplicate. '
+        'When a same-visibility target (same team_id as the candidate) carries a mutating identity relation '
+        '(equivalent, candidate_revises, candidate_supersedes, mutually_incompatible), act on that '
+        'same-visibility target with its normal targeted outcome. '
+        'Only when no target is redundant and no same-visibility target carries a mutating identity relation, '
+        'fall back to outcome=publish_new, relation=compatible_distinct, reason_code=distinct_claim, '
         'target_memory_version_id=null, and report the honest per-target relation (including '
         'mutually_incompatible against a cross-visibility target) only inside the comparisons array. '
         'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
