@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 
 import structlog
+from django.db import transaction
 from django.db.models import OuterRef, Subquery
 
 from engram.core.models import (
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowWork,
     WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.memory.aware_time import require_aware
+from engram.memory.work_dispatch import queue_work_attempt
 
 logger = structlog.get_logger(__name__)
 
@@ -92,3 +98,64 @@ def select_targets(
         )
         for work in works[:limit]
     ]
+
+
+def reset_work_for_redrive(work: WorkflowWork) -> None:
+    work.execution_state = WorkflowWorkExecutionState.READY
+    work.failure_streak = 0
+    work.next_retry_at = None
+    work.blocked_configuration_fingerprint = ''
+    work.lease_owner = ''
+    work.lease_expires_at = None
+    work.heartbeat_at = None
+    work.save(update_fields=list(_RESET_FIELDS))
+
+    return
+
+
+def redrive_target(
+    *,
+    work_id: uuid.UUID,
+    failure_codes: tuple[str, ...],
+    now: datetime,
+) -> uuid.UUID | None:
+    require_aware(now, field='now')
+
+    with transaction.atomic():
+        try:
+            work = WorkflowWork.objects.select_for_update().get(
+                id=work_id,
+                work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                contract_version=1,
+                disposition=WorkflowWorkDisposition.REQUIRED,
+            )
+        except WorkflowWork.DoesNotExist:
+            return None
+
+        latest = (
+            WorkflowRun.objects.filter(work_id=work.id, execution_contract_version=1)
+            .order_by('-created_at', '-id')
+            .first()
+        )
+        if latest is None or latest.status != WorkflowRunStatus.FAILED or latest.failure_code not in failure_codes:
+            return None
+
+        prior_state = work.execution_state
+        reset_work_for_redrive(work)
+        run = queue_work_attempt(
+            work_id=work.id,
+            now=now,
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        )
+        if run.dispatched_at != now:
+            return None
+
+        logger.info(
+            'distill_backfill_redriven',
+            work_id=str(work.id),
+            session_id=str(work.subject_id),
+            run_id=str(run.id),
+            prior_state=prior_state,
+        )
+
+        return run.id

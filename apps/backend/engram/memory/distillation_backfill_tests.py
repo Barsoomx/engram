@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from django.utils import timezone
+from django_celery_outbox.models import CeleryOutbox
 
 from engram.core.models import (
     AgentSession,
@@ -12,12 +13,15 @@ from engram.core.models import (
     Organization,
     Project,
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowWork,
+    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory.distillation_backfill import (
     DEFAULT_FAILURE_CODES,
+    redrive_target,
     select_targets,
 )
 from engram.memory.observation_work_tests import create_scope
@@ -35,6 +39,8 @@ SessionScope = tuple[Organization, Project, AgentSession]
 
 _LEASE = timedelta(seconds=720)
 _RETRY_STEP = timedelta(seconds=1800)
+_DISTILL_TASK = 'engram.memory.distill_session_work_v1'
+_STREAK_LIMIT = 12
 
 
 def _seed(session: AgentSession, *, sequence: int, event_type: str = 'post_tool_use') -> Observation:
@@ -179,3 +185,145 @@ def test_select_targets_scope_and_limit() -> None:
         for target in select_targets(failure_codes=DEFAULT_FAILURE_CODES, limit=100)
     }
     assert WorkflowRun.objects.filter(work_id=work_2.id, status=WorkflowRunStatus.FAILED).exists()
+
+
+@pytest.mark.django_db
+def test_redrive_resets_terminal_failure_and_dispatches(f_scope: SessionScope) -> None:
+    now = timezone.now()
+    work = _current_work(f_scope, sequence=1)
+    _fail_work(
+        work,
+        code='provider_output_malformed',
+        failure_class='provider_transient',
+        times=_STREAK_LIMIT,
+        now=now,
+    )
+    assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    CeleryOutbox.objects.all().delete()
+
+    run_id = redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+
+    assert isinstance(run_id, uuid.UUID)
+    reloaded = WorkflowWork.objects.get(id=work.id)
+    assert reloaded.execution_state == WorkflowWorkExecutionState.READY
+    assert reloaded.failure_streak == 0
+    assert reloaded.next_retry_at is None
+    assert reloaded.blocked_configuration_fingerprint == ''
+    assert reloaded.lease_owner == ''
+    assert reloaded.lease_expires_at is None
+    assert reloaded.heartbeat_at is None
+    queued = WorkflowRun.objects.get(id=run_id)
+    assert queued.status == WorkflowRunStatus.QUEUED
+    assert queued.execution_contract_version == 1
+    assert queued.origin == WorkflowRunOrigin.RECONCILIATION
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
+
+
+@pytest.mark.django_db
+def test_redrive_clears_blocked_config(f_scope: SessionScope) -> None:
+    now = timezone.now()
+    work = _current_work(f_scope, sequence=1)
+    _fail_work(
+        work,
+        code='provider_account_unavailable',
+        failure_class=CONFIGURATION,
+        times=1,
+        now=now,
+    )
+    blocked = WorkflowWork.objects.get(id=work.id)
+    assert blocked.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert blocked.blocked_configuration_fingerprint != ''
+    CeleryOutbox.objects.all().delete()
+
+    run_id = redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+
+    assert isinstance(run_id, uuid.UUID)
+    reloaded = WorkflowWork.objects.get(id=work.id)
+    assert reloaded.execution_state == WorkflowWorkExecutionState.READY
+    assert reloaded.blocked_configuration_fingerprint == ''
+    assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
+
+
+@pytest.mark.django_db
+def test_redrive_preserves_identity_fields(f_scope: SessionScope) -> None:
+    now = timezone.now()
+    work = _current_work(f_scope, sequence=1)
+    _fail_work(
+        work,
+        code='provider_output_malformed',
+        failure_class='provider_transient',
+        times=1,
+        now=now,
+    )
+    before = WorkflowWork.objects.get(id=work.id)
+    fencing_token = before.fencing_token
+    contract_version = before.contract_version
+    input_fingerprint = before.input_fingerprint
+    input_snapshot = before.input_snapshot
+    disposition = before.disposition
+    subject_id = before.subject_id
+    team_id = before.team_id
+
+    redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+
+    after = WorkflowWork.objects.get(id=work.id)
+    assert after.fencing_token == fencing_token
+    assert after.contract_version == contract_version
+    assert after.input_fingerprint == input_fingerprint
+    assert after.input_snapshot == input_snapshot
+    assert after.disposition == disposition
+    assert after.subject_id == subject_id
+    assert after.team_id == team_id
+
+
+@pytest.mark.django_db
+def test_redrive_idempotent_second_call_skips(f_scope: SessionScope) -> None:
+    now = timezone.now()
+    work = _current_work(f_scope, sequence=1)
+    _fail_work(
+        work,
+        code='provider_output_malformed',
+        failure_class='provider_transient',
+        times=1,
+        now=now,
+    )
+
+    first = redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+    assert isinstance(first, uuid.UUID)
+    queued_count = WorkflowRun.objects.filter(
+        work_id=work.id,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    ).count()
+
+    second = redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+
+    assert second is None
+    assert (
+        WorkflowRun.objects.filter(
+            work_id=work.id,
+            status=WorkflowRunStatus.QUEUED,
+            execution_contract_version=1,
+        ).count()
+        == queued_count
+    )
+
+
+@pytest.mark.django_db
+def test_redrive_reset_reclaimable(f_scope: SessionScope) -> None:
+    now = timezone.now()
+    work = _current_work(f_scope, sequence=1)
+    _fail_work(
+        work,
+        code='provider_output_malformed',
+        failure_class='provider_transient',
+        times=_STREAK_LIMIT,
+        now=now,
+    )
+    redrive_target(work_id=work.id, failure_codes=DEFAULT_FAILURE_CODES, now=timezone.now())
+    token_before = WorkflowWork.objects.get(id=work.id).fencing_token
+
+    claimed = _claim(work, now=timezone.now())
+
+    assert claimed.claim is not None
+    assert claimed.claim.fencing_token == token_before + 1
