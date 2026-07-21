@@ -59,9 +59,24 @@ def _draft(index: int, *, stage: str = 'extract-stage') -> ReductionDraft:
     )
 
 
+def _merge_all_provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
+    return {
+        'memories': [
+            {
+                'title': 'merged',
+                'body': 'merged body',
+                'confidence': 0.9,
+                'source_refs': list(range(1, len(batch.input_refs) + 1)),
+            }
+        ]
+    }
+
+
 def test_reduction_state_requires_typed_extraction_stages() -> None:
     with pytest.raises(ReductionContractError):
-        derive_first_pending_reduction_target(({},), (), reduction_target=1, prompt_budget=1000)
+        derive_first_pending_reduction_target(
+            ({},), (), reduction_target_floor=1, output_budget_tokens=2867, generation=0
+        )
 
 
 def test_reduction_state_rejects_untyped_stage_adapters() -> None:
@@ -69,8 +84,9 @@ def test_reduction_state_rejects_untyped_stage_adapters() -> None:
         derive_first_pending_reduction_target(
             ({'status': 'completed', 'outputs': []},),
             (),
-            reduction_target=1,
-            prompt_budget=1000,
+            reduction_target_floor=1,
+            output_budget_tokens=2867,
+            generation=0,
         )
 
 
@@ -79,40 +95,55 @@ def test_reduction_state_rejects_legacy_status_values() -> None:
         derive_first_pending_reduction_target(
             (object(),),
             (),
-            reduction_target=1,
-            prompt_budget=1000,
+            reduction_target_floor=1,
+            output_budget_tokens=2867,
+            generation=0,
         )
 
 
 def test_final_reduction_requires_explicit_accepted_stage_sequence() -> None:
     with pytest.raises(TypeError):
-        derive_final_reduction_drafts((), reduction_target=1)  # type: ignore[call-arg]
+        derive_final_reduction_drafts(  # type: ignore[call-arg]
+            (), reduction_target_floor=1, output_budget_tokens=2867, generation=0
+        )
 
 
-def test_multilevel_reduction_covers_every_leaf_and_preserves_anchor_union() -> None:
+def test_reduce_multilevel_pass_through_covers_every_leaf() -> None:
     leaves = [_draft(i) for i in range(5)]
-    calls: list[tuple[str, ...]] = []
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=5734,
+        generation=0,
+        provider=_merge_all_provider,
+    )
+
+    assert len(output) <= 2
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
+    assert {anchor for draft in output for anchor in draft.anchor_ids} == {f'anchor-{i}' for i in range(5)}
+    assert {stage for draft in output for stage in draft.source_stage_ids} == {'extract-stage'}
+
+
+def test_reduce_multilevel_terminates_on_no_shrink_without_provider_call() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    calls: list[ReductionBatch] = []
 
     def provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
-        calls.append(tuple(ref.draft_id for ref in batch.input_refs))
-        return {
-            'memories': [
-                {
-                    'title': 'merged',
-                    'body': 'merged body',
-                    'confidence': 0.9,
-                    'source_ids': [ref.draft_id for ref in batch.input_refs],
-                }
-            ]
-        }
+        calls.append(batch)
 
-    output = reduce_multilevel(leaves, reduction_target=1, prompt_budget=500, provider=provider)
+        return {'memories': []}
 
-    assert len(calls) == 3
-    assert len(output) == 1
-    assert set(output[0].source_ids) == {f'obs-{i}' for i in range(5)}
-    assert set(output[0].anchor_ids) == {f'anchor-{i}' for i in range(5)}
-    assert set(output[0].source_stage_ids) == {'extract-stage'}
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=100,
+        generation=0,
+        provider=provider,
+    )
+
+    assert calls == []
+    assert len(output) == 5
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
 
 
 @pytest.mark.parametrize(
@@ -120,13 +151,19 @@ def test_multilevel_reduction_covers_every_leaf_and_preserves_anchor_union() -> 
     [
         {'memories': []},
         {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_ids': ['foreign']}]},
-        {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_ids': []}]},
+        {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_refs': []}]},
     ],
 )
-def test_nonshrinking_or_incomplete_reduction_is_retryable_not_union_fallback(payload: Any) -> None:
+def test_reduce_multilevel_raises_on_malformed_provider_output(payload: Any) -> None:
     leaves = [_draft(0), _draft(1)]
     with pytest.raises(ReductionContractError):
-        reduce_multilevel(leaves, reduction_target=1, prompt_budget=10000, provider=lambda _batch: payload)
+        reduce_multilevel(
+            leaves,
+            reduction_target_floor=1,
+            output_budget_tokens=5734,
+            generation=0,
+            provider=lambda _batch: payload,
+        )
 
 
 def test_manifest_and_batches_are_deterministic_and_singletons_are_carried() -> None:
@@ -275,7 +312,9 @@ def test_parse_reduction_output_allows_passthrough_without_forced_shrink() -> No
 
 
 def test_final_drafts_wait_until_all_targets_accepted() -> None:
-    assert derive_final_reduction_drafts((), (), reduction_target=2) == ()
+    assert (
+        derive_final_reduction_drafts((), (), reduction_target_floor=2, output_budget_tokens=2867, generation=0) == ()
+    )
 
 
 def test_reduction_levels_start_at_one() -> None:
@@ -304,27 +343,21 @@ def test_normalize_output_strictly_parses_and_canonicalizes_confidence() -> None
 
 def test_accepted_replay_uses_recomputed_batch_identity_not_durable_target_key() -> None:
     with pytest.raises(ReductionContractError):
-        derive_first_pending_reduction_target(({},), ({},), reduction_target=1, prompt_budget=10000)
+        derive_first_pending_reduction_target(
+            ({},), ({},), reduction_target_floor=1, output_budget_tokens=5734, generation=0
+        )
 
 
 def test_final_derivation_replays_singleton_carry_between_accepted_levels() -> None:
     leaves = [_draft(0), _draft(1), _draft(2)]
     output = reduce_multilevel(
         leaves,
-        reduction_target=2,
-        prompt_budget=350,
-        provider=lambda batch: {
-            'memories': [
-                {
-                    'title': 'merged',
-                    'body': 'body',
-                    'confidence': 0.9,
-                    'source_ids': [ref.draft_id for ref in batch.input_refs],
-                }
-            ]
-        },
+        reduction_target_floor=1,
+        output_budget_tokens=5734,
+        generation=0,
+        provider=_merge_all_provider,
     )
-    assert len(output) == 2
+    assert len(output) <= 1
 
 
 def test_provider_stage_target_has_reduction_shape_and_manifest() -> None:

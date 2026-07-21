@@ -409,7 +409,12 @@ def _materialize_reduced(batch: ReductionBatch, parsed: ReductionOutput) -> tupl
 
 
 def reduce_multilevel(
-    drafts: Sequence[ReductionDraft], *, reduction_target: int, prompt_budget: int, provider: Provider
+    drafts: Sequence[ReductionDraft],
+    *,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
+    provider: Provider,
 ) -> tuple[ReductionDraft, ...]:
     if any(not isinstance(draft, ReductionDraft) for draft in drafts):
         raise ReductionContractError('reduction drafts must be typed ReductionDraft instances')
@@ -418,16 +423,15 @@ def reduce_multilevel(
         state = _evaluate_draft_reduction_state(
             tuple(drafts),
             accepted,
-            reduction_target=reduction_target,
-            prompt_budget=prompt_budget,
+            reduction_target_floor=reduction_target_floor,
+            output_budget_tokens=output_budget_tokens,
+            generation=generation,
         )
         if state.final is not None:
             return state.final
         if state.pending is None:
             raise ReductionContractError('reduction state is incomplete')
-        parsed = parse_reduction_output(
-            provider(state.pending), state.pending.input_drafts, reduction_target=reduction_target
-        )
+        parsed = parse_reduction_output(provider(state.pending), state.pending.input_drafts)
         accepted.append(
             _AcceptedReduction(
                 state.pending.level,
@@ -610,25 +614,27 @@ def _evaluate_draft_reduction_state(
     initial_drafts: tuple[ReductionDraft, ...],
     accepted_rows: Sequence[_AcceptedReduction],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> _ReductionState:
-    if reduction_target <= 0 or prompt_budget <= 0:
+    if reduction_target_floor <= 0 or output_budget_tokens <= 0:
         return _ReductionState((), None, ())
     if len({row.batch_key for row in accepted_rows}) != len(accepted_rows):
         raise ReductionContractError('accepted reduction identities are duplicate')
     accepted_by_key = {row.batch_key: row for row in accepted_rows}
+    target = effective_reduction_target(len(initial_drafts), reduction_target_floor)
     current = initial_drafts
-    if len(current) <= reduction_target:
+    if len(current) <= target:
         return _ReductionState(current, None, current)
-    level = 1
-    while len(current) > reduction_target:
-        batches = build_reduction_batches(
-            current,
-            reduction_target=reduction_target,
-            prompt_budget=prompt_budget,
-            level=level,
-        )
+    budget = output_budget_tokens >> generation
+    max_fanin = max_reduction_fanin(budget)
+    level_base = generation * _GENERATION_LEVEL_STRIDE
+    for tree_level in range(1, _MAX_TREE_LEVELS + 1):
+        if len(current) <= target:
+            break
+        level = level_base + tree_level
+        batches = build_reduction_batches(current, max_fanin=max_fanin, level=level)
         next_level: list[ReductionDraft] = []
         for batch in batches:
             if not batch.provider_required:
@@ -638,10 +644,10 @@ def _evaluate_draft_reduction_state(
             if accepted is None:
                 return _ReductionState(current, batch, None)
             next_level.extend(_expand_reduced_drafts(accepted.drafts, batch.input_drafts))
-        if len(next_level) >= len(current):
-            raise ReductionContractError('reduction level did not shrink')
+        if len(next_level) == len(current):
+            return _ReductionState(current, None, current)
         current = tuple(next_level)
-        level += 1
+
     return _ReductionState(current, None, current)
 
 
@@ -665,8 +671,9 @@ def _evaluate_reduction_state(
     extraction_stages: Sequence[DistillationStage],
     accepted_stages: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> _ReductionState:
     from engram.core.models import DistillationStageKind, DistillationStageStatus
 
@@ -693,8 +700,9 @@ def _evaluate_reduction_state(
     return _evaluate_draft_reduction_state(
         current,
         accepted_rows,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     )
 
 
@@ -702,14 +710,16 @@ def derive_first_pending_reduction_target(
     extraction_targets: Sequence[DistillationStage],
     accepted_targets: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> ReductionBatch | None:
     return _evaluate_reduction_state(
         extraction_targets,
         accepted_targets,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     ).pending
 
 
@@ -721,15 +731,18 @@ def derive_final_reduction_drafts(
     extraction_targets: Sequence[DistillationStage],
     accepted_targets: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int = 120_000,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> tuple[ReductionDraft, ...]:
     result = _evaluate_reduction_state(
         extraction_targets,
         accepted_targets,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     )
+
     return result.final or ()
 
 
