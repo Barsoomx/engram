@@ -1,13 +1,27 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import parse_qs, urlsplit
 
-from engram_cli import mcp_tools
+from engram_cli import commands, mcp_tools
+
+
+def query_params(url: str) -> dict[str, list[str]]:
+    return parse_qs(urlsplit(url).query)
+
+
+def cli_error_text(body: dict) -> str:
+    error = commands.error_from_body(body, "http_error")
+    stream = io.StringIO()
+    commands.emit_error(stream, error)
+
+    return stream.getvalue()
 
 
 class StubTransport:
@@ -296,6 +310,119 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("[c-1] T (memory_id=m-1)", text)
         self.assertNotIn("garbage", text)
 
+    def test_search_renders_match_line_reason_and_terms(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "exact match: gitlab",
+                        "matched_terms": ["gitlab", "workflow"],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  match: exact match: gitlab | terms: gitlab, workflow", text)
+
+    def test_search_renders_filter_only_match_without_terms(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "filter-only authorized memory",
+                        "matched_terms": [],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  match: filter-only authorized memory", text)
+        self.assertNotIn("| terms:", text)
+
+    def test_search_renders_terms_only_without_match_prefix(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "citation": "M1",
+                        "title": "T",
+                        "body": "B",
+                        "memory_id": "m-1",
+                        "inclusion_reason": "",
+                        "matched_terms": ["gitlab", "workflow"],
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("  terms: gitlab, workflow", text)
+        self.assertNotIn("match:", text)
+
+    def test_search_renders_warnings_block(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {"citation": "M1", "title": "T", "body": "B", "memory_id": "m-1"}
+                ],
+                "warnings": [
+                    {
+                        "code": "stale_match",
+                        "message": "stale memory matched",
+                        "memory_id": "m-1",
+                    }
+                ],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("Warnings:", text)
+        self.assertIn("  [stale_match] stale memory matched (memory_id=m-1)", text)
+
+    def test_search_renders_no_warnings_block_when_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {"citation": "M1", "title": "T", "body": "B", "memory_id": "m-1"}
+                ],
+                "warnings": [],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertNotIn("Warnings:", text)
+
+    def test_search_empty_items_still_renders_warnings(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [],
+                "warnings": [{"code": "stale_match", "message": "stale"}],
+            }
+        )
+        text = mcp_tools.search_memory({"query": "x"}, self.config_dir, transport)
+
+        self.assertIn("No memory matched the search.", text)
+        self.assertIn("Warnings:", text)
+        self.assertLess(
+            text.index("No memory matched the search."), text.index("Warnings:")
+        )
+
     def test_search_uses_repository_url_when_no_project(self) -> None:
         self.write_local_config(project_id="")
         transport = StubTransport(body={"items": []})
@@ -328,6 +455,137 @@ class McpToolsTests(unittest.TestCase):
         self.assertEqual("Engram call failed: HTTP 403 forbidden: denied", text)
         self.assertNotIn("egk_file_key", text)
 
+    def test_search_sends_kinds_when_non_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.search_memory(
+            {"query": "auth", "kinds": ["gotcha", "decision"]},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(["gotcha", "decision"], transport.calls[0][3]["kinds"])
+
+    def test_search_omits_kinds_when_absent_or_empty(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"query": "auth"},
+            {"query": "auth", "kinds": []},
+            {"query": "auth", "kinds": None},
+        ):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.search_memory(arguments, self.config_dir, transport)
+
+            self.assertNotIn("kinds", transport.calls[0][3])
+
+    def test_search_raises_on_bare_string_kinds(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.search_memory(
+                {"query": "auth", "kinds": "convention"},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_context_sends_kinds_when_non_empty(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "kinds": ["convention"]},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(["convention"], transport.calls[0][3]["kinds"])
+
+    def test_context_omits_kinds_when_absent_or_empty(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"session_id": "s"},
+            {"session_id": "s", "kinds": []},
+            {"session_id": "s", "kinds": None},
+        ):
+            transport = StubTransport(body={"rendered_context": "bundle"})
+            mcp_tools.fetch_context(arguments, self.config_dir, transport)
+
+            self.assertNotIn("kinds", transport.calls[0][3])
+
+    def test_context_raises_on_bare_string_kinds(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.fetch_context(
+                {"session_id": "s", "kinds": "convention"},
+                self.config_dir,
+                StubTransport(body={"rendered_context": "bundle"}),
+            )
+
+    def test_context_sends_token_budget_when_int(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "token_budget": 1200},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertEqual(1200, transport.calls[0][3]["token_budget"])
+
+    def test_context_forwards_zero_token_budget(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "token_budget": 0},
+            self.config_dir,
+            transport,
+        )
+
+        payload = transport.calls[0][3]
+        self.assertIn("token_budget", payload)
+        self.assertEqual(0, payload["token_budget"])
+
+    def test_context_omits_token_budget_when_none(self) -> None:
+        self.write_local_config()
+        for arguments in (
+            {"session_id": "s"},
+            {"session_id": "s", "token_budget": None},
+        ):
+            transport = StubTransport(body={"rendered_context": "bundle"})
+            mcp_tools.fetch_context(arguments, self.config_dir, transport)
+
+            self.assertNotIn("token_budget", transport.calls[0][3])
+
+    def test_context_raises_on_bool_or_string_token_budget(self) -> None:
+        self.write_local_config()
+        for value in (True, "5"):
+            with self.assertRaises(ValueError):
+                mcp_tools.fetch_context(
+                    {"session_id": "s", "token_budget": value},
+                    self.config_dir,
+                    StubTransport(body={"rendered_context": "bundle"}),
+                )
+
+    def test_context_always_mints_fresh_request_id(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"rendered_context": "bundle"})
+        mcp_tools.fetch_context(
+            {"session_id": "s", "request_id": "fixed-1", "kinds": ["convention", "gotcha"]},
+            self.config_dir,
+            transport,
+        )
+        mcp_tools.fetch_context(
+            {"session_id": "s", "request_id": "fixed-1", "kinds": ["gotcha"]},
+            self.config_dir,
+            transport,
+        )
+
+        first = transport.calls[0][3]["request_id"]
+        second = transport.calls[1][3]["request_id"]
+        self.assertTrue(first.startswith("mcp-"))
+        self.assertTrue(second.startswith("mcp-"))
+        self.assertNotEqual("fixed-1", first)
+        self.assertNotEqual("fixed-1", second)
+        self.assertNotEqual(first, second)
+
     def test_context_requires_session_id(self) -> None:
         text = mcp_tools.fetch_context({}, self.config_dir, StubTransport())
 
@@ -344,6 +602,118 @@ class McpToolsTests(unittest.TestCase):
         payload = transport.calls[0][3]
         self.assertEqual("sess-1", payload["session_id"])
         self.assertTrue(payload["request_id"].startswith("mcp-"))
+
+    def _context_body(self, item: dict, rendered: str = "ctx") -> dict:
+        return {"rendered_context": rendered, "items": [item]}
+
+    def test_context_citation_renders_kind_and_confidence(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "convention",
+                    "confidence": "0.920",
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("ctx", text)
+        self.assertIn("Citations:", text)
+        self.assertIn("  [M1] memory_id=abc-123 kind=convention confidence=0.920", text)
+
+    def test_context_citation_omits_both_when_absent(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {"citation": "M1", "memory_id": "abc-123", "kind": "", "confidence": None}
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123", text)
+        self.assertNotIn("kind=", text)
+        self.assertNotIn("confidence=", text)
+
+    def test_context_citation_kind_only(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "gotcha",
+                    "confidence": None,
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123 kind=gotcha", text)
+        self.assertNotIn("confidence=", text)
+
+    def test_context_citation_confidence_only(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body=self._context_body(
+                {
+                    "citation": "M1",
+                    "memory_id": "abc-123",
+                    "kind": "",
+                    "confidence": "0.780",
+                }
+            )
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("  [M1] memory_id=abc-123 confidence=0.780", text)
+        self.assertNotIn("kind=", text)
+
+    def test_context_empty_items_renders_bundle_verbatim(self) -> None:
+        self.write_local_config()
+        bundle = "# Engram context\n\nNo approved memory matched this request."
+        transport = StubTransport(body={"rendered_context": bundle, "items": []})
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertEqual(bundle, text)
+        self.assertNotIn("Citations:", text)
+        self.assertNotIn("Warnings:", text)
+
+    def test_context_non_empty_path_does_not_add_warnings_block(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "rendered_context": "ctx",
+                "items": [{"citation": "M1", "memory_id": "abc-123"}],
+                "warnings": [{"code": "stale_match", "message": "x"}],
+            }
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertNotIn("Warnings:", text)
+
+    def test_context_empty_render_appends_quarantine_warning(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "rendered_context": "",
+                "items": [],
+                "warnings": [
+                    {"code": "context_bundle_digest_visibility_unproven"}
+                ],
+            }
+        )
+        text = mcp_tools.fetch_context({"session_id": "s"}, self.config_dir, transport)
+
+        self.assertIn("Engram returned no context for this session.", text)
+        self.assertIn("  [context_bundle_digest_visibility_unproven]", text)
+        self.assertNotIn("Citations:", text)
+        self.assertNotIn("None", text)
+        self.assertLess(
+            text.index("Engram returned no context"), text.index("Warnings:")
+        )
 
     def test_memory_version_renders_current_version_fields(self) -> None:
         self.write_local_config()
@@ -422,6 +792,148 @@ class McpToolsTests(unittest.TestCase):
         self.assertIn("/v1/observations/", url)
         self.assertIn("limit=3", url)
         self.assertIsNone(payload)
+
+    def test_observations_forwards_string_filters(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations(
+            {
+                "observation_type": "user_prompt",
+                "session_id": "sess-9",
+                "since": "2026-07-18T00:00:00+00:00",
+                "until": "2026-07-19T00:00:00+00:00",
+            },
+            self.config_dir,
+            transport,
+        )
+
+        params = query_params(transport.calls[0][1])
+        self.assertEqual(["user_prompt"], params["observation_type"])
+        self.assertEqual(["sess-9"], params["session_id"])
+        self.assertEqual(["2026-07-18T00:00:00+00:00"], params["since"])
+        self.assertEqual(["2026-07-19T00:00:00+00:00"], params["until"])
+
+    def test_observations_omits_string_filters_when_absent(self) -> None:
+        self.write_local_config()
+        for absent in (None, "", [], {}, ()):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.list_observations(
+                {
+                    "observation_type": absent,
+                    "session_id": absent,
+                    "since": absent,
+                    "until": absent,
+                },
+                self.config_dir,
+                transport,
+            )
+
+            params = query_params(transport.calls[0][1])
+            self.assertNotIn("observation_type", params)
+            self.assertNotIn("session_id", params)
+            self.assertNotIn("since", params)
+            self.assertNotIn("until", params)
+
+    def test_observations_forwards_offset_when_non_zero(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(body={"items": []})
+        mcp_tools.list_observations({"offset": 5}, self.config_dir, transport)
+
+        self.assertEqual(["5"], query_params(transport.calls[0][1])["offset"])
+
+    def test_observations_omits_offset_when_zero_or_absent(self) -> None:
+        self.write_local_config()
+        for arguments in ({"offset": 0}, {"offset": None}, {}):
+            transport = StubTransport(body={"items": []})
+            mcp_tools.list_observations(arguments, self.config_dir, transport)
+
+            self.assertNotIn("offset", query_params(transport.calls[0][1]))
+
+    def test_observations_raises_on_non_string_observation_type(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"observation_type": ["tool_use"]},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_session_id(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"session_id": 123},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_since(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"since": 123},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_non_string_until(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"until": ["x"]},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_raises_on_bool_offset(self) -> None:
+        self.write_local_config()
+        with self.assertRaises(ValueError):
+            mcp_tools.list_observations(
+                {"offset": True},
+                self.config_dir,
+                StubTransport(body={"items": []}),
+            )
+
+    def test_observations_render_includes_meta_line(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "observation_type": "user_prompt",
+                        "title": "T",
+                        "body": "B",
+                        "observed_at": "2026-07-18T20:15:03+00:00",
+                        "session_id": "9f2c",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.list_observations({}, self.config_dir, transport)
+
+        self.assertIn(
+            "  observed_at=2026-07-18T20:15:03+00:00 session_id=9f2c", text
+        )
+
+    def test_observations_render_session_only_meta_line(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "items": [
+                    {
+                        "observation_type": "user_prompt",
+                        "title": "T",
+                        "body": "B",
+                        "observed_at": None,
+                        "session_id": "9f2c",
+                    }
+                ]
+            }
+        )
+        text = mcp_tools.list_observations({}, self.config_dir, transport)
+
+        self.assertIn("  session_id=9f2c", text)
+        self.assertNotIn("observed_at=", text)
 
     def test_feedback_validates_action(self) -> None:
         self.write_local_config()
@@ -600,6 +1112,73 @@ class McpToolsTests(unittest.TestCase):
 
         self.assertIn("project_id=arg-project", transport.calls[0][1])
         self.assertNotIn("repository_url=", transport.calls[0][1])
+
+    def test_error_text_kinds_membership_renders_fixed_message(self) -> None:
+        for code in ("search_kinds_invalid", "context_kinds_invalid"):
+            body = {
+                "kinds": {
+                    "code": [code],
+                    "detail": ["Invalid kind(s): egk_abcdefghijklmnop."],
+                }
+            }
+            text = mcp_tools._error_text(400, body)
+
+            for kind in commands._ALLOWED_KINDS:
+                self.assertIn(kind, text)
+            self.assertIn("Invalid kind filter", text)
+            self.assertNotIn("egk_abcdefghijklmnop", text)
+            self.assertNotIn("Invalid kind(s)", text)
+
+    def test_error_text_kinds_list_length_renders_fixed_message(self) -> None:
+        body = {"kinds": ["Ensure this field has no more than 6 elements."]}
+        text = mcp_tools._error_text(400, body)
+
+        for kind in commands._ALLOWED_KINDS:
+            self.assertIn(kind, text)
+        self.assertNotIn("Ensure this field", text)
+
+    def test_error_text_kinds_item_length_renders_fixed_message(self) -> None:
+        body = {"kinds": {"0": ["Ensure this field has no more than 40 characters."]}}
+        text = mcp_tools._error_text(400, body)
+
+        for kind in commands._ALLOWED_KINDS:
+            self.assertIn(kind, text)
+        self.assertNotIn("Ensure this field", text)
+
+    def test_error_text_non_kinds_body_degrades_to_generic(self) -> None:
+        body = {"token_budget": ["Ensure this value is greater than or equal to 1."]}
+        text = mcp_tools._error_text(400, body)
+
+        self.assertNotIn("Invalid kind filter", text)
+        self.assertIn("request failed", text)
+
+    def test_cli_error_kinds_all_shapes_render_fixed_message(self) -> None:
+        bodies = [
+            {
+                "kinds": {
+                    "code": ["search_kinds_invalid"],
+                    "detail": ["Invalid kind(s): egk_abcdefghijklmnop."],
+                }
+            },
+            {"kinds": ["Ensure this field has no more than 6 elements."]},
+            {"kinds": {"0": ["Ensure this field has no more than 40 characters."]}},
+        ]
+        for body in bodies:
+            text = cli_error_text(body)
+
+            for kind in commands._ALLOWED_KINDS:
+                self.assertIn(kind, text)
+            self.assertIn("Invalid kind filter", text)
+            self.assertNotIn("egk_abcdefghijklmnop", text)
+            self.assertNotIn("Invalid kind(s)", text)
+            self.assertNotIn("Ensure this field", text)
+
+    def test_cli_error_non_kinds_body_degrades_to_generic(self) -> None:
+        body = {"token_budget": ["Ensure this value is greater than or equal to 1."]}
+        error = commands.error_from_body(body, "http_error")
+
+        self.assertNotEqual("invalid_kind_filter", error.code)
+        self.assertNotIn("Invalid kind filter", error.detail)
 
     def test_build_tools_exposes_six_tools(self) -> None:
         tools = mcp_tools.build_tools(self.config_dir, StubTransport())
