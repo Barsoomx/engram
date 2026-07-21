@@ -171,41 +171,21 @@ def test_build_reduction_batches_generation_band_is_disjoint() -> None:
     assert zero_keys.isdisjoint(one_keys)
 
 
-def test_parser_requires_exact_envelope_and_known_duplicate_free_ids() -> None:
-    leaves = [_draft(0), _draft(1)]
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output({'memories': [], 'extra': True}, leaves)
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output(
-            {
-                'memories': [
-                    {
-                        'title': 'x',
-                        'body': 'y',
-                        'confidence': 0.5,
-                        'source_ids': [leaves[0].draft_id, leaves[0].draft_id],
-                    }
-                ]
-            },
-            leaves,
-        )
-
-
-def _memory(source_ids: list[str]) -> dict[str, object]:
+def _memory(source_refs: list[int]) -> dict[str, object]:
     return {
         'title': 'Reduced fact',
         'body': 'A durable reduced memory body.',
         'confidence': 0.8,
-        'source_ids': source_ids,
+        'source_refs': source_refs,
     }
 
 
-def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
-    ids = [draft.draft_id for draft in inputs]
-    buckets: list[list[str]] = [[] for _ in range(count)]
-    for index, draft_id in enumerate(ids):
-        buckets[index % count].append(draft_id)
-    return {'memories': [_memory(bucket) for bucket in buckets]}
+def test_parser_requires_exact_envelope_and_duplicate_free_refs() -> None:
+    leaves = [_draft(0), _draft(1)]
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [], 'extra': True}, leaves)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [_memory([1, 1])]}, leaves)
 
 
 @pytest.mark.parametrize(
@@ -218,68 +198,79 @@ def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
 )
 def test_reduction_rejects_blank_text_and_string_confidence(field: str, value: object) -> None:
     inputs = [_draft(0), _draft(1)]
-    memory = _memory([draft.draft_id for draft in inputs])
+    memory = _memory([1, 2])
     memory[field] = value
 
     with pytest.raises(ReductionContractError):
-        parse_reduction_output({'memories': [memory]}, inputs, reduction_target=1)
+        parse_reduction_output({'memories': [memory]}, inputs)
 
 
-def test_reduction_accepts_spec_cap_above_twelve() -> None:
-    inputs = [_draft(index) for index in range(40)]
-    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=12)
-    assert len(parsed.memories) == 20
-
-
-def test_reduction_rejects_output_above_spec_cap() -> None:
-    inputs = [_draft(index) for index in range(40)]
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output(_cover(inputs, 21), inputs, reduction_target=12)
-
-
-def test_reduction_target_twenty_accepts_twenty_memories() -> None:
-    inputs = [_draft(index) for index in range(50)]
-    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=20)
-    assert len(parsed.memories) == 20
-
-
-def _flip_last_hex_digit(source_id: str) -> str:
-    last = source_id[-1]
-    replacement = '0' if last != '0' else '1'
-
-    return source_id[:-1] + replacement
-
-
-def test_parse_reduction_drops_typoed_source_id_and_tolerates_uncovered_draft() -> None:
+def test_parse_reduction_output_maps_indices_and_enforces_partition() -> None:
     inputs = [_draft(index) for index in range(4)]
-    typo = _flip_last_hex_digit(inputs[1].draft_id)
-    payload = {
-        'memories': [
-            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, typo]},
-            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[2].draft_id, inputs[3].draft_id]},
-        ]
-    }
 
-    parsed = parse_reduction_output(payload, inputs, reduction_target=2)
+    passthrough = parse_reduction_output({'memories': [_memory([i]) for i in range(1, 5)]}, inputs)
+    assert len(passthrough.memories) == 4
+    assert passthrough.memories[0].source_ids == (inputs[0].draft_id,)
 
-    assert len(parsed.memories) == 2
-    assert parsed.memories[0].source_ids == (inputs[0].draft_id,)
-    assert parsed.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
+    merged = parse_reduction_output({'memories': [_memory([1, 2]), _memory([3, 4])]}, inputs)
+    assert len(merged.memories) == 2
+    assert merged.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
 
 
-def test_parse_reduction_discards_memory_with_only_unknown_source_ids() -> None:
+@pytest.mark.parametrize(
+    'memories',
+    [
+        [_memory([1, 2, 3, 5])],
+        [_memory([0, 1, 2, 3])],
+        [_memory([1, 2]), _memory([2, 3, 4])],
+        [_memory([1, 2]), _memory([3])],
+        [{'title': 'x', 'body': 'y', 'confidence': 0.5, 'source_refs': ['1', 2, 3, 4]}],
+    ],
+)
+def test_parse_reduction_output_rejects_non_partition_refs(memories: list[dict[str, object]]) -> None:
+    inputs = [_draft(index) for index in range(4)]
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': memories}, inputs)
+
+
+def test_parse_reduction_output_rejects_malformed_keys_and_values() -> None:
     inputs = [_draft(0), _draft(1)]
-    payload = {
-        'memories': [
-            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [_flip_last_hex_digit(inputs[0].draft_id)]},
-            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, inputs[1].draft_id]},
-        ]
-    }
 
-    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
+    extra = _memory([1, 2])
+    extra['unexpected'] = True
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [extra]}, inputs)
 
-    assert len(parsed.memories) == 1
-    assert parsed.memories[0].source_ids == (inputs[0].draft_id, inputs[1].draft_id)
+    missing = _memory([1, 2])
+    del missing['confidence']
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [missing]}, inputs)
+
+    over_title = _memory([1, 2])
+    over_title['title'] = 'x' * (MAX_TITLE + 1)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [over_title]}, inputs)
+
+    over_body = _memory([1, 2])
+    over_body['body'] = 'y' * (MAX_BODY + 1)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [over_body]}, inputs)
+
+    out_of_range = _memory([1, 2])
+    out_of_range['confidence'] = 1.5
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [out_of_range]}, inputs)
+
+    bad_kind = _memory([1, 2])
+    bad_kind['kind'] = 'nonsense'
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [bad_kind]}, inputs)
+
+
+def test_parse_reduction_output_allows_passthrough_without_forced_shrink() -> None:
+    inputs = [_draft(index) for index in range(3)]
+    parsed = parse_reduction_output({'memories': [_memory([1]), _memory([2]), _memory([3])]}, inputs)
+    assert len(parsed.memories) == len(inputs)
 
 
 def test_final_drafts_wait_until_all_targets_accepted() -> None:

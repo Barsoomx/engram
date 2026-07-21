@@ -257,18 +257,19 @@ def _confidence(value: object) -> Decimal:
 
 
 def parse_reduction_output(  # noqa: C901
-    payload: object, inputs: Sequence[ReductionDraft], *, reduction_target: int | None = None
+    payload: object, inputs: Sequence[ReductionDraft]
 ) -> ReductionOutput:
     if not isinstance(payload, dict) or set(payload) != {'memories'} or not isinstance(payload['memories'], list):
         raise ReductionContractError('reduction output must be exactly {memories: [...]}')
-    allowed = {'title', 'body', 'confidence', 'source_ids', 'kind'}
-    known = {draft.draft_id for draft in inputs}
+    allowed = {'title', 'body', 'confidence', 'source_refs', 'kind'}
+    n = len(inputs)
     memories: list[ReducedMemory] = []
+    covered: list[int] = []
     for item in payload['memories']:
         if (
             not isinstance(item, dict)
             or not set(item).issubset(allowed)
-            or not {'title', 'body', 'confidence', 'source_ids'} <= set(item)
+            or not {'title', 'body', 'confidence', 'source_refs'} <= set(item)
         ):
             raise ReductionContractError('memory has malformed keys')
         title, body = item['title'], item['body']
@@ -276,14 +277,20 @@ def parse_reduction_output(  # noqa: C901
             raise ReductionContractError('title is invalid')
         if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
             raise ReductionContractError('body is invalid')
-        source_ids = item['source_ids']
-        if not isinstance(source_ids, list) or not source_ids:
-            raise ReductionContractError('source_ids must be non-empty')
-        if any(not isinstance(source_id, str) or not source_id for source_id in source_ids):
-            raise ReductionContractError('source_ids must contain strings')
-        if len(set(source_ids)) != len(source_ids):
-            raise ReductionContractError('source_ids must be duplicate-free')
-        valid_source_ids = tuple(source_id for source_id in source_ids if source_id in known)
+        source_refs = item['source_refs']
+        if not isinstance(source_refs, list) or not source_refs:
+            raise ReductionContractError('source_refs must be non-empty')
+        indices: list[int] = []
+        seen: set[int] = set()
+        for ref in source_refs:
+            if isinstance(ref, bool) or not isinstance(ref, int):
+                raise ReductionContractError('source_refs must be integers')
+            if ref < 1 or ref > n:
+                raise ReductionContractError('source_refs index is out of range')
+            if ref in seen:
+                raise ReductionContractError('source_refs must be duplicate-free')
+            seen.add(ref)
+            indices.append(ref)
         kind = item.get('kind', '')
         if not isinstance(kind, str) or (
             kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
@@ -292,19 +299,15 @@ def parse_reduction_output(  # noqa: C901
         confidence_value = item['confidence']
         if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
             raise ReductionContractError('confidence must be numeric')
-        if not valid_source_ids:
-            continue
+        source_ids = tuple(inputs[index - 1].draft_id for index in indices)
+        covered.extend(indices)
+        memories.append(ReducedMemory(title, body, _confidence(confidence_value), source_ids, kind))
+    if n:
+        if len(covered) != len(set(covered)):
+            raise ReductionContractError('source_refs index repeats across memories')
+        if set(covered) != set(range(1, n + 1)):
+            raise ReductionContractError('reduction output must partition every draft')
 
-        memories.append(ReducedMemory(title, body, _confidence(confidence_value), valid_source_ids, kind))
-    if inputs and not memories:
-        raise ReductionContractError('reduction output is empty')
-    if inputs:
-        target = reduction_target if reduction_target is not None else len(inputs) - 1
-        if len(inputs) > 1 and len(memories) >= len(inputs):
-            raise ReductionContractError('reduction output must shrink')
-        cap = max(target, math.ceil(len(inputs) / 2)) if len(inputs) > target else target
-        if len(memories) > cap:
-            raise ReductionContractError('reduction output exceeds cap')
     return ReductionOutput(tuple(memories))
 
 
