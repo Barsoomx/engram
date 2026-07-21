@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from django.apps.registry import Apps
-from django.db import connection, models
+from django.db import IntegrityError, connection, models, transaction
 from django.db.migrations.executor import MigrationExecutor
 from django.utils import timezone
 
@@ -31,6 +31,8 @@ MIGRATION_0044_NODE = ('core', '0044_memory_last_confirmed_at')
 MIGRATE_0045 = [('core', '0045_agent_proposal_source')]
 MIGRATION_0045_NODE = ('core', '0045_agent_proposal_source')
 MIGRATION_0045_MODULE = 'engram.core.migrations.0045_agent_proposal_source'
+MIGRATE_0046 = [('core', '0046_merge_20260721_1032')]
+MIGRATE_0047 = [('core', '0047_distill_stage_coord_prompt_contract')]
 
 
 def _create_historical_0032b_scope(historical_apps: Apps) -> dict[str, object]:
@@ -913,3 +915,122 @@ def test_0045_forward_preserves_rows_and_reverse_guards_agent_proposal() -> None
         assert reverted_source_model.objects.filter(id=import_source.id).exists()
     finally:
         MigrationExecutor(connection).migrate(leaf_nodes)
+
+
+def _create_historical_reduce_scope(historical_apps: Apps, suffix: str) -> dict[str, object]:
+    scope = _create_historical_0032b_scope(historical_apps)
+    session = _create_historical_session(historical_apps, scope, f'distill-reduce-{suffix}')
+    work = _create_historical_work(
+        historical_apps,
+        scope,
+        work_type='session_distillation',
+        subject_type='agent_session',
+        subject_id=session.id,
+    )
+    secret_model = historical_apps.get_model('model_policy', 'ProviderSecret')
+    policy_model = historical_apps.get_model('model_policy', 'ModelPolicy')
+    secret = secret_model.objects.create(
+        organization=scope['organization'],
+        team=scope['team'],
+        name=f'distill-secret-{suffix}',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+    policy = policy_model.objects.create(
+        organization=scope['organization'],
+        team=scope['team'],
+        project=scope['project'],
+        name=f'distill-policy-{suffix}',
+        scope='project',
+        task_type='curation',
+        provider='openai',
+        model='gpt-4.1-mini',
+        secret=secret,
+        version=2,
+    )
+    window_model = historical_apps.get_model('core', 'DistillationWindow')
+    window = window_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        work=work,
+        session=session,
+        contract_version=1,
+        lower_sequence_exclusive=0,
+        upper_sequence_inclusive=1,
+        observation_count=1,
+        input_hash=('a' * 63) + suffix[-1],
+        chunk_char_budget=8000,
+        reduction_target=12,
+        chunk_contract_version=1,
+    )
+
+    return {'scope': scope, 'policy': policy, 'window': window}
+
+
+def _create_historical_reduce_stage(
+    historical_apps: Apps,
+    fixture: dict[str, object],
+    *,
+    prompt_contract: str,
+) -> models.Model:
+    stage_model = historical_apps.get_model('core', 'DistillationStage')
+    scope = fixture['scope']
+    window = fixture['window']
+    policy = fixture['policy']
+
+    return stage_model.objects.create(
+        organization=scope['organization'],
+        project=scope['project'],
+        team=scope['team'],
+        window=window,
+        chunk=None,
+        stage_kind='reduce',
+        level=1,
+        ordinal=0,
+        target_key=uuid.uuid4().hex + uuid.uuid4().hex,
+        stage_key=uuid.uuid4().hex + uuid.uuid4().hex,
+        input_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        input_manifest={'schema': 'distillation_reduce_manifest.v1', 'level': 1, 'ordinal': 0, 'refs': []},
+        prompt_contract=prompt_contract,
+        policy=policy,
+        policy_version=2,
+        policy_role='primary',
+        status='required',
+        attempt_count=0,
+    )
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0047_coord_uniqueness_admits_distinct_prompt_contracts_at_one_coordinate() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0046)
+        old_apps = executor.loader.project_state(MIGRATE_0046).apps
+        fixture = _create_historical_reduce_scope(old_apps, 'a')
+        _create_historical_reduce_stage(old_apps, fixture, prompt_contract='distill_reduce.v1')
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_reduce_stage(old_apps, fixture, prompt_contract='distill_reduce.v2')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0047)
+        new_apps = executor.loader.project_state(MIGRATE_0047).apps
+        new_fixture = _create_historical_reduce_scope(new_apps, 'b')
+        v1 = _create_historical_reduce_stage(new_apps, new_fixture, prompt_contract='distill_reduce.v1')
+        v2 = _create_historical_reduce_stage(new_apps, new_fixture, prompt_contract='distill_reduce.v2')
+
+        stage_model = new_apps.get_model('core', 'DistillationStage')
+        coexisting = stage_model.objects.filter(window=new_fixture['window'], stage_kind='reduce', level=1, ordinal=0)
+        assert {row.id for row in coexisting} == {v1.id, v2.id}
+
+        with pytest.raises(IntegrityError):
+            with transaction.atomic():
+                _create_historical_reduce_stage(new_apps, new_fixture, prompt_contract='distill_reduce.v2')
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
