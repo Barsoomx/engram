@@ -1039,20 +1039,20 @@ def generated_distill_reduce_payload(prompt: str) -> str:
     except (json.JSONDecodeError, TypeError):
         parsed = None
 
-    source_ids: list[str] = []
-    seen_ids: set[str] = set()
+    indices: list[int] = []
+    seen: set[int] = set()
     drafts = parsed.get('drafts') if isinstance(parsed, dict) else None
     if isinstance(drafts, list):
         for draft in drafts:
             if not isinstance(draft, dict):
                 continue
-            source_id = draft.get('id')
-            if not isinstance(source_id, str) or not source_id or source_id in seen_ids:
+            index = draft.get('index')
+            if not isinstance(index, int) or isinstance(index, bool) or index < 1 or index in seen:
                 continue
-            seen_ids.add(source_id)
-            source_ids.append(source_id)
+            seen.add(index)
+            indices.append(index)
 
-    if not source_ids:
+    if not indices:
         return json.dumps({'memories': []})
 
     digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
@@ -1063,7 +1063,7 @@ def generated_distill_reduce_payload(prompt: str) -> str:
                     'title': f'Provider-reduced memory {digest}',
                     'body': f'Provider-reduced memory body {digest}',
                     'confidence': 0.9,
-                    'source_ids': source_ids,
+                    'source_refs': indices,
                     'kind': 'gotcha',
                 },
             ],
@@ -1118,7 +1118,7 @@ def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, s
         return title, generated_curation_judgment_payload()
     if data.response_kind == 'distill_extract.v1':
         return title, generated_distill_extract_payload(prompt)
-    if data.response_kind == 'distill_reduce.v1':
+    if data.response_kind == 'distill_reduce.v2':
         return title, generated_distill_reduce_payload(prompt)
     if data.response_kind == 'curation_decision_v1':
         return title, generated_curation_decision_payload(prompt)
@@ -1151,7 +1151,7 @@ def deepseek_thinking_override(provider: str, task_type: str, response_kind: str
 
 
 _STRUCTURED_RESPONSE_KINDS = frozenset(
-    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'}
+    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'}
 )
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
@@ -1177,10 +1177,10 @@ _MAX_TOKENS_BY_KIND = {
     'candidates': 8192,
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
-    'distill_reduce.v1': 8192,
+    'distill_reduce.v2': 8192,
     'curation_decision_v1': 16384,
 }
-_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
+_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'})
 _CURATION_DECISION_OUTCOMES = (
     'publish_new',
     'merge_evidence',
@@ -1285,17 +1285,15 @@ _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
 )
 _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-    'The object must contain exactly the key memories (array of objects) and no additional properties. '
-    'Each memories entry must contain exactly these keys and no additional properties: '
-    'title (non-blank string, at most 255 characters); '
-    'body (non-blank string, at most 3000 characters); '
-    'confidence (a JSON number between 0 and 1); '
-    'source_ids (non-empty array of unique draft ids); '
-    f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
-    'Only use draft ids copied verbatim from the input drafts. '
-    'Group each input draft id into the source_ids of the memory that consolidates it. '
-    'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
-    'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+    'The object must contain exactly the key memories (array of objects) and no additional '
+    'properties. Each memories entry must contain exactly these keys and no additional '
+    'properties: title (non-blank string, at most 255 characters); body (non-blank string, at '
+    'most 3000 characters); confidence (a JSON number between 0 and 1); source_refs (non-empty '
+    f'array of unique positive integers); kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
+    'Only use draft indices copied verbatim from the input drafts. '
+    'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
+    'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
+    'own memory, so the number of memories may equal the number of input drafts.'
 )
 
 
@@ -1306,7 +1304,7 @@ def curation_schema_prompt_prefix(response_kind: str) -> str:
     if response_kind == 'distill_extract.v1':
         return _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS
 
-    if response_kind == 'distill_reduce.v1':
+    if response_kind == 'distill_reduce.v2':
         return _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS
 
     return ''
@@ -1393,7 +1391,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'additionalProperties': False,
         },
     },
-    'distill_reduce.v1': {
+    'distill_reduce.v2': {
         'name': 'emit_distillation_reduction',
         'description': 'Return the distillation reduction.',
         'input_schema': {
@@ -1401,16 +1399,15 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'properties': {
                 'memories': {
                     'type': 'array',
-                    'maxItems': 12,
                     'items': {
                         'type': 'object',
                         'properties': {
                             'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
                             'body': {'type': 'string', 'maxLength': 3000},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
-                            'source_ids': {
+                            'source_refs': {
                                 'type': 'array',
-                                'items': {'type': 'string'},
+                                'items': {'type': 'integer', 'minimum': 1},
                                 'minItems': 1,
                                 'uniqueItems': True,
                             },
@@ -1419,7 +1416,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                                 'enum': ['decision', 'convention', 'gotcha', 'architecture', 'incident'],
                             },
                         },
-                        'required': ['title', 'body', 'confidence', 'source_ids'],
+                        'required': ['title', 'body', 'confidence', 'source_refs'],
                         'additionalProperties': False,
                     },
                 },

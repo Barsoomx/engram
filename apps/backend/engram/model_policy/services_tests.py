@@ -25,9 +25,13 @@ from engram.model_policy.services import (
     RotateProviderSecretInput,
     UpdateModelPolicy,
     UpdateModelPolicyInput,
+    _completion_body,
+    _completion_title,
     _split_completion,
+    _STRUCTURED_RESPONSE_KINDS,
     curation_schema_prompt_prefix,
     generated_candidates_payload,
+    generated_distill_reduce_payload,
     resolve_max_tokens,
     secret_fingerprint,
 )
@@ -420,7 +424,7 @@ def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
             request_id='distill-reduce-schema-1',
             trace_id='distill-reduce-schema-1',
             prompt='{"drafts":[]}',
-            response_kind='distill_reduce.v1',
+            response_kind='distill_reduce.v2',
         ),
     )
 
@@ -428,7 +432,7 @@ def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
     user_message = sent['messages'][-1]['content']
 
     assert 'memories' in user_message
-    assert 'source_ids' in user_message
+    assert 'source_refs' in user_message
     assert 'confidence' in user_message
     assert user_message.rstrip().endswith('{"drafts":[]}')
 
@@ -455,22 +459,21 @@ def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
 
 
 def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
-    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
+    instructions = curation_schema_prompt_prefix('distill_reduce.v2')
 
     assert instructions == (
         'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-        'The object must contain exactly the key memories (array of objects) and no additional properties. '
-        'Each memories entry must contain exactly these keys and no additional properties: '
-        'title (non-blank string, at most 255 characters); '
-        'body (non-blank string, at most 3000 characters); '
-        'confidence (a JSON number between 0 and 1); '
-        'source_ids (non-empty array of unique draft ids); '
-        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
-        'Only use draft ids copied verbatim from the input drafts. '
-        'Group each input draft id into the source_ids of the memory that consolidates it. '
-        'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
-        'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+        'The object must contain exactly the key memories (array of objects) and no additional '
+        'properties. Each memories entry must contain exactly these keys and no additional '
+        'properties: title (non-blank string, at most 255 characters); body (non-blank string, at '
+        'most 3000 characters); confidence (a JSON number between 0 and 1); source_refs (non-empty '
+        'array of unique positive integers); kind (optional, one of: decision, convention, gotcha, '
+        'architecture, incident). Only use draft indices copied verbatim from the input drafts. '
+        'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
+        'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
+        'own memory, so the number of memories may equal the number of input drafts.'
     )
+    assert curation_schema_prompt_prefix('distill_reduce.v1') == ''
 
 
 def test_curation_decision_prefix_lists_every_mutating_identity_relation() -> None:
@@ -912,3 +915,105 @@ def test_rotate_provider_secret_audit_stores_fingerprint_not_cleartext() -> None
     assert 'raw_secret' not in event.metadata
     assert event.metadata['fingerprint'] == secret_fingerprint(rotated)
     assert rotated not in json.dumps(event.metadata)
+
+
+def _reduce_inputs(count: int) -> list[Any]:
+    from decimal import Decimal
+
+    from engram.memory.distillation_reduction import ReductionDraft
+
+    return [
+        ReductionDraft(
+            draft_id=f'draft-{index}',
+            title=f'Title {index}',
+            body=f'Body {index}',
+            confidence=Decimal('0.5'),
+            source_ids=(f'obs-{index}',),
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def test_anthropic_distill_reduce_tool_uses_integer_source_refs() -> None:
+    assert 'distill_reduce.v1' not in _ANTHROPIC_STRUCTURED_TOOLS
+    tool = _ANTHROPIC_STRUCTURED_TOOLS['distill_reduce.v2']
+    schema = tool['input_schema']
+    memories = schema['properties']['memories']
+
+    assert 'maxItems' not in memories
+    item = memories['items']
+    assert 'source_ids' not in item['properties']
+    assert item['properties']['source_refs'] == {
+        'type': 'array',
+        'items': {'type': 'integer', 'minimum': 1},
+        'minItems': 1,
+        'uniqueItems': True,
+    }
+    assert item['required'] == ['title', 'body', 'confidence', 'source_refs']
+
+
+def test_generated_distill_reduce_payload_partitions_with_integer_source_refs() -> None:
+    from engram.memory.distillation_reduction import parse_reduction_output
+
+    prompt = json.dumps(
+        {
+            'drafts': [
+                {'index': 1, 'title': 'a', 'body': 'b', 'confidence': '0.5'},
+                {'index': 2, 'title': 'c', 'body': 'd', 'confidence': '0.5'},
+                {'index': 3, 'title': 'e', 'body': 'f', 'confidence': '0.5'},
+            ]
+        }
+    )
+
+    payload = json.loads(generated_distill_reduce_payload(prompt))
+    refs = [ref for memory in payload['memories'] for ref in memory['source_refs']]
+
+    assert all(isinstance(ref, int) and not isinstance(ref, bool) for ref in refs)
+    assert sorted(refs) == [1, 2, 3]
+
+    parsed = parse_reduction_output(payload, _reduce_inputs(3))
+    assert {source for memory in parsed.memories for source in memory.source_ids} == {
+        'draft-1',
+        'draft-2',
+        'draft-3',
+    }
+
+
+def test_distill_reduce_v2_is_structured_kind_and_body_is_verbatim() -> None:
+    content = json.dumps(
+        {'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]}
+    )
+
+    assert 'distill_reduce.v2' in _STRUCTURED_RESPONSE_KINDS
+    assert _completion_body(content, 'distill_reduce.v2') == content
+    assert _completion_title(content, 'distill_reduce.v2') == ''
+
+
+@pytest.mark.django_db
+def test_openai_gateway_returns_verbatim_reduce_body_that_parses() -> None:
+    from engram.memory.distillation_reduction import parse_reduction_output
+
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    content = json.dumps(
+        {'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]}
+    )
+    opener = _opener_returning(_openai_chat_body(content))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='reduce-body-1',
+            trace_id='reduce-body-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v2',
+        ),
+    )
+
+    assert result.generated_body == content
+    parsed = parse_reduction_output(json.loads(result.generated_body), _reduce_inputs(2))
+    assert len(parsed.memories) == 1
