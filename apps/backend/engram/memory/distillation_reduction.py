@@ -51,6 +51,30 @@ _REDUCE_SYSTEM_PROMPT = (
 )
 
 
+_OUTPUT_TOKENS_PER_CHAR = 0.4
+_OUTPUT_ENVELOPE_CHARS = 32
+_PER_MEMORY_JSON_OVERHEAD = 128
+_PER_MEMORY_INDEX_CHARS = 8
+_TRUNCATION_MARGIN = 0.30
+_PER_MEMORY_CHARS = MAX_TITLE + MAX_BODY + _PER_MEMORY_JSON_OVERHEAD + _PER_MEMORY_INDEX_CHARS
+
+
+def worst_case_output_tokens(n: int) -> int:
+    return math.ceil(_OUTPUT_TOKENS_PER_CHAR * (_OUTPUT_ENVELOPE_CHARS + n * _PER_MEMORY_CHARS))
+
+
+def output_budget_tokens(cap: int) -> int:
+    return math.floor(cap * (1 - _TRUNCATION_MARGIN))
+
+
+def max_reduction_fanin(budget: int) -> int:
+    n = 1
+    while worst_case_output_tokens(n + 1) <= budget:
+        n += 1
+
+    return n
+
+
 def _json(value: object) -> bytes:
     return canonical_json_bytes(value)
 

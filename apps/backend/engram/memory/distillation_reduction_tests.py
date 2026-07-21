@@ -1,4 +1,5 @@
 import json
+import math
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -9,6 +10,7 @@ from django.utils import timezone
 from engram.core.models import DistillationStage, DistillationWindow
 from engram.memory.distillation_provider_stage import ProviderStageOutputError
 from engram.memory.distillation_reduction import (
+    _PER_MEMORY_CHARS,
     _REDUCE_SYSTEM_PROMPT,
     MAX_BODY,
     MAX_TITLE,
@@ -21,11 +23,14 @@ from engram.memory.distillation_reduction import (
     build_reduction_batches,
     derive_final_reduction_drafts,
     derive_first_pending_reduction_target,
+    max_reduction_fanin,
+    output_budget_tokens,
     parse_reduction_output,
     provider_stage_target,
     reduce_multilevel,
     resolve_reduction_stage,
     stable_draft_id,
+    worst_case_output_tokens,
 )
 from engram.memory.distillation_tests import create_session_distillation_work, create_session_scope
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
@@ -559,3 +564,20 @@ def test_prepare_call_prompt_carries_the_stage_reduction_target(f_reduce_stage: 
     assert [draft['id'] for draft in prompt['drafts']] == [
         draft.draft_id for draft in _snapshot_drafts(f_reduce_stage.window.stages.get(level=1))
     ]
+
+
+def test_worst_case_output_tokens_matches_closed_form_and_is_monotonic() -> None:
+    assert _PER_MEMORY_CHARS == 3391
+    for n in (1, 2, 4, 25):
+        assert worst_case_output_tokens(n) == math.ceil(0.4 * (32 + n * 3391))
+    values = [worst_case_output_tokens(n) for n in range(1, 30)]
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+
+
+def test_output_budget_and_fanin_worked_values() -> None:
+    assert output_budget_tokens(4096) == 2867
+    assert output_budget_tokens(8192) == 5734
+    assert max_reduction_fanin(2867) == 2
+    assert max_reduction_fanin(5734) == 4
+    assert max_reduction_fanin(worst_case_output_tokens(1) - 1) == 1
