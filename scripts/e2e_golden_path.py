@@ -24,6 +24,15 @@ WORKER_MEMORY_TIMEOUT_SECONDS = 120.0
 WORKER_MEMORY_POLL_INTERVAL_SECONDS = 2.0
 CONTEXT_AUDIT_NOT_READY_ERROR = 'context audit evidence not ready'
 SYMBOL_TERM = 'plan_lookup_helper'
+MEMORY_KIND = 'gotcha'
+SEARCH_EXCLUDED_KIND = 'decision'
+PROPOSE_KIND = 'decision'
+SESSION_START_BODY_TRUNCATE_LIMIT = 400
+MEMORY_GET_UNTRUNCATED_SENTENCE = (
+    'This durable memory body deliberately exceeds the four hundred character '
+    'session-start preview so engram_memory_get proves it returns the complete '
+    'untruncated stored text instead of the shortened context injection preview. '
+)
 
 
 @dataclass(frozen=True)
@@ -211,6 +220,7 @@ def main() -> int:
                 memory_id=worker_memory['memory_id'],
                 run_id=run_id,
                 secrets_list=[api_key, agent_key],
+                has_project=True,
             )
             progress('MCP stdio bridge passed')
 
@@ -293,6 +303,7 @@ def main() -> int:
                 secrets_list=[api_key, agent_key],
                 cwd=workspace_dir,
                 feedback_action='refuted',
+                has_project=False,
             )
             progress('MCP repo-url mode passed')
 
@@ -328,7 +339,9 @@ def drive_mcp_stdio(
     secrets_list: list[str],
     cwd: Path = ROOT,
     feedback_action: str = 'stale',
+    has_project: bool = True,
 ) -> None:
+    long_body = memory_get_long_body(run_id)
     requests = [
         {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize'},
         {'jsonrpc': '2.0', 'method': 'notifications/initialized'},
@@ -359,6 +372,41 @@ def drive_mcp_stdio(
         _tool_call(9, 'engram_search', {'query': '', 'symbols': [SYMBOL_TERM]}),
         _tool_call(
             10,
+            'engram_search',
+            {
+                'query': 'Provider-distilled memory',
+                'file_paths': [MEMORY_FILE],
+                'kinds': [MEMORY_KIND],
+            },
+        ),
+        _tool_call(
+            11,
+            'engram_search',
+            {
+                'query': 'Provider-distilled memory',
+                'file_paths': [MEMORY_FILE],
+                'kinds': [SEARCH_EXCLUDED_KIND],
+            },
+        ),
+        _tool_call(12, 'engram_memory_version', {'memory_id': memory_id, 'body': long_body}),
+        _tool_call(13, 'engram_memory_get', {'memory_id': memory_id}),
+        _tool_call(
+            14,
+            'engram_memory_propose',
+            {
+                'title': f'E2E proposed decision {run_id}',
+                'body': f'Adopt the golden-path parity contract for run {run_id} as a durable decision.',
+                'kind': PROPOSE_KIND,
+            },
+        ),
+        _tool_call(
+            15,
+            'engram_memory_feedback',
+            {'memory_id': memory_id, 'action': 'confirmed', 'reason': f'mcp e2e confirm {run_id}'},
+        ),
+        _tool_call(16, 'engram_audit', {'memory_id': memory_id}),
+        _tool_call(
+            17,
             'engram_memory_feedback',
             {'memory_id': memory_id, 'action': feedback_action, 'reason': f'mcp e2e {run_id}'},
         ),
@@ -388,7 +436,8 @@ def drive_mcp_stdio(
     for expected_tool in ('engram_memory_propose', 'engram_memory_get', 'engram_audit'):
         if expected_tool not in tool_names:
             raise SystemExit(f'mcp tools/list missing {expected_tool}: {tool_names}')
-    texts = {rid: _content_text(responses[rid]) for rid in (3, 4, 5, 6, 7, 8, 9, 10)}
+    call_ids = (3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+    texts = {rid: _content_text(responses[rid]) for rid in call_ids}
     for rid, text in texts.items():
         for secret in secrets_list:
             assert_secret_absent(f'mcp response {rid}', text, secret)
@@ -406,8 +455,88 @@ def drive_mcp_stdio(
         )
     if f'memory_id={memory_id}' not in texts[9]:
         raise SystemExit(f'mcp symbol search missed memory_id: {texts[9][:400]}')
-    if f'{feedback_action}=True' not in texts[10] or 'already_applied=False' not in texts[10]:
-        raise SystemExit(f'mcp feedback failed: {texts[10]}')
+    _assert_search_kinds_filter(memory_id, texts[10], texts[11])
+    _assert_memory_get(memory_id, long_body, run_id, texts[13])
+    _assert_memory_propose(texts[14])
+    _assert_confirmed_feedback(texts[15])
+    _assert_audit(memory_id, texts[16], has_project=has_project)
+    if f'{feedback_action}=True' not in texts[17] or 'already_applied=False' not in texts[17]:
+        raise SystemExit(f'mcp feedback failed: {texts[17]}')
+
+
+def memory_get_long_body(run_id: str) -> str:
+    body = f'mcp e2e long-body {run_id}: ' + MEMORY_GET_UNTRUNCATED_SENTENCE * 3
+    body += f'tail-sentinel-{run_id}'
+    if len(body) <= SESSION_START_BODY_TRUNCATE_LIMIT:
+        raise E2EError('memory_get long body must exceed the session-start preview limit')
+
+    return body
+
+
+def _assert_search_kinds_filter(memory_id: str, matching_text: str, excluded_text: str) -> None:
+    if f'memory_id={memory_id}' not in matching_text:
+        raise SystemExit(
+            f'mcp kinds filter dropped matching-kind memory: {matching_text[:400]}'
+        )
+
+    if f'memory_id={memory_id}' in excluded_text:
+        raise SystemExit(
+            f'mcp kinds filter leaked non-matching-kind memory: {excluded_text[:400]}'
+        )
+
+
+def _assert_memory_get(memory_id: str, long_body: str, run_id: str, text: str) -> None:
+    if f'memory_id={memory_id}' not in text:
+        raise SystemExit(f'mcp memory_get missed memory_id: {text[:400]}')
+
+    if long_body not in text:
+        raise SystemExit(f'mcp memory_get truncated or dropped the full body: {text[:400]}')
+
+    if f'tail-sentinel-{run_id}' not in text or '…' in text:
+        raise SystemExit(f'mcp memory_get applied session-start truncation: {text[:400]}')
+
+    if '\nversions: v' not in text:
+        raise SystemExit(f'mcp memory_get missing versions section: {text[:400]}')
+
+    if f'links: file: e2e/{run_id}.py' not in text:
+        raise SystemExit(f'mcp memory_get missing links line: {text[:400]}')
+
+
+def _assert_memory_propose(text: str) -> None:
+    candidate_id = _extract_field(text, 'candidate_id')
+    if not candidate_id or candidate_id == 'None':
+        raise SystemExit(f'mcp propose returned no candidate_id: {text}')
+
+    if 'status=proposed' not in text or 'decision_work_queued=True' not in text:
+        raise SystemExit(f'mcp propose did not queue a proposed candidate: {text}')
+
+
+def _assert_confirmed_feedback(text: str) -> None:
+    confirmed_at = _extract_field(text, 'confirmed_at')
+    if not confirmed_at or confirmed_at == 'None':
+        raise SystemExit(f'mcp confirmed feedback did not record confirmed_at: {text}')
+
+    if 'action=confirmed' not in text or 'already_applied=False' not in text:
+        raise SystemExit(f'mcp confirmed feedback not applied: {text}')
+
+    if 'stale=False' not in text or 'refuted=False' not in text:
+        raise SystemExit(f'mcp confirmed feedback disturbed stale/refuted state: {text}')
+
+
+def _assert_audit(memory_id: str, text: str, *, has_project: bool) -> None:
+    if not has_project:
+        if 'needs a project_id' not in text:
+            raise SystemExit(f'mcp audit should require a project_id in repo-url mode: {text[:400]}')
+
+        return
+
+    header, _, remainder = text.partition('\n')
+    if f'audit trace for memory {memory_id}' not in header:
+        raise SystemExit(f'mcp audit header did not name the memory: {header}')
+
+    event_lines = [line for line in remainder.splitlines() if line.strip()]
+    if not event_lines or event_lines == ['No audit events found.']:
+        raise SystemExit(f'mcp audit rendered no events for the memory: {text[:400]}')
 
 
 def _tool_call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, object]:
