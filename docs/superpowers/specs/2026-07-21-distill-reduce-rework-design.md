@@ -476,7 +476,7 @@ Constants: `_MAX_TREE_LEVELS = 4`, `_GENERATION_LEVEL_STRIDE = 16`, `_MAX_GENERA
 
 ```
 def effective_reduction_target(total_drafts, floor) -> int:
-    return min(48, max(floor, ceil(total_drafts / 4)))
+    return max(floor, min(48, ceil(total_drafts / 4)))
 
 class ReductionTruncationExhausted(ReductionContractError):
     pass
@@ -956,3 +956,4 @@ Round 5 (2026-07-21, codex cross-check of the implemented slice):
   the corrected `_MalformedOutcome(response_hash, response_size, response_prefix, error_detail,
   provider_call_ids)` positional order) and to the error_detail->failure_reason threading. No code
   change required.
+- code-review round 3, finding 1, verdict fixed — binding formula reconciled to the implemented floor-above-cap semantics: max(floor, min(48, ceil(total_drafts / 4))); a configured window.reduction_target above 48 is preserved (regression-tested), the 48 cap applies only to the scaled component.
