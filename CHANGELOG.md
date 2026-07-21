@@ -158,3 +158,49 @@ integration, client surfaces, and operations.
   including the password-only form (`https://:token@host/...`, previously
   missed because an empty username was treated as absent), so embedded
   credentials never reach a request payload or query string.
+
+## engram-connect 0.6.0 / claude-plugin 0.1.13 / codex-plugin 0.3.0 - 2026-07-21
+
+MCP/CLI parity campaign (PRs #277-#283): the agent tool surface catches up
+with the backend memory loop. Nine MCP tools now ship.
+
+### Added
+
+- `engram_memory_propose`: agents deliberately record a durable fact; routed
+  through the full curation pipeline (deterministic gates, shortlist,
+  evidence-aware judge) via a new typed `agent_proposal` candidate provenance
+  and `POST /v1/memories/propose` (`memories:propose`).
+- `engram_memory_get`: read one memory in full by id - untruncated body,
+  version history, links, optional version diff.
+- `engram_audit`: memory-scoped audit trace (who refuted/revised/curated and
+  when), newest-first via a new ordering-aware audit-events inspection path
+  with `target_id`/`target_type` filters.
+- `kinds` filter on `engram_search`/`engram_context` (+ CLI `--kind`) to fetch
+  conventions/decisions/gotchas on a topic; search render now surfaces match
+  reasons, matched terms, and retrieval warnings; context render appends a
+  citations map (`[Mn]` -> memory id).
+- `engram_observations` filters: `observation_type`, `session_id`, `since`,
+  `until`, `offset`; renders `observed_at` and session.
+- `confirmed` feedback action: confirming a memory resets its confidence-decay
+  anchor (`last_confirmed_at`) without touching stale/refuted state.
+- `conflict_excluded` retrieval warning plus a fail-closed
+  `has_open_conflict`-aware `authorized_for_injection` in inspection.
+- Per-call `request_id` and `team_id` on the six base MCP tools;
+  `engram mcp-install` no longer requires a configured `project_id`
+  (repository-url routing).
+- Compose golden path now exercises all new tools end-to-end in both
+  project-scoped and repo-url modes.
+
+### Fixed
+
+- Fail-open team-scope reads on memory `version`/`links`/`diff` GET endpoints
+  (visibility whitelist: deny SESSION/ORGANIZATION/null-team/foreign-TEAM).
+- Unproven-digest link leak on the links GET path (digest quarantine).
+- Cross-team audit target-title disclosure (org/project/whitelist-scoped
+  resolution) and cross-team digest-title quarantine.
+- `provenance` and `scope` transition errors now classify as terminal
+  `INVALID_INPUT` for candidate-decision work instead of retrying forever.
+- Curation prompt no longer steers cross-visibility duplicates to
+  `publish_new`; redundant matches route to targeted rejection.
+- Exception text no longer reaches propose error responses
+  (CodeQL stack-trace-exposure).
