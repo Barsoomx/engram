@@ -214,14 +214,19 @@ def list_tools() -> list[dict[str, object]]:
             "description": (
                 "Step 3 - close the loop: the moment you discover an "
                 "injected or retrieved memory is outdated or wrong, mark it "
-                "stale or refuted with a reason. Clean memory improves every "
+                "stale or refuted with a reason. Confirm a memory when you "
+                "have verified it is still accurate — this resets its "
+                "confidence decay clock. Clean memory improves every "
                 "future session; do not silently ignore bad memory."
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "memory_id": {"type": "string"},
-                    "action": {"type": "string", "enum": ["stale", "refuted"]},
+                    "action": {
+                        "type": "string",
+                        "enum": ["stale", "refuted", "confirmed"],
+                    },
                     "reason": {"type": "string"},
                     "project_id": {"type": "string"},
                 },

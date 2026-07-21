@@ -943,7 +943,80 @@ class McpToolsTests(unittest.TestCase):
             StubTransport(),
         )
 
-        self.assertIn("stale or refuted", text)
+        self.assertIn("stale, refuted, or confirmed", text)
+
+    def test_submit_memory_feedback_passes_confirmed_action(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "memory_id": "m-1",
+                "action": "confirmed",
+                "stale": False,
+                "refuted": False,
+                "confirmed_at": "2026-07-19T10:00:00+00:00",
+                "already_applied": False,
+            }
+        )
+        text = mcp_tools.submit_memory_feedback(
+            {"memory_id": "m-1", "action": "confirmed", "reason": "still accurate"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("action=confirmed", text)
+        self.assertEqual("confirmed", transport.calls[0][3]["action"])
+
+    def test_submit_memory_feedback_rejects_unknown_action(self) -> None:
+        self.write_local_config()
+        transport = StubTransport()
+        text = mcp_tools.submit_memory_feedback(
+            {"memory_id": "m-1", "action": "bogus", "reason": "r"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("stale, refuted, or confirmed", text)
+        self.assertEqual([], transport.calls)
+
+    def test_submit_memory_feedback_confirmed_renders_confirmed_at(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "memory_id": "m-1",
+                "action": "confirmed",
+                "stale": False,
+                "refuted": False,
+                "confirmed_at": "2026-07-19T10:00:00+00:00",
+                "already_applied": False,
+            }
+        )
+        text = mcp_tools.submit_memory_feedback(
+            {"memory_id": "m-1", "action": "confirmed", "reason": "still accurate"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("confirmed_at=2026-07-19T10:00:00+00:00", text)
+
+    def test_submit_memory_feedback_stale_renders_empty_confirmed_at(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            body={
+                "memory_id": "m-1",
+                "action": "stale",
+                "stale": True,
+                "refuted": False,
+                "confirmed_at": "",
+                "already_applied": False,
+            }
+        )
+        text = mcp_tools.submit_memory_feedback(
+            {"memory_id": "m-1", "action": "stale", "reason": "outdated"},
+            self.config_dir,
+            transport,
+        )
+
+        self.assertIn("confirmed_at=", text)
 
     def test_feedback_posts_and_renders(self) -> None:
         self.write_local_config()

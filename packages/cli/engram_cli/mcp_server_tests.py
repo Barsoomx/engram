@@ -137,8 +137,18 @@ class McpContractTests(unittest.TestCase):
             ["memory_id", "action", "reason"], feedback["inputSchema"]["required"]
         )
         self.assertEqual(
-            ["stale", "refuted"],
+            ["stale", "refuted", "confirmed"],
             feedback["inputSchema"]["properties"]["action"]["enum"],
+        )
+
+    def test_memory_feedback_tool_enum_includes_confirmed(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 11, "method": "tools/list"}, build_tools()
+        )
+        feedback = response["result"]["tools"][5]
+
+        self.assertIn(
+            "confirmed", feedback["inputSchema"]["properties"]["action"]["enum"]
         )
 
     def test_tools_list_exposes_s1_filter_schema(self) -> None:
@@ -202,7 +212,7 @@ class McpContractTests(unittest.TestCase):
         )
         self.assertEqual(
             descriptions["engram_memory_feedback"],
-            "Step 3 - close the loop: the moment you discover an injected or retrieved memory is outdated or wrong, mark it stale or refuted with a reason. Clean memory improves every future session; do not silently ignore bad memory.",
+            "Step 3 - close the loop: the moment you discover an injected or retrieved memory is outdated or wrong, mark it stale or refuted with a reason. Confirm a memory when you have verified it is still accurate — this resets its confidence decay clock. Clean memory improves every future session; do not silently ignore bad memory.",
         )
         self.assertEqual(
             descriptions["engram_memory_link"],

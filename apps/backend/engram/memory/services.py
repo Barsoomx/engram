@@ -199,6 +199,7 @@ class MemoryFeedbackResult:
     action: str
     retrieval_documents_updated: int
     already_applied: bool
+    confirmed_at: str
 
     def to_response(self) -> dict[str, object]:
         return {
@@ -208,6 +209,7 @@ class MemoryFeedbackResult:
             'action': self.action,
             'stale': self.memory.stale,
             'refuted': self.memory.refuted,
+            'confirmed_at': self.confirmed_at,
             'retrieval_documents_updated': self.retrieval_documents_updated,
             'already_applied': self.already_applied,
         }
@@ -225,6 +227,9 @@ class RecordMemoryFeedback:
         with transaction.atomic():
             memory = self._lock_memory(data, scope)
             self._ensure_team_scope(memory, scope)
+            if data.action == 'confirmed':
+                return self._confirm(memory, scope, data)
+
             already_applied = self._already_applied(memory, data.action)
             if already_applied:
                 updated = self._matching_retrieval_documents(memory, data.action)
@@ -237,6 +242,100 @@ class RecordMemoryFeedback:
             action=data.action,
             retrieval_documents_updated=updated,
             already_applied=already_applied,
+            confirmed_at=memory.last_confirmed_at.isoformat() if memory.last_confirmed_at else '',
+        )
+
+    def _confirm(self, memory: Memory, scope: EffectiveScope, data: MemoryFeedbackInput) -> MemoryFeedbackResult:
+        prior = (
+            AuditEvent.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                event_type='MemoryConfirmed',
+                target_type='memory',
+                target_id=str(memory.id),
+                actor_type=scope.actor_type,
+                actor_id=scope.actor_id,
+                request_id=data.request_id,
+            )
+            .order_by('created_at', 'id')
+            .first()
+        )
+        if prior is not None:
+            self._log(memory, data.action, 0, True)
+
+            return MemoryFeedbackResult(
+                memory=memory,
+                action='confirmed',
+                retrieval_documents_updated=0,
+                already_applied=True,
+                confirmed_at=str(prior.metadata.get('confirmed_at') or ''),
+            )
+
+        self._ensure_confirmable(memory, scope)
+        memory.last_confirmed_at = timezone.now()
+        memory.save(update_fields=['last_confirmed_at'])
+        self._write_confirm_audit(memory, scope, data)
+        self._log(memory, data.action, 0, False)
+
+        return MemoryFeedbackResult(
+            memory=memory,
+            action='confirmed',
+            retrieval_documents_updated=0,
+            already_applied=False,
+            confirmed_at=memory.last_confirmed_at.isoformat(),
+        )
+
+    def _ensure_confirmable(self, memory: Memory, scope: EffectiveScope) -> None:
+        floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
+        caller_retrievable = (
+            RetrievalDocument.objects.filter(
+                organization=memory.organization,
+                project=memory.project,
+                memory_id=memory.id,
+                stale=False,
+                refuted=False,
+            )
+            .filter(
+                Q(visibility_scope=VisibilityScope.PROJECT)
+                | Q(visibility_scope=VisibilityScope.TEAM, team_id__in=scope.team_ids)
+            )
+            .exists()
+        )
+        if (
+            memory.status != MemoryStatus.APPROVED
+            or memory.stale
+            or memory.refuted
+            or memory.confidence is None
+            or memory.confidence <= floor
+            or memory.kind == 'digest'
+            or MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists()
+            or not caller_retrievable
+        ):
+            raise MemoryFeedbackError(
+                'memory_not_confirmable',
+                'Only an approved, non-stale, non-refuted, above-floor, non-digest, non-conflicted, '
+                'retrieval-injectable memory can be confirmed',
+            )
+
+    def _write_confirm_audit(self, memory: Memory, scope: EffectiveScope, data: MemoryFeedbackInput) -> None:
+        AuditEvent.objects.create(
+            organization_id=memory.organization_id,
+            project_id=memory.project_id,
+            team_id=memory.team_id if memory.visibility_scope == VisibilityScope.TEAM else None,
+            event_type='MemoryConfirmed',
+            actor_type=scope.actor_type,
+            actor_id=scope.actor_id,
+            target_type='memory',
+            target_id=str(memory.id),
+            capability='memories:review',
+            result=AuditResult.RECORDED,
+            request_id=data.request_id,
+            correlation_id=data.correlation_id,
+            metadata={
+                'memory_id': str(memory.id),
+                'confirmed_at': memory.last_confirmed_at.isoformat(),
+                'reason': str(redact_value(data.reason))[:1024],
+            },
         )
 
     def _lock_memory(self, data: MemoryFeedbackInput, scope: EffectiveScope) -> Memory:
