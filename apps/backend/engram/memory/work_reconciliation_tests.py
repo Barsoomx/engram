@@ -53,12 +53,6 @@ _REPORT_FIELDS = {
 _FORBIDDEN_SUBSTRINGS = ('candidate body', 'candidate title')
 
 
-@pytest.fixture(autouse=True)
-def f_reset_builder() -> object:
-    yield None
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
-
-
 def _candidate(scope: Scope, suffix: str) -> MemoryCandidate:
     organization, project, session = scope
 

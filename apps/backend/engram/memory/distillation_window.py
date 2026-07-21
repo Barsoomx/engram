@@ -315,8 +315,6 @@ def materialize_distillation_window(work: WorkflowWork) -> DistillationWindow:
     if not observations:
         raise MemoryWorkerError('session distillation window has no useful observations', code=_CONTRACT_INVALID)
 
-    budget = _frozen_chunk_char_budget()
-    target = _frozen_reduction_target()
     entries = _manifest_entries(observations)
     manifest = _window_manifest(work, entries, lower=lower, upper=upper)
     input_hash = _sha256(manifest)
@@ -324,6 +322,8 @@ def materialize_distillation_window(work: WorkflowWork) -> DistillationWindow:
     if existing is not None:
         return _verify_existing(existing, input_hash)
 
+    budget = _frozen_chunk_char_budget()
+    target = _frozen_reduction_target()
     chunk_plans = _plan_chunks(entries, budget)
 
     return _persist_plan(

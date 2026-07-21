@@ -103,6 +103,7 @@ def test_c43_writer_census_has_no_publishable_memory_writes_outside_typed_module
     allowed_operational_writes = {
         ('console/views/settings.py', 'Memory', 'delete'),
         ('memory/conflict_links.py', 'MemoryLink', 'delete'),
+        ('memory/confidence_decay.py', 'Memory', 'update'),
         ('memory/services.py', 'MemoryLink', 'get_or_create'),
     }
     violations: list[str] = []

@@ -38,14 +38,26 @@ from engram.memory.invariant_queries import InvariantId, InvariantState, evaluat
 from engram.memory.services import MemoryWorkerError, weekly_digest_content_hash
 from engram.memory.tasks import generate_daily_digest_work_v1, generate_weekly_digest_work_v1
 from engram.memory.transitions import (
+    MarkMemoryStale,
+    MemoryStateInput,
+    OpenMemoryConflict,
+    OpenMemoryConflictInput,
     PromoteMemoryCandidate,
+    RefuteMemory,
     ReviseMemory,
     ReviseMemoryInput,
     TransitionRequest,
     TransitionScope,
     build_memory_fence,
 )
-from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
+from engram.memory.transitions_test_support import (
+    candidate_fence_for,
+    open_single_conflict,
+    provenanced_candidate_in_scope,
+    transition_request,
+    transition_request_for,
+)
+from engram.memory.work_dispatch import queue_work_attempt
 from engram.memory.work_execution import execution_configuration_fingerprint
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT
 from engram.memory.workflow_work import CreateWorkflowWorkInput
@@ -1472,12 +1484,16 @@ def _digest_output_for_work(project: Project, work: WorkflowWork) -> int:
 
 
 @pytest.mark.django_db
-def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
+def test_daily_work_explicit_v1_run_ends_succeeded_with_result_memory_id() -> None:
     organization, project = _make_scope('daily-run-succeeded')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
-    run = _linked_daily_run(organization, project, work)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
 
     result = generate_daily_digest_work_v1(str(work.id), str(run.id))
 
@@ -1490,24 +1506,81 @@ def test_daily_work_linked_run_ends_succeeded_with_result_memory_id() -> None:
 
 
 @pytest.mark.django_db
-def test_daily_work_linked_run_fails_on_frozen_drift_before_provider() -> None:
+def test_daily_work_explicit_v1_frozen_drift_terminalizes_at_claim_without_provider() -> None:
     organization, project = _make_scope('daily-run-failed')
     _create_digest_policy(organization, project)
     _make_memory(organization, project, title='Alpha', body='body-a')
     work, _snapshot = _make_daily_work(organization, project)
-    run = _linked_daily_run(organization, project, work)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
 
     tampered = dict(work.input_snapshot)
     tampered['input_digest'] = 'deadbeef' * 8
     WorkflowWork.objects.filter(id=work.id).update(input_snapshot=tampered)
 
-    with pytest.raises(MemoryWorkerError, match='fingerprint'):
-        generate_daily_digest_work_v1(str(work.id), str(run.id))
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
 
+    assert result == str(work.id)
     run.refresh_from_db()
-    assert run.status == WorkflowRunStatus.FAILED
-    assert run.failure_reason != ''
+    assert run.status == WorkflowRunStatus.QUEUED
+    terminal = _v1_runs(work).exclude(id=run.id).get()
+    assert terminal.status == WorkflowRunStatus.FAILED
+    assert terminal.failure_class == INVALID_INPUT
+    assert terminal.failure_code == 'work_fingerprint_mismatch'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
     assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+def test_daily_explicit_v1_attempt_is_claimed_and_completed_with_a_fence() -> None:
+    organization, project = _make_scope('daily-explicit-v1-fence')
+    _create_digest_policy(organization, project)
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = queue_work_attempt(
+        work_id=work.id,
+        now=timezone.now(),
+        origin=WorkflowRunOrigin.RECONCILIATION,
+    )
+
+    result = generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert result == str(run.id)
+    assert run.execution_contract_version == 1
+    assert run.status == WorkflowRunStatus.SUCCEEDED
+    assert run.fencing_token == work.fencing_token == 1
+    assert run.lease_owner != ''
+    assert run.heartbeat_at is not None
+    assert run.lease_expires_at is not None
+
+
+@pytest.mark.django_db
+def test_daily_explicit_delivery_rejects_legacy_v0_before_domain_access() -> None:
+    organization, project = _make_scope('daily-explicit-v0-rejected')
+    _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    run = _linked_daily_run(organization, project, work)
+
+    with mock.patch(
+        'engram.memory.digest_work.execute_frozen_digest_work',
+        return_value=None,
+    ) as m_execute:
+        with pytest.raises(ValueError, match='queued v1 attempt'):
+            generate_daily_digest_work_v1(str(work.id), str(run.id))
+
+    m_execute.assert_not_called()
+    work.refresh_from_db()
+    run.refresh_from_db()
+    assert run.execution_contract_version == 0
+    assert run.status == WorkflowRunStatus.QUEUED
+    assert run.fencing_token is None
+    assert work.fencing_token == 0
 
 
 @pytest.mark.django_db
@@ -1839,3 +1912,201 @@ def test_execute_frozen_digest_work_without_claim_publishes_via_legacy_resolver(
     work.refresh_from_db()
     assert work.disposition == WorkflowWorkDisposition.COMPLETE
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+def _digest_source_state_input(memory: Memory, action: str) -> MemoryStateInput:
+    memory.refresh_from_db()
+
+    return MemoryStateInput(
+        request=TransitionRequest(
+            scope=TransitionScope(
+                organization_id=memory.organization_id,
+                project_id=memory.project_id,
+                team_id=memory.team_id,
+            ),
+            idempotency_key=f'test:digest-source:{action}:{memory.id}:v1',
+            actor_type='system',
+            actor_id='digest-work-test',
+            capability='memories:write',
+            request_id=f'test:digest-source:{action}:{memory.id}',
+            correlation_id=f'test:digest-source:{memory.id}',
+            reason=f'{action} digest source',
+            origin='digest-work-test',
+        ),
+        memory_fence=build_memory_fence(memory),
+    )
+
+
+class _StateInvalidatingDigestGateway:
+    def __init__(
+        self,
+        memory: Memory,
+        command_type: type[MarkMemoryStale] | type[RefuteMemory],
+        action: str,
+        calls: list[ProviderCallInput],
+    ) -> None:
+        self._memory = memory
+        self._command_type = command_type
+        self._action = action
+        self._calls = calls
+        self._delegate = FakeProviderGateway()
+
+    def call(self, data: ProviderCallInput) -> ProviderCallResult:
+        self._calls.append(data)
+        self._command_type().execute(_digest_source_state_input(self._memory, self._action))
+
+        return self._delegate.call(data)
+
+    def embed(self, data: object) -> object:
+        return self._delegate.embed(data)
+
+
+@pytest.mark.django_db
+def test_daily_snapshot_excludes_stale_approved_source() -> None:
+    digest_work = _load_digest_work()
+    organization, project = _make_scope('daily-stale-eligibility')
+    source, _version = _make_memory(organization, project, title='Invalid claim', body='stale body')
+
+    MarkMemoryStale().execute(_digest_source_state_input(source, 'mark-stale-before-freeze'))
+    source.refresh_from_db()
+    assert source.status == MemoryStatus.APPROVED
+    assert source.stale is True
+
+    window_start, window_end = _daily_window()
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=organization.id,
+        project_id=project.id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='daily:stale-eligibility',
+        max_sources=10,
+    )
+
+    assert snapshot['eligible_source_count'] == 0
+    assert snapshot['sources'] == []
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('command_type', 'action'),
+    (
+        (MarkMemoryStale, 'mark-stale-before-worker'),
+        (RefuteMemory, 'refute-before-worker'),
+    ),
+    ids=('stale', 'refuted'),
+)
+def test_daily_worker_rejects_source_invalidated_after_freeze_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    command_type: type[MarkMemoryStale] | type[RefuteMemory],
+    action: str,
+) -> None:
+    organization, project = _make_scope(f'daily-{action}')
+    _create_digest_policy(organization, project)
+    source, _version = _make_memory(organization, project, title='Invalid claim', body='invalid body')
+    work, _snapshot = _make_daily_work(organization, project, schedule_key=f'daily:{action}')
+    command_type().execute(_digest_source_state_input(source, action))
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError) as error:
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert error.value.code == 'work_scope_invalid'
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('command_type', 'action'),
+    (
+        (MarkMemoryStale, 'mark-stale-during-provider'),
+        (RefuteMemory, 'refute-during-provider'),
+    ),
+    ids=('stale', 'refuted'),
+)
+def test_daily_worker_discards_result_when_source_becomes_inactive_during_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    command_type: type[MarkMemoryStale] | type[RefuteMemory],
+    action: str,
+) -> None:
+    organization, project = _make_scope(f'daily-{action}')
+    _create_digest_policy(organization, project)
+    source, _version = _make_memory(organization, project, title='Invalid claim', body='invalid body')
+    work, _snapshot = _make_daily_work(organization, project, schedule_key=f'daily:{action}')
+    calls: list[ProviderCallInput] = []
+
+    def gateway(_policy: object, **_kwargs: object) -> object:
+        return _StateInvalidatingDigestGateway(source, command_type, action, calls)
+
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', gateway)
+
+    with pytest.raises(MemoryWorkerError) as error:
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert error.value.code == 'work_scope_invalid'
+    assert len(calls) == 1
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0
+    assert MemoryVersion.objects.filter(memory__project=project, memory__kind='digest').count() == 0
+    assert RetrievalDocument.objects.filter(project=project, memory__kind='digest').count() == 0
+
+
+def _open_conflict_on(memory: Memory) -> None:
+    candidate, _source, _session = provenanced_candidate_in_scope(
+        memory.organization,
+        memory.project,
+        None,
+        suffix=f'digest-conflict-{memory.id}',
+        title='Contradiction candidate',
+        body='Contradiction candidate body',
+        visibility_scope=VisibilityScope.PROJECT,
+    )
+    memory.refresh_from_db()
+    OpenMemoryConflict().execute(
+        OpenMemoryConflictInput(
+            request=transition_request_for(candidate, key=f'request:conflict-open:{candidate.id}:v1'),
+            candidate_fence=candidate_fence_for(candidate),
+            memory_fence=build_memory_fence(memory),
+            evidence_hash='e' * 64,
+            redacted_reason='digest conflict revalidation test',
+        )
+    )
+
+
+@pytest.mark.django_db
+def test_daily_snapshot_excludes_source_with_unresolved_conflict() -> None:
+    digest_work = _load_digest_work()
+    _candidate, conflict = open_single_conflict('daily-conflict-eligibility')
+    window_start, window_end = _daily_window()
+
+    snapshot = digest_work.freeze_daily_digest_input(
+        organization_id=conflict.organization_id,
+        project_id=conflict.project_id,
+        window_start=window_start,
+        window_end=window_end,
+        schedule_key='daily:conflict-eligibility',
+        max_sources=10,
+    )
+
+    assert snapshot['eligible_source_count'] == 0
+    assert snapshot['sources'] == []
+
+
+@pytest.mark.django_db
+def test_daily_worker_rejects_source_with_conflict_opened_after_freeze(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, project = _make_scope('daily-conflict-after-freeze')
+    _create_digest_policy(organization, project)
+    source, _version = _make_memory(organization, project, title='Alpha', body='body-a')
+    work, _snapshot = _make_daily_work(organization, project)
+    _open_conflict_on(source)
+    calls: list[ProviderCallInput] = []
+    monkeypatch.setattr('engram.memory.services.get_provider_gateway', _counting_gateway(calls))
+
+    with pytest.raises(MemoryWorkerError) as error:
+        generate_daily_digest_work_v1(str(work.id))
+
+    assert error.value.code == 'work_scope_invalid'
+    assert calls == []
+    assert Memory.objects.filter(project=project, kind='digest').count() == 0

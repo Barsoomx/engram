@@ -938,9 +938,9 @@ class RebuildMemoryProjections:
                     changed += 1
 
                     continue
-                _work, created = create_embedding_work_and_signal(document=evaluation.document)
-                changed += int(created)
-                skipped += int(not created)
+                _work, signaled = create_embedding_work_and_signal(document=evaluation.document)
+                changed += int(signaled)
+                skipped += int(not signaled)
 
         return RebuildProjectionResult(
             organization_id=organization_id,

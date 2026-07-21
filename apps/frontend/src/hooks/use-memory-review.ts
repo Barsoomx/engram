@@ -8,113 +8,60 @@ import {
 } from '@tanstack/react-query';
 
 import {
-  bulkArchiveMemoryReview,
-  bulkReviewAction,
+  getMemoryConflict,
   listMemoryReview,
-  memoryReviewAction,
-  memoryReviewDiff,
-  type BulkArchiveMemoryReviewPayload,
-  type BulkArchiveMemoryReviewResult,
-  type BulkReviewActionPayload,
-  type BulkReviewActionResult,
-  type MemoryReviewActionPayload,
-  type MemoryReviewActionResult,
-  type MemoryReviewDiff,
+  resolveMemoryConflict,
+  type ConflictResolvePayload,
+  type ConflictResolveResult,
+  type MemoryConflictDetail,
   type MemoryReviewItem,
   type MemoryReviewListParams,
   type Paginated,
 } from '@/lib/admin-api';
 import { adminQueryKeys } from '@/lib/query-keys';
 
-type ReviewParams = Parameters<typeof adminQueryKeys.memoryReview>[1];
-
 export function useMemoryReview(
   orgId: string | null,
-  params?: ReviewParams,
+  params?: MemoryReviewListParams,
   options?: Partial<UseQueryOptions<Paginated<MemoryReviewItem>>>,
 ) {
   return useQuery<Paginated<MemoryReviewItem>>({
     queryKey: adminQueryKeys.memoryReview(orgId, params),
-    queryFn: () =>
-      listMemoryReview(params as MemoryReviewListParams | undefined),
+    queryFn: () => listMemoryReview(params),
     enabled: Boolean(orgId),
     ...options,
   });
 }
 
-export function useMemoryReviewDiff(
+export function useMemoryConflict(
   orgId: string | null,
-  memoryId: string | null,
-  fromVersion: number | null,
-  toVersion: number | null,
-  options?: Partial<UseQueryOptions<MemoryReviewDiff>>,
+  candidateId: string | null,
+  options?: Partial<UseQueryOptions<MemoryConflictDetail>>,
 ) {
-  return useQuery<MemoryReviewDiff>({
-    queryKey: adminQueryKeys.memoryReviewDiff(
-      orgId,
-      memoryId,
-      fromVersion,
-      toVersion,
-    ),
+  return useQuery<MemoryConflictDetail>({
+    queryKey: adminQueryKeys.memoryConflict(orgId, candidateId),
     queryFn: () => {
-      if (!memoryId || fromVersion === null || toVersion === null) {
-        throw new Error('memory diff requires id, from and to versions');
+      if (!candidateId) {
+        throw new Error('conflict detail requires a candidate id');
       }
 
-      return memoryReviewDiff(memoryId, fromVersion, toVersion);
+      return getMemoryConflict(candidateId);
     },
-    enabled:
-      Boolean(orgId) &&
-      Boolean(memoryId) &&
-      fromVersion !== null &&
-      toVersion !== null,
+    enabled: Boolean(orgId) && Boolean(candidateId),
     ...options,
   });
 }
 
-export function useMemoryReviewAction(orgId: string | null) {
+export function useResolveMemoryConflict(orgId: string | null) {
   const queryClient = useQueryClient();
 
   return useMutation<
-    MemoryReviewActionResult,
+    ConflictResolveResult,
     unknown,
-    { id: string; payload: MemoryReviewActionPayload }
+    { id: string; payload: ConflictResolvePayload; ifMatch: string }
   >({
-    mutationFn: ({ id, payload }) => memoryReviewAction(id, payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: adminQueryKeys.memoryReview(orgId),
-      });
-    },
-  });
-}
-
-export function useBulkArchiveMemoryReview(orgId: string | null) {
-  const queryClient = useQueryClient();
-
-  return useMutation<
-    BulkArchiveMemoryReviewResult,
-    unknown,
-    BulkArchiveMemoryReviewPayload
-  >({
-    mutationFn: (payload) => bulkArchiveMemoryReview(payload),
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        queryKey: adminQueryKeys.memoryReview(orgId),
-      });
-    },
-  });
-}
-
-export function useBulkReviewAction(orgId: string | null) {
-  const queryClient = useQueryClient();
-
-  return useMutation<
-    BulkReviewActionResult,
-    unknown,
-    BulkReviewActionPayload
-  >({
-    mutationFn: (payload) => bulkReviewAction(payload),
+    mutationFn: ({ id, payload, ifMatch }) =>
+      resolveMemoryConflict(id, payload, ifMatch),
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: adminQueryKeys.memoryReview(orgId),

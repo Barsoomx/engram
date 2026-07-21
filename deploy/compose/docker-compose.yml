@@ -177,6 +177,27 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Test-only CP5 frontend gate: source plus dev dependencies (builder stage), never
+  # started as a long-lived service. `run --rm frontend-ci` typechecks, lints, builds,
+  # and runs the conflict-surface action/ETag helper tests. The production runner image
+  # (the `frontend` service) is unchanged.
+  frontend-ci:
+    image: engram-frontend-ci:local
+    profiles:
+      - ci
+    build:
+      context: ../../apps/frontend
+      dockerfile: Dockerfile
+      target: builder
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,::1}
+    command:
+      - sh
+      - -ec
+      - pnpm typecheck && pnpm lint && pnpm build && node --test src/lib/memory-conflict-actions.test.ts
+
   postgres:
     image: pgvector/pgvector:pg18
     environment:

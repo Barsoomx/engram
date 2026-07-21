@@ -927,7 +927,7 @@ def test_get_weekly_weeks_back_one_finds_new_format_digest(
 
 
 @pytest.mark.django_db
-def test_get_weekly_current_scope_error_returns_404(
+def test_get_weekly_current_unlinked_team_returns_not_built_without_writing(
     f_read_client: APIClient,
     f_org: Organization,
     f_project: Project,
@@ -940,7 +940,10 @@ def test_get_weekly_current_scope_error_returns_404(
 
     response = f_read_client.get('/v1/admin/digests/weekly', {'project_id': str(f_project.id)})
 
-    assert response.status_code == 404
+    assert response.status_code == 200
+    assert response.data['built'] is False
+    assert response.data['digest_memory_id'] is None
+    assert response.data['window_start'] is not None
     assert WorkflowWork.objects.count() == 0
     assert CeleryOutbox.objects.count() == 0
 

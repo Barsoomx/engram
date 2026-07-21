@@ -44,6 +44,7 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.digest_work import digest_output_identity
+from engram.memory.transitions_test_support import open_single_conflict
 
 VERSION_BODY_MAX_LENGTH = 16000
 AGENT_RAW_KEY = 'egk_test_memory_version_agent_0123456789abcdefghijklmnopqrstuv'
@@ -392,6 +393,37 @@ def test_update_memory_body_rejects_stale_or_refuted_memory(stale_field: str) ->
     assert response.status_code == 400
     assert response.json()['code'] == 'memory_not_editable'
     assert MemoryVersion.objects.filter(memory=memory).count() == 1
+
+
+@pytest.mark.django_db
+def test_update_memory_body_rejects_memory_with_open_conflict() -> None:
+    _candidate, conflict = open_single_conflict('memory-version-open-conflict')
+    memory = conflict.memory
+    project = conflict.project
+    pinned_version_id = conflict.memory_version_id
+    create_org_agent_key(conflict.organization)
+    client = APIClient()
+
+    response = client.post(
+        f'/v1/memories/{memory.id}/version',
+        version_payload(
+            project,
+            body='This edit must not drift an unresolved conflict.',
+            request_id='request-version-open-conflict',
+        ),
+        format='json',
+        HTTP_AUTHORIZATION=f'Bearer {AGENT_RAW_KEY}',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'memory_not_editable'
+
+    memory.refresh_from_db()
+    conflict.refresh_from_db()
+    assert memory.current_version == conflict.memory_version.version
+    assert conflict.memory_version_id == pinned_version_id
+    assert MemoryVersion.objects.filter(memory=memory).count() == 1
+    assert conflict.resolved_transition_id is None
 
 
 @pytest.mark.django_db

@@ -724,6 +724,7 @@ class Memory(TimestampedModel):
     )
     current_version = models.PositiveIntegerField(default=1)
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    confidence_decayed_at = models.DateTimeField(null=True, blank=True)
     stale = models.BooleanField(default=False)
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
@@ -895,8 +896,8 @@ class RetrievalDocument(TimestampedModel):
     refuted = models.BooleanField(default=False)
     metadata = models.JSONField(default=dict, blank=True)
     projection_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
-    exact_projection_hash = models.CharField(max_length=64, default='', blank=True)
-    embedding_projection_hash = models.CharField(max_length=64, default='', blank=True)
+    exact_projection_hash = models.CharField(max_length=64, default='', db_default='', blank=True)
+    embedding_projection_hash = models.CharField(max_length=64, default='', db_default='', blank=True)
     embedding_projected_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -2834,6 +2835,8 @@ class CurationDecision(ImmutableCreatedModel):
         null=True,
         blank=True,
     )
+    applicability = models.CharField(max_length=20, blank=True, default='', db_default='')
+    evidence_membership = models.JSONField(default=dict, blank=True, db_default={})
     payload_hash = models.CharField(max_length=64)
 
     _IMMUTABLE_FIELDS = (
@@ -2858,6 +2861,8 @@ class CurationDecision(ImmutableCreatedModel):
         ('policy_version', 'policy_version'),
         ('transition_id', 'transition'),
         ('conflict_id', 'conflict'),
+        ('applicability', 'applicability'),
+        ('evidence_membership', 'evidence_membership'),
         ('payload_hash', 'payload_hash'),
     )
 

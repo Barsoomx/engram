@@ -22,6 +22,7 @@ from engram.core.models import (
     VisibilityScope,
 )
 from engram.memory.digest_visibility_tests import build_legacy_digest, build_proven_weekly_digest
+from engram.memory.transitions_test_support import open_single_conflict
 from engram.model_policy.services import EmbeddingCallResult
 
 pytestmark_pgvector = pytest.mark.skipif(VectorField is None, reason='pgvector not installed')
@@ -430,3 +431,27 @@ def test_search_debug_excludes_unproven_digest_and_admin_does_not_bypass() -> No
     assert legacy.id not in semantic_ids
     assert legacy.id not in lexical_ids
     assert legacy.id not in packed_ids
+
+
+@pytest.mark.django_db
+def test_search_debug_excludes_document_with_unresolved_conflict() -> None:
+    _candidate, conflict = open_single_conflict('search-debug-conflict')
+    organization = conflict.organization
+    project = conflict.project
+
+    assert RetrievalDocument.objects.filter(memory_id=conflict.memory_id).exists()
+
+    result = ReplaySearchDebug().execute(
+        organization=organization,
+        project=project,
+        scope=_make_scope(organization, project),
+        query='',
+        team_id=None,
+        file_paths=(),
+        symbols=(),
+    )
+
+    excluded_reasons = {entry.memory_id: entry.reason for entry in result.excluded}
+    assert conflict.memory_id in excluded_reasons
+    assert excluded_reasons[conflict.memory_id] == 'unresolved_conflict'
+    assert conflict.memory_id not in {match.memory_id for match in result.exact_matches}

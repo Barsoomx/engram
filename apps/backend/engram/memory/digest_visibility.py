@@ -42,7 +42,15 @@ def digest_visibility_failure(memory: Memory) -> str | None:
 
     work = _load_work(meta)
     documents = list(
-        RetrievalDocument.objects.filter(memory_id=memory.id).only('memory_id', 'visibility_scope', 'team_id'),
+        RetrievalDocument.objects.select_related('memory_version')
+        .filter(memory_id=memory.id)
+        .only(
+            'memory_id',
+            'visibility_scope',
+            'team_id',
+            'memory_version__memory_id',
+            'memory_version__version',
+        ),
     )
     if _prove(memory, meta, work, documents):
         return None
@@ -87,10 +95,16 @@ def _load_works(metas: Iterable[dict[str, object] | None]) -> dict[UUID, Workflo
 
 def _load_documents(memory_ids: list[UUID]) -> dict[UUID, list[RetrievalDocument]]:
     documents_by_memory: dict[UUID, list[RetrievalDocument]] = defaultdict(list)
-    for document in RetrievalDocument.objects.filter(memory_id__in=memory_ids).only(
-        'memory_id',
-        'visibility_scope',
-        'team_id',
+    for document in (
+        RetrievalDocument.objects.select_related('memory_version')
+        .filter(memory_id__in=memory_ids)
+        .only(
+            'memory_id',
+            'visibility_scope',
+            'team_id',
+            'memory_version__memory_id',
+            'memory_version__version',
+        )
     ):
         documents_by_memory[document.memory_id].append(document)
 
@@ -155,7 +169,7 @@ def _prove(
     if not _memory_visibility_matches(memory, meta):
         return False
 
-    return _documents_visibility_match(memory, documents)
+    return _documents_prove_current(memory, documents)
 
 
 def _work_is_completed_digest(work: WorkflowWork, memory: Memory) -> bool:
@@ -208,12 +222,24 @@ def _memory_visibility_matches(memory: Memory, meta: dict[str, object]) -> bool:
     return False
 
 
-def _documents_visibility_match(memory: Memory, documents: list[RetrievalDocument]) -> bool:
+def _documents_prove_current(memory: Memory, documents: list[RetrievalDocument]) -> bool:
+    if not documents:
+        return False
+
     for document in documents:
         if document.visibility_scope != memory.visibility_scope:
             return False
 
         if _normalize(document.team_id) != _normalize(memory.team_id):
+            return False
+
+        version = document.memory_version
+        if (
+            document.memory_id != memory.id
+            or version is None
+            or version.memory_id != memory.id
+            or version.version != memory.current_version
+        ):
             return False
 
     return True

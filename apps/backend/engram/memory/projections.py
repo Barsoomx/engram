@@ -16,8 +16,10 @@ from engram.core.models import (
     MemoryVersion,
     MemoryVersionSource,
     RetrievalDocument,
+    WorkflowRunOrigin,
     WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkExecutionState,
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
@@ -201,7 +203,21 @@ def create_embedding_work_and_signal(*, document: RetrievalDocument) -> tuple[Wo
     if created:
         queue_work_attempt(work_id=work.id, now=timezone.now(), origin='memory_transition')
 
-    return work, created
+        return work, True
+
+    if _embedding_work_needs_resignal(work):
+        queue_work_attempt(work_id=work.id, now=timezone.now(), origin=WorkflowRunOrigin.MANUAL)
+
+        return work, True
+
+    return work, False
+
+
+def _embedding_work_needs_resignal(work: WorkflowWork) -> bool:
+    return (
+        work.execution_state == WorkflowWorkExecutionState.SETTLED
+        and work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+    )
 
 
 def _load_current_transition(memory: Memory, transition_id: uuid.UUID) -> MemoryTransition | None:

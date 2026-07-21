@@ -6,6 +6,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.conf import settings
+from django.db.models import Q
 from django.utils import timezone
 
 from engram.core.models import (
@@ -58,25 +59,29 @@ class DecayMemoryConfidence:
         )
 
     def _decay_project(self, organization: Organization, project: Project) -> list[uuid.UUID]:
-        cutoff = timezone.now() - timedelta(days=settings.ENGRAM_CONFIDENCE_DECAY_MIN_AGE_DAYS)
+        now = timezone.now()
+        cutoff = now - timedelta(days=settings.ENGRAM_CONFIDENCE_DECAY_MIN_AGE_DAYS)
         step = settings.ENGRAM_CONFIDENCE_DECAY_STEP
         floor = settings.ENGRAM_CONFIDENCE_DECAY_FLOOR
 
-        candidates = Memory.objects.filter(
-            organization=organization,
-            project=project,
-            status=MemoryStatus.APPROVED,
-            stale=False,
-            refuted=False,
-            confidence__isnull=False,
-            confidence__gt=floor,
-            updated_at__lt=cutoff,
-        ).exclude(kind='digest')
+        candidates = (
+            Memory.objects.filter(
+                organization=organization,
+                project=project,
+                status=MemoryStatus.APPROVED,
+                stale=False,
+                refuted=False,
+                confidence__isnull=False,
+                confidence__gt=floor,
+            )
+            .filter(Q(confidence_decayed_at__lt=cutoff) | Q(confidence_decayed_at__isnull=True, updated_at__lt=cutoff))
+            .exclude(kind='digest')
+        )
 
         decayed_ids: list[uuid.UUID] = []
         for memory in candidates:
-            memory.confidence = max(floor, memory.confidence - step).quantize(_CONFIDENCE_QUANTIZE)
-            memory.save(update_fields=['confidence', 'updated_at'])
+            decayed = max(floor, memory.confidence - step).quantize(_CONFIDENCE_QUANTIZE)
+            Memory.objects.filter(id=memory.id).update(confidence=decayed, confidence_decayed_at=now)
             decayed_ids.append(memory.id)
 
         return decayed_ids

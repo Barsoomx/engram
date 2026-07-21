@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Any
 
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import mixins, viewsets
 from rest_framework.decorators import action
@@ -26,23 +28,18 @@ from engram.console.serializers.workflow_runs import (
 from engram.console.services import audit_admin_action
 from engram.core.models import (
     WorkflowRun,
+    WorkflowRunOrigin,
     WorkflowRunStatus,
     WorkflowRunType,
     WorkflowWork,
 )
 from engram.memory.tasks import (
-    dispatch_work_task,
     distill_session,  # noqa: F401
-    generate_daily_digest_work_v1,
-    generate_weekly_digest_work_v1,
 )
+from engram.memory.work_dispatch import queue_work_attempt
 
 _DIGEST_RUN_TYPES = (WorkflowRunType.DAILY_DIGEST, WorkflowRunType.WEEKLY_DIGEST)
 _TERMINAL_RUN_STATUSES = (WorkflowRunStatus.SUCCEEDED, WorkflowRunStatus.FAILED)
-_DIGEST_WORK_TASKS = {
-    WorkflowRunType.DAILY_DIGEST: generate_daily_digest_work_v1,
-    WorkflowRunType.WEEKLY_DIGEST: generate_weekly_digest_work_v1,
-}
 
 
 class WorkflowRunViewSet(
@@ -69,15 +66,14 @@ class WorkflowRunViewSet(
         ]
 
     def get_queryset(self) -> Any:
-        queryset = WorkflowRun.objects.filter(
-            organization=self.request.active_organization,
-        ).select_related('project', 'team', 'result_memory')
-        if self.action == 'rerun':
-            project_ids = self.request.effective_scope.project_ids
-            if project_ids:
-                return queryset.filter(project_id__in=project_ids)
+        scope = self.request.effective_scope
 
-        return queryset
+        return (
+            WorkflowRun.objects.filter(organization=self.request.active_organization)
+            .select_related('project', 'team', 'result_memory')
+            .filter(project_id__in=scope.project_ids)
+            .filter(Q(team_id__isnull=True) | Q(team_id__in=scope.team_ids))
+        )
 
     def get_serializer_class(self) -> type:
         if self.action == 'retrieve':
@@ -111,7 +107,6 @@ class WorkflowRunViewSet(
             raise WorkflowRunNotTerminalError('workflow run must reach a terminal status before rerun')
 
         request_id = f'workflow-rerun:{run.id}'
-        signal_task = _DIGEST_WORK_TASKS[run.run_type]
 
         try:
             with transaction.atomic():
@@ -121,20 +116,14 @@ class WorkflowRunViewSet(
                     project=run.project,
                 )
 
-                new_run = WorkflowRun.objects.create(
-                    organization=run.organization,
-                    project=run.project,
-                    team=run.team,
-                    work=work,
-                    run_type=run.run_type,
-                    status=WorkflowRunStatus.QUEUED,
-                    input_snapshot=work.input_snapshot,
+                new_run = queue_work_attempt(
+                    work_id=work.id,
+                    now=datetime.now(UTC),
+                    origin=WorkflowRunOrigin.MANUAL,
                     request_id=request_id,
                     correlation_id=request_id,
-                    rerun_of=run,
+                    rerun_of_id=run.id,
                 )
-
-                dispatch_work_task(signal_task, work.id, new_run.id)
 
                 audit_admin_action(
                     organization=run.organization,

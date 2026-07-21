@@ -3,6 +3,9 @@
 import { persist } from 'zustand/middleware';
 import { create } from 'zustand';
 
+import { shouldClearTeamOnProjectChange } from '@/lib/team-scope';
+import { useTeamStore } from '@/lib/team-store';
+
 const PROJECT_STORAGE_KEY = 'engram_active_project';
 
 export type ProjectStoreState = {
@@ -13,10 +16,16 @@ export type ProjectStoreState = {
 
 export const useProjectStore = create<ProjectStoreState>()(
   persist(
-    (set) => ({
+    (set, get) => ({
       activeProjectId: null,
       setActiveProject: (projectId) => {
+        const previous = get().activeProjectId;
+
         set({ activeProjectId: projectId });
+
+        if (shouldClearTeamOnProjectChange(previous, projectId)) {
+          useTeamStore.getState().clearActiveTeam();
+        }
       },
       clearActiveProject: () => {
         set({ activeProjectId: null });

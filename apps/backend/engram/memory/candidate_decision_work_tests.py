@@ -35,7 +35,7 @@ from engram.memory.candidate_decision_work import (
     ensure_candidate_decision_work_locked,
     get_candidate_decision_work_builder,
 )
-from engram.memory.work_execution import claim_work, fail_work_claim
+from engram.memory.work_execution import claim_work, execution_configuration_fingerprint, fail_work_claim
 from engram.memory.work_failures import CONFIGURATION, PROVIDER_TRANSIENT, ClassifiedWorkFailure
 from engram.memory.workflow_work import (
     CreateWorkflowWorkInput,
@@ -44,12 +44,6 @@ from engram.memory.workflow_work import (
     resolve_work_succeeded,
 )
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
-
-
-@pytest.fixture(autouse=True)
-def f_reset_candidate_builder() -> None:
-    yield
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
 
 
 def _scope(suffix: str) -> tuple[Organization, Team, Project, Agent, AgentSession]:
@@ -515,13 +509,15 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     candidate = _candidate(scope, '1')
     _mark_cp3_candidate(scope, candidate)
     now = timezone.now()
+    prepared, _created = ensure_candidate_decision_work(candidate.id)
+    blocked_fingerprint = execution_configuration_fingerprint(prepared)
     work = _fail_candidate_decision_work(
         candidate,
         now=now,
         failure=ClassifiedWorkFailure(
             failure_class=CONFIGURATION,
             code='model_policy_unavailable',
-            configuration_fingerprint='a' * 64,
+            configuration_fingerprint=blocked_fingerprint,
         ),
     )
     assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
@@ -536,4 +532,90 @@ def test_reconcile_blocked_candidate_work_is_untouched(monkeypatch: pytest.Monke
     assert result.queued == 0
     assert not WorkflowRun.objects.filter(work=work, status=WorkflowRunStatus.QUEUED).exists()
     assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert sent == []
+
+
+@pytest.mark.django_db
+def test_reconcile_expired_candidate_lease_queues_recovery_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('expired-lease')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, created = ensure_candidate_decision_work(candidate.id)
+    assert created is True
+
+    now = timezone.now()
+    claimed = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        lease_owner=f'host:worker:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(seconds=1),
+    )
+    assert claimed.outcome == 'claimed'
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(seconds=2),
+    )
+
+    assert result.queued == 1
+    queued = WorkflowRun.objects.filter(
+        work=work,
+        status=WorkflowRunStatus.QUEUED,
+        execution_contract_version=1,
+    )
+    assert queued.count() == 1
+    assert sent == [
+        (
+            'engram.memory.process_candidate_decision_work_v1',
+            (str(work.id), str(queued.get().id)),
+        )
+    ]
+
+
+@pytest.mark.django_db
+def test_retry_streak_ceiling_parks_candidate_work_and_reconciler_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_WORK_FAILURE_STREAK_LIMIT', '3')
+    scope = _scope('ceiling')
+    organization, _team, project, _agent, _session = scope
+    candidate = _candidate(scope, '1')
+    _mark_cp3_candidate(scope, candidate)
+    work, _created = ensure_candidate_decision_work(candidate.id)
+    now = timezone.now()
+
+    for attempt in range(1, 4):
+        claim_now = now + timedelta(hours=attempt - 1)
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            lease_owner=f'ceiling:{attempt}',
+            now=claim_now,
+            lease_for=timedelta(minutes=5),
+        )
+        assert claimed.outcome == 'claimed'
+        fail_work_claim(
+            claim=claimed.claim,
+            now=claim_now,
+            failure=ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code='judge_policy_denied'),
+        )
+
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    assert work.failure_streak == 3
+    sent = _collect_sent(monkeypatch)
+
+    result = candidate_work_reconciler.reconcile_candidate_work(
+        organization_id=organization.id,
+        project_id=project.id,
+        as_of=now + timedelta(days=1),
+    )
+
+    assert result.queued == 0
     assert sent == []
