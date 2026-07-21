@@ -125,6 +125,7 @@ class PublishDigestMemoryInput:
     work_claim: WorkClaim | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
     visibility_scope: str = VisibilityScope.PROJECT
+    require_active_sources: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -923,6 +924,11 @@ def _require_proposed_candidate(candidate: MemoryCandidate) -> None:
 def _require_no_open_conflict(candidate: MemoryCandidate) -> None:
     if MemoryConflict.objects.filter(candidate_id=candidate.id, resolved_transition__isnull=True).exists():
         raise MemoryTransitionError('unresolved_conflict', 'candidate has unresolved memory conflicts')
+
+
+def _require_memory_has_no_open_conflict(memory: Memory) -> None:
+    if MemoryConflict.objects.filter(memory_id=memory.id, resolved_transition__isnull=True).exists():
+        raise MemoryTransitionError('memory_conflicted', 'memory has an unresolved conflict pinned to it')
 
 
 def _require_sha256(value: str, *, field: str) -> None:
@@ -1802,6 +1808,10 @@ class PublishDigestMemory:
                 memories, versions = _lock_digest_sources_from_versions(request, version_ids, data.visibility_scope)
                 source_pairs = {(str(memory_id), str(version.id)) for memory_id, version in versions.items()}
             _lock_exact_documents(versions)
+            if data.require_active_sources:
+                for source_memory in memories.values():
+                    _require_active_memory(source_memory)
+                    _require_memory_has_no_open_conflict(source_memory)
             if claimed_work is not None:
                 _validate_digest_work_claim(claimed_work, request, source_pairs)
             existing = _existing_transition(request, fingerprint=fingerprint)
@@ -1877,6 +1887,7 @@ class ReviseMemory:
             memory = memories[data.memory_fence.memory_id]
             prior_version = versions[memory.id]
             _require_active_memory(memory)
+            _require_memory_has_no_open_conflict(memory)
             version, version_sources = _create_revision_version(
                 memory,
                 prior_version,
@@ -1968,6 +1979,7 @@ def _execute_candidate_revision(
         memory = memories[data.memory_fence.memory_id]
         prior_version = versions[memory.id]
         _require_active_memory(memory)
+        _require_memory_has_no_open_conflict(memory)
         sanitized_view = _revalidated_sanitized_view(
             candidate,
             sanitized_title=data.sanitized_title,

@@ -7,6 +7,7 @@ name: Publish images
 #
 # - master push  -> tags `latest` + `sha-<short>`
 # - tag `0.1.0`  -> stable semver tags `0.1.0` + `0.1`
+# - tag `engram-v0.2` -> release tags `0.2` (`engram-v0.2.1` -> `0.2.1` + `0.2`); tag pushes never move `latest`
 # - pull_request -> BUILD only, NOT pushed (validates the Dockerfiles + placeholder build)
 #
 # The frontend image is GENERIC: NEXT_PUBLIC_* config is baked as APP_* placeholders and
@@ -19,6 +20,7 @@ on:
     tags:
       - '[0-9]+.[0-9]+.[0-9]+'
       - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'engram-v[0-9]*'
   pull_request:
     paths:
       - 'apps/backend/**'
@@ -77,10 +79,16 @@ jobs:
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.OWNER_LC }}/${{ matrix.image }}
+          # latest is minted ONLY by the raw entry on master below — auto-latest would let any
+          # tag push (semver or engram-v*) re-point :latest, which prod pulls.
+          flavor: |
+            latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=^engram-v(\d+(\.\d+)+)$,group=1
+            type=match,pattern=^engram-v(\d+\.\d+)\.\d+$,group=1
             type=sha,format=short
             type=raw,value=${{ github.event.inputs.extra_tag }},enable=${{ github.event.inputs.extra_tag != '' }}
 

@@ -209,21 +209,11 @@ def _manifest_hash(
 
 def revalidate_curation_shortlist(data: BuildCurationShortlistInput, shortlist: CurationShortlist) -> bool:
     try:
-        if _authorized_memories(data).count() != shortlist.authorized_corpus_count:
-            return False
-        if not shortlist.entries:
-            return True
-        current = dict(
-            Memory.objects.filter(
-                id__in=[entry.memory_id for entry in shortlist.entries],
-                organization_id=data.organization_id,
-                project_id=data.project_id,
-            ).values_list('id', 'current_transition_id')
-        )
-    except (DatabaseError, FieldError, TypeError, ValueError) as exc:
-        raise CurationShortlistError('shortlist_query_failed') from exc
+        rebuilt = BuildCurationShortlist.execute(data)
+    except CurationShortlistError:
+        return False
 
-    return all(current.get(entry.memory_id) == entry.current_transition_id for entry in shortlist.entries)
+    return rebuilt.manifest_hash == shortlist.manifest_hash
 
 
 class BuildCurationShortlist:

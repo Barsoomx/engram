@@ -824,3 +824,48 @@ def test_concurrent_reconcile_converges_on_one_attempt() -> None:
         == 1
     )
     assert CeleryOutbox.objects.filter(task_name=_DISTILL_TASK).count() == 1
+
+
+_DISTILL_SETTING_SUFFIX = {
+    'ENGRAM_DISTILL_CHUNK_CHAR_BUDGET': 'budget',
+    'ENGRAM_DISTILL_REDUCE_TARGET': 'target',
+    'ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT': 'maxcalls',
+}
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize(
+    ('setting_name', 'invalid_value', 'repaired_value'),
+    [
+        ('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '7999', '8000'),
+        ('ENGRAM_DISTILL_REDUCE_TARGET', '0', '1'),
+        ('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '0', '1'),
+    ],
+)
+def test_distillation_configuration_repair_changes_block_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    setting_name: str,
+    invalid_value: str,
+    repaired_value: str,
+) -> None:
+    monkeypatch.setenv(setting_name, invalid_value)
+    scope = create_scope(f'cfg-repair-{_DISTILL_SETTING_SUFFIX[setting_name]}')
+    now = timezone.now()
+    work = _current_work(scope, sequence=1)
+    blocked_fingerprint = _we().execution_configuration_fingerprint(work)
+    claimed = _claim(work, now=now)
+    _we().fail_work_claim(
+        claim=claimed.claim,
+        now=now,
+        failure=ClassifiedWorkFailure(
+            failure_class=CONFIGURATION,
+            code='distillation_configuration_invalid',
+            configuration_fingerprint=blocked_fingerprint,
+        ),
+    )
+
+    monkeypatch.setenv(setting_name, repaired_value)
+
+    findings = _inspect(scope, as_of=now + timedelta(seconds=60))
+    finding = _one(findings, 'configuration_changed')
+    assert finding.work_id == work.id

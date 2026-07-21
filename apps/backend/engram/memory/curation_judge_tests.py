@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import pytest
+from django.utils import timezone
 
 from engram.core.models import (
     CurationDecision,
@@ -23,13 +24,18 @@ from engram.core.models import (
     Observation,
     Organization,
     Project,
+    SessionStatus,
     Team,
     VisibilityScope,
+    WorkflowWork,
 )
 from engram.memory.curation_test_support import create_curation_policy
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
 from engram.memory.distillation_provenance import candidate_source_anchors, canonical_source_manifest
+from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.session_lifecycle import EndSession
 from engram.memory.transitions_test_support import (
+    _stage_history,
     candidate_in_scope,
     provenanced_candidate,
     provenanced_candidate_in_scope,
@@ -489,6 +495,27 @@ def test_conflict_tag_blocks_revise_and_supersede_targets() -> None:
         assert getattr(error.value, 'code', None) == 'judge_policy_denied'
 
 
+@pytest.mark.django_db
+def test_conflict_tag_blocks_merge_evidence_target() -> None:
+    module, data, entry, candidate = _fixture()
+    conflicted = replace(entry, has_open_conflict=True)
+    data = replace(data, shortlist=replace(data.shortlist, entries=(conflicted,)))
+    payload = _payload(
+        conflicted,
+        outcome='merge_evidence',
+        relation='equivalent',
+        target=str(conflicted.memory_version_id),
+        reason_code='equivalent_claim',
+        applicability='same',
+        temporal_order='not_applicable',
+    )
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.parse_curation_judge_verdict(json.dumps(payload), data)
+
+    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+
+
 def _conflict_payload(
     entry: object,
     *,
@@ -542,6 +569,18 @@ def test_open_conflict_opens_with_genuinely_unordered_evidence() -> None:
         verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
     assert verdict.outcome == 'open_conflict'
+
+
+@pytest.mark.django_db
+def test_parse_judge_verdict_strips_markdown_json_fence() -> None:
+    module, data, entry, candidate = _fixture()
+    payload = _payload(entry)
+    fenced = f'```json\n{json.dumps(payload)}\n```'
+
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(fenced, data)
+
+    assert verdict.outcome == 'publish_new'
 
 
 @pytest.mark.django_db
@@ -903,6 +942,72 @@ def test_two_distinct_window_groups_reach_corroborated_candidate_tier() -> None:
 
 
 @pytest.mark.django_db
+def test_cumulative_windows_do_not_corroborate_the_same_observation() -> None:
+    module = _judge_module()
+    candidate, first_source, scope = provenanced_candidate('judge-evidence-cumulative-window')
+    organization, project, session = scope
+    original = first_source.observation
+    first_window = first_source.window
+
+    type(session).objects.filter(id=session.id).update(
+        status=SessionStatus.ACTIVE,
+        ended_at=None,
+        end_work_contract_version=0,
+        observation_sequence_cursor=2,
+    )
+    Observation.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        agent=session.agent,
+        session=session,
+        observation_type='tool_use',
+        title='Later unrelated observation',
+        body='This later event does not independently support the candidate claim.',
+        content_hash=f'evidence-content-{session.id}-2',
+        session_sequence=2,
+        source_metadata={'event_type': 'post_tool_use'},
+    )
+    ended = EndSession().execute(
+        organization_id=organization.id,
+        project_id=project.id,
+        session_id=session.id,
+        ended_at=timezone.now(),
+        source='explicit',
+    )
+    second_work = WorkflowWork.objects.get(id=ended.work_id)
+    second_window = materialize_distillation_window(second_work)
+    second_stage, _primary_stage = _stage_history(scope, second_window)
+
+    second_manifest_ids = {
+        entry['observation_id']
+        for chunk in second_window.chunks.order_by('ordinal')
+        for entry in chunk.input_manifest['observations']
+    }
+    assert first_window.lower_sequence_exclusive == 0
+    assert second_window.lower_sequence_exclusive == 0
+    assert first_window.input_hash != second_window.input_hash
+    assert str(original.id) in second_manifest_ids
+
+    MemoryCandidateSource.objects.create(
+        organization=organization,
+        project=project,
+        team=session.team,
+        candidate=candidate,
+        window=second_window,
+        observation=original,
+        stage=second_stage,
+        anchors=first_source.anchors,
+        anchors_hash=first_source.anchors_hash,
+    )
+
+    context = module.build_curation_evidence_context(candidate.id, _empty_shortlist())
+
+    assert context.candidate.tier == 'supported'
+    assert len(context.candidate.refs) == 1
+
+
+@pytest.mark.django_db
 def test_missing_target_provenance_raises_operational_retry_without_override() -> None:
     module = _judge_module()
     candidate, source, _scope = provenanced_candidate('judge-evidence-missing-target')
@@ -1072,6 +1177,40 @@ def test_judge_result_carries_comparison_manifest_binding(monkeypatch: pytest.Mo
 
 
 @pytest.mark.django_db
+def test_judge_call_carries_decision_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, data, entry, candidate = _fixture()
+    candidate.refresh_from_db()
+    organization, project = candidate.organization, candidate.project
+    session_team = candidate.team
+    create_curation_policy(organization, session_team, project, task_type='curation')
+    verdict_body = json.dumps(_payload(entry))
+    calls: list[object] = []
+
+    class GatewayStub:
+        def call(self, call_input: object) -> ProviderCallResult:
+            calls.append(call_input)
+            return ProviderCallResult(
+                provider=call_input.policy.provider,
+                model=call_input.policy.model,
+                call_record_id=uuid.uuid4(),
+                redaction_state='clean',
+                generated_title='',
+                generated_body=verdict_body,
+            )
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())
+
+    module.JudgeCurationCandidate().execute(data)
+
+    assert calls
+    assert calls[0].system_prompt == module._CURATION_JUDGE_SYSTEM_PROMPT
+    assert 'curation_judge_input.v1' in calls[0].system_prompt
+    assert 'reject_candidate form that matches the candidate evidence' in calls[0].system_prompt
+    assert 'Allowed outcome and relation combinations' not in calls[0].system_prompt
+    assert 'exactly one object per input comparisons entry' not in calls[0].system_prompt
+
+
+@pytest.mark.django_db
 def test_cyclic_target_provenance_is_detected_without_infinite_recursion() -> None:
     module = _judge_module()
     candidate, source, _scope = provenanced_candidate('judge-evidence-cyclic-target')
@@ -1129,11 +1268,11 @@ def test_agent_only_candidate_tier_supported_with_none_evidence_time() -> None:
 
 
 @pytest.mark.django_db
-def test_eligible_group_hash_returns_agent_anchors_hash() -> None:
+def test_eligible_group_pair_returns_agent_anchors_hash() -> None:
     module = _judge_module()
     _candidate, source, _scope = _agent_candidate('judge-agent-hash')
 
-    assert module._eligible_group_hash(source) == source.anchors_hash
+    assert module._eligible_group_pair(source) == (source.anchors_hash, source.anchors_hash)
 
 
 @pytest.mark.django_db
@@ -1143,7 +1282,7 @@ def test_eligible_group_hash_rejects_corrupted_agent_hash() -> None:
     source.anchors_hash = 'f' * 64
 
     with pytest.raises(ValueError) as error:
-        module._eligible_group_hash(source)
+        module._eligible_group_pair(source)
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
 
@@ -1156,7 +1295,7 @@ def test_eligible_group_hash_rejects_empty_agent_anchors() -> None:
     source.anchors_hash = _agent_anchors_hash({})
 
     with pytest.raises(ValueError) as error:
-        module._eligible_group_hash(source)
+        module._eligible_group_pair(source)
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
 
@@ -1168,7 +1307,7 @@ def test_eligible_group_hash_rejects_wrong_shape_agent_source() -> None:
     source.observation_id = uuid.uuid4()
 
     with pytest.raises(ValueError) as error:
-        module._eligible_group_hash(source)
+        module._eligible_group_pair(source)
 
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
 

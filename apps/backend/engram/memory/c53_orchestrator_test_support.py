@@ -293,6 +293,24 @@ def disable_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tasks_module(), 'candidate_decision_enabled', lambda _work: False, raising=False)
 
 
+def _stub_revalidate(data: Any, shortlist: CurationShortlist) -> bool:
+    from engram.memory.curation_shortlist import _authorized_memories
+
+    if _authorized_memories(data).count() != shortlist.authorized_corpus_count:
+        return False
+    if not shortlist.entries:
+        return True
+    current = dict(
+        Memory.objects.filter(
+            id__in=[entry.memory_id for entry in shortlist.entries],
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+        ).values_list('id', 'current_transition_id')
+    )
+
+    return all(current.get(entry.memory_id) == entry.current_transition_id for entry in shortlist.entries)
+
+
 def install_decision_services(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -306,6 +324,7 @@ def install_decision_services(
     monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist, raising=False)
     monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence, raising=False)
     monkeypatch.setattr(module, 'judge_curation_candidate', lambda *_a, **_k: judge_result, raising=False)
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', _stub_revalidate, raising=False)
 
 
 def install_judged_decision(

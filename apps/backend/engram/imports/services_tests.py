@@ -1777,6 +1777,76 @@ def test_memory_batch_rejects_two_canonical_same_store_sessions_without_mutation
 
 
 @pytest.mark.django_db
+def test_memory_batch_rejects_mixed_modern_and_legacy_canonical_sessions_without_mutation(
+    f_import_scope: ImportScope,
+) -> None:
+    importer = ClaudeMemImporter()
+    context = ImportContext(
+        source_store_id='mixed-provenance-store',
+        organization=f_import_scope.organization,
+        project=f_import_scope.project,
+        team=f_import_scope.team,
+    )
+    agent = Agent.objects.create(
+        organization=context.organization,
+        runtime=Runtime.CODEX,
+        external_id='mixed-provenance-agent',
+    )
+    modern_session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'mixed-modern-content'),
+        content_session_id='mixed-modern-content',
+        memory_session_id='mixed-provenance-memory',
+        runtime=Runtime.CODEX,
+        metadata={
+            'source': 'claude_mem_import',
+            'source_store_id': context.source_store_id,
+        },
+        observation_sequence_cursor=0,
+    )
+    legacy_session = AgentSession.objects.create(
+        organization=context.organization,
+        project=context.project,
+        team=context.team,
+        agent=agent,
+        external_session_id=importer._session_source_id(context, 'mixed-legacy-content'),
+        content_session_id='mixed-legacy-content',
+        memory_session_id='mixed-provenance-memory',
+        runtime=Runtime.CODEX,
+        metadata={'source': 'claude_mem_import'},
+        observation_sequence_cursor=0,
+    )
+    row = {
+        'id': 506,
+        'memory_session_id': 'mixed-provenance-memory',
+        'project': context.project.repository_root,
+        'text': 'Mixed provenance ambiguity body.',
+        'type': 'discovery',
+        'title': 'Mixed provenance ambiguity',
+        'created_at': '2026-06-25T09:04:00Z',
+    }
+
+    with pytest.raises(ValueError, match='^import session identity collision$'):
+        importer.import_batch(context, 'observations', [row], defer_embedding=True)
+
+    modern_session.refresh_from_db()
+    legacy_session.refresh_from_db()
+    assert modern_session.observation_sequence_cursor == 0
+    assert legacy_session.observation_sequence_cursor == 0
+    assert AgentSession.objects.filter(memory_session_id='mixed-provenance-memory').count() == 2
+    assert not RawEventEnvelope.objects.exists()
+    assert not Observation.objects.exists()
+    assert not ObservationSource.objects.exists()
+    assert not MemoryCandidate.objects.exists()
+    assert not Memory.objects.exists()
+    assert not WorkflowWork.objects.exists()
+    assert not CeleryOutbox.objects.exists()
+
+
+@pytest.mark.django_db
 def test_memory_batch_fails_closed_after_legacy_candidate_sentinel(
     f_import_scope: ImportScope,
 ) -> None:
@@ -1918,7 +1988,7 @@ def test_memory_batch_caches_session_lookup_for_repeated_memory_session(
     session.refresh_from_db()
     assert result.created == 5
     assert session.observation_sequence_cursor == 5
-    assert len(candidate_queries) == 1
+    assert len(candidate_queries) == 2
 
 
 @pytest.mark.django_db

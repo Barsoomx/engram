@@ -53,12 +53,6 @@ _MANIFEST_OLD = 'ordered-manifest-old'
 _MANIFEST_NEW = 'ordered-manifest-new'
 
 
-@pytest.fixture(autouse=True)
-def f_reset_builder() -> object:
-    yield None
-    candidate_work_reconciler.set_candidate_decision_work_builder(None)
-
-
 def _candidate(
     scope: Scope,
     suffix: str,
