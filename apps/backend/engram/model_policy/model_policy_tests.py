@@ -932,7 +932,7 @@ def test_fake_provider_distill_extract_is_strict_deterministic_and_near_miss_saf
 
 
 @pytest.mark.django_db
-def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_string_source_ids() -> None:
+def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_integer_source_refs() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     secret = ProviderSecret.objects.create(
         organization=organization,
@@ -967,11 +967,11 @@ def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_string_so
     prompt = json.dumps(
         {
             'drafts': [
-                {'id': 'draft-b', 'title': 'B'},
-                {'id': 'draft-a', 'title': 'A'},
-                {'id': 'draft-b', 'title': 'duplicate'},
-                {'source_id': 'near-miss'},
-                {'id': 1},
+                {'index': 1, 'title': 'B', 'body': 'first', 'confidence': '0.9'},
+                {'index': 2, 'title': 'A', 'body': 'second', 'confidence': '0.8'},
+                {'title': 'no-index', 'body': 'skipped'},
+                {'index': 2, 'title': 'duplicate', 'body': 'skipped'},
+                {'index': 0, 'title': 'non-positive', 'body': 'skipped'},
             ]
         }
     )
@@ -983,7 +983,7 @@ def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_string_so
         request_id='distill-reduce:session-1',
         trace_id='trace-distill-reduce-1',
         prompt=prompt,
-        response_kind='distill_reduce.v1',
+        response_kind='distill_reduce.v2',
     )
 
     result = FakeProviderGateway().call(data)
@@ -993,9 +993,9 @@ def test_fake_provider_distill_reduce_is_strict_deterministic_and_uses_string_so
     assert set(payload) == {'memories'}
     assert len(payload['memories']) == 1
     memory = payload['memories'][0]
-    assert set(memory) == {'title', 'body', 'confidence', 'source_ids', 'kind'}
-    assert memory['source_ids'] == ['draft-b', 'draft-a']
-    assert all(isinstance(source_id, str) for source_id in memory['source_ids'])
+    assert set(memory) == {'title', 'body', 'confidence', 'source_refs', 'kind'}
+    assert memory['source_refs'] == [1, 2]
+    assert all(isinstance(source_ref, int) for source_ref in memory['source_refs'])
     assert replay.generated_body == result.generated_body
     assert replay.call_record_id != result.call_record_id
     assert ProviderCallRecord.objects.filter(request_id='distill-reduce:session-1').count() == 2

@@ -1617,6 +1617,28 @@ def test_empty_body_extraction_is_malformed_and_retryable(
 
 
 @pytest.mark.django_db
+def test_truncated_extraction_is_malformed_not_truncated(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-extract-truncated')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body='not extraction json', finish_reason='length')
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+
+    assert result.status == 'retry'
+    assert result.failure is not None
+    assert result.failure.code == dps.PROVIDER_OUTPUT_MALFORMED
+    stage.refresh_from_db()
+    assert stage.last_failure_class == dps.PROVIDER_OUTPUT_MALFORMED
+
+
+@pytest.mark.django_db
 def test_render_stage_prompt_digest_mismatch_is_invalid_input(m_monkeypatch: pytest.MonkeyPatch) -> None:
     scope = _scope('stage-digest-mismatch')
     _curation_policy(scope)

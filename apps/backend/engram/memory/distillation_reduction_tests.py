@@ -616,6 +616,13 @@ def test_effective_reduction_target_scales_and_clamps() -> None:
     assert effective_reduction_target(4, floor=12) == 12
 
 
+def test_effective_reduction_target_never_drops_below_a_floor_above_the_cap() -> None:
+    assert effective_reduction_target(100, floor=64) == 64
+    assert effective_reduction_target(300, floor=50) == 50
+    assert effective_reduction_target(4, floor=64) == 64
+    assert effective_reduction_target(1000, floor=49) == 49
+
+
 def test_compute_reduction_generation_bands_and_exhaustion() -> None:
     assert issubclass(ReductionTruncationExhausted, ReductionContractError)
     assert compute_reduction_generation([]) == 0

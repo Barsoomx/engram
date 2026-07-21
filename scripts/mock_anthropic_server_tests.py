@@ -29,26 +29,28 @@ def test_generation_content_emits_exact_distill_extract_v1_coverage() -> None:
     assert memory['supporting_observation_ids'] == [first, second]
 
 
-def test_generation_content_emits_exact_distill_reduce_v1_sources() -> None:
+def test_generation_content_emits_exact_distill_reduce_v2_source_refs() -> None:
     prompt = json.dumps(
         {
             'drafts': [
-                {'id': 'draft-a', 'title': 'A', 'body': 'A', 'confidence': '0.9'},
-                {'id': 'draft-b', 'title': 'B', 'body': 'B', 'confidence': '0.8'},
+                {'index': 1, 'title': 'A', 'body': 'A', 'confidence': '0.9'},
+                {'index': 2, 'title': 'B', 'body': 'B', 'confidence': '0.8'},
             ]
         }
     )
 
     payload = json.loads(
         generation_content(
-            'Return exactly a JSON object with the memories key following distill_reduce.v1.',
+            'You consolidate engineering-memory drafts under the distill_reduce.v2 contract.',
             prompt,
         )
     )
 
     assert set(payload) == {'memories'}
     assert len(payload['memories']) == 1
-    assert payload['memories'][0]['source_ids'] == ['draft-a', 'draft-b']
+    memory = payload['memories'][0]
+    assert memory['source_refs'] == [1, 2]
+    assert all(isinstance(source_ref, int) for source_ref in memory['source_refs'])
 
 
 def test_generation_content_emits_curation_decision_v1_for_empty_shortlist() -> None:
