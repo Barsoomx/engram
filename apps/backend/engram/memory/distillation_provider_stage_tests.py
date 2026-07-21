@@ -553,6 +553,7 @@ def test_generic_reduction_truncated_output_is_transient_without_fallback(
 def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    leaky_secret = 'sk-live0123456789abcdefLEAK'
     scope = _scope('generic-reduction-diagnostics')
     _curation_policy(scope)
     work, window, _chunk = _single_chunk(scope, sequences=(1,))
@@ -560,7 +561,7 @@ def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
     claim = _claim(work, now)
     target = _synthetic_reduction_target(window)
 
-    malformed_gateway = _StubGateway(body='not reduction json')
+    malformed_gateway = _StubGateway(body=f'not reduction json {leaky_secret}')
     _install_gateway(m_monkeypatch, malformed_gateway)
     stage = dps.resolve_provider_stage(target, claim, now=now)
     malformed = dps.execute_provider_stage(stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now, max_provider_calls=1)
@@ -569,8 +570,24 @@ def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
     malformed_record = ProviderCallRecord.objects.get(id=malformed.provider_call_ids[0])
     prefix = malformed_record.metadata['response_prefix']
     assert prefix and len(prefix) <= 2000
+    assert leaky_secret not in prefix
+    assert '[REDACTED]' in prefix
 
-    truncated_gateway = _StubGateway(body=_valid_reduction_body(), finish_reason='length')
+    truncated_gateway = _StubGateway(
+        body=json.dumps(
+            {
+                'memories': [
+                    {
+                        'title': 'Consolidated durable fact',
+                        'body': f'A strict synthetic reduction result leaking {leaky_secret}.',
+                        'confidence': 0.9,
+                        'source_ids': ['draft-a', 'draft-b'],
+                    }
+                ]
+            }
+        ),
+        finish_reason='length',
+    )
     _install_gateway(m_monkeypatch, truncated_gateway)
     truncated = dps.execute_provider_stage(
         stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now + timedelta(seconds=1), max_provider_calls=1
@@ -580,6 +597,8 @@ def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
     truncated_record = ProviderCallRecord.objects.get(id=truncated.provider_call_ids[0])
     truncated_prefix = truncated_record.metadata['response_prefix']
     assert truncated_prefix and len(truncated_prefix) <= 2000
+    assert leaky_secret not in truncated_prefix
+    assert '[REDACTED]' in truncated_prefix
 
 
 @pytest.mark.django_db
