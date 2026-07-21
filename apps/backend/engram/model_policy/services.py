@@ -1483,8 +1483,11 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
 }
 
 
+_PROVIDER_COMPLETION_CLAMP_DEFAULTS = {'deepseek': 4096}
+
+
 def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
-    if response_kind in _FIXED_MAX_TOKEN_KINDS:
+    if response_kind in _FIXED_MAX_TOKEN_KINDS and response_kind != 'distill_reduce.v2':
         return _MAX_TOKENS_BY_KIND[response_kind]
 
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
@@ -1499,6 +1502,25 @@ def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
         return override
 
     return _MAX_TOKENS_BY_KIND.get(response_kind, _DEFAULT_MAX_TOKENS)
+
+
+def provider_completion_clamp(policy: ModelPolicy) -> int | None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    raw = metadata.get('completion_clamp')
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw
+
+    return _PROVIDER_COMPLETION_CLAMP_DEFAULTS.get(policy.provider)
+
+
+def effective_completion_cap(policy: ModelPolicy, response_kind: str) -> int:
+    cap = resolve_max_tokens(policy, response_kind)
+    if response_kind != 'distill_reduce.v2':
+        return cap
+
+    clamp = provider_completion_clamp(policy)
+
+    return min(cap, clamp) if clamp is not None else cap
 
 
 def resolve_context_window_tokens(policy: ModelPolicy) -> int | None:

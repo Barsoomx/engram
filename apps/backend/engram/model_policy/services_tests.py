@@ -30,8 +30,10 @@ from engram.model_policy.services import (
     _split_completion,
     _STRUCTURED_RESPONSE_KINDS,
     curation_schema_prompt_prefix,
+    effective_completion_cap,
     generated_candidates_payload,
     generated_distill_reduce_payload,
+    provider_completion_clamp,
     resolve_max_tokens,
     secret_fingerprint,
 )
@@ -1017,3 +1019,30 @@ def test_openai_gateway_returns_verbatim_reduce_body_that_parses() -> None:
     assert result.generated_body == content
     parsed = parse_reduction_output(json.loads(result.generated_body), _reduce_inputs(2))
     assert len(parsed.memories) == 1
+
+
+def test_resolve_max_tokens_reduce_override_is_scoped() -> None:
+    policy = ModelPolicy(provider='deepseek', metadata={'max_tokens': 5000})
+
+    assert resolve_max_tokens(policy, 'distill_reduce.v2') == 5000
+    assert resolve_max_tokens(ModelPolicy(provider='deepseek', metadata={}), 'distill_reduce.v2') == 8192
+    assert resolve_max_tokens(policy, 'distill_extract.v1') == 8192
+    assert resolve_max_tokens(policy, 'curation_decision_v1') == 16384
+
+
+def test_provider_completion_clamp_defaults_and_override() -> None:
+    assert provider_completion_clamp(ModelPolicy(provider='deepseek', metadata={})) == 4096
+    assert provider_completion_clamp(ModelPolicy(provider='deepseek', metadata={'completion_clamp': 2048})) == 2048
+    assert provider_completion_clamp(ModelPolicy(provider='openai', metadata={})) is None
+
+
+def test_effective_completion_cap_is_reduce_scoped() -> None:
+    deepseek = ModelPolicy(provider='deepseek', metadata={})
+    openai = ModelPolicy(provider='openai', metadata={})
+
+    assert effective_completion_cap(deepseek, 'distill_reduce.v2') == 4096
+    assert effective_completion_cap(openai, 'distill_reduce.v2') == 8192
+
+    clamped = ModelPolicy(provider='deepseek', metadata={'completion_clamp': 1000})
+    assert effective_completion_cap(clamped, 'distill_extract.v1') == resolve_max_tokens(clamped, 'distill_extract.v1')
+    assert effective_completion_cap(clamped, 'distill_extract.v1') == 8192
