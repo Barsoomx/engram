@@ -25,10 +25,12 @@ from engram.model_policy.services import SECRET_KEY_VERSION, encrypt_secret, sec
 GOLDEN_PATH_CAPABILITIES = ('memories:read', 'observations:write')
 AGENT_KEY_CAPABILITIES = (
     'memories:read',
+    'memories:propose',
     'memories:review',
     'observations:write',
     'observations:read',
     'search:query',
+    'audit:read',
     'projects:agent',
 )
 GOLDEN_PATH_PROVIDER_SECRET = 'sk-engram_golden_path_local_provider_secret_1234567890'
