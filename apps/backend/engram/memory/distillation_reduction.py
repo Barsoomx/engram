@@ -620,7 +620,7 @@ def _evaluate_draft_reduction_state(
     output_budget_tokens: int,
     generation: int,
 ) -> _ReductionState:
-    if reduction_target_floor <= 0 or output_budget_tokens <= 0:
+    if not initial_drafts:
         return _ReductionState((), None, ())
     if len({row.batch_key for row in accepted_rows}) != len(accepted_rows):
         raise ReductionContractError('accepted reduction identities are duplicate')

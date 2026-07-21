@@ -146,6 +146,28 @@ def test_reduce_multilevel_terminates_on_no_shrink_without_provider_call() -> No
     assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
 
 
+def test_reduce_multilevel_zero_output_budget_passes_drafts_through_without_provider_call() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    calls: list[ReductionBatch] = []
+
+    def provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
+        calls.append(batch)
+
+        return {'memories': []}
+
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=0,
+        generation=0,
+        provider=provider,
+    )
+
+    assert calls == []
+    assert len(output) == 5
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
+
+
 @pytest.mark.parametrize(
     'payload',
     [
