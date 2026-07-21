@@ -16,8 +16,8 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
 )
 from engram.memory.distillation_backfill_tests import (
-    SessionScope,
     _STREAK_LIMIT,
+    SessionScope,
     _current_work,
     _fail_work,
 )
@@ -97,16 +97,12 @@ def test_command_limit_throttle() -> None:
 
     call_command('engram_backfill_distillations', '--limit', '1', stdout=StringIO())
 
-    dispatched_first = [
-        work for work in (work_a, work_b, work_c) if _queued_count(work) == 1
-    ]
+    dispatched_first = [work for work in (work_a, work_b, work_c) if _queued_count(work) == 1]
     assert len(dispatched_first) == 1
 
     call_command('engram_backfill_distillations', '--limit', '1', stdout=StringIO())
 
-    dispatched_second = [
-        work for work in (work_a, work_b, work_c) if _queued_count(work) == 1
-    ]
+    dispatched_second = [work for work in (work_a, work_b, work_c) if _queued_count(work) == 1]
     assert len(dispatched_second) == 2
 
 

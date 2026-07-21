@@ -120,9 +120,7 @@ def _succeed(work: WorkflowWork, *, now: datetime) -> None:
 
 def _latest_run(work: WorkflowWork) -> WorkflowRun | None:
     return (
-        WorkflowRun.objects.filter(work_id=work.id, execution_contract_version=1)
-        .order_by('-created_at', '-id')
-        .first()
+        WorkflowRun.objects.filter(work_id=work.id, execution_contract_version=1).order_by('-created_at', '-id').first()
     )
 
 
@@ -181,8 +179,7 @@ def test_select_targets_scope_and_limit() -> None:
     assert len(limited) == 1
     assert limited[0].work_id == work_1.id
     assert {work_1.id, work_2.id} == {
-        target.work_id
-        for target in select_targets(failure_codes=DEFAULT_FAILURE_CODES, limit=100)
+        target.work_id for target in select_targets(failure_codes=DEFAULT_FAILURE_CODES, limit=100)
     }
     assert WorkflowRun.objects.filter(work_id=work_2.id, status=WorkflowRunStatus.FAILED).exists()
 
