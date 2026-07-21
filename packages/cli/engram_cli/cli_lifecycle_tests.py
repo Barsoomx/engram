@@ -4114,6 +4114,108 @@ class McpInstallTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn("missing_credential", stderr)
 
+    def _write_install_config(
+        self, config_dir: Path, *, server_url: str = "", project_id: str = ""
+    ) -> None:
+        config: dict[str, object] = {}
+        if server_url:
+            config["server_url"] = server_url
+        if project_id:
+            config["project_id"] = project_id
+        (config_dir / "config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        (config_dir / "credentials.json").write_text(
+            json.dumps({"api_key": RAW_KEY}), encoding="utf-8"
+        )
+
+    def test_mcp_install_succeeds_without_project_id_warns_repo_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self._write_install_config(
+                config_dir, server_url="https://engram.example"
+            )
+            claude_code_config = config_dir / "claude.json"
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which", return_value=None
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    [
+                        "mcp-install",
+                        "--agent",
+                        "claude_code",
+                        "--config-dir",
+                        str(config_dir),
+                        "--claude-code-config",
+                        str(claude_code_config),
+                    ],
+                    FakeTransport([]),
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertIn("engram", data["mcpServers"])
+            self.assertIn("route by the git remote", stderr)
+            self.assertIn("ENGRAM_PROJECT_ID", stderr)
+            self.assertIn("per-call project_id", stderr)
+
+    def test_mcp_install_still_fails_without_server_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self._write_install_config(config_dir, project_id=PROJECT_ID)
+            claude_code_config = config_dir / "claude.json"
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which", return_value=None
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "mcp-install",
+                        "--agent",
+                        "claude_code",
+                        "--config-dir",
+                        str(config_dir),
+                        "--claude-code-config",
+                        str(claude_code_config),
+                    ],
+                    FakeTransport([]),
+                )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("missing_config", stderr)
+
+    def test_mcp_install_with_project_id_omits_repo_routing_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self._write_install_config(
+                config_dir,
+                server_url="https://engram.example",
+                project_id=PROJECT_ID,
+            )
+            claude_code_config = config_dir / "claude.json"
+
+            with mock.patch(
+                "engram_cli.commands.shutil.which", return_value=None
+            ):
+                exit_code, _stdout, stderr = self.run_cli(
+                    [
+                        "mcp-install",
+                        "--agent",
+                        "claude_code",
+                        "--config-dir",
+                        str(config_dir),
+                        "--claude-code-config",
+                        str(claude_code_config),
+                    ],
+                    FakeTransport([]),
+                )
+
+            self.assertEqual(0, exit_code, stderr)
+            data = read_json(claude_code_config)
+            self.assertIn("engram", data["mcpServers"])
+            self.assertNotIn("route by the git remote", stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

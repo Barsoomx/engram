@@ -160,6 +160,56 @@ class McpContractTests(unittest.TestCase):
             self.assertEqual({"type": "string"}, properties["project_id"])
             self.assertNotIn("project_id", tool["inputSchema"]["required"])
 
+    def test_tools_list_all_six_schemas_expose_optional_request_id(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/list"}, build_tools()
+        )
+        s6_tools = {
+            "engram_search",
+            "engram_context",
+            "engram_memory_link",
+            "engram_observations",
+            "engram_memory_version",
+            "engram_memory_feedback",
+        }
+        by_name = {
+            tool["name"]: tool
+            for tool in response["result"]["tools"]
+            if tool["name"] in s6_tools
+        }
+
+        self.assertEqual(s6_tools, set(by_name))
+        for name, tool in by_name.items():
+            properties = tool["inputSchema"]["properties"]
+            self.assertIn("request_id", properties, f"{name} missing request_id")
+            self.assertEqual({"type": "string"}, properties["request_id"])
+            self.assertNotIn("request_id", tool["inputSchema"]["required"])
+
+    def test_tools_list_all_six_schemas_expose_optional_team_id(self) -> None:
+        response = handle_request(
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/list"}, build_tools()
+        )
+        s6_tools = {
+            "engram_search",
+            "engram_context",
+            "engram_memory_link",
+            "engram_observations",
+            "engram_memory_version",
+            "engram_memory_feedback",
+        }
+        by_name = {
+            tool["name"]: tool
+            for tool in response["result"]["tools"]
+            if tool["name"] in s6_tools
+        }
+
+        self.assertEqual(s6_tools, set(by_name))
+        for name, tool in by_name.items():
+            properties = tool["inputSchema"]["properties"]
+            self.assertIn("team_id", properties, f"{name} missing team_id")
+            self.assertEqual({"type": "string"}, properties["team_id"])
+            self.assertNotIn("team_id", tool["inputSchema"]["required"])
+
     def test_tools_list_feedback_schema(self) -> None:
         response = handle_request(
             {"jsonrpc": "2.0", "id": 10, "method": "tools/list"}, build_tools()
