@@ -33,8 +33,8 @@ bundles, prompt/tool-output bodies, persistent queues.
 ## Project resolution
 
 `engram search`, `engram observations`, `engram memory version|link|links|get`,
-`engram audit`, and hook ingest all resolve which project a call targets with
-the same precedence ladder, in order:
+and hook ingest all resolve which project a call targets with the same
+precedence ladder, in order:
 
 1. an explicit override for that call - `--project` on the CLI commands
    below, or the harness-supplied `project_id` field on hook payloads;
@@ -52,10 +52,12 @@ in the ladder resolves, it sends the request with neither `project_id` nor
 `repository_url`, and the server answers `400 project_or_repository_required`.
 `engram observations` and `engram memory version|link|links|get` fail fast
 client-side instead - `missing_project: Set --project, ENGRAM_PROJECT_ID, or
-run inside a git repository` - with no network call. `engram audit` requires a
-resolved `project_id` specifically (it reads the inspection audit-events
-endpoint, which has no repository-URL routing): a repository-only scope fails
-client-side with `missing_project` and makes no network call.
+run inside a git repository` - with no network call. `engram audit` resolves a
+project through rungs 1-3 only (explicit `--project`, `ENGRAM_PROJECT_ID`, then
+config `project_id`) and has no rung-4 repository fallback: it reads the
+inspection audit-events endpoint, which has no repository-URL routing, so a
+repository-only scope fails client-side with `missing_project` and makes no
+network call.
 
 The server always re-authorizes whichever project a `repository_url`-derived
 request resolves to, inside the caller's own organization; see

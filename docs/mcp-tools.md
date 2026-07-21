@@ -29,23 +29,27 @@ Eight tools ship in `engram mcp serve`
 automatically with the Claude Code plugin, via `engram mcp install` for Claude
 Desktop, or directly over stdio for any other client.
 
-| Tool                      | Maps to conceptual tool                        | Description                                                    |
-|----------------------------|--------------------------------------------------|--------------------------------------------------------------------|
-| `engram_search`           | `memory.search`                                 | hybrid exact + semantic search over authorized memory             |
-| `engram_context`          | `memory.context`                                | session-start context bundle for the resolved project              |
-| `engram_memory_link`      | shipped extra, beyond the original catalog      | attach a file/symbol/commit/issue link to an approved memory      |
-| `engram_observations`     | shipped extra, beyond the original catalog      | list recent observations for the resolved project                |
-| `engram_memory_version`   | shipped extra, beyond the original catalog      | update an approved memory body, creating a new reviewed version   |
-| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | mark an injected memory stale or refuted, with a reason         |
-| `engram_memory_get`       | shipped extra, beyond the original catalog      | read one memory in full (untruncated body, versions, links) by id |
-| `engram_audit`            | shipped extra, beyond the original catalog      | list a memory's own recorded audit events (project-scoped only)   |
+| Tool                      | Maps to conceptual tool                        | Required capability | Description                                                    |
+|----------------------------|--------------------------------------------------|---------------------|--------------------------------------------------------------------|
+| `engram_search`           | `memory.search`                                 | `search:query`      | hybrid exact + semantic search over authorized memory             |
+| `engram_context`          | `memory.context`                                | `memories:read`     | session-start context bundle for the resolved project              |
+| `engram_memory_link`      | shipped extra, beyond the original catalog      | `memories:review`   | attach a file/symbol/commit/issue link to an approved memory      |
+| `engram_observations`     | shipped extra, beyond the original catalog      | `observations:read` | list recent observations for the resolved project                |
+| `engram_memory_version`   | shipped extra, beyond the original catalog      | `memories:review`   | update an approved memory body, creating a new reviewed version   |
+| `engram_memory_feedback`  | `memory.feedback` (subset: `stale`/`refuted` only) | `memories:review` | mark an injected memory stale or refuted, with a reason         |
+| `engram_memory_get`       | shipped extra, beyond the original catalog      | `memories:read`     | read one memory in full (untruncated body, versions, links) by id |
+| `engram_audit`            | shipped extra, beyond the original catalog      | `audit:read`        | list a memory's own recorded audit events (project-scoped only)   |
 
 All eight are developer-scoped; there is no separate lead/curator tool set yet.
-Seven of them read or write a target memory and need the key's `memories:read`
-(or `memories:write`) capability for that memory. `engram_audit` is the
-exception: it reads the inspection audit-events endpoint and requires the
-separate `audit:read` capability - a key holding only memory read/write receives
-`403 missing_capability` and a prompt to re-issue the key with `audit:read`.
+Each tool checks exactly one capability, shown in the table above:
+`engram_search` needs `search:query`; `engram_context` and `engram_memory_get`
+read a memory and need `memories:read`; `engram_observations` needs
+`observations:read`; the three mutation tools (`engram_memory_link`,
+`engram_memory_version`, `engram_memory_feedback`) write through the review
+path and need `memories:review`; and `engram_audit` reads the inspection
+audit-events endpoint and needs `audit:read`. A key that lacks the capability a
+given tool requires receives `403 missing_capability` and a prompt to re-issue
+the key with that capability.
 Seven of the eight also accept an optional per-call `project_id` argument and
 fall back to a repository-derived project when neither it nor
 `ENGRAM_PROJECT_ID`/config resolve one - see
