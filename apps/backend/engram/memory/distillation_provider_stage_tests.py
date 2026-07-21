@@ -219,11 +219,13 @@ class _StubGateway:
         body: str = '',
         error: BaseException | None = None,
         on_call: Callable[[], None] | None = None,
+        finish_reason: str = '',
     ) -> None:
         self.calls: list[object] = []
         self._body = body
         self._error = error
         self._on_call = on_call
+        self._finish_reason = finish_reason
 
     def call(self, data: object) -> ProviderCallResult:
         self.calls.append(data)
@@ -255,6 +257,7 @@ class _StubGateway:
             redaction_state='redacted',
             generated_title='',
             generated_body=self._body,
+            finish_reason=self._finish_reason,
         )
 
 
@@ -507,6 +510,78 @@ def test_generic_reduction_malformed_output_retains_diagnostics_without_completi
     record = ProviderCallRecord.objects.get(id=result.provider_call_ids[0])
     assert record.metadata['response_hash'] == hashlib.sha256(b'not reduction json').hexdigest()
     assert record.metadata['response_size'] == len(b'not reduction json')
+
+
+@pytest.mark.django_db
+@pytest.mark.parametrize('finish_reason', ['length', 'max_tokens'])
+def test_generic_reduction_truncated_output_is_transient_without_fallback(
+    m_monkeypatch: pytest.MonkeyPatch, finish_reason: str
+) -> None:
+    scope = _scope(f'generic-reduction-truncated-{finish_reason}')
+    primary_policy = _curation_policy(scope, fallback_enabled=True)
+    fallback_policy = _generation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+    primary_gateway = _StubGateway(body=_valid_reduction_body(), finish_reason=finish_reason)
+    fallback_gateway = _StubGateway(body=_valid_reduction_body())
+    _install_gateways(m_monkeypatch, {primary_policy.id: primary_gateway, fallback_policy.id: fallback_gateway})
+
+    stage = dps.resolve_provider_stage(target, claim, now=now)
+    result = dps.execute_provider_stage(
+        stage,
+        claim,
+        _SYNTHETIC_REDUCTION_CONTRACT,
+        now=now,
+        max_provider_calls=2,
+    )
+
+    assert result.status == 'retry'
+    assert result.fallback_used is False
+    assert result.started_provider_calls == 1
+    assert result.failure.failure_class == PROVIDER_TRANSIENT
+    assert result.failure.code == dps.PROVIDER_OUTPUT_TRUNCATED
+    assert len(primary_gateway.calls) == 1
+    assert len(fallback_gateway.calls) == 0
+    required = DistillationStage.objects.get(id=stage.id)
+    assert required.status == 'required'
+    assert required.last_failure_class == dps.PROVIDER_OUTPUT_TRUNCATED
+
+
+@pytest.mark.django_db
+def test_generic_reduction_diagnostics_populate_prefix_and_failure_detail(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('generic-reduction-diagnostics')
+    _curation_policy(scope)
+    work, window, _chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+    target = _synthetic_reduction_target(window)
+
+    malformed_gateway = _StubGateway(body='not reduction json')
+    _install_gateway(m_monkeypatch, malformed_gateway)
+    stage = dps.resolve_provider_stage(target, claim, now=now)
+    malformed = dps.execute_provider_stage(
+        stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now, max_provider_calls=1
+    )
+
+    assert malformed.failure.redacted_detail
+    malformed_record = ProviderCallRecord.objects.get(id=malformed.provider_call_ids[0])
+    prefix = malformed_record.metadata['response_prefix']
+    assert prefix and len(prefix) <= 2000
+
+    truncated_gateway = _StubGateway(body=_valid_reduction_body(), finish_reason='length')
+    _install_gateway(m_monkeypatch, truncated_gateway)
+    truncated = dps.execute_provider_stage(
+        stage, claim, _SYNTHETIC_REDUCTION_CONTRACT, now=now + timedelta(seconds=1), max_provider_calls=1
+    )
+
+    assert truncated.failure.redacted_detail == 'reduction provider output was truncated at the completion cap'
+    truncated_record = ProviderCallRecord.objects.get(id=truncated.provider_call_ids[0])
+    truncated_prefix = truncated_record.metadata['response_prefix']
+    assert truncated_prefix and len(truncated_prefix) <= 2000
 
 
 @pytest.mark.django_db

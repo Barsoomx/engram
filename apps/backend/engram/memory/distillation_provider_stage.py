@@ -43,16 +43,21 @@ from engram.memory.work_failures import (
 from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord
+from engram.core.redaction import redact_value
 from engram.model_policy.services import (
     ProviderCallInput,
     ProviderCallResult,
     ResolveModelPolicy,
     ResolveModelPolicyInput,
     get_provider_gateway,
+    is_truncated_finish_reason,
 )
 
 EXTRACT_PROMPT_CONTRACT = 'distill_extract.v1'
 PROVIDER_OUTPUT_MALFORMED = 'provider_output_malformed'
+PROVIDER_OUTPUT_TRUNCATED = 'provider_output_truncated'
+_TRUNCATION_FAILURE_DETAIL = 'reduction provider output was truncated at the completion cap'
+_RESPONSE_PREFIX_LIMIT = 2000
 
 STAGE_COMPLETED = 'completed'
 STAGE_RETRY = 'retry'
@@ -177,6 +182,17 @@ class _CompletedOutcome:
 class _MalformedOutcome:
     response_hash: str
     response_size: int
+    response_prefix: str = ''
+    error_detail: str = ''
+    provider_call_ids: tuple[str, ...] = ()
+    started_calls: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _TruncatedOutcome:
+    response_hash: str
+    response_size: int
+    response_prefix: str
     provider_call_ids: tuple[str, ...] = ()
     started_calls: int = 1
 
@@ -854,7 +870,7 @@ def _attempt_stage(
     contract: ProviderStageContract,
     *,
     now: datetime,
-) -> _CompletedOutcome | _MalformedOutcome | _ProviderErrorOutcome:
+) -> _CompletedOutcome | _MalformedOutcome | _TruncatedOutcome | _ProviderErrorOutcome:
     _validate_contract(stage, contract)
     request_id = f'distill-stage:{stage.stage_key}'
     prior_call_ids = frozenset(_provider_call_ids(stage=stage, request_id=request_id))
@@ -911,10 +927,24 @@ def _attempt_stage(
     response_bytes = result.generated_body.encode('utf-8')
     response_hash = hashlib.sha256(response_bytes).hexdigest()
     response_size = len(response_bytes)
+    response_prefix = str(redact_value(result.generated_body).value)[:_RESPONSE_PREFIX_LIMIT]
+    if is_truncated_finish_reason(result.finish_reason):
+        return _TruncatedOutcome(
+            response_hash,
+            response_size,
+            response_prefix,
+            (str(result.call_record_id),),
+        )
     try:
         snapshot = contract.normalize_output(result.generated_body, stage=stage)
-    except ProviderStageOutputError:
-        return _MalformedOutcome(response_hash, response_size, (str(result.call_record_id),))
+    except ProviderStageOutputError as error:
+        return _MalformedOutcome(
+            response_hash,
+            response_size,
+            response_prefix,
+            str(error),
+            (str(result.call_record_id),),
+        )
 
     output_hash = hashlib.sha256(canonical_json_bytes(snapshot)).hexdigest()
     commit_now = _fresh_now(now)
@@ -950,13 +980,15 @@ def _attempt_stage(
         return _CompletedOutcome(locked, (str(result.call_record_id),), 1)
 
 
-def _record_malformed(
+def _record_stage_failure_diagnostics(
     stage: DistillationStage,
     claim: WorkClaim,
     *,
     now: datetime,
+    failure_class: str,
     response_hash: str,
     response_size: int,
+    response_prefix: str,
     provider_call_ids: tuple[str, ...],
 ) -> None:
     with transaction.atomic():
@@ -964,7 +996,7 @@ def _record_malformed(
         locked = DistillationStage.objects.select_for_update().get(id=stage.id)
         if locked.window.work_id != claim.work_id:
             raise ValueError('stage is outside the claimed work scope')
-        locked.last_failure_class = PROVIDER_OUTPUT_MALFORMED
+        locked.last_failure_class = failure_class
         locked.last_failure_at = now
         locked.save(update_fields=['last_failure_class', 'last_failure_at', 'updated_at'])
         for call_id in provider_call_ids:
@@ -981,9 +1013,63 @@ def _record_malformed(
             if record is None:
                 continue
             metadata = dict(record.metadata or {})
-            metadata.update({'response_hash': response_hash, 'response_size': response_size})
+            metadata.update(
+                {
+                    'response_hash': response_hash,
+                    'response_size': response_size,
+                    'response_prefix': response_prefix,
+                }
+            )
             record.metadata = metadata
             record.save(update_fields=['metadata', 'updated_at'])
+
+    return
+
+
+def _record_malformed(
+    stage: DistillationStage,
+    claim: WorkClaim,
+    *,
+    now: datetime,
+    response_hash: str,
+    response_size: int,
+    response_prefix: str,
+    provider_call_ids: tuple[str, ...],
+) -> None:
+    _record_stage_failure_diagnostics(
+        stage,
+        claim,
+        now=now,
+        failure_class=PROVIDER_OUTPUT_MALFORMED,
+        response_hash=response_hash,
+        response_size=response_size,
+        response_prefix=response_prefix,
+        provider_call_ids=provider_call_ids,
+    )
+
+    return
+
+
+def _record_truncated(
+    stage: DistillationStage,
+    claim: WorkClaim,
+    *,
+    now: datetime,
+    response_hash: str,
+    response_size: int,
+    response_prefix: str,
+    provider_call_ids: tuple[str, ...],
+) -> None:
+    _record_stage_failure_diagnostics(
+        stage,
+        claim,
+        now=now,
+        failure_class=PROVIDER_OUTPUT_TRUNCATED,
+        response_hash=response_hash,
+        response_size=response_size,
+        response_prefix=response_prefix,
+        provider_call_ids=provider_call_ids,
+    )
 
     return
 
@@ -1007,8 +1093,20 @@ def _record_provider_failure(
     return
 
 
-def _malformed_failure() -> ClassifiedWorkFailure:
-    return ClassifiedWorkFailure(failure_class=PROVIDER_TRANSIENT, code=PROVIDER_OUTPUT_MALFORMED)
+def _malformed_failure(detail: str = '') -> ClassifiedWorkFailure:
+    return ClassifiedWorkFailure(
+        failure_class=PROVIDER_TRANSIENT,
+        code=PROVIDER_OUTPUT_MALFORMED,
+        redacted_detail=str(redact_value(detail).value)[:1024],
+    )
+
+
+def _truncated_failure() -> ClassifiedWorkFailure:
+    return ClassifiedWorkFailure(
+        failure_class=PROVIDER_TRANSIENT,
+        code=PROVIDER_OUTPUT_TRUNCATED,
+        redacted_detail=_TRUNCATION_FAILURE_DETAIL,
+    )
 
 
 def _fallback_permitted(stage: DistillationStage) -> bool:
@@ -1125,6 +1223,26 @@ def _run_stage(
             started_provider_calls=prior_started_calls + outcome.started_calls,
         )
 
+    if isinstance(outcome, _TruncatedOutcome):
+        truncated_now = _fresh_now(now)
+        _record_truncated(
+            stage,
+            claim,
+            now=truncated_now,
+            response_hash=outcome.response_hash,
+            response_size=outcome.response_size,
+            response_prefix=outcome.response_prefix,
+            provider_call_ids=outcome.provider_call_ids,
+        )
+
+        return StageExecutionResult(
+            STAGE_RETRY,
+            stage,
+            failure=_truncated_failure(),
+            provider_call_ids=prior_provider_call_ids + outcome.provider_call_ids,
+            started_provider_calls=prior_started_calls + outcome.started_calls,
+        )
+
     if isinstance(outcome, _MalformedOutcome):
         malformed_now = _fresh_now(now)
         _record_malformed(
@@ -1133,11 +1251,12 @@ def _run_stage(
             now=malformed_now,
             response_hash=outcome.response_hash,
             response_size=outcome.response_size,
+            response_prefix=outcome.response_prefix,
             provider_call_ids=outcome.provider_call_ids,
         )
         provider_call_ids = prior_provider_call_ids + outcome.provider_call_ids
         started_calls = prior_started_calls + outcome.started_calls
-        failure = _malformed_failure()
+        failure = _malformed_failure(outcome.error_detail)
         if allow_fallback and _fallback_permitted(stage):
             fallback = _try_fallback(
                 stage,
