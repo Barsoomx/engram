@@ -922,7 +922,8 @@ class AuditToolTests(unittest.TestCase):
 
     def test_audit_memory_get_links_injection_guard(self) -> None:
         self.write_local_config()
-        injected = "\nfake links line"
+        target_marker = "\nfake target line"
+        label_marker = "\nfake label line"
         transport = RouteStubTransport(
             {
                 "/version": (
@@ -937,8 +938,8 @@ class AuditToolTests(unittest.TestCase):
                             {
                                 "link_id": "l-1",
                                 "link_type": "file",
-                                "target": "path" + injected,
-                                "label": "label" + injected,
+                                "target": "path" + target_marker,
+                                "label": "label" + label_marker,
                                 "created_at": "2026-07-01T00:00:00Z",
                             }
                         ],
@@ -952,7 +953,8 @@ class AuditToolTests(unittest.TestCase):
         lines = text.splitlines()
         links_lines = [line for line in lines if line.startswith("links:")]
         self.assertEqual(1, len(links_lines))
-        self.assertEqual(1, len([line for line in lines if "fake links line" in line]))
+        self.assertEqual([links_lines[0]], [line for line in lines if "fake target line" in line])
+        self.assertEqual([links_lines[0]], [line for line in lines if "fake label line" in line])
 
     def test_audit_single_request_and_truncation_note(self) -> None:
         self.write_local_config()
@@ -994,6 +996,19 @@ class AuditToolTests(unittest.TestCase):
         text = mcp_tools.audit({"memory_id": "m-1"}, self.config_dir, transport)
 
         self.assertIn("audit:read", text)
+
+    def test_memory_get_missing_capability_names_memories_read(self) -> None:
+        self.write_local_config()
+        transport = StubTransport(
+            status=403,
+            body={"code": "missing_capability", "error_code": "missing_capability", "detail": "no"},
+        )
+
+        text = mcp_tools.memory_get({"memory_id": "m-1"}, self.config_dir, transport)
+
+        self.assertIn("memories:read", text)
+        self.assertNotIn("observations:write", text)
+        self.assertNotIn("audit:read", text)
 
     def test_audit_and_memory_get_project_scope_denied(self) -> None:
         self.write_local_config()
@@ -1039,6 +1054,29 @@ class AuditToolTests(unittest.TestCase):
         self.assertNotIn("access team  ", get_text)
         self.assertNotIn("team  for memory", get_text)
         self.assertNotIn("cannot resolve project", get_text)
+
+    def test_audit_team_scope_denied_project_wide_names_project(self) -> None:
+        self.write_local_config(team_id="team-42")
+        body = {"code": "team_scope_denied", "error_code": "team_scope_denied", "detail": "no"}
+
+        text = mcp_tools.audit({}, self.config_dir, StubTransport(status=403, body=body))
+
+        self.assertNotIn("for memory .", text)
+        self.assertNotIn("for memory  ", text)
+        self.assertIn("project 11111111-1111-1111-1111-111111111111", text)
+
+    def test_audit_team_scope_denied_labels_target_type(self) -> None:
+        self.write_local_config(team_id="team-42")
+        body = {"code": "team_scope_denied", "error_code": "team_scope_denied", "detail": "no"}
+
+        text = mcp_tools.audit(
+            {"target_id": "l-9", "target_type": "memory_link"},
+            self.config_dir,
+            StubTransport(status=403, body=body),
+        )
+
+        self.assertIn("for memory_link l-9", text)
+        self.assertNotIn("for memory l-9", text)
 
     def test_memory_get_project_scope_denied_repo_routed_names_repository(self) -> None:
         self.write_local_config(project_id="")

@@ -2805,6 +2805,22 @@ class CliLifecycleTests(unittest.TestCase):
             self.assertEqual(1, exit_code)
             self.assertIn("not found", stderr.lower())
 
+    def test_memory_get_capability_denied_names_memories_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp)
+            self.connect(config_dir)
+            transport = FakeTransport(
+                [(403, {"code": "missing_capability", "error_code": "missing_capability", "detail": "no"})]
+            )
+            exit_code, _stdout, stderr = self.run_cli(
+                ["memory", "get", "mem-1", "--config-dir", str(config_dir)],
+                transport,
+            )
+
+            self.assertEqual(1, exit_code)
+            self.assertIn("memories:read", stderr)
+            self.assertNotIn("observations:write", stderr)
+
     def test_audit_capability_denied_returns_1_with_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_dir = Path(tmp)

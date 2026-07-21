@@ -59,6 +59,39 @@ def team_scope_denied_message(team_id: str, memory_id: str) -> str:
     )
 
 
+def memory_read_missing_capability_message() -> str:
+    return (
+        'This key cannot read this memory. Re-issue the API key with the memories:read '
+        'capability from the Engram console, then retry.'
+    )
+
+
+def audit_team_scope_denied_message(
+    team_id: str,
+    target_id: str,
+    target_type: str,
+    project_id: str,
+) -> str:
+    if target_id:
+        safe_type = collapse_control_chars(target_type) or 'memory'
+        subject = f'{safe_type} {collapse_control_chars(target_id)}'
+    elif project_id:
+        subject = f'project {collapse_control_chars(project_id)}'
+    else:
+        subject = 'this project'
+
+    if team_id:
+        return (
+            f'This key cannot access team {team_id} for {subject}. Use a key bound to '
+            'that team (or one with team admin), then retry.'
+        )
+
+    return (
+        f'This key cannot access the team scope of {subject}. Use a key bound to that '
+        'team (or one with team admin), then retry.'
+    )
+
+
 def audit_needs_project_message() -> str:
     return 'engram_audit needs a project_id — pass project_id or connect a project.'
 
@@ -294,6 +327,9 @@ def _memory_read_denial(
         return None
 
     code = _body_code(body)
+    if code == 'missing_capability':
+        return ReadError('missing_capability', memory_read_missing_capability_message())
+
     if code == 'project_scope_denied':
         return ReadError('project_scope_denied', project_scope_denied_message(scope.project_id, scope.repository_url))
 
@@ -406,7 +442,10 @@ def fetch_audit(
 
         if code == 'team_scope_denied':
             return ReadOutcome(
-                error=ReadError('team_scope_denied', team_scope_denied_message(scope.team_id, target_id)),
+                error=ReadError(
+                    'team_scope_denied',
+                    audit_team_scope_denied_message(scope.team_id, target_id, target_type, scope.project_id),
+                ),
             )
 
     if status != 200:
