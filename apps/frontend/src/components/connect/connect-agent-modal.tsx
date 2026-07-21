@@ -34,16 +34,8 @@ import {
   buildManualInstallCommands,
   validateConnectServerUrl,
 } from '@/lib/build-connect-command';
+import { CONNECT_CAPABILITIES } from '@/lib/connect-capabilities';
 import { useOrgStore } from '@/lib/org-store';
-
-const CONNECT_CAPABILITIES = [
-  'memories:read',
-  'memories:review',
-  'observations:write',
-  'observations:read',
-  'search:query',
-  'projects:agent',
-];
 
 const DEFAULT_AGENT_TARGET: AgentTarget = 'claude-code';
 
