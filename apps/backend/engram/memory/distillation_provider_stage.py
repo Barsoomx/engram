@@ -932,7 +932,7 @@ def _attempt_stage(
     response_hash = hashlib.sha256(response_bytes).hexdigest()
     response_size = len(response_bytes)
     response_prefix = str(redact_value(result.generated_body).value)[:_RESPONSE_PREFIX_LIMIT]
-    if is_truncated_finish_reason(result.finish_reason):
+    if stage.stage_kind == DistillationStageKind.REDUCE and is_truncated_finish_reason(result.finish_reason):
         return _TruncatedOutcome(
             response_hash,
             response_size,

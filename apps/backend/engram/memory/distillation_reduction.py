@@ -80,7 +80,7 @@ class ReductionTruncationExhausted(ReductionContractError):  # noqa: N818
 
 
 def effective_reduction_target(total_drafts: int, floor: int) -> int:
-    return min(48, max(floor, math.ceil(total_drafts / 4)))
+    return max(floor, min(48, math.ceil(total_drafts / 4)))
 
 
 def compute_reduction_generation(truncated_levels: Sequence[int]) -> int:
