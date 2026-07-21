@@ -1498,9 +1498,10 @@ def test_reduce_planner_redrives_v2_over_residual_v1_stage_cleanly(m_monkeypatch
 
 
 class _TruncatingThenValidReductionGateway(_NoSignalStageGateway):
-    def __init__(self) -> None:
+    def __init__(self, *, always_truncate: bool = False) -> None:
         super().__init__()
         self.reduce_calls = 0
+        self._always_truncate = always_truncate
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         self.calls.append(data)
@@ -1535,7 +1536,7 @@ class _TruncatingThenValidReductionGateway(_NoSignalStageGateway):
                     }
                 ]
             }
-            finish_reason = 'length' if self.reduce_calls == 1 else ''
+            finish_reason = 'length' if (self._always_truncate or self.reduce_calls == 1) else ''
 
         return ProviderCallResult(
             provider=policy.provider,
@@ -1635,7 +1636,7 @@ def test_escape_heavy_reduce_batch_truncates_once_then_recovers_via_split_backst
             organization, project, team, agent, session, index=index, body=escape_heavy, narrative=escape_heavy
         )
     work = create_session_distillation_work(session, upper=3)
-    gateway = _TruncatingThenValidReductionGateway()
+    gateway = _TruncatingThenValidReductionGateway(always_truncate=True)
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
     m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
     m_monkeypatch.setattr(
@@ -1677,13 +1678,26 @@ def test_escape_heavy_reduce_batch_truncates_once_then_recovers_via_split_backst
             workflow_run_id=queued.id if queued is not None else None,
         )
         assert claim_result.claim is not None
-        run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+        try:
+            run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+            now += timedelta(seconds=1)
+        except DistillationStageError:
+            now += timedelta(minutes=13)
         attempts += 1
         assert attempts < 20
-        now += timedelta(seconds=1)
 
-    assert gateway.reduce_calls >= 2
+    assert gateway.reduce_calls == 2
+    assert DistillationStage.objects.filter(
+        window=window,
+        stage_kind='reduce',
+        status='required',
+        last_failure_class=PROVIDER_OUTPUT_TRUNCATED,
+        level__gte=17,
+        level__lte=20,
+    ).exists()
     assert not DistillationStage.objects.filter(window=window, stage_kind='reduce', level__gte=48).exists()
+    coverage = DistillationObservationCoverage.objects.filter(window=window)
+    assert coverage.count() == 3
     work.refresh_from_db()
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
 
