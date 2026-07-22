@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from engram.core.models import (
+    MEMORY_KINDS,
     Agent,
     AgentSession,
     DistillationChunk,
@@ -31,7 +33,8 @@ from engram.core.models import (
 )
 from engram.memory import distillation_provider_stage as dps
 from engram.memory import work_execution
-from engram.memory.distillation_window import materialize_distillation_window
+from engram.memory.distillation_reduction import _snapshot_drafts
+from engram.memory.distillation_window import materialize_distillation_window, render_observation_block
 from engram.memory.services import MemoryWorkerError
 from engram.memory.work_execution import StaleWorkFenceError, WorkClaim, claim_work
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, PROVIDER_TRANSIENT, translate_failure
@@ -427,6 +430,37 @@ def test_stage_key_binds_work_snapshot_kind_chunk_input_and_policy_version() -> 
 
 
 @pytest.mark.django_db
+def test_extract_stage_created_with_reuse_key() -> None:
+    scope = _scope('extract-reuse-key')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    assert stage.reuse_key != ''
+    assert stage.reuse_key == dps.extract_reuse_key(chunk)
+
+
+@pytest.mark.django_db
+def test_existing_required_stage_with_empty_reuse_key_resolves_cleanly() -> None:
+    scope = _scope('extract-reuse-key-backfill')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    DistillationStage.objects.filter(id=stage.id).update(reuse_key='')
+
+    replay = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    assert replay.id == stage.id
+    assert DistillationStage.objects.get(id=stage.id).reuse_key == ''
+
+
+@pytest.mark.django_db
 def test_generic_reduction_stage_reuses_identity_call_provenance_and_replay(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -772,6 +806,389 @@ def test_crash_after_provider_response_replays_to_one_durable_decision(
         status='complete',
     )
     assert complete_targets.count() == 1
+
+
+_REUSE_CHUNK_BUDGET = 8000
+_REUSE_OVERSIZED_BODY = 'y' * 9000
+
+
+def _reused_prefix_stages(
+    m_monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> tuple[_StubGateway, DistillationStage, DistillationStage, WorkClaim, datetime]:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope(suffix)
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key == stage_a.reuse_key
+
+    return gateway, stage_a, stage_b, claim_b, now
+
+
+@pytest.mark.django_db
+def test_extract_stage_reuses_prior_session_output_without_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-hit')
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert result.started_provider_calls == 0
+    assert len(gateway.calls) == 1
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.status == 'complete'
+    assert reused.reused_from_id == stage_a.id
+    assert reused.output_snapshot == stage_a.output_snapshot
+    assert reused.output_hash == stage_a.output_hash
+    assert reused.accepted_provider_call_id == stage_a.accepted_provider_call_id
+    assert reused.attempt_count == 0
+
+
+class _DynamicNoSignalGateway:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def call(self, data: object) -> ProviderCallResult:
+        self.calls.append(data)
+        observation_ids = re.findall(r'^Observation: ([0-9a-f-]{36})$', data.prompt, flags=re.MULTILINE)
+        assert observation_ids
+        policy = data.policy
+        record = ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=getattr(data, 'trace_id', ''),
+            redaction_state='redacted',
+            metadata={'prompt_retained': False},
+        )
+
+        return ProviderCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state='redacted',
+            generated_title='',
+            generated_body=json.dumps({'memories': [], 'no_signal_observation_ids': observation_ids}),
+        )
+
+
+@pytest.mark.django_db
+def test_window_reuses_all_unchanged_chunks_with_zero_calls_and_extracts_only_trailing(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-multichunk')
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=2)
+    window_a = materialize_distillation_window(work_a)
+    assert window_a.chunks.count() == 2
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _DynamicNoSignalGateway()
+    _install_gateway(m_monkeypatch, gateway)
+
+    stages_a = []
+    for chunk in window_a.chunks.order_by('ordinal'):
+        stage_a = dps.resolve_extraction_stage(chunk=chunk, claim=claim_a, now=now)
+        assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+        stage_a.refresh_from_db()
+        stages_a.append(stage_a)
+
+    assert len(gateway.calls) == 2
+
+    _observation(scope, sequence=3, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=3)
+    window_b = materialize_distillation_window(work_b)
+    assert window_b.chunks.count() == 3
+    claim_b = _claim(work_b, now)
+
+    for stage_a in stages_a:
+        chunk_b = window_b.chunks.get(ordinal=stage_a.chunk.ordinal)
+        stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+        assert stage_b.reuse_key == stage_a.reuse_key
+        result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+        assert result.status == 'completed'
+        assert result.started_provider_calls == 0
+        reused = DistillationStage.objects.get(id=stage_b.id)
+        assert reused.reused_from_id == stage_a.id
+
+    assert len(gateway.calls) == 2
+
+    trailing_chunk = window_b.chunks.get(ordinal=2)
+    trailing_stage = dps.resolve_extraction_stage(chunk=trailing_chunk, claim=claim_b, now=now)
+    result = dps.execute_distillation_stage(trailing_stage, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 3
+    settled_trailing = DistillationStage.objects.get(id=trailing_stage.id)
+    assert settled_trailing.reused_from is None
+
+
+@pytest.mark.django_db
+def test_extract_reuse_records_provenance(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    _gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-provenance')
+
+    assert dps.execute_distillation_stage(stage_b, claim_b, now=now).status == 'completed'
+
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.status == 'complete'
+    assert reused.reused_from_id == stage_a.id
+    assert reused.accepted_provider_call_id is not None
+    assert reused.accepted_provider_call_id == stage_a.accepted_provider_call_id
+    assert reused.response_hash == stage_a.response_hash
+    assert reused.response_size == stage_a.response_size
+    assert reused.completed_at is not None
+    reused.full_clean()
+
+
+@pytest.mark.django_db
+def test_reused_stage_drafts_semantics_identical_but_identity_is_b_rooted(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-drafts')
+
+    assert dps.execute_distillation_stage(stage_b, claim_b, now=now).status == 'completed'
+
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.reused_from_id == stage_a.id
+    drafts_a = _snapshot_drafts(stage_a)
+    drafts_b = _snapshot_drafts(reused)
+    assert len(drafts_a) == len(drafts_b) == 1
+    draft_a = drafts_a[0]
+    draft_b = drafts_b[0]
+    assert draft_b.title == draft_a.title
+    assert draft_b.body == draft_a.body
+    assert draft_b.confidence == draft_a.confidence
+    assert draft_b.kind == draft_a.kind
+    assert draft_b.source_ids == draft_a.source_ids
+    assert draft_b.source_output_hash == draft_a.source_output_hash
+    assert draft_b.output_index == draft_a.output_index
+    assert draft_b.draft_id != draft_a.draft_id
+    assert draft_b.source_stage_key == reused.stage_key
+    assert draft_b.source_stage_ids == (reused.stage_key,)
+
+
+@pytest.mark.django_db
+def test_extract_reuse_rejects_freeze_to_execute_drift(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway, _stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-drift')
+    drifting_id = _chunk_observation_ids(stage_b.chunk)[0]
+    Observation.objects.filter(id=drifting_id).update(body='content drifted after window freeze')
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
+    assert len(gateway.calls) == 1
+    stale = DistillationStage.objects.get(id=stage_b.id)
+    assert stale.status == 'required'
+    assert stale.reused_from_id is None
+
+
+@pytest.mark.django_db
+def test_extract_reuse_disabled_on_content_change(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-content-change')
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    Observation.objects.filter(session_id=scope[4].id, session_sequence=1).update(
+        body=_REUSE_OVERSIZED_BODY + 'changed'
+    )
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key != stage_a.reuse_key
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 2
+    settled = DistillationStage.objects.get(id=stage_b.id)
+    assert settled.reused_from is None
+
+
+@pytest.mark.django_db
+def test_extract_reuse_disabled_on_policy_version_bump(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-policy-bump')
+    policy = _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    ModelPolicy.objects.filter(id=policy.id).update(version=policy.version + 1)
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key == stage_a.reuse_key
+    assert stage_b.policy_version != stage_a.policy_version
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 2
+    settled = DistillationStage.objects.get(id=stage_b.id)
+    assert settled.reused_from is None
+
+
+@pytest.mark.django_db
+def test_extract_reuse_rejects_live_policy_drift(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway, _stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-policy-drift')
+    ModelPolicy.objects.filter(id=stage_b.policy_id).update(version=stage_b.policy_version + 1)
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'blocked'
+    assert result.started_provider_calls == 0
+    assert len(gateway.calls) == 1
+    assert result.failure is not None
+    assert result.failure.failure_class == CONFIGURATION
+    assert result.failure.code == 'model_policy_unavailable'
+    blocked = DistillationStage.objects.get(id=stage_b.id)
+    assert blocked.status == 'required'
+    assert blocked.reused_from is None
+
+
+_EXTRACT_PROMPT_CONTRACT_FINGERPRINT = 'ae75f20303f1f0de5897008303d7bdec21a6bb5e044ab85f1deea7fb592a1d58'
+
+
+def _fingerprint_sample_observation() -> Observation:
+    return Observation(
+        id=uuid.UUID('00000000-0000-4000-8000-000000000001'),
+        title='Auth failure investigation sk-titletoken1234567890',
+        body='Root cause traced to a leaked credential sk-bodytoken1234567890 embedded in service logs.',
+        facts=['fact one sk-factsonetoken1234567890', 'fact two sk-factstwotoken1234567890'],
+        narrative='Narrative describing the incident sk-narrativetoken1234567890 in detail for rendering pin coverage.',
+        concepts=['gotcha sk-conceptsonetoken1234567890', 'architecture sk-conceptstwotoken1234567890'],
+        files_read=[
+            'apps/backend/engram/memory/distillation_provider_stage.py sk-filesreadonetoken1234567890',
+            'apps/backend/engram/memory/distillation_window.py sk-filesreadtwotoken1234567890',
+        ],
+        files_modified=[
+            'apps/backend/engram/memory/candidate_parsing.py sk-filesmodifiedonetoken1234567890',
+            'apps/backend/engram/core/redaction.py sk-filesmodifiedtwotoken1234567890',
+        ],
+    )
+
+
+def _fingerprint_output_snapshot_sample() -> dict[str, object]:
+    chunk_observation_ids = frozenset(
+        {
+            '11111111-1111-4111-8111-111111111111',
+            '22222222-2222-4222-8222-222222222222',
+            '33333333-3333-4333-8333-333333333333',
+        }
+    )
+    raw_body = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Memory A',
+                    'body': 'Body A',
+                    'confidence': 0.9,
+                    'supporting_observation_ids': [
+                        '11111111-1111-4111-8111-111111111111',
+                        'ffffffff-ffff-4fff-8fff-ffffffffffff',
+                    ],
+                    'kind': 'decision',
+                },
+                {
+                    'title': 'Memory B',
+                    'body': 'Body B',
+                    'confidence': 0.5,
+                    'supporting_observation_ids': ['22222222-2222-4222-8222-222222222222'],
+                },
+                {
+                    'title': 'Memory C',
+                    'body': 'Body C',
+                    'confidence': 0,
+                    'supporting_observation_ids': ['33333333-3333-4333-8333-333333333333'],
+                },
+                {
+                    'title': 'Memory D',
+                    'body': 'Body D',
+                    'confidence': 1,
+                    'supporting_observation_ids': ['11111111-1111-4111-8111-111111111111'],
+                },
+            ],
+            'no_signal_observation_ids': ['33333333-3333-4333-8333-333333333333'],
+        }
+    )
+    parsed = dps.parse_extraction_output(raw_body, chunk_observation_ids=chunk_observation_ids)
+
+    return dps._normalize_output(parsed)
+
+
+def test_extract_prompt_contract_pins_prompt_and_parser_fingerprint() -> None:
+    sample_observation = _fingerprint_sample_observation()
+    projection = {
+        'system_prompt': dps._EXTRACT_SYSTEM_PROMPT,
+        'schema_instructions': curation_schema_prompt_prefix('distill_extract.v1'),
+        'max_memories': dps._MAX_MEMORIES,
+        'max_title': dps._MAX_TITLE,
+        'max_body': dps._MAX_BODY,
+        'allowed_kinds': sorted(kind for kind in MEMORY_KINDS if kind != 'digest'),
+        'prompt_contract': dps.EXTRACT_PROMPT_CONTRACT,
+        'rendered_block_sample': render_observation_block(sample_observation, 10000),
+        'rendered_block_truncated_sample': render_observation_block(sample_observation, 80),
+        'output_snapshot_sample': _fingerprint_output_snapshot_sample(),
+    }
+    digest = hashlib.sha256(canonical_json_bytes(projection)).hexdigest()
+
+    assert digest == _EXTRACT_PROMPT_CONTRACT_FINGERPRINT, (
+        'rendered prompt or accepted-output parser changed - bump EXTRACT_PROMPT_CONTRACT to '
+        'distill_extract.v2 and update this snapshot'
+    )
 
 
 def _flip_last_hex_digit(observation_id: str) -> str:
@@ -1685,6 +2102,36 @@ def test_render_stage_prompt_scope_mismatch_is_invalid_input(m_monkeypatch: pyte
 
     assert excinfo.value.code == 'work_scope_invalid'
     assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
+
+
+@pytest.mark.django_db
+def test_verify_stage_manifest_live_raises_on_freeze_to_execute_drift(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-manifest-live-drift')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+    assert result.status == 'completed'
+    stage.refresh_from_db()
+
+    observations, observation_ids = dps._verify_stage_manifest_live(chunk, stage=stage)
+
+    assert observation_ids == _chunk_observation_ids(chunk)
+    assert set(observations) == set(observation_ids)
+
+    observation_id = observation_ids[0]
+    Observation.objects.filter(id=observation_id).update(body='content mutated after the manifest was frozen')
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps._verify_stage_manifest_live(chunk, stage=stage)
+
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
 
 
 def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> None:

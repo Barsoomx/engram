@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
+import structlog
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
@@ -53,11 +54,30 @@ from engram.model_policy.services import (
     is_truncated_finish_reason,
 )
 
+logger = structlog.get_logger(__name__)
+
 EXTRACT_PROMPT_CONTRACT = 'distill_extract.v1'
 PROVIDER_OUTPUT_MALFORMED = 'provider_output_malformed'
 PROVIDER_OUTPUT_TRUNCATED = 'provider_output_truncated'
+_EXTRACT_REUSE_SCHEMA = 'distill_extract_reuse.v1'
 _TRUNCATION_FAILURE_DETAIL = 'reduction provider output was truncated at the completion cap'
 _RESPONSE_PREFIX_LIMIT = 2000
+
+
+def extract_reuse_key(chunk: DistillationChunk) -> str:
+    observations = chunk.input_manifest['observations']
+    projection = {
+        'schema': _EXTRACT_REUSE_SCHEMA,
+        'prompt_contract': EXTRACT_PROMPT_CONTRACT,
+        'chunk_char_budget': chunk.window.chunk_char_budget,
+        'observations': [
+            {'observation_id': entry['observation_id'], 'content_digest': entry['content_digest']}
+            for entry in observations
+        ],
+    }
+
+    return hashlib.sha256(canonical_json_bytes(projection)).hexdigest()
+
 
 STAGE_COMPLETED = 'completed'
 STAGE_RETRY = 'retry'
@@ -559,27 +579,30 @@ def _create_or_reuse_stage(
         policy_version=policy.version,
         policy_role=role_value,
     )
+    defaults: dict[str, object] = {
+        'team_id': window.team_id,
+        'window': window,
+        'chunk': chunk,
+        'stage_kind': target.stage_kind,
+        'level': target.level,
+        'ordinal': target.ordinal,
+        'target_key': target_key,
+        'input_hash': target.input_hash,
+        'input_manifest': target.input_manifest,
+        'prompt_contract': target.prompt_contract,
+        'policy': policy,
+        'policy_version': policy.version,
+        'policy_role': role_value,
+        'status': DistillationStageStatus.REQUIRED,
+        'attempt_count': 0,
+    }
+    if target.stage_kind == DistillationStageKind.EXTRACT:
+        defaults['reuse_key'] = extract_reuse_key(chunk)
     stage, _created = DistillationStage.objects.get_or_create(
         organization_id=window.organization_id,
         project_id=window.project_id,
         stage_key=scoped_key,
-        defaults={
-            'team_id': window.team_id,
-            'window': window,
-            'chunk': chunk,
-            'stage_kind': target.stage_kind,
-            'level': target.level,
-            'ordinal': target.ordinal,
-            'target_key': target_key,
-            'input_hash': target.input_hash,
-            'input_manifest': target.input_manifest,
-            'prompt_contract': target.prompt_contract,
-            'policy': policy,
-            'policy_version': policy.version,
-            'policy_role': role_value,
-            'status': DistillationStageStatus.REQUIRED,
-            'attempt_count': 0,
-        },
+        defaults=defaults,
     )
     if not _stage_matches_target(
         stage,
@@ -699,7 +722,9 @@ def _stage_manifest_ids(chunk: DistillationChunk) -> tuple[list[str], dict[str, 
     return observation_ids, expected_digests
 
 
-def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage | None = None) -> str:
+def _verify_stage_manifest_live(
+    chunk: DistillationChunk, *, stage: DistillationStage | None = None
+) -> tuple[dict[str, Observation], list[str]]:
     observation_ids, expected_digests = _stage_manifest_ids(chunk)
     scope = stage or chunk
 
@@ -726,6 +751,12 @@ def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage |
                 'observation content digest does not match the frozen manifest',
                 code='work_fingerprint_mismatch',
             )
+
+    return observations, observation_ids
+
+
+def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage | None = None) -> str:
+    observations, observation_ids = _verify_stage_manifest_live(chunk, stage=stage)
 
     cap = chunk.window.chunk_char_budget
     blocks = [render_observation_block(observations[observation_id], cap) for observation_id in observation_ids]
@@ -868,6 +899,66 @@ def _validate_contract(stage: DistillationStage, contract: ProviderStageContract
         raise ValueError('provider stage contract does not match the persisted stage identity')
 
 
+def _reuse_completed_source(
+    stage: DistillationStage,
+    window: DistillationWindow,
+    *,
+    now: datetime,
+) -> _CompletedOutcome | _ProviderErrorOutcome | None:
+    if stage.stage_kind != DistillationStageKind.EXTRACT or not stage.reuse_key:
+        return None
+
+    source = (
+        DistillationStage.objects.filter(
+            window__session_id=window.session_id,
+            organization_id=stage.organization_id,
+            project_id=stage.project_id,
+            team_id=stage.team_id,
+            stage_kind=DistillationStageKind.EXTRACT,
+            status=DistillationStageStatus.COMPLETE,
+            reuse_key=stage.reuse_key,
+            policy_id=stage.policy_id,
+            policy_version=stage.policy_version,
+        )
+        .exclude(id=stage.id)
+        .order_by('completed_at', 'id')
+        .first()
+    )
+    if source is None:
+        return None
+
+    locked = DistillationStage.objects.select_for_update().get(id=stage.id)
+    if locked.status == DistillationStageStatus.COMPLETE:
+        return _CompletedOutcome(locked)
+
+    chunk = stage.chunk
+    _verify_stage_manifest_live(chunk, stage=locked)
+    try:
+        _refresh_live_policy(stage)
+    except (ModelPolicyError, ProviderSecretError) as error:
+        return _ProviderErrorOutcome(error, started_calls=0)
+
+    locked.status = DistillationStageStatus.COMPLETE
+    locked.reused_from = source
+    locked.accepted_provider_call_id = source.accepted_provider_call_id
+    locked.response_hash = source.response_hash
+    locked.response_size = source.response_size
+    locked.output_snapshot = source.output_snapshot
+    locked.output_hash = source.output_hash
+    locked.completed_at = now
+    locked.save()
+    logger.info(
+        'distill_extract_reused',
+        stage_id=str(locked.id),
+        reused_from_stage_id=str(source.id),
+        session_id=str(window.session_id),
+        window_id=str(window.id),
+        chunk_ordinal=locked.ordinal,
+    )
+
+    return _CompletedOutcome(locked, provider_call_ids=(), started_calls=0)
+
+
 def _attempt_stage(
     stage: DistillationStage,
     claim: WorkClaim,
@@ -897,6 +988,10 @@ def _attempt_stage(
         )
         if existing is not None:
             return _CompletedOutcome(existing)
+
+        reused = _reuse_completed_source(stage, window, now=now)
+        if reused is not None:
+            return reused
 
         prepared = contract.prepare_call(stage)
         try:
