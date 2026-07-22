@@ -427,6 +427,37 @@ def test_stage_key_binds_work_snapshot_kind_chunk_input_and_policy_version() -> 
 
 
 @pytest.mark.django_db
+def test_extract_stage_created_with_reuse_key() -> None:
+    scope = _scope('extract-reuse-key')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    assert stage.reuse_key != ''
+    assert stage.reuse_key == dps.extract_reuse_key(chunk)
+
+
+@pytest.mark.django_db
+def test_existing_required_stage_with_empty_reuse_key_resolves_cleanly() -> None:
+    scope = _scope('extract-reuse-key-backfill')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1,))
+    now = timezone.now()
+    claim = _claim(work, now)
+
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    DistillationStage.objects.filter(id=stage.id).update(reuse_key='')
+
+    replay = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+
+    assert replay.id == stage.id
+    assert DistillationStage.objects.get(id=stage.id).reuse_key == ''
+
+
+@pytest.mark.django_db
 def test_generic_reduction_stage_reuses_identity_call_provenance_and_replay(
     m_monkeypatch: pytest.MonkeyPatch,
 ) -> None:

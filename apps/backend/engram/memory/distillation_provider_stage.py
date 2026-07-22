@@ -579,27 +579,30 @@ def _create_or_reuse_stage(
         policy_version=policy.version,
         policy_role=role_value,
     )
+    defaults: dict[str, object] = {
+        'team_id': window.team_id,
+        'window': window,
+        'chunk': chunk,
+        'stage_kind': target.stage_kind,
+        'level': target.level,
+        'ordinal': target.ordinal,
+        'target_key': target_key,
+        'input_hash': target.input_hash,
+        'input_manifest': target.input_manifest,
+        'prompt_contract': target.prompt_contract,
+        'policy': policy,
+        'policy_version': policy.version,
+        'policy_role': role_value,
+        'status': DistillationStageStatus.REQUIRED,
+        'attempt_count': 0,
+    }
+    if target.stage_kind == DistillationStageKind.EXTRACT:
+        defaults['reuse_key'] = extract_reuse_key(chunk)
     stage, _created = DistillationStage.objects.get_or_create(
         organization_id=window.organization_id,
         project_id=window.project_id,
         stage_key=scoped_key,
-        defaults={
-            'team_id': window.team_id,
-            'window': window,
-            'chunk': chunk,
-            'stage_kind': target.stage_kind,
-            'level': target.level,
-            'ordinal': target.ordinal,
-            'target_key': target_key,
-            'input_hash': target.input_hash,
-            'input_manifest': target.input_manifest,
-            'prompt_contract': target.prompt_contract,
-            'policy': policy,
-            'policy_version': policy.version,
-            'policy_role': role_value,
-            'status': DistillationStageStatus.REQUIRED,
-            'attempt_count': 0,
-        },
+        defaults=defaults,
     )
     if not _stage_matches_target(
         stage,
