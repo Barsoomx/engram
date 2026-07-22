@@ -5,6 +5,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from threading import Barrier
+from types import SimpleNamespace
 
 import pytest
 from django.db import close_old_connections, connection, transaction
@@ -32,6 +33,7 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory import distillation_window as dw
+from engram.memory.distillation_provider_stage import extract_reuse_key
 from engram.memory.services import MemoryWorkerError
 from engram.memory.session_lifecycle import EndSession
 from engram.memory.work_execution import claim_work, finish_work_claim
@@ -607,3 +609,58 @@ def test_existing_window_replay_uses_frozen_planner_configuration(
     assert replay.id == window.id
     assert replay.chunk_char_budget == 8000
     assert replay.reduction_target == 1
+
+
+@pytest.mark.django_db
+def test_extract_reuse_key_stable_across_windows_for_identical_prefix_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    oversized_body = 'x' * 9000
+    scope = _scope('reuse-key-prefix-stable')
+    _observation(scope, sequence=1, body=oversized_body)
+    work_a = _session_work(scope, upper=1)
+    window_a = dw.materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+
+    _observation(scope, sequence=2, body=oversized_body)
+    work_b = _session_work(scope, upper=2)
+    window_b = dw.materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+
+    assert window_a.id != window_b.id
+    assert window_a.input_hash != window_b.input_hash
+    assert chunk_a.input_manifest['observations'] == chunk_b.input_manifest['observations']
+    assert extract_reuse_key(chunk_a) == extract_reuse_key(chunk_b)
+
+
+def test_extract_reuse_key_changes_when_observation_content_digest_changes() -> None:
+    window = SimpleNamespace(chunk_char_budget=8000)
+    chunk_a = SimpleNamespace(
+        window=window,
+        input_manifest={'observations': [{'observation_id': 'obs-1', 'content_digest': _HEX_A}]},
+    )
+    chunk_b = SimpleNamespace(
+        window=window,
+        input_manifest={'observations': [{'observation_id': 'obs-1', 'content_digest': _HEX_B}]},
+    )
+
+    assert extract_reuse_key(chunk_a) != extract_reuse_key(chunk_b)
+
+
+@pytest.mark.django_db
+def test_plan_chunks_full_chunks_are_prefix_stable_under_append() -> None:
+    budget = 8000
+    oversized_body = 'x' * (budget + 500)
+    scope = _scope('plan-chunks-prefix-stable')
+    observations = [_observation(scope, sequence=sequence, body=oversized_body) for sequence in range(1, 5)]
+    entries = dw._manifest_entries(observations)
+
+    shorter = dw._plan_chunks(entries[:2], budget)
+    longer = dw._plan_chunks(entries[:4], budget)
+
+    for ordinal in range(len(shorter) - 1):
+        shorter_ids = [entry.payload['observation_id'] for entry in shorter[ordinal]]
+        longer_ids = [entry.payload['observation_id'] for entry in longer[ordinal]]
+        assert shorter_ids == longer_ids
+    assert len(longer) >= len(shorter)

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
+import structlog
 from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
@@ -53,11 +54,30 @@ from engram.model_policy.services import (
     is_truncated_finish_reason,
 )
 
+logger = structlog.get_logger(__name__)
+
 EXTRACT_PROMPT_CONTRACT = 'distill_extract.v1'
 PROVIDER_OUTPUT_MALFORMED = 'provider_output_malformed'
 PROVIDER_OUTPUT_TRUNCATED = 'provider_output_truncated'
+_EXTRACT_REUSE_SCHEMA = 'distill_extract_reuse.v1'
 _TRUNCATION_FAILURE_DETAIL = 'reduction provider output was truncated at the completion cap'
 _RESPONSE_PREFIX_LIMIT = 2000
+
+
+def extract_reuse_key(chunk: DistillationChunk) -> str:
+    observations = chunk.input_manifest['observations']
+    projection = {
+        'schema': _EXTRACT_REUSE_SCHEMA,
+        'prompt_contract': EXTRACT_PROMPT_CONTRACT,
+        'chunk_char_budget': chunk.window.chunk_char_budget,
+        'observations': [
+            {'observation_id': entry['observation_id'], 'content_digest': entry['content_digest']}
+            for entry in observations
+        ],
+    }
+
+    return hashlib.sha256(canonical_json_bytes(projection)).hexdigest()
+
 
 STAGE_COMPLETED = 'completed'
 STAGE_RETRY = 'retry'
