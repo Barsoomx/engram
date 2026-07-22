@@ -33,6 +33,7 @@ MIGRATION_0045_NODE = ('core', '0045_agent_proposal_source')
 MIGRATION_0045_MODULE = 'engram.core.migrations.0045_agent_proposal_source'
 MIGRATE_0046 = [('core', '0046_merge_20260721_1032')]
 MIGRATE_0047 = [('core', '0047_distill_stage_coord_prompt_contract')]
+MIGRATE_0048 = [('core', '0048_distillation_stage_extract_reuse')]
 
 
 def _create_historical_0032b_scope(historical_apps: Apps) -> dict[str, object]:
@@ -1031,6 +1032,105 @@ def test_0047_coord_uniqueness_admits_distinct_prompt_contracts_at_one_coordinat
         with pytest.raises(IntegrityError):
             with transaction.atomic():
                 _create_historical_reduce_stage(new_apps, new_fixture, prompt_contract='distill_reduce.v2')
+    finally:
+        executor = MigrationExecutor(connection)
+        executor.migrate(leaf_nodes)
+
+
+@pytest.mark.django_db(transaction=True)
+def test_0048_adds_reuse_columns_and_shares_provider_call() -> None:
+    executor = MigrationExecutor(connection)
+    leaf_nodes = executor.loader.graph.leaf_nodes()
+
+    try:
+        executor.migrate(MIGRATE_0047)
+        old_apps = executor.loader.project_state(MIGRATE_0047).apps
+        stage_model, required_stage = _create_historical_0036_stage_fixture(old_apps, 'reuse-a')
+
+        executor = MigrationExecutor(connection)
+        executor.migrate(MIGRATE_0048)
+        new_apps = executor.loader.project_state(MIGRATE_0048).apps
+
+        new_stage_model = new_apps.get_model('core', 'DistillationStage')
+        backfilled = new_stage_model.objects.get(id=required_stage.id)
+        assert backfilled.reuse_key == ''
+        assert backfilled.reused_from_id is None
+
+        policy_model = new_apps.get_model('model_policy', 'ModelPolicy')
+        policy = policy_model.objects.get(id=required_stage.policy_id)
+        call_model = new_apps.get_model('model_policy', 'ProviderCallRecord')
+        call = call_model.objects.create(
+            organization_id=required_stage.organization_id,
+            project_id=required_stage.project_id,
+            team_id=required_stage.team_id,
+            policy_id=policy.id,
+            secret_id=policy.secret_id,
+            provider='openai',
+            model='gpt-4.1-mini',
+            task_type='curation',
+            policy_version=2,
+            request_id='distill-stage:reuse-shared-call',
+            redaction_state='redacted',
+        )
+        now = timezone.now()
+        source = new_stage_model.objects.create(
+            organization_id=required_stage.organization_id,
+            project_id=required_stage.project_id,
+            team_id=required_stage.team_id,
+            window_id=required_stage.window_id,
+            chunk_id=required_stage.chunk_id,
+            stage_kind='extract',
+            level=0,
+            ordinal=1,
+            target_key=_hex_fingerprint(),
+            stage_key=_hex_fingerprint(),
+            input_hash=_hex_fingerprint(),
+            input_manifest={'chunk_ordinal': 0},
+            prompt_contract='distill_extract.v1',
+            policy_id=policy.id,
+            policy_version=2,
+            policy_role='primary',
+            status='complete',
+            attempt_count=1,
+            reuse_key=_hex_fingerprint(),
+            accepted_provider_call_id=call.id,
+            response_hash=_hex_fingerprint(),
+            response_size=16,
+            output_snapshot={'memories': []},
+            output_hash=_hex_fingerprint(),
+            completed_at=now,
+        )
+        reused = new_stage_model.objects.create(
+            organization_id=required_stage.organization_id,
+            project_id=required_stage.project_id,
+            team_id=required_stage.team_id,
+            window_id=required_stage.window_id,
+            chunk_id=required_stage.chunk_id,
+            stage_kind='extract',
+            level=0,
+            ordinal=2,
+            target_key=_hex_fingerprint(),
+            stage_key=_hex_fingerprint(),
+            input_hash=_hex_fingerprint(),
+            input_manifest={'chunk_ordinal': 0},
+            prompt_contract='distill_extract.v1',
+            policy_id=policy.id,
+            policy_version=2,
+            policy_role='primary',
+            status='complete',
+            attempt_count=0,
+            reuse_key=source.reuse_key,
+            reused_from_id=source.id,
+            accepted_provider_call_id=call.id,
+            response_hash=source.response_hash,
+            response_size=source.response_size,
+            output_snapshot=source.output_snapshot,
+            output_hash=source.output_hash,
+            completed_at=now,
+        )
+
+        assert new_stage_model.objects.filter(accepted_provider_call_id=call.id).count() == 2
+        assert reused.reused_from_id == source.id
     finally:
         executor = MigrationExecutor(connection)
         executor.migrate(leaf_nodes)

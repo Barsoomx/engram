@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import pytest
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 
 from engram.core.models import (
@@ -861,3 +862,65 @@ def test_workflow_run_rejects_unknown_run_type() -> None:
 
     with pytest.raises(ValidationError):
         run.full_clean()
+
+
+@pytest.mark.django_db
+def test_complete_reused_stage_shares_provider_call_and_satisfies_status_shape() -> None:
+    deps = _deps('stage-reuse-shape')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    now = timezone.now()
+    source = _stage(deps, window, chunk, **_complete_overrides(deps, now))
+
+    reused = DistillationStage(
+        organization=deps.organization,
+        project=deps.project,
+        team=deps.team,
+        window=window,
+        chunk=chunk,
+        stage_kind='extract',
+        level=0,
+        ordinal=1,
+        target_key=_HEX_E,
+        stage_key=_HEX_F,
+        input_hash=_HEX_C,
+        input_manifest={'chunk_ordinal': 0},
+        prompt_contract='distill_extract.v1',
+        policy=deps.policy,
+        policy_version=2,
+        policy_role='primary',
+        reuse_key=_HEX_A,
+        reused_from=source,
+        **_complete_overrides(deps, now),
+    )
+    reused.full_clean()
+    reused.save()
+
+    persisted = DistillationStage.objects.get(id=reused.id)
+    assert persisted.reused_from_id == source.id
+    assert persisted.accepted_provider_call_id == source.accepted_provider_call_id
+    assert persisted.status == 'complete'
+
+
+@pytest.mark.django_db
+def test_reused_from_protects_source_stage_from_deletion() -> None:
+    deps = _deps('stage-reuse-protect')
+    window = _window(deps)
+    chunk = _chunk(deps, window)
+    now = timezone.now()
+    source = _stage(deps, window, chunk, **_complete_overrides(deps, now))
+    _stage(
+        deps,
+        window,
+        chunk,
+        ordinal=1,
+        target_key=_HEX_E,
+        stage_key=_HEX_F,
+        input_hash=_HEX_C,
+        reuse_key=_HEX_A,
+        reused_from=source,
+        **_complete_overrides(deps, now),
+    )
+
+    with pytest.raises(ProtectedError):
+        source.delete()

@@ -2000,10 +2000,10 @@ class DistillationStage(TimestampedModel):
     attempt_count = models.PositiveIntegerField(default=0)
     last_failure_class = models.CharField(max_length=80, blank=True, default='')
     last_failure_at = models.DateTimeField(null=True, blank=True)
-    accepted_provider_call = models.OneToOneField(
+    accepted_provider_call = models.ForeignKey(
         'model_policy.ProviderCallRecord',
         on_delete=models.PROTECT,
-        related_name='accepted_distillation_stage',
+        related_name='accepted_distillation_stages',
         null=True,
         blank=True,
     )
@@ -2012,6 +2012,14 @@ class DistillationStage(TimestampedModel):
     output_snapshot = models.JSONField(null=True, blank=True)
     output_hash = models.CharField(max_length=64, blank=True, default='')
     completed_at = models.DateTimeField(null=True, blank=True)
+    reuse_key = models.CharField(max_length=64, blank=True, default='')
+    reused_from = models.ForeignKey(
+        'self',
+        on_delete=models.PROTECT,
+        related_name='reuse_children',
+        null=True,
+        blank=True,
+    )
 
     _IMMUTABLE_FIELDS = (
         ('organization_id', 'organization'),
@@ -2030,6 +2038,7 @@ class DistillationStage(TimestampedModel):
         ('policy_id', 'policy'),
         ('policy_version', 'policy_version'),
         ('policy_role', 'policy_role'),
+        ('reuse_key', 'reuse_key'),
     )
 
     class Meta:
@@ -2110,6 +2119,10 @@ class DistillationStage(TimestampedModel):
             models.Index(
                 fields=['organization', 'project', 'window', 'stage_kind', 'status'],
                 name='core_distill_stage_scope_idx',
+            ),
+            models.Index(
+                fields=['organization', 'project', 'reuse_key', 'status'],
+                name='core_distill_stage_reuse_idx',
             ),
         ]
         ordering = ['window_id', 'stage_kind', 'level', 'ordinal']
