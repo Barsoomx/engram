@@ -919,6 +919,77 @@ def test_extract_reuse_rejects_freeze_to_execute_drift(m_monkeypatch: pytest.Mon
     assert stale.reused_from_id is None
 
 
+@pytest.mark.django_db
+def test_extract_reuse_disabled_on_content_change(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-content-change')
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    Observation.objects.filter(session_id=scope[4].id, session_sequence=1).update(
+        body=_REUSE_OVERSIZED_BODY + 'changed'
+    )
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key != stage_a.reuse_key
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 2
+    settled = DistillationStage.objects.get(id=stage_b.id)
+    assert settled.reused_from is None
+
+
+@pytest.mark.django_db
+def test_extract_reuse_disabled_on_policy_version_bump(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-policy-bump')
+    policy = _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    ModelPolicy.objects.filter(id=policy.id).update(version=policy.version + 1)
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key == stage_a.reuse_key
+    assert stage_b.policy_version != stage_a.policy_version
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 2
+    settled = DistillationStage.objects.get(id=stage_b.id)
+    assert settled.reused_from is None
+
+
 def _flip_last_hex_digit(observation_id: str) -> str:
     last = observation_id[-1]
     replacement = '0' if last != '0' else '1'
