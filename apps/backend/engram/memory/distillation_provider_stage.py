@@ -899,6 +899,61 @@ def _validate_contract(stage: DistillationStage, contract: ProviderStageContract
         raise ValueError('provider stage contract does not match the persisted stage identity')
 
 
+def _reuse_completed_source(
+    stage: DistillationStage,
+    window: DistillationWindow,
+    *,
+    now: datetime,
+) -> _CompletedOutcome | None:
+    if stage.stage_kind != DistillationStageKind.EXTRACT or not stage.reuse_key:
+        return None
+
+    source = (
+        DistillationStage.objects.filter(
+            window__session_id=window.session_id,
+            organization_id=stage.organization_id,
+            project_id=stage.project_id,
+            team_id=stage.team_id,
+            stage_kind=DistillationStageKind.EXTRACT,
+            status=DistillationStageStatus.COMPLETE,
+            reuse_key=stage.reuse_key,
+            policy_id=stage.policy_id,
+            policy_version=stage.policy_version,
+        )
+        .exclude(id=stage.id)
+        .order_by('completed_at', 'id')
+        .first()
+    )
+    if source is None:
+        return None
+
+    locked = DistillationStage.objects.select_for_update().get(id=stage.id)
+    if locked.status == DistillationStageStatus.COMPLETE:
+        return _CompletedOutcome(locked)
+
+    chunk = stage.chunk
+    _verify_stage_manifest_live(chunk, stage=locked)
+    locked.status = DistillationStageStatus.COMPLETE
+    locked.reused_from = source
+    locked.accepted_provider_call_id = source.accepted_provider_call_id
+    locked.response_hash = source.response_hash
+    locked.response_size = source.response_size
+    locked.output_snapshot = source.output_snapshot
+    locked.output_hash = source.output_hash
+    locked.completed_at = now
+    locked.save()
+    logger.info(
+        'distill_extract_reused',
+        stage_id=str(locked.id),
+        reused_from_stage_id=str(source.id),
+        session_id=str(window.session_id),
+        window_id=str(window.id),
+        chunk_ordinal=locked.ordinal,
+    )
+
+    return _CompletedOutcome(locked, provider_call_ids=(), started_calls=0)
+
+
 def _attempt_stage(
     stage: DistillationStage,
     claim: WorkClaim,
@@ -928,6 +983,10 @@ def _attempt_stage(
         )
         if existing is not None:
             return _CompletedOutcome(existing)
+
+        reused = _reuse_completed_source(stage, window, now=now)
+        if reused is not None:
+            return reused
 
         prepared = contract.prepare_call(stage)
         try:

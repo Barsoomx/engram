@@ -31,6 +31,7 @@ from engram.core.models import (
 )
 from engram.memory import distillation_provider_stage as dps
 from engram.memory import work_execution
+from engram.memory.distillation_reduction import _snapshot_drafts
 from engram.memory.distillation_window import materialize_distillation_window
 from engram.memory.services import MemoryWorkerError
 from engram.memory.work_execution import StaleWorkFenceError, WorkClaim, claim_work
@@ -803,6 +804,119 @@ def test_crash_after_provider_response_replays_to_one_durable_decision(
         status='complete',
     )
     assert complete_targets.count() == 1
+
+
+_REUSE_CHUNK_BUDGET = 8000
+_REUSE_OVERSIZED_BODY = 'y' * 9000
+
+
+def _reused_prefix_stages(
+    m_monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> tuple[_StubGateway, DistillationStage, DistillationStage, WorkClaim, datetime]:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope(suffix)
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=1)
+    window_a = materialize_distillation_window(work_a)
+    chunk_a = window_a.chunks.get(ordinal=0)
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _StubGateway(body=_valid_body(chunk_a))
+    _install_gateway(m_monkeypatch, gateway)
+    stage_a = dps.resolve_extraction_stage(chunk=chunk_a, claim=claim_a, now=now)
+    assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+    stage_a.refresh_from_db()
+
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=2)
+    window_b = materialize_distillation_window(work_b)
+    chunk_b = window_b.chunks.get(ordinal=0)
+    claim_b = _claim(work_b, now)
+    stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+    assert stage_b.reuse_key == stage_a.reuse_key
+
+    return gateway, stage_a, stage_b, claim_b, now
+
+
+@pytest.mark.django_db
+def test_extract_stage_reuses_prior_session_output_without_provider_call(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-hit')
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert result.started_provider_calls == 0
+    assert len(gateway.calls) == 1
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.status == 'complete'
+    assert reused.reused_from_id == stage_a.id
+    assert reused.output_snapshot == stage_a.output_snapshot
+    assert reused.output_hash == stage_a.output_hash
+    assert reused.accepted_provider_call_id == stage_a.accepted_provider_call_id
+    assert reused.attempt_count == 0
+
+
+@pytest.mark.django_db
+def test_extract_reuse_records_provenance(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    _gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-provenance')
+
+    assert dps.execute_distillation_stage(stage_b, claim_b, now=now).status == 'completed'
+
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.status == 'complete'
+    assert reused.reused_from_id == stage_a.id
+    assert reused.accepted_provider_call_id is not None
+    assert reused.accepted_provider_call_id == stage_a.accepted_provider_call_id
+    assert reused.response_hash == stage_a.response_hash
+    assert reused.response_size == stage_a.response_size
+    assert reused.completed_at is not None
+    reused.full_clean()
+
+
+@pytest.mark.django_db
+def test_reused_stage_drafts_semantics_identical_but_identity_is_b_rooted(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _gateway, stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-drafts')
+
+    assert dps.execute_distillation_stage(stage_b, claim_b, now=now).status == 'completed'
+
+    reused = DistillationStage.objects.get(id=stage_b.id)
+    assert reused.reused_from_id == stage_a.id
+    drafts_a = _snapshot_drafts(stage_a)
+    drafts_b = _snapshot_drafts(reused)
+    assert len(drafts_a) == len(drafts_b) == 1
+    draft_a = drafts_a[0]
+    draft_b = drafts_b[0]
+    assert draft_b.title == draft_a.title
+    assert draft_b.body == draft_a.body
+    assert draft_b.confidence == draft_a.confidence
+    assert draft_b.kind == draft_a.kind
+    assert draft_b.source_ids == draft_a.source_ids
+    assert draft_b.source_output_hash == draft_a.source_output_hash
+    assert draft_b.output_index == draft_a.output_index
+    assert draft_b.draft_id != draft_a.draft_id
+    assert draft_b.source_stage_key == reused.stage_key
+    assert draft_b.source_stage_ids == (reused.stage_key,)
+
+
+@pytest.mark.django_db
+def test_extract_reuse_rejects_freeze_to_execute_drift(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway, _stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-drift')
+    drifting_id = _chunk_observation_ids(stage_b.chunk)[0]
+    Observation.objects.filter(id=drifting_id).update(body='content drifted after window freeze')
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
+    assert len(gateway.calls) == 1
+    stale = DistillationStage.objects.get(id=stage_b.id)
+    assert stale.status == 'required'
+    assert stale.reused_from_id is None
 
 
 def _flip_last_hex_digit(observation_id: str) -> str:
