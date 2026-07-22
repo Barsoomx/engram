@@ -1080,6 +1080,21 @@ def test_extract_reuse_disabled_on_policy_version_bump(m_monkeypatch: pytest.Mon
     assert settled.reused_from is None
 
 
+@pytest.mark.django_db
+def test_extract_reuse_rejects_live_policy_drift(m_monkeypatch: pytest.MonkeyPatch) -> None:
+    gateway, _stage_a, stage_b, claim_b, now = _reused_prefix_stages(m_monkeypatch, 'stage-reuse-policy-drift')
+    ModelPolicy.objects.filter(id=stage_b.policy_id).update(version=stage_b.policy_version + 1)
+
+    result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+
+    assert result.status == 'blocked'
+    assert result.started_provider_calls == 0
+    assert len(gateway.calls) == 1
+    blocked = DistillationStage.objects.get(id=stage_b.id)
+    assert blocked.status == 'required'
+    assert blocked.reused_from is None
+
+
 def _flip_last_hex_digit(observation_id: str) -> str:
     last = observation_id[-1]
     replacement = '0' if last != '0' else '1'

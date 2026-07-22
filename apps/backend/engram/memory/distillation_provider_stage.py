@@ -904,7 +904,7 @@ def _reuse_completed_source(
     window: DistillationWindow,
     *,
     now: datetime,
-) -> _CompletedOutcome | None:
+) -> _CompletedOutcome | _ProviderErrorOutcome | None:
     if stage.stage_kind != DistillationStageKind.EXTRACT or not stage.reuse_key:
         return None
 
@@ -933,6 +933,11 @@ def _reuse_completed_source(
 
     chunk = stage.chunk
     _verify_stage_manifest_live(chunk, stage=locked)
+    try:
+        _refresh_live_policy(stage)
+    except (ModelPolicyError, ProviderSecretError) as error:
+        return _ProviderErrorOutcome(error, started_calls=0)
+
     locked.status = DistillationStageStatus.COMPLETE
     locked.reused_from = source
     locked.accepted_provider_call_id = source.accepted_provider_call_id
