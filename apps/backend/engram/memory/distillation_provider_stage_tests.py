@@ -14,6 +14,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from engram.core.models import (
+    MEMORY_KINDS,
     Agent,
     AgentSession,
     DistillationChunk,
@@ -1090,9 +1091,33 @@ def test_extract_reuse_rejects_live_policy_drift(m_monkeypatch: pytest.MonkeyPat
     assert result.status == 'blocked'
     assert result.started_provider_calls == 0
     assert len(gateway.calls) == 1
+    assert result.failure is not None
+    assert result.failure.failure_class == CONFIGURATION
+    assert result.failure.code == 'model_policy_unavailable'
     blocked = DistillationStage.objects.get(id=stage_b.id)
     assert blocked.status == 'required'
     assert blocked.reused_from is None
+
+
+_EXTRACT_PROMPT_CONTRACT_FINGERPRINT = '40c078490fa14a98a14eff0cd4c6514cd79021c66324a21f20cbd20598932d0d'
+
+
+def test_extract_prompt_contract_pins_prompt_and_parser_fingerprint() -> None:
+    projection = {
+        'system_prompt': dps._EXTRACT_SYSTEM_PROMPT,
+        'schema_instructions': curation_schema_prompt_prefix('distill_extract.v1'),
+        'max_memories': dps._MAX_MEMORIES,
+        'max_title': dps._MAX_TITLE,
+        'max_body': dps._MAX_BODY,
+        'allowed_kinds': sorted(kind for kind in MEMORY_KINDS if kind != 'digest'),
+        'prompt_contract': dps.EXTRACT_PROMPT_CONTRACT,
+    }
+    digest = hashlib.sha256(canonical_json_bytes(projection)).hexdigest()
+
+    assert digest == _EXTRACT_PROMPT_CONTRACT_FINGERPRINT, (
+        'rendered prompt or accepted-output parser changed - bump EXTRACT_PROMPT_CONTRACT to '
+        'distill_extract.v2 and update this snapshot'
+    )
 
 
 def _flip_last_hex_digit(observation_id: str) -> str:
