@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 from typing import Any
@@ -10,11 +11,16 @@ from structlog.testing import capture_logs
 from engram.context.context_api_tests import create_project_scope
 from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
+from engram.memory.distillation_provider_stage import _EXTRACT_SYSTEM_PROMPT, EXTRACT_PROMPT_CONTRACT
+from engram.memory.distillation_reduction import _REDUCE_SYSTEM_PROMPT, REDUCE_PROMPT_CONTRACT
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
 from engram.model_policy.services import (
     _ANTHROPIC_STRUCTURED_TOOLS,
+    _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS,
+    _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS,
+    _STRUCTURED_RESPONSE_KINDS,
     AnthropicMessagesGateway,
     CreateProviderSecret,
     EmbeddingCallInput,
@@ -25,9 +31,15 @@ from engram.model_policy.services import (
     RotateProviderSecretInput,
     UpdateModelPolicy,
     UpdateModelPolicyInput,
+    _completion_body,
+    _completion_title,
     _split_completion,
     curation_schema_prompt_prefix,
+    effective_completion_cap,
     generated_candidates_payload,
+    generated_distill_reduce_payload,
+    is_truncated_finish_reason,
+    provider_completion_clamp,
     resolve_max_tokens,
     secret_fingerprint,
 )
@@ -35,16 +47,43 @@ from engram.model_policy.services import (
 PLAINTEXT_PROVIDER_SECRET = 'provider-plaintext-value-abc123'
 
 
-def _openai_chat_body(content: str, usage: dict[str, int] | None = None) -> bytes:
-    response: dict[str, Any] = {'choices': [{'message': {'content': content}}]}
+def _fingerprint(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+_REDUCE_SYSTEM_PROMPT_FINGERPRINT = '5178d5f24b0965171b7cdc9f333272795167de3fa3a5e0cd7dcb25da06b80574'
+_REDUCE_SCHEMA_INSTRUCTIONS_FINGERPRINT = '291cd38b28d36ca33b384ee36a4416bf4c4d931ac7336ef89b9aa1d76bdb8348'
+_EXTRACT_SYSTEM_PROMPT_FINGERPRINT = '40999ca6a885bb8257a8e08e89c15930febc209b5c6c38421cc60e6f32901e23'
+_EXTRACT_SCHEMA_INSTRUCTIONS_FINGERPRINT = 'b8ad77b18e8d39c474dde0b23819dff2647512e59e64f095f942c8ce977f63e2'
+
+
+def test_reduce_prompt_components_pinned_change_forces_contract_version_bump() -> None:
+    assert REDUCE_PROMPT_CONTRACT == 'distill_reduce.v2'
+    assert _fingerprint(_REDUCE_SYSTEM_PROMPT) == _REDUCE_SYSTEM_PROMPT_FINGERPRINT
+    assert _fingerprint(_DISTILL_REDUCE_SCHEMA_INSTRUCTIONS) == _REDUCE_SCHEMA_INSTRUCTIONS_FINGERPRINT
+
+
+def test_extract_prompt_components_pinned_change_forces_contract_version_bump() -> None:
+    assert EXTRACT_PROMPT_CONTRACT == 'distill_extract.v1'
+    assert _fingerprint(_EXTRACT_SYSTEM_PROMPT) == _EXTRACT_SYSTEM_PROMPT_FINGERPRINT
+    assert _fingerprint(_DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS) == _EXTRACT_SCHEMA_INSTRUCTIONS_FINGERPRINT
+
+
+def _openai_chat_body(content: str, usage: dict[str, int] | None = None, finish_reason: str | None = None) -> bytes:
+    choice: dict[str, Any] = {'message': {'content': content}}
+    if finish_reason is not None:
+        choice['finish_reason'] = finish_reason
+    response: dict[str, Any] = {'choices': [choice]}
     if usage is not None:
         response['usage'] = usage
 
     return json.dumps(response).encode()
 
 
-def _anthropic_message_body(content: str, usage: dict[str, int] | None = None) -> bytes:
+def _anthropic_message_body(content: str, usage: dict[str, int] | None = None, stop_reason: str | None = None) -> bytes:
     response: dict[str, Any] = {'content': [{'type': 'text', 'text': content}]}
+    if stop_reason is not None:
+        response['stop_reason'] = stop_reason
     if usage is not None:
         response['usage'] = usage
 
@@ -420,7 +459,7 @@ def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
             request_id='distill-reduce-schema-1',
             trace_id='distill-reduce-schema-1',
             prompt='{"drafts":[]}',
-            response_kind='distill_reduce.v1',
+            response_kind='distill_reduce.v2',
         ),
     )
 
@@ -428,7 +467,7 @@ def test_openai_distill_reduce_prompt_carries_schema_instructions() -> None:
     user_message = sent['messages'][-1]['content']
 
     assert 'memories' in user_message
-    assert 'source_ids' in user_message
+    assert 'source_refs' in user_message
     assert 'confidence' in user_message
     assert user_message.rstrip().endswith('{"drafts":[]}')
 
@@ -455,22 +494,22 @@ def test_distill_extract_schema_prefix_states_parser_enforced_rules() -> None:
 
 
 def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
-    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
+    instructions = curation_schema_prompt_prefix('distill_reduce.v2')
 
     assert instructions == (
         'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-        'The object must contain exactly the key memories (array of objects) and no additional properties. '
-        'Each memories entry must contain exactly these keys and no additional properties: '
-        'title (non-blank string, at most 255 characters); '
-        'body (non-blank string, at most 3000 characters); '
-        'confidence (a JSON number between 0 and 1); '
-        'source_ids (non-empty array of unique draft ids); '
-        'kind (optional, one of: decision, convention, gotcha, architecture, incident). '
-        'Only use draft ids copied verbatim from the input drafts. '
-        'Group each input draft id into the source_ids of the memory that consolidates it. '
-        'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
-        'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+        'The object must contain exactly the key memories (array of objects) and no additional '
+        'properties. Each memories entry must contain exactly these keys and no additional '
+        'properties: title (non-blank string, at most 255 characters); body (non-blank string, at '
+        'most 3000 characters); confidence (a JSON number between 0 and 1); source_refs (non-empty '
+        'array of unique positive integers); kind (optional, one of: decision, convention, gotcha, '
+        'architecture, incident). Only use draft indices copied verbatim from the input drafts. '
+        'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
+        'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
+        'own memory, so the number of memories may equal the number of input drafts. '
+        'Give each memory a confidence no higher than the highest confidence among its source drafts.'
     )
+    assert curation_schema_prompt_prefix('distill_reduce.v1') == ''
 
 
 def test_curation_decision_prefix_lists_every_mutating_identity_relation() -> None:
@@ -912,3 +951,208 @@ def test_rotate_provider_secret_audit_stores_fingerprint_not_cleartext() -> None
     assert 'raw_secret' not in event.metadata
     assert event.metadata['fingerprint'] == secret_fingerprint(rotated)
     assert rotated not in json.dumps(event.metadata)
+
+
+def _reduce_inputs(count: int) -> list[Any]:
+    from decimal import Decimal
+
+    from engram.memory.distillation_reduction import ReductionDraft
+
+    return [
+        ReductionDraft(
+            draft_id=f'draft-{index}',
+            title=f'Title {index}',
+            body=f'Body {index}',
+            confidence=Decimal('0.5'),
+            source_ids=(f'obs-{index}',),
+        )
+        for index in range(1, count + 1)
+    ]
+
+
+def test_anthropic_distill_reduce_tool_uses_integer_source_refs() -> None:
+    assert 'distill_reduce.v1' not in _ANTHROPIC_STRUCTURED_TOOLS
+    tool = _ANTHROPIC_STRUCTURED_TOOLS['distill_reduce.v2']
+    schema = tool['input_schema']
+    memories = schema['properties']['memories']
+
+    assert 'maxItems' not in memories
+    item = memories['items']
+    assert 'source_ids' not in item['properties']
+    assert item['properties']['source_refs'] == {
+        'type': 'array',
+        'items': {'type': 'integer', 'minimum': 1},
+        'minItems': 1,
+        'uniqueItems': True,
+    }
+    assert item['required'] == ['title', 'body', 'confidence', 'source_refs']
+
+
+def test_generated_distill_reduce_payload_partitions_with_integer_source_refs() -> None:
+    from engram.memory.distillation_reduction import parse_reduction_output
+
+    prompt = json.dumps(
+        {
+            'drafts': [
+                {'index': 1, 'title': 'a', 'body': 'b', 'confidence': '0.5'},
+                {'index': 2, 'title': 'c', 'body': 'd', 'confidence': '0.5'},
+                {'index': 3, 'title': 'e', 'body': 'f', 'confidence': '0.5'},
+            ]
+        }
+    )
+
+    payload = json.loads(generated_distill_reduce_payload(prompt))
+    refs = [ref for memory in payload['memories'] for ref in memory['source_refs']]
+
+    assert all(isinstance(ref, int) and not isinstance(ref, bool) for ref in refs)
+    assert sorted(refs) == [1, 2, 3]
+
+    parsed = parse_reduction_output(payload, _reduce_inputs(3))
+    assert {source for memory in parsed.memories for source in memory.source_ids} == {
+        'draft-1',
+        'draft-2',
+        'draft-3',
+    }
+
+
+def test_distill_reduce_v2_is_structured_kind_and_body_is_verbatim() -> None:
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]})
+
+    assert 'distill_reduce.v2' in _STRUCTURED_RESPONSE_KINDS
+    assert _completion_body(content, 'distill_reduce.v2') == content
+    assert _completion_title(content, 'distill_reduce.v2') == ''
+
+
+@pytest.mark.django_db
+def test_openai_gateway_returns_verbatim_reduce_body_that_parses() -> None:
+    from engram.memory.distillation_reduction import parse_reduction_output
+
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1, 2]}]})
+    opener = _opener_returning(_openai_chat_body(content))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='reduce-body-1',
+            trace_id='reduce-body-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v2',
+        ),
+    )
+
+    assert result.generated_body == content
+    parsed = parse_reduction_output(json.loads(result.generated_body), _reduce_inputs(2))
+    assert len(parsed.memories) == 1
+
+
+def test_resolve_max_tokens_reduce_override_is_scoped() -> None:
+    policy = ModelPolicy(provider='deepseek', metadata={'max_tokens': 5000})
+
+    assert resolve_max_tokens(policy, 'distill_reduce.v2') == 5000
+    assert resolve_max_tokens(ModelPolicy(provider='deepseek', metadata={}), 'distill_reduce.v2') == 8192
+    assert resolve_max_tokens(policy, 'distill_extract.v1') == 8192
+    assert resolve_max_tokens(policy, 'curation_decision_v1') == 16384
+
+
+def test_provider_completion_clamp_defaults_and_override() -> None:
+    assert provider_completion_clamp(ModelPolicy(provider='deepseek', metadata={})) == 4096
+    assert provider_completion_clamp(ModelPolicy(provider='deepseek', metadata={'completion_clamp': 2048})) == 2048
+    assert provider_completion_clamp(ModelPolicy(provider='openai', metadata={})) is None
+
+
+def test_effective_completion_cap_is_reduce_scoped() -> None:
+    deepseek = ModelPolicy(provider='deepseek', metadata={})
+    openai = ModelPolicy(provider='openai', metadata={})
+
+    assert effective_completion_cap(deepseek, 'distill_reduce.v2') == 4096
+    assert effective_completion_cap(openai, 'distill_reduce.v2') == 8192
+
+    clamped = ModelPolicy(provider='deepseek', metadata={'completion_clamp': 1000})
+    assert effective_completion_cap(clamped, 'distill_extract.v1') == resolve_max_tokens(clamped, 'distill_extract.v1')
+    assert effective_completion_cap(clamped, 'distill_extract.v1') == 8192
+
+
+def test_is_truncated_finish_reason_predicate() -> None:
+    assert is_truncated_finish_reason('length') is True
+    assert is_truncated_finish_reason('max_tokens') is True
+    assert is_truncated_finish_reason('stop') is False
+    assert is_truncated_finish_reason('') is False
+
+
+@pytest.mark.django_db
+def test_openai_gateway_surfaces_finish_reason_and_sends_effective_cap() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek')
+    content = json.dumps({'memories': [{'title': 't', 'body': 'b', 'confidence': 0.9, 'source_refs': [1]}]})
+    opener = _opener_returning(_openai_chat_body(content, finish_reason='length'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='finish-reason-1',
+            trace_id='finish-reason-1',
+            prompt='{"drafts":[]}',
+            response_kind='distill_reduce.v2',
+        ),
+    )
+
+    assert result.finish_reason == 'length'
+    sent = json.loads(opener.requests[0].data)
+    assert sent['max_tokens'] == effective_completion_cap(policy, 'distill_reduce.v2') == 4096
+
+
+@pytest.mark.django_db
+def test_openai_gateway_surfaces_non_truncating_finish_reason() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+    opener = _opener_returning(_openai_chat_body('Title: X\nBody: Y', finish_reason='stop'))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='finish-reason-2',
+            trace_id='finish-reason-2',
+            prompt='a prompt',
+        ),
+    )
+
+    assert result.finish_reason == 'stop'
+
+
+@pytest.mark.django_db
+def test_anthropic_gateway_surfaces_stop_reason() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='anthropic')
+    gateway = AnthropicMessagesGateway(
+        base_url='https://api.anthropic.com',
+        api_key='key',
+        opener=_opener_returning(_anthropic_message_body('Title: X\nBody: Y', stop_reason='max_tokens')),
+    )
+
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='stop-reason-1',
+            trace_id='stop-reason-1',
+            prompt='a prompt',
+        ),
+    )
+
+    assert result.finish_reason == 'max_tokens'

@@ -21,34 +21,77 @@ class ReductionContractError(ValueError):
 MAX_TITLE = 255
 MAX_BODY = 3000
 REDUCTION_MANIFEST_SCHEMA = 'distillation_reduce_manifest.v1'
-REDUCE_PROMPT_CONTRACT = 'distill_reduce.v1'
+REDUCE_PROMPT_CONTRACT = 'distill_reduce.v2'
 
 _REDUCE_SYSTEM_PROMPT = (
-    'You consolidate engineering memory drafts following the distill_reduce.v1 contract. '
-    'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-    'The object must contain exactly the key memories (array of objects) and no additional properties. '
-    'Each memories entry must contain exactly these keys and no additional properties: '
-    f'title (non-blank string, at most {MAX_TITLE} characters); '
-    f'body (non-blank string, at most {MAX_BODY} characters); '
-    'confidence (a JSON number between 0 and 1, never a string); '
-    'source_ids (non-empty array of unique draft ids); '
-    'kind (optional, one of: decision, convention, gotcha, architecture, incident; omit it when none applies). '
-    'Every source_ids value must be an id copied verbatim from the input drafts. '
-    'Group each input draft id into the source_ids of the memory that consolidates it; '
-    'the same draft id may appear in more than one entry. '
-    'memories must never be empty. '
-    'The user message is one JSON object: drafts (array of {id, title, body, confidence, kind?}) '
-    'and reduction_target (a number). '
-    'Task: merge drafts that record the same or closely related durable fact, decision, or behavior into one '
-    'memory whose title and body preserve the concrete details (identifiers, paths, versions, numbers) of '
-    'every merged draft; never invent facts absent from the drafts. '
-    'A draft unrelated to every other draft may pass through as its own entry with that single source id. '
-    'Return strictly fewer memories than there are input drafts and at most reduction_target memories; '
-    'if consolidating to reduction_target would force unrelated drafts into one memory, you may instead '
-    'return up to half the number of input drafts, rounded up. '
-    'Give each entry a confidence no higher than the highest confidence among its source drafts. '
-    'When unsure how to group, merge the most closely related drafts first and repeat until the count rules hold.'
+    'You consolidate engineering-memory drafts under the distill_reduce.v2 contract. Return '
+    'exactly one JSON object and nothing else: no prose, no markdown code fences. The object '
+    'must contain exactly the key memories (array of objects) and no additional properties. '
+    'Each memories entry must contain exactly these keys and no additional properties: title '
+    f'(non-blank string, at most {MAX_TITLE} characters); body (non-blank string, at most {MAX_BODY} '
+    'characters); confidence (a JSON number between 0 and 1, never a string); source_refs '
+    '(non-empty array of unique positive integers); kind (optional, one of: decision, '
+    'convention, gotcha, architecture, incident; omit it when none applies). The user message is '
+    'one JSON object with the single key drafts: an array of {index, title, body, confidence, '
+    'kind?} where index is a positive integer. Every source_refs value must be a draft index '
+    'copied verbatim from the input. Partition the drafts: assign every input index to exactly '
+    'one memory, never repeat an index across memories or within one memory, and never omit an '
+    'index. Task: merge only drafts that record the same or a near-duplicate durable fact, '
+    'decision, or behavior into one memory whose title and body preserve the concrete details '
+    '(identifiers, paths, versions, numbers) of every merged draft; never invent facts absent '
+    'from the drafts. A draft that is distinct from every other draft must pass through as its '
+    'own memory referencing that single index; do not force unrelated drafts together and do not '
+    'drop any draft. The number of memories may therefore equal the number of drafts. Give each '
+    'memory a confidence no higher than the highest confidence among its source drafts.'
 )
+
+
+_OUTPUT_TOKENS_PER_CHAR = 0.4
+_OUTPUT_ENVELOPE_CHARS = 32
+_PER_MEMORY_JSON_OVERHEAD = 128
+_PER_MEMORY_INDEX_CHARS = 8
+_TRUNCATION_MARGIN = 0.30
+_PER_MEMORY_CHARS = MAX_TITLE + MAX_BODY + _PER_MEMORY_JSON_OVERHEAD + _PER_MEMORY_INDEX_CHARS
+
+
+def worst_case_output_tokens(n: int) -> int:
+    return math.ceil(_OUTPUT_TOKENS_PER_CHAR * (_OUTPUT_ENVELOPE_CHARS + n * _PER_MEMORY_CHARS))
+
+
+def output_budget_tokens(cap: int) -> int:
+    return math.floor(cap * (1 - _TRUNCATION_MARGIN))
+
+
+def max_reduction_fanin(budget: int) -> int:
+    n = 1
+    while worst_case_output_tokens(n + 1) <= budget:
+        n += 1
+
+    return n
+
+
+_MAX_TREE_LEVELS = 4
+_GENERATION_LEVEL_STRIDE = 16
+_MAX_GENERATION = 3
+
+
+class ReductionTruncationExhausted(ReductionContractError):  # noqa: N818
+    pass
+
+
+def effective_reduction_target(total_drafts: int, floor: int) -> int:
+    return max(floor, min(48, math.ceil(total_drafts / 4)))
+
+
+def compute_reduction_generation(truncated_levels: Sequence[int]) -> int:
+    if not truncated_levels:
+        return 0
+
+    generation = max(level // _GENERATION_LEVEL_STRIDE for level in truncated_levels) + 1
+    if generation > _MAX_GENERATION:
+        raise ReductionTruncationExhausted('reduction truncation generations exhausted')
+
+    return generation
 
 
 def _json(value: object) -> bytes:
@@ -209,18 +252,19 @@ def _confidence(value: object) -> Decimal:
 
 
 def parse_reduction_output(  # noqa: C901
-    payload: object, inputs: Sequence[ReductionDraft], *, reduction_target: int | None = None
+    payload: object, inputs: Sequence[ReductionDraft]
 ) -> ReductionOutput:
     if not isinstance(payload, dict) or set(payload) != {'memories'} or not isinstance(payload['memories'], list):
         raise ReductionContractError('reduction output must be exactly {memories: [...]}')
-    allowed = {'title', 'body', 'confidence', 'source_ids', 'kind'}
-    known = {draft.draft_id for draft in inputs}
+    allowed = {'title', 'body', 'confidence', 'source_refs', 'kind'}
+    n = len(inputs)
     memories: list[ReducedMemory] = []
+    covered: list[int] = []
     for item in payload['memories']:
         if (
             not isinstance(item, dict)
             or not set(item).issubset(allowed)
-            or not {'title', 'body', 'confidence', 'source_ids'} <= set(item)
+            or not {'title', 'body', 'confidence', 'source_refs'} <= set(item)
         ):
             raise ReductionContractError('memory has malformed keys')
         title, body = item['title'], item['body']
@@ -228,14 +272,20 @@ def parse_reduction_output(  # noqa: C901
             raise ReductionContractError('title is invalid')
         if not isinstance(body, str) or not body.strip() or len(body) > MAX_BODY:
             raise ReductionContractError('body is invalid')
-        source_ids = item['source_ids']
-        if not isinstance(source_ids, list) or not source_ids:
-            raise ReductionContractError('source_ids must be non-empty')
-        if any(not isinstance(source_id, str) or not source_id for source_id in source_ids):
-            raise ReductionContractError('source_ids must contain strings')
-        if len(set(source_ids)) != len(source_ids):
-            raise ReductionContractError('source_ids must be duplicate-free')
-        valid_source_ids = tuple(source_id for source_id in source_ids if source_id in known)
+        source_refs = item['source_refs']
+        if not isinstance(source_refs, list) or not source_refs:
+            raise ReductionContractError('source_refs must be non-empty')
+        indices: list[int] = []
+        seen: set[int] = set()
+        for ref in source_refs:
+            if isinstance(ref, bool) or not isinstance(ref, int):
+                raise ReductionContractError('source_refs must be integers')
+            if ref < 1 or ref > n:
+                raise ReductionContractError('source_refs index is out of range')
+            if ref in seen:
+                raise ReductionContractError('source_refs must be duplicate-free')
+            seen.add(ref)
+            indices.append(ref)
         kind = item.get('kind', '')
         if not isinstance(kind, str) or (
             kind and kind not in {'decision', 'convention', 'gotcha', 'architecture', 'incident'}
@@ -244,19 +294,17 @@ def parse_reduction_output(  # noqa: C901
         confidence_value = item['confidence']
         if isinstance(confidence_value, bool) or not isinstance(confidence_value, (int, float)):
             raise ReductionContractError('confidence must be numeric')
-        if not valid_source_ids:
-            continue
+        source_ids = tuple(inputs[index - 1].draft_id for index in indices)
+        source_ceiling = max(inputs[index - 1].confidence for index in indices)
+        confidence = min(_confidence(confidence_value), source_ceiling)
+        covered.extend(indices)
+        memories.append(ReducedMemory(title, body, confidence, source_ids, kind))
+    if n:
+        if len(covered) != len(set(covered)):
+            raise ReductionContractError('source_refs index repeats across memories')
+        if set(covered) != set(range(1, n + 1)):
+            raise ReductionContractError('reduction output must partition every draft')
 
-        memories.append(ReducedMemory(title, body, _confidence(confidence_value), valid_source_ids, kind))
-    if inputs and not memories:
-        raise ReductionContractError('reduction output is empty')
-    if inputs:
-        target = reduction_target if reduction_target is not None else len(inputs) - 1
-        if len(inputs) > 1 and len(memories) >= len(inputs):
-            raise ReductionContractError('reduction output must shrink')
-        cap = max(target, math.ceil(len(inputs) / 2)) if len(inputs) > target else target
-        if len(memories) > cap:
-            raise ReductionContractError('reduction output exceeds cap')
     return ReductionOutput(tuple(memories))
 
 
@@ -295,33 +343,18 @@ reduction_target_key = reduction_batch_key
 
 
 def build_reduction_batches(
-    drafts: Sequence[ReductionDraft], *, reduction_target: int, prompt_budget: int, level: int = 1
+    drafts: Sequence[ReductionDraft], *, max_fanin: int, level: int
 ) -> tuple[ReductionBatch, ...]:
-    if reduction_target <= 0 or prompt_budget <= 0:
-        raise ReductionContractError('reduction target and prompt budget must be positive')
+    if max_fanin < 1:
+        raise ReductionContractError('reduction fan-in must be positive')
     ordered = tuple(drafts)
     batches: list[ReductionBatch] = []
     index = 0
     while index < len(ordered):
-        remaining = len(ordered) - index
-        if remaining == 1:
-            group = (ordered[index],)
-            index += 1
-            provider_required = False
-        else:
-            group_list = [ordered[index]]
-            index += 1
-            while index < len(ordered):
-                candidate = tuple(group_list + [ordered[index]])
-                size = len(_json([_draft_payload(draft) for draft in candidate]))
-                if len(candidate) >= 2 and size > prompt_budget:
-                    break
-                group_list.append(ordered[index])
-                index += 1
-            if len(group_list) < 2:
-                raise ReductionContractError('two normalized drafts do not fit prompt budget')
-            group = tuple(group_list)
-            provider_required = True
+        size = min(max_fanin, len(ordered) - index)
+        group = ordered[index : index + size]
+        index += size
+        provider_required = len(group) >= 2
         refs = tuple(draft.ref for draft in group)
         input_hash = reduction_input_hash(refs)
         batches.append(
@@ -335,6 +368,7 @@ def build_reduction_batches(
                 provider_required,
             )
         )
+
     return tuple(batches)
 
 
@@ -377,7 +411,12 @@ def _materialize_reduced(batch: ReductionBatch, parsed: ReductionOutput) -> tupl
 
 
 def reduce_multilevel(
-    drafts: Sequence[ReductionDraft], *, reduction_target: int, prompt_budget: int, provider: Provider
+    drafts: Sequence[ReductionDraft],
+    *,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
+    provider: Provider,
 ) -> tuple[ReductionDraft, ...]:
     if any(not isinstance(draft, ReductionDraft) for draft in drafts):
         raise ReductionContractError('reduction drafts must be typed ReductionDraft instances')
@@ -386,16 +425,15 @@ def reduce_multilevel(
         state = _evaluate_draft_reduction_state(
             tuple(drafts),
             accepted,
-            reduction_target=reduction_target,
-            prompt_budget=prompt_budget,
+            reduction_target_floor=reduction_target_floor,
+            output_budget_tokens=output_budget_tokens,
+            generation=generation,
         )
         if state.final is not None:
             return state.final
         if state.pending is None:
             raise ReductionContractError('reduction state is incomplete')
-        parsed = parse_reduction_output(
-            provider(state.pending), state.pending.input_drafts, reduction_target=reduction_target
-        )
+        parsed = parse_reduction_output(provider(state.pending), state.pending.input_drafts)
         accepted.append(
             _AcceptedReduction(
                 state.pending.level,
@@ -578,25 +616,27 @@ def _evaluate_draft_reduction_state(
     initial_drafts: tuple[ReductionDraft, ...],
     accepted_rows: Sequence[_AcceptedReduction],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> _ReductionState:
-    if reduction_target <= 0 or prompt_budget <= 0:
+    if not initial_drafts:
         return _ReductionState((), None, ())
     if len({row.batch_key for row in accepted_rows}) != len(accepted_rows):
         raise ReductionContractError('accepted reduction identities are duplicate')
     accepted_by_key = {row.batch_key: row for row in accepted_rows}
+    target = effective_reduction_target(len(initial_drafts), reduction_target_floor)
     current = initial_drafts
-    if len(current) <= reduction_target:
+    if len(current) <= target:
         return _ReductionState(current, None, current)
-    level = 1
-    while len(current) > reduction_target:
-        batches = build_reduction_batches(
-            current,
-            reduction_target=reduction_target,
-            prompt_budget=prompt_budget,
-            level=level,
-        )
+    budget = output_budget_tokens >> generation
+    max_fanin = max_reduction_fanin(budget)
+    level_base = generation * _GENERATION_LEVEL_STRIDE
+    for tree_level in range(1, _MAX_TREE_LEVELS + 1):
+        if len(current) <= target:
+            break
+        level = level_base + tree_level
+        batches = build_reduction_batches(current, max_fanin=max_fanin, level=level)
         next_level: list[ReductionDraft] = []
         for batch in batches:
             if not batch.provider_required:
@@ -606,10 +646,10 @@ def _evaluate_draft_reduction_state(
             if accepted is None:
                 return _ReductionState(current, batch, None)
             next_level.extend(_expand_reduced_drafts(accepted.drafts, batch.input_drafts))
-        if len(next_level) >= len(current):
-            raise ReductionContractError('reduction level did not shrink')
+        if len(next_level) == len(current):
+            return _ReductionState(current, None, current)
         current = tuple(next_level)
-        level += 1
+
     return _ReductionState(current, None, current)
 
 
@@ -633,8 +673,9 @@ def _evaluate_reduction_state(
     extraction_stages: Sequence[DistillationStage],
     accepted_stages: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> _ReductionState:
     from engram.core.models import DistillationStageKind, DistillationStageStatus
 
@@ -661,8 +702,9 @@ def _evaluate_reduction_state(
     return _evaluate_draft_reduction_state(
         current,
         accepted_rows,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     )
 
 
@@ -670,14 +712,16 @@ def derive_first_pending_reduction_target(
     extraction_targets: Sequence[DistillationStage],
     accepted_targets: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> ReductionBatch | None:
     return _evaluate_reduction_state(
         extraction_targets,
         accepted_targets,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     ).pending
 
 
@@ -689,32 +733,35 @@ def derive_final_reduction_drafts(
     extraction_targets: Sequence[DistillationStage],
     accepted_targets: Sequence[DistillationStage],
     *,
-    reduction_target: int,
-    prompt_budget: int = 120_000,
+    reduction_target_floor: int,
+    output_budget_tokens: int,
+    generation: int,
 ) -> tuple[ReductionDraft, ...]:
     result = _evaluate_reduction_state(
         extraction_targets,
         accepted_targets,
-        reduction_target=reduction_target,
-        prompt_budget=prompt_budget,
+        reduction_target_floor=reduction_target_floor,
+        output_budget_tokens=output_budget_tokens,
+        generation=generation,
     )
+
     return result.final or ()
 
 
 @dataclass(frozen=True, slots=True)
 class ReductionStageContract:
     stage_kind: str = 'reduce'
-    prompt_contract: str = 'distill_reduce.v1'
-    response_kind: str = 'distill_reduce.v1'
+    prompt_contract: str = 'distill_reduce.v2'
+    response_kind: str = 'distill_reduce.v2'
 
     def prepare_call(self, stage: DistillationStage) -> object:
         from engram.memory.distillation_provider_stage import PreparedProviderStageCall
 
         inputs = _hydrate_input_drafts(stage)
         drafts = []
-        for draft in inputs:
+        for index, draft in enumerate(inputs, start=1):
             entry = {
-                'id': draft.draft_id,
+                'index': index,
                 'title': draft.title,
                 'body': draft.body,
                 'confidence': str(draft.confidence),
@@ -723,7 +770,7 @@ class ReductionStageContract:
                 entry['kind'] = draft.kind
             drafts.append(entry)
         prompt = json.dumps(
-            {'drafts': drafts, 'reduction_target': stage.window.reduction_target},
+            {'drafts': drafts},
             ensure_ascii=False,
             separators=(',', ':'),
         )
@@ -739,9 +786,7 @@ class ReductionStageContract:
         try:
             payload = json.loads(raw_body)
             inputs = _hydrate_input_drafts(stage)
-            stage = _require_stage(stage)
-            reduction_target = stage.window.reduction_target
-            parsed = parse_reduction_output(payload, inputs, reduction_target=reduction_target)
+            parsed = parse_reduction_output(payload, inputs)
             memories: list[dict[str, object]] = []
             for memory in parsed.memories:
                 entry: dict[str, object] = {

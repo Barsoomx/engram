@@ -1,4 +1,6 @@
 import json
+import math
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -9,27 +11,36 @@ from django.utils import timezone
 from engram.core.models import DistillationStage, DistillationWindow
 from engram.memory.distillation_provider_stage import ProviderStageOutputError
 from engram.memory.distillation_reduction import (
+    _PER_MEMORY_CHARS,
     _REDUCE_SYSTEM_PROMPT,
     MAX_BODY,
     MAX_TITLE,
+    REDUCE_PROMPT_CONTRACT,
     REDUCTION_MANIFEST_SCHEMA,
     ReductionBatch,
     ReductionContractError,
     ReductionDraft,
     ReductionStageContract,
+    ReductionTruncationExhausted,
     _snapshot_drafts,
     build_reduction_batches,
+    compute_reduction_generation,
     derive_final_reduction_drafts,
     derive_first_pending_reduction_target,
+    effective_reduction_target,
+    max_reduction_fanin,
+    output_budget_tokens,
     parse_reduction_output,
     provider_stage_target,
     reduce_multilevel,
+    reduction_input_hash,
+    reduction_target_key,
     resolve_reduction_stage,
     stable_draft_id,
+    worst_case_output_tokens,
 )
 from engram.memory.distillation_tests import create_session_distillation_work, create_session_scope
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
-from engram.model_policy.services import curation_schema_prompt_prefix
 
 
 def _draft(index: int, *, stage: str = 'extract-stage') -> ReductionDraft:
@@ -48,9 +59,24 @@ def _draft(index: int, *, stage: str = 'extract-stage') -> ReductionDraft:
     )
 
 
+def _merge_all_provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
+    return {
+        'memories': [
+            {
+                'title': 'merged',
+                'body': 'merged body',
+                'confidence': 0.9,
+                'source_refs': list(range(1, len(batch.input_refs) + 1)),
+            }
+        ]
+    }
+
+
 def test_reduction_state_requires_typed_extraction_stages() -> None:
     with pytest.raises(ReductionContractError):
-        derive_first_pending_reduction_target(({},), (), reduction_target=1, prompt_budget=1000)
+        derive_first_pending_reduction_target(
+            ({},), (), reduction_target_floor=1, output_budget_tokens=2867, generation=0
+        )
 
 
 def test_reduction_state_rejects_untyped_stage_adapters() -> None:
@@ -58,8 +84,9 @@ def test_reduction_state_rejects_untyped_stage_adapters() -> None:
         derive_first_pending_reduction_target(
             ({'status': 'completed', 'outputs': []},),
             (),
-            reduction_target=1,
-            prompt_budget=1000,
+            reduction_target_floor=1,
+            output_budget_tokens=2867,
+            generation=0,
         )
 
 
@@ -68,40 +95,77 @@ def test_reduction_state_rejects_legacy_status_values() -> None:
         derive_first_pending_reduction_target(
             (object(),),
             (),
-            reduction_target=1,
-            prompt_budget=1000,
+            reduction_target_floor=1,
+            output_budget_tokens=2867,
+            generation=0,
         )
 
 
 def test_final_reduction_requires_explicit_accepted_stage_sequence() -> None:
     with pytest.raises(TypeError):
-        derive_final_reduction_drafts((), reduction_target=1)  # type: ignore[call-arg]
+        derive_final_reduction_drafts(  # type: ignore[call-arg]
+            (), reduction_target_floor=1, output_budget_tokens=2867, generation=0
+        )
 
 
-def test_multilevel_reduction_covers_every_leaf_and_preserves_anchor_union() -> None:
+def test_reduce_multilevel_pass_through_covers_every_leaf() -> None:
     leaves = [_draft(i) for i in range(5)]
-    calls: list[tuple[str, ...]] = []
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=5734,
+        generation=0,
+        provider=_merge_all_provider,
+    )
+
+    assert len(output) <= 2
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
+    assert {anchor for draft in output for anchor in draft.anchor_ids} == {f'anchor-{i}' for i in range(5)}
+    assert {stage for draft in output for stage in draft.source_stage_ids} == {'extract-stage'}
+
+
+def test_reduce_multilevel_terminates_on_no_shrink_without_provider_call() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    calls: list[ReductionBatch] = []
 
     def provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
-        calls.append(tuple(ref.draft_id for ref in batch.input_refs))
-        return {
-            'memories': [
-                {
-                    'title': 'merged',
-                    'body': 'merged body',
-                    'confidence': 0.9,
-                    'source_ids': [ref.draft_id for ref in batch.input_refs],
-                }
-            ]
-        }
+        calls.append(batch)
 
-    output = reduce_multilevel(leaves, reduction_target=1, prompt_budget=500, provider=provider)
+        return {'memories': []}
 
-    assert len(calls) == 3
-    assert len(output) == 1
-    assert set(output[0].source_ids) == {f'obs-{i}' for i in range(5)}
-    assert set(output[0].anchor_ids) == {f'anchor-{i}' for i in range(5)}
-    assert set(output[0].source_stage_ids) == {'extract-stage'}
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=100,
+        generation=0,
+        provider=provider,
+    )
+
+    assert calls == []
+    assert len(output) == 5
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
+
+
+def test_reduce_multilevel_zero_output_budget_passes_drafts_through_without_provider_call() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    calls: list[ReductionBatch] = []
+
+    def provider(batch: ReductionBatch) -> dict[str, list[dict[str, object]]]:
+        calls.append(batch)
+
+        return {'memories': []}
+
+    output = reduce_multilevel(
+        leaves,
+        reduction_target_floor=1,
+        output_budget_tokens=0,
+        generation=0,
+        provider=provider,
+    )
+
+    assert calls == []
+    assert len(output) == 5
+    assert {obs for draft in output for obs in draft.source_ids} == {f'obs-{i}' for i in range(5)}
 
 
 @pytest.mark.parametrize(
@@ -109,19 +173,25 @@ def test_multilevel_reduction_covers_every_leaf_and_preserves_anchor_union() -> 
     [
         {'memories': []},
         {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_ids': ['foreign']}]},
-        {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_ids': []}]},
+        {'memories': [{'title': 'x', 'body': 'y', 'confidence': 1, 'source_refs': []}]},
     ],
 )
-def test_nonshrinking_or_incomplete_reduction_is_retryable_not_union_fallback(payload: Any) -> None:
+def test_reduce_multilevel_raises_on_malformed_provider_output(payload: Any) -> None:
     leaves = [_draft(0), _draft(1)]
     with pytest.raises(ReductionContractError):
-        reduce_multilevel(leaves, reduction_target=1, prompt_budget=10000, provider=lambda _batch: payload)
+        reduce_multilevel(
+            leaves,
+            reduction_target_floor=1,
+            output_budget_tokens=5734,
+            generation=0,
+            provider=lambda _batch: payload,
+        )
 
 
 def test_manifest_and_batches_are_deterministic_and_singletons_are_carried() -> None:
     leaves = [_draft(i) for i in range(3)]
-    first = build_reduction_batches(leaves, reduction_target=1, prompt_budget=350, level=0)
-    second = build_reduction_batches(leaves, reduction_target=1, prompt_budget=350, level=0)
+    first = build_reduction_batches(leaves, max_fanin=2, level=1)
+    second = build_reduction_batches(leaves, max_fanin=2, level=1)
 
     assert first == second
     assert len(first) == 2
@@ -130,46 +200,52 @@ def test_manifest_and_batches_are_deterministic_and_singletons_are_carried() -> 
     assert first[0].input_hash == second[0].input_hash
 
 
-def test_prompt_budget_rejects_two_drafts_that_cannot_fit() -> None:
-    with pytest.raises(ReductionContractError):
-        build_reduction_batches([_draft(0), _draft(1)], reduction_target=1, prompt_budget=1, level=0)
+def test_build_reduction_batches_groups_by_count_and_marks_passthrough() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    batches = build_reduction_batches(leaves, max_fanin=2, level=1)
+
+    assert [len(batch.input_drafts) for batch in batches] == [2, 2, 1]
+    assert batches[0].provider_required is True
+    assert batches[1].provider_required is True
+    assert batches[2].provider_required is False
+
+    singles = build_reduction_batches(leaves, max_fanin=1, level=1)
+    assert [len(batch.input_drafts) for batch in singles] == [1, 1, 1, 1, 1]
+    assert all(batch.provider_required is False for batch in singles)
 
 
-def test_parser_requires_exact_envelope_and_known_duplicate_free_ids() -> None:
-    leaves = [_draft(0), _draft(1)]
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output({'memories': [], 'extra': True}, leaves)
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output(
-            {
-                'memories': [
-                    {
-                        'title': 'x',
-                        'body': 'y',
-                        'confidence': 0.5,
-                        'source_ids': [leaves[0].draft_id, leaves[0].draft_id],
-                    }
-                ]
-            },
-            leaves,
+def test_build_reduction_batches_generation_band_is_disjoint() -> None:
+    leaves = [_draft(i) for i in range(5)]
+    generation_zero = build_reduction_batches(leaves, max_fanin=2, level=2)
+    generation_one = build_reduction_batches(leaves, max_fanin=2, level=17)
+
+    assert all(batch.level == 17 for batch in generation_one)
+    assert [batch.ordinal for batch in generation_one] == [0, 1, 2]
+    for batch in generation_one:
+        assert batch.input_hash == reduction_input_hash(batch.input_refs)
+        assert batch.target_key == reduction_target_key(
+            level=batch.level, ordinal=batch.ordinal, input_hash=batch.input_hash
         )
+    zero_keys = {batch.target_key for batch in generation_zero}
+    one_keys = {batch.target_key for batch in generation_one}
+    assert zero_keys.isdisjoint(one_keys)
 
 
-def _memory(source_ids: list[str]) -> dict[str, object]:
+def _memory(source_refs: list[int]) -> dict[str, object]:
     return {
         'title': 'Reduced fact',
         'body': 'A durable reduced memory body.',
         'confidence': 0.8,
-        'source_ids': source_ids,
+        'source_refs': source_refs,
     }
 
 
-def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
-    ids = [draft.draft_id for draft in inputs]
-    buckets: list[list[str]] = [[] for _ in range(count)]
-    for index, draft_id in enumerate(ids):
-        buckets[index % count].append(draft_id)
-    return {'memories': [_memory(bucket) for bucket in buckets]}
+def test_parser_requires_exact_envelope_and_duplicate_free_refs() -> None:
+    leaves = [_draft(0), _draft(1)]
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [], 'extra': True}, leaves)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [_memory([1, 1])]}, leaves)
 
 
 @pytest.mark.parametrize(
@@ -182,144 +258,117 @@ def _cover(inputs: list[ReductionDraft], count: int) -> dict[str, object]:
 )
 def test_reduction_rejects_blank_text_and_string_confidence(field: str, value: object) -> None:
     inputs = [_draft(0), _draft(1)]
-    memory = _memory([draft.draft_id for draft in inputs])
+    memory = _memory([1, 2])
     memory[field] = value
 
     with pytest.raises(ReductionContractError):
-        parse_reduction_output({'memories': [memory]}, inputs, reduction_target=1)
+        parse_reduction_output({'memories': [memory]}, inputs)
 
 
-def test_reduction_budget_does_not_charge_unprompted_observation_lineage() -> None:
-    observation_ids = tuple(f'{index:036d}' for index in range(100))
-    drafts = [
-        ReductionDraft(
-            draft_id=marker * 64,
-            title='T',
-            body='B',
-            confidence=Decimal('0.8'),
-            source_ids=observation_ids,
-        )
-        for marker in ('a', 'b')
-    ]
-    charged_payload = json.dumps(
-        [
-            {
-                'id': draft.draft_id,
-                'title': draft.title,
-                'body': draft.body,
-                'confidence': str(draft.confidence),
-                'source_ids': list(draft.source_ids),
-                'kind': draft.kind,
-            }
-            for draft in drafts
-        ],
-        ensure_ascii=False,
-        separators=(',', ':'),
-        sort_keys=True,
-    ).encode()
-    rendered_prompt = json.dumps(
-        {
-            'drafts': [
-                {
-                    'id': draft.draft_id,
-                    'title': draft.title,
-                    'body': draft.body,
-                    'confidence': str(draft.confidence),
-                }
-                for draft in drafts
-            ],
-            'reduction_target': 1,
-        },
-        ensure_ascii=False,
-        separators=(',', ':'),
-    ).encode()
-
-    assert len(charged_payload) == 8083
-    assert len(rendered_prompt) == 265
-    assert len(rendered_prompt) <= 8000 < len(charged_payload)
-
-    batches = build_reduction_batches(
-        drafts,
-        reduction_target=1,
-        prompt_budget=8000,
-    )
-
-    assert len(batches) == 1
-    assert batches[0].input_drafts == tuple(drafts)
-    assert batches[0].provider_required is True
-
-
-def test_reduction_accepts_spec_cap_above_twelve() -> None:
-    inputs = [_draft(index) for index in range(40)]
-    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=12)
-    assert len(parsed.memories) == 20
-
-
-def test_reduction_rejects_output_above_spec_cap() -> None:
-    inputs = [_draft(index) for index in range(40)]
-    with pytest.raises(ReductionContractError):
-        parse_reduction_output(_cover(inputs, 21), inputs, reduction_target=12)
-
-
-def test_reduction_target_twenty_accepts_twenty_memories() -> None:
-    inputs = [_draft(index) for index in range(50)]
-    parsed = parse_reduction_output(_cover(inputs, 20), inputs, reduction_target=20)
-    assert len(parsed.memories) == 20
-
-
-def _flip_last_hex_digit(source_id: str) -> str:
-    last = source_id[-1]
-    replacement = '0' if last != '0' else '1'
-
-    return source_id[:-1] + replacement
-
-
-def test_parse_reduction_drops_typoed_source_id_and_tolerates_uncovered_draft() -> None:
+def test_parse_reduction_output_maps_indices_and_enforces_partition() -> None:
     inputs = [_draft(index) for index in range(4)]
-    typo = _flip_last_hex_digit(inputs[1].draft_id)
-    payload = {
-        'memories': [
-            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, typo]},
-            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[2].draft_id, inputs[3].draft_id]},
-        ]
-    }
 
-    parsed = parse_reduction_output(payload, inputs, reduction_target=2)
+    passthrough = parse_reduction_output({'memories': [_memory([i]) for i in range(1, 5)]}, inputs)
+    assert len(passthrough.memories) == 4
+    assert passthrough.memories[0].source_ids == (inputs[0].draft_id,)
 
-    assert len(parsed.memories) == 2
-    assert parsed.memories[0].source_ids == (inputs[0].draft_id,)
-    assert parsed.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
+    merged = parse_reduction_output({'memories': [_memory([1, 2]), _memory([3, 4])]}, inputs)
+    assert len(merged.memories) == 2
+    assert merged.memories[1].source_ids == (inputs[2].draft_id, inputs[3].draft_id)
 
 
-def test_parse_reduction_discards_memory_with_only_unknown_source_ids() -> None:
+@pytest.mark.parametrize(
+    'memories',
+    [
+        [_memory([1, 2, 3, 5])],
+        [_memory([0, 1, 2, 3])],
+        [_memory([1, 2]), _memory([2, 3, 4])],
+        [_memory([1, 2]), _memory([3])],
+        [{'title': 'x', 'body': 'y', 'confidence': 0.5, 'source_refs': ['1', 2, 3, 4]}],
+    ],
+)
+def test_parse_reduction_output_rejects_non_partition_refs(memories: list[dict[str, object]]) -> None:
+    inputs = [_draft(index) for index in range(4)]
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': memories}, inputs)
+
+
+def test_parse_reduction_output_rejects_malformed_keys_and_values() -> None:
     inputs = [_draft(0), _draft(1)]
-    payload = {
-        'memories': [
-            {'title': 'A', 'body': 'B', 'confidence': 0.8, 'source_ids': [_flip_last_hex_digit(inputs[0].draft_id)]},
-            {'title': 'C', 'body': 'D', 'confidence': 0.8, 'source_ids': [inputs[0].draft_id, inputs[1].draft_id]},
-        ]
-    }
 
-    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
+    extra = _memory([1, 2])
+    extra['unexpected'] = True
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [extra]}, inputs)
 
-    assert len(parsed.memories) == 1
-    assert parsed.memories[0].source_ids == (inputs[0].draft_id, inputs[1].draft_id)
+    missing = _memory([1, 2])
+    del missing['confidence']
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [missing]}, inputs)
+
+    over_title = _memory([1, 2])
+    over_title['title'] = 'x' * (MAX_TITLE + 1)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [over_title]}, inputs)
+
+    over_body = _memory([1, 2])
+    over_body['body'] = 'y' * (MAX_BODY + 1)
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [over_body]}, inputs)
+
+    out_of_range = _memory([1, 2])
+    out_of_range['confidence'] = 1.5
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [out_of_range]}, inputs)
+
+    bad_kind = _memory([1, 2])
+    bad_kind['kind'] = 'nonsense'
+    with pytest.raises(ReductionContractError):
+        parse_reduction_output({'memories': [bad_kind]}, inputs)
+
+
+def test_parse_reduction_output_allows_passthrough_without_forced_shrink() -> None:
+    inputs = [_draft(index) for index in range(3)]
+    parsed = parse_reduction_output({'memories': [_memory([1]), _memory([2]), _memory([3])]}, inputs)
+    assert len(parsed.memories) == len(inputs)
+
+
+def _draft_with_confidence(index: int, confidence: str) -> ReductionDraft:
+    draft = _draft(index)
+
+    return replace(draft, confidence=Decimal(confidence))
+
+
+def test_parse_reduction_output_clamps_confidence_to_source_draft_ceiling_without_rejecting() -> None:
+    inputs = [_draft_with_confidence(0, '0.50'), _draft_with_confidence(1, '0.40'), _draft_with_confidence(2, '0.90')]
+
+    merged = _memory([1, 2])
+    merged['confidence'] = 0.99
+    passthrough = _memory([3])
+    passthrough['confidence'] = 0.70
+
+    parsed = parse_reduction_output({'memories': [merged, passthrough]}, inputs)
+
+    assert parsed.memories[0].confidence == Decimal('0.50')
+    assert parsed.memories[1].confidence == Decimal('0.70')
 
 
 def test_final_drafts_wait_until_all_targets_accepted() -> None:
-    assert derive_final_reduction_drafts((), (), reduction_target=2) == ()
+    assert (
+        derive_final_reduction_drafts((), (), reduction_target_floor=2, output_budget_tokens=2867, generation=0) == ()
+    )
 
 
 def test_reduction_levels_start_at_one() -> None:
-    batch = build_reduction_batches([_draft(0), _draft(1)], reduction_target=1, prompt_budget=1000)
+    batch = build_reduction_batches([_draft(0), _draft(1)], max_fanin=2, level=1)
     assert batch[0].level == 1
 
 
 def test_reduction_contract_exposes_provider_seam_methods() -> None:
     contract = ReductionStageContract()
     assert contract.stage_kind == 'reduce'
-    assert contract.prompt_contract == 'distill_reduce.v1'
-    assert contract.response_kind == 'distill_reduce.v1'
+    assert contract.prompt_contract == 'distill_reduce.v2'
+    assert contract.response_kind == 'distill_reduce.v2'
     with pytest.raises(ProviderStageOutputError):
         contract.normalize_output('{"memories": []}', stage=object())
 
@@ -336,32 +385,26 @@ def test_normalize_output_strictly_parses_and_canonicalizes_confidence() -> None
 
 def test_accepted_replay_uses_recomputed_batch_identity_not_durable_target_key() -> None:
     with pytest.raises(ReductionContractError):
-        derive_first_pending_reduction_target(({},), ({},), reduction_target=1, prompt_budget=10000)
+        derive_first_pending_reduction_target(
+            ({},), ({},), reduction_target_floor=1, output_budget_tokens=5734, generation=0
+        )
 
 
 def test_final_derivation_replays_singleton_carry_between_accepted_levels() -> None:
     leaves = [_draft(0), _draft(1), _draft(2)]
     output = reduce_multilevel(
         leaves,
-        reduction_target=2,
-        prompt_budget=350,
-        provider=lambda batch: {
-            'memories': [
-                {
-                    'title': 'merged',
-                    'body': 'body',
-                    'confidence': 0.9,
-                    'source_ids': [ref.draft_id for ref in batch.input_refs],
-                }
-            ]
-        },
+        reduction_target_floor=1,
+        output_budget_tokens=5734,
+        generation=0,
+        provider=_merge_all_provider,
     )
-    assert len(output) == 2
+    assert len(output) <= 1
 
 
 def test_provider_stage_target_has_reduction_shape_and_manifest() -> None:
     leaves = [_draft(0), _draft(1)]
-    batch = build_reduction_batches(leaves, reduction_target=1, prompt_budget=10000, level=1)[0]
+    batch = build_reduction_batches(leaves, max_fanin=2, level=1)[0]
     with pytest.raises(ReductionContractError):
         provider_stage_target({'id': UUID('00000000-0000-0000-0000-000000000001')}, batch)
 
@@ -506,56 +549,106 @@ def f_reduce_stage() -> DistillationStage:
     )
 
 
-def test_reduce_schema_instructions_describe_a_payload_the_parser_accepts() -> None:
-    instructions = curation_schema_prompt_prefix('distill_reduce.v1')
-    inputs = [_draft(index) for index in range(4)]
-    payload = {
-        'memories': [
-            {
-                'title': 'Consolidated durable fact',
-                'body': 'One reduced fact preserving every input draft.',
-                'confidence': 0.9,
-                'source_ids': [draft.draft_id for draft in inputs],
-                'kind': 'decision',
-            }
-        ]
-    }
-
-    assert instructions
-    assert str(MAX_TITLE) in instructions
-    assert str(MAX_BODY) in instructions
-    for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
-        assert kind in instructions
-
-    parsed = parse_reduction_output(payload, inputs, reduction_target=1)
-
-    assert len(parsed.memories) == 1
-    assert parsed.memories[0].kind == 'decision'
-    assert parsed.memories[0].source_ids == tuple(draft.draft_id for draft in inputs)
-    assert parsed.memories[0].confidence == Decimal('0.9')
-
-
-def test_reduce_system_prompt_states_contract_marker_and_parser_rules() -> None:
+def test_reduce_prompt_contract_and_system_prompt_are_v2() -> None:
+    assert REDUCE_PROMPT_CONTRACT == 'distill_reduce.v2'
     prompt = _REDUCE_SYSTEM_PROMPT
 
-    assert 'distill_reduce.v1' in prompt
+    assert 'distill_reduce.v2' in prompt
+    assert 'distill_reduce.v1' not in prompt
     assert 'distill_extract.v1' not in prompt
+    assert 'reduction_target' not in prompt
     assert str(MAX_TITLE) in prompt
     assert str(MAX_BODY) in prompt
     for kind in ('decision', 'convention', 'gotcha', 'architecture', 'incident'):
         assert kind in prompt
-    assert 'reduction_target' in prompt
-    assert 'strictly fewer' in prompt
+    assert 'source_refs' in prompt
+    assert 'Partition the drafts' in prompt
     assert 'copied verbatim' in prompt
     assert 'no additional properties' in prompt
 
 
 @pytest.mark.django_db
-def test_prepare_call_prompt_carries_the_stage_reduction_target(f_reduce_stage: DistillationStage) -> None:
+def test_prepare_call_prompt_carries_one_based_index_and_no_reduction_target(
+    f_reduce_stage: DistillationStage,
+) -> None:
     prepared = ReductionStageContract().prepare_call(f_reduce_stage)
     prompt = json.loads(prepared.prompt)
 
-    assert prompt['reduction_target'] == REDUCTION_TARGET
-    assert [draft['id'] for draft in prompt['drafts']] == [
+    assert prepared.response_kind == 'distill_reduce.v2'
+    assert 'reduction_target' not in prompt
+    assert [draft['index'] for draft in prompt['drafts']] == list(range(1, len(prompt['drafts']) + 1))
+    for draft in prompt['drafts']:
+        assert isinstance(draft['confidence'], str)
+        assert 'id' not in draft
+
+
+@pytest.mark.django_db
+def test_normalize_output_parses_partition_body_to_persisted_snapshot(
+    f_reduce_stage: DistillationStage,
+) -> None:
+    prepared = ReductionStageContract().prepare_call(f_reduce_stage)
+    drafts = json.loads(prepared.prompt)['drafts']
+    raw_body = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Consolidated fact',
+                    'body': 'A durable consolidated fact.',
+                    'confidence': 0.9,
+                    'source_refs': [draft['index'] for draft in drafts],
+                    'kind': 'decision',
+                }
+            ]
+        }
+    )
+
+    snapshot = ReductionStageContract().normalize_output(raw_body, stage=f_reduce_stage)
+
+    assert set(snapshot) == {'memories'}
+    memory = snapshot['memories'][0]
+    assert set(memory) == {'title', 'body', 'confidence', 'source_ids', 'kind'}
+    assert memory['confidence'] == '0.9'
+    assert memory['source_ids'] == [
         draft.draft_id for draft in _snapshot_drafts(f_reduce_stage.window.stages.get(level=1))
     ]
+
+
+def test_worst_case_output_tokens_matches_closed_form_and_is_monotonic() -> None:
+    assert _PER_MEMORY_CHARS == 3391
+    for n in (1, 2, 4, 25):
+        assert worst_case_output_tokens(n) == math.ceil(0.4 * (32 + n * 3391))
+    values = [worst_case_output_tokens(n) for n in range(1, 30)]
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+
+
+def test_output_budget_and_fanin_worked_values() -> None:
+    assert output_budget_tokens(4096) == 2867
+    assert output_budget_tokens(8192) == 5734
+    assert max_reduction_fanin(2867) == 2
+    assert max_reduction_fanin(5734) == 4
+    assert max_reduction_fanin(worst_case_output_tokens(1) - 1) == 1
+
+
+def test_effective_reduction_target_scales_and_clamps() -> None:
+    assert effective_reduction_target(12, floor=12) == 12
+    assert effective_reduction_target(48, floor=12) == 12
+    assert effective_reduction_target(100, floor=12) == 25
+    assert effective_reduction_target(200, floor=12) == 48
+    assert effective_reduction_target(4, floor=12) == 12
+
+
+def test_effective_reduction_target_never_drops_below_a_floor_above_the_cap() -> None:
+    assert effective_reduction_target(100, floor=64) == 64
+    assert effective_reduction_target(300, floor=50) == 50
+    assert effective_reduction_target(4, floor=64) == 64
+    assert effective_reduction_target(1000, floor=49) == 49
+
+
+def test_compute_reduction_generation_bands_and_exhaustion() -> None:
+    assert issubclass(ReductionTruncationExhausted, ReductionContractError)
+    assert compute_reduction_generation([]) == 0
+    assert compute_reduction_generation([1, 4]) == 1
+    assert compute_reduction_generation([17, 20]) == 2
+    with pytest.raises(ReductionTruncationExhausted):
+        compute_reduction_generation([50])

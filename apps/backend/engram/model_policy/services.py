@@ -141,6 +141,11 @@ class ProviderCallResult:
     redaction_state: str
     generated_title: str
     generated_body: str
+    finish_reason: str = ''
+
+
+def is_truncated_finish_reason(reason: str) -> bool:
+    return reason in {'length', 'max_tokens'}
 
 
 def encryption_key() -> bytes:
@@ -1039,20 +1044,20 @@ def generated_distill_reduce_payload(prompt: str) -> str:
     except (json.JSONDecodeError, TypeError):
         parsed = None
 
-    source_ids: list[str] = []
-    seen_ids: set[str] = set()
+    indices: list[int] = []
+    seen: set[int] = set()
     drafts = parsed.get('drafts') if isinstance(parsed, dict) else None
     if isinstance(drafts, list):
         for draft in drafts:
             if not isinstance(draft, dict):
                 continue
-            source_id = draft.get('id')
-            if not isinstance(source_id, str) or not source_id or source_id in seen_ids:
+            index = draft.get('index')
+            if not isinstance(index, int) or isinstance(index, bool) or index < 1 or index in seen:
                 continue
-            seen_ids.add(source_id)
-            source_ids.append(source_id)
+            seen.add(index)
+            indices.append(index)
 
-    if not source_ids:
+    if not indices:
         return json.dumps({'memories': []})
 
     digest = hashlib.sha256(prompt.encode()).hexdigest()[:12]
@@ -1063,7 +1068,7 @@ def generated_distill_reduce_payload(prompt: str) -> str:
                     'title': f'Provider-reduced memory {digest}',
                     'body': f'Provider-reduced memory body {digest}',
                     'confidence': 0.9,
-                    'source_ids': source_ids,
+                    'source_refs': indices,
                     'kind': 'gotcha',
                 },
             ],
@@ -1118,7 +1123,7 @@ def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, s
         return title, generated_curation_judgment_payload()
     if data.response_kind == 'distill_extract.v1':
         return title, generated_distill_extract_payload(prompt)
-    if data.response_kind == 'distill_reduce.v1':
+    if data.response_kind == 'distill_reduce.v2':
         return title, generated_distill_reduce_payload(prompt)
     if data.response_kind == 'curation_decision_v1':
         return title, generated_curation_decision_payload(prompt)
@@ -1151,7 +1156,7 @@ def deepseek_thinking_override(provider: str, task_type: str, response_kind: str
 
 
 _STRUCTURED_RESPONSE_KINDS = frozenset(
-    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'}
+    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'}
 )
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
@@ -1177,10 +1182,10 @@ _MAX_TOKENS_BY_KIND = {
     'candidates': 8192,
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
-    'distill_reduce.v1': 8192,
+    'distill_reduce.v2': 8192,
     'curation_decision_v1': 16384,
 }
-_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v1', 'curation_decision_v1'})
+_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'})
 _CURATION_DECISION_OUTCOMES = (
     'publish_new',
     'merge_evidence',
@@ -1285,17 +1290,16 @@ _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS = (
 )
 _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
     'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
-    'The object must contain exactly the key memories (array of objects) and no additional properties. '
-    'Each memories entry must contain exactly these keys and no additional properties: '
-    'title (non-blank string, at most 255 characters); '
-    'body (non-blank string, at most 3000 characters); '
-    'confidence (a JSON number between 0 and 1); '
-    'source_ids (non-empty array of unique draft ids); '
-    f'kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
-    'Only use draft ids copied verbatim from the input drafts. '
-    'Group each input draft id into the source_ids of the memory that consolidates it. '
-    'Return at most reduction_target memories, as given by the reduction_target key of the input object, '
-    'and when more than one draft is given return strictly fewer memories than the number of input drafts.'
+    'The object must contain exactly the key memories (array of objects) and no additional '
+    'properties. Each memories entry must contain exactly these keys and no additional '
+    'properties: title (non-blank string, at most 255 characters); body (non-blank string, at '
+    'most 3000 characters); confidence (a JSON number between 0 and 1); source_refs (non-empty '
+    f'array of unique positive integers); kind (optional, one of: {", ".join(_MEMORY_KIND_VALUES)}). '
+    'Only use draft indices copied verbatim from the input drafts. '
+    'Partition the drafts: assign every input index to exactly one memory, never repeat an index '
+    'and never omit one. Merge only near-duplicate drafts; a distinct draft passes through as its '
+    'own memory, so the number of memories may equal the number of input drafts. '
+    'Give each memory a confidence no higher than the highest confidence among its source drafts.'
 )
 
 
@@ -1306,7 +1310,7 @@ def curation_schema_prompt_prefix(response_kind: str) -> str:
     if response_kind == 'distill_extract.v1':
         return _DISTILL_EXTRACT_SCHEMA_INSTRUCTIONS
 
-    if response_kind == 'distill_reduce.v1':
+    if response_kind == 'distill_reduce.v2':
         return _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS
 
     return ''
@@ -1393,7 +1397,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'additionalProperties': False,
         },
     },
-    'distill_reduce.v1': {
+    'distill_reduce.v2': {
         'name': 'emit_distillation_reduction',
         'description': 'Return the distillation reduction.',
         'input_schema': {
@@ -1401,16 +1405,15 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'properties': {
                 'memories': {
                     'type': 'array',
-                    'maxItems': 12,
                     'items': {
                         'type': 'object',
                         'properties': {
                             'title': {'type': 'string', 'minLength': 1, 'maxLength': 255},
                             'body': {'type': 'string', 'maxLength': 3000},
                             'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1},
-                            'source_ids': {
+                            'source_refs': {
                                 'type': 'array',
-                                'items': {'type': 'string'},
+                                'items': {'type': 'integer', 'minimum': 1},
                                 'minItems': 1,
                                 'uniqueItems': True,
                             },
@@ -1419,7 +1422,7 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                                 'enum': ['decision', 'convention', 'gotcha', 'architecture', 'incident'],
                             },
                         },
-                        'required': ['title', 'body', 'confidence', 'source_ids'],
+                        'required': ['title', 'body', 'confidence', 'source_refs'],
                         'additionalProperties': False,
                     },
                 },
@@ -1486,8 +1489,11 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
 }
 
 
+_PROVIDER_COMPLETION_CLAMP_DEFAULTS = {'deepseek': 4096}
+
+
 def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
-    if response_kind in _FIXED_MAX_TOKEN_KINDS:
+    if response_kind in _FIXED_MAX_TOKEN_KINDS and response_kind != 'distill_reduce.v2':
         return _MAX_TOKENS_BY_KIND[response_kind]
 
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
@@ -1502,6 +1508,25 @@ def resolve_max_tokens(policy: ModelPolicy, response_kind: str) -> int:
         return override
 
     return _MAX_TOKENS_BY_KIND.get(response_kind, _DEFAULT_MAX_TOKENS)
+
+
+def provider_completion_clamp(policy: ModelPolicy) -> int | None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    raw = metadata.get('completion_clamp')
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw
+
+    return _PROVIDER_COMPLETION_CLAMP_DEFAULTS.get(policy.provider)
+
+
+def effective_completion_cap(policy: ModelPolicy, response_kind: str) -> int:
+    cap = resolve_max_tokens(policy, response_kind)
+    if response_kind != 'distill_reduce.v2':
+        return cap
+
+    clamp = provider_completion_clamp(policy)
+
+    return min(cap, clamp) if clamp is not None else cap
 
 
 def resolve_context_window_tokens(policy: ModelPolicy) -> int | None:
@@ -1574,10 +1599,10 @@ class OpenAICompatibleGateway:
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
-        extra['max_tokens'] = resolve_max_tokens(policy, data.response_kind)
+        extra['max_tokens'] = effective_completion_cap(policy, data.response_kind)
         started_at = time.monotonic()
         try:
-            content, real_usage = self._chat_completion(
+            content, real_usage, finish_reason = self._chat_completion(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
@@ -1606,6 +1631,7 @@ class OpenAICompatibleGateway:
             redaction_state=record.redaction_state,
             generated_title=title,
             generated_body=body,
+            finish_reason=finish_reason,
         )
 
     def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
@@ -1708,7 +1734,7 @@ class OpenAICompatibleGateway:
         prompt: str,
         system_prompt: str = '',
         extra: dict[str, object] | None = None,
-    ) -> tuple[str, dict[str, int] | None]:
+    ) -> tuple[str, dict[str, int] | None, str]:
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({'role': 'system', 'content': system_prompt})
@@ -1722,8 +1748,10 @@ class OpenAICompatibleGateway:
             payload_dict.update(extra)
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/chat/completions', payload, timeout=self._timeout)
+        choice = response['choices'][0]
+        finish_reason = str(choice.get('finish_reason') or '')
 
-        return str(response['choices'][0]['message']['content']), _parse_openai_usage(response)
+        return str(choice['message']['content']), _parse_openai_usage(response), finish_reason
 
     def _embeddings(self, model: str, text: str) -> tuple[tuple[float, ...], dict[str, int] | None]:
         payload = json.dumps({'model': model, 'input': text}).encode()
@@ -1836,12 +1864,12 @@ class AnthropicMessagesGateway:
 
         started_at = time.monotonic()
         try:
-            content, real_usage = self._messages(
+            content, real_usage, stop_reason = self._messages(
                 policy.model,
                 prompt_text,
                 system_prompt=data.system_prompt,
                 response_kind=data.response_kind,
-                max_tokens=resolve_max_tokens(policy, data.response_kind),
+                max_tokens=effective_completion_cap(policy, data.response_kind),
             )
         except ModelPolicyError as error:
             self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
@@ -1866,6 +1894,7 @@ class AnthropicMessagesGateway:
             redaction_state=record.redaction_state,
             generated_title=title,
             generated_body=body,
+            finish_reason=stop_reason,
         )
 
     def embed(self, data: EmbeddingCallInput) -> EmbeddingCallResult:
@@ -1945,7 +1974,7 @@ class AnthropicMessagesGateway:
         *,
         response_kind: str = 'single',
         max_tokens: int = _DEFAULT_MAX_TOKENS,
-    ) -> tuple[str, dict[str, int] | None]:
+    ) -> tuple[str, dict[str, int] | None, str]:
         payload_dict: dict[str, object] = {
             'model': model,
             'max_tokens': max_tokens,
@@ -1959,8 +1988,9 @@ class AnthropicMessagesGateway:
             payload_dict['tool_choice'] = {'type': 'tool', 'name': tool['name']}
         payload = json.dumps(payload_dict).encode()
         response = self._open(self._base_url + '/v1/messages', payload, timeout=self._timeout)
+        stop_reason = str(response.get('stop_reason') or '')
 
-        return _anthropic_content_text(response), _parse_anthropic_usage(response)
+        return _anthropic_content_text(response), _parse_anthropic_usage(response), stop_reason
 
     def _open(self, url: str, body: bytes, timeout: int) -> dict[str, Any]:
         request = urllib.request.Request(  # noqa: S310 - url built from operator-configured base_url

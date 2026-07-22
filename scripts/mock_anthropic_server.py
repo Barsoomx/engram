@@ -98,25 +98,30 @@ def generation_content(system_prompt: str, prompt: str) -> str:
                 'no_signal_observation_ids': [],
             }
         )
-    if 'distill_reduce.v1' in system_prompt:
+    if 'distill_reduce.v2' in system_prompt:
         try:
             payload = json.loads(prompt)
         except json.JSONDecodeError:
             payload = {}
         drafts = payload.get('drafts') if isinstance(payload, dict) else None
-        source_ids = [
-            draft['id']
-            for draft in drafts or []
-            if isinstance(draft, dict) and isinstance(draft.get('id'), str) and draft['id']
-        ]
+        source_refs: list[int] = []
+        seen: set[int] = set()
+        for draft in drafts or []:
+            if not isinstance(draft, dict):
+                continue
+            index = draft.get('index')
+            if not isinstance(index, int) or isinstance(index, bool) or index < 1 or index in seen:
+                continue
+            seen.add(index)
+            source_refs.append(index)
         memories = []
-        if source_ids:
+        if source_refs:
             memories.append(
                 {
                     'title': f'{SESSION_TITLE_PREFIX} {digest_suffix}',
                     'body': f'Fixed reduced session memory produced by the mock provider for {digest_suffix}.',
                     'confidence': 0.9,
-                    'source_ids': source_ids,
+                    'source_refs': source_refs,
                 }
             )
         return json.dumps({'memories': memories})

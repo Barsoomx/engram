@@ -951,7 +951,7 @@ def test_get_provider_gateway_anthropic_returns_anthropic_host_with_blank_metada
 @pytest.mark.django_db
 @pytest.mark.parametrize(
     'response_kind',
-    ['candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v1'],
+    ['candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v2'],
 )
 def test_openai_gateway_sends_json_mode_for_structured_kinds(response_kind: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
@@ -984,7 +984,7 @@ def test_openai_gateway_sends_json_mode_for_structured_kinds(response_kind: str)
 
 
 @pytest.mark.django_db
-@pytest.mark.parametrize('response_kind', ['candidates', 'distill_extract.v1', 'distill_reduce.v1'])
+@pytest.mark.parametrize('response_kind', ['candidates', 'distill_extract.v1', 'distill_reduce.v2'])
 def test_openai_gateway_omits_json_mode_when_policy_disables_it(response_kind: str) -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation', metadata={'json_mode': False})
@@ -1287,7 +1287,7 @@ def test_anthropic_gateway_forces_tool_for_distill_extract_and_returns_tool_inpu
 
 
 @pytest.mark.django_db
-def test_anthropic_gateway_forces_closed_distill_reduce_tool_with_string_source_ids() -> None:
+def test_anthropic_gateway_forces_closed_distill_reduce_tool_with_integer_source_refs() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(
         organization,
@@ -1302,7 +1302,7 @@ def test_anthropic_gateway_forces_closed_distill_reduce_tool_with_string_source_
                 'title': 'T',
                 'body': 'B',
                 'confidence': 0.9,
-                'source_ids': ['draft-a', 'draft-b'],
+                'source_refs': [1, 2],
             },
         ],
     }
@@ -1327,7 +1327,7 @@ def test_anthropic_gateway_forces_closed_distill_reduce_tool_with_string_source_
             request_id='anthropic-distill-reduce-1',
             trace_id='anthropic-distill-reduce-1',
             prompt='prompt text',
-            response_kind='distill_reduce.v1',
+            response_kind='distill_reduce.v2',
         ),
     )
 
@@ -1339,7 +1339,8 @@ def test_anthropic_gateway_forces_closed_distill_reduce_tool_with_string_source_
     assert tool['input_schema']['additionalProperties'] is False
     memory_schema = tool['input_schema']['properties']['memories']['items']
     assert memory_schema['additionalProperties'] is False
-    assert memory_schema['properties']['source_ids']['items'] == {'type': 'string'}
+    assert 'source_ids' not in memory_schema['properties']
+    assert memory_schema['properties']['source_refs']['items'] == {'type': 'integer', 'minimum': 1}
     assert sent_body['max_tokens'] == 8192
     assert json.loads(result.generated_body) == expected
 
@@ -1426,8 +1427,8 @@ def test_anthropic_gateway_single_kind_has_no_tools_and_default_budget() -> None
         ('candidates', 2048, 2048),
         ('distill_extract.v1', 2048, 8192),
         ('distill_extract.v1', 20000, 8192),
-        ('distill_reduce.v1', 2048, 8192),
-        ('distill_reduce.v1', 20000, 8192),
+        ('distill_reduce.v2', 2048, 2048),
+        ('distill_reduce.v2', 20000, 20000),
     ],
 )
 def test_anthropic_gateway_max_tokens_metadata_override(
@@ -1448,7 +1449,7 @@ def test_anthropic_gateway_max_tokens_metadata_override(
     if response_kind == 'distill_extract.v1':
         tool_name = 'emit_distillation_extraction'
         tool_input = {'memories': [], 'no_signal_observation_ids': []}
-    elif response_kind == 'distill_reduce.v1':
+    elif response_kind == 'distill_reduce.v2':
         tool_name = 'emit_distillation_reduction'
         tool_input = {'memories': []}
     else:
@@ -1818,7 +1819,7 @@ def test_openai_gateway_constructor_timeout_overrides_env(monkeypatch: pytest.Mo
         ('candidates', 8192),
         ('curation_judgment', 1024),
         ('distill_extract.v1', 8192),
-        ('distill_reduce.v1', 8192),
+        ('distill_reduce.v2', 8192),
     ],
 )
 def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str, expected_max_tokens: int) -> None:
@@ -1857,8 +1858,8 @@ def test_openai_gateway_chat_payload_includes_max_tokens(response_kind: str, exp
         ('candidates', 2048, 2048),
         ('distill_extract.v1', 2048, 8192),
         ('distill_extract.v1', 20000, 8192),
-        ('distill_reduce.v1', 2048, 8192),
-        ('distill_reduce.v1', 20000, 8192),
+        ('distill_reduce.v2', 2048, 2048),
+        ('distill_reduce.v2', 20000, 20000),
     ],
 )
 def test_openai_gateway_chat_payload_max_tokens_metadata_override_respected(
