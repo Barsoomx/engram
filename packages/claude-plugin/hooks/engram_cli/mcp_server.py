@@ -82,15 +82,20 @@ def list_tools() -> list[dict[str, object]]:
             "name": "engram_search",
             "description": (
                 "Step 1 - ALWAYS search project memory BEFORE starting any "
-                "non-trivial task (bug fix, feature, refactor, debugging). "
-                "Returns prior decisions, gotchas, incidents and architecture "
-                "notes ranked by relevance. Call it when the user references "
-                "past work ('did we', 'last time', 'as before'), names a "
-                "subsystem, or reports an error you have not seen this "
-                "session. Prefer short 2-4 word queries (symptom, component, "
-                "error text). Filter by kinds=[convention,decision] to fetch "
-                "project conventions or decisions on a topic (e.g. gitlab "
-                "workflow)."
+                "non-trivial task (bug fix, feature, refactor, debugging, code "
+                "review) and BEFORE asserting how a subsystem works. Returns "
+                "prior decisions, gotchas, incidents and architecture notes "
+                "ranked by relevance — 30 seconds here routinely saves "
+                "re-deriving a root cause someone already found. Call it when "
+                "the user references past work ('did we', 'last time', 'as "
+                "before', 'мы уже делали', 'в прошлый раз', 'как раньше', 'как "
+                "в тот раз'), names a subsystem, or reports an error you have "
+                "not seen this session. Prefer short 2-4 word queries "
+                "(symptom, component, error text), in the language the "
+                "memories are written in (mostly English here); run 2-3 "
+                "differently-angled queries rather than one broad one. Filter "
+                "by kinds=[convention,decision] to fetch project conventions "
+                "or decisions on a topic (e.g. gitlab workflow)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -112,10 +117,13 @@ def list_tools() -> list[dict[str, object]]:
             "description": (
                 "Re-request the memory context bundle that is injected at "
                 "session start (recent and relevant approved memories for "
-                "this project). Use after /clear or context compaction, or "
-                "when the injected Engram context looks stale. Filter by "
-                "kinds=[convention,decision] to fetch project conventions or "
-                "decisions on a topic (e.g. gitlab workflow)."
+                "this project). Call it FIRST THING after /clear, context "
+                "compaction, or resuming a continued session — the injected "
+                "context is gone and you are working without your project "
+                "memory until you re-fetch it. Also use it when the injected "
+                "Engram context looks stale or unrelated to the current task. "
+                "Filter by kinds=[convention,decision] to fetch project "
+                "conventions or decisions on a topic (e.g. gitlab workflow)."
             ),
             "inputSchema": {
                 "type": "object",
@@ -137,9 +145,14 @@ def list_tools() -> list[dict[str, object]]:
         {
             "name": "engram_memory_link",
             "description": (
-                "Attach a file/symbol/commit/issue link to an approved "
-                "memory so future retrieval can find it by exact file path "
-                "or symbol match."
+                "Attach a file/symbol/commit/issue link to an approved memory "
+                "so future sessions surface it when touching that exact file "
+                "or symbol — linked memories are retrieved by path/symbol "
+                "match that plain text search misses. Use it the moment you "
+                "identify WHERE a memory's fact lives in code: after fixing a "
+                "bug a memory described, after verifying which module "
+                "implements a documented behavior, or after moving code a "
+                "memory references."
             ),
             "inputSchema": {
                 "type": "object",
@@ -163,8 +176,10 @@ def list_tools() -> list[dict[str, object]]:
             "description": (
                 "Step 2 - list recent raw observations (prompts, tool "
                 "activity, hook events) captured for the connected project. "
-                "Use to corroborate a memory found via engram_search with "
-                "ground-truth detail, or to audit what Engram captured. Time "
+                "Use when you need ground truth about a past or interrupted "
+                "session: the exact command that failed, the exact error "
+                "text, what an earlier agent actually did — or to corroborate "
+                "a memory found via engram_search before relying on it. Time "
                 "filters since/until bound ingestion time (created_at, until "
                 "exclusive); results still display and sort by observed_at."
             ),
@@ -203,8 +218,12 @@ def list_tools() -> list[dict[str, object]]:
             "name": "engram_memory_version",
             "description": (
                 "Update an approved memory body, creating a new reviewed "
-                "version. Use when you verified materially better "
-                "information than what the memory states."
+                "version. Use when a memory is right in substance but wrong "
+                "or incomplete in detail — line numbers moved, a flag was "
+                "renamed, you verified a materially better explanation. "
+                "Prefer this over refuting and re-proposing: it preserves "
+                "history, links, and confidence. Read the full body with "
+                "engram_memory_get first so the new version loses nothing."
             ),
             "inputSchema": {
                 "type": "object",
@@ -222,12 +241,14 @@ def list_tools() -> list[dict[str, object]]:
         {
             "name": "engram_memory_feedback",
             "description": (
-                "Step 3 - close the loop: the moment you discover an "
-                "injected or retrieved memory is outdated or wrong, mark it "
-                "stale or refuted with a reason. Confirm a memory when you "
-                "have verified it is still accurate — this resets its "
-                "confidence decay clock. Clean memory improves every "
-                "future session; do not silently ignore bad memory."
+                "Step 3 - close the loop on every memory you actually used. "
+                "The moment you discover an injected or retrieved memory is "
+                "outdated or wrong, mark it stale or refuted with a reason. "
+                "When you acted on a memory and it proved accurate, confirm "
+                "it — confirmation resets its confidence decay clock and "
+                "keeps it surfacing. Clean memory improves every future "
+                "session: do not silently ignore bad memory, and do not let "
+                "good memory decay unconfirmed."
             ),
             "inputSchema": {
                 "type": "object",
@@ -248,10 +269,18 @@ def list_tools() -> list[dict[str, object]]:
         {
             "name": "engram_memory_propose",
             "description": (
-                "Deliberately record a durable fact you have verified. The "
-                "proposal goes through curation (dedup, conflict, judge) and is "
-                "NOT instantly retrievable — it becomes a memory only after "
-                "curation promotes it."
+                "Deliberately record a durable, verified fact the moment you "
+                "learn it — a non-obvious root cause you just debugged, a "
+                "settled design or architecture decision, a gotcha or "
+                "convention written nowhere in the repo, a correction the "
+                "user gave you. If a future session would redo real work "
+                "without this fact, propose it NOW rather than at task end. "
+                "Write a self-contained body with concrete file/symbol "
+                "anchors; kind is one of "
+                "architecture/decision/convention/gotcha/incident. The "
+                "proposal goes through curation (dedup, conflict, judge) and "
+                "is NOT instantly retrievable — it becomes a memory only "
+                "after curation promotes it."
             ),
             "inputSchema": {
                 "type": "object",
@@ -268,9 +297,11 @@ def list_tools() -> list[dict[str, object]]:
             "name": "engram_memory_get",
             "description": (
                 "Read one memory in full by memory_id — the complete "
-                "untruncated current body, version history, and links, not the "
-                "400-char session-start preview. Use before revising, linking, "
-                "or giving feedback so you act on the full stored text. Kind, "
+                "untruncated current body, version history, and links, not "
+                "the 400-char session-start preview. Use whenever a search or "
+                "context snippet is cut off mid-thought, before quoting a "
+                "memory as authority, and ALWAYS before revising, linking, or "
+                "giving feedback so you act on the full stored text. Kind, "
                 "confidence, and conflict/stale/refuted validity come from "
                 "engram_search, not this tool."
             ),
@@ -288,16 +319,19 @@ def list_tools() -> list[dict[str, object]]:
         {
             "name": "engram_audit",
             "description": (
-                "Show a memory's own recorded audit events — every transition "
-                "committed against it (promotion, revise, refute, stale, "
-                "restore, supersede, archive, a candidate merged into it, and a "
-                "merge where it is the source), most recent first. Use to "
-                "explain why a memory is in its current state. Not returned: "
-                "the winner side of a supersession (a direct merge is recorded "
-                "under the source memory; a candidate supersession that creates "
-                "a new winner is recorded under the superseded loser), "
-                "confidence-decay, and link add/remove events — those are keyed "
-                "to a different audit target."
+                "Answer 'why is this memory in this state and what changed "
+                "it' — every transition committed against a memory "
+                "(promotion, revise, refute, stale, restore, supersede, "
+                "archive, a candidate merged into it, and a merge where it is "
+                "the source), most recent first. Without memory_id it lists "
+                "project-wide events — useful to see what curation did "
+                "recently. With an org-wide key you must pass project_id "
+                "explicitly. Not returned: the winner side of a supersession "
+                "(a direct merge is recorded under the source memory; a "
+                "candidate supersession that creates a new winner is recorded "
+                "under the superseded loser), confidence-decay, and link "
+                "add/remove events — those are keyed to a different audit "
+                "target."
             ),
             "inputSchema": {
                 "type": "object",
