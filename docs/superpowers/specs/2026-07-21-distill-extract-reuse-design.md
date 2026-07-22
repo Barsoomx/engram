@@ -1036,3 +1036,70 @@ factual-accuracy — none waived by the dogfood directive). No finding weakened 
 spec — every fix strengthens correctness (a/b/c) or coordination accuracy (d).
 `contract_version` / `chunk_contract_version` defaults untouched (TRAP respected); all
 schema changes remain additive.
+
+---
+
+### Round 5 (post-implementation code review)
+
+- **Round-2 finding — §6 test 12
+  (`test_extract_prompt_contract_pins_prompt_and_parser_fingerprint`) was mandated
+  by this spec (lines 615-631) but never implemented in
+  `distillation_provider_stage_tests.py`: CONFIRMED, FIXED.** Test-implementation
+  pass added the test with a projection over `dps._EXTRACT_SYSTEM_PROMPT`,
+  `curation_schema_prompt_prefix('distill_extract.v1')`, the parser caps
+  (`dps._MAX_MEMORIES`/`_MAX_TITLE`/`_MAX_BODY`), the sorted allowed-kind set
+  (`MEMORY_KINDS` minus `'digest'`), and `dps.EXTRACT_PROMPT_CONTRACT`, hashed with
+  `hashlib.sha256(canonical_json_bytes(...))` and pinned to a hard-coded hex digest,
+  mirroring the R1 `REDUCE_PROMPT_CONTRACT` fingerprint precedent
+  (`model_policy/services_tests.py::test_reduce_prompt_components_pinned_change_forces_contract_version_bump`).
+  Same pass also strengthened `test_extract_reuse_rejects_live_policy_drift` to
+  assert `result.failure.failure_class == CONFIGURATION` and
+  `result.failure.code == 'model_policy_unavailable'`, closing round-3 Finding (c)'s
+  residual gap (status was asserted but not the failure classification).
+
+- **Round-3 finding (Codex) — the test-12 fingerprint enumerated only literals and
+  stayed blind to renderer/parser BEHAVIOR: CONFIRMED, FIXED.** A change to
+  `render_observation_block`'s field labels or order, to the redaction it applies
+  (`redact_text`/`redact_value` calling `core.redaction.redact_value`, driven by
+  `SECRET_STRING_RE`/`REDACTED_VALUE`, core/redaction.py:7,18,36), or to
+  `truncate_with_marker`'s marker text (candidate_parsing.py:32-39) would not move
+  the digest, yet the reuse path (§2.4) skips `_render_stage_prompt` entirely and
+  serves the source's already-rendered/parsed snapshot — exactly the behavior a
+  mid-session change to any of those would silently leave stale. Symmetrically,
+  `parse_extraction_output`'s structural rules (required/unknown-key validation,
+  confidence bounds, the silent drop of a `supporting_observation_ids` entry not in
+  the chunk set at `_parse_supporting_ids`, distillation_provider_stage.py:306-326,
+  and the `no_signal_observation_ids` complement recomputed from
+  `chunk_observation_ids - supporting_union` rather than the input array,
+  :390-398) were also unpinned. Fix (mine, binding): extended the SAME
+  `test_extract_prompt_contract_pins_prompt_and_parser_fingerprint` with three
+  golden samples added to the hashed projection instead of listing more literals:
+  (1) `render_observation_block` at a generous cap (10000) over a fixed, unsaved
+  `Observation` whose body embeds a secret-shaped token (`sk-...`) matched by
+  `SECRET_STRING_RE`, pinning field labels/order and redaction end-to-end; (2) the
+  same observation at a tiny cap (80), pinning the `truncate_with_marker` marker
+  text; (3) a plain-dict projection of `parse_extraction_output` over a fixed raw
+  body and a fixed 3-id chunk set, constructed to exercise two memories (one with
+  `kind`, one without), one supporting id outside the chunk set (pins the silent-drop
+  rule), and a non-empty no-signal complement (pins the recomputation, not a
+  pass-through of the input array). Re-snapshotted the hard-coded digest after
+  verifying each sample's actual output by hand (redaction fired, truncation marker
+  present, drop and complement behaved as designed) before hard-coding.
+  Structural source-hashing of `parse_extraction_output`/`render_observation_block`
+  (e.g. hashing the function's AST or source text) was **considered and REJECTED**
+  as brittle: a behavior-preserving refactor (rename a local, reorder an unrelated
+  helper, restructure control flow with identical outputs) would trip the tripwire
+  for no reason, creating snapshot churn with no correctness signal. The
+  golden-sample approach only trips when *observable* behavior changes, which is
+  exactly the invariant §5 needs mechanically enforced. Net effect: the §5 bump
+  obligation is now mechanically enforced for BOTH rendered-prompt components
+  (labels, order, redaction, truncation) and accepted-output parser semantics
+  (validation rules, coverage-drop, no-signal computation) — closing the gap the
+  round-3 finding identified, with no product code touched (test-only change).
+
+No finding was refuted; no directive-based dismissal applied (both are test-coverage
+completeness/correctness gaps in the fingerprint's mechanical enforcement, not
+waived by the dogfood directive). No finding weakened the spec — both fixes
+strengthen the §5 invariant's enforcement. `contract_version` /
+`chunk_contract_version` defaults untouched (TRAP respected); all schema changes
+remain additive; no product code was modified by either fix.
