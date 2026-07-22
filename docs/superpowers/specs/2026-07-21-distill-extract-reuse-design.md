@@ -1103,3 +1103,87 @@ waived by the dogfood directive). No finding weakened the spec — both fixes
 strengthen the §5 invariant's enforcement. `contract_version` /
 `chunk_contract_version` defaults untouched (TRAP respected); all schema changes
 remain additive; no product code was modified by either fix.
+
+---
+
+### Round 6 (final verification)
+
+- **Round-4 finding (a) — the golden rendered-block sample embedded a secret in
+  `body` only, leaving every other field's redaction unpinned: CONFIRMED, FIXED.**
+  `render_observation_block` calls `redact_text`/`redact_value` independently per
+  field — `title`, `body`, `facts`, `narrative`, `concepts`, `files_read`,
+  `files_modified` (distillation_window.py:151-157) — so a secret only in `body`
+  proved nothing about the other six call sites; each is a distinct opportunity to
+  drop or mis-wire the redaction call in a future edit. Related and more severe:
+  `observation_content_digest` hashes the RAW (pre-redaction) observation fields
+  (workflow_work.py:196-216) and the reuse key is a projection of `observation_id` +
+  that raw content digest (§2.1) — redaction never touches either, so a change to
+  `SECRET_STRING_RE`/`REDACTED_VALUE`/the per-field redaction wiring cannot ever
+  invalidate a `reuse_key` or force re-extraction. The test-12 fingerprint is
+  therefore the ONLY tripwire in the system for redaction regressions on the reuse
+  path — it cannot lean on the reuse key as a second line of defense the way
+  content changes can. Fix: `_fingerprint_sample_observation` now embeds a distinct
+  `sk-`-shaped token (matching `SECRET_STRING_RE`) into `title`, `body`, both
+  elements of `facts`, `narrative`, both elements of `concepts`, both elements of
+  `files_read`, and both elements of `files_modified` — eight independent
+  redaction sites. Verified by hand (rendered the sample outside pytest) that all
+  eight tokens come back `[REDACTED]` and zero `sk-` substrings survive.
+
+- **Round-4 finding (b) — the golden output-snapshot sample was a hand-rolled
+  projection, not the production serializer, and silently diverged from it:
+  CONFIRMED, FIXED.** The reuse path copies `source.output_snapshot`
+  (distillation_provider_stage.py:946), which is produced by
+  `_normalize_output(output)` (:770-783, called from `normalize_output` at :811) —
+  and `_normalize_output` omits the `kind` key entirely when a memory has no kind
+  (`if memory.kind: entry['kind'] = memory.kind`, :779-780). The prior hand-rolled
+  helper always included a `'kind'` key (even `''` for kind-less memories), so a
+  future change to that omission rule (e.g. always emitting `kind: ''`) would not
+  have moved the fingerprint even though it changes exactly the bytes reuse copies
+  verbatim. Fix: `_fingerprint_parsed_output_sample` renamed
+  `_fingerprint_output_snapshot_sample` and now returns
+  `dps._normalize_output(parsed)` directly — the real production function — instead
+  of a parallel hand-built dict. Verified by hand that the real serializer omits
+  `kind` for the three kind-less memories and includes it only for the one with
+  `kind='decision'`.
+
+- **Round-4 finding (c) — confidence boundary acceptance (0 and 1 inclusive) was
+  unpinned: CONFIRMED, FIXED.** `_parse_confidence` rejects only `< 0` or `> 1`
+  (distillation_provider_stage.py:289-290), so `0` and `1` are valid boundary
+  values a provider could legitimately emit, but no golden sample exercised either.
+  Fix: the golden raw body gained two more memories — Memory C at `confidence=0`
+  (supported by the previously-unsupported third chunk id) and Memory D at
+  `confidence=1` (reusing chunk id A's id, which is permitted: the duplicate-free
+  rule in `_parse_supporting_ids` is scoped to one memory's own list, not across
+  memories) — bringing the golden body to 4 memories, still well under
+  `_MAX_MEMORIES` (12). Verified by hand that both parse to `Decimal('0')` and
+  `Decimal('1')` without error. Side effect accepted as correct, not a regression:
+  because Memory C now supports the third chunk id, `no_signal_observation_ids`
+  recomputes to empty rather than the previously-pinned single id — the golden
+  simply pins whatever the real complement computation yields, which is the whole
+  point of using the production functions instead of asserting a preconceived
+  shape.
+
+Re-snapshotted `_EXTRACT_PROMPT_CONTRACT_FINGERPRINT` after all three fixes
+(placeholder → run → hard-code actual digest, per the established procedure). No
+finding was refuted; no directive-based dismissal applied — all three are
+mechanical strengthenings of test coverage, not product-code changes, not waived by
+the dogfood directive. `contract_version` / `chunk_contract_version` defaults
+untouched (TRAP respected); all schema changes remain additive; no product code was
+touched by this pass.
+
+**Scope settlement.** The fingerprint's coverage is now: the system prompt: the
+schema instructions; the parser limits (`_MAX_MEMORIES`/`_MAX_TITLE`/`_MAX_BODY`);
+the sorted allowed-kind set; the `EXTRACT_PROMPT_CONTRACT` literal; and golden
+end-to-end samples through the REAL renderer (all seven fields secret-bearing,
+both a plain and a truncated render) and the REAL normalizer (kind-present,
+kind-absent, boundary confidences 0 and 1, the out-of-chunk-set silent-drop rule,
+and the no-signal complement recomputation). Residual semantic axes that cannot be
+expressed as one of these samples — e.g. a wholesale rewrite of the parser's
+control flow that happens to reproduce every golden sample's output byte-for-byte —
+remain governed by the process-level `EXTRACT_PROMPT_CONTRACT` bump obligation
+(§5), which is a human/review discipline, not a mechanical one, and that is an
+accepted, intentional boundary. Structural source/AST-hashing of the renderer or
+parser to close that residual gap was considered in round 5 and is
+**SETTLED-REJECTED**: it would trip on behavior-preserving refactors with no
+correctness signal. This scope is final — further fingerprint enumeration is
+SETTLED-REJECTED and future reviews must not re-litigate it.

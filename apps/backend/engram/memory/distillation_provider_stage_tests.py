@@ -1099,23 +1099,29 @@ def test_extract_reuse_rejects_live_policy_drift(m_monkeypatch: pytest.MonkeyPat
     assert blocked.reused_from is None
 
 
-_EXTRACT_PROMPT_CONTRACT_FINGERPRINT = 'a85550a301146011ceb3702fecece03f9bff7c015f763e5d685aba4281959883'
+_EXTRACT_PROMPT_CONTRACT_FINGERPRINT = 'ae75f20303f1f0de5897008303d7bdec21a6bb5e044ab85f1deea7fb592a1d58'
 
 
 def _fingerprint_sample_observation() -> Observation:
     return Observation(
         id=uuid.UUID('00000000-0000-4000-8000-000000000001'),
-        title='Auth failure investigation',
-        body='Root cause traced to a leaked credential sk-testtoken1234567890 embedded in service logs.',
-        facts=['fact one', 'fact two'],
-        narrative='Narrative describing the incident timeline in detail for rendering pin coverage.',
-        concepts=['gotcha', 'architecture'],
-        files_read=['apps/backend/engram/memory/distillation_provider_stage.py'],
-        files_modified=['apps/backend/engram/memory/distillation_window.py'],
+        title='Auth failure investigation sk-titletoken1234567890',
+        body='Root cause traced to a leaked credential sk-bodytoken1234567890 embedded in service logs.',
+        facts=['fact one sk-factsonetoken1234567890', 'fact two sk-factstwotoken1234567890'],
+        narrative='Narrative describing the incident sk-narrativetoken1234567890 in detail for rendering pin coverage.',
+        concepts=['gotcha sk-conceptsonetoken1234567890', 'architecture sk-conceptstwotoken1234567890'],
+        files_read=[
+            'apps/backend/engram/memory/distillation_provider_stage.py sk-filesreadonetoken1234567890',
+            'apps/backend/engram/memory/distillation_window.py sk-filesreadtwotoken1234567890',
+        ],
+        files_modified=[
+            'apps/backend/engram/memory/candidate_parsing.py sk-filesmodifiedonetoken1234567890',
+            'apps/backend/engram/core/redaction.py sk-filesmodifiedtwotoken1234567890',
+        ],
     )
 
 
-def _fingerprint_parsed_output_sample() -> dict[str, object]:
+def _fingerprint_output_snapshot_sample() -> dict[str, object]:
     chunk_observation_ids = frozenset(
         {
             '11111111-1111-4111-8111-111111111111',
@@ -1142,25 +1148,25 @@ def _fingerprint_parsed_output_sample() -> dict[str, object]:
                     'confidence': 0.5,
                     'supporting_observation_ids': ['22222222-2222-4222-8222-222222222222'],
                 },
+                {
+                    'title': 'Memory C',
+                    'body': 'Body C',
+                    'confidence': 0,
+                    'supporting_observation_ids': ['33333333-3333-4333-8333-333333333333'],
+                },
+                {
+                    'title': 'Memory D',
+                    'body': 'Body D',
+                    'confidence': 1,
+                    'supporting_observation_ids': ['11111111-1111-4111-8111-111111111111'],
+                },
             ],
             'no_signal_observation_ids': ['33333333-3333-4333-8333-333333333333'],
         }
     )
     parsed = dps.parse_extraction_output(raw_body, chunk_observation_ids=chunk_observation_ids)
 
-    return {
-        'memories': [
-            {
-                'title': memory.title,
-                'body': memory.body,
-                'confidence': str(memory.confidence),
-                'supporting_observation_ids': list(memory.supporting_observation_ids),
-                'kind': memory.kind,
-            }
-            for memory in parsed.memories
-        ],
-        'no_signal_observation_ids': list(parsed.no_signal_observation_ids),
-    }
+    return dps._normalize_output(parsed)
 
 
 def test_extract_prompt_contract_pins_prompt_and_parser_fingerprint() -> None:
@@ -1175,7 +1181,7 @@ def test_extract_prompt_contract_pins_prompt_and_parser_fingerprint() -> None:
         'prompt_contract': dps.EXTRACT_PROMPT_CONTRACT,
         'rendered_block_sample': render_observation_block(sample_observation, 10000),
         'rendered_block_truncated_sample': render_observation_block(sample_observation, 80),
-        'parsed_output_sample': _fingerprint_parsed_output_sample(),
+        'output_snapshot_sample': _fingerprint_output_snapshot_sample(),
     }
     digest = hashlib.sha256(canonical_json_bytes(projection)).hexdigest()
 
