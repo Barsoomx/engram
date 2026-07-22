@@ -1,6 +1,6 @@
 [project]
 name = "engram-connect"
-version = "0.6.0"
+version = "0.6.1"
 description = "Thin Engram command-line client"
 readme = "README.md"
 requires-python = ">=3.12"
