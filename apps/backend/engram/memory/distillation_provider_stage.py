@@ -719,7 +719,9 @@ def _stage_manifest_ids(chunk: DistillationChunk) -> tuple[list[str], dict[str, 
     return observation_ids, expected_digests
 
 
-def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage | None = None) -> str:
+def _verify_stage_manifest_live(
+    chunk: DistillationChunk, *, stage: DistillationStage | None = None
+) -> tuple[dict[str, Observation], list[str]]:
     observation_ids, expected_digests = _stage_manifest_ids(chunk)
     scope = stage or chunk
 
@@ -746,6 +748,12 @@ def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage |
                 'observation content digest does not match the frozen manifest',
                 code='work_fingerprint_mismatch',
             )
+
+    return observations, observation_ids
+
+
+def _render_stage_prompt(chunk: DistillationChunk, *, stage: DistillationStage | None = None) -> str:
+    observations, observation_ids = _verify_stage_manifest_live(chunk, stage=stage)
 
     cap = chunk.window.chunk_char_budget
     blocks = [render_observation_block(observations[observation_id], cap) for observation_id in observation_ids]

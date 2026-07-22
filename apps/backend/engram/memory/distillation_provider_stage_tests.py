@@ -1687,6 +1687,36 @@ def test_render_stage_prompt_scope_mismatch_is_invalid_input(m_monkeypatch: pyte
     assert translate_failure(excinfo.value).failure_class == INVALID_INPUT
 
 
+@pytest.mark.django_db
+def test_verify_stage_manifest_live_raises_on_freeze_to_execute_drift(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = _scope('stage-manifest-live-drift')
+    _curation_policy(scope)
+    work, _window, chunk = _single_chunk(scope, sequences=(1, 2))
+    now = timezone.now()
+    claim = _claim(work, now)
+    gateway = _StubGateway(body=_valid_body(chunk))
+    _install_gateway(m_monkeypatch, gateway)
+    stage = dps.resolve_extraction_stage(chunk=chunk, claim=claim, now=now)
+    result = dps.execute_distillation_stage(stage, claim, now=now)
+    assert result.status == 'completed'
+    stage.refresh_from_db()
+
+    observations, observation_ids = dps._verify_stage_manifest_live(chunk, stage=stage)
+
+    assert observation_ids == _chunk_observation_ids(chunk)
+    assert set(observations) == set(observation_ids)
+
+    observation_id = observation_ids[0]
+    Observation.objects.filter(id=observation_id).update(body='content mutated after the manifest was frozen')
+
+    with pytest.raises(MemoryWorkerError) as excinfo:
+        dps._verify_stage_manifest_live(chunk, stage=stage)
+
+    assert excinfo.value.code == 'work_fingerprint_mismatch'
+
+
 def test_extract_schema_instructions_describe_a_payload_the_parser_accepts() -> None:
     instructions = curation_schema_prompt_prefix('distill_extract.v1')
     supported = '2b0f4f4e-6c0d-4f5e-8b7a-9c1d2e3f4a5b'
