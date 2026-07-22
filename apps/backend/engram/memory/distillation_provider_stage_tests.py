@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
@@ -857,6 +858,95 @@ def test_extract_stage_reuses_prior_session_output_without_provider_call(
     assert reused.output_hash == stage_a.output_hash
     assert reused.accepted_provider_call_id == stage_a.accepted_provider_call_id
     assert reused.attempt_count == 0
+
+
+class _DynamicNoSignalGateway:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def call(self, data: object) -> ProviderCallResult:
+        self.calls.append(data)
+        observation_ids = re.findall(r'^Observation: ([0-9a-f-]{36})$', data.prompt, flags=re.MULTILINE)
+        assert observation_ids
+        policy = data.policy
+        record = ProviderCallRecord.objects.create(
+            organization_id=data.organization_id,
+            project_id=data.project_id,
+            team_id=data.team_id,
+            policy=policy,
+            secret=policy.secret,
+            provider=policy.provider,
+            model=policy.model,
+            task_type=policy.task_type,
+            policy_version=policy.version,
+            request_id=data.request_id,
+            trace_id=getattr(data, 'trace_id', ''),
+            redaction_state='redacted',
+            metadata={'prompt_retained': False},
+        )
+
+        return ProviderCallResult(
+            provider=policy.provider,
+            model=policy.model,
+            call_record_id=record.id,
+            redaction_state='redacted',
+            generated_title='',
+            generated_body=json.dumps({'memories': [], 'no_signal_observation_ids': observation_ids}),
+        )
+
+
+@pytest.mark.django_db
+def test_window_reuses_all_unchanged_chunks_with_zero_calls_and_extracts_only_trailing(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', str(_REUSE_CHUNK_BUDGET))
+    scope = _scope('stage-reuse-multichunk')
+    _curation_policy(scope)
+    _observation(scope, sequence=1, body=_REUSE_OVERSIZED_BODY)
+    _observation(scope, sequence=2, body=_REUSE_OVERSIZED_BODY)
+    work_a = _session_work(scope, upper=2)
+    window_a = materialize_distillation_window(work_a)
+    assert window_a.chunks.count() == 2
+    now = timezone.now()
+    claim_a = _claim(work_a, now)
+    gateway = _DynamicNoSignalGateway()
+    _install_gateway(m_monkeypatch, gateway)
+
+    stages_a = []
+    for chunk in window_a.chunks.order_by('ordinal'):
+        stage_a = dps.resolve_extraction_stage(chunk=chunk, claim=claim_a, now=now)
+        assert dps.execute_distillation_stage(stage_a, claim_a, now=now).status == 'completed'
+        stage_a.refresh_from_db()
+        stages_a.append(stage_a)
+
+    assert len(gateway.calls) == 2
+
+    _observation(scope, sequence=3, body=_REUSE_OVERSIZED_BODY)
+    work_b = _session_work(scope, upper=3)
+    window_b = materialize_distillation_window(work_b)
+    assert window_b.chunks.count() == 3
+    claim_b = _claim(work_b, now)
+
+    for stage_a in stages_a:
+        chunk_b = window_b.chunks.get(ordinal=stage_a.chunk.ordinal)
+        stage_b = dps.resolve_extraction_stage(chunk=chunk_b, claim=claim_b, now=now)
+        assert stage_b.reuse_key == stage_a.reuse_key
+        result = dps.execute_distillation_stage(stage_b, claim_b, now=now)
+        assert result.status == 'completed'
+        assert result.started_provider_calls == 0
+        reused = DistillationStage.objects.get(id=stage_b.id)
+        assert reused.reused_from_id == stage_a.id
+
+    assert len(gateway.calls) == 2
+
+    trailing_chunk = window_b.chunks.get(ordinal=2)
+    trailing_stage = dps.resolve_extraction_stage(chunk=trailing_chunk, claim=claim_b, now=now)
+    result = dps.execute_distillation_stage(trailing_stage, claim_b, now=now)
+
+    assert result.status == 'completed'
+    assert len(gateway.calls) == 3
+    settled_trailing = DistillationStage.objects.get(id=trailing_stage.id)
+    assert settled_trailing.reused_from is None
 
 
 @pytest.mark.django_db
