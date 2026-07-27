@@ -3272,3 +3272,68 @@ def test_resolve_candidate_embedding_returns_none_on_transient_error(monkeypatch
     )
 
     assert module.resolve_candidate_embedding(candidate, view, None) is None
+
+
+@pytest.mark.django_db
+def test_candidate_embedding_is_paid_once_and_reused(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('embedcache')
+    _embedding_policy(scope)
+    candidate, _work, _run = orch.subject_candidate(scope, suffix='embedcache')
+    module = orch.curation_module()
+    calls: list[int] = []
+
+    class CountingGateway:
+        def embed(self, _data: object) -> object:
+            calls.append(1)
+
+            return type('R', (), {'embedding': list(_EMBEDDING)})()
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda _policy: CountingGateway(), raising=False)
+    view = SanitizedCandidateView(
+        title=candidate.title,
+        body=candidate.body,
+        kind=candidate.kind,
+        evidence=(),
+        content_hash=candidate.content_hash,
+        redaction_codes=(),
+    )
+
+    first = module.resolve_candidate_embedding(candidate, view, None)
+    candidate.refresh_from_db()
+    second = module.resolve_candidate_embedding(candidate, view, None)
+
+    assert first == second == _EMBEDDING
+    assert len(calls) == 1
+
+
+@pytest.mark.django_db
+def test_candidate_embedding_cache_invalidates_on_content_change(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('embedinvalidate')
+    _embedding_policy(scope)
+    candidate, _work, _run = orch.subject_candidate(scope, suffix='embedinvalidate')
+    module = orch.curation_module()
+    calls: list[int] = []
+
+    class CountingGateway:
+        def embed(self, _data: object) -> object:
+            calls.append(1)
+
+            return type('R', (), {'embedding': list(_EMBEDDING)})()
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda _policy: CountingGateway(), raising=False)
+    view = SanitizedCandidateView(
+        title=candidate.title,
+        body=candidate.body,
+        kind=candidate.kind,
+        evidence=(),
+        content_hash=candidate.content_hash,
+        redaction_codes=(),
+    )
+
+    module.resolve_candidate_embedding(candidate, view, None)
+    candidate.refresh_from_db()
+    orch.mutate_candidate_generation(candidate, new_title='A different subject claim entirely')
+    candidate.refresh_from_db()
+    module.resolve_candidate_embedding(candidate, view, None)
+
+    assert len(calls) == 2

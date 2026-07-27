@@ -811,8 +811,53 @@ def _build_token_usage(
     return {'input_tokens': input_estimate, 'output_tokens': output_estimate, 'source': 'estimated'}
 
 
-def _resolve_policy_pricing(policy: ModelPolicy) -> dict[str, Decimal] | None:
+def _response_kind_override(policy: ModelPolicy, response_kind: str) -> dict[str, Any] | None:
+    if not response_kind:
+        return None
+
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    overrides = metadata.get('model_overrides')
+    if not isinstance(overrides, dict):
+        return None
+
+    override = overrides.get(response_kind)
+    if not isinstance(override, dict):
+        if override is not None:
+            logger.warning(
+                'provider_model_override_malformed',
+                policy_id=str(policy.id),
+                response_kind=response_kind,
+            )
+
+        return None
+
+    return override
+
+
+def resolve_model(policy: ModelPolicy, response_kind: str = '') -> str:
+    override = _response_kind_override(policy, response_kind)
+    if override is None:
+        return policy.model
+
+    model = override.get('model')
+    if not isinstance(model, str) or not model.strip():
+        logger.warning(
+            'provider_model_override_malformed',
+            policy_id=str(policy.id),
+            response_kind=response_kind,
+            reason='model_missing',
+        )
+
+        return policy.model
+
+    return model
+
+
+def _resolve_policy_pricing(policy: ModelPolicy, response_kind: str = '') -> dict[str, Decimal] | None:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    override = _response_kind_override(policy, response_kind)
+    if override is not None and override.get('pricing') is not None:
+        metadata = override
     raw = metadata.get('pricing')
     if raw is None:
         return None
@@ -848,8 +893,9 @@ def _build_cost_metadata(
     real_usage: dict[str, int] | None,
     *,
     output_billable: bool = True,
+    response_kind: str = '',
 ) -> dict[str, Any]:
-    pricing = _resolve_policy_pricing(policy)
+    pricing = _resolve_policy_pricing(policy, response_kind)
     if pricing is None:
         return {'estimated': True, 'cost_usd': '0.0000', 'pricing_source': 'unknown'}
     if real_usage is None:
@@ -1600,10 +1646,11 @@ class OpenAICompatibleGateway:
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
         extra['max_tokens'] = effective_completion_cap(policy, data.response_kind)
+        effective_model = resolve_model(policy, data.response_kind)
         started_at = time.monotonic()
         try:
             content, real_usage, finish_reason = self._chat_completion(
-                policy.model,
+                effective_model,
                 prompt_text,
                 system_prompt=data.system_prompt,
                 extra=extra,
@@ -1620,13 +1667,14 @@ class OpenAICompatibleGateway:
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
             token_usage=_build_token_usage(real_usage, len(prompt_text.split()), len(content.split())),
-            cost_metadata=_build_cost_metadata(policy, real_usage),
+            cost_metadata=_build_cost_metadata(policy, real_usage, response_kind=data.response_kind),
             latency_ms=latency_ms,
+            model=effective_model,
         )
 
         return ProviderCallResult(
             provider=policy.provider,
-            model=policy.model,
+            model=effective_model,
             call_record_id=record.id,
             redaction_state=record.redaction_state,
             generated_title=title,
@@ -1674,6 +1722,7 @@ class OpenAICompatibleGateway:
         token_usage: dict[str, Any],
         cost_metadata: dict[str, Any],
         latency_ms: int,
+        model: str = '',
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
             organization_id=data.organization_id,
@@ -1682,7 +1731,7 @@ class OpenAICompatibleGateway:
             policy=policy,
             secret=policy.secret,
             provider=policy.provider,
-            model=policy.model,
+            model=model or policy.model,
             task_type=policy.task_type,
             policy_version=policy.version,
             request_id=data.request_id,
@@ -1862,10 +1911,11 @@ class AnthropicMessagesGateway:
         redacted_prompt = redact_value(data.prompt)
         prompt_text = str(redacted_prompt.value)
 
+        effective_model = resolve_model(policy, data.response_kind)
         started_at = time.monotonic()
         try:
             content, real_usage, stop_reason = self._messages(
-                policy.model,
+                effective_model,
                 prompt_text,
                 system_prompt=data.system_prompt,
                 response_kind=data.response_kind,
@@ -1883,13 +1933,14 @@ class AnthropicMessagesGateway:
             policy,
             redaction_state='redacted' if redacted_prompt.redacted or '[REDACTED]' in data.prompt else 'clean',
             token_usage=_build_token_usage(real_usage, len(prompt_text.split()), len(content.split())),
-            cost_metadata=_build_cost_metadata(policy, real_usage),
+            cost_metadata=_build_cost_metadata(policy, real_usage, response_kind=data.response_kind),
             latency_ms=latency_ms,
+            model=effective_model,
         )
 
         return ProviderCallResult(
             provider=policy.provider,
-            model=policy.model,
+            model=effective_model,
             call_record_id=record.id,
             redaction_state=record.redaction_state,
             generated_title=title,
@@ -1912,6 +1963,7 @@ class AnthropicMessagesGateway:
         token_usage: dict[str, Any],
         cost_metadata: dict[str, Any],
         latency_ms: int,
+        model: str = '',
     ) -> ProviderCallRecord:
         return ProviderCallRecord.objects.create(
             organization_id=data.organization_id,
@@ -1920,7 +1972,7 @@ class AnthropicMessagesGateway:
             policy=policy,
             secret=policy.secret,
             provider=policy.provider,
-            model=policy.model,
+            model=model or policy.model,
             task_type=policy.task_type,
             policy_version=policy.version,
             request_id=data.request_id,

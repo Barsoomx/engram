@@ -13,6 +13,7 @@ from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
 from engram.memory.distillation_provider_stage import _EXTRACT_SYSTEM_PROMPT, EXTRACT_PROMPT_CONTRACT
 from engram.memory.distillation_reduction import _REDUCE_SYSTEM_PROMPT, REDUCE_PROMPT_CONTRACT
+from engram.model_policy import services
 from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord
 from engram.model_policy.real_provider_tests import _opener_raising, _opener_returning, make_real_policy
@@ -1156,3 +1157,115 @@ def test_anthropic_gateway_surfaces_stop_reason() -> None:
     )
 
     assert result.finish_reason == 'max_tokens'
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 - distill extraction and the curation judge share one
+# task_type='curation' policy row, so the model cannot be split by policy alone.
+# A per-response-kind override lets the mechanical extraction stage run on a
+# cheaper model while the judge stays on the reasoning model. The override MUST
+# carry its own pricing, otherwise cost accounting silently bills the wrong rate.
+# See docs/superpowers/specs/2026-07-27-curation-outage-resilience-design.md
+# ---------------------------------------------------------------------------
+
+_OVERRIDE_METADATA = {
+    'pricing': {'input_per_mtok': '0.435', 'output_per_mtok': '0.87'},
+    'model_overrides': {
+        'distill_extract.v1': {
+            'model': 'deepseek-v4-flash',
+            'pricing': {'input_per_mtok': '0.14', 'output_per_mtok': '0.28'},
+        },
+    },
+}
+
+
+def _call_with_kind(policy: Any, body: bytes, response_kind: str) -> tuple[ProviderCallRecord, Any]:
+    gateway = OpenAICompatibleGateway(
+        base_url='https://provider.example/v1',
+        api_key='key',
+        opener=_opener_returning(body),
+    )
+    result = gateway.call(
+        ProviderCallInput(
+            organization_id=policy.organization_id,
+            project_id=policy.project_id,
+            team_id=None,
+            policy=policy,
+            request_id=f'override-{response_kind}',
+            trace_id='override',
+            prompt='a prompt',
+            response_kind=response_kind,
+        ),
+    )
+
+    return ProviderCallRecord.objects.get(id=result.call_record_id), gateway._opener
+
+
+def test_resolve_model_without_override_returns_policy_model() -> None:
+    policy = ModelPolicy(model='deepseek-v4-pro', metadata=_OVERRIDE_METADATA)
+
+    assert services.resolve_model(policy, 'curation_decision_v1') == 'deepseek-v4-pro'
+
+
+def test_resolve_model_applies_response_kind_override() -> None:
+    policy = ModelPolicy(model='deepseek-v4-pro', metadata=_OVERRIDE_METADATA)
+
+    assert services.resolve_model(policy, 'distill_extract.v1') == 'deepseek-v4-flash'
+
+
+def test_resolve_model_ignores_malformed_override() -> None:
+    policy = ModelPolicy(model='deepseek-v4-pro', metadata={'model_overrides': {'distill_extract.v1': 42}})
+
+    assert services.resolve_model(policy, 'distill_extract.v1') == 'deepseek-v4-pro'
+
+
+@pytest.mark.django_db
+def test_override_model_is_sent_to_provider_and_recorded() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_OVERRIDE_METADATA)
+    policy.model = 'deepseek-v4-pro'
+    policy.save(update_fields=['model'])
+    body = _openai_chat_body(
+        '{"memories": []}',
+        usage={'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000, 'total_tokens': 2_000_000},
+    )
+
+    record, opener = _call_with_kind(policy, body, 'distill_extract.v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['model'] == 'deepseek-v4-flash'
+    assert record.model == 'deepseek-v4-flash'
+
+
+@pytest.mark.django_db
+def test_override_pricing_is_used_for_cost() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_OVERRIDE_METADATA)
+    policy.model = 'deepseek-v4-pro'
+    policy.save(update_fields=['model'])
+    body = _openai_chat_body(
+        '{"memories": []}',
+        usage={'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000, 'total_tokens': 2_000_000},
+    )
+
+    record, _opener = _call_with_kind(policy, body, 'distill_extract.v1')
+
+    assert record.cost_metadata['cost_usd'] == '0.420000'
+
+
+@pytest.mark.django_db
+def test_non_overridden_kind_keeps_policy_model_and_pricing() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_OVERRIDE_METADATA)
+    policy.model = 'deepseek-v4-pro'
+    policy.save(update_fields=['model'])
+    body = _openai_chat_body(
+        'Title: Memory\nBody: line one',
+        usage={'prompt_tokens': 1_000_000, 'completion_tokens': 1_000_000, 'total_tokens': 2_000_000},
+    )
+
+    record, opener = _call_with_kind(policy, body, 'single')
+
+    assert json.loads(opener.requests[0].data.decode())['model'] == 'deepseek-v4-pro'
+    assert record.model == 'deepseek-v4-pro'
+    assert record.cost_metadata['cost_usd'] == '1.305000'
