@@ -137,11 +137,18 @@ instead asserts that the service opens its **own** atomic block, by checking tha
 savepoint depth grows across the call. Verified genuinely red against the
 unfixed code (`[0] == [1]`).
 
-### D6 — idle reconciler churn
+### D6 — WITHDRAWN, not a defect
 
 `retry_failed_distillations` returned `{'retried': 0, 'reconciled': 0,
-'unlinked': 54}` in **all 48 runs** over 24 h — the same 54 works re-unlinked
-every 30 minutes.
+'unlinked': 54}` in all 48 runs over 24 h. This was initially read as idle churn.
+
+Reading `distillation_reconciler.py:170`, `_unlinked_failed_run_ids` is a **pure
+read**: it selects `SESSION_DISTILLATION` runs with `work__isnull=True` and
+`status=FAILED` and returns their ids. It mutates nothing. The constant 54 is an
+observability count of orphaned legacy failed runs, not repeated work.
+
+No fix is warranted. The original claim was inferred from the constant value
+without reading the implementation and is withdrawn.
 
 ## 3. Approach
 
@@ -311,5 +318,35 @@ Slices are verified against the stand only after the user's topup:
 ## 8. Status
 
 Design approved by user directive 2026-07-27 ("сам всё решай, делаем максимум").
-Scope is all four slices. Cost levers other than the per-response-kind override
-are rejected above with reasons rather than deferred.
+
+| Item | Status |
+|---|---|
+| D1 classification | Done, PR #295 (`a34bd623`) |
+| Redrive command | Done, PR #295 |
+| D4 reembed transaction | Done, PR #295 |
+| D5 stranded leases | Done, PR #295 |
+| D6 idle churn | **Withdrawn — not a defect** |
+| Slice 4 model override | Done, follow-up branch |
+| Slice 3 embedding checkpoint | Done, follow-up branch (migration 0049) |
+
+Cost levers other than the per-response-kind override are rejected in §4 with
+reasons rather than deferred.
+
+Observation, not addressed: `consistency_tests.py::test_authoritative_mismatches
+_are_report_only_and_never_mutated[provenance-…]` failed once and then passed in
+four consecutive runs (three file-level, one full-suite) with identical code. It
+is flaky, not a regression from this work; no fix attempted, recorded here so the
+next flake is not mistaken for a new break.
+
+Enabling the override on the stand is a data change, applied after deploy:
+
+```sql
+UPDATE model_policy_modelpolicy
+SET metadata = jsonb_set(metadata, '{model_overrides}', '{"distill_extract.v1":
+  {"model":"deepseek-v4-flash",
+   "pricing":{"input_per_mtok":"0.14","output_per_mtok":"0.28"}}}'::jsonb)
+WHERE task_type = 'curation' AND active;
+```
+
+Reverted by deleting the `model_overrides` key. A/B the extraction quality
+against the R3 golden samples before leaving it on.
