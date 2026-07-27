@@ -8,8 +8,9 @@ import structlog
 from django.core.management.base import BaseCommand, CommandError, CommandParser
 from django.utils import timezone
 
+from engram.core.models import WorkflowWorkType
 from engram.memory.work_backfill import (
-    DEFAULT_FAILURE_CODES,
+    ACCOUNT_FAILURE_CODES,
     redrive_target,
     select_targets,
 )
@@ -21,12 +22,18 @@ _SKIP_ALREADY_REDISPATCHED = 'already_redispatched'
 
 class Command(BaseCommand):
     help = (
-        'Re-drive v1 SESSION_DISTILLATION works whose latest run failed with a target code '
-        'by resetting execution-state bookkeeping and queuing a fresh attempt.'
+        'Re-drive v1 CANDIDATE_DECISION works whose latest run failed with a target code. '
+        'Use after restoring provider account balance to recover works that an outage '
+        'blocked or terminalized.'
     )
 
     def add_arguments(self, parser: CommandParser) -> None:
-        parser.add_argument('--failure-codes', type=str, default=','.join(DEFAULT_FAILURE_CODES), dest='failure_codes')
+        parser.add_argument(
+            '--failure-codes',
+            type=str,
+            default=','.join(ACCOUNT_FAILURE_CODES),
+            dest='failure_codes',
+        )
         parser.add_argument('--limit', type=int, default=100, dest='limit')
         parser.add_argument('--sleep', type=float, default=0.0, dest='sleep')
         parser.add_argument('--dry-run', action='store_true', dest='dry_run')
@@ -45,7 +52,7 @@ class Command(BaseCommand):
         project_id = uuid.UUID(options['project_id']) if options['project_id'] else None
 
         logger.info(
-            'distill_backfill_started',
+            'candidate_decision_redrive_started',
             failure_codes=list(codes),
             limit=limit,
             dry_run=dry_run,
@@ -56,6 +63,7 @@ class Command(BaseCommand):
         targets = select_targets(
             failure_codes=codes,
             limit=limit,
+            work_type=WorkflowWorkType.CANDIDATE_DECISION,
             organization_id=organization_id,
             project_id=project_id,
         )
@@ -63,13 +71,13 @@ class Command(BaseCommand):
         if dry_run:
             for target in targets:
                 self.stdout.write(
-                    f'work={target.work_id} subject={target.subject_id} '
+                    f'work={target.work_id} candidate={target.subject_id} '
                     f'state={target.execution_state} code={target.failure_code} '
                     f'latest_run={target.latest_run_id}'
                 )
             self.stdout.write(f'selected={len(targets)} dispatched=0 skipped=0 dry_run=1')
             logger.info(
-                'distill_backfill_summary',
+                'candidate_decision_redrive_summary',
                 selected=len(targets),
                 dispatched=0,
                 skipped=0,
@@ -84,7 +92,12 @@ class Command(BaseCommand):
             if sleep > 0 and index > 0:
                 time.sleep(sleep)
 
-            run_id = redrive_target(work_id=target.work_id, failure_codes=codes, now=timezone.now())
+            run_id = redrive_target(
+                work_id=target.work_id,
+                failure_codes=codes,
+                now=timezone.now(),
+                work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            )
             if run_id is None:
                 skipped.append((target.work_id, _SKIP_ALREADY_REDISPATCHED))
 
@@ -97,7 +110,7 @@ class Command(BaseCommand):
             self.stdout.write(f'skipped work={work_id} reason={reason}')
 
         logger.info(
-            'distill_backfill_summary',
+            'candidate_decision_redrive_summary',
             selected=len(targets),
             dispatched=len(dispatched),
             skipped=len(skipped),

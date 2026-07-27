@@ -211,3 +211,49 @@ def test_recovery_ignores_live_leased_complete_embedding_work(monkeypatch: pytes
     assert result.queued == 0
     assert sent == []
     assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.LEASED
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 - SESSION_DISTILLATION was missing from _RECOVERABLE_WORK_TYPES, so
+# a worker that died mid-run left the work leased forever: two such works sat
+# stranded on the stand for eight days.
+# See docs/superpowers/specs/2026-07-27-curation-outage-resilience-design.md
+# ---------------------------------------------------------------------------
+
+_DISTILL_TASK = 'engram.memory.distill_session_work_v1'
+
+
+@pytest.mark.django_db
+def test_recovers_expired_lease_on_session_distillation_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    from engram.memory.observation_work_tests import create_scope as create_session_scope
+    from engram.memory.work_backfill_tests import _current_work
+
+    scope = create_session_scope('recover-distill-lease')
+    work = _current_work(scope, sequence=1)
+
+    now = timezone.now()
+    claimed = work_execution.claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner='recover:distill',
+        now=now,
+        lease_for=timedelta(seconds=1),
+    )
+    assert claimed.outcome == 'claimed'
+    assert WorkflowWork.objects.get(id=work.id).execution_state == WorkflowWorkExecutionState.LEASED
+
+    sent = _collect_sent(monkeypatch)
+
+    result = RecoverStrandedWork().execute(as_of=now + timedelta(minutes=30))
+
+    assert result.queued == 1
+    assert (
+        WorkflowRun.objects.filter(
+            work=work,
+            status=WorkflowRunStatus.QUEUED,
+            execution_contract_version=1,
+            origin=WorkflowRunOrigin.RECONCILIATION,
+        ).count()
+        == 1
+    )
+    assert {name for name, _args in sent} == {_DISTILL_TASK}

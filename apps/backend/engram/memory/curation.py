@@ -97,6 +97,7 @@ from engram.memory.transitions import (
     build_memory_fence,
 )
 from engram.memory.work_execution import WorkClaim, finish_work_claim, lock_work_fence
+from engram.memory.work_failures import CURATION_TRANSITION_CODES, is_provider_account_failure
 from engram.memory.workflow_work import canonical_json_bytes
 from engram.model_policy.models import ModelPolicy
 from engram.model_policy.services import (
@@ -1058,7 +1059,10 @@ def resolve_candidate_embedding(
                 text=f'{view.title}\n{view.body}',
             ),
         )
-    except (ModelPolicyError, ProviderSecretError):
+    except (ModelPolicyError, ProviderSecretError) as error:
+        if is_provider_account_failure(error):
+            raise _operational('embedding_account_unavailable', 'embedding provider account is unavailable') from error
+
         return None
 
     return tuple(result.embedding)
@@ -1078,6 +1082,17 @@ def judge_curation_candidate(data: CurationJudgeInput) -> CurationJudgeResult:
 
 def _operational(reason: str, message: str) -> MemoryTransitionError:
     return MemoryTransitionError(reason, message, retryable=True)
+
+
+def _judge_failure_code(error: Exception) -> str:
+    if is_provider_account_failure(error):
+        return 'judge_account_unavailable'
+
+    code = getattr(error, 'code', None)
+    if isinstance(code, str) and code in CURATION_TRANSITION_CODES:
+        return code
+
+    return 'judge_provider_unavailable'
 
 
 class DecideMemoryCandidate:
@@ -1322,10 +1337,7 @@ class DecideMemoryCandidate:
             judge_input = self._judge_input(work, candidate, view, scope, shortlist, evidence)
             judge_result = judge_curation_candidate(judge_input)
         except (CurationJudgeError, ModelPolicyError, ProviderSecretError) as error:
-            raise _operational(
-                getattr(error, 'code', None) or 'judge_provider_unavailable',
-                'curation judge is unavailable',
-            ) from error
+            raise _operational(_judge_failure_code(error), 'curation judge is unavailable') from error
         _fault_boundary('after_judge')
 
         verdict = judge_result.verdict

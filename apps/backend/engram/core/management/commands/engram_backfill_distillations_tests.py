@@ -15,13 +15,13 @@ from engram.core.models import (
     WorkflowWork,
     WorkflowWorkExecutionState,
 )
-from engram.memory.distillation_backfill_tests import (
+from engram.memory.observation_work_tests import create_scope
+from engram.memory.work_backfill_tests import (
     _STREAK_LIMIT,
     SessionScope,
     _current_work,
     _fail_work,
 )
-from engram.memory.observation_work_tests import create_scope
 
 _DISTILL_TASK = 'engram.memory.distill_session_work_v1'
 
@@ -65,7 +65,7 @@ def test_dry_run_prints_selection_no_state_change() -> None:
 
     output = out.getvalue()
     assert f'work={work.id}' in output
-    assert f'session={work.subject_id}' in output
+    assert f'subject={work.subject_id}' in output
     assert f'state={state_before}' in output
     assert 'code=provider_output_malformed' in output
     assert f'latest_run={latest_run_id}' in output

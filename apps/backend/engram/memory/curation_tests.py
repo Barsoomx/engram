@@ -68,9 +68,11 @@ from engram.memory.curation_test_support import (
     seed_atomic_existing_and_duplicate,
     set_curator_settings,
 )
+from engram.memory.deterministic_gates import SanitizedCandidateView
 from engram.memory.tasks import embed_memory_projection_work_v1
 from engram.memory.transitions import MemoryTransitionError, PromoteMemoryCandidate
 from engram.memory.transitions_test_support import provenanced_candidate_in_scope, transition_request
+from engram.model_policy.errors import ModelPolicyError
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret, ProviderSecretEnvelope
 from engram.model_policy.services import (
     EMBEDDING_DIMENSION,
@@ -3126,3 +3128,147 @@ def test_late_evidence_does_not_record_transitionless_repeat_conflict(
         [False],
         WorkflowWorkResolutionReason.PROJECTION_SUPERSEDED,
     )
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 outage resilience - an exhausted provider account must block the
+# work on the first failure instead of buying twelve paid retries and dying.
+# See docs/superpowers/specs/2026-07-27-curation-outage-resilience-design.md
+# ---------------------------------------------------------------------------
+
+
+def _account_error() -> ModelPolicyError:
+    return ModelPolicyError('provider_http_error', 'Insufficient Balance', retryable=True, http_status=402)
+
+
+def _rate_limit_error() -> ModelPolicyError:
+    return ModelPolicyError('provider_http_error', 'slow down', retryable=True, http_status=429)
+
+
+def _embedding_policy(scope: object) -> ModelPolicy:
+    secret = ProviderSecret.objects.create(
+        organization=scope.organization,
+        team=scope.team,
+        name='outage embedding secret',
+        provider='openai',
+        scope='team',
+        current_version=1,
+    )
+
+    return ModelPolicy.objects.create(
+        organization=scope.organization,
+        team=scope.team,
+        project=scope.project,
+        name='outage embedding policy',
+        scope='project',
+        task_type='embedding',
+        provider='openai',
+        model='text-embedding-3-small',
+        secret=secret,
+        version=1,
+    )
+
+
+def _install_failing_judge(monkeypatch: pytest.MonkeyPatch, error: ModelPolicyError) -> None:
+    def raise_error(*_args: object, **_kwargs: object) -> object:
+        raise error
+
+    monkeypatch.setattr(orch.curation_module(), 'judge_curation_candidate', raise_error, raising=False)
+
+
+@pytest.mark.django_db
+def test_judge_account_error_blocks_work_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('acctjudge')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='acctjudge')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge = orch.stub_judge_result(orch.stub_verdict('publish_new'), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    _install_failing_judge(monkeypatch, _account_error())
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'judge_account_unavailable'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+    assert work.next_retry_at is None
+    assert len(work.blocked_configuration_fingerprint) == 64
+
+
+@pytest.mark.django_db
+def test_judge_rate_limit_still_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('ratejudge')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='ratejudge')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge = orch.stub_judge_result(orch.stub_verdict('publish_new'), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    _install_failing_judge(monkeypatch, _rate_limit_error())
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'judge_provider_unavailable'
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.RETRY_WAIT
+    assert work.next_retry_at is not None
+
+
+@pytest.mark.django_db
+def test_resolve_candidate_embedding_raises_on_account_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('acctembed')
+    _embedding_policy(scope)
+    candidate, _work, _run = orch.subject_candidate(scope, suffix='acctembed')
+    module = orch.curation_module()
+
+    class FailingGateway:
+        def embed(self, _data: object) -> object:
+            raise _account_error()
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda _policy: FailingGateway(), raising=False)
+    view = SanitizedCandidateView(
+        title=candidate.title,
+        body=candidate.body,
+        kind=candidate.kind,
+        evidence=(),
+        content_hash=candidate.content_hash,
+        redaction_codes=(),
+    )
+
+    with pytest.raises(MemoryTransitionError) as raised:
+        module.resolve_candidate_embedding(candidate, view, None)
+
+    assert raised.value.code == 'embedding_account_unavailable'
+
+
+@pytest.mark.django_db
+def test_resolve_candidate_embedding_returns_none_on_transient_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('transembed')
+    _embedding_policy(scope)
+    candidate, _work, _run = orch.subject_candidate(scope, suffix='transembed')
+    module = orch.curation_module()
+
+    class FailingGateway:
+        def embed(self, _data: object) -> object:
+            raise _rate_limit_error()
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda _policy: FailingGateway(), raising=False)
+    view = SanitizedCandidateView(
+        title=candidate.title,
+        body=candidate.body,
+        kind=candidate.kind,
+        evidence=(),
+        content_hash=candidate.content_hash,
+        redaction_codes=(),
+    )
+
+    assert module.resolve_candidate_embedding(candidate, view, None) is None

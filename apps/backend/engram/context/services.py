@@ -858,7 +858,8 @@ class ReembedMissingEmbeddings:
         failed = 0
         for document in documents:
             try:
-                _work, created = create_embedding_work_and_signal(document=document)
+                with transaction.atomic():
+                    _work, created = create_embedding_work_and_signal(document=document)
             except (ContextIndexError, ValueError):
                 created = False
             if created:

@@ -19,13 +19,13 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
-from engram.memory.distillation_backfill import (
+from engram.memory.observation_work_tests import create_scope
+from engram.memory.session_lifecycle import EndSession
+from engram.memory.work_backfill import (
     DEFAULT_FAILURE_CODES,
     redrive_target,
     select_targets,
 )
-from engram.memory.observation_work_tests import create_scope
-from engram.memory.session_lifecycle import EndSession
 from engram.memory.work_execution import (
     ClaimResult,
     claim_work,
@@ -149,7 +149,7 @@ def test_select_targets_picks_latest_failed_in_set() -> None:
 
     assert {target.work_id for target in targets} == {work_a.id}
     target = targets[0]
-    assert target.session_id == work_a.subject_id
+    assert target.subject_id == work_a.subject_id
     assert target.failure_code == 'provider_output_malformed'
     assert _latest_run(work_c) is not None
 
@@ -324,3 +324,177 @@ def test_redrive_reset_reclaimable(f_scope: SessionScope) -> None:
 
     assert claimed.claim is not None
     assert claimed.claim.fencing_token == token_before + 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 outage recovery - the same redrive machinery must serve
+# CANDIDATE_DECISION works, which the 402 outage terminalized in bulk.
+# See docs/superpowers/specs/2026-07-27-curation-outage-resilience-design.md
+# ---------------------------------------------------------------------------
+
+ACCOUNT_CODES = ('provider_account_unavailable', 'judge_account_unavailable', 'embedding_account_unavailable')
+_UNEXPECTED_STEP = timedelta(hours=7)
+
+
+def _decision_work(suffix: str) -> tuple[WorkflowWork, WorkflowRun]:
+    from engram.memory import c53_orchestrator_test_support as orch
+
+    scope = orch.orchestrator_scope(suffix)
+    _candidate, work, run = orch.subject_candidate(scope, suffix=suffix)
+
+    return work, run
+
+
+def _fail_decision_work(
+    work: WorkflowWork,
+    *,
+    seed_run: WorkflowRun,
+    code: str,
+    failure_class: str,
+    times: int,
+    now: datetime,
+    step: timedelta = _RETRY_STEP,
+) -> None:
+    current = now
+    for index in range(times):
+        claimed = claim_work(
+            work_id=work.id,
+            expected_work_type=WorkflowWorkType.CANDIDATE_DECISION,
+            lease_owner=f'host:backfill:{uuid.uuid4()}',
+            now=current,
+            lease_for=_LEASE,
+            workflow_run_id=seed_run.id if index == 0 else None,
+        )
+        assert claimed.claim is not None, f'claim {index} failed: {claimed.outcome}'
+        fingerprint = ''
+        if failure_class == CONFIGURATION:
+            fingerprint = execution_configuration_fingerprint(WorkflowWork.objects.get(id=work.id))
+        fail_work_claim(
+            claim=claimed.claim,
+            now=current,
+            failure=ClassifiedWorkFailure(
+                failure_class=failure_class,
+                code=code,
+                configuration_fingerprint=fingerprint,
+            ),
+        )
+        current = current + step
+
+
+@pytest.mark.django_db
+def test_select_targets_finds_terminal_candidate_decision_work() -> None:
+    work, seed = _decision_work('cdselect')
+    _fail_decision_work(
+        work,
+        seed_run=seed,
+        code='unexpected_exception',
+        failure_class='unexpected',
+        times=_STREAK_LIMIT,
+        now=timezone.now(),
+        step=_UNEXPECTED_STEP,
+    )
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+
+    targets = select_targets(
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        failure_codes=('unexpected_exception',),
+        limit=100,
+    )
+
+    assert [target.work_id for target in targets] == [work.id]
+    assert targets[0].subject_id == work.subject_id
+
+
+@pytest.mark.django_db
+def test_select_targets_does_not_cross_work_types() -> None:
+    work, seed = _decision_work('cdisolate')
+    _fail_decision_work(
+        work,
+        seed_run=seed,
+        code='unexpected_exception',
+        failure_class='unexpected',
+        times=1,
+        now=timezone.now(),
+    )
+
+    assert select_targets(failure_codes=('unexpected_exception',), limit=100) == []
+
+
+@pytest.mark.django_db
+def test_redrive_revives_terminal_candidate_decision_work() -> None:
+    work, seed = _decision_work('cdredrive')
+    _fail_decision_work(
+        work,
+        seed_run=seed,
+        code='unexpected_exception',
+        failure_class='unexpected',
+        times=_STREAK_LIMIT,
+        now=timezone.now(),
+        step=_UNEXPECTED_STEP,
+    )
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+
+    run_id = redrive_target(
+        work_id=work.id,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        failure_codes=('unexpected_exception',),
+        now=timezone.now(),
+    )
+
+    assert run_id is not None
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+    assert work.failure_streak == 0
+    assert work.blocked_configuration_fingerprint == ''
+
+
+@pytest.mark.django_db
+def test_redrive_clears_account_block_on_candidate_decision() -> None:
+    work, seed = _decision_work('cdaccount')
+    _fail_decision_work(
+        work,
+        seed_run=seed,
+        code='judge_account_unavailable',
+        failure_class=CONFIGURATION,
+        times=1,
+        now=timezone.now(),
+    )
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.BLOCKED
+
+    run_id = redrive_target(
+        work_id=work.id,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        failure_codes=ACCOUNT_CODES,
+        now=timezone.now(),
+    )
+
+    assert run_id is not None
+    work.refresh_from_db()
+    assert work.execution_state == WorkflowWorkExecutionState.READY
+    assert work.blocked_configuration_fingerprint == ''
+
+
+@pytest.mark.django_db
+def test_redrive_rejects_work_type_mismatch() -> None:
+    work, seed = _decision_work('cdmismatch')
+    _fail_decision_work(
+        work,
+        seed_run=seed,
+        code='judge_account_unavailable',
+        failure_class=CONFIGURATION,
+        times=1,
+        now=timezone.now(),
+    )
+
+    assert (
+        redrive_target(
+            work_id=work.id,
+            work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            failure_codes=ACCOUNT_CODES,
+            now=timezone.now(),
+        )
+        is None
+    )
