@@ -154,13 +154,41 @@ stored; the block reason must be persisted to select safely rather than
 unblocking every blocked work indiscriminately.
 
 **D3-redrive.** Revive `terminal_failure` `candidate_decision` works whose
-candidate is still `PROPOSED` and which have no unresolved `MemoryConflict`.
-`_repair_action` currently falls through to `skip` for terminal works by design,
-so revival must be an explicit, opt-in ops action — not a silent reconciler
-behaviour change. Batched with `--limit` / `--sleep` like
-`engram_backfill_distillations` (#288).
+candidate is still `PROPOSED`. `_repair_action` falls through to `skip` for
+terminal works by design, so revival is an explicit, opt-in ops action — not a
+silent reconciler behaviour change.
+
+Implementation reuses the proven R2 machinery rather than duplicating it:
+`distillation_backfill.py` is renamed `work_backfill.py` and parameterized by
+`work_type` (defaulting to `SESSION_DISTILLATION`, so the R2 command is
+unchanged in behaviour), and `BackfillTarget.session_id` becomes `subject_id`.
+A sibling command `engram_redrive_candidate_decisions` drives the new type.
+
+Two findings from production data shape this:
+
+- **All 2 991 terminal works have no leftover `QUEUED` run**, so the R2
+  "already redispatched" guard will not silently skip them.
+- Their **latest** failure codes are historical, predating the D1 fix:
+  `embedding_provider_unavailable` (2 756), `unexpected_exception` (232),
+  `judge_policy_denied` (3). The account codes introduced by D1 match none of
+  them. The command therefore defaults to the *safe* post-fix account codes, and
+  the one-time historical recovery passes them explicitly:
+
+  ```
+  engram_redrive_candidate_decisions \
+    --failure-codes embedding_provider_unavailable,unexpected_exception,judge_policy_denied \
+    --limit 25 --sleep 2
+  ```
+
+  `unexpected_exception` is deliberately **not** a default: as a blanket default
+  it would redrive genuinely broken works, not just outage casualties.
 
 Expected cost of the redrive after topup: ~2 991 decisions × ~$0.0057 ≈ **$17**.
+
+Scope note: 2 905 further `proposed` candidates have no decision work at all and
+carry `decision_work_contract_version=0`. `_cp3_repair_candidates` filters to
+version 1, so they are deliberately outside this machinery. They are a
+pre-existing population, not outage damage, and are out of scope here.
 
 ### Slice 2 (P1) — independent bug fixes
 

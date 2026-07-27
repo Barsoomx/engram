@@ -40,10 +40,17 @@ _RESET_FIELDS = (
 )
 
 
+ACCOUNT_FAILURE_CODES = (
+    'provider_account_unavailable',
+    'judge_account_unavailable',
+    'embedding_account_unavailable',
+)
+
+
 @dataclass(frozen=True, slots=True)
 class BackfillTarget:
     work_id: uuid.UUID
-    session_id: uuid.UUID
+    subject_id: uuid.UUID
     latest_run_id: uuid.UUID
     failure_code: str
     execution_state: str
@@ -59,6 +66,7 @@ def select_targets(
     *,
     failure_codes: tuple[str, ...],
     limit: int,
+    work_type: str = WorkflowWorkType.SESSION_DISTILLATION,
     organization_id: uuid.UUID | None = None,
     project_id: uuid.UUID | None = None,
 ) -> list[BackfillTarget]:
@@ -68,7 +76,7 @@ def select_targets(
     ).order_by('-created_at', '-id')
     works = (
         WorkflowWork.objects.filter(
-            work_type=WorkflowWorkType.SESSION_DISTILLATION,
+            work_type=work_type,
             contract_version=1,
             disposition=WorkflowWorkDisposition.REQUIRED,
         )
@@ -91,7 +99,7 @@ def select_targets(
     return [
         BackfillTarget(
             work_id=work.id,
-            session_id=work.subject_id,
+            subject_id=work.subject_id,
             latest_run_id=work.latest_run_id,
             failure_code=work.latest_code,
             execution_state=work.execution_state,
@@ -118,6 +126,7 @@ def redrive_target(
     work_id: uuid.UUID,
     failure_codes: tuple[str, ...],
     now: datetime,
+    work_type: str = WorkflowWorkType.SESSION_DISTILLATION,
 ) -> uuid.UUID | None:
     require_aware(now, field='now')
 
@@ -125,7 +134,7 @@ def redrive_target(
         try:
             work = WorkflowWork.objects.select_for_update().get(
                 id=work_id,
-                work_type=WorkflowWorkType.SESSION_DISTILLATION,
+                work_type=work_type,
                 contract_version=1,
                 disposition=WorkflowWorkDisposition.REQUIRED,
             )
@@ -151,9 +160,10 @@ def redrive_target(
             return None
 
         logger.info(
-            'distill_backfill_redriven',
+            'work_backfill_redriven',
+            work_type=work.work_type,
             work_id=str(work.id),
-            session_id=str(work.subject_id),
+            subject_id=str(work.subject_id),
             run_id=str(run.id),
             prior_state=prior_state,
         )
