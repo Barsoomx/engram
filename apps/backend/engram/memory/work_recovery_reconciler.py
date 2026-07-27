@@ -25,6 +25,7 @@ _RECOVERABLE_WORK_TYPES = (
     WorkflowWorkType.DAILY_DIGEST,
     WorkflowWorkType.WEEKLY_DIGEST,
     WorkflowWorkType.MEMORY_EMBEDDING,
+    WorkflowWorkType.SESSION_DISTILLATION,
 )
 
 

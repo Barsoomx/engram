@@ -139,3 +139,39 @@ def test_reembed_beat_schedule_is_registered() -> None:
     assert 'reembed-missing-embeddings' in beat_schedule
     entry = beat_schedule['reembed-missing-embeddings']
     assert entry['task'] == 'engram.memory.reembed_missing_embeddings'
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 - create_work() requires an active transaction, and the beat task
+# runs in autocommit, so in production this died on the first document. The
+# suite always runs inside pytest-django's ambient atomic block, which hid it;
+# assert instead that the service opens its own atomic block (savepoint depth
+# grows across the call) rather than relying on an ambient one.
+# See docs/superpowers/specs/2026-07-27-curation-outage-resilience-design.md
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.django_db
+def test_reembed_opens_its_own_transaction_per_document(monkeypatch: pytest.MonkeyPatch) -> None:
+    from django.db import connection
+
+    from engram.context import services as services_module
+
+    organization, team, project, _owner, _api_key = create_project_scope()
+    create_embedding_policy(organization, team, project)
+    create_unembedded_document(organization, team, project, sequence=11)
+    real = services_module.create_embedding_work_and_signal
+    depths: list[int] = []
+
+    def recording(*, document: RetrievalDocument) -> object:
+        depths.append(len(connection.savepoint_ids))
+
+        return real(document=document)
+
+    monkeypatch.setattr(services_module, 'create_embedding_work_and_signal', recording)
+    outer_depth = len(connection.savepoint_ids)
+
+    result = ReembedMissingEmbeddings().execute()
+
+    assert result.scanned == 1
+    assert depths == [outer_depth + 1]

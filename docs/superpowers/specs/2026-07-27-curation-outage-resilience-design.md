@@ -106,8 +106,36 @@ permanent log noise hiding real failures.
 ### D5 — stuck leases
 
 Two `session_distillation` works have been `leased` since 07-18/07-19 with
-`lease_expires_at` long past. `_repair_action` handles expired leases, but only
-for `candidate_decision`; the session path does not reclaim them.
+`lease_expires_at` long past and their latest run still `running` — a worker
+died mid-run and nobody reclaimed the lease.
+
+Root cause is an allowlist omission: `work_recovery_reconciler.py:23`
+`_RECOVERABLE_WORK_TYPES` contains only `OBSERVATION_PROCESSING`, `DAILY_DIGEST`,
+`WEEKLY_DIGEST` and `MEMORY_EMBEDDING`. The `recover-stranded-work` beat task
+runs every 15 minutes and reclaims exactly this condition (`lease_expires_at <
+now`), but **`SESSION_DISTILLATION` is not in the list**, so it never scans them.
+
+Both stranded works are managed by a v1 `AgentSession`, so
+`RetryFailedDistillations` — which by contract handles only non-v1 sessions —
+skips them too. `session_work_reconciler` does classify the condition as
+`LEASE_EXPIRED` with `proposed_action='reclaim_via_claim_work'`, but that surface
+is a *report* consumed by `engram_audit_work_reconciliation`, not an actor.
+The result is a work type with three overlapping reconcilers and no owner for
+this case.
+
+Fix: add `SESSION_DISTILLATION` to `_RECOVERABLE_WORK_TYPES`.
+`CANDIDATE_DECISION` is deliberately left out — `candidate_work_reconciler`
+`_repair_action` already dispatches on expired leases for it, and adding a second
+actor would create redundant dispatch paths.
+
+Test note: the reembed defect (D4) cannot be reproduced with
+`django_db(transaction=True)` — `TransactionTestCase` truncates
+migration-seeded tables, which breaks `Role` lookups in this test and pollutes
+later tests in the same run (observed: `consistency_tests` failing with
+`scanned=0`), and `serialized_rollback` is disallowed in this repo. The test
+instead asserts that the service opens its **own** atomic block, by checking that
+savepoint depth grows across the call. Verified genuinely red against the
+unfixed code (`[0] == [1]`).
 
 ### D6 — idle reconciler churn
 
