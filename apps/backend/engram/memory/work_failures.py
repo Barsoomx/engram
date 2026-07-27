@@ -53,6 +53,8 @@ _CURATION_TRANSITION_CODE_MAP = {
     'judge_cross_visibility_denied': (INVALID_INPUT, 'judge_cross_visibility_denied'),
     'provenance': (INVALID_INPUT, 'provenance'),
     'scope': (INVALID_INPUT, 'scope'),
+    'embedding_account_unavailable': (CONFIGURATION, 'embedding_account_unavailable'),
+    'judge_account_unavailable': (CONFIGURATION, 'judge_account_unavailable'),
     'embedding_policy_unavailable': (CONFIGURATION, 'embedding_policy_unavailable'),
     'judge_policy_unavailable': (CONFIGURATION, 'judge_policy_unavailable'),
     'candidate_decision_capability_unavailable': (CONFIGURATION, 'candidate_decision_capability_unavailable'),
@@ -86,8 +88,24 @@ class ClassifiedWorkFailure:
         return
 
 
+_ACCOUNT_HTTP_STATUSES = frozenset({401, 402, 403})
+
+CURATION_TRANSITION_CODES = frozenset(_CURATION_TRANSITION_CODE_MAP)
+
+
+def is_provider_account_failure(error: BaseException) -> bool:
+    if isinstance(error, ProviderSecretError):
+        return True
+
+    return (
+        isinstance(error, ModelPolicyError)
+        and error.code == 'provider_http_error'
+        and error.http_status in _ACCOUNT_HTTP_STATUSES
+    )
+
+
 def _classify_http(http_status: int | None) -> tuple[str, str]:
-    if http_status in (401, 402, 403):
+    if http_status in _ACCOUNT_HTTP_STATUSES:
         return CONFIGURATION, 'provider_account_unavailable'
 
     if http_status == 404:

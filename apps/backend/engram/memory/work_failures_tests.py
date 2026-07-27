@@ -366,6 +366,8 @@ CURATION_TRANSITION_TABLE = (
     ('judge_policy_unavailable', 'configuration', True),
     ('candidate_decision_capability_unavailable', 'configuration', True),
     ('rollout_not_enabled', 'configuration', True),
+    ('embedding_account_unavailable', 'configuration', True),
+    ('judge_account_unavailable', 'configuration', True),
 )
 
 

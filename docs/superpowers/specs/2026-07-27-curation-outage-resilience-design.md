@@ -34,19 +34,38 @@ path that would not have worked.
 with no retries. That is the correct designed behaviour, and
 `session_distillation` reaches it — hence its 109 `blocked` works.
 
-`candidate_decision` never reaches it:
+`candidate_decision` never reaches it, via two distinct leaks:
 
 - `curation.py:1061` — `resolve_candidate_embedding` catches
   `(ModelPolicyError, ProviderSecretError)` and returns `None`; the caller then
-  raises `MemoryTransitionError('embedding_provider_unavailable')`.
-- `curation.py:1324` — the judge call catches the same exceptions and re-raises
-  as `MemoryTransitionError('judge_provider_unavailable')`.
+  raises `MemoryTransitionError('embedding_provider_unavailable')`, which maps to
+  `PROVIDER_TRANSIENT`. The HTTP status is discarded.
+- `curation.py:1325` — the judge's `except` block builds the transition error as
+  `getattr(error, 'code', None) or 'judge_provider_unavailable'`. For a
+  `ModelPolicyError` that yields the **provider's own** code,
+  `provider_http_error`, which is absent from `_CURATION_TRANSITION_CODE_MAP` and
+  therefore classifies as **`UNEXPECTED`** — backoff `(300, 21600)`, up to six
+  hours, still terminalizing at `failure_streak=12`.
 
-Both codes map to `PROVIDER_TRANSIENT` in `_CURATION_TRANSITION_CODE_MAP`, so the
-HTTP status is discarded. The work retries with backoff, pays on every attempt,
-and terminalizes at `failure_streak=12`.
+Production run records confirm the second leak dominates:
 
-Arithmetic confirms the mechanism: 2 991 works × 12 attempts ≈ 35 892 ≈ the
+| failure_class | failure_code | runs |
+|---|---|---|
+| `unexpected` | `unexpected_exception` | **29 513** |
+| `provider_transient` | `embedding_provider_unavailable` | 2 773 |
+| `provider_transient` | `judge_policy_denied` | 2 592 |
+| `provider_transient` | `judge_invalid_output` | 829 |
+
+The same 402, on the `session_distillation` path, was recorded correctly as
+`configuration / provider_account_unavailable` (168 runs) — one outage, two
+different fates, decided purely by which `except` block saw it.
+
+The code passthrough is the more general defect: **any** provider error code
+absent from the curation map silently degrades to `UNEXPECTED`. Fixing only the
+402 case would leave that hole open, so the fix constrains the code to the known
+curation vocabulary rather than trusting whatever the provider layer supplies.
+
+Arithmetic confirms the spend: 2 991 works × 12 attempts ≈ 35 892 ≈ the
 34 785 embedding calls actually observed.
 
 ### D2 — an account block never self-heals
