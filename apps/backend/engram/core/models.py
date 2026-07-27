@@ -668,6 +668,8 @@ class MemoryCandidate(TimestampedModel):
     confidence = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
     kind = models.CharField(max_length=40, blank=True, default='')
     decision_work_contract_version = models.PositiveSmallIntegerField(default=0, db_default=0)
+    decision_embedding = models.JSONField(default=list, blank=True)
+    decision_embedding_hash = models.CharField(max_length=128, blank=True, default='', db_default='')
 
     class Meta:
         constraints = [

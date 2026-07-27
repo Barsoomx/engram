@@ -1034,11 +1034,40 @@ def _fault_boundary(_point: str) -> None:
     return None
 
 
+def _cached_candidate_embedding(candidate: MemoryCandidate) -> tuple[float, ...] | None:
+    if not candidate.content_hash or candidate.decision_embedding_hash != candidate.content_hash:
+        return None
+
+    stored = candidate.decision_embedding
+    if not isinstance(stored, list) or not stored:
+        return None
+
+    return tuple(float(value) for value in stored)
+
+
+def _store_candidate_embedding(candidate: MemoryCandidate, embedding: tuple[float, ...]) -> None:
+    if not candidate.content_hash:
+        return
+
+    candidate.decision_embedding = list(embedding)
+    candidate.decision_embedding_hash = candidate.content_hash
+    MemoryCandidate.objects.filter(id=candidate.id).update(
+        decision_embedding=candidate.decision_embedding,
+        decision_embedding_hash=candidate.decision_embedding_hash,
+    )
+
+    return
+
+
 def resolve_candidate_embedding(
     candidate: MemoryCandidate,
     view: SanitizedCandidateView,
     scope: EffectiveCandidateScope,
 ) -> tuple[float, ...] | None:
+    cached = _cached_candidate_embedding(candidate)
+    if cached is not None:
+        return cached
+
     try:
         resolved = ResolveModelPolicy().execute(
             ResolveModelPolicyInput(
@@ -1065,7 +1094,10 @@ def resolve_candidate_embedding(
 
         return None
 
-    return tuple(result.embedding)
+    embedding = tuple(result.embedding)
+    _store_candidate_embedding(candidate, embedding)
+
+    return embedding
 
 
 def build_curation_shortlist(data: BuildCurationShortlistInput) -> CurationShortlist:
