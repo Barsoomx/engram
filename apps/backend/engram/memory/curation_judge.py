@@ -57,6 +57,7 @@ class CurationJudgeInput:
     evidence: CurationEvidenceContext
     request_id: str
     trace_id: str
+    attempt: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -697,6 +698,7 @@ class JudgeCurationCandidate:
                 prompt=prompt,
                 system_prompt=_CURATION_JUDGE_SYSTEM_PROMPT,
                 response_kind='curation_decision_v1',
+                attempt=data.attempt,
             )
         )
         verdict = parse_curation_judge_verdict(result.generated_body, data)

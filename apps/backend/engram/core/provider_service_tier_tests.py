@@ -43,6 +43,11 @@ def test_negative_attempts_are_treated_as_the_first_attempt() -> None:
     assert resolve_service_tier(_FLEX_POLICY, attempt=-4) == 'flex'
 
 
+def test_unparseable_attempt_gives_up_the_queued_tier() -> None:
+    for attempt in ('0', None, 1.5, True, [0]):
+        assert resolve_service_tier(_FLEX_POLICY, attempt=attempt) is None
+
+
 def test_attempt_budget_is_configurable_per_policy() -> None:
     single = {'service_tier': {'tier': 'flex', 'attempt_budget': 1}}
     disabled = {'service_tier': {'tier': 'flex', 'attempt_budget': 0}}

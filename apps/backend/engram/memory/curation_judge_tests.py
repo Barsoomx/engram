@@ -1772,3 +1772,30 @@ def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pyte
         module.JudgeCurationCandidate().execute(data)
 
     assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'
+
+
+@pytest.mark.django_db
+def test_judge_forwards_the_attempt_index_to_the_provider_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, data, entry, candidate = _fixture()
+    data = replace(data, attempt=1)
+    create_curation_policy(candidate.organization, candidate.team, candidate.project, task_type='curation')
+    calls: list[object] = []
+
+    class GatewayStub:
+        def call(self, call_input: object) -> ProviderCallResult:
+            calls.append(call_input)
+
+            return ProviderCallResult(
+                provider=call_input.policy.provider,
+                model=call_input.policy.model,
+                call_record_id=uuid.uuid4(),
+                redaction_state='clean',
+                generated_title='',
+                generated_body=json.dumps(_payload(entry)),
+            )
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())
+
+    module.JudgeCurationCandidate().execute(data)
+
+    assert [call.attempt for call in calls] == [1]

@@ -1724,6 +1724,7 @@ class DecideMemoryCandidate:
             evidence=evidence,
             request_id=f'curation-decision:{work.id}:judge',
             trace_id=f'curation-decision:{work.id}',
+            attempt=work.failure_streak,
         )
 
     def _decision_evidence_membership(

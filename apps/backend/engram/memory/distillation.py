@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from celery import current_task
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
@@ -87,7 +88,7 @@ from engram.memory.work_execution import (
 from engram.memory.work_failures import CONFIGURATION, INVALID_INPUT, ClassifiedWorkFailure
 from engram.memory.workflow_work import canonical_json_bytes, observation_content_digest
 from engram.model_policy.errors import ModelPolicyError
-from engram.model_policy.services import effective_completion_cap
+from engram.model_policy.services import effective_completion_cap, max_chat_http_timeout
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +617,7 @@ def finalize_distillation(  # noqa: C901
 
 
 _LEASE_SAFE_MARGIN = timedelta(seconds=30)
+_PROVIDER_CALL_SAFE_MARGIN = timedelta(seconds=30)
 
 
 def _configuration_failure(work: WorkflowWork, error: Exception) -> DistillationStageError:
@@ -700,8 +702,35 @@ def _attempt_now(initial: datetime) -> datetime:
     return max(initial, timezone.now())
 
 
-def _can_start_provider_call(claim: WorkClaim, *, now: datetime, started: int, budget: int) -> bool:
-    return started < budget and now + _LEASE_SAFE_MARGIN < claim.lease_expires_at
+def attempt_deadline(claim: WorkClaim, *, started_at: datetime) -> datetime:
+    soft_time_limit = _task_soft_time_limit()
+    if soft_time_limit is None:
+        return claim.lease_expires_at
+
+    return min(claim.lease_expires_at, started_at + timedelta(seconds=soft_time_limit))
+
+
+def _task_soft_time_limit() -> int | None:
+    limits = getattr(getattr(current_task, 'request', None), 'timelimit', None)
+    soft = limits[0] if isinstance(limits, (tuple, list)) and limits else None
+    if not _positive_seconds(soft):
+        soft = getattr(current_task, 'soft_time_limit', None)
+    if not _positive_seconds(soft):
+        return None
+
+    return int(soft)
+
+
+def _positive_seconds(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+
+def _provider_call_reserve() -> timedelta:
+    return timedelta(seconds=max_chat_http_timeout()) + _PROVIDER_CALL_SAFE_MARGIN
+
+
+def _can_start_provider_call(*, now: datetime, started: int, budget: int, deadline: datetime) -> bool:
+    return started < budget and now + _provider_call_reserve() <= deadline
 
 
 def _continue_complete_distillation(
@@ -756,16 +785,17 @@ def run_complete_distillation_attempt(  # noqa: C901
     except ValueError as error:
         raise _configuration_failure(work, error) from error
 
+    deadline = attempt_deadline(claim, started_at=now)
     started_provider_calls = 0
     while True:
         current_now = _attempt_now(now)
         pending_chunk = next_distillation_stage(window)
         if pending_chunk is not None:
             if not _can_start_provider_call(
-                claim,
                 now=current_now,
                 started=started_provider_calls,
                 budget=provider_budget,
+                deadline=deadline,
             ):
                 return _continue_complete_distillation(work, claim, now=current_now)
             stage = resolve_extraction_stage(chunk=pending_chunk, claim=claim, now=current_now)
@@ -821,10 +851,10 @@ def run_complete_distillation_attempt(  # noqa: C901
             ) from error
         if pending_reduction is not None:
             if not _can_start_provider_call(
-                claim,
                 now=current_now,
                 started=started_provider_calls,
                 budget=provider_budget,
+                deadline=deadline,
             ):
                 return _continue_complete_distillation(work, claim, now=current_now)
             target = provider_stage_target(window, pending_reduction)

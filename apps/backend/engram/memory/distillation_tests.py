@@ -7,6 +7,7 @@ import uuid
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -47,6 +48,7 @@ from engram.memory.distillation import (
     DistillationStageError,
     _accepted_stage_rows,
     _attach_promoted_candidate_source,
+    attempt_deadline,
     finalize_distillation,
     run_complete_distillation_attempt,
     session_candidate_content_hash,
@@ -65,6 +67,7 @@ from engram.memory.distillation_provenance import (
 from engram.memory.distillation_provider_stage import (
     PROVIDER_OUTPUT_MALFORMED,
     PROVIDER_OUTPUT_TRUNCATED,
+    STAGE_CONTINUATION,
     resolve_reduction_policy,
     stage_key,
     stage_target_key,
@@ -78,7 +81,7 @@ from engram.memory.distillation_window import (
 from engram.memory.services import MemoryWorkerError
 from engram.memory.tasks import distill_session_work_v1
 from engram.memory.work_dispatch import queue_work_attempt
-from engram.memory.work_execution import claim_work, finish_work_claim
+from engram.memory.work_execution import WorkClaim, claim_work, finish_work_claim
 from engram.memory.work_failures import (
     INFRASTRUCTURE_TRANSIENT,
     PROVIDER_TRANSIENT,
@@ -1012,6 +1015,7 @@ def test_complete_distillation_reduces_every_leaf_before_signal_finalization(
     gateway = _SignalReductionStageGateway()
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
     m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '8')
     m_monkeypatch.setattr(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
@@ -1616,6 +1620,7 @@ def test_reduce_truncation_bumps_generation_to_disjoint_level_band(
     gateway = _TruncatingThenValidReductionGateway()
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
     m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '8')
     m_monkeypatch.setattr(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
@@ -1692,6 +1697,7 @@ def test_escape_heavy_reduce_batch_truncates_once_then_recovers_via_split_backst
     gateway = _TruncatingThenValidReductionGateway(always_truncate=True)
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
     m_monkeypatch.setenv('ENGRAM_DISTILL_REDUCE_TARGET', '1')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '8')
     m_monkeypatch.setattr(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
@@ -1823,6 +1829,7 @@ def test_small_session_never_calls_reduce(m_monkeypatch: pytest.MonkeyPatch) -> 
     work = create_session_distillation_work(session, upper=3)
     gateway = _SignalReductionStageGateway()
     m_monkeypatch.setenv('ENGRAM_DISTILL_CHUNK_CHAR_BUDGET', '8000')
+    m_monkeypatch.setenv('ENGRAM_DISTILL_MAX_PROVIDER_CALLS_PER_ATTEMPT', '8')
     m_monkeypatch.setattr(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
@@ -1838,3 +1845,124 @@ def test_small_session_never_calls_reduce(m_monkeypatch: pytest.MonkeyPatch) -> 
     assert MemoryCandidate.objects.filter(project=project).count() == 3
     work.refresh_from_db()
     assert work.resolution_reason == WorkflowWorkResolutionReason.SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# A queued flex chat completion holds the socket for up to the flex ceiling, so
+# an attempt must only start one while its own celery soft deadline (not just
+# the lease) can still host the full HTTP budget. Starting one it cannot finish
+# means SoftTimeLimitExceeded mid-call and a work item left leased.
+# ---------------------------------------------------------------------------
+
+
+class _SoftLimitedTask:
+    def __init__(self, soft_time_limit: int | None) -> None:
+        self.soft_time_limit = soft_time_limit
+        self.request = SimpleNamespace(timelimit=(None, None))
+
+
+def test_attempt_deadline_is_the_earlier_of_lease_and_celery_soft_limit(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = timezone.now()
+    claim = WorkClaim(
+        work_id=uuid.uuid4(),
+        workflow_run_id=uuid.uuid4(),
+        fencing_token=1,
+        lease_owner='test',
+        lease_expires_at=now + timedelta(seconds=1380),
+    )
+
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(1260))
+    assert attempt_deadline(claim, started_at=now) == now + timedelta(seconds=1260)
+
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(None))
+    assert attempt_deadline(claim, started_at=now) == claim.lease_expires_at
+
+
+@pytest.mark.django_db
+def test_attempt_defers_a_provider_call_the_soft_deadline_cannot_host(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='soft-deadline-defer')
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    work = create_session_distillation_work(session, upper=1)
+    gateway = _NoSignalStageGateway()
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(120))
+    now = timezone.now()
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'test:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=30),
+    )
+    assert claim_result.claim is not None
+
+    status = run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+
+    assert status == STAGE_CONTINUATION
+    assert gateway.calls == []
+
+
+@pytest.mark.django_db
+def test_attempt_starts_a_provider_call_the_soft_deadline_can_host(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='soft-deadline-host')
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    work = create_session_distillation_work(session, upper=1)
+    gateway = _NoSignalStageGateway()
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(1260))
+    now = timezone.now()
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'test:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=30),
+    )
+    assert claim_result.claim is not None
+
+    run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+
+    assert [call.response_kind for call in gateway.calls] == ['distill_extract.v1']
+
+
+@pytest.mark.django_db
+def test_stage_provider_call_carries_the_work_failure_streak_as_its_attempt(
+    m_monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    organization, team, project, agent, session = create_session_scope(suffix='stage-attempt')
+    create_curation_policy(organization, team, project)
+    create_observation(organization, project, team, agent, session, index=1)
+    work = create_session_distillation_work(session, upper=1)
+    gateway = _NoSignalStageGateway()
+    m_monkeypatch.setattr(
+        'engram.memory.distillation_provider_stage.get_provider_gateway',
+        lambda *_args, **_kwargs: gateway,
+    )
+    now = timezone.now()
+    claim_result = claim_work(
+        work_id=work.id,
+        expected_work_type=WorkflowWorkType.SESSION_DISTILLATION,
+        lease_owner=f'test:{uuid.uuid4()}',
+        now=now,
+        lease_for=timedelta(minutes=30),
+    )
+    assert claim_result.claim is not None
+    WorkflowWork.objects.filter(id=work.id).update(failure_streak=3)
+
+    run_complete_distillation_attempt(work=work, claim=claim_result.claim, now=now)
+
+    assert [call.attempt for call in gateway.calls] == [3]

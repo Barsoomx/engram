@@ -22,8 +22,14 @@ from django.core.exceptions import ImproperlyConfigured
 from django.db import transaction
 from django.db.models import Q
 
+from engram.core import provider_timeouts
 from engram.core.environments import NON_PRODUCTION_ENVIRONMENTS
 from engram.core.models import AuditEvent, AuditResult, Project, Team
+from engram.core.provider_service_tier import (
+    SERVICE_TIER_FLEX,
+    SERVICE_TIER_METADATA_KEY,
+    resolve_service_tier,
+)
 from engram.core.redaction import redact_value
 from engram.model_policy.base_url_validation import BaseUrlValidationError, validate_base_url
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
@@ -131,6 +137,7 @@ class ProviderCallInput:
     prompt: str
     system_prompt: str = ''
     response_kind: str = 'single'
+    attempt: int = 0
 
 
 @dataclass(frozen=True)
@@ -1577,12 +1584,34 @@ def effective_completion_cap(policy: ModelPolicy, response_kind: str) -> int:
 
 _DEFAULT_TEMPERATURE = 0.2
 _DEFAULT_COMPLETION_TOKENS_PARAM = 'max_tokens'
-_COMPLETION_TOKENS_PARAMS = frozenset({'max_tokens', 'max_completion_tokens'})
+_REASONING_COMPLETION_TOKENS_PARAM = 'max_completion_tokens'
+_COMPLETION_TOKENS_PARAMS = frozenset({_DEFAULT_COMPLETION_TOKENS_PARAM, _REASONING_COMPLETION_TOKENS_PARAM})
+_LOWEST_REASONING_EFFORT = 'minimal'
+# max_completion_tokens includes reasoning tokens; the floors leave room for the
+# reasoning burn measured on 2026-07-27 (gpt-5-nano: low 192, medium 832) plus an
+# answer. An effort that cannot fit its own reasoning is a guaranteed HTTP 400.
+_REASONING_EFFORT_FLOORS = (
+    (_LOWEST_REASONING_EFFORT, 128),
+    ('low', 512),
+    ('medium', 4096),
+    ('high', 16384),
+)
+_REASONING_EFFORTS = frozenset(effort for effort, _floor in _REASONING_EFFORT_FLOORS)
 
 
-def _request_shape(policy: ModelPolicy) -> dict[str, Any]:
+def _policy_request_shape(policy: ModelPolicy, response_kind: str = '') -> dict[str, Any]:
+    override = _response_kind_override(policy, response_kind)
+    if override is not None:
+        shape = _shape_mapping(policy, override.get('request_shape'), response_kind=response_kind)
+        if shape is not None:
+            return shape
+
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
-    shape = metadata.get('request_shape')
+
+    return _shape_mapping(policy, metadata.get('request_shape'), response_kind=response_kind) or {}
+
+
+def _shape_mapping(policy: ModelPolicy, shape: object, *, response_kind: str) -> dict[str, Any] | None:
     if isinstance(shape, dict):
         return shape
 
@@ -1590,14 +1619,15 @@ def _request_shape(policy: ModelPolicy) -> dict[str, Any]:
         logger.warning(
             'provider_request_shape_malformed',
             policy_id=str(policy.id),
+            response_kind=response_kind,
             reason='not_a_mapping',
         )
 
-    return {}
+    return None
 
 
-def resolve_completion_tokens_param(policy: ModelPolicy) -> str:
-    raw = _request_shape(policy).get('completion_tokens_param')
+def resolve_completion_tokens_param(policy: ModelPolicy, response_kind: str = '') -> str:
+    raw = _policy_request_shape(policy, response_kind).get('completion_tokens_param')
     if isinstance(raw, str) and raw in _COMPLETION_TOKENS_PARAMS:
         return raw
 
@@ -1605,15 +1635,19 @@ def resolve_completion_tokens_param(policy: ModelPolicy) -> str:
         logger.warning(
             'provider_request_shape_malformed',
             policy_id=str(policy.id),
+            response_kind=response_kind,
             field='completion_tokens_param',
         )
 
     return _DEFAULT_COMPLETION_TOKENS_PARAM
 
 
-def resolve_temperature(policy: ModelPolicy) -> float | None:
-    shape = _request_shape(policy)
+def resolve_temperature(policy: ModelPolicy, response_kind: str = '') -> float | None:
+    shape = _policy_request_shape(policy, response_kind)
     if 'temperature' not in shape:
+        if resolve_completion_tokens_param(policy, response_kind) == _REASONING_COMPLETION_TOKENS_PARAM:
+            return None
+
         return _DEFAULT_TEMPERATURE
 
     raw = shape['temperature']
@@ -1624,44 +1658,75 @@ def resolve_temperature(policy: ModelPolicy) -> float | None:
         logger.warning(
             'provider_request_shape_malformed',
             policy_id=str(policy.id),
+            response_kind=response_kind,
             field='temperature',
         )
 
-        return _DEFAULT_TEMPERATURE
+        return None
 
     return float(raw)
 
 
-def resolve_reasoning_effort(policy: ModelPolicy, response_kind: str) -> str:
+def resolve_reasoning_effort(policy: ModelPolicy, response_kind: str, *, completion_cap: int) -> str:
+    requested = _requested_reasoning_effort(policy, response_kind)
+    if not requested:
+        return ''
+
+    return _reasoning_effort_within_cap(requested, completion_cap, policy=policy, response_kind=response_kind)
+
+
+def _requested_reasoning_effort(policy: ModelPolicy, response_kind: str) -> str:
     if not response_kind:
         return ''
 
-    efforts = _request_shape(policy).get('reasoning_effort')
+    efforts = _policy_request_shape(policy, response_kind).get('reasoning_effort')
     if efforts is None:
         return ''
 
-    if not isinstance(efforts, dict):
-        logger.warning(
-            'provider_request_shape_malformed',
-            policy_id=str(policy.id),
-            field='reasoning_effort',
-        )
-
+    effort = efforts.get(response_kind) if isinstance(efforts, dict) else efforts
+    if effort is None:
         return ''
 
-    effort = efforts.get(response_kind)
-    if isinstance(effort, str) and effort.strip():
+    if isinstance(effort, str) and effort.strip() in _REASONING_EFFORTS:
         return effort.strip()
 
-    if effort is not None:
-        logger.warning(
-            'provider_request_shape_malformed',
-            policy_id=str(policy.id),
-            field='reasoning_effort',
-            response_kind=response_kind,
-        )
+    logger.warning(
+        'provider_request_shape_malformed',
+        policy_id=str(policy.id),
+        field='reasoning_effort',
+        response_kind=response_kind,
+    )
 
     return ''
+
+
+def _reasoning_effort_within_cap(
+    requested: str,
+    completion_cap: int,
+    *,
+    policy: ModelPolicy,
+    response_kind: str,
+) -> str:
+    floors = dict(_REASONING_EFFORT_FLOORS)
+    if floors[requested] <= completion_cap:
+        return requested
+
+    affordable = _LOWEST_REASONING_EFFORT
+    for effort, floor in _REASONING_EFFORT_FLOORS:
+        if floor > completion_cap:
+            break
+        affordable = effort
+
+    logger.warning(
+        'provider_reasoning_effort_downgraded',
+        policy_id=str(policy.id),
+        response_kind=response_kind,
+        requested=requested,
+        applied=affordable,
+        completion_cap=completion_cap,
+    )
+
+    return affordable
 
 
 def resolve_context_window_tokens(policy: ModelPolicy) -> int | None:
@@ -1700,11 +1765,24 @@ def _recheck_custom_base_url(policy: ModelPolicy, base_url: str) -> None:
         raise ModelPolicyError('provider_base_url_invalid', error.public_message, retryable=False) from error
 
 
-def provider_http_timeout() -> int:
+def provider_http_timeout(tier: str | None = None) -> int:
+    if tier == SERVICE_TIER_FLEX:
+        return int(os.environ.get('ENGRAM_FLEX_HTTP_TIMEOUT', str(_flex_processing_ceiling())))
+
     return int(os.environ.get('ENGRAM_PROVIDER_HTTP_TIMEOUT', '60'))
 
 
-def _embedding_http_timeout() -> int:
+def _flex_processing_ceiling() -> int:
+    default = str(provider_timeouts.FLEX_PROCESSING_CEILING_SECONDS)
+
+    return int(os.environ.get('ENGRAM_FLEX_PROCESSING_CEILING', default))
+
+
+def max_chat_http_timeout() -> int:
+    return max(provider_http_timeout(), provider_http_timeout(SERVICE_TIER_FLEX))
+
+
+def embedding_http_timeout() -> int:
     return int(os.environ.get('ENGRAM_EMBEDDING_HTTP_TIMEOUT', '30'))
 
 
@@ -1720,7 +1798,7 @@ class OpenAICompatibleGateway:
         self._base_url = base_url.rstrip('/')
         self._api_key = api_key
         self._opener = opener or urllib.request.urlopen
-        self._timeout = timeout if timeout is not None else provider_http_timeout()
+        self._timeout = timeout
 
     def call(self, data: ProviderCallInput) -> ProviderCallResult:
         policy = data.policy
@@ -1731,13 +1809,17 @@ class OpenAICompatibleGateway:
         if schema_prefix:
             prompt_text = f'{schema_prefix}\n\n{prompt_text}'
 
+        completion_cap = effective_completion_cap(policy, data.response_kind)
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
-        extra[resolve_completion_tokens_param(policy)] = effective_completion_cap(policy, data.response_kind)
-        reasoning_effort = resolve_reasoning_effort(policy, data.response_kind)
+        extra[resolve_completion_tokens_param(policy, data.response_kind)] = completion_cap
+        reasoning_effort = resolve_reasoning_effort(policy, data.response_kind, completion_cap=completion_cap)
         if reasoning_effort:
             extra['reasoning_effort'] = reasoning_effort
+        service_tier = resolve_service_tier(policy.metadata, attempt=data.attempt)
+        if service_tier is not None:
+            extra[SERVICE_TIER_METADATA_KEY] = service_tier
         effective_model = resolve_model(policy, data.response_kind)
         started_at = time.monotonic()
         try:
@@ -1746,7 +1828,8 @@ class OpenAICompatibleGateway:
                 prompt_text,
                 system_prompt=data.system_prompt,
                 extra=extra,
-                temperature=resolve_temperature(policy),
+                temperature=resolve_temperature(policy, data.response_kind),
+                timeout=self._chat_timeout(service_tier),
             )
         except ModelPolicyError as error:
             self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
@@ -1870,6 +1953,9 @@ class OpenAICompatibleGateway:
             },
         )
 
+    def _chat_timeout(self, tier: str | None) -> int:
+        return self._timeout if self._timeout is not None else provider_http_timeout(tier)
+
     def _chat_completion(
         self,
         model: str,
@@ -1877,6 +1963,7 @@ class OpenAICompatibleGateway:
         system_prompt: str = '',
         extra: dict[str, object] | None = None,
         temperature: float | None = _DEFAULT_TEMPERATURE,
+        timeout: int | None = None,
     ) -> tuple[str, dict[str, int] | None, str]:
         messages: list[dict[str, str]] = []
         if system_prompt:
@@ -1891,7 +1978,11 @@ class OpenAICompatibleGateway:
         if extra:
             payload_dict.update(extra)
         payload = json.dumps(payload_dict).encode()
-        response = self._open(self._base_url + '/chat/completions', payload, timeout=self._timeout)
+        response = self._open(
+            self._base_url + '/chat/completions',
+            payload,
+            timeout=timeout if timeout is not None else self._chat_timeout(None),
+        )
         choice = response['choices'][0]
         finish_reason = str(choice.get('finish_reason') or '')
 
@@ -1899,7 +1990,7 @@ class OpenAICompatibleGateway:
 
     def _embeddings(self, model: str, text: str) -> tuple[tuple[float, ...], dict[str, int] | None]:
         payload = json.dumps({'model': model, 'input': text}).encode()
-        response = self._open(self._base_url + '/embeddings', payload, timeout=_embedding_http_timeout())
+        response = self._open(self._base_url + '/embeddings', payload, timeout=embedding_http_timeout())
         embedding = tuple(float(component) for component in response['data'][0]['embedding'])
 
         return fit_embedding_dimension(embedding), _parse_openai_usage(response)

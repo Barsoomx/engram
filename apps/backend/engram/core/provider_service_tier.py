@@ -4,7 +4,8 @@ import os
 from collections.abc import Mapping
 
 SERVICE_TIER_METADATA_KEY = 'service_tier'
-SUPPORTED_SERVICE_TIERS = frozenset({'auto', 'default', 'flex', 'priority'})
+SERVICE_TIER_FLEX = 'flex'
+SUPPORTED_SERVICE_TIERS = frozenset({'auto', 'default', SERVICE_TIER_FLEX, 'priority'})
 DEFAULT_ATTEMPT_BUDGET = int(os.environ.get('ENGRAM_SERVICE_TIER_ATTEMPT_BUDGET', '2'))
 
 
@@ -17,15 +18,16 @@ def resolve_service_tier(metadata: Mapping[str, object] | None, *, attempt: int)
     if not isinstance(tier, str) or tier not in SUPPORTED_SERVICE_TIERS:
         return None
 
-    if _attempt_index(attempt) >= _attempt_budget(config):
+    index = _attempt_index(attempt)
+    if index is None or index >= _attempt_budget(config):
         return None
 
     return tier
 
 
-def _attempt_index(attempt: int) -> int:
+def _attempt_index(attempt: int) -> int | None:
     if isinstance(attempt, bool) or not isinstance(attempt, int):
-        return 0
+        return None
 
     return max(attempt, 0)
 

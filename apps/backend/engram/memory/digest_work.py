@@ -644,6 +644,7 @@ def _render_daily(
         sources=sources,
         request_id=trace_id,
         trace_id=trace_id,
+        attempt=work.failure_streak,
     )
 
 
