@@ -33,7 +33,10 @@ x-backend: &backend
 
 x-worker: &worker
   <<: *backend
-  stop_grace_period: 12m
+  # Must outlast the longest task hard limit plus worker_soft_shutdown_timeout, or a
+  # restart SIGKILLs a task mid provider call and leaves its work LEASED with no worker.
+  # engram/core/deployment_contract_tests.py derives the minimum from the timeout ladder.
+  stop_grace_period: 23m
 
 services:
   api:

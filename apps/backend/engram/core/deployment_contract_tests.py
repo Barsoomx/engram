@@ -9,7 +9,19 @@ from typing import cast
 import pytest
 import yaml
 
+from engram import celeryconfig
+from engram.core.provider_timeouts import (
+    WORK_TIMEOUT_SPECS,
+    chat_call_capacity,
+    chat_call_ceiling,
+    embedding_call_ceiling,
+    global_task_timeouts,
+    required_stop_grace_seconds,
+    resolve_work_timeouts,
+)
+
 ComposeMapping = dict[str, object]
+EnvMapping = dict[str, str]
 
 WORKER_QUEUES = {
     'worker-realtime': 'engram-realtime',
@@ -60,9 +72,43 @@ def _load_compose_contract() -> ComposeMapping:
     return _as_mapping(config, label='Compose contract')
 
 
+def _load_env_example() -> EnvMapping:
+    configured_path = os.environ.get('ENGRAM_COMPOSE_ENV_EXAMPLE_PATH')
+    env_path = (
+        Path(configured_path)
+        if configured_path
+        else Path(__file__).resolve().parents[4] / 'deploy' / 'compose' / '.env.example'
+    )
+    assert env_path.is_file(), f'Compose env example is absent: {env_path}'
+
+    values: EnvMapping = {}
+    for line in env_path.read_text(encoding='utf-8').splitlines():
+        entry = line.strip()
+        if not entry or entry.startswith('#') or '=' not in entry:
+            continue
+        name, _, value = entry.partition('=')
+        values[name.strip()] = value.strip()
+
+    return values
+
+
 @pytest.fixture(scope='module')
 def f_compose() -> ComposeMapping:
     return _load_compose_contract()
+
+
+@pytest.fixture(scope='module')
+def f_env_example() -> EnvMapping:
+    return _load_env_example()
+
+
+def _worker_stop_grace_seconds(config: ComposeMapping) -> float:
+    grace_periods = {
+        _duration_seconds(_service(config, service_name).get('stop_grace_period')) for service_name in WORKER_SERVICES
+    }
+    assert len(grace_periods) == 1, f'workers must share one stop grace period: {grace_periods}'
+
+    return grace_periods.pop()
 
 
 def _service(config: ComposeMapping, name: str) -> ComposeMapping:
@@ -214,7 +260,68 @@ def test_all_workers_are_direct_commands_with_exact_stop_policy(f_compose: Compo
         else:
             assert prefetch_options == []
 
-        _assert_stop_policy(worker, 12 * 60)
+        assert worker.get('stop_signal') == 'SIGTERM'
+
+
+def test_worker_stop_grace_outlasts_the_longest_task_hard_limit(f_compose: ComposeMapping) -> None:
+    required = required_stop_grace_seconds(
+        worker_soft_shutdown_timeout=celeryconfig.worker_soft_shutdown_timeout,
+    )
+
+    grace = _worker_stop_grace_seconds(f_compose)
+
+    assert grace >= required, f'worker stop_grace_period {grace}s must be at least {required}s'
+
+
+def test_worker_stop_grace_outlasts_the_shipped_env_hard_limits(
+    f_compose: ComposeMapping,
+    f_env_example: EnvMapping,
+) -> None:
+    required = required_stop_grace_seconds(
+        f_env_example,
+        worker_soft_shutdown_timeout=celeryconfig.worker_soft_shutdown_timeout,
+    )
+
+    grace = _worker_stop_grace_seconds(f_compose)
+
+    assert grace >= required, f'worker stop_grace_period {grace}s must be at least {required}s'
+
+
+def test_shipped_env_example_keeps_every_work_ladder_strictly_ordered(f_env_example: EnvMapping) -> None:
+    for work_type, spec in WORK_TIMEOUT_SPECS.items():
+        timeouts = resolve_work_timeouts(work_type, f_env_example)
+        socket_timeout = chat_call_ceiling(f_env_example) if spec.chat_calls else embedding_call_ceiling(f_env_example)
+        ladder = (socket_timeout, timeouts.soft_time_limit, timeouts.time_limit, timeouts.lease_seconds)
+
+        assert list(ladder) == sorted(set(ladder)), f'{work_type} ladder must be strictly increasing: {ladder}'
+
+
+def test_shipped_env_example_hosts_the_chained_chat_calls_each_work_type_declares(
+    f_env_example: EnvMapping,
+) -> None:
+    for work_type, spec in WORK_TIMEOUT_SPECS.items():
+        soft_time_limit = resolve_work_timeouts(work_type, f_env_example).soft_time_limit
+        capacity = chat_call_capacity(soft_time_limit, f_env_example)
+
+        assert capacity >= spec.chat_calls, f'{work_type} hosts {capacity} chat calls but chains {spec.chat_calls}'
+
+
+def test_shipped_env_example_lets_every_attempt_start_one_worst_case_chat_call(
+    f_env_example: EnvMapping,
+) -> None:
+    for work_type, spec in WORK_TIMEOUT_SPECS.items():
+        if not spec.chat_calls:
+            continue
+        soft_time_limit = resolve_work_timeouts(work_type, f_env_example).soft_time_limit
+
+        assert chat_call_ceiling(f_env_example) < soft_time_limit, f'{work_type} cannot host one chat call'
+
+
+def test_shipped_env_example_global_task_limits_host_a_queued_chat_call(f_env_example: EnvMapping) -> None:
+    soft_time_limit, time_limit = global_task_timeouts(f_env_example)
+
+    assert soft_time_limit < time_limit
+    assert chat_call_capacity(soft_time_limit, f_env_example) >= 1
 
 
 def test_relay_is_direct_and_its_timeouts_fit_inside_grace(f_compose: ComposeMapping) -> None:

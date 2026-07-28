@@ -12,9 +12,11 @@ services:
       ENGRAM_DATABASE_URL: postgresql://engram:engram@db:5432/engram
       DJANGO_SETTINGS_MODULE: settings.test_settings
       ENGRAM_COMPOSE_CONTRACT_PATH: /srv/deploy/compose/docker-compose.yml
+      ENGRAM_COMPOSE_ENV_EXAMPLE_PATH: /srv/deploy/compose/.env.example
     volumes:
       - ./apps/backend:/srv/app
       - ./deploy/compose/docker-compose.yml:/srv/deploy/compose/docker-compose.yml:ro
+      - ./deploy/compose/.env.example:/srv/deploy/compose/.env.example:ro
     depends_on:
       db:
         condition: service_healthy

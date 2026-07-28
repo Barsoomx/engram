@@ -22,7 +22,7 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
-from engram.core.provider_timeouts import ladder_step_above, soft_time_limit_for
+from engram.core.provider_timeouts import resolve_work_timeouts
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.confidence_decay import DecayMemoryConfidence
@@ -60,67 +60,31 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
-_SINGLE_PROVIDER_CALL = 1
-_CHAINED_PROVIDER_CALLS = 2
 
+_OBSERVATION_TIMEOUTS = resolve_work_timeouts(WorkflowWorkType.OBSERVATION_PROCESSING)
+_DISTILL_TIMEOUTS = resolve_work_timeouts(WorkflowWorkType.SESSION_DISTILLATION)
+_DIGEST_TIMEOUTS = resolve_work_timeouts(WorkflowWorkType.DAILY_DIGEST)
+_CANDIDATE_DECISION_TIMEOUTS = resolve_work_timeouts(WorkflowWorkType.CANDIDATE_DECISION)
+_EMBEDDING_TIMEOUTS = resolve_work_timeouts(WorkflowWorkType.MEMORY_EMBEDDING)
 
-def _limit_seconds(name: str, default: int) -> int:
-    return int(os.environ.get(name, str(default)))
+_OBSERVATION_SOFT_TIME_LIMIT = _OBSERVATION_TIMEOUTS.soft_time_limit
+_OBSERVATION_TIME_LIMIT = _OBSERVATION_TIMEOUTS.time_limit
+_DISTILL_SOFT_TIME_LIMIT = _DISTILL_TIMEOUTS.soft_time_limit
+_DISTILL_TIME_LIMIT = _DISTILL_TIMEOUTS.time_limit
+_DIGEST_SOFT_TIME_LIMIT = _DIGEST_TIMEOUTS.soft_time_limit
+_DIGEST_TIME_LIMIT = _DIGEST_TIMEOUTS.time_limit
+_CANDIDATE_DECISION_SOFT_TIME_LIMIT = _CANDIDATE_DECISION_TIMEOUTS.soft_time_limit
+_CANDIDATE_DECISION_TIME_LIMIT = _CANDIDATE_DECISION_TIMEOUTS.time_limit
+_EMBEDDING_SOFT_TIME_LIMIT = _EMBEDDING_TIMEOUTS.soft_time_limit
+_EMBEDDING_TIME_LIMIT = _EMBEDDING_TIMEOUTS.time_limit
+_DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
+_DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
 
-
-_OBSERVATION_SOFT_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_OBSERVATION_SOFT_TIME_LIMIT',
-    soft_time_limit_for(_SINGLE_PROVIDER_CALL),
-)
-_OBSERVATION_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_OBSERVATION_TIME_LIMIT',
-    ladder_step_above(_OBSERVATION_SOFT_TIME_LIMIT),
-)
-_DISTILL_SOFT_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_DISTILL_SOFT_TIME_LIMIT',
-    soft_time_limit_for(_CHAINED_PROVIDER_CALLS),
-)
-_DISTILL_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_DISTILL_TIME_LIMIT',
-    ladder_step_above(_DISTILL_SOFT_TIME_LIMIT),
-)
-_DECAY_SOFT_TIME_LIMIT = _limit_seconds('ENGRAM_DECAY_SOFT_TIME_LIMIT', 600)
-_DECAY_TIME_LIMIT = _limit_seconds('ENGRAM_DECAY_TIME_LIMIT', 660)
-_DIGEST_SOFT_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_DIGEST_SOFT_TIME_LIMIT',
-    soft_time_limit_for(_SINGLE_PROVIDER_CALL),
-)
-_DIGEST_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_DIGEST_TIME_LIMIT',
-    ladder_step_above(_DIGEST_SOFT_TIME_LIMIT),
-)
-_EMBEDDING_SOFT_TIME_LIMIT = _limit_seconds('ENGRAM_EMBEDDING_SOFT_TIME_LIMIT', 180)
-_EMBEDDING_TIME_LIMIT = _limit_seconds('ENGRAM_EMBEDDING_TIME_LIMIT', 210)
-_CANDIDATE_DECISION_SOFT_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_CANDIDATE_DECISION_SOFT_TIME_LIMIT',
-    soft_time_limit_for(_CHAINED_PROVIDER_CALLS),
-)
-_CANDIDATE_DECISION_TIME_LIMIT = _limit_seconds(
-    'ENGRAM_CANDIDATE_DECISION_TIME_LIMIT',
-    ladder_step_above(_CANDIDATE_DECISION_SOFT_TIME_LIMIT),
-)
-
-_OBSERVATION_LEASE = timedelta(
-    seconds=_limit_seconds('ENGRAM_OBSERVATION_LEASE_SECONDS', ladder_step_above(_OBSERVATION_TIME_LIMIT)),
-)
-_SESSION_LEASE = timedelta(
-    seconds=_limit_seconds('ENGRAM_SESSION_LEASE_SECONDS', ladder_step_above(_DISTILL_TIME_LIMIT)),
-)
-_DIGEST_LEASE = timedelta(
-    seconds=_limit_seconds('ENGRAM_DIGEST_LEASE_SECONDS', ladder_step_above(_DIGEST_TIME_LIMIT)),
-)
-_CANDIDATE_DECISION_LEASE = timedelta(
-    seconds=_limit_seconds(
-        'ENGRAM_CANDIDATE_DECISION_LEASE_SECONDS',
-        ladder_step_above(_CANDIDATE_DECISION_TIME_LIMIT),
-    ),
-)
-_EMBEDDING_LEASE = timedelta(seconds=_limit_seconds('ENGRAM_EMBEDDING_LEASE_SECONDS', 300))
+_OBSERVATION_LEASE = timedelta(seconds=_OBSERVATION_TIMEOUTS.lease_seconds)
+_SESSION_LEASE = timedelta(seconds=_DISTILL_TIMEOUTS.lease_seconds)
+_DIGEST_LEASE = timedelta(seconds=_DIGEST_TIMEOUTS.lease_seconds)
+_CANDIDATE_DECISION_LEASE = timedelta(seconds=_CANDIDATE_DECISION_TIMEOUTS.lease_seconds)
+_EMBEDDING_LEASE = timedelta(seconds=_EMBEDDING_TIMEOUTS.lease_seconds)
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
 

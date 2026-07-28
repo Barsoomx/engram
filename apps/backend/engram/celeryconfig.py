@@ -10,7 +10,7 @@ from django.db.models import Model
 from kombu import Exchange, Queue
 from kombu.utils.json import register_type
 
-from engram.core.provider_timeouts import ladder_step_above, soft_time_limit_for
+from engram.core.provider_timeouts import global_task_timeouts
 from engram.core.redis_sentinel import REDIS_PASS, REDIS_RETRY_KWARGS, REDIS_SENTINELS, REDIS_USE_SENTINEL
 
 HEARTBEAT_FILE = Path('/tmp/engram_celery_worker_heartbeat')  # noqa: S108
@@ -93,8 +93,7 @@ task_routes = {
     'engram.imports.expire_stale_import_jobs': {'queue': QUEUE_BATCH},
 }
 
-task_soft_time_limit = int(os.environ.get('ENGRAM_TASK_SOFT_TIME_LIMIT', str(soft_time_limit_for(1))))
-task_time_limit = int(os.environ.get('ENGRAM_TASK_TIME_LIMIT', str(ladder_step_above(task_soft_time_limit))))
+task_soft_time_limit, task_time_limit = global_task_timeouts()
 
 task_queues = (
     Queue(
