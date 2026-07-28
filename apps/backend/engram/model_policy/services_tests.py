@@ -1269,3 +1269,110 @@ def test_non_overridden_kind_keeps_policy_model_and_pricing() -> None:
     assert json.loads(opener.requests[0].data.decode())['model'] == 'deepseek-v4-pro'
     assert record.model == 'deepseek-v4-pro'
     assert record.cost_metadata['cost_usd'] == '1.305000'
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 - live probes against gpt-5-nano / gpt-5-mini: those models reject
+# 'max_tokens' (400, "use 'max_completion_tokens'") and reject any explicit
+# temperature other than the default. Chat-completion parameter names are
+# therefore per-policy metadata under 'request_shape' - opt-in, so DeepSeek and
+# Anthropic policies keep the historic payload untouched.
+# ---------------------------------------------------------------------------
+
+_GPT5_REQUEST_SHAPE: dict[str, Any] = {
+    'request_shape': {
+        'completion_tokens_param': 'max_completion_tokens',
+        'temperature': None,
+        'reasoning_effort': {'distill_extract.v1': 'minimal'},
+    },
+}
+
+
+def test_resolve_completion_tokens_param_defaults_to_max_tokens() -> None:
+    default_policy = ModelPolicy(provider='deepseek', metadata={})
+    shaped_policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+
+    assert services.resolve_completion_tokens_param(default_policy) == 'max_tokens'
+    assert services.resolve_completion_tokens_param(shaped_policy) == 'max_completion_tokens'
+
+
+def test_resolve_completion_tokens_param_ignores_unknown_param_name() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        metadata={'request_shape': {'completion_tokens_param': 'max_output_tokens'}},
+    )
+
+    assert services.resolve_completion_tokens_param(policy) == 'max_tokens'
+
+
+def test_resolve_temperature_defaults_and_explicit_omission() -> None:
+    default_policy = ModelPolicy(provider='deepseek', metadata={})
+    omitting_policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+    tuned_policy = ModelPolicy(provider='openai', metadata={'request_shape': {'temperature': 0.7}})
+
+    assert services.resolve_temperature(default_policy) == 0.2
+    assert services.resolve_temperature(omitting_policy) is None
+    assert services.resolve_temperature(tuned_policy) == 0.7
+
+
+def test_resolve_temperature_ignores_malformed_value() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'request_shape': {'temperature': 'hot'}})
+
+    assert services.resolve_temperature(policy) == 0.2
+
+
+def test_resolve_reasoning_effort_is_scoped_to_response_kind() -> None:
+    policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+    unshaped_policy = ModelPolicy(provider='deepseek', metadata={})
+
+    assert services.resolve_reasoning_effort(policy, 'distill_extract.v1') == 'minimal'
+    assert services.resolve_reasoning_effort(policy, 'curation_decision_v1') == ''
+    assert services.resolve_reasoning_effort(unshaped_policy, 'distill_extract.v1') == ''
+
+
+def test_malformed_request_shape_falls_back_to_defaults() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'request_shape': 'flex'})
+
+    assert services.resolve_completion_tokens_param(policy) == 'max_tokens'
+    assert services.resolve_temperature(policy) == 0.2
+    assert services.resolve_reasoning_effort(policy, 'distill_extract.v1') == ''
+
+
+@pytest.mark.django_db
+def test_policy_without_request_shape_keeps_max_tokens_and_temperature() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek')
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{"memories": []}'), 'distill_extract.v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['max_tokens'] == effective_completion_cap(policy, 'distill_extract.v1')
+    assert 'max_completion_tokens' not in sent
+    assert sent['temperature'] == 0.2
+    assert 'reasoning_effort' not in sent
+
+
+@pytest.mark.django_db
+def test_request_shape_renames_completion_cap_and_drops_temperature() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_GPT5_REQUEST_SHAPE)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{"memories": []}'), 'distill_extract.v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'distill_extract.v1')
+    assert 'max_tokens' not in sent
+    assert 'temperature' not in sent
+    assert sent['reasoning_effort'] == 'minimal'
+
+
+@pytest.mark.django_db
+def test_request_shape_sends_reasoning_effort_only_for_configured_kind() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_GPT5_REQUEST_SHAPE)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert 'reasoning_effort' not in sent
+    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v1')

@@ -1575,6 +1575,95 @@ def effective_completion_cap(policy: ModelPolicy, response_kind: str) -> int:
     return min(cap, clamp) if clamp is not None else cap
 
 
+_DEFAULT_TEMPERATURE = 0.2
+_DEFAULT_COMPLETION_TOKENS_PARAM = 'max_tokens'
+_COMPLETION_TOKENS_PARAMS = frozenset({'max_tokens', 'max_completion_tokens'})
+
+
+def _request_shape(policy: ModelPolicy) -> dict[str, Any]:
+    metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
+    shape = metadata.get('request_shape')
+    if isinstance(shape, dict):
+        return shape
+
+    if shape is not None:
+        logger.warning(
+            'provider_request_shape_malformed',
+            policy_id=str(policy.id),
+            reason='not_a_mapping',
+        )
+
+    return {}
+
+
+def resolve_completion_tokens_param(policy: ModelPolicy) -> str:
+    raw = _request_shape(policy).get('completion_tokens_param')
+    if isinstance(raw, str) and raw in _COMPLETION_TOKENS_PARAMS:
+        return raw
+
+    if raw is not None:
+        logger.warning(
+            'provider_request_shape_malformed',
+            policy_id=str(policy.id),
+            field='completion_tokens_param',
+        )
+
+    return _DEFAULT_COMPLETION_TOKENS_PARAM
+
+
+def resolve_temperature(policy: ModelPolicy) -> float | None:
+    shape = _request_shape(policy)
+    if 'temperature' not in shape:
+        return _DEFAULT_TEMPERATURE
+
+    raw = shape['temperature']
+    if raw is None:
+        return None
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        logger.warning(
+            'provider_request_shape_malformed',
+            policy_id=str(policy.id),
+            field='temperature',
+        )
+
+        return _DEFAULT_TEMPERATURE
+
+    return float(raw)
+
+
+def resolve_reasoning_effort(policy: ModelPolicy, response_kind: str) -> str:
+    if not response_kind:
+        return ''
+
+    efforts = _request_shape(policy).get('reasoning_effort')
+    if efforts is None:
+        return ''
+
+    if not isinstance(efforts, dict):
+        logger.warning(
+            'provider_request_shape_malformed',
+            policy_id=str(policy.id),
+            field='reasoning_effort',
+        )
+
+        return ''
+
+    effort = efforts.get(response_kind)
+    if isinstance(effort, str) and effort.strip():
+        return effort.strip()
+
+    if effort is not None:
+        logger.warning(
+            'provider_request_shape_malformed',
+            policy_id=str(policy.id),
+            field='reasoning_effort',
+            response_kind=response_kind,
+        )
+
+    return ''
+
+
 def resolve_context_window_tokens(policy: ModelPolicy) -> int | None:
     metadata = policy.metadata if isinstance(policy.metadata, dict) else {}
     override = metadata.get('context_window_tokens')
@@ -1645,7 +1734,10 @@ class OpenAICompatibleGateway:
         extra: dict[str, object] = {}
         extra.update(deepseek_thinking_override(policy.provider, policy.task_type, data.response_kind))
         extra.update(openai_json_mode_override(data.response_kind, policy))
-        extra['max_tokens'] = effective_completion_cap(policy, data.response_kind)
+        extra[resolve_completion_tokens_param(policy)] = effective_completion_cap(policy, data.response_kind)
+        reasoning_effort = resolve_reasoning_effort(policy, data.response_kind)
+        if reasoning_effort:
+            extra['reasoning_effort'] = reasoning_effort
         effective_model = resolve_model(policy, data.response_kind)
         started_at = time.monotonic()
         try:
@@ -1654,6 +1746,7 @@ class OpenAICompatibleGateway:
                 prompt_text,
                 system_prompt=data.system_prompt,
                 extra=extra,
+                temperature=resolve_temperature(policy),
             )
         except ModelPolicyError as error:
             self._record_error(data, policy, error, latency_ms=_elapsed_ms(started_at))
@@ -1783,6 +1876,7 @@ class OpenAICompatibleGateway:
         prompt: str,
         system_prompt: str = '',
         extra: dict[str, object] | None = None,
+        temperature: float | None = _DEFAULT_TEMPERATURE,
     ) -> tuple[str, dict[str, int] | None, str]:
         messages: list[dict[str, str]] = []
         if system_prompt:
@@ -1791,8 +1885,9 @@ class OpenAICompatibleGateway:
         payload_dict: dict[str, object] = {
             'model': model,
             'messages': messages,
-            'temperature': 0.2,
         }
+        if temperature is not None:
+            payload_dict['temperature'] = temperature
         if extra:
             payload_dict.update(extra)
         payload = json.dumps(payload_dict).encode()
