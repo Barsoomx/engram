@@ -22,6 +22,7 @@ from engram.core.models import (
     WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
+from engram.core.provider_timeouts import ladder_step_above, soft_time_limit_for
 from engram.memory.candidate_ttl import ExpireStaleCandidates
 from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.confidence_decay import DecayMemoryConfidence
@@ -59,24 +60,67 @@ logger = structlog.get_logger(__name__)
 
 _RETRY_BACKOFF_BASE = 5
 _MAX_RETRIES = 3
-_OBSERVATION_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_OBSERVATION_SOFT_TIME_LIMIT', '60'))
-_OBSERVATION_TIME_LIMIT = int(os.environ.get('ENGRAM_OBSERVATION_TIME_LIMIT', '90'))
-_DISTILL_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_SOFT_TIME_LIMIT', '600'))
-_DISTILL_TIME_LIMIT = int(os.environ.get('ENGRAM_DISTILL_TIME_LIMIT', '660'))
-_DECAY_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_SOFT_TIME_LIMIT', '600'))
-_DECAY_TIME_LIMIT = int(os.environ.get('ENGRAM_DECAY_TIME_LIMIT', '660'))
-_DIGEST_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_SOFT_TIME_LIMIT', '180'))
-_DIGEST_TIME_LIMIT = int(os.environ.get('ENGRAM_DIGEST_TIME_LIMIT', '210'))
-_EMBEDDING_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_SOFT_TIME_LIMIT', '180'))
-_EMBEDDING_TIME_LIMIT = int(os.environ.get('ENGRAM_EMBEDDING_TIME_LIMIT', '210'))
-_CANDIDATE_DECISION_SOFT_TIME_LIMIT = int(os.environ.get('ENGRAM_CANDIDATE_DECISION_SOFT_TIME_LIMIT', '240'))
-_CANDIDATE_DECISION_TIME_LIMIT = int(os.environ.get('ENGRAM_CANDIDATE_DECISION_TIME_LIMIT', '270'))
+_SINGLE_PROVIDER_CALL = 1
+_CHAINED_PROVIDER_CALLS = 2
 
-_OBSERVATION_LEASE = timedelta(seconds=120)
-_SESSION_LEASE = timedelta(seconds=720)
-_DIGEST_LEASE = timedelta(seconds=240)
-_CANDIDATE_DECISION_LEASE = timedelta(seconds=300)
-_EMBEDDING_LEASE = timedelta(seconds=300)
+
+def _limit_seconds(name: str, default: int) -> int:
+    return int(os.environ.get(name, str(default)))
+
+
+_OBSERVATION_SOFT_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_OBSERVATION_SOFT_TIME_LIMIT',
+    soft_time_limit_for(_SINGLE_PROVIDER_CALL),
+)
+_OBSERVATION_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_OBSERVATION_TIME_LIMIT',
+    ladder_step_above(_OBSERVATION_SOFT_TIME_LIMIT),
+)
+_DISTILL_SOFT_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_DISTILL_SOFT_TIME_LIMIT',
+    soft_time_limit_for(_CHAINED_PROVIDER_CALLS),
+)
+_DISTILL_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_DISTILL_TIME_LIMIT',
+    ladder_step_above(_DISTILL_SOFT_TIME_LIMIT),
+)
+_DECAY_SOFT_TIME_LIMIT = _limit_seconds('ENGRAM_DECAY_SOFT_TIME_LIMIT', 600)
+_DECAY_TIME_LIMIT = _limit_seconds('ENGRAM_DECAY_TIME_LIMIT', 660)
+_DIGEST_SOFT_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_DIGEST_SOFT_TIME_LIMIT',
+    soft_time_limit_for(_SINGLE_PROVIDER_CALL),
+)
+_DIGEST_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_DIGEST_TIME_LIMIT',
+    ladder_step_above(_DIGEST_SOFT_TIME_LIMIT),
+)
+_EMBEDDING_SOFT_TIME_LIMIT = _limit_seconds('ENGRAM_EMBEDDING_SOFT_TIME_LIMIT', 180)
+_EMBEDDING_TIME_LIMIT = _limit_seconds('ENGRAM_EMBEDDING_TIME_LIMIT', 210)
+_CANDIDATE_DECISION_SOFT_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_CANDIDATE_DECISION_SOFT_TIME_LIMIT',
+    soft_time_limit_for(_CHAINED_PROVIDER_CALLS),
+)
+_CANDIDATE_DECISION_TIME_LIMIT = _limit_seconds(
+    'ENGRAM_CANDIDATE_DECISION_TIME_LIMIT',
+    ladder_step_above(_CANDIDATE_DECISION_SOFT_TIME_LIMIT),
+)
+
+_OBSERVATION_LEASE = timedelta(
+    seconds=_limit_seconds('ENGRAM_OBSERVATION_LEASE_SECONDS', ladder_step_above(_OBSERVATION_TIME_LIMIT)),
+)
+_SESSION_LEASE = timedelta(
+    seconds=_limit_seconds('ENGRAM_SESSION_LEASE_SECONDS', ladder_step_above(_DISTILL_TIME_LIMIT)),
+)
+_DIGEST_LEASE = timedelta(
+    seconds=_limit_seconds('ENGRAM_DIGEST_LEASE_SECONDS', ladder_step_above(_DIGEST_TIME_LIMIT)),
+)
+_CANDIDATE_DECISION_LEASE = timedelta(
+    seconds=_limit_seconds(
+        'ENGRAM_CANDIDATE_DECISION_LEASE_SECONDS',
+        ladder_step_above(_CANDIDATE_DECISION_TIME_LIMIT),
+    ),
+)
+_EMBEDDING_LEASE = timedelta(seconds=_limit_seconds('ENGRAM_EMBEDDING_LEASE_SECONDS', 300))
 _LEASE_OWNER_MAX = 255
 _NON_EXECUTING_CLAIM_OUTCOMES = frozenset({'terminal', 'busy', 'not_due', 'blocked'})
 
