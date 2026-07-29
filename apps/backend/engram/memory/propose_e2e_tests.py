@@ -11,6 +11,7 @@ from engram.core.models import (
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
+    MemoryConflict,
     Organization,
     Project,
     ProjectTeam,
@@ -20,7 +21,6 @@ from engram.core.models import (
     WorkflowRunStatus,
     WorkflowSubjectType,
     WorkflowWork,
-    WorkflowWorkExecutionState,
     WorkflowWorkType,
 )
 from engram.memory import c53_orchestrator_test_support as orch
@@ -259,7 +259,9 @@ def test_agent_proposal_team_publish_new_creates_team_visible_memory(monkeypatch
 
 
 @pytest.mark.django_db
-def test_agent_proposal_cross_visibility_open_conflict_terminates(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_agent_proposal_cross_visibility_conflict_claim_never_mutates_the_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from engram.memory import curation_judge
     from engram.model_policy.services import OpenAICompatibleGateway
 
@@ -315,14 +317,15 @@ def test_agent_proposal_cross_visibility_open_conflict_terminates(monkeypatch: p
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
     monkeypatch.setattr(curation_judge, 'get_provider_gateway', lambda *_a, **_k: gateway)
 
-    _result, error = orch.run_decision(work, run)
+    before = (target.current_version, target.current_transition_id, target.status)
 
-    assert error is not None
-    assert getattr(error, 'code', None) == 'judge_cross_visibility_denied'
-    work.refresh_from_db()
-    assert work.execution_state == WorkflowWorkExecutionState.TERMINAL_FAILURE
+    _result, _error = orch.run_decision(work, run)
+
     candidate.refresh_from_db()
+    target.refresh_from_db()
     assert candidate.status != CandidateStatus.PROMOTED
+    assert (target.current_version, target.current_transition_id, target.status) == before
+    assert not MemoryConflict.objects.filter(memory_version_id=target_version.id).exists()
 
 
 @pytest.mark.django_db

@@ -60,6 +60,7 @@ _CURATION_TRANSITION_CODE_MAP = {
     'judge_policy_unavailable': (CONFIGURATION, 'judge_policy_unavailable'),
     'candidate_decision_capability_unavailable': (CONFIGURATION, 'candidate_decision_capability_unavailable'),
     'rollout_not_enabled': (CONFIGURATION, 'rollout_not_enabled'),
+    'curation_infeasible': (INFRASTRUCTURE_TRANSIENT, 'curation_infeasible'),
     'evidence_unavailable': (INFRASTRUCTURE_TRANSIENT, 'evidence_unavailable'),
     'shortlist_query_failed': (INFRASTRUCTURE_TRANSIENT, 'shortlist_query_failed'),
     'transition_dependency_unavailable': (INFRASTRUCTURE_TRANSIENT, 'transition_dependency_unavailable'),

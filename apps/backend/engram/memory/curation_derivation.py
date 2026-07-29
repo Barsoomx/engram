@@ -189,8 +189,7 @@ def _suppressed(
     return tuple(
         (target.memory_version_id, relations[target.memory_version_id])
         for target in facts.targets
-        if target.memory_version_id != selected_id
-        and relations.get(target.memory_version_id) in _IDENTITY_RELATIONS
+        if target.memory_version_id != selected_id and relations.get(target.memory_version_id) in _IDENTITY_RELATIONS
     )
 
 

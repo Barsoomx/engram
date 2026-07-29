@@ -142,8 +142,7 @@ def _judge_input(
 
 def _relations(data: CurationJudgeInput, assignment: tuple[str, ...]) -> dict[uuid.UUID, str]:
     return {
-        entry.memory_version_id: relation
-        for entry, relation in zip(data.shortlist.entries, assignment, strict=True)
+        entry.memory_version_id: relation for entry, relation in zip(data.shortlist.entries, assignment, strict=True)
     }
 
 

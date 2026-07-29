@@ -6,6 +6,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
+import structlog
+
 from engram.core.models import (
     MemoryCandidate,
     MemoryCandidateSource,
@@ -14,6 +16,13 @@ from engram.core.models import (
 )
 from engram.core.redaction import SECRET_STRING_RE, redact_value
 from engram.memory.candidate_parsing import strip_json_fence, truncate_with_marker
+from engram.memory.curation_derivation import (
+    DerivationFacts,
+    DerivedDecision,
+    build_derivation_facts,
+    derive_decision,
+    feasible_outcomes,
+)
 from engram.memory.curation_shortlist import CurationShortlist, CurationShortlistEntry
 from engram.memory.deterministic_gates import EffectiveCandidateScope, SanitizedCandidateView
 from engram.memory.distillation_provenance import ProvenanceContractError, canonical_source_manifest
@@ -25,6 +34,8 @@ from engram.model_policy.services import (
     ResolveModelPolicyInput,
     get_provider_gateway,
 )
+
+logger = structlog.get_logger(__name__)
 
 
 class CurationJudgeError(ValueError):
@@ -114,9 +125,6 @@ _TOP_KEYS = frozenset(
     }
 )
 _COMPARISON_KEYS = frozenset({'memory_version_id', 'relation', 'target_evidence_refs'})
-_OUTCOMES = frozenset(
-    {'publish_new', 'merge_evidence', 'revise_memory', 'supersede_memory', 'reject_candidate', 'open_conflict'}
-)
 _RELATIONS = frozenset(
     {
         'unrelated',
@@ -129,19 +137,7 @@ _RELATIONS = frozenset(
         'mutually_incompatible',
     }
 )
-_REASON_CODES = frozenset(
-    {
-        'distinct_claim',
-        'equivalent_claim',
-        'same_subject_revision',
-        'ordered_replacement',
-        'redundant_claim',
-        'unsupported_claim',
-        'same_scope_contradiction',
-    }
-)
 _APPLICABILITY = frozenset({'same', 'different'})
-_TEMPORAL_ORDERS = frozenset({'candidate_newer', 'target_newer', 'unordered', 'not_applicable'})
 _ALLOWED_COMBINATIONS = {
     ('publish_new', 'unrelated'): False,
     ('publish_new', 'compatible_distinct'): False,
@@ -154,10 +150,6 @@ _ALLOWED_COMBINATIONS = {
 }
 _SUPPORTED_TIERS = frozenset({'supported', 'corroborated'})
 _MUTATION_OUTCOMES = frozenset({'merge_evidence', 'open_conflict', 'revise_memory', 'supersede_memory'})
-_IDENTITY_RELATIONS = frozenset(
-    {'equivalent', 'candidate_revises', 'candidate_supersedes', 'redundant', 'mutually_incompatible'}
-)
-_TARGETLESS_OUTCOMES = frozenset({'publish_new', 'reject_candidate'})
 
 _CURATION_JUDGE_SYSTEM_PROMPT = (
     'You are the memory curation judge. The user message is a curation_judge_input.v1 JSON envelope, and the '
@@ -495,7 +487,7 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
         raise CurationJudgeError('judge_policy_denied')
 
 
-def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:  # noqa: C901
+def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:
     try:
         payload = json.loads(strip_json_fence(raw))
     except (json.JSONDecodeError, TypeError, ValueError) as error:
@@ -505,59 +497,60 @@ def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> Curation
         raise CurationJudgeError('judge_invalid_output')
     if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
         raise CurationJudgeError('judge_invalid_output')
-    if not (
-        _is_enum(payload['outcome'], _OUTCOMES)
-        and _is_enum(payload['relation'], _RELATIONS)
-        and _is_enum(payload['applicability'], _APPLICABILITY)
-        and _is_enum(payload['temporal_order'], _TEMPORAL_ORDERS)
-        and _is_enum(payload['reason_code'], _REASON_CODES)
-    ):
+    if not _is_enum(payload['applicability'], _APPLICABILITY):
         raise CurationJudgeError('judge_invalid_output')
 
     version_ids = tuple(entry.memory_version_id for entry in data.shortlist.entries)
-    target_raw = payload['target_memory_version_id']
-    target_id: uuid.UUID | None = None
-    if target_raw is not None:
-        target_id = _parse_uuid(target_raw)
-        if target_id not in set(version_ids):
+    if payload['target_memory_version_id'] is not None:
+        if _parse_uuid(payload['target_memory_version_id']) not in set(version_ids):
             raise CurationJudgeError('judge_invalid_output')
 
     candidate_refs = _validate_refs(payload['candidate_evidence_refs'], set(data.evidence.candidate.refs))
     comparisons = _validate_comparisons(payload['comparisons'], data, version_ids)
 
-    if target_id is not None:
-        selected = next((item for item in comparisons if item.memory_version_id == target_id), None)
-        if selected is None or selected.relation != payload['relation']:
-            raise CurationJudgeError('judge_invalid_output')
-    elif payload['outcome'] in _TARGETLESS_OUTCOMES:
-        candidate_pair = (data.effective_scope.visibility_scope, data.effective_scope.team_id)
-        entries_by_version = {entry.memory_version_id: entry for entry in data.shortlist.entries}
-        for comparison in comparisons:
-            if comparison.relation not in _IDENTITY_RELATIONS:
-                continue
-            entry = entries_by_version.get(comparison.memory_version_id)
-            if entry is None or (entry.visibility_scope, entry.team_id) == candidate_pair:
-                raise CurationJudgeError('judge_invalid_output')
-
     reason = payload['reason']
     if not isinstance(reason, str) or not (1 <= len(reason) <= 500) or SECRET_STRING_RE.search(reason):
         raise CurationJudgeError('judge_invalid_output')
 
+    applicability = payload['applicability']
+    facts = build_derivation_facts(data)
+    relations = {item.memory_version_id: item.relation for item in comparisons}
+    decision = derive_decision(facts, relations, applicability)
+    if decision is None:
+        raise CurationJudgeError('curation_infeasible')
+
     verdict = CurationJudgeVerdictV1(
         schema_version=1,
-        outcome=payload['outcome'],
-        relation=payload['relation'],
-        target_memory_version_id=target_id,
+        outcome=decision.outcome,
+        relation=decision.relation,
+        target_memory_version_id=decision.target_memory_version_id,
         candidate_evidence_refs=candidate_refs,
         comparisons=comparisons,
-        applicability=payload['applicability'],
-        temporal_order=payload['temporal_order'],
-        reason_code=payload['reason_code'],
+        applicability=applicability,
+        temporal_order=decision.temporal_order,
+        reason_code=decision.reason_code,
         reason=reason,
     )
     _apply_evidence_policy(verdict, data)
+    _log_derived_decision(decision, facts)
 
     return verdict
+
+
+def _log_derived_decision(decision: DerivedDecision, facts: DerivationFacts) -> None:
+    target = next(
+        (item for item in facts.targets if item.memory_version_id == decision.target_memory_version_id),
+        None,
+    )
+    logger.info(
+        'curation_decision_derived',
+        outcome=decision.outcome,
+        rung=decision.rung,
+        candidate_tier=facts.candidate_tier,
+        target_tier=target.tier if target is not None else 'none',
+        comparison_complete=facts.comparison_complete,
+        suppressed_identity_relation_count=len(decision.suppressed_identity_relations),
+    )
 
 
 def _iter_strings(value: object) -> list[str]:
@@ -638,6 +631,9 @@ def _fallback_eligible(error: CurationJudgeError | ModelPolicyError) -> bool:
 
 class JudgeCurationCandidate:
     def execute(self, data: CurationJudgeInput) -> CurationJudgeResult:
+        if not feasible_outcomes(build_derivation_facts(data)):
+            raise CurationJudgeError('curation_infeasible')
+
         team_id = self._candidate_team(data)
         prompt = build_curation_judge_prompt(data)
         primary = self._resolve_policy(data, team_id, 'curation')
