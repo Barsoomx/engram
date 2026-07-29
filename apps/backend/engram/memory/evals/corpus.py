@@ -596,6 +596,51 @@ def _lookalike_cases() -> list[dict[str, object]]:
     return cases
 
 
+def _unsupported_supersession_cases() -> list[dict[str, object]]:
+    case_id = 'supersede-unsupported-000'
+    candidate = _candidate(
+        case_id,
+        title='Primary datastore choice',
+        body='The primary datastore for sessions moved to a managed cluster.',
+        tier='none',
+        refs=[],
+        latest=_LATER,
+    )
+    entry = _entry(
+        case_id,
+        0,
+        title='Primary datastore choice',
+        body='The primary datastore for sessions is Postgres.',
+        tier='supported',
+        refs=[f'{case_id}-t1'],
+        latest=_EARLIER,
+    )
+    case_input = _input(case_id, candidate, _scope(), _shortlist(case_id, [entry]))
+    verdict = _verdict(
+        outcome='supersede_memory',
+        relation='candidate_supersedes',
+        target=str(entry['memory_version_id']),
+        candidate_refs=[],
+        comparisons=[_comparison(entry, 'candidate_supersedes', [f'{case_id}-t1'])],
+        temporal_order='candidate_newer',
+        reason_code='ordered_replacement',
+    )
+
+    return [
+        _case(
+            case_id,
+            'safe_supersession',
+            gate='semantic',
+            allowed_outcomes=['reject_candidate'],
+            forbidden_outcomes=['publish_new', 'merge_evidence', 'revise_memory', 'supersede_memory', 'open_conflict'],
+            primary_outcome='reject_candidate',
+            case_input=case_input,
+            fixture_verdict=verdict,
+            min_evidence_tier='none',
+        )
+    ]
+
+
 def _fault_cases() -> list[dict[str, object]]:
     cases: list[dict[str, object]] = []
     templates = [
@@ -603,7 +648,7 @@ def _fault_cases() -> list[dict[str, object]]:
         ('fault-schema', {'schema_version': 1, 'outcome': 'publish_new'}),
         ('fault-target', 'invented_target'),
         ('fault-evidence', 'invented_evidence'),
-        ('fault-policy', 'weak_destructive'),
+        ('fault-comparisons', 'unmanifested_comparison'),
     ]
     for index, (prefix, marker) in enumerate(templates):
         case_id = f'{prefix}-{index:03d}'
@@ -611,8 +656,8 @@ def _fault_cases() -> list[dict[str, object]]:
             case_id,
             title='Retention window',
             body='Audit logs are retained for ninety days before archival.',
-            tier='corroborated' if marker != 'weak_destructive' else 'none',
-            refs=_refs(case_id, 'c', 2) if marker != 'weak_destructive' else [],
+            tier='corroborated',
+            refs=_refs(case_id, 'c', 2),
             latest=_LATER,
         )
         entry = _entry(
@@ -649,14 +694,18 @@ def _fault_cases() -> list[dict[str, object]]:
             )
         else:
             fixture_verdict = _verdict(
-                outcome='supersede_memory',
-                relation='candidate_supersedes',
+                outcome='merge_evidence',
+                relation='equivalent',
                 target=str(entry['memory_version_id']),
-                candidate_refs=[],
-                comparisons=[_comparison(entry, 'candidate_supersedes', [f'{case_id}-t1'])],
-                applicability='same',
-                temporal_order='candidate_newer',
-                reason_code='ordered_replacement',
+                candidate_refs=_refs(case_id, 'c', 2),
+                comparisons=[
+                    {
+                        'memory_version_id': str(_uid(f'{case_id}:phantom')),
+                        'relation': 'equivalent',
+                        'target_evidence_refs': [],
+                    }
+                ],
+                reason_code='equivalent_claim',
             )
         cases.append(
             _case(
@@ -749,6 +798,7 @@ def build_corpus() -> list[dict[str, object]]:
             min_evidence_tier='corroborated',
         )
     )
+    cases.extend(_unsupported_supersession_cases())
     cases.extend(
         _semantic_bucket_cases(
             'genuine_conflict',
