@@ -861,7 +861,10 @@ def _provider_call_record_matches(
         and record.policy_version == stage.policy_version
         and record.secret_id == stage.policy.secret_id
         and record.provider == stage.policy.provider == result.provider
-        and record.model == stage.policy.model == result.model
+        # Not stage.policy.model: the gateway resolves the effective model per response kind, so a
+        # per-kind override made this leg disagree with itself and discarded every paid call.
+        # policy_id and policy_version above already pin the record to this stage's policy.
+        and record.model == result.model
         and record.task_type == stage.policy.task_type
         and record.request_id == request_id
         and record.redaction_state == result.redaction_state
@@ -882,6 +885,13 @@ def _call_provider(
     except Exception as error:
         if isinstance(error, StaleWorkFenceError):
             raise
+        logger.warning(
+            'distillation_provider_call_failed',
+            stage_id=str(stage.id),
+            request_id=request_id,
+            error_type=type(error).__name__,
+        )
+
         return _ProviderErrorOutcome(
             error,
             _new_provider_call_ids(stage=stage, request_id=request_id, before=prior_call_ids),
@@ -1237,11 +1247,7 @@ def _classify_provider_error(error: BaseException, stage: DistillationStage) -> 
     fingerprint = execution_configuration_fingerprint(stage.window.work)
     translated = translate_failure(error, configuration_fingerprint=fingerprint)
 
-    return ClassifiedWorkFailure(
-        failure_class=translated.failure_class,
-        code=translated.code,
-        configuration_fingerprint=translated.configuration_fingerprint,
-    )
+    return translated
 
 
 def _try_fallback(

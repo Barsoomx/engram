@@ -1961,9 +1961,12 @@ def test_mismatched_provider_call_record_cannot_complete_stage(
 
     result = dps.execute_distillation_stage(stage, claim, now=now)
 
-    assert result.status == 'retry'
+    # Blocked, not retried: the provider call already succeeded and was billed, so a retry buys another
+    # one and discards it too. On the stand this pattern spent ~840 calls for no output.
+    assert result.status == 'blocked'
     assert result.failure is not None
-    assert result.failure.code == 'unexpected_exception'
+    assert result.failure.code == 'provider_call_record_missing'
+    assert result.failure.redacted_detail
     assert DistillationStage.objects.get(id=stage.id).status == 'required'
 
 
@@ -2219,3 +2222,21 @@ def test_extraction_still_rejects_genuinely_unknown_keys() -> None:
 
     with pytest.raises(ExtractionContractError):
         parse_extraction_output(payload, chunk_observation_ids={'obs-1'})
+
+
+# The classifier rebuilt ClassifiedWorkFailure field by field and dropped redacted_detail, so every
+# persisted failure_reason on this path was empty and the real cause was invisible in the DB.
+
+
+def test_provider_error_classification_keeps_the_redacted_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from engram.memory import distillation_provider_stage as module
+
+    monkeypatch.setattr(module, 'execution_configuration_fingerprint', lambda _work: 'a' * 64)
+    stage = SimpleNamespace(window=SimpleNamespace(work=object()))
+
+    failure = module._classify_provider_error(TimeoutError('provider was slow'), stage)
+
+    assert failure.failure_class == 'infrastructure_transient'
+    assert failure.redacted_detail
