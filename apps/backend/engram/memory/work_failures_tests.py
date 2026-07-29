@@ -448,3 +448,18 @@ def test_translate_failure_maps_scope_to_invalid_input() -> None:
     assert failure.failure_class == 'invalid_input'
     assert failure.code == 'scope'
     assert failure.configuration_fingerprint == ''
+
+
+# A provenance mismatch is a configuration defect (the policy and the gateway disagree on the model),
+# not a transient provider fault. Left unmapped it degraded to `unexpected_exception` and retried,
+# and every retry bought another provider call that was then discarded — 840 paid calls on the stand.
+
+
+def test_provider_call_record_missing_is_configuration_not_transient() -> None:
+    failure = _wf().translate_failure(
+        ModelPolicyError('provider_call_record_missing', 'provider call provenance is unavailable'),
+        configuration_fingerprint=HEX64,
+    )
+
+    assert failure.failure_class == 'configuration'
+    assert failure.code == 'provider_call_record_missing'

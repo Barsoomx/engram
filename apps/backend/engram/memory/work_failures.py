@@ -41,6 +41,7 @@ _MODEL_POLICY_CODE_MAP = {
     'policy_scope_mismatch': (CONFIGURATION, 'policy_scope_invalid'),
     'team_required': (CONFIGURATION, 'policy_scope_invalid'),
     'secret_scope_denied': (CONFIGURATION, 'provider_secret_unavailable'),
+    'provider_call_record_missing': (CONFIGURATION, 'provider_call_record_missing'),
 }
 
 _CURATION_TRANSITION_CODE_MAP = {
