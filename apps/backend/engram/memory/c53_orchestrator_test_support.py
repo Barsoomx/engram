@@ -296,7 +296,10 @@ def disable_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
 def _stub_revalidate(data: Any, shortlist: CurationShortlist) -> bool:
     from engram.memory.curation_shortlist import _authorized_memories
 
-    if _authorized_memories(data).count() != shortlist.authorized_corpus_count:
+    frozen_ids = [entry.memory_id for entry in shortlist.entries]
+    # Stands in for "a newly authorized memory would now rank into this shortlist": the real predicate
+    # rebuilds the shortlist, which stubbed settle tests cannot do, so a title match models the hit.
+    if _authorized_memories(data).exclude(id__in=frozen_ids).filter(title=data.title).exists():
         return False
     if not shortlist.entries:
         return True
