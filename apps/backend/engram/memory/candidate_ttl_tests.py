@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 import pytest
 from django.utils import timezone
 from django_celery_outbox.models import CeleryOutbox
-from pytest_django.fixtures import SettingsWrapper
 
 from engram.core.models import (
     AuditEvent,
@@ -16,10 +15,13 @@ from engram.core.models import (
     MemoryConflict,
     MemoryLink,
     Organization,
-    OrganizationSettings,
     Project,
     WorkflowRun,
+    WorkflowSubjectType,
     WorkflowWork,
+    WorkflowWorkDisposition,
+    WorkflowWorkExecutionState,
+    WorkflowWorkType,
 )
 from engram.memory import candidate_work_reconciler
 from engram.memory.candidate_decision_work import evidence_manifest
@@ -32,7 +34,13 @@ from engram.memory.candidate_decision_work_tests import (
 from engram.memory.candidate_decision_work_tests import (
     _scope as _decision_scope,
 )
-from engram.memory.candidate_ttl import ExpireStaleCandidates
+from engram.memory.candidate_ttl import (
+    TTL_REASON,
+    ExpireStaleCandidates,
+    candidate_review_ttl_days,
+    candidate_ttl_batch,
+    candidate_ttl_dry_run,
+)
 from engram.memory.candidate_work_reconciler import ReconcileCandidateDecisionWork
 from engram.memory.curation import CurateMemoryCandidate, CurateMemoryCandidateInput
 from engram.memory.curation_test_support import (
@@ -80,6 +88,22 @@ def _make_candidate(
     return candidate
 
 
+def _decision_work(candidate: MemoryCandidate, *, execution_state: str) -> WorkflowWork:
+    return WorkflowWork.objects.create(
+        organization=candidate.organization,
+        project=candidate.project,
+        team=candidate.team,
+        work_type=WorkflowWorkType.CANDIDATE_DECISION,
+        subject_type=WorkflowSubjectType.MEMORY_CANDIDATE,
+        subject_id=candidate.id,
+        input_fingerprint=f'{candidate.id.int:064x}'[:64],
+        input_snapshot={'schema': 'candidate_decision_input/v1', 'candidate_id': str(candidate.id)},
+        disposition=WorkflowWorkDisposition.REQUIRED,
+        execution_state=execution_state,
+        next_retry_at=(timezone.now() if execution_state == WorkflowWorkExecutionState.RETRY_WAIT else None),
+    )
+
+
 @pytest.fixture
 def f_org() -> Organization:
     return Organization.objects.create(name='Sweep', slug='sweep')
@@ -90,50 +114,215 @@ def f_project(f_org: Organization) -> Project:
     return Project.objects.create(organization=f_org, name='Eng', slug='eng')
 
 
+def test_ttl_settings_read_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', raising=False)
+    monkeypatch.delenv('ENGRAM_CANDIDATE_TTL_BATCH', raising=False)
+
+    assert candidate_review_ttl_days() == 30
+    assert candidate_ttl_batch() == 500
+
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '7')
+    monkeypatch.setenv('ENGRAM_CANDIDATE_TTL_BATCH', '9')
+
+    assert candidate_review_ttl_days() == 7
+    assert candidate_ttl_batch() == 9
+
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '0')
+    with pytest.raises(ValueError):
+        candidate_review_ttl_days()
+
+
 @pytest.mark.django_db
-def test_candidate_ttl_never_rejects_or_audits_old_low_confidence_candidate(
+def test_stale_proposed_candidate_is_expired_with_an_audit_trail(
     f_org: Organization,
     f_project: Project,
-    settings: SettingsWrapper,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
 
-    candidate = _make_candidate(
-        f_org,
-        f_project,
-        confidence='0.300',
-        created_at=timezone.now() - timedelta(days=20),
-    )
-
-    result = ExpireStaleCandidates().execute()
+    result = ExpireStaleCandidates().execute(dry_run=False)
 
     candidate.refresh_from_db()
+    audit = AuditEvent.objects.get(target_id=str(candidate.id), event_type='MemoryAutoRejected')
+    assert result.scanned == 1
+    assert result.rejected == 1
+    assert result.dry_run is False
+    assert result.candidate_ids == (str(candidate.id),)
+    assert candidate.status == CandidateStatus.REJECTED
+    assert audit.metadata['reason'] == TTL_REASON
+    assert audit.metadata['ttl_days'] == 14
+    assert audit.actor_type == 'system'
 
+
+@pytest.mark.django_db
+def test_dry_run_reports_the_same_candidates_without_writing(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
+
+    preview = ExpireStaleCandidates().execute(dry_run=True)
+
+    candidate.refresh_from_db()
+    assert preview.scanned == 1
+    assert preview.rejected == 0
+    assert preview.dry_run is True
+    assert preview.candidate_ids == (str(candidate.id),)
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert not AuditEvent.objects.filter(target_id=str(candidate.id)).exists()
+
+
+@pytest.mark.django_db
+def test_dry_run_can_be_forced_from_the_environment(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    monkeypatch.setenv('ENGRAM_CANDIDATE_TTL_DRY_RUN', 'true')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
+
+    result = ExpireStaleCandidates().execute(dry_run=False)
+
+    candidate.refresh_from_db()
+    assert result.dry_run is True
+    assert result.rejected == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_fresh_candidate_is_untouched(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now())
+
+    result = ExpireStaleCandidates().execute(dry_run=False)
+
+    candidate.refresh_from_db()
     assert result.scanned == 0
     assert result.rejected == 0
-    assert result.rejected == 0
     assert candidate.status == CandidateStatus.PROPOSED
-    assert not AuditEvent.objects.filter(target_id=str(candidate.id), event_type='MemoryAutoRejected').exists()
 
 
 @pytest.mark.django_db
-def test_candidate_ttl_never_rejects_old_low_confidence_candidate(
+def test_high_confidence_stale_candidate_expires_on_age_alone(
     f_org: Organization,
     f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
     candidate = _make_candidate(
         f_org,
         f_project,
-        confidence='0.001',
-        created_at=timezone.now() - timedelta(days=365),
+        confidence='0.900',
+        created_at=timezone.now() - timedelta(days=30),
     )
 
-    result = ExpireStaleCandidates().execute()
+    result = ExpireStaleCandidates().execute(dry_run=False)
 
     candidate.refresh_from_db()
-    assert candidate.status == CandidateStatus.PROPOSED
+    assert result.rejected == 1
+    assert candidate.status == CandidateStatus.REJECTED
+
+
+@pytest.mark.django_db
+def test_candidate_with_active_decision_work_is_never_expired(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=40))
+    _decision_work(candidate, execution_state=WorkflowWorkExecutionState.RETRY_WAIT)
+
+    result = ExpireStaleCandidates().execute(dry_run=False)
+
+    candidate.refresh_from_db()
+    assert result.scanned == 0
     assert result.rejected == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_candidate_with_terminal_decision_work_is_expired(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=40))
+    _decision_work(candidate, execution_state=WorkflowWorkExecutionState.TERMINAL_FAILURE)
+
+    result = ExpireStaleCandidates().execute(dry_run=False)
+
+    candidate.refresh_from_db()
+    assert result.rejected == 1
+    assert candidate.status == CandidateStatus.REJECTED
+
+
+@pytest.mark.django_db
+def test_sweep_is_capped_by_the_configured_batch(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    monkeypatch.setenv('ENGRAM_CANDIDATE_TTL_BATCH', '2')
+    base = timezone.now() - timedelta(days=30)
+    candidates = [_make_candidate(f_org, f_project, created_at=base + timedelta(hours=index)) for index in range(5)]
+
+    result = ExpireStaleCandidates().execute(dry_run=False)
+
+    for candidate in candidates:
+        candidate.refresh_from_db()
+
+    assert result.rejected == 2
+    assert [candidate.status for candidate in candidates] == [
+        CandidateStatus.REJECTED,
+        CandidateStatus.REJECTED,
+        CandidateStatus.PROPOSED,
+        CandidateStatus.PROPOSED,
+        CandidateStatus.PROPOSED,
+    ]
+
+
+@pytest.mark.django_db
+def test_second_run_expires_nothing_more(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
+
+    first = ExpireStaleCandidates().execute(dry_run=False)
+    second = ExpireStaleCandidates().execute(dry_run=False)
+
+    assert first.rejected == 1
+    assert second.rejected == 0
+    assert AuditEvent.objects.filter(event_type='MemoryAutoRejected').count() == 1
+
+
+@pytest.mark.django_db
+def test_expiry_never_queues_candidate_decision_work(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
+
+    ExpireStaleCandidates().execute(dry_run=False)
+
+    assert not WorkflowWork.objects.exists()
+    assert not WorkflowRun.objects.exists()
+    assert not CeleryOutbox.objects.exists()
 
 
 @pytest.mark.django_db
@@ -164,23 +353,6 @@ def test_reconciliation_creates_and_queues_missing_v1_work_once(
     assert CeleryOutbox.objects.count() == outbox_count
     first_run.refresh_from_db()
     assert first_run.dispatched_at == as_of
-
-
-@pytest.mark.django_db
-def test_legacy_expire_task_delegates_without_semantic_writes(monkeypatch: pytest.MonkeyPatch) -> None:
-    result = type('Result', (), {'scanned': 3, 'queued': 2})()
-    calls: list[object] = []
-
-    def execute(_self: object) -> object:
-        calls.append(_self)
-        return result
-
-    monkeypatch.setattr('engram.memory.candidate_ttl.ReconcileCandidateDecisionWork.execute', execute)
-    returned = ExpireStaleCandidates().execute()
-
-    assert len(calls) == 1
-    assert returned.scanned == 3
-    assert returned.rejected == 0
 
 
 @pytest.mark.django_db
@@ -229,140 +401,10 @@ def test_reconciliation_locked_recheck_skips_conflict_created_after_scan(
 
 
 @pytest.mark.django_db
-def test_fresh_candidate_is_untouched(
-    f_org: Organization,
-    f_project: Project,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-
-    candidate = _make_candidate(f_org, f_project, confidence='0.300', created_at=timezone.now())
-
-    result = ExpireStaleCandidates().execute()
-
-    candidate.refresh_from_db()
-
-    assert result.rejected == 0
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_high_confidence_old_candidate_is_untouched(
-    f_org: Organization,
-    f_project: Project,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
-
-    candidate = _make_candidate(
-        f_org,
-        f_project,
-        confidence='0.900',
-        created_at=timezone.now() - timedelta(days=30),
-    )
-
-    result = ExpireStaleCandidates().execute()
-
-    candidate.refresh_from_db()
-
-    assert result.rejected == 0
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_per_org_threshold_from_organization_settings_is_respected(
-    f_org: Organization,
-    f_project: Project,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.900'
-    OrganizationSettings.objects.update_or_create(
-        organization=f_org,
-        defaults={'distillation_auto_approve_threshold': '0.200'},
-    )
-
-    candidate = _make_candidate(
-        f_org,
-        f_project,
-        confidence='0.300',
-        created_at=timezone.now() - timedelta(days=20),
-    )
-
-    result = ExpireStaleCandidates().execute()
-
-    candidate.refresh_from_db()
-
-    assert result.rejected == 0
-    assert candidate.status == CandidateStatus.PROPOSED
-
-
-@pytest.mark.django_db
-def test_old_candidates_are_not_batch_rejected(
-    f_org: Organization,
-    f_project: Project,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_CANDIDATE_TTL_BATCH = 2
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
-
-    base = timezone.now() - timedelta(days=30)
-    candidates = [
-        _make_candidate(
-            f_org,
-            f_project,
-            confidence='0.300',
-            created_at=base + timedelta(hours=index),
-        )
-        for index in range(5)
-    ]
-
-    result = ExpireStaleCandidates().execute()
-
-    assert result.rejected == 0
-    assert result.rejected == 0
-
-    for candidate in candidates:
-        candidate.refresh_from_db()
-
-    assert [candidate.status for candidate in candidates] == [CandidateStatus.PROPOSED] * 5
-
-
-@pytest.mark.django_db
-def test_second_run_is_idempotent(
-    f_org: Organization,
-    f_project: Project,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_CANDIDATE_TTL_BATCH = 500
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
-
-    _make_candidate(
-        f_org,
-        f_project,
-        confidence='0.300',
-        created_at=timezone.now() - timedelta(days=20),
-    )
-
-    first = ExpireStaleCandidates().execute()
-    second = ExpireStaleCandidates().execute()
-
-    assert first.rejected == 0
-    assert second.rejected == 0
-    assert AuditEvent.objects.filter(event_type='MemoryAutoRejected').count() == 0
-
-
-@pytest.mark.django_db
-def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confidence(
+def test_unresolved_conflict_is_excluded_from_ttl_even_when_old(
     monkeypatch: pytest.MonkeyPatch,
-    settings: SettingsWrapper,
 ) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    settings.ENGRAM_CANDIDATE_TTL_BATCH = 500
-    settings.ENGRAM_DISTILLATION_AUTO_APPROVE_THRESHOLD = '0.500'
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
     organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-conflict')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
@@ -374,7 +416,7 @@ def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confiden
         confidence='0.100',
     )
 
-    result = ExpireStaleCandidates().execute()
+    result = ExpireStaleCandidates().execute(dry_run=False)
 
     candidate.refresh_from_db()
     conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
@@ -388,34 +430,10 @@ def test_unresolved_conflict_is_excluded_from_ttl_even_when_old_and_low_confiden
 
 
 @pytest.mark.django_db
-def test_ttl_locked_recheck_skips_candidate_with_conflict(
-    monkeypatch: pytest.MonkeyPatch,
-    settings: SettingsWrapper,
-) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
-    organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-lock-conflict')
-    create_curation_policy(organization, team, project)
-    set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
-    patch_atomic_near_duplicate(monkeypatch, existing, score=1.000)
-    patch_judge_gateway(monkeypatch, JudgeGatewayStub('{"decision": "contradicts", "reason": "opposite claim"}'))
-    CurateMemoryCandidate().execute(CurateMemoryCandidateInput(candidate_id=candidate.id))
-
-    result = ExpireStaleCandidates().execute()
-
-    candidate.refresh_from_db()
-    conflict = MemoryConflict.objects.get(candidate=candidate, memory=existing)
-    assert result.rejected == 0
-    assert candidate.status == CandidateStatus.PROPOSED
-    assert conflict.resolved_transition_id is None
-    assert MemoryLink.objects.filter(id=conflict.semantic_link_id).exists()
-
-
-@pytest.mark.django_db
 def test_resolved_conflict_allows_later_ttl_noop_without_erasing_history(
     monkeypatch: pytest.MonkeyPatch,
-    settings: SettingsWrapper,
 ) -> None:
-    settings.ENGRAM_CANDIDATE_REVIEW_TTL_DAYS = 14
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
     organization, team, project, existing, candidate = seed_atomic_existing_and_duplicate('ttl-resolved-conflict')
     create_curation_policy(organization, team, project)
     set_curator_settings(organization, threshold='1.050', llm_judge_enabled=True)
@@ -458,10 +476,36 @@ def test_resolved_conflict_allows_later_ttl_noop_without_erasing_history(
     MemoryCandidate.objects.filter(id=candidate.id).update(created_at=timezone.now() - timedelta(days=30))
 
     before_link_count = MemoryLink.objects.filter(id=conflict.semantic_link_id).count()
-    result = ExpireStaleCandidates().execute()
+    result = ExpireStaleCandidates().execute(dry_run=False)
 
     assert resolved.transition.id == conflict.resolved_transition_id
     assert conflict.resolution == 'reject_candidate'
     assert candidate.status == CandidateStatus.REJECTED
     assert result.rejected == 0
     assert MemoryLink.objects.filter(id=conflict.semantic_link_id).count() == before_link_count == 1
+
+
+@pytest.mark.django_db
+def test_sweep_previews_by_default_so_an_unchanged_caller_cannot_mass_reject(
+    f_org: Organization,
+    f_project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv('ENGRAM_CANDIDATE_TTL_DRY_RUN', raising=False)
+    monkeypatch.setenv('ENGRAM_CANDIDATE_REVIEW_TTL_DAYS', '14')
+    candidate = _make_candidate(f_org, f_project, created_at=timezone.now() - timedelta(days=20))
+
+    result = ExpireStaleCandidates().execute()
+
+    candidate.refresh_from_db()
+    assert result.dry_run is True
+    assert result.rejected == 0
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+def test_kill_switch_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_CANDIDATE_TTL_DRY_RUN', raising=False)
+    assert candidate_ttl_dry_run() is False
+
+    monkeypatch.setenv('ENGRAM_CANDIDATE_TTL_DRY_RUN', '1')
+    assert candidate_ttl_dry_run() is True

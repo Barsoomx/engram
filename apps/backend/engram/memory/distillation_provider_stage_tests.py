@@ -1213,9 +1213,9 @@ def _malformed_body(chunk: DistillationChunk, variant: str) -> str:
         return 'this is definitely not json'
 
     if variant == 'missing_keys':
-        return json.dumps(
-            {'memories': [{'title': 'T', 'body': 'B', 'confidence': 0.9, 'supporting_observation_ids': [first]}]}
-        )
+        # Omitting no_signal_observation_ids alone is NOT malformed — it is recomputed from the chunk
+        # manifest — so a genuinely missing key means the one the parser actually reads.
+        return json.dumps({'no_signal_observation_ids': [second]})
 
     return json.dumps(
         {
@@ -2185,3 +2185,37 @@ def test_extract_system_prompt_states_contract_marker_and_parser_rules() -> None
     # Instructed caps are intentionally stricter than the parser caps (safe direction).
     assert 8 <= dps._MAX_MEMORIES
     assert 2000 <= dps._MAX_BODY
+
+
+# `no_signal_observation_ids` is recomputed from the manifest a few lines after it is validated, so its
+# value never reaches anything. Rejecting an output that omits it buys a paid retry for a field we discard.
+
+
+def test_extraction_accepts_output_that_omits_the_recomputed_field() -> None:
+    from engram.memory.distillation_provider_stage import parse_extraction_output
+
+    payload = json.dumps(
+        {
+            'memories': [
+                {
+                    'title': 'Retry backoff caps at 1800 seconds',
+                    'body': 'Provider transient failures retry with exponential backoff capped at 1800s.',
+                    'confidence': 0.8,
+                    'supporting_observation_ids': ['obs-1'],
+                }
+            ]
+        }
+    )
+
+    output = parse_extraction_output(payload, chunk_observation_ids={'obs-1', 'obs-2'})
+
+    assert output.no_signal_observation_ids == ('obs-2',)
+
+
+def test_extraction_still_rejects_genuinely_unknown_keys() -> None:
+    from engram.memory.distillation_provider_stage import ExtractionContractError, parse_extraction_output
+
+    payload = json.dumps({'memories': [], 'totally_unexpected': 1})
+
+    with pytest.raises(ExtractionContractError):
+        parse_extraction_output(payload, chunk_observation_ids={'obs-1'})
