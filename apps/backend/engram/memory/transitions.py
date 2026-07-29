@@ -1944,6 +1944,23 @@ def _candidate_revision_fingerprint(
     )
 
 
+def _candidate_revision_content(
+    data: ReviseMemoryFromCandidateInput | MergeMemoryCandidateInput,
+    *,
+    transition_type: str,
+    memory: Memory,
+    prior_version: MemoryVersion,
+    sanitized_view: SanitizedCandidateView | None,
+) -> tuple[str, str]:
+    if transition_type == MemoryTransitionType.MERGE:
+        return memory.title, prior_version.body
+
+    if sanitized_view is not None:
+        return sanitized_view.title, sanitized_view.body
+
+    return data.title, data.body
+
+
 def _execute_candidate_revision(
     data: ReviseMemoryFromCandidateInput | MergeMemoryCandidateInput,
     *,
@@ -1985,8 +2002,13 @@ def _execute_candidate_revision(
             sanitized_title=data.sanitized_title,
             sanitized_body=data.sanitized_body,
         )
-        result_title = sanitized_view.title if sanitized_view is not None else data.title
-        result_body = sanitized_view.body if sanitized_view is not None else data.body
+        result_title, result_body = _candidate_revision_content(
+            data,
+            transition_type=transition_type,
+            memory=memory,
+            prior_version=prior_version,
+            sanitized_view=sanitized_view,
+        )
         version, version_sources = _create_revision_version(
             memory,
             prior_version,
