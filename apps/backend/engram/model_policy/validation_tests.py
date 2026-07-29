@@ -458,3 +458,18 @@ def test_non_openai_policy_keeps_the_default_request_shape(f_policy: ModelPolicy
     result = validate_policy(f_policy, gateway_factory=_gateway_factory(_OkGateway()))
 
     assert result.ok is True
+
+
+# The health check sends response_kind 'candidates' for curation policies, and OpenAI turns on
+# json_object mode for that kind. OpenAI rejects json_object unless the messages mention json,
+# so a probe prompt without the word cannot validate an OpenAI curation policy at all.
+
+
+def test_validation_prompt_satisfies_json_object_mode() -> None:
+    from engram.model_policy.services import _STRUCTURED_RESPONSE_KINDS
+    from engram.model_policy.validation import VALIDATION_PROMPT, _validation_response_kind
+
+    curation = ModelPolicy(provider='openai', model='gpt-5-mini', task_type='curation')
+
+    assert _validation_response_kind(curation) in _STRUCTURED_RESPONSE_KINDS
+    assert 'json' in VALIDATION_PROMPT.lower()
