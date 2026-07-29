@@ -131,6 +131,31 @@ def _promote(suffix: str) -> tuple[object, object, object, object, object, objec
     return scope, result.memory, result.memory_version, document, candidate, source
 
 
+def _promote_extra(
+    base_candidate: object,
+    base_source: object,
+    *,
+    title: str,
+    body: str,
+    terms: list[str],
+    full_text: str,
+) -> tuple[object, object]:
+    candidate, _source = candidate_in_scope(base_candidate, base_source, title=title, body=body)
+    result = transitions_module().PromoteMemoryCandidate().execute(transition_request(candidate))
+    version = result.memory_version
+    version.source_metadata = {'exact_terms': terms, 'symbols': [], 'full_text': full_text}
+    version.save(update_fields=['source_metadata', 'updated_at'])
+    with transaction.atomic():
+        document = write_exact_memory_projection(
+            memory=result.memory,
+            version=version,
+            transition_id=result.memory.current_transition_id,
+            sources=list(version.provenance_sources.all()),
+        )
+
+    return result, document
+
+
 def _embedding(seed: int) -> tuple[float, ...]:
     values = [0.0] * 1536
     values[seed % len(values)] = 1.0
@@ -152,6 +177,25 @@ def _set_embedding(document: object, seed: int) -> None:
         'embedding_projection_hash',
         'exact_projection_hash',
         'projection_contract_version',
+        'embedding_projected_at',
+        'updated_at',
+    ]
+    if hasattr(document, 'embedding_pgvector'):
+        update_fields.append('embedding_pgvector')
+    document.save(update_fields=update_fields)
+
+
+def _clear_embedding(document: object) -> None:
+    document.embedding_vector = []
+    if hasattr(document, 'embedding_pgvector'):
+        document.embedding_pgvector = None
+    document.embedding_reference = ''
+    document.embedding_projection_hash = ''
+    document.embedding_projected_at = None
+    update_fields = [
+        'embedding_vector',
+        'embedding_reference',
+        'embedding_projection_hash',
         'embedding_projected_at',
         'updated_at',
     ]
@@ -716,4 +760,185 @@ def test_revalidation_detects_transition_of_previously_unselected_memory() -> No
     assert rebuilt.manifest_hash != frozen.manifest_hash
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
     assert selected.current_transition_id == selected_transition_id
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_ignores_unrelated_authorized_memory_added_after_freeze() -> None:
+    module = _shortlist_module()
+    scope, selected, _version, _document, base_candidate, base_source = _promote('revalidate-unrelated')
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    assert [entry.memory_id for entry in frozen.entries] == [selected.id]
+
+    unrelated, _unrelated_document = _promote_extra(
+        base_candidate,
+        base_source,
+        title='Unrelated retention policy',
+        body='This claim shares no shortlist signal with the frozen query.',
+        terms=['other'],
+        full_text='unrelated retention policy',
+    )
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+
+    assert unrelated.memory.id not in {entry.memory_id for entry in rebuilt.entries}
+    assert rebuilt.entries == frozen.entries
+    assert rebuilt.comparison_complete == frozen.comparison_complete
+    assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count + 1
+    assert rebuilt.manifest_hash != frozen.manifest_hash
+    assert module.revalidate_curation_shortlist(data, frozen) is True
+    assert module.shortlist_revalidation_hash(rebuilt) == module.shortlist_revalidation_hash(frozen)
+
+
+@pytest.mark.django_db
+def test_revalidation_fails_when_selected_entry_transition_advances() -> None:
+    module = _shortlist_module()
+    scope, memory, _version, _document, candidate, _source = _promote('revalidate-entry-transition')
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    assert [entry.memory_id for entry in frozen.entries] == [memory.id]
+
+    transitions = transitions_module()
+    revised = transitions.ReviseMemory().execute(
+        transitions.ReviseMemoryInput(
+            request=transition_request(candidate, key=f'revalidate-advance:{memory.id}:v2').request,
+            memory_fence=transitions.build_memory_fence(memory),
+            title='Revised during judgment',
+            body='The selected comparison advanced while the verdict was in flight.',
+        ),
+    )
+    _write_projection(
+        revised.memory,
+        revised.memory_version,
+        revised.transition.id,
+        full_text='revised during judgment',
+    )
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+
+    assert rebuilt.entries[0].current_transition_id != frozen.entries[0].current_transition_id
+    assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
+    assert module.shortlist_revalidation_hash(rebuilt) != module.shortlist_revalidation_hash(frozen)
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_fails_when_selected_entry_body_changes_without_a_transition() -> None:
+    module = _shortlist_module()
+    scope, memory, version, _document, _candidate, _source = _promote('revalidate-entry-body')
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    assert [entry.memory_id for entry in frozen.entries] == [memory.id]
+
+    version.body = 'The stored comparison body was rewritten after the freeze.'
+    version.save(update_fields=['body', 'updated_at'])
+    memory.body = version.body
+    memory.save(update_fields=['body', 'updated_at'])
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+
+    assert rebuilt.entries[0].current_transition_id == frozen.entries[0].current_transition_id
+    assert rebuilt.entries[0].body_hash != frozen.entries[0].body_hash
+    assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_fails_when_a_new_memory_displaces_a_shortlist_entry() -> None:
+    module = _shortlist_module()
+    scope, _memory, _version, _document, base_candidate, base_source = _promote('revalidate-displaced')
+    for index in range(1, 4):
+        _promote_extra(
+            base_candidate,
+            base_source,
+            title=f'Bounded exact claim {index}',
+            body=f'Bounded exact body {index}',
+            terms=['term'],
+            full_text=f'bounded exact body {index}',
+        )
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        terms=('term', 'other'),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    assert len(frozen.entries) == 4
+    assert {entry.exact_overlap for entry in frozen.entries} == {1}
+
+    _promote_extra(
+        base_candidate,
+        base_source,
+        title='Stronger exact claim',
+        body='Stronger exact body',
+        terms=['term', 'other'],
+        full_text='stronger exact body',
+    )
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+
+    assert len(rebuilt.entries) == 4
+    assert {entry.memory_id for entry in rebuilt.entries} != {entry.memory_id for entry in frozen.entries}
+    assert module.revalidate_curation_shortlist(data, frozen) is False
+
+
+@pytest.mark.django_db
+def test_revalidation_fails_when_comparison_completeness_regresses() -> None:
+    module = _shortlist_module()
+    scope, selected, _version, document, base_candidate, base_source = _promote('revalidate-completeness')
+    _set_embedding(document, 0)
+    _unrelated, unrelated_document = _promote_extra(
+        base_candidate,
+        base_source,
+        title='Distant unrelated claim',
+        body='Distant unrelated body',
+        terms=['other'],
+        full_text='distant unrelated body',
+    )
+    _set_embedding(unrelated_document, 700)
+    data = _input(
+        scope[0].id,
+        scope[1].id,
+        EffectiveCandidateScope(VisibilityScope.PROJECT, None),
+        embedding=_embedding(0),
+        terms=('term',),
+        title='',
+        body='',
+    )
+    frozen = module.BuildCurationShortlist.execute(data)
+    assert [entry.memory_id for entry in frozen.entries] == [selected.id]
+    assert frozen.comparison_complete is True
+
+    _clear_embedding(unrelated_document)
+
+    rebuilt = module.BuildCurationShortlist.execute(data)
+
+    assert rebuilt.entries == frozen.entries
+    assert rebuilt.comparison_complete is False
+    assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
+    assert module.shortlist_revalidation_hash(rebuilt) != module.shortlist_revalidation_hash(frozen)
     assert module.revalidate_curation_shortlist(data, frozen) is False

@@ -4,7 +4,7 @@ import hashlib
 import json
 import threading
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 
 import pytest
@@ -2412,7 +2412,7 @@ def test_existing_open_conflict_pair_is_not_duplicated(monkeypatch: pytest.Monke
 
 
 @pytest.mark.django_db
-def test_empty_shortlist_publish_is_stale_when_new_memory_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_empty_shortlist_publish_commits_when_unrelated_memory_appears(monkeypatch: pytest.MonkeyPatch) -> None:
     scope = orch.orchestrator_scope('revalidate')
     policy = orch.curation_policy(scope)
     call = orch.provider_call_record(scope, policy)
@@ -2432,7 +2432,67 @@ def test_empty_shortlist_publish_is_stale_when_new_memory_appears(monkeypatch: p
 
     _result, error = orch.run_decision(work, run)
 
-    assert error is not None
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.PUBLISH_NEW
+    assert decisions[0].comparison_manifest_hash == shortlist.manifest_hash
+    candidate.refresh_from_db()
+    work.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id is not None
+    assert work.execution_state == WorkflowWorkExecutionState.SETTLED
+
+
+@pytest.mark.django_db
+def test_empty_shortlist_publish_is_stale_when_a_shortlisted_memory_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('revalidate-dup')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='revalidate-dup')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = orch.stub_judge_result(verdict, call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    def appear() -> None:
+        orch.target_memory(scope, suffix='revalidate-dup-intruder', title=candidate.title, body=_LONG_BODY)
+
+    orch.install_fault(monkeypatch, 'before_transition', appear)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert candidate.promoted_memory_id is None
+
+
+@pytest.mark.django_db
+def test_verdict_judged_against_another_manifest_is_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    scope = orch.orchestrator_scope('manifest-parity')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='manifest-parity')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    verdict = orch.stub_verdict('publish_new')
+    judge = replace(
+        orch.stub_judge_result(verdict, call, policy, shortlist),
+        comparison_manifest_hash='e' * 64,
+    )
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+
+    _result, error = orch.run_decision(work, run)
+
+    assert judge.comparison_manifest_hash != shortlist.manifest_hash
     assert isinstance(error, MemoryTransitionError)
     assert error.code == 'stale_decision'
     assert orch.curation_decisions_for(candidate) == []
