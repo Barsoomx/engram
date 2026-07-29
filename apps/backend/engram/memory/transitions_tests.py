@@ -38,6 +38,7 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory.candidate_decision_work import ensure_candidate_decision_work_locked, evidence_manifest
+from engram.memory.deterministic_gates import redact_candidate_view
 from engram.memory.distillation_provenance import (
     candidate_source_anchors,
     canonical_source_manifest,
@@ -1565,6 +1566,192 @@ def test_merge_evidence_transition_accepts_agent_candidate() -> None:
         candidate_source_id=source.id,
     )
     assert version_source.source_content_hash == source.anchors_hash
+
+
+def _merge_target_with_candidate(suffix: str) -> tuple[Any, MemoryCandidate, MemoryCandidateSource]:
+    base, base_source, _scope = _provenanced_candidate(suffix)
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    candidate, candidate_source = _candidate_in_scope(
+        base,
+        base_source,
+        title=f'Equivalent claim {suffix}',
+        body=f'Equivalent claim body {suffix}',
+    )
+
+    return promoted, candidate, candidate_source
+
+
+def _merge_input(
+    candidate: MemoryCandidate,
+    memory: Memory,
+    *,
+    key: str,
+    sanitized_title: str | None = None,
+    sanitized_body: str | None = None,
+) -> MergeMemoryCandidateInput:
+    return MergeMemoryCandidateInput(
+        request=_request_for(candidate, key=f'request:{uuid.uuid4()}:{key}:{candidate.id}:v1'),
+        candidate_fence=_candidate_fence_for(candidate),
+        memory_fence=_transitions().build_memory_fence(memory),
+        title=candidate.title,
+        body=candidate.body,
+        sanitized_title=sanitized_title,
+        sanitized_body=sanitized_body,
+    )
+
+
+@pytest.mark.django_db
+def test_merge_evidence_retains_target_content_and_attaches_candidate_sources() -> None:
+    promoted, candidate, candidate_source = _merge_target_with_candidate('merge-retains-target')
+    target_title = promoted.memory.title
+    target_body = promoted.memory_version.body
+    assert candidate.title != target_title
+    assert candidate.body != target_body
+
+    result = MergeMemoryCandidate().execute(_merge_input(candidate, promoted.memory, key='merge-retain'))
+
+    memory = Memory.objects.get(id=promoted.memory.id)
+    assert memory.title == target_title
+    assert memory.body == target_body
+    assert result.memory_version.id != promoted.memory_version.id
+    assert result.memory_version.version == promoted.memory_version.version + 1
+    assert result.memory_version.body == target_body
+    assert memory.current_version == result.memory_version.version
+    version_source = _model('MemoryVersionSource').objects.get(
+        memory_version_id=result.memory_version.id,
+        candidate_source_id=candidate_source.id,
+    )
+    assert version_source.source_content_hash == candidate_source.anchors_hash
+
+
+@pytest.mark.django_db
+def test_merge_evidence_exact_projection_reflects_retained_content() -> None:
+    promoted, candidate, _candidate_source = _merge_target_with_candidate('merge-projection')
+    target_title = promoted.memory.title
+    target_body = promoted.memory_version.body
+
+    result = MergeMemoryCandidate().execute(_merge_input(candidate, promoted.memory, key='merge-projection'))
+
+    document = RetrievalDocument.objects.get(memory_version_id=result.memory_version.id)
+    projection = document.metadata['projection']
+    assert projection['title'] == target_title
+    assert projection['body'] == target_body
+    assert document.full_text == f'{target_title}\n\n{target_body}'.strip()
+    assert candidate.title not in document.full_text
+    assert candidate.body not in document.full_text
+
+
+@pytest.mark.django_db
+def test_merge_evidence_retains_target_content_when_sanitized_view_is_locked() -> None:
+    promoted, candidate, _candidate_source = _merge_target_with_candidate('merge-sanitized')
+    view = redact_candidate_view(candidate)
+    target_title = promoted.memory.title
+    target_body = promoted.memory_version.body
+
+    result = MergeMemoryCandidate().execute(
+        _merge_input(
+            candidate,
+            promoted.memory,
+            key='merge-sanitized',
+            sanitized_title=view.title,
+            sanitized_body=view.body,
+        )
+    )
+
+    memory = Memory.objects.get(id=promoted.memory.id)
+    assert memory.title == target_title
+    assert memory.body == target_body
+    assert result.memory_version.body == target_body
+
+
+@pytest.mark.django_db
+def test_merge_evidence_rejects_sanitized_content_that_no_longer_derives_from_candidate() -> None:
+    promoted, candidate, _candidate_source = _merge_target_with_candidate('merge-stale-sanitized')
+    transitions = _transitions()
+
+    with pytest.raises(transitions.MemoryTransitionError) as error:
+        MergeMemoryCandidate().execute(
+            _merge_input(
+                candidate,
+                promoted.memory,
+                key='merge-stale-sanitized',
+                sanitized_title='Sanitized title from another candidate',
+                sanitized_body=candidate.body,
+            )
+        )
+
+    assert error.value.code == 'stale_decision'
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+    assert _model('MemoryVersion').objects.filter(memory_id=promoted.memory.id).count() == 1
+
+
+@pytest.mark.django_db
+def test_revise_from_candidate_still_writes_candidate_content() -> None:
+    promoted, candidate, _candidate_source = _merge_target_with_candidate('revise-writes-candidate')
+    view = redact_candidate_view(candidate)
+
+    result = ReviseMemoryFromCandidate().execute(
+        ReviseMemoryFromCandidateInput(
+            request=_request_for(candidate, key=f'request:{uuid.uuid4()}:revise-candidate:{candidate.id}:v1'),
+            candidate_fence=_candidate_fence_for(candidate),
+            memory_fence=_transitions().build_memory_fence(promoted.memory),
+            title=candidate.title,
+            body=candidate.body,
+            sanitized_title=view.title,
+            sanitized_body=view.body,
+        )
+    )
+
+    memory = Memory.objects.get(id=promoted.memory.id)
+    assert memory.title == candidate.title
+    assert memory.body == candidate.body
+    assert result.memory_version.body == candidate.body
+
+
+@pytest.mark.django_db
+def test_two_candidates_merging_into_one_memory_commit_distinct_transitions() -> None:
+    base, base_source, _scope = _provenanced_candidate('merge-distinct-transitions')
+    promoted = _transitions().PromoteMemoryCandidate().execute(_request(base))
+    first, first_source = _candidate_in_scope(
+        base,
+        base_source,
+        title='First equivalent claim',
+        body='First equivalent claim body',
+    )
+    second, second_source = _candidate_in_scope(
+        base,
+        base_source,
+        title='Second equivalent claim',
+        body='Second equivalent claim body',
+    )
+
+    first_result = MergeMemoryCandidate().execute(_merge_input(first, promoted.memory, key='merge-first'))
+    second_result = MergeMemoryCandidate().execute(
+        _merge_input(second, Memory.objects.get(id=promoted.memory.id), key='merge-second')
+    )
+
+    assert not first_result.duplicate
+    assert not second_result.duplicate
+    assert first_result.transition.id != second_result.transition.id
+    assert first_result.memory_version.id != second_result.memory_version.id
+    assert _model('MemoryVersion').objects.filter(memory_id=promoted.memory.id).count() == 3
+    assert (
+        _model('MemoryVersionSource')
+        .objects.filter(
+            memory_version_id=first_result.memory_version.id,
+            candidate_source_id=first_source.id,
+        )
+        .exists()
+    )
+    assert (
+        _model('MemoryVersionSource')
+        .objects.filter(
+            memory_version_id=second_result.memory_version.id,
+            candidate_source_id=second_source.id,
+        )
+        .exists()
+    )
 
 
 @pytest.mark.django_db

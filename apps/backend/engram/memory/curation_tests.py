@@ -1905,6 +1905,36 @@ def test_exact_duplicate_no_new_evidence_settles_without_new_version(monkeypatch
 
 
 @pytest.mark.django_db
+def test_deterministic_exact_identity_keeps_target_wording_and_attaches_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('exactidentity')
+    memory = orch.target_memory(scope, suffix='exactidentity', title='Cache eviction policy', body=_LONG_BODY)
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(
+        scope, suffix='exactidentity', title='cache   Eviction Policy', body=_LONG_BODY.upper()
+    )
+    source = MemoryCandidateSource.objects.get(candidate=candidate)
+    orch.install_deterministic_only(monkeypatch)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    decisions = orch.curation_decisions_for(candidate)
+    assert len(decisions) == 1
+    assert decisions[0].outcome == CurationOutcome.MERGE_EVIDENCE
+    assert decisions[0].reason_code == CurationReasonCode.EXACT_IDENTITY
+    assert decisions[0].transition_id is not None
+    memory.refresh_from_db()
+    assert memory.title == 'Cache eviction policy'
+    assert memory.body == _LONG_BODY
+    assert memory.current_version == target_version.version + 1
+    merged_version = MemoryVersion.objects.get(memory=memory, version=memory.current_version)
+    assert merged_version.body == _LONG_BODY
+    assert MemoryVersionSource.objects.filter(memory_version=merged_version, candidate_source=source).exists()
+
+
+@pytest.mark.django_db
 def test_reject_candidate_and_superseded_generation_complete_as_product_no_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
