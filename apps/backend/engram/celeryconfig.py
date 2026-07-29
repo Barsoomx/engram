@@ -79,7 +79,12 @@ task_routes = {
     'engram.memory.distill_session': {'queue': QUEUE_BATCH},
     'engram.memory.distill_session_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.process_candidate_decision_work_v1': {'queue': QUEUE_BATCH},
-    'engram.memory.embed_memory_projection_work_v1': {'queue': QUEUE_BATCH},
+    # Embedding sits on QUEUE_REALTIME for isolation, not for its latency class. It gates
+    # curation (corpus_fully_embedded), so it must not queue behind session distillation; it
+    # is also bulk-enqueued (ReembedMissingEmbeddings, 200 per beat tick), so it must not
+    # share a FIFO queue with observation ingestion either. QUEUE_REALTIME carried no tasks
+    # before this and has a consumer in both worker layouts.
+    'engram.memory.embed_memory_projection_work_v1': {'queue': QUEUE_REALTIME},
     'engram.memory.generate_daily_digest': {'queue': QUEUE_BATCH},
     'engram.memory.generate_daily_digest_work_v1': {'queue': QUEUE_BATCH},
     'engram.memory.generate_weekly_digest': {'queue': QUEUE_BATCH},

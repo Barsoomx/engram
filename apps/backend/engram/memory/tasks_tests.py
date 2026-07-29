@@ -218,14 +218,32 @@ def test_task_routes_send_retry_failed_distillations_to_batch_queue() -> None:
     assert celeryconfig.task_routes['engram.memory.retry_failed_distillations']['queue'] == celeryconfig.QUEUE_BATCH
 
 
-def test_embedding_projection_worker_is_registered_on_batch_queue() -> None:
+def test_embedding_projection_worker_is_registered_on_realtime_queue() -> None:
     task = tasks_module.embed_memory_projection_work_v1
     task_name = 'engram.memory.embed_memory_projection_work_v1'
 
     assert task.name == task_name
     assert task.acks_late is True
     assert task.reject_on_worker_lost is True
-    assert celeryconfig.task_routes[task_name]['queue'] == celeryconfig.QUEUE_BATCH
+    assert celeryconfig.task_routes[task_name]['queue'] == celeryconfig.QUEUE_REALTIME
+
+
+def test_embedding_projection_does_not_queue_behind_session_distillation() -> None:
+    embedding_queue = celeryconfig.task_routes['engram.memory.embed_memory_projection_work_v1']['queue']
+    distillation_queue = celeryconfig.task_routes['engram.memory.distill_session_work_v1']['queue']
+
+    assert embedding_queue != distillation_queue
+
+
+def test_embedding_projection_does_not_share_a_queue_with_observation_ingestion() -> None:
+    embedding_queue = celeryconfig.task_routes['engram.memory.embed_memory_projection_work_v1']['queue']
+    ingestion_task_names = (
+        'engram.memory.process_observation_recorded',
+        'engram.memory.process_observation_work_v1',
+    )
+
+    for task_name in ingestion_task_names:
+        assert celeryconfig.task_routes[task_name]['queue'] != embedding_queue
 
 
 def test_embedding_projection_worker_is_not_sized_for_flex_latency() -> None:
