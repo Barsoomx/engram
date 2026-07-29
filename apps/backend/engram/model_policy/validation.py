@@ -25,7 +25,11 @@ from engram.model_policy.services import (
     resolve_temperature,
 )
 
-VALIDATION_PROMPT = 'engram_validate_policies health check: respond with a minimal completion.'
+VALIDATION_PROMPT = (
+    'engram_validate_policies health check: reply with the minimal JSON object {"ok": true}. '
+    'The word json must appear here because structured response kinds are sent in json_object mode, '
+    'which providers reject unless the messages mention it.'
+)
 NO_PROJECT_AVAILABLE_ERROR_CODE = 'no_project_available'
 REQUEST_SHAPE_ERROR_CODE = 'policy_request_shape_unsupported'
 SERVICE_TIER_ERROR_CODE = 'policy_service_tier_unsupported'
