@@ -596,6 +596,347 @@ def _lookalike_cases() -> list[dict[str, object]]:
     return cases
 
 
+def _unsupported_supersession_cases() -> list[dict[str, object]]:
+    case_id = 'supersede-unsupported-000'
+    candidate = _candidate(
+        case_id,
+        title='Primary datastore choice',
+        body='The primary datastore for sessions moved to a managed cluster.',
+        tier='none',
+        refs=[],
+        latest=_LATER,
+    )
+    entry = _entry(
+        case_id,
+        0,
+        title='Primary datastore choice',
+        body='The primary datastore for sessions is Postgres.',
+        tier='supported',
+        refs=[f'{case_id}-t1'],
+        latest=_EARLIER,
+    )
+    case_input = _input(case_id, candidate, _scope(), _shortlist(case_id, [entry]))
+    verdict = _verdict(
+        outcome='supersede_memory',
+        relation='candidate_supersedes',
+        target=str(entry['memory_version_id']),
+        candidate_refs=[],
+        comparisons=[_comparison(entry, 'candidate_supersedes', [f'{case_id}-t1'])],
+        temporal_order='candidate_newer',
+        reason_code='ordered_replacement',
+    )
+
+    return [
+        _case(
+            case_id,
+            'safe_supersession',
+            gate='semantic',
+            allowed_outcomes=['reject_candidate'],
+            forbidden_outcomes=['publish_new', 'merge_evidence', 'revise_memory', 'supersede_memory', 'open_conflict'],
+            primary_outcome='reject_candidate',
+            case_input=case_input,
+            fixture_verdict=verdict,
+            min_evidence_tier='none',
+        )
+    ]
+
+
+def _ladder_entry(
+    case_id: str,
+    index: int,
+    *,
+    title: str,
+    body: str,
+    tier: str,
+    relation: str,
+    scope: str = 'project',
+    team_id: str | None = None,
+    has_open_conflict: bool = False,
+    latest: str | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    refs = _refs(case_id, f't{index}', 0 if tier == 'none' else 1)
+    entry = _entry(
+        case_id,
+        index,
+        title=title,
+        body=body,
+        tier=tier,
+        refs=refs,
+        scope=scope,
+        team_id=team_id,
+        has_open_conflict=has_open_conflict,
+        latest=latest,
+    )
+
+    return entry, _comparison(entry, relation, refs)
+
+
+def _ladder_case(
+    case_id: str,
+    *,
+    candidate_title: str,
+    candidate_body: str,
+    candidate_tier: str,
+    candidate_latest: str | None,
+    scope: dict[str, object],
+    pairs: list[tuple[dict[str, object], dict[str, object]]],
+    model_outcome: str,
+    model_relation: str,
+    model_target: str | None,
+    model_temporal_order: str,
+    model_reason_code: str,
+    derived_outcome: str,
+    expected_targets: list[str],
+    open_conflict_valid: bool = False,
+    out_of_scope_target: str | None = None,
+) -> dict[str, object]:
+    candidate_refs = _refs(case_id, 'c', 2 if candidate_tier == 'corroborated' else 1)
+    candidate = _candidate(
+        case_id,
+        title=candidate_title,
+        body=candidate_body,
+        tier=candidate_tier,
+        refs=candidate_refs,
+        latest=candidate_latest,
+    )
+    entries = [pair[0] for pair in pairs]
+    comparisons = [pair[1] for pair in pairs]
+    case_input = _input(case_id, candidate, scope, _shortlist(case_id, entries))
+    verdict = _verdict(
+        outcome=model_outcome,
+        relation=model_relation,
+        target=model_target,
+        candidate_refs=candidate_refs,
+        comparisons=comparisons,
+        temporal_order=model_temporal_order,
+        reason_code=model_reason_code,
+    )
+
+    return _case(
+        case_id,
+        'multi_target_ladder',
+        gate='semantic',
+        allowed_outcomes=[derived_outcome],
+        forbidden_outcomes=_forbidden_except(derived_outcome),
+        primary_outcome=derived_outcome,
+        case_input=case_input,
+        fixture_verdict=verdict,
+        expected_targets=expected_targets,
+        min_evidence_tier=candidate_tier,
+        open_conflict_valid=open_conflict_valid,
+        out_of_scope_target=out_of_scope_target,
+    )
+
+
+def _rung_order_case() -> dict[str, object]:
+    case_id = 'ladder-rung-order-000'
+    redundant = _ladder_entry(
+        case_id,
+        0,
+        title='Shortlist ranking rule',
+        body='The curation shortlist ranks candidates by cosine distance.',
+        tier='supported',
+        relation='redundant',
+        latest=_EQUAL,
+    )
+    equivalent = _ladder_entry(
+        case_id,
+        1,
+        title='Shortlist ordering',
+        body='Curation shortlist entries are ordered by cosine distance over cached embeddings.',
+        tier='supported',
+        relation='equivalent',
+        latest=_EQUAL,
+    )
+
+    return _ladder_case(
+        case_id,
+        candidate_title='Shortlist ranking rule',
+        candidate_body='The curation shortlist ranks candidates by cosine distance over cached embeddings.',
+        candidate_tier='supported',
+        candidate_latest=_EQUAL,
+        scope=_scope(),
+        pairs=[redundant, equivalent],
+        model_outcome='reject_candidate',
+        model_relation='redundant',
+        model_target=str(redundant[0]['memory_version_id']),
+        model_temporal_order='not_applicable',
+        model_reason_code='redundant_claim',
+        derived_outcome='merge_evidence',
+        expected_targets=[str(equivalent[0]['memory_version_id'])],
+    )
+
+
+def _conflict_outranks_merge_case() -> dict[str, object]:
+    case_id = 'ladder-conflict-first-001'
+    incompatible = _ladder_entry(
+        case_id,
+        0,
+        title='Retry budget for ingestion',
+        body='Ingestion retries cap at twenty attempts before parking the work.',
+        tier='supported',
+        relation='mutually_incompatible',
+        latest=_EQUAL,
+    )
+    equivalent = _ladder_entry(
+        case_id,
+        1,
+        title='Ingestion retry cap',
+        body='Ingestion retries cap at five attempts before the work item is parked.',
+        tier='supported',
+        relation='equivalent',
+        latest=_EQUAL,
+    )
+
+    return _ladder_case(
+        case_id,
+        candidate_title='Retry budget for ingestion',
+        candidate_body='Ingestion retries cap at five attempts before parking the work.',
+        candidate_tier='supported',
+        candidate_latest=_EQUAL,
+        scope=_scope(),
+        pairs=[incompatible, equivalent],
+        model_outcome='merge_evidence',
+        model_relation='equivalent',
+        model_target=str(equivalent[0]['memory_version_id']),
+        model_temporal_order='unordered',
+        model_reason_code='equivalent_claim',
+        derived_outcome='open_conflict',
+        expected_targets=[str(incompatible[0]['memory_version_id'])],
+        open_conflict_valid=True,
+    )
+
+
+def _cross_visibility_identity_case() -> dict[str, object]:
+    case_id = 'ladder-cross-visibility-002'
+    cross = _ladder_entry(
+        case_id,
+        0,
+        title='Digest delivery window',
+        body='The daily digest goes out at 09:00 UTC to all project members.',
+        tier='supported',
+        relation='equivalent',
+        scope='team',
+        team_id=str(_uid(f'{case_id}:team')),
+        latest=_EQUAL,
+    )
+    neighbor = _ladder_entry(
+        case_id,
+        1,
+        title='Digest retention',
+        body='Digest emails are retained for thirty days before archival.',
+        tier='supported',
+        relation='compatible_distinct',
+        latest=_EQUAL,
+    )
+
+    return _ladder_case(
+        case_id,
+        candidate_title='Digest delivery window',
+        candidate_body='The daily digest is delivered at 09:00 UTC to every project member.',
+        candidate_tier='supported',
+        candidate_latest=_EQUAL,
+        scope=_scope(),
+        pairs=[cross, neighbor],
+        model_outcome='merge_evidence',
+        model_relation='equivalent',
+        model_target=str(cross[0]['memory_version_id']),
+        model_temporal_order='unordered',
+        model_reason_code='equivalent_claim',
+        derived_outcome='publish_new',
+        expected_targets=[],
+        out_of_scope_target=str(cross[0]['memory_version_id']),
+    )
+
+
+def _tie_breaks_on_shortlist_order_case() -> dict[str, object]:
+    case_id = 'ladder-tie-order-003'
+    first = _ladder_entry(
+        case_id,
+        0,
+        title='Embedding cache key',
+        body='The embedding cache key hashes the normalized body with the model id.',
+        tier='supported',
+        relation='equivalent',
+        latest=_EQUAL,
+    )
+    second = _ladder_entry(
+        case_id,
+        1,
+        title='Embedding cache identity',
+        body='Embedding cache entries are keyed by normalized body and model id.',
+        tier='supported',
+        relation='equivalent',
+        latest=_EQUAL,
+    )
+
+    return _ladder_case(
+        case_id,
+        candidate_title='Embedding cache key',
+        candidate_body='Embedding cache keys hash the normalized body together with the model id.',
+        candidate_tier='supported',
+        candidate_latest=_EQUAL,
+        scope=_scope(),
+        pairs=[first, second],
+        model_outcome='merge_evidence',
+        model_relation='equivalent',
+        model_target=str(second[0]['memory_version_id']),
+        model_temporal_order='unordered',
+        model_reason_code='equivalent_claim',
+        derived_outcome='merge_evidence',
+        expected_targets=[str(first[0]['memory_version_id'])],
+    )
+
+
+def _unsupported_duplicate_case() -> dict[str, object]:
+    case_id = 'ladder-unsupported-duplicate-004'
+    unsupported = _ladder_entry(
+        case_id,
+        0,
+        title='Outbox flush interval',
+        body='The outbox flushes pending rows every five seconds.',
+        tier='none',
+        relation='redundant',
+        latest=_EQUAL,
+    )
+    unrelated = _ladder_entry(
+        case_id,
+        1,
+        title='Outbox table growth',
+        body='The outbox table is vacuumed nightly to bound index growth.',
+        tier='supported',
+        relation='unrelated',
+        latest=_EQUAL,
+    )
+
+    return _ladder_case(
+        case_id,
+        candidate_title='Outbox flush interval',
+        candidate_body='The celery outbox flushes pending rows every five seconds.',
+        candidate_tier='supported',
+        candidate_latest=_EQUAL,
+        scope=_scope(),
+        pairs=[unsupported, unrelated],
+        model_outcome='reject_candidate',
+        model_relation='redundant',
+        model_target=str(unsupported[0]['memory_version_id']),
+        model_temporal_order='not_applicable',
+        model_reason_code='redundant_claim',
+        derived_outcome='publish_new',
+        expected_targets=[],
+    )
+
+
+def _multi_target_ladder_cases() -> list[dict[str, object]]:
+    return [
+        _rung_order_case(),
+        _conflict_outranks_merge_case(),
+        _cross_visibility_identity_case(),
+        _tie_breaks_on_shortlist_order_case(),
+        _unsupported_duplicate_case(),
+    ]
+
+
 def _fault_cases() -> list[dict[str, object]]:
     cases: list[dict[str, object]] = []
     templates = [
@@ -603,7 +944,7 @@ def _fault_cases() -> list[dict[str, object]]:
         ('fault-schema', {'schema_version': 1, 'outcome': 'publish_new'}),
         ('fault-target', 'invented_target'),
         ('fault-evidence', 'invented_evidence'),
-        ('fault-policy', 'weak_destructive'),
+        ('fault-comparisons', 'unmanifested_comparison'),
     ]
     for index, (prefix, marker) in enumerate(templates):
         case_id = f'{prefix}-{index:03d}'
@@ -611,8 +952,8 @@ def _fault_cases() -> list[dict[str, object]]:
             case_id,
             title='Retention window',
             body='Audit logs are retained for ninety days before archival.',
-            tier='corroborated' if marker != 'weak_destructive' else 'none',
-            refs=_refs(case_id, 'c', 2) if marker != 'weak_destructive' else [],
+            tier='corroborated',
+            refs=_refs(case_id, 'c', 2),
             latest=_LATER,
         )
         entry = _entry(
@@ -649,14 +990,18 @@ def _fault_cases() -> list[dict[str, object]]:
             )
         else:
             fixture_verdict = _verdict(
-                outcome='supersede_memory',
-                relation='candidate_supersedes',
+                outcome='merge_evidence',
+                relation='equivalent',
                 target=str(entry['memory_version_id']),
-                candidate_refs=[],
-                comparisons=[_comparison(entry, 'candidate_supersedes', [f'{case_id}-t1'])],
-                applicability='same',
-                temporal_order='candidate_newer',
-                reason_code='ordered_replacement',
+                candidate_refs=_refs(case_id, 'c', 2),
+                comparisons=[
+                    {
+                        'memory_version_id': str(_uid(f'{case_id}:phantom')),
+                        'relation': 'equivalent',
+                        'target_evidence_refs': [],
+                    }
+                ],
+                reason_code='equivalent_claim',
             )
         cases.append(
             _case(
@@ -749,6 +1094,7 @@ def build_corpus() -> list[dict[str, object]]:
             min_evidence_tier='corroborated',
         )
     )
+    cases.extend(_unsupported_supersession_cases())
     cases.extend(
         _semantic_bucket_cases(
             'genuine_conflict',
@@ -770,6 +1116,7 @@ def build_corpus() -> list[dict[str, object]]:
         )
     )
     cases.extend(_lookalike_cases())
+    cases.extend(_multi_target_ladder_cases())
     cases.extend(_fault_cases())
 
     return cases

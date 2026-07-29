@@ -23,6 +23,7 @@ BUCKETS = (
     'safe_supersession',
     'genuine_conflict',
     'lookalike_non_conflict',
+    'multi_target_ladder',
     'provider_fault',
 )
 BUCKET_MINIMUMS = {
@@ -34,6 +35,7 @@ BUCKET_MINIMUMS = {
     'safe_supersession': 10,
     'genuine_conflict': 15,
     'lookalike_non_conflict': 10,
+    'multi_target_ladder': 5,
     'provider_fault': 5,
 }
 MINIMUM_CASES = 120

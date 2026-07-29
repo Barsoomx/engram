@@ -444,7 +444,7 @@ def test_destructive_verdict_below_evidence_threshold_is_not_applied() -> None:
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(destructive), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert getattr(error.value, 'code', None) == 'curation_infeasible'
 
 
 @pytest.mark.django_db
@@ -467,10 +467,11 @@ def test_similarity_point_999_cannot_choose_destructive_outcome() -> None:
         reason='high similarity is retrieval evidence only',
     )
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(destructive), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(destructive), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -490,9 +491,10 @@ def test_conflict_tag_blocks_revise_and_supersede_targets() -> None:
             reason_code=reason_code,
             temporal_order='candidate_newer',
         )
-        with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-            module.parse_curation_judge_verdict(json.dumps(payload), data)
-        assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+        with _unchanged(candidate.project_id):
+            verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
+        assert verdict.outcome == 'publish_new'
+        assert verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -510,10 +512,11 @@ def test_conflict_tag_blocks_merge_evidence_target() -> None:
         temporal_order='not_applicable',
     )
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.target_memory_version_id is None
 
 
 def _conflict_payload(
@@ -594,7 +597,7 @@ def test_open_conflict_denied_when_comparison_incomplete() -> None:
     with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
         module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert getattr(error.value, 'code', None) == 'curation_infeasible'
 
 
 @pytest.mark.django_db
@@ -603,10 +606,11 @@ def test_open_conflict_denied_when_deterministic_precedence_exists() -> None:
     data = _conflict_data(module, data, entry, candidate_at=_CANDIDATE_EVIDENCE_AT, target_at=_TARGET_EVIDENCE_AT)
     payload = _conflict_payload(entry, candidate_refs=['candidate-ref'])
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -626,10 +630,11 @@ def test_open_conflict_denied_when_evidence_refs_empty(side: str) -> None:
     )
     payload = _conflict_payload(entry, candidate_refs=list(candidate_refs), target_refs=list(target_refs))
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -661,7 +666,6 @@ def test_judge_schema_rejects_recursive_extra_and_missing_keys(
     [
         ('schema_version', True),
         ('schema_version', 1.0),
-        ('outcome', 1),
         ('target_memory_version_id', 1),
         ('candidate_evidence_refs', [True]),
         ('comparisons', {}),
@@ -1052,7 +1056,7 @@ def test_corrupt_target_provenance_raises_operational_retry_without_downgrade() 
 
 
 @pytest.mark.django_db
-def test_targetless_outcome_rejects_identity_relation_comparison() -> None:
+def test_targetless_outcome_is_overridden_by_an_identity_relation_comparison() -> None:
     module, data, entry, candidate = _fixture()
     payload = _payload(
         entry,
@@ -1068,10 +1072,12 @@ def test_targetless_outcome_rejects_identity_relation_comparison() -> None:
         ],
     )
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+    assert verdict.outcome == 'merge_evidence'
+    assert verdict.relation == 'equivalent'
+    assert verdict.target_memory_version_id == entry.memory_version_id
 
 
 @pytest.mark.django_db
@@ -1098,10 +1104,11 @@ def test_supersede_requires_deterministic_precedence_not_provider_claim() -> Non
         reason='provider asserts precedence the evidence does not support',
     )
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.temporal_order == 'not_applicable'
 
 
 @pytest.mark.django_db
@@ -1118,10 +1125,11 @@ def test_supersede_requires_same_applicability() -> None:
         reason='supersession across a different applicability is not authorized',
     )
 
-    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    with _unchanged(candidate.project_id):
+        verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_policy_denied'
+    assert verdict.outcome == 'publish_new'
+    assert verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -1644,7 +1652,7 @@ def test_publish_new_allows_cross_visibility_identity_comparison() -> None:
 
 
 @pytest.mark.django_db
-def test_publish_new_still_rejects_same_visibility_identity_comparison() -> None:
+def test_publish_new_yields_to_a_same_visibility_identity_comparison() -> None:
     module, data, entries = _agent_parse_data([(VisibilityScope.TEAM, True)])
     payload = {
         'schema_version': 1,
@@ -1665,10 +1673,12 @@ def test_publish_new_still_rejects_same_visibility_identity_comparison() -> None
         'reason': 'same-visibility identity should block targetless publish',
     }
 
-    with pytest.raises(ValueError) as error:
-        module.parse_curation_judge_verdict(json.dumps(payload), data)
+    verdict = module.parse_curation_judge_verdict(json.dumps(payload), data)
 
-    assert getattr(error.value, 'code', None) == 'judge_invalid_output'
+    assert verdict.outcome == 'open_conflict'
+    assert verdict.relation == 'mutually_incompatible'
+    assert verdict.temporal_order == 'unordered'
+    assert verdict.target_memory_version_id == entries[0].memory_version_id
 
 
 @pytest.mark.django_db
@@ -1768,10 +1778,10 @@ def test_provider_path_emits_cross_visibility_rule_and_settles(monkeypatch: pyte
     )
     monkeypatch.setattr(module, 'get_provider_gateway', lambda *_a, **_k: gateway_conflict)
 
-    with pytest.raises(ValueError) as error:
-        module.JudgeCurationCandidate().execute(data)
+    settled = module.JudgeCurationCandidate().execute(data)
 
-    assert getattr(error.value, 'code', None) == 'judge_cross_visibility_denied'
+    assert settled.verdict.outcome == 'publish_new'
+    assert settled.verdict.target_memory_version_id is None
 
 
 @pytest.mark.django_db
@@ -1799,3 +1809,34 @@ def test_judge_forwards_the_attempt_index_to_the_provider_call(monkeypatch: pyte
     module.JudgeCurationCandidate().execute(data)
 
     assert [call.attempt for call in calls] == [1]
+
+
+@pytest.mark.django_db
+def test_infeasible_candidate_never_reaches_the_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, data, entry, candidate = _fixture(comparison_complete=False)
+    stripped = replace(entry, has_open_conflict=True)
+    data = replace(
+        data,
+        shortlist=replace(data.shortlist, entries=(stripped,)),
+        evidence=replace(
+            data.evidence,
+            candidate=module.ClaimEvidence(tier='supported', refs=('candidate-ref',)),
+            targets={stripped.memory_version_id: module.ClaimEvidence(tier='none', refs=())},
+        ),
+    )
+    create_curation_policy(candidate.organization, candidate.team, candidate.project, task_type='curation')
+    calls: list[object] = []
+
+    class GatewayStub:
+        def call(self, call_input: object) -> ProviderCallResult:
+            calls.append(call_input)
+
+            raise AssertionError('the provider must not be called for an infeasible candidate')
+
+    monkeypatch.setattr(module, 'get_provider_gateway', lambda *_args, **_kwargs: GatewayStub())
+
+    with _unchanged(candidate.project_id), pytest.raises(ValueError) as error:
+        module.JudgeCurationCandidate().execute(data)
+
+    assert getattr(error.value, 'code', None) == 'curation_infeasible'
+    assert calls == []

@@ -515,7 +515,7 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
 
 
 def test_curation_decision_prefix_lists_every_mutating_identity_relation() -> None:
-    from engram.memory.curation_judge import _IDENTITY_RELATIONS
+    from engram.memory.curation_derivation import _IDENTITY_RELATIONS
 
     instructions = curation_schema_prompt_prefix('curation_decision_v1')
     marker = 'carries a mutating identity relation ('

@@ -426,6 +426,18 @@ def test_translate_failure_judge_policy_denied_stays_provider_transient() -> Non
     assert failure.code == 'judge_policy_denied'
 
 
+def test_translate_failure_curation_infeasible_retries_as_infrastructure_transient() -> None:
+    from engram.memory.transitions import MemoryTransitionError
+
+    failure = _wf().translate_failure(
+        MemoryTransitionError('curation_infeasible', 'no outcome is admissible yet', retryable=True),
+    )
+
+    assert failure.failure_class == 'infrastructure_transient'
+    assert failure.code == 'curation_infeasible'
+    assert _wf().retry_backoff(failure_class=failure.failure_class, failure_streak=1).total_seconds() > 0
+
+
 def test_translate_failure_maps_provenance_to_invalid_input() -> None:
     from engram.memory.transitions import MemoryTransitionError
 
