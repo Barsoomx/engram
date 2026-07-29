@@ -210,6 +210,30 @@ embedding cliff produced, made visible before it costs money.
 4. Live: redrive after deploy, confirm `judge_policy_denied` goes to zero and
    the decision/call ratio rises from 31%.
 
+## Redrive protocol (and why it is batched)
+
+The ~2918 terminal `candidate_decision` works must be redriven in bounded
+batches, letting embeddings drain between them. This is not caution for its
+own sake — it is required by a second-order effect:
+
+`write_exact_memory_projection` looks the document up by `memory_version_id`
+(projections.py:147). Every write outcome — publish, merge, revise, supersede
+— creates a **new** version, therefore a new `RetrievalDocument`, therefore
+one with `embedding_pgvector` NULL until the embedding work lands. And
+`corpus_fully_embedded` (curation_shortlist.py:240) is False if **any**
+current document in the authorized corpus is unembedded.
+
+So every successful decision briefly sets `comparison_complete=False` for the
+whole project. At low volume this is invisible; under a mass redrive it would
+stay false continuously, which starves the `publish_new` rung and makes
+`derive_decision` return `None` — **after** the provider call was paid for,
+since `feasible_outcomes` cannot know the model's relations in advance. The
+`INFRASTRUCTURE_TRANSIENT` backoff throttles the repeat, but batching removes
+the cause rather than damping it.
+
+Between batches, check: unembedded current documents back to zero, the
+decision outcome mix, and that `judge_policy_denied` stays at zero.
+
 ## Risks
 
 - **False `equivalent` still overwrites — and this slice amplifies it.**
