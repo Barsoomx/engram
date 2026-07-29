@@ -4,10 +4,12 @@ import json
 import uuid
 
 import pytest
+from django.utils import timezone
 
 from engram.access.services import EffectiveScope
 from engram.core.models import (
     CandidateStatus,
+    CurationOutcome,
     Memory,
     MemoryCandidate,
     MemoryCandidateSource,
@@ -24,7 +26,12 @@ from engram.core.models import (
     WorkflowWorkType,
 )
 from engram.memory import c53_orchestrator_test_support as orch
-from engram.memory.curation_judge import CurationJudgeComparisonV1, CurationJudgeVerdictV1
+from engram.memory.curation_judge import (
+    ClaimEvidence,
+    CurationEvidenceContext,
+    CurationJudgeComparisonV1,
+    CurationJudgeVerdictV1,
+)
 from engram.memory.memory_propose_service import ProposeMemory, ProposeMemoryInput
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
 
@@ -288,7 +295,11 @@ def test_agent_proposal_cross_visibility_conflict_claim_never_mutates_the_target
     )
     entry = orch.shortlist_entry(target)
     shortlist = orch.stub_shortlist(entry)
-    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
+    evidence_at = timezone.now()
+    evidence = CurationEvidenceContext(
+        candidate=ClaimEvidence(tier='supported', refs=('cref-1', 'cref-2'), latest_evidence_at=evidence_at),
+        targets={target_version.id: ClaimEvidence(tier='supported', refs=('tref-1',), latest_evidence_at=evidence_at)},
+    )
 
     conflict_payload = {
         'schema_version': 1,
@@ -313,17 +324,23 @@ def test_agent_proposal_cross_visibility_conflict_claim_never_mutates_the_target
     monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: orch.EMBEDDING_1536, raising=False)
     monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist, raising=False)
     monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence, raising=False)
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', orch._stub_revalidate, raising=False)
     opener = _opener_returning(_completion_bytes(conflict_payload))
     gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
     monkeypatch.setattr(curation_judge, 'get_provider_gateway', lambda *_a, **_k: gateway)
 
     before = (target.current_version, target.current_transition_id, target.status)
 
-    _result, _error = orch.run_decision(work, run)
+    _result, error = orch.run_decision(work, run)
 
+    assert error is None
     candidate.refresh_from_db()
     target.refresh_from_db()
-    assert candidate.status != CandidateStatus.PROMOTED
+    decisions = orch.curation_decisions_for(candidate)
+    assert [decision.outcome for decision in decisions] == [CurationOutcome.PUBLISH_NEW]
+    assert decisions[0].target_memory_version_id is None
+    assert candidate.status == CandidateStatus.PROMOTED
+    assert candidate.promoted_memory_id != target.id
     assert (target.current_version, target.current_transition_id, target.status) == before
     assert not MemoryConflict.objects.filter(memory_version_id=target_version.id).exists()
 

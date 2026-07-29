@@ -109,6 +109,18 @@ def test_semantic_fixture_verdicts_parse_and_faults_reject(f_corpus: list[dict[s
             assert verdict.outcome == case['primary_outcome']
 
 
+def test_multi_target_cases_derive_the_pinned_target(f_corpus: list[dict[str, object]]) -> None:
+    cases = [case for case in f_corpus if case['bucket'] == 'multi_target_ladder']
+    assert cases
+    for case in cases:
+        verdict = parse_curation_judge_verdict(json.dumps(case['fixture_verdict']), build_judge_input(case['input']))
+        derived = str(verdict.target_memory_version_id) if verdict.target_memory_version_id is not None else None
+        if case['expected_targets']:
+            assert derived in case['expected_targets']
+        else:
+            assert derived is None
+
+
 def test_committed_corpus_matches_generator(f_corpus: list[dict[str, object]]) -> None:
     assert load_corpus() == f_corpus
 
