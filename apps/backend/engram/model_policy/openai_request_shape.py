@@ -22,6 +22,35 @@ REASONING_EFFORT_BY_RESPONSE_KIND: dict[str, str] = {
     'single': 'minimal',
 }
 
+# Published USD per 1M tokens, captured 2026-07-27, as (standard, flex) pairs. Cost recording is
+# blind without these: a policy with no pricing records cost_usd 0.0000 and the spend disappears.
+_OPENAI_PRICING: dict[str, tuple[dict[str, str], dict[str, str]]] = {
+    'gpt-5-nano': (
+        {'input_per_mtok': '0.05', 'output_per_mtok': '0.40'},
+        {'input_per_mtok': '0.025', 'output_per_mtok': '0.20'},
+    ),
+    'gpt-5-mini': (
+        {'input_per_mtok': '0.25', 'output_per_mtok': '2.00'},
+        {'input_per_mtok': '0.125', 'output_per_mtok': '1.00'},
+    ),
+    'gpt-5.4-nano': (
+        {'input_per_mtok': '0.20', 'output_per_mtok': '1.25'},
+        {'input_per_mtok': '0.10', 'output_per_mtok': '0.625'},
+    ),
+    'gpt-5.4-mini': (
+        {'input_per_mtok': '0.75', 'output_per_mtok': '4.50'},
+        {'input_per_mtok': '0.375', 'output_per_mtok': '2.25'},
+    ),
+    'text-embedding-3-small': (
+        {'input_per_mtok': '0.02'},
+        {'input_per_mtok': '0.02'},
+    ),
+    'text-embedding-3-large': (
+        {'input_per_mtok': '0.13'},
+        {'input_per_mtok': '0.13'},
+    ),
+}
+
 _REASONING_FAMILIES = ('gpt-5', 'o4-mini', 'o3', 'o1')
 _FLEX_FAMILIES = frozenset({'gpt-5', 'o4-mini', 'o3'})
 _MINIMAL_EFFORT_FAMILIES = frozenset({'gpt-5'})
@@ -48,21 +77,40 @@ def supports_service_tier_flex(provider: str, model: str, base_url: str = '') ->
     return openai_model_family(provider, model, base_url) in _FLEX_FAMILIES
 
 
+def openai_model_pricing(model: str, *, flex: bool = False) -> dict[str, str] | None:
+    normalized = str(model or '').strip().lower()
+    prices = _OPENAI_PRICING.get(normalized)
+    if prices is None:
+        return None
+
+    standard, flex_prices = prices
+
+    return dict(flex_prices if flex else standard)
+
+
 def openai_policy_metadata(*, provider: str, model: str, base_url: str = '', flex: bool = False) -> dict[str, Any]:
-    family = openai_model_family(provider, model, base_url)
-    if not family:
+    if provider != OPENAI_PROVIDER or not _is_openai_api(base_url):
         return {}
 
-    request_shape: dict[str, Any] = {
-        'completion_tokens_param': REASONING_COMPLETION_TOKENS_PARAM,
-        'temperature': None,
-    }
-    if family in _MINIMAL_EFFORT_FAMILIES:
-        request_shape['reasoning_effort'] = dict(REASONING_EFFORT_BY_RESPONSE_KIND)
+    family = openai_model_family(provider, model, base_url)
+    metadata: dict[str, Any] = {}
+    use_flex = flex and family in _FLEX_FAMILIES
 
-    metadata: dict[str, Any] = {'request_shape': request_shape}
-    if flex and family in _FLEX_FAMILIES:
+    if family:
+        request_shape: dict[str, Any] = {
+            'completion_tokens_param': REASONING_COMPLETION_TOKENS_PARAM,
+            'temperature': None,
+        }
+        if family in _MINIMAL_EFFORT_FAMILIES:
+            request_shape['reasoning_effort'] = dict(REASONING_EFFORT_BY_RESPONSE_KIND)
+        metadata['request_shape'] = request_shape
+
+    if use_flex:
         metadata[SERVICE_TIER_METADATA_KEY] = {'tier': SERVICE_TIER_FLEX, 'attempt_budget': FLEX_ATTEMPT_BUDGET}
+
+    pricing = openai_model_pricing(model, flex=use_flex)
+    if pricing is not None:
+        metadata['pricing'] = pricing
 
     return metadata
 

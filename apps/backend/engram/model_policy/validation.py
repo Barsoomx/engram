@@ -8,6 +8,7 @@ from typing import Any
 
 from engram.core.models import Project, ProjectTeam
 from engram.core.provider_service_tier import resolve_service_tier
+from engram.core.provider_timeouts import FLEX_TIMEOUT_SIZING_ENV, flex_timeout_sizing_enabled
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, TaskType
 from engram.model_policy.openai_request_shape import (
@@ -28,6 +29,7 @@ VALIDATION_PROMPT = 'engram_validate_policies health check: respond with a minim
 NO_PROJECT_AVAILABLE_ERROR_CODE = 'no_project_available'
 REQUEST_SHAPE_ERROR_CODE = 'policy_request_shape_unsupported'
 SERVICE_TIER_ERROR_CODE = 'policy_service_tier_unsupported'
+FLEX_SIZING_ERROR_CODE = 'policy_flex_sizing_disabled'
 VALIDATION_REQUEST_ID_PREFIX = 'engram_validate_policies:'
 
 VALIDATION_HTTP_TIMEOUT_SECONDS = 15
@@ -50,6 +52,7 @@ _SANITIZED_ERROR_CODES = {
     NO_PROJECT_AVAILABLE_ERROR_CODE: NO_PROJECT_AVAILABLE_ERROR_CODE,
     REQUEST_SHAPE_ERROR_CODE: REQUEST_SHAPE_ERROR_CODE,
     SERVICE_TIER_ERROR_CODE: SERVICE_TIER_ERROR_CODE,
+    FLEX_SIZING_ERROR_CODE: FLEX_SIZING_ERROR_CODE,
 }
 
 _PUBLIC_ERROR_MESSAGES = {
@@ -64,6 +67,10 @@ _PUBLIC_ERROR_MESSAGES = {
     NO_PROJECT_AVAILABLE_ERROR_CODE: 'No project is available to route this validation.',
     REQUEST_SHAPE_ERROR_CODE: 'This model needs a request shape the policy does not declare.',
     SERVICE_TIER_ERROR_CODE: 'This model does not offer the configured service tier.',
+    FLEX_SIZING_ERROR_CODE: (
+        'This deployment is not sized for queued flex requests; '
+        f'set {FLEX_TIMEOUT_SIZING_ENV}=1 and restart the workers before enabling the flex tier.'
+    ),
     _PROVIDER_SECRET_ERROR_CODE: 'The provider secret is missing or disabled.',
     _FALLBACK_ERROR_CODE: 'The validation call failed.',
     _RESPONSE_INVALID_ERROR_CODE: 'The provider returned an unexpected response.',
@@ -95,7 +102,7 @@ def validate_policy(
     if project is None:
         return _failure(policy, NO_PROJECT_AVAILABLE_ERROR_CODE, latency_ms=0)
 
-    metadata_error = _policy_metadata_error(policy)
+    metadata_error = policy_metadata_error(policy)
     if metadata_error is not None:
         return _failure(policy, metadata_error, latency_ms=0)
 
@@ -159,9 +166,13 @@ def _validation_response_kind(policy: ModelPolicy) -> str:
     return 'candidates' if policy.task_type == TaskType.CURATION else 'single'
 
 
-def _policy_metadata_error(policy: ModelPolicy) -> str | None:
-    if policy_requests_flex_tier(policy) and not policy_supports_service_tier_flex(policy):
-        return SERVICE_TIER_ERROR_CODE
+def policy_metadata_error(policy: ModelPolicy) -> str | None:
+    if policy_requests_flex_tier(policy):
+        if not policy_supports_service_tier_flex(policy):
+            return SERVICE_TIER_ERROR_CODE
+
+        if not flex_timeout_sizing_enabled():
+            return FLEX_SIZING_ERROR_CODE
 
     response_kind = _validation_response_kind(policy)
     if not response_kind or not policy_openai_family(policy):

@@ -426,7 +426,11 @@ def test_flex_tier_on_a_family_that_rejects_it_is_reported(f_policy: ModelPolicy
 
 
 @pytest.mark.django_db
-def test_flex_policy_is_health_checked_on_the_standard_tier(f_policy: ModelPolicy) -> None:
+def test_flex_policy_is_health_checked_on_the_standard_tier(
+    f_policy: ModelPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv('ENGRAM_FLEX_TIMEOUT_SIZING', '1')
     _reshape(
         f_policy,
         model='gpt-5-mini',

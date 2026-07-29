@@ -142,6 +142,5 @@ def test_embedding_and_non_openai_task_models_carry_no_request_shape() -> None:
             is_openai_chat = preset['key'] in OPENAI_PRESET_KEYS and tm['task_type'] in CHAT_TASK_TYPES
             if is_openai_chat:
                 continue
-            assert tm['metadata'] == {}, (
-                f'preset {preset["key"]} {tm["task_type"]} must not carry provider request shaping'
-            )
+            shaping = {key: value for key, value in tm['metadata'].items() if key != 'pricing'}
+            assert shaping == {}, f'preset {preset["key"]} {tm["task_type"]} must not carry provider request shaping'

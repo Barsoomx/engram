@@ -106,9 +106,21 @@ def test_minimal_reasoning_effort_is_only_sent_to_the_gpt5_family() -> None:
     assert 'reasoning_effort' not in metadata['request_shape']
 
 
-def test_non_reasoning_models_get_no_metadata_at_all() -> None:
-    assert openai_policy_metadata(provider='openai', model='text-embedding-3-small') == {}
+def test_non_reasoning_models_get_no_request_shaping() -> None:
+    embedding = openai_policy_metadata(provider='openai', model='text-embedding-3-small')
+
+    assert 'request_shape' not in embedding
+    assert 'service_tier' not in embedding
+    assert embedding['pricing'] == {'input_per_mtok': '0.02'}
+
+
+def test_models_behind_a_foreign_base_url_get_no_metadata_at_all() -> None:
     assert openai_policy_metadata(provider='openai', model='glm-4.7', base_url=GLM_BASE_URL) == {}
+    assert openai_policy_metadata(provider='deepseek', model='deepseek-v4-pro') == {}
+
+
+def test_unknown_openai_models_carry_no_invented_pricing() -> None:
+    assert openai_policy_metadata(provider='openai', model='gpt-9-imaginary') == {}
 
 
 def test_policy_family_reads_the_base_url_from_metadata() -> None:
