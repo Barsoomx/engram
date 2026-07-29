@@ -25,7 +25,7 @@ POLL_INTERVAL = 1.0
 POLL_TIMEOUT = 5 * 60.0
 OUTPUT_LIMIT = 4000
 MAX_FAKE_PROVIDER_DELAY_MS = 5000
-FAILURE_LOG_SERVICES = ('api', 'relay', 'worker-batch', 'rabbitmq')
+FAILURE_LOG_SERVICES = ('api', 'relay', 'worker-realtime', 'rabbitmq')
 FAILURE_LOG_TAIL = 200
 FAILURE_LOG_TIMEOUT = 30
 
@@ -264,7 +264,7 @@ def write_override_file(path: Path, project: str) -> None:
               - "127.0.0.1::8000"
           relay:
             image: {image}
-          worker-batch:
+          worker-realtime:
             image: {image}
             environment:
               ENGRAM_FAKE_PROVIDER_DELAY_MS: "5000"
@@ -731,13 +731,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             harness.assert_project_absent()
             owns_project = True
-            harness.compose('build', 'api', 'relay', 'worker-batch', timeout=STARTUP_TIMEOUT)
+            harness.compose('build', 'api', 'relay', 'worker-realtime', timeout=STARTUP_TIMEOUT)
             harness.compose('up', '-d', '--wait', 'api', 'relay', timeout=STARTUP_TIMEOUT)
             harness.shell_json(bootstrap_code(raw_api_key, raw_search_key), timeout=120)
             ids = harness.shell_json(seed_code(f'c43-{secrets.token_hex(6)}', raw_search_key), timeout=180)
             baseline = parse_memory_snapshot(json.dumps(harness.shell_json(snapshot_query(ids), timeout=120)))
             validate_pre_kill(baseline)
-            harness.compose('up', '-d', '--no-deps', 'worker-batch', timeout=60)
+            harness.compose('up', '-d', '--no-deps', 'worker-realtime', timeout=60)
 
             def active_probe() -> MemorySnapshot:
                 snapshot = parse_memory_snapshot(json.dumps(harness.shell_json(snapshot_query(ids), timeout=60)))
@@ -746,10 +746,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return snapshot
 
             harness.poll('one active embedding lease', active_probe, timeout=POLL_TIMEOUT)
-            harness.compose('kill', '-s', 'SIGKILL', 'worker-batch', timeout=30)
-            harness.compose('stop', '-t', '2', 'worker-batch', timeout=30, check=False)
+            harness.compose('kill', '-s', 'SIGKILL', 'worker-realtime', timeout=30)
+            harness.compose('stop', '-t', '2', 'worker-realtime', timeout=30, check=False)
             reconciliation = harness.shell_json(force_reconciliation_code(ids['work_id']), timeout=60)
-            harness.compose('up', '-d', '--no-deps', 'worker-batch', timeout=60)
+            harness.compose('up', '-d', '--no-deps', 'worker-realtime', timeout=60)
 
             def recovered_probe() -> MemorySnapshot:
                 snapshot = parse_memory_snapshot(json.dumps(harness.shell_json(snapshot_query(ids), timeout=60)))

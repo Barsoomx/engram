@@ -84,6 +84,12 @@ lease, killed `worker-batch` with `SIGKILL`, manually expired the work and run
 leases, explicitly queued one `origin=reconciliation` attempt, restarted the
 worker, and observed recovery of the same embedding work identity.
 
+That run is kept verbatim as the historical record. Since 2026-07-29 the
+embedding task routes to `engram-realtime`, so the scenario now kills
+`worker-realtime` — whichever worker consumes the embedding queue is the one
+the fault targets. The procedure is otherwise unchanged: still exactly one
+worker, still killed mid-lease.
+
 The final evidence was one transition, audit, document, and embedding work;
 one 1,536-component current vector; and exact projection hash
 `3c7857e12cffcae19181f1743ab8732ee10def44ebf88b35d3f9d6945226341b`.
