@@ -377,8 +377,13 @@ def parse_extraction_output(raw_body: str, *, chunk_observation_ids: frozenset[s
     if not isinstance(parsed, dict):
         raise ExtractionContractError('extraction output must be a JSON object')
 
-    if set(parsed.keys()) != {'memories', 'no_signal_observation_ids'}:
+    # no_signal_observation_ids is recomputed from the chunk manifest below, so its value is never
+    # read. Demanding it only converts a harmless omission into a paid retry.
+    if not set(parsed.keys()) <= {'memories', 'no_signal_observation_ids'}:
         raise ExtractionContractError('extraction output has unexpected keys')
+
+    if 'memories' not in parsed:
+        raise ExtractionContractError('extraction output is missing memories')
 
     memories_raw = parsed['memories']
     if not isinstance(memories_raw, list):
@@ -387,7 +392,8 @@ def parse_extraction_output(raw_body: str, *, chunk_observation_ids: frozenset[s
     if len(memories_raw) > _MAX_MEMORIES:
         raise ExtractionContractError('too many memories')
 
-    _validate_no_signal_ids(parsed['no_signal_observation_ids'])
+    if 'no_signal_observation_ids' in parsed:
+        _validate_no_signal_ids(parsed['no_signal_observation_ids'])
     parsed_memories = tuple(_parse_memory(item, chunk_observation_ids) for item in memories_raw)
     memories = tuple(memory for memory in parsed_memories if memory.supporting_observation_ids)
 
