@@ -34,6 +34,46 @@ Two structural consequences:
    `latest_evidence_at` timestamps that are **not in the prompt at all**. The
    model is asked to assert `temporal_order` it has no way to know.
 
+## Measured feasible sets (30 stuck works, stand, zero judge calls)
+
+Brute-forcing `_apply_evidence_policy` over every (outcome, relation, target,
+applicability, temporal_order) tuple for 30 stuck `candidate_decision` works:
+
+```
+candidate tier      : supported x30      (never corroborated, never none)
+comparison_complete : True x30           (the corpus is fully embedded)
+shortlist size      : 4 x30
+target tiers        : supported x93, corroborated x27
+
+reachable outcomes:
+  16/30  merge_evidence | publish_new | reject_candidate/redundant
+  14/30  the same plus open_conflict
+```
+
+Two conclusions that reshape the problem:
+
+1. **The feasible set is never empty here.** The embedding cliff is not the
+   current cause; `comparison_complete` is true everywhere. The infeasibility
+   precheck below is cheap insurance against a cliff regression, not the main
+   saving. The main saving is the derivation itself.
+
+2. **`revise_memory` and `supersede_memory` are structurally unreachable.**
+   They require `candidate_tier == 'corroborated'`, and:
+
+   ```
+   candidates by distinct source window: 1 window -> 4243 of 4243
+   curation decisions by evidence_tier : supported -> 1333, corroborated -> 0
+   ```
+
+   Every distillation candidate is produced from exactly one window, the
+   independence union-find collapses that to exactly one group, so the tier is
+   always `supported`. Two of the six outcomes are dead code for the only
+   candidate producer that exists. The model is asked to choose among six
+   outcomes when four are achievable — and pays for every miss.
+
+   Whether single-window multi-observation evidence *should* count as
+   corroboration is a separate design question and is **not** changed here.
+
 ## Thesis
 
 `outcome` is a pure function of (per-target relation, deterministic facts).
@@ -153,6 +193,17 @@ embedding cliff produced, made visible before it costs money.
    already committed (`forbidden_destructive_max=0`, `conflict_recall_min=1.0`,
    `destructive_precision_min=1.0`, `macro_f1_min=0.92`). A miss is evidence
    the ladder order is wrong — diagnose, do not tune blindly.
+
+   **The corpus as committed could not see the new decision surface.** Every
+   case had 0 or 1 shortlist entries (`{1: 86, 0: 35}`), while production
+   shortlists carry 4 (`{4: 30}` across 30 sampled works). Cross-target rung
+   ordering — the entire behaviour the ladder introduces — had zero eval
+   coverage, so an earlier draft of this spec was wrong to name the eval's
+   destructive thresholds as the guard for the last risk below. Multi-target
+   cases were added to close it: rung ordering beating the model's own target,
+   a contradiction outranking a merge on another target, a cross-visibility
+   identity relation never mutating, ties resolving to shortlist order, and an
+   unsupported target failing to absorb a duplicate.
 3. Offline census on the stand: for stuck candidates, build shortlist +
    evidence and report `feasible_outcomes` **without any provider call**.
    Proves the 2918 terminal works become actionable before spending on them.
@@ -161,17 +212,68 @@ embedding cliff produced, made visible before it costs money.
 
 ## Risks
 
-- **False `equivalent` still overwrites.** Derivation removes the *pressure*
-  to misreport an outcome, not the *ability* to misjudge a relation. MERGE
-  routes through `_execute_candidate_revision`, which writes the candidate's
-  text into the target memory. Making MERGE evidence-only is a separate
-  slice and is the real fix for that class.
+- **False `equivalent` still overwrites — and this slice amplifies it.**
+  Derivation removes the *pressure* to misreport an outcome, not the *ability*
+  to misjudge a relation. MERGE routes through `_execute_candidate_revision`,
+  which sets `memory.title` / `memory.body` to the **candidate's** text: it is
+  a full content replacement wearing the name "merge". Today it fires 69 times
+  all-time because most attempts are denied. After derivation it sits at rung
+  4 and is reachable for every `supported` candidate — against a backlog of
+  5,824 mostly-duplicate proposed candidates. Shipping derivation alone would
+  knowingly amplify a destructive path, so **MERGE must become evidence-only
+  before either change reaches the stand**: keep the prior version's title and
+  body, attach only the candidate's sources. That is a separate PR, merged
+  immediately after this one and deployed together.
 - **Duplicate publish.** When the model calls a target redundant but that
   target's tier is `none`, rung 5 is ineligible and the ladder falls through
   to `publish_new`. The old gate admitted exactly this state, so the
   restriction invariant holds, but the outcome is a duplicate. Log the
   suppressed identity relations so it is observable.
+- **`applicability` is top-level in v1 but the ladder is per-target.** The
+  model reports applicability for *its own* chosen target; the ladder may
+  select a different one. The conservative direction (model said `different`,
+  ladder blocks every mutation rung) is safe. The unsafe direction — model
+  said `same` about target A while the ladder acts on target B — is real but
+  narrow, since the ladder picks the strongest identity relation, which is
+  usually the target the model chose. Slice 2 moves `applicability` into the
+  comparison object and closes it.
+- **Revision signal degrades to a duplicate.** Because candidates are always
+  `supported`, a `candidate_revises` or `candidate_supersedes` relation can
+  never reach its rung; the ladder falls through to `publish_new`, adding a
+  competing memory rather than updating the existing one. This is what the old
+  gate admitted too, so the restriction invariant holds and nothing is
+  overwritten — but the corpus accumulates near-duplicates instead of
+  revisions. `suppressed_identity_relations` exists to measure exactly this;
+  the fix belongs in the evidence-tier design, not here.
+- **`open_conflict` is structurally unreachable, so contradictions publish
+  silently.** `_conflict_eligible` requires `¬deterministic_precedence`, i.e.
+  the candidate's and target's `latest_evidence_at` are equal or one is
+  missing. In production both are always populated and essentially never
+  equal, which is why `open_conflict` has never fired. This mirrors the old
+  gate exactly — the unreachability is pre-existing, not introduced here — but
+  the consequence changes: a model-asserted `mutually_incompatible` used to be
+  denied and eventually terminalise, writing nothing; now it falls through to
+  `publish_new` and a knowingly contradictory memory enters the corpus with no
+  conflict marker. Widening the rung would break the restriction invariant, so
+  it is deliberately not done here. `suppressed_identity_relations` will
+  measure how often it happens. Tracked as B-008.
+
 - **Derivation may act more destructively than the model asked.** The model's
-  own `outcome` is ignored; a `candidate_supersedes` in `comparisons` now
-  supersedes even if the model wrote `reject_candidate` on top. The frozen
-  eval's destructive-precision and forbidden-outcome thresholds are the guard.
+  own `outcome` is ignored, so an identity relation on a target the model did
+  *not* select now drives the outcome. Concretely: shortlist `[A, B]`, model
+  says `reject_candidate` against A with `comparisons=[A:redundant,
+  B:equivalent]`. The old parser inspected only A and rejected, writing
+  nothing; the ladder fires rung 4 on B before rung 5 on A and merges into B.
+  With MERGE made evidence-only this is no longer a content overwrite — B
+  keeps its text and gains the candidate's sources, a faithful action on the
+  model's own assertion that B is equivalent — but it is still an action the
+  model did not request, applied at backlog scale. It is now pinned as an
+  explicit eval case (C1) rather than left as an emergent accident.
+
+- **`judge_cross_visibility_denied` becomes unreachable.** The ladder never
+  selects a cross-visibility target for a mutation rung, so the terminal
+  `INVALID_INPUT` stop can no longer fire from the parse path. On redrive,
+  works that previously died there now derive `publish_new` and create a
+  memory. That is a data-creating change applied to an existing backlog, so
+  the redrive is done in bounded batches with the outcome mix checked between
+  them.
