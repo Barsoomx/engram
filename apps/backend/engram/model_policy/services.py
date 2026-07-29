@@ -42,6 +42,7 @@ from engram.model_policy.models import (
     ProviderSecretEnvelope,
     SecretScope,
 )
+from engram.model_policy.openai_request_shape import openai_policy_metadata
 
 logger = structlog.get_logger(__name__)
 
@@ -427,6 +428,19 @@ def ensure_policy_in_scope(policy: ModelPolicy, allowed_team_ids: tuple[uuid.UUI
         raise ModelPolicyError('model_policy_not_found', 'Model policy was not found')
 
 
+def apply_derived_request_shape(metadata: dict[str, Any], *, provider: str, model: str) -> None:
+    derived = openai_policy_metadata(provider=provider, model=model, base_url=str(metadata.get('base_url') or ''))
+    shape = derived.get('request_shape')
+    if shape is None:
+        metadata.pop('request_shape', None)
+
+        return
+
+    metadata['request_shape'] = shape
+
+    return
+
+
 class CreateModelPolicy:
     def execute(self, data: ModelPolicyInput) -> ModelPolicy:
         team_id = data.scope_team_id if data.scope_team_id is not None else data.team_id
@@ -454,6 +468,7 @@ class CreateModelPolicy:
             metadata['context_window_tokens'] = data.context_window_tokens
         if data.json_mode is not None:
             metadata['json_mode'] = data.json_mode
+        apply_derived_request_shape(metadata, provider=data.provider, model=data.model)
 
         with transaction.atomic():
             policy = ModelPolicy.objects.create(
@@ -573,6 +588,19 @@ class UpdateModelPolicy:
         if 'metadata' not in update_fields:
             update_fields.append('metadata')
 
+    def _apply_request_shape_update(self, policy: ModelPolicy, update_fields: list[str]) -> None:
+        current = dict(policy.metadata or {})
+        before = current.get('request_shape')
+        apply_derived_request_shape(current, provider=policy.provider, model=policy.model)
+        if current.get('request_shape') == before:
+            return
+
+        policy.metadata = current
+        if 'metadata' not in update_fields:
+            update_fields.append('metadata')
+
+        return
+
     def execute(self, data: UpdateModelPolicyInput) -> ModelPolicy:
         with transaction.atomic():
             try:
@@ -590,6 +618,7 @@ class UpdateModelPolicy:
             self._apply_secret_update(policy, data, update_fields)
             self._apply_base_url_update(policy, data, update_fields)
             self._apply_context_window_update(policy, data, update_fields)
+            self._apply_request_shape_update(policy, update_fields)
 
             policy.version += 1
             policy.save(update_fields=update_fields)
