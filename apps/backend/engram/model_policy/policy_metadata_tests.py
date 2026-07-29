@@ -125,3 +125,48 @@ def test_switching_away_from_gpt5_restores_the_historic_request_shape(f_scope: t
 
     assert resolve_completion_tokens_param(updated, 'candidates') == 'max_tokens'
     assert resolve_temperature(updated, 'candidates') == 0.2
+
+
+@pytest.mark.django_db
+def test_switching_away_from_a_flex_family_drops_the_flex_tier(f_scope: tuple) -> None:
+    organization, _team, project, _owner, _api_key = f_scope
+    policy = _create(organization, project, provider='openai', model='gpt-5-mini')
+    ModelPolicy.objects.filter(id=policy.id).update(
+        metadata={**policy.metadata, 'service_tier': {'tier': 'flex', 'attempt_budget': 2}}
+    )
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            model='gpt-4o-mini',
+            request_id=str(uuid.uuid4()),
+            actor_id='tests',
+        )
+    )
+
+    assert 'service_tier' not in (updated.metadata or {})
+
+
+@pytest.mark.django_db
+def test_unrelated_updates_preserve_a_hand_tuned_request_shape(f_scope: tuple) -> None:
+    organization, _team, project, _owner, _api_key = f_scope
+    policy = _create(organization, project, provider='openai', model='gpt-5-mini')
+    tuned = {**policy.metadata['request_shape'], 'reasoning_effort': {'single': 'medium'}}
+    ModelPolicy.objects.filter(id=policy.id).update(metadata={**policy.metadata, 'request_shape': tuned})
+
+    updated = UpdateModelPolicy().execute(
+        UpdateModelPolicyInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy_id=policy.id,
+            name='renamed but otherwise untouched',
+            request_id=str(uuid.uuid4()),
+            actor_id='tests',
+        )
+    )
+
+    assert updated.metadata['request_shape']['reasoning_effort'] == {'single': 'medium'}

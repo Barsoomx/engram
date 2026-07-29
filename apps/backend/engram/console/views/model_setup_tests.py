@@ -670,7 +670,9 @@ def test_apply_openai_flex_persists_the_service_tier_block(
     f_admin_client: APIClient,
     f_setup_project: Project,
     f_setup_org: Organization,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv('ENGRAM_FLEX_TIMEOUT_SIZING', '1')
     response = f_admin_client.post(
         '/v1/admin/model-setup/apply',
         {
@@ -748,3 +750,56 @@ def test_presets_endpoint_exposes_the_flex_variant(f_read_client: APIClient) -> 
     assert presets['openai_all_flex']['providers_needed'] == ['openai']
     flex_curation = next(tm for tm in presets['openai_all_flex']['task_models'] if tm['task_type'] == 'curation')
     assert flex_curation['metadata']['service_tier']['tier'] == 'flex'
+
+
+@pytest.mark.django_db
+def test_apply_openai_flex_is_refused_when_the_deployment_is_not_sized_for_it(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv('ENGRAM_FLEX_TIMEOUT_SIZING', raising=False)
+
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all_flex',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-flex-unsized',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 400
+    assert response.json()['code'] == 'policy_flex_sizing_disabled'
+    assert not ModelPolicy.objects.filter(organization=f_setup_org, active=True).exists()
+
+
+@pytest.mark.django_db
+def test_standard_openai_preset_applies_without_flex_sizing(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv('ENGRAM_FLEX_TIMEOUT_SIZING', raising=False)
+
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-openai-standard',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    curation = ModelPolicy.objects.get(organization=f_setup_org, task_type='curation', active=True)
+    assert 'service_tier' not in curation.metadata
+    assert curation.metadata['pricing']['input_per_mtok'] == '0.25'

@@ -42,7 +42,7 @@ from engram.model_policy.models import (
     ProviderSecretEnvelope,
     SecretScope,
 )
-from engram.model_policy.openai_request_shape import openai_policy_metadata
+from engram.model_policy.openai_request_shape import openai_policy_metadata, supports_service_tier_flex
 
 logger = structlog.get_logger(__name__)
 
@@ -588,11 +588,22 @@ class UpdateModelPolicy:
         if 'metadata' not in update_fields:
             update_fields.append('metadata')
 
-    def _apply_request_shape_update(self, policy: ModelPolicy, update_fields: list[str]) -> None:
+    def _apply_request_shape_update(
+        self,
+        policy: ModelPolicy,
+        data: UpdateModelPolicyInput,
+        update_fields: list[str],
+    ) -> None:
+        if data.provider is None and data.model is None:
+            return
+
         current = dict(policy.metadata or {})
-        before = current.get('request_shape')
+        before = dict(current)
+        base_url = str(current.get('base_url') or '')
         apply_derived_request_shape(current, provider=policy.provider, model=policy.model)
-        if current.get('request_shape') == before:
+        if not supports_service_tier_flex(policy.provider, policy.model, base_url):
+            current.pop(SERVICE_TIER_METADATA_KEY, None)
+        if current == before:
             return
 
         policy.metadata = current
@@ -618,7 +629,7 @@ class UpdateModelPolicy:
             self._apply_secret_update(policy, data, update_fields)
             self._apply_base_url_update(policy, data, update_fields)
             self._apply_context_window_update(policy, data, update_fields)
-            self._apply_request_shape_update(policy, update_fields)
+            self._apply_request_shape_update(policy, data, update_fields)
 
             policy.version += 1
             policy.save(update_fields=update_fields)
