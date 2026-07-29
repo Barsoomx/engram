@@ -1012,6 +1012,7 @@ def _attempt_stage(
         prompt=prepared.prompt,
         system_prompt=prepared.system_prompt,
         response_kind=prepared.response_kind,
+        attempt=window.work.failure_streak,
     )
     provider_result = _call_provider(
         stage=stage,

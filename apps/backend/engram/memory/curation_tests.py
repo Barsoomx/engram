@@ -3337,3 +3337,40 @@ def test_candidate_embedding_cache_invalidates_on_content_change(monkeypatch: py
     module.resolve_candidate_embedding(candidate, view, None)
 
     assert len(calls) == 2
+
+
+@pytest.mark.django_db
+def test_candidate_decision_judge_carries_the_work_failure_streak_as_its_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('judge-attempt')
+    policy = orch.curation_policy(scope)
+    _candidate, work, run = orch.subject_candidate(scope, suffix='judge-attempt')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge_result = orch.stub_judge_result(
+        orch.stub_verdict('publish_new'),
+        orch.provider_call_record(scope, policy),
+        policy,
+        shortlist,
+    )
+    module = orch.curation_module()
+    orch.enable_rollout(monkeypatch)
+    captured: list[object] = []
+
+    def capture_judge_input(data: object) -> object:
+        captured.append(data)
+
+        return judge_result
+
+    monkeypatch.setattr(module, 'resolve_candidate_embedding', lambda *_a, **_k: _EMBEDDING)
+    monkeypatch.setattr(module, 'build_curation_shortlist', lambda *_a, **_k: shortlist)
+    monkeypatch.setattr(module, 'build_curation_evidence_context', lambda *_a, **_k: evidence)
+    monkeypatch.setattr(module, 'judge_curation_candidate', capture_judge_input)
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', orch._stub_revalidate)
+    WorkflowWork.objects.filter(id=work.id).update(failure_streak=2)
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert [data.attempt for data in captured] == [2]

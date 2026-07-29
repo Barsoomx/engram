@@ -7,15 +7,33 @@ from dataclasses import dataclass
 from typing import Any
 
 from engram.core.models import Project, ProjectTeam
+from engram.core.provider_service_tier import resolve_service_tier
+from engram.core.provider_timeouts import FLEX_TIMEOUT_SIZING_ENV, flex_timeout_sizing_enabled
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, TaskType
-from engram.model_policy.services import EmbeddingCallInput, ProviderCallInput, get_provider_gateway
+from engram.model_policy.openai_request_shape import (
+    REASONING_COMPLETION_TOKENS_PARAM,
+    policy_openai_family,
+    policy_requests_flex_tier,
+    policy_supports_service_tier_flex,
+)
+from engram.model_policy.services import (
+    EmbeddingCallInput,
+    ProviderCallInput,
+    get_provider_gateway,
+    resolve_completion_tokens_param,
+    resolve_temperature,
+)
 
 VALIDATION_PROMPT = 'engram_validate_policies health check: respond with a minimal completion.'
 NO_PROJECT_AVAILABLE_ERROR_CODE = 'no_project_available'
+REQUEST_SHAPE_ERROR_CODE = 'policy_request_shape_unsupported'
+SERVICE_TIER_ERROR_CODE = 'policy_service_tier_unsupported'
+FLEX_SIZING_ERROR_CODE = 'policy_flex_sizing_disabled'
 VALIDATION_REQUEST_ID_PREFIX = 'engram_validate_policies:'
 
 VALIDATION_HTTP_TIMEOUT_SECONDS = 15
+_MAX_SERVICE_TIER_PROBE_ATTEMPTS = 16
 
 _PROVIDER_SECRET_ERROR_CODE = 'provider_secret_unavailable'
 _FALLBACK_ERROR_CODE = 'provider_error'
@@ -32,6 +50,9 @@ _SANITIZED_ERROR_CODES = {
     'policy_scope_mismatch': 'policy_scope_mismatch',
     'model_policy_not_found': 'model_policy_not_found',
     NO_PROJECT_AVAILABLE_ERROR_CODE: NO_PROJECT_AVAILABLE_ERROR_CODE,
+    REQUEST_SHAPE_ERROR_CODE: REQUEST_SHAPE_ERROR_CODE,
+    SERVICE_TIER_ERROR_CODE: SERVICE_TIER_ERROR_CODE,
+    FLEX_SIZING_ERROR_CODE: FLEX_SIZING_ERROR_CODE,
 }
 
 _PUBLIC_ERROR_MESSAGES = {
@@ -44,6 +65,12 @@ _PUBLIC_ERROR_MESSAGES = {
     'policy_scope_mismatch': 'The policy scope is misconfigured.',
     'model_policy_not_found': 'The model policy could not be found.',
     NO_PROJECT_AVAILABLE_ERROR_CODE: 'No project is available to route this validation.',
+    REQUEST_SHAPE_ERROR_CODE: 'This model needs a request shape the policy does not declare.',
+    SERVICE_TIER_ERROR_CODE: 'This model does not offer the configured service tier.',
+    FLEX_SIZING_ERROR_CODE: (
+        'This deployment is not sized for queued flex requests; '
+        f'set {FLEX_TIMEOUT_SIZING_ENV}=1 and restart the workers before enabling the flex tier.'
+    ),
     _PROVIDER_SECRET_ERROR_CODE: 'The provider secret is missing or disabled.',
     _FALLBACK_ERROR_CODE: 'The validation call failed.',
     _RESPONSE_INVALID_ERROR_CODE: 'The provider returned an unexpected response.',
@@ -75,6 +102,10 @@ def validate_policy(
     if project is None:
         return _failure(policy, NO_PROJECT_AVAILABLE_ERROR_CODE, latency_ms=0)
 
+    metadata_error = policy_metadata_error(policy)
+    if metadata_error is not None:
+        return _failure(policy, metadata_error, latency_ms=0)
+
     request_id = f'{VALIDATION_REQUEST_ID_PREFIX}{policy.id}:{uuid.uuid4()}'
     started_at = time.monotonic()
     try:
@@ -92,7 +123,6 @@ def validate_policy(
                 ),
             )
         else:
-            response_kind = 'candidates' if policy.task_type == TaskType.CURATION else 'single'
             gateway.call(
                 ProviderCallInput(
                     organization_id=policy.organization_id,
@@ -102,7 +132,8 @@ def validate_policy(
                     request_id=request_id,
                     trace_id=request_id,
                     prompt=VALIDATION_PROMPT,
-                    response_kind=response_kind,
+                    response_kind=_validation_response_kind(policy),
+                    attempt=_standard_tier_attempt(policy),
                 ),
             )
     except ModelPolicyError as error:
@@ -126,6 +157,44 @@ def validate_policy(
 
 def validation_timeout_failure(policy: ModelPolicy, *, latency_ms: int) -> PolicyValidationResult:
     return _failure(policy, _VALIDATION_TIMEOUT_ERROR_CODE, latency_ms=latency_ms)
+
+
+def _validation_response_kind(policy: ModelPolicy) -> str:
+    if policy.task_type == TaskType.EMBEDDING:
+        return ''
+
+    return 'candidates' if policy.task_type == TaskType.CURATION else 'single'
+
+
+def policy_metadata_error(policy: ModelPolicy) -> str | None:
+    if policy_requests_flex_tier(policy):
+        if not policy_supports_service_tier_flex(policy):
+            return SERVICE_TIER_ERROR_CODE
+
+        if not flex_timeout_sizing_enabled():
+            return FLEX_SIZING_ERROR_CODE
+
+    response_kind = _validation_response_kind(policy)
+    if not response_kind or not policy_openai_family(policy):
+        return None
+
+    if resolve_completion_tokens_param(policy, response_kind) != REASONING_COMPLETION_TOKENS_PARAM:
+        return REQUEST_SHAPE_ERROR_CODE
+
+    if resolve_temperature(policy, response_kind) is not None:
+        return REQUEST_SHAPE_ERROR_CODE
+
+    return None
+
+
+# A queued flex request cannot answer a health check inside the validation
+# timeout, and flex capacity is transient anyway - probe the standard tier.
+def _standard_tier_attempt(policy: ModelPolicy) -> int:
+    for attempt in range(_MAX_SERVICE_TIER_PROBE_ATTEMPTS):
+        if resolve_service_tier(policy.metadata, attempt=attempt) is None:
+            return attempt
+
+    return _MAX_SERVICE_TIER_PROBE_ATTEMPTS
 
 
 def _sanitize_error_code(raw_code: str) -> str:

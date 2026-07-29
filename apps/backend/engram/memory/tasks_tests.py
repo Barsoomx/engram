@@ -40,6 +40,12 @@ from engram.core.models import (
     WorkflowWorkResolutionReason,
     WorkflowWorkType,
 )
+from engram.core.provider_timeouts import (
+    FLEX_TIMEOUT_SIZING_ENV,
+    chat_call_ceiling,
+    hosted_provider_seconds,
+    resolve_work_timeouts,
+)
 from engram.memory import c53_orchestrator_test_support as orch
 from engram.memory import tasks as tasks_module
 from engram.memory.candidate_ttl import ExpireStaleCandidatesResult
@@ -85,6 +91,12 @@ from engram.model_policy.models import ModelPolicy, ProviderCallRecord, Provider
 
 _OBS_LEASE = timedelta(seconds=120)
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
+
+_TASKS_ON_GLOBAL_TIME_LIMITS = (
+    generate_daily_digest,
+    generate_weekly_digest,
+    tasks_module.reembed_missing_embeddings,
+)
 
 _VERSIONED_WORK_TASKS = (
     (
@@ -161,9 +173,13 @@ def test_versioned_work_tasks_are_registered_with_id_only_names_and_queues() -> 
         assert celeryconfig.task_routes[task_name]['queue'] == queue
 
 
-def test_celeryconfig_sets_global_time_limits() -> None:
-    assert celeryconfig.task_soft_time_limit == 120
-    assert celeryconfig.task_time_limit == 180
+def test_provider_calling_tasks_without_overrides_inherit_the_global_limits() -> None:
+    for task in _TASKS_ON_GLOBAL_TIME_LIMITS:
+        assert task.soft_time_limit is None
+        assert task.time_limit is None
+
+    assert celeryconfig.task_soft_time_limit < celeryconfig.task_time_limit
+    assert chat_call_ceiling() <= celeryconfig.task_soft_time_limit
 
 
 def test_ingest_and_digest_tasks_ack_late_and_reject_on_worker_lost() -> None:
@@ -172,24 +188,30 @@ def test_ingest_and_digest_tasks_ack_late_and_reject_on_worker_lost() -> None:
         assert task.reject_on_worker_lost is True
 
 
-def test_distill_session_has_a_per_task_time_limit_override_above_the_global_default() -> None:
-    assert distill_session.soft_time_limit == 600
-    assert distill_session.time_limit == 660
-    assert celeryconfig.task_soft_time_limit == 120
-    assert celeryconfig.task_time_limit == 180
+def test_distill_session_overrides_the_global_default_to_host_extract_and_reduce() -> None:
+    assert celeryconfig.task_soft_time_limit < distill_session.soft_time_limit < distill_session.time_limit
+    assert celeryconfig.task_time_limit < distill_session.time_limit
+    assert hosted_provider_seconds(WorkflowWorkType.SESSION_DISTILLATION) <= distill_session.soft_time_limit
 
 
-def test_process_observation_recorded_has_a_per_task_time_limit() -> None:
-    assert process_observation_recorded.soft_time_limit == 60
-    assert process_observation_recorded.time_limit == 90
+def test_process_observation_recorded_hosts_its_realtime_generation_call() -> None:
+    hosted = hosted_provider_seconds(WorkflowWorkType.OBSERVATION_PROCESSING)
+
+    assert process_observation_recorded.soft_time_limit < process_observation_recorded.time_limit
+    assert hosted <= process_observation_recorded.soft_time_limit
 
 
-def test_candidate_decision_worker_uses_explicit_time_limits_within_its_lease() -> None:
+def test_candidate_decision_worker_hosts_embedding_and_judge_inside_its_lease() -> None:
     task = tasks_module.process_candidate_decision_work_v1
+    lease_seconds = tasks_module._CANDIDATE_DECISION_LEASE.total_seconds()
 
-    assert task.soft_time_limit == tasks_module._CANDIDATE_DECISION_SOFT_TIME_LIMIT == 240
-    assert task.time_limit == tasks_module._CANDIDATE_DECISION_TIME_LIMIT == 270
-    assert tasks_module._CANDIDATE_DECISION_LEASE == timedelta(seconds=300)
+    assert task.soft_time_limit < task.time_limit < lease_seconds
+    assert hosted_provider_seconds(WorkflowWorkType.CANDIDATE_DECISION) <= task.soft_time_limit
+
+
+def test_confidence_decay_is_not_sized_for_provider_latency() -> None:
+    assert decay_memory_confidence.soft_time_limit < decay_memory_confidence.time_limit
+    assert (decay_memory_confidence.soft_time_limit, decay_memory_confidence.time_limit) == (600, 660)
 
 
 def test_task_routes_send_retry_failed_distillations_to_batch_queue() -> None:
@@ -206,11 +228,13 @@ def test_embedding_projection_worker_is_registered_on_batch_queue() -> None:
     assert celeryconfig.task_routes[task_name]['queue'] == celeryconfig.QUEUE_BATCH
 
 
-def test_embedding_projection_worker_uses_explicit_embedding_time_limits() -> None:
+def test_embedding_projection_worker_is_not_sized_for_flex_latency() -> None:
     task = tasks_module.embed_memory_projection_work_v1
+    lease_seconds = tasks_module._EMBEDDING_LEASE.total_seconds()
+    work_type = WorkflowWorkType.MEMORY_EMBEDDING
 
-    assert task.soft_time_limit == tasks_module._EMBEDDING_SOFT_TIME_LIMIT == 180
-    assert task.time_limit == tasks_module._EMBEDDING_TIME_LIMIT == 210
+    assert task.soft_time_limit < task.time_limit < lease_seconds
+    assert resolve_work_timeouts(work_type, {FLEX_TIMEOUT_SIZING_ENV: '1'}) == resolve_work_timeouts(work_type, {})
 
 
 def test_embedding_work_uses_embedding_policy_task_type_for_configuration_scope() -> None:

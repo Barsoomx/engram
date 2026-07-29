@@ -17,11 +17,12 @@ from rest_framework.status import (
 )
 from rest_framework.views import APIView
 
-from engram.console.model_presets import ALL_TASK_TYPES, PRESET_BY_KEY, PRESETS
+from engram.console.model_presets import ALL_TASK_TYPES, OPENAI_FLEX_PRESET_KEY, PRESET_BY_KEY, PRESETS
 from engram.console.org_resolution import ActiveOrganizationPermission
 from engram.console.permissions import RequireCapability
 from engram.console.serializers.model_setup import ApplyPresetSerializer, ModelSetupStatusQuerySerializer
 from engram.core.models import Organization
+from engram.core.provider_timeouts import FLEX_TIMEOUT_SIZING_ENV, flex_timeout_sizing_enabled
 from engram.model_policy.models import ModelPolicy, ProviderSecret
 from engram.model_policy.services import (
     CreateModelPolicy,
@@ -31,6 +32,7 @@ from engram.model_policy.services import (
     ModelPolicyInput,
     ProviderSecretInput,
 )
+from engram.model_policy.validation import FLEX_SIZING_ERROR_CODE
 
 logger = structlog.get_logger(__name__)
 
@@ -67,6 +69,34 @@ class ModelPresetsView(APIView):
         return Response({'presets': PRESETS})
 
 
+def _preset_rejection(
+    preset_key: str,
+    providers_needed: list[str],
+    provider_keys: dict[str, str],
+) -> Response | None:
+    if preset_key == OPENAI_FLEX_PRESET_KEY and not flex_timeout_sizing_enabled():
+        return Response(
+            {
+                'code': FLEX_SIZING_ERROR_CODE,
+                'detail': (
+                    'This deployment is not sized for queued flex requests; '
+                    f'set {FLEX_TIMEOUT_SIZING_ENV}=1 and restart the workers first, '
+                    'or apply the standard-tier OpenAI preset instead.'
+                ),
+            },
+            status=HTTP_400_BAD_REQUEST,
+        )
+
+    missing = [slot for slot in providers_needed if slot not in provider_keys]
+    if missing:
+        return Response(
+            {'code': 'missing_provider_key', 'detail': f'missing provider keys: {missing}'},
+            status=HTTP_400_BAD_REQUEST,
+        )
+
+    return None
+
+
 class ApplyPresetView(APIView):
     def get_permissions(self) -> list[BasePermission]:
         return [
@@ -97,15 +127,9 @@ class ApplyPresetView(APIView):
 
         provider_keys: dict[str, str] = data['provider_keys']
         providers_needed: list[str] = preset['providers_needed']
-        missing = [slot for slot in providers_needed if slot not in provider_keys]
-        if missing:
-            return Response(
-                {
-                    'code': 'missing_provider_key',
-                    'detail': f'missing provider keys: {missing}',
-                },
-                status=HTTP_400_BAD_REQUEST,
-            )
+        rejection = _preset_rejection(preset_key, providers_needed, provider_keys)
+        if rejection is not None:
+            return rejection
 
         project_id: uuid.UUID = data['project_id']
         team_id: uuid.UUID | None = data['team_id']
@@ -181,7 +205,8 @@ class ApplyPresetView(APIView):
                     disabled_policy_ids.append(str(policy.id))
 
                 secret = slot_to_secret[tm['key_slot']]
-                policy = CreateModelPolicy().execute(
+                policy = _create_policy_with_metadata(
+                    tm,
                     ModelPolicyInput(
                         organization_id=org.id,
                         project_id=project_id,
@@ -216,6 +241,18 @@ class ApplyPresetView(APIView):
                 'status': _build_status(org, project_id, team_id),
             }
         )
+
+
+def _create_policy_with_metadata(task_model: dict[str, Any], policy_input: ModelPolicyInput) -> ModelPolicy:
+    policy = CreateModelPolicy().execute(policy_input)
+    provider_metadata: dict[str, Any] = task_model.get('metadata') or {}
+    if not provider_metadata:
+        return policy
+
+    policy.metadata.update(provider_metadata)
+    policy.save(update_fields=['metadata'])
+
+    return policy
 
 
 def _active_policies_in_scope(

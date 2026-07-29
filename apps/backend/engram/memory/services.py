@@ -1465,6 +1465,7 @@ def render_frozen_daily_digest_provider_result(
     sources: tuple[object, ...],
     request_id: str,
     trace_id: str,
+    attempt: int = 0,
 ) -> ProviderCallResult:
     resolved = ResolveModelPolicy().execute(
         ResolveModelPolicyInput(
@@ -1488,6 +1489,7 @@ def render_frozen_daily_digest_provider_result(
                 trace_id=trace_id,
                 prompt=prompt,
                 system_prompt=digest_system_prompt(),
+                attempt=attempt,
             ),
         )
     except (ModelPolicyError, ProviderSecretError) as error:

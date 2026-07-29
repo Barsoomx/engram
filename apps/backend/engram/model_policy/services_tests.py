@@ -9,6 +9,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from engram.context.context_api_tests import create_project_scope
+from engram.core import provider_timeouts
 from engram.core.models import AuditEvent
 from engram.memory.curation_judge import _ALLOWED_COMBINATIONS
 from engram.memory.distillation_provider_stage import _EXTRACT_SYSTEM_PROMPT, EXTRACT_PROMPT_CONTRACT
@@ -1179,7 +1180,13 @@ _OVERRIDE_METADATA = {
 }
 
 
-def _call_with_kind(policy: Any, body: bytes, response_kind: str) -> tuple[ProviderCallRecord, Any]:
+def _call_with_kind(
+    policy: Any,
+    body: bytes,
+    response_kind: str,
+    *,
+    attempt: int = 0,
+) -> tuple[ProviderCallRecord, Any]:
     gateway = OpenAICompatibleGateway(
         base_url='https://provider.example/v1',
         api_key='key',
@@ -1195,6 +1202,7 @@ def _call_with_kind(policy: Any, body: bytes, response_kind: str) -> tuple[Provi
             trace_id='override',
             prompt='a prompt',
             response_kind=response_kind,
+            attempt=attempt,
         ),
     )
 
@@ -1269,3 +1277,365 @@ def test_non_overridden_kind_keeps_policy_model_and_pricing() -> None:
     assert json.loads(opener.requests[0].data.decode())['model'] == 'deepseek-v4-pro'
     assert record.model == 'deepseek-v4-pro'
     assert record.cost_metadata['cost_usd'] == '1.305000'
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 - live probes against gpt-5-nano / gpt-5-mini: those models reject
+# 'max_tokens' (400, "use 'max_completion_tokens'") and reject any explicit
+# temperature other than the default. Chat-completion parameter names are
+# therefore per-policy metadata under 'request_shape' - opt-in, so DeepSeek and
+# Anthropic policies keep the historic payload untouched.
+# ---------------------------------------------------------------------------
+
+_GPT5_REQUEST_SHAPE: dict[str, Any] = {
+    'request_shape': {
+        'completion_tokens_param': 'max_completion_tokens',
+        'temperature': None,
+        'reasoning_effort': {'distill_extract.v1': 'minimal'},
+    },
+}
+
+
+def test_resolve_completion_tokens_param_defaults_to_max_tokens() -> None:
+    default_policy = ModelPolicy(provider='deepseek', metadata={})
+    shaped_policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+
+    assert services.resolve_completion_tokens_param(default_policy) == 'max_tokens'
+    assert services.resolve_completion_tokens_param(shaped_policy) == 'max_completion_tokens'
+
+
+def test_resolve_completion_tokens_param_ignores_unknown_param_name() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        metadata={'request_shape': {'completion_tokens_param': 'max_output_tokens'}},
+    )
+
+    assert services.resolve_completion_tokens_param(policy) == 'max_tokens'
+
+
+def test_resolve_temperature_defaults_and_explicit_omission() -> None:
+    default_policy = ModelPolicy(provider='deepseek', metadata={})
+    omitting_policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+    tuned_policy = ModelPolicy(provider='openai', metadata={'request_shape': {'temperature': 0.7}})
+
+    assert services.resolve_temperature(default_policy) == 0.2
+    assert services.resolve_temperature(omitting_policy) is None
+    assert services.resolve_temperature(tuned_policy) == 0.7
+
+
+def test_resolve_temperature_omits_a_malformed_value_instead_of_guessing() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'request_shape': {'temperature': 'hot'}})
+
+    assert services.resolve_temperature(policy) is None
+
+
+def test_resolve_temperature_is_omitted_for_the_reasoning_completion_param() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        metadata={'request_shape': {'completion_tokens_param': 'max_completion_tokens'}},
+    )
+
+    assert services.resolve_temperature(policy) is None
+
+
+def test_resolve_reasoning_effort_is_scoped_to_response_kind() -> None:
+    policy = ModelPolicy(provider='openai', metadata=_GPT5_REQUEST_SHAPE)
+    unshaped_policy = ModelPolicy(provider='deepseek', metadata={})
+
+    assert services.resolve_reasoning_effort(policy, 'distill_extract.v1', completion_cap=8192) == 'minimal'
+    assert services.resolve_reasoning_effort(policy, 'curation_decision_v1', completion_cap=16384) == ''
+    assert services.resolve_reasoning_effort(unshaped_policy, 'distill_extract.v1', completion_cap=8192) == ''
+
+
+def test_malformed_request_shape_falls_back_to_defaults() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'request_shape': 'flex'})
+
+    assert services.resolve_completion_tokens_param(policy) == 'max_tokens'
+    assert services.resolve_temperature(policy) == 0.2
+    assert services.resolve_reasoning_effort(policy, 'distill_extract.v1', completion_cap=8192) == ''
+
+
+@pytest.mark.django_db
+def test_policy_without_request_shape_keeps_max_tokens_and_temperature() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, provider='deepseek')
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{"memories": []}'), 'distill_extract.v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['max_tokens'] == effective_completion_cap(policy, 'distill_extract.v1')
+    assert 'max_completion_tokens' not in sent
+    assert sent['temperature'] == 0.2
+    assert 'reasoning_effort' not in sent
+
+
+@pytest.mark.django_db
+def test_request_shape_renames_completion_cap_and_drops_temperature() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_GPT5_REQUEST_SHAPE)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{"memories": []}'), 'distill_extract.v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'distill_extract.v1')
+    assert 'max_tokens' not in sent
+    assert 'temperature' not in sent
+    assert sent['reasoning_effort'] == 'minimal'
+
+
+@pytest.mark.django_db
+def test_request_shape_sends_reasoning_effort_only_for_configured_kind() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_GPT5_REQUEST_SHAPE)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert 'reasoning_effort' not in sent
+    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v1')
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-27 live probes, output tokens (total/reasoning) on a small prompt:
+# gpt-5-nano minimal 23/0, low 215/192, medium 860/832; gpt-5-mini minimal
+# 29/0, low 87/64, medium 280/256. max_completion_tokens INCLUDES reasoning
+# tokens, so an effort whose reasoning alone overruns the cap is a guaranteed
+# HTTP 400 ("Could not finish the message") - which _open() classifies as
+# non-retryable and turns into a terminal work failure.
+# ---------------------------------------------------------------------------
+
+_FLEX_SERVICE_TIER_METADATA: dict[str, Any] = {'service_tier': {'tier': 'flex', 'attempt_budget': 2}}
+
+
+def test_reasoning_effort_is_downgraded_to_fit_the_completion_cap() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        metadata={'request_shape': {'reasoning_effort': {'curation_judgment': 'medium'}}},
+    )
+
+    assert services.resolve_reasoning_effort(policy, 'curation_judgment', completion_cap=16384) == 'medium'
+    assert services.resolve_reasoning_effort(policy, 'curation_judgment', completion_cap=1024) == 'low'
+    assert services.resolve_reasoning_effort(policy, 'curation_judgment', completion_cap=256) == 'minimal'
+
+
+def test_reasoning_effort_whitelist_rejects_unknown_levels() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        metadata={'request_shape': {'reasoning_effort': {'curation_judgment': 'ultra'}}},
+    )
+
+    assert services.resolve_reasoning_effort(policy, 'curation_judgment', completion_cap=16384) == ''
+
+
+def test_reasoning_effort_accepts_a_plain_string_inside_a_per_kind_shape() -> None:
+    policy = ModelPolicy(provider='openai', metadata={'request_shape': {'reasoning_effort': 'low'}})
+
+    assert services.resolve_reasoning_effort(policy, 'curation_judgment', completion_cap=1024) == 'low'
+
+
+def test_request_shape_is_resolvable_per_response_kind() -> None:
+    policy = ModelPolicy(
+        provider='openai',
+        model='gpt-4o-mini',
+        metadata={
+            'model_overrides': {
+                'curation_decision_v1': {
+                    'model': 'gpt-5-nano',
+                    'request_shape': {
+                        'completion_tokens_param': 'max_completion_tokens',
+                        'temperature': None,
+                        'reasoning_effort': 'medium',
+                    },
+                },
+            },
+        },
+    )
+
+    assert services.resolve_completion_tokens_param(policy, 'curation_decision_v1') == 'max_completion_tokens'
+    assert services.resolve_temperature(policy, 'curation_decision_v1') is None
+    assert services.resolve_reasoning_effort(policy, 'curation_decision_v1', completion_cap=16384) == 'medium'
+    assert services.resolve_completion_tokens_param(policy, 'candidates') == 'max_tokens'
+    assert services.resolve_temperature(policy, 'candidates') == 0.2
+    assert services.resolve_reasoning_effort(policy, 'candidates', completion_cap=8192) == ''
+
+
+@pytest.mark.django_db
+def test_mixed_model_policy_shapes_each_kind_for_its_own_model() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        metadata={
+            'model_overrides': {
+                'curation_decision_v1': {
+                    'model': 'gpt-5-nano',
+                    'request_shape': {
+                        'completion_tokens_param': 'max_completion_tokens',
+                        'temperature': None,
+                        'reasoning_effort': 'medium',
+                    },
+                },
+            },
+        },
+    )
+    policy.model = 'gpt-4o-mini'
+    policy.save(update_fields=['model'])
+
+    _reasoning, reasoning_opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1')
+    _classic, classic_opener = _call_with_kind(policy, _openai_chat_body('Title\nBody'), 'single')
+
+    reasoning_sent = json.loads(reasoning_opener.requests[0].data.decode())
+    classic_sent = json.loads(classic_opener.requests[0].data.decode())
+    assert reasoning_sent['model'] == 'gpt-5-nano'
+    assert reasoning_sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v1')
+    assert 'max_tokens' not in reasoning_sent
+    assert 'temperature' not in reasoning_sent
+    assert reasoning_sent['reasoning_effort'] == 'medium'
+    assert classic_sent['model'] == 'gpt-4o-mini'
+    assert classic_sent['max_tokens'] == effective_completion_cap(policy, 'single')
+    assert classic_sent['temperature'] == 0.2
+    assert 'reasoning_effort' not in classic_sent
+
+
+@pytest.mark.django_db
+def test_gateway_never_sends_an_effort_the_completion_cap_cannot_fit() -> None:
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        metadata={'request_shape': {'reasoning_effort': {'curation_judgment': 'medium'}}},
+    )
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('keep'), 'curation_judgment')
+
+    sent = json.loads(opener.requests[0].data.decode())
+    assert sent['max_tokens'] == 1024
+    assert sent['reasoning_effort'] == 'low'
+
+
+# ---------------------------------------------------------------------------
+# service_tier: 'flex' queues the request provider-side (documented 10 minute
+# client timeout) and is echoed back in the response. The socket budget has to
+# follow the tier actually requested, otherwise the queued call is aborted
+# locally long before the provider answers.
+# ---------------------------------------------------------------------------
+
+
+def test_provider_http_timeout_follows_the_requested_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_PROCESSING_CEILING', raising=False)
+
+    assert services.provider_http_timeout() == 60
+    assert services.provider_http_timeout('auto') == 60
+    assert services.embedding_http_timeout() == 30
+    assert services.provider_http_timeout('flex') == provider_timeouts.FLEX_PROCESSING_CEILING_SECONDS
+    assert services.max_chat_http_timeout() == max(60, provider_timeouts.FLEX_PROCESSING_CEILING_SECONDS)
+
+
+def test_a_deployment_that_did_not_size_for_flex_gets_no_wider_socket() -> None:
+    assert provider_timeouts.flex_processing_ceiling({}) == provider_timeouts.provider_call_ceiling({}) == 60
+
+
+def test_the_queued_tier_socket_widens_only_where_the_deployment_sized_for_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
+    monkeypatch.setenv('ENGRAM_FLEX_PROCESSING_CEILING', '600')
+
+    assert services.provider_http_timeout('flex') == 600
+    assert services.provider_http_timeout() == 60
+    assert services.max_chat_http_timeout() == 600
+
+
+def test_flex_http_timeout_is_env_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('ENGRAM_FLEX_HTTP_TIMEOUT', '900')
+
+    assert services.provider_http_timeout('flex') == 900
+    assert services.max_chat_http_timeout() == 900
+
+
+@pytest.mark.django_db
+def test_gateway_requests_the_configured_tier_and_widens_the_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
+    monkeypatch.setenv('ENGRAM_FLEX_PROCESSING_CEILING', '600')
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_FLEX_SERVICE_TIER_METADATA)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=0)
+
+    assert json.loads(opener.requests[0].data.decode())['service_tier'] == 'flex'
+    assert opener.timeouts == [600]
+
+
+@pytest.mark.django_db
+def test_gateway_drops_the_queued_tier_once_the_attempt_budget_is_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project, metadata=_FLEX_SERVICE_TIER_METADATA)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=2)
+
+    assert 'service_tier' not in json.loads(opener.requests[0].data.decode())
+    assert opener.timeouts == [60]
+
+
+@pytest.mark.django_db
+def test_gateway_without_tier_metadata_keeps_the_standard_socket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(organization, project)
+
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=0)
+
+    assert 'service_tier' not in json.loads(opener.requests[0].data.decode())
+    assert opener.timeouts == [60]
+
+
+@pytest.mark.django_db
+def test_embedding_calls_never_inherit_the_flex_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', raising=False)
+    organization, _team, project, _owner, _api_key = create_project_scope()
+    policy = make_real_policy(
+        organization,
+        project,
+        task_type='embedding',
+        metadata=_FLEX_SERVICE_TIER_METADATA,
+    )
+    opener = _opener_returning(_openai_embedding_body([0.1, 0.2, 0.3]))
+    gateway = OpenAICompatibleGateway(base_url='https://provider.example/v1', api_key='key', opener=opener)
+
+    gateway.embed(
+        EmbeddingCallInput(
+            organization_id=organization.id,
+            project_id=project.id,
+            team_id=None,
+            policy=policy,
+            request_id='tier-embed-1',
+            trace_id='tier-embed-1',
+            text='text to embed',
+        ),
+    )
+
+    assert 'service_tier' not in json.loads(opener.requests[0].data.decode())
+    assert opener.timeouts == [30]
+
+
+def test_socket_budget_matches_the_ladder_ceiling_it_is_sized_against(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ('ENGRAM_FLEX_HTTP_TIMEOUT', 'ENGRAM_PROVIDER_HTTP_TIMEOUT', 'ENGRAM_EMBEDDING_HTTP_TIMEOUT'):
+        monkeypatch.delenv(name, raising=False)
+
+    assert services.max_chat_http_timeout() == provider_timeouts.chat_call_ceiling()
+    assert services.embedding_http_timeout() == provider_timeouts.embedding_call_ceiling()
+
+    monkeypatch.setenv('ENGRAM_FLEX_HTTP_TIMEOUT', '450')
+    monkeypatch.setenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', '90')
+    monkeypatch.setenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', '45')
+
+    assert services.provider_http_timeout('flex') == 450
+    assert services.provider_http_timeout() == 90
+    assert services.max_chat_http_timeout() == provider_timeouts.chat_call_ceiling() == 450
+    assert services.embedding_http_timeout() == provider_timeouts.embedding_call_ceiling() == 45
