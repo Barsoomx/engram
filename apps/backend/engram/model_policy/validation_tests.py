@@ -6,11 +6,15 @@ from typing import Any
 import pytest
 
 from engram.core.models import Organization, Project, Team
+from engram.core.provider_service_tier import resolve_service_tier
 from engram.model_policy.errors import ModelPolicyError, ProviderSecretError
 from engram.model_policy.models import ModelPolicy, ProviderSecret, ProviderSecretEnvelope
+from engram.model_policy.openai_request_shape import openai_policy_metadata
 from engram.model_policy.services import EmbeddingCallInput, EmbeddingCallResult, ProviderCallInput, ProviderCallResult
 from engram.model_policy.validation import (
     NO_PROJECT_AVAILABLE_ERROR_CODE,
+    REQUEST_SHAPE_ERROR_CODE,
+    SERVICE_TIER_ERROR_CODE,
     VALIDATION_HTTP_TIMEOUT_SECONDS,
     VALIDATION_PROMPT,
     VALIDATION_REQUEST_ID_PREFIX,
@@ -358,3 +362,95 @@ def test_validate_policy_embedding_failure_returns_sanitized_code(f_embedding_po
     assert result.error_code == 'provider_http_error'
     assert result.public_error
     assert '403' not in result.public_error
+
+
+def _reshape(policy: ModelPolicy, *, model: str, metadata: dict[str, Any]) -> ModelPolicy:
+    policy.model = model
+    policy.metadata = metadata
+    policy.save(update_fields=['model', 'metadata'])
+
+    return policy
+
+
+@pytest.mark.django_db
+def test_gpt5_policy_without_request_shape_fails_before_calling_the_provider(f_policy: ModelPolicy) -> None:
+    _reshape(f_policy, model='gpt-5-mini', metadata={})
+    calls: list[ProviderCallInput] = []
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_RecordingGateway(calls)))
+
+    assert result.ok is False
+    assert result.error_code == REQUEST_SHAPE_ERROR_CODE
+    assert result.public_error
+    assert calls == []
+
+
+@pytest.mark.django_db
+def test_gpt5_policy_with_preset_metadata_reaches_the_provider(f_policy: ModelPolicy) -> None:
+    _reshape(
+        f_policy,
+        model='gpt-5-mini',
+        metadata=openai_policy_metadata(provider='openai', model='gpt-5-mini'),
+    )
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_OkGateway()))
+
+    assert result.ok is True
+    assert result.error_code is None
+
+
+@pytest.mark.django_db
+def test_gpt5_policy_with_an_explicit_temperature_is_rejected(f_policy: ModelPolicy) -> None:
+    _reshape(
+        f_policy,
+        model='gpt-5-mini',
+        metadata={'request_shape': {'completion_tokens_param': 'max_completion_tokens', 'temperature': 0.2}},
+    )
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_OkGateway()))
+
+    assert result.ok is False
+    assert result.error_code == REQUEST_SHAPE_ERROR_CODE
+
+
+@pytest.mark.django_db
+def test_flex_tier_on_a_family_that_rejects_it_is_reported(f_policy: ModelPolicy) -> None:
+    _reshape(f_policy, model='gpt-4o-mini', metadata={'service_tier': {'tier': 'flex', 'attempt_budget': 2}})
+    calls: list[ProviderCallInput] = []
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_RecordingGateway(calls)))
+
+    assert result.ok is False
+    assert result.error_code == SERVICE_TIER_ERROR_CODE
+    assert calls == []
+
+
+@pytest.mark.django_db
+def test_flex_policy_is_health_checked_on_the_standard_tier(f_policy: ModelPolicy) -> None:
+    _reshape(
+        f_policy,
+        model='gpt-5-mini',
+        metadata=openai_policy_metadata(provider='openai', model='gpt-5-mini', flex=True),
+    )
+    calls: list[ProviderCallInput] = []
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_RecordingGateway(calls)))
+
+    assert result.ok is True
+    assert len(calls) == 1
+    assert resolve_service_tier(f_policy.metadata, attempt=calls[0].attempt) is None
+
+
+@pytest.mark.django_db
+def test_non_openai_policy_keeps_the_default_request_shape(f_policy: ModelPolicy) -> None:
+    secret = f_policy.secret
+    secret.provider = 'deepseek'
+    secret.save(update_fields=['provider'])
+    f_policy.provider = 'deepseek'
+    f_policy.model = 'deepseek-v4-pro'
+    f_policy.metadata = {}
+    f_policy.save(update_fields=['provider', 'model', 'metadata'])
+
+    result = validate_policy(f_policy, gateway_factory=_gateway_factory(_OkGateway()))
+
+    assert result.ok is True

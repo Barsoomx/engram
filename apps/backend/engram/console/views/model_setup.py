@@ -181,7 +181,8 @@ class ApplyPresetView(APIView):
                     disabled_policy_ids.append(str(policy.id))
 
                 secret = slot_to_secret[tm['key_slot']]
-                policy = CreateModelPolicy().execute(
+                policy = _create_policy_with_metadata(
+                    tm,
                     ModelPolicyInput(
                         organization_id=org.id,
                         project_id=project_id,
@@ -216,6 +217,18 @@ class ApplyPresetView(APIView):
                 'status': _build_status(org, project_id, team_id),
             }
         )
+
+
+def _create_policy_with_metadata(task_model: dict[str, Any], policy_input: ModelPolicyInput) -> ModelPolicy:
+    policy = CreateModelPolicy().execute(policy_input)
+    provider_metadata: dict[str, Any] = task_model.get('metadata') or {}
+    if not provider_metadata:
+        return policy
+
+    policy.metadata.update(provider_metadata)
+    policy.save(update_fields=['metadata'])
+
+    return policy
 
 
 def _active_policies_in_scope(

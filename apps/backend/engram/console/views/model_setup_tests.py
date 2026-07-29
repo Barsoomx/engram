@@ -193,14 +193,14 @@ def test_status_denied_without_capability(
 
 
 @pytest.mark.django_db
-def test_presets_returns_four_presets(f_admin_client: APIClient) -> None:
+def test_presets_returns_every_shipped_preset(f_admin_client: APIClient) -> None:
     response = f_admin_client.get('/v1/admin/model-setup/presets')
 
     assert response.status_code == 200
     body = response.json()
-    assert len(body['presets']) == 4
+    assert len(body['presets']) == 5
     keys = {p['key'] for p in body['presets']}
-    assert keys == {'anthropic_openai', 'openai_all', 'deepseek_openai', 'glm_openai'}
+    assert keys == {'anthropic_openai', 'openai_all', 'openai_all_flex', 'deepseek_openai', 'glm_openai'}
 
 
 @pytest.mark.django_db
@@ -633,3 +633,118 @@ def test_apply_tenant_isolation() -> None:
     assert body['ready'] is False
     for tt in body['task_types']:
         assert tt['configured'] is False
+
+
+@pytest.mark.django_db
+def test_apply_openai_all_persists_the_reasoning_request_shape(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-openai-shape',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    curation = ModelPolicy.objects.get(organization=f_setup_org, task_type='curation', active=True)
+    assert curation.model == 'gpt-5-mini'
+    assert curation.metadata['request_shape']['completion_tokens_param'] == 'max_completion_tokens'
+    assert curation.metadata['request_shape']['temperature'] is None
+    assert curation.metadata['request_shape']['reasoning_effort']['curation_decision_v1'] == 'minimal'
+    assert 'service_tier' not in curation.metadata
+
+    embedding = ModelPolicy.objects.get(organization=f_setup_org, task_type='embedding', active=True)
+    assert 'request_shape' not in embedding.metadata
+
+
+@pytest.mark.django_db
+def test_apply_openai_flex_persists_the_service_tier_block(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    response = f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'openai_all_flex',
+            'provider_keys': {'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-openai-flex',
+        },
+        format='json',
+    )
+
+    assert response.status_code == 200
+    generation = ModelPolicy.objects.get(organization=f_setup_org, task_type='generation', active=True)
+    assert generation.metadata['service_tier'] == {'tier': 'flex', 'attempt_budget': 2}
+    assert generation.metadata['request_shape']['completion_tokens_param'] == 'max_completion_tokens'
+
+    embedding = ModelPolicy.objects.get(organization=f_setup_org, task_type='embedding', active=True)
+    assert 'service_tier' not in embedding.metadata
+
+
+@pytest.mark.django_db
+def test_apply_deepseek_writes_no_openai_request_shape(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'deepseek_openai',
+            'provider_keys': {'deepseek': 'sk-deepseek-key', 'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-ds-shape',
+        },
+        format='json',
+    )
+
+    curation = ModelPolicy.objects.get(organization=f_setup_org, task_type='curation', active=True)
+    assert 'request_shape' not in curation.metadata
+    assert 'service_tier' not in curation.metadata
+
+
+@pytest.mark.django_db
+def test_apply_glm_keeps_base_url_and_skips_request_shape(
+    f_admin_client: APIClient,
+    f_setup_project: Project,
+    f_setup_org: Organization,
+) -> None:
+    f_admin_client.post(
+        '/v1/admin/model-setup/apply',
+        {
+            'project_id': str(f_setup_project.id),
+            'scope': 'project',
+            'preset_key': 'glm_openai',
+            'provider_keys': {'glm': 'sk-glm-key', 'openai': 'sk-openai-key'},
+            'request_id': 'req-apply-glm-shape',
+        },
+        format='json',
+    )
+
+    curation = ModelPolicy.objects.get(organization=f_setup_org, task_type='curation', active=True)
+    assert curation.metadata['base_url'] == 'https://api.z.ai/api/paas/v4'
+    assert 'request_shape' not in curation.metadata
+
+
+@pytest.mark.django_db
+def test_presets_endpoint_exposes_the_flex_variant(f_read_client: APIClient) -> None:
+    response = f_read_client.get('/v1/admin/model-setup/presets')
+
+    assert response.status_code == 200
+    presets = {preset['key']: preset for preset in response.json()['presets']}
+    assert 'openai_all_flex' in presets
+    assert presets['openai_all_flex']['providers_needed'] == ['openai']
+    flex_curation = next(tm for tm in presets['openai_all_flex']['task_models'] if tm['task_type'] == 'curation')
+    assert flex_curation['metadata']['service_tier']['tier'] == 'flex'
