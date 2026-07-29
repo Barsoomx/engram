@@ -16,10 +16,13 @@ from engram.core.domain.event_dispatcher import QUEUE_DOMAIN_EVENTS, CeleryEvent
 from engram.core.domain.events import DomainEvent
 from engram.core.models import WorkflowWorkType
 from engram.core.provider_timeouts import (
+    FLEX_TIMEOUT_SIZING_ENV,
     WORK_TIMEOUT_SPECS,
-    chat_call_capacity,
     chat_call_ceiling,
     embedding_call_ceiling,
+    flex_timeout_sizing_enabled,
+    global_task_timeouts,
+    hosted_provider_seconds,
     resolve_work_timeouts,
 )
 from engram.core.redis_sentinel import REDIS_DB_CACHE, DynamicRedisConnectionFactory
@@ -28,6 +31,7 @@ from engram.memory import tasks as memory_tasks
 from engram.model_policy.services import embedding_http_timeout, max_chat_http_timeout
 
 _LEASE_MARGIN_SECONDS = 30
+_FLEX_ENV = {FLEX_TIMEOUT_SIZING_ENV: '1'}
 
 _VERSIONED_WORK_TASKS_BY_TYPE = {
     WorkflowWorkType.OBSERVATION_PROCESSING: memory_tasks.process_observation_work_v1,
@@ -38,12 +42,14 @@ _VERSIONED_WORK_TASKS_BY_TYPE = {
     WorkflowWorkType.MEMORY_EMBEDDING: memory_tasks.embed_memory_projection_work_v1,
 }
 
-
-def _socket_timeout_for(work_type: str) -> int:
-    if WORK_TIMEOUT_SPECS[work_type].chat_calls:
-        return max_chat_http_timeout()
-
-    return embedding_http_timeout()
+_PRE_FLEX_LEASE_SECONDS = {
+    WorkflowWorkType.OBSERVATION_PROCESSING: 120,
+    WorkflowWorkType.SESSION_DISTILLATION: 720,
+    WorkflowWorkType.CANDIDATE_DECISION: 300,
+    WorkflowWorkType.DAILY_DIGEST: 240,
+    WorkflowWorkType.WEEKLY_DIGEST: 240,
+    WorkflowWorkType.MEMORY_EMBEDDING: 300,
+}
 
 
 EXPECTED_QUEUE_NAMES = {
@@ -183,7 +189,7 @@ def test_versioned_work_tasks_are_wired_to_the_shared_timeout_registry() -> None
 def test_versioned_work_timeout_ladder_is_strictly_ordered() -> None:
     for work_type, task in _VERSIONED_WORK_TASKS_BY_TYPE.items():
         lease_seconds = memory_tasks.LEASE_BY_WORK_TYPE[work_type].total_seconds()
-        ladder = (_socket_timeout_for(work_type), task.soft_time_limit, task.time_limit, lease_seconds)
+        ladder = (task.soft_time_limit, task.time_limit, lease_seconds)
 
         assert list(ladder) == sorted(set(ladder)), f'{work_type} ladder must be strictly increasing: {ladder}'
 
@@ -193,25 +199,34 @@ def test_ladder_ceilings_track_the_socket_timeouts_the_gateway_actually_uses() -
     assert embedding_call_ceiling() == embedding_http_timeout()
 
 
-def test_versioned_work_hosts_the_chained_chat_calls_its_spec_declares() -> None:
+def test_versioned_work_hosts_the_provider_calls_its_spec_declares() -> None:
     for work_type, task in _VERSIONED_WORK_TASKS_BY_TYPE.items():
-        expected_calls = WORK_TIMEOUT_SPECS[work_type].chat_calls
-        capacity = chat_call_capacity(task.soft_time_limit)
+        hosted = hosted_provider_seconds(work_type)
 
-        assert capacity >= expected_calls, f'{work_type} hosts {capacity} queued chat calls but chains {expected_calls}'
+        assert hosted <= task.soft_time_limit, f'{work_type} chains {hosted}s of provider calls it cannot host'
 
 
 def test_embedding_only_work_is_not_sized_for_the_chat_ceiling() -> None:
-    task = _VERSIONED_WORK_TASKS_BY_TYPE[WorkflowWorkType.MEMORY_EMBEDDING]
+    work_type = WorkflowWorkType.MEMORY_EMBEDDING
 
-    assert WORK_TIMEOUT_SPECS[WorkflowWorkType.MEMORY_EMBEDDING].chat_calls == 0
-    assert chat_call_capacity(task.soft_time_limit) == 0
+    assert WORK_TIMEOUT_SPECS[work_type].chat_calls == 0
+    assert resolve_work_timeouts(work_type, _FLEX_ENV) == resolve_work_timeouts(work_type, {})
+
+
+def test_celery_global_limits_come_from_the_shared_timeout_registry() -> None:
+    assert (celeryconfig.task_soft_time_limit, celeryconfig.task_time_limit) == global_task_timeouts()
+
+
+def test_a_deployment_that_did_not_opt_into_flex_keeps_its_pre_flex_reclaim_window() -> None:
+    assert flex_timeout_sizing_enabled({}) is False
+
+    for work_type, lease_seconds in _PRE_FLEX_LEASE_SECONDS.items():
+        assert resolve_work_timeouts(work_type, {}).lease_seconds == lease_seconds, f'{work_type} lease drifted'
 
 
 def test_celery_default_time_limits_host_a_queued_chat_call() -> None:
-    assert chat_call_capacity(celeryconfig.task_soft_time_limit) >= 1
+    assert max_chat_http_timeout() <= celeryconfig.task_soft_time_limit
     assert celeryconfig.task_soft_time_limit < celeryconfig.task_time_limit
-    assert max_chat_http_timeout() < celeryconfig.task_soft_time_limit
 
 
 def test_celery_support_classes_are_available() -> None:

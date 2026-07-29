@@ -11,11 +11,12 @@ import yaml
 
 from engram import celeryconfig
 from engram.core.provider_timeouts import (
+    FLEX_TIMEOUT_SIZING_ENV,
     WORK_TIMEOUT_SPECS,
-    chat_call_capacity,
     chat_call_ceiling,
-    embedding_call_ceiling,
+    flex_timeout_sizing_enabled,
     global_task_timeouts,
+    hosted_provider_seconds,
     required_stop_grace_seconds,
     resolve_work_timeouts,
 )
@@ -287,41 +288,55 @@ def test_worker_stop_grace_outlasts_the_shipped_env_hard_limits(
     assert grace >= required, f'worker stop_grace_period {grace}s must be at least {required}s'
 
 
+def test_worker_stop_grace_also_covers_a_deployment_that_opts_into_flex(
+    f_compose: ComposeMapping,
+    f_env_example: EnvMapping,
+) -> None:
+    required = required_stop_grace_seconds(
+        {**f_env_example, FLEX_TIMEOUT_SIZING_ENV: '1'},
+        worker_soft_shutdown_timeout=celeryconfig.worker_soft_shutdown_timeout,
+    )
+
+    grace = _worker_stop_grace_seconds(f_compose)
+
+    assert grace >= required, f'worker stop_grace_period {grace}s must be at least {required}s'
+
+
+def test_shipped_env_example_does_not_flex_size_the_ladder(f_env_example: EnvMapping) -> None:
+    assert flex_timeout_sizing_enabled(f_env_example) is False
+
+    for work_type in WORK_TIMEOUT_SPECS:
+        assert resolve_work_timeouts(work_type, f_env_example) == resolve_work_timeouts(work_type, {})
+
+    assert global_task_timeouts(f_env_example) == global_task_timeouts({})
+
+
 def test_shipped_env_example_keeps_every_work_ladder_strictly_ordered(f_env_example: EnvMapping) -> None:
-    for work_type, spec in WORK_TIMEOUT_SPECS.items():
-        timeouts = resolve_work_timeouts(work_type, f_env_example)
-        socket_timeout = chat_call_ceiling(f_env_example) if spec.chat_calls else embedding_call_ceiling(f_env_example)
-        ladder = (socket_timeout, timeouts.soft_time_limit, timeouts.time_limit, timeouts.lease_seconds)
+    for env in (f_env_example, {**f_env_example, FLEX_TIMEOUT_SIZING_ENV: '1'}):
+        for work_type in WORK_TIMEOUT_SPECS:
+            timeouts = resolve_work_timeouts(work_type, env)
+            ladder = (timeouts.soft_time_limit, timeouts.time_limit, timeouts.lease_seconds)
 
-        assert list(ladder) == sorted(set(ladder)), f'{work_type} ladder must be strictly increasing: {ladder}'
+            assert list(ladder) == sorted(set(ladder)), f'{work_type} ladder must be strictly increasing: {ladder}'
 
 
-def test_shipped_env_example_hosts_the_chained_chat_calls_each_work_type_declares(
+def test_shipped_env_example_hosts_the_provider_calls_each_work_type_chains(
     f_env_example: EnvMapping,
 ) -> None:
-    for work_type, spec in WORK_TIMEOUT_SPECS.items():
-        soft_time_limit = resolve_work_timeouts(work_type, f_env_example).soft_time_limit
-        capacity = chat_call_capacity(soft_time_limit, f_env_example)
+    for env in (f_env_example, {**f_env_example, FLEX_TIMEOUT_SIZING_ENV: '1'}):
+        for work_type in WORK_TIMEOUT_SPECS:
+            soft_time_limit = resolve_work_timeouts(work_type, env).soft_time_limit
+            hosted = hosted_provider_seconds(work_type, env)
 
-        assert capacity >= spec.chat_calls, f'{work_type} hosts {capacity} chat calls but chains {spec.chat_calls}'
-
-
-def test_shipped_env_example_lets_every_attempt_start_one_worst_case_chat_call(
-    f_env_example: EnvMapping,
-) -> None:
-    for work_type, spec in WORK_TIMEOUT_SPECS.items():
-        if not spec.chat_calls:
-            continue
-        soft_time_limit = resolve_work_timeouts(work_type, f_env_example).soft_time_limit
-
-        assert chat_call_ceiling(f_env_example) < soft_time_limit, f'{work_type} cannot host one chat call'
+            assert hosted <= soft_time_limit, f'{work_type} chains {hosted}s of provider calls it cannot host'
 
 
 def test_shipped_env_example_global_task_limits_host_a_queued_chat_call(f_env_example: EnvMapping) -> None:
-    soft_time_limit, time_limit = global_task_timeouts(f_env_example)
+    for env in (f_env_example, {**f_env_example, FLEX_TIMEOUT_SIZING_ENV: '1'}):
+        soft_time_limit, time_limit = global_task_timeouts(env)
 
-    assert soft_time_limit < time_limit
-    assert chat_call_capacity(soft_time_limit, f_env_example) >= 1
+        assert soft_time_limit < time_limit
+        assert chat_call_ceiling(env) <= soft_time_limit
 
 
 def test_relay_is_direct_and_its_timeouts_fit_inside_grace(f_compose: ComposeMapping) -> None:

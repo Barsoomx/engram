@@ -1525,11 +1525,28 @@ def test_provider_http_timeout_follows_the_requested_tier(monkeypatch: pytest.Mo
     monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
     monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
     monkeypatch.delenv('ENGRAM_EMBEDDING_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_PROCESSING_CEILING', raising=False)
 
     assert services.provider_http_timeout() == 60
-    assert services.provider_http_timeout('flex') == 600
     assert services.provider_http_timeout('auto') == 60
     assert services.embedding_http_timeout() == 30
+    assert services.provider_http_timeout('flex') == provider_timeouts.FLEX_PROCESSING_CEILING_SECONDS
+    assert services.max_chat_http_timeout() == max(60, provider_timeouts.FLEX_PROCESSING_CEILING_SECONDS)
+
+
+def test_a_deployment_that_did_not_size_for_flex_gets_no_wider_socket() -> None:
+    assert provider_timeouts.flex_processing_ceiling({}) == provider_timeouts.provider_call_ceiling({}) == 60
+
+
+def test_the_queued_tier_socket_widens_only_where_the_deployment_sized_for_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
+    monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
+    monkeypatch.setenv('ENGRAM_FLEX_PROCESSING_CEILING', '600')
+
+    assert services.provider_http_timeout('flex') == 600
+    assert services.provider_http_timeout() == 60
     assert services.max_chat_http_timeout() == 600
 
 
@@ -1544,6 +1561,7 @@ def test_flex_http_timeout_is_env_tunable(monkeypatch: pytest.MonkeyPatch) -> No
 def test_gateway_requests_the_configured_tier_and_widens_the_socket(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv('ENGRAM_PROVIDER_HTTP_TIMEOUT', raising=False)
     monkeypatch.delenv('ENGRAM_FLEX_HTTP_TIMEOUT', raising=False)
+    monkeypatch.setenv('ENGRAM_FLEX_PROCESSING_CEILING', '600')
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, metadata=_FLEX_SERVICE_TIER_METADATA)
 

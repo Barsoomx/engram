@@ -99,6 +99,7 @@ from engram.model_policy.services import (
     ProviderCallResult,
     _completion_body,
     effective_completion_cap,
+    max_chat_http_timeout,
 )
 
 _OWNER_RE = re.compile(r'^[^:]+:[0-9]+:[0-9a-f-]{36}$')
@@ -1893,7 +1894,7 @@ def test_attempt_defers_a_provider_call_the_soft_deadline_cannot_host(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
     )
-    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(120))
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(max_chat_http_timeout()))
     now = timezone.now()
     claim_result = claim_work(
         work_id=work.id,
@@ -1923,7 +1924,7 @@ def test_attempt_starts_a_provider_call_the_soft_deadline_can_host(
         'engram.memory.distillation_provider_stage.get_provider_gateway',
         lambda *_args, **_kwargs: gateway,
     )
-    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(1260))
+    m_monkeypatch.setattr('engram.memory.distillation.current_task', _SoftLimitedTask(max_chat_http_timeout() + 120))
     now = timezone.now()
     claim_result = claim_work(
         work_id=work.id,
