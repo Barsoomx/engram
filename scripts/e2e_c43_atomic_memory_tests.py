@@ -226,10 +226,10 @@ def test_collect_failure_logs_fetches_redacts_and_caps_each_service_independentl
                 'relay ' + ('b' * (atomic.OUTPUT_LIMIT + 200)),
                 '',
             ),
-            'worker-batch': atomic.CommandResult(
-                ('docker', 'compose', 'logs', 'worker-batch'),
+            'worker-realtime': atomic.CommandResult(
+                ('docker', 'compose', 'logs', 'worker-realtime'),
                 0,
-                'worker-batch ' + ('c' * (atomic.OUTPUT_LIMIT + 200)),
+                'worker-realtime ' + ('c' * (atomic.OUTPUT_LIMIT + 200)),
                 '',
             ),
             'rabbitmq': atomic.HarnessError('rabbitmq logs unavailable'),
@@ -238,18 +238,18 @@ def test_collect_failure_logs_fetches_redacts_and_caps_each_service_independentl
 
     logs = atomic.collect_failure_logs(harness, secrets_to_redact=(secret,))
 
-    assert [call[-1] for call in harness.calls] == ['api', 'relay', 'worker-batch', 'rabbitmq']
+    assert [call[-1] for call in harness.calls] == ['api', 'relay', 'worker-realtime', 'rabbitmq']
     assert all(call[0:3] == ('logs', '--no-color', '--tail=200') for call in harness.calls)
     assert '[api]' in logs
     assert '[relay]' in logs
-    assert '[worker-batch]' in logs
+    assert '[worker-realtime]' in logs
     assert '[rabbitmq]' in logs
     assert secret not in logs
     assert '[REDACTED]' in logs
     for service, marker in (
         ('api', 'a'),
         ('relay', 'b'),
-        ('worker-batch', 'c'),
+        ('worker-realtime', 'c'),
     ):
         section = logs.split(f'[{service}]', 1)[1].split('\n[', 1)[0]
         assert len(section) <= atomic.OUTPUT_LIMIT + 1
