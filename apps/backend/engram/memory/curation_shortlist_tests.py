@@ -619,7 +619,7 @@ def test_revalidation_detects_selected_vector_rank_and_membership_change() -> No
     assert rebuilt.entries == ()
     assert rebuilt.manifest_hash != frozen.manifest_hash
     assert memory.current_transition_id == frozen_transition_id
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
@@ -647,7 +647,7 @@ def test_revalidation_detects_selected_projection_becoming_incoherent() -> None:
     memory.refresh_from_db()
     assert getattr(error.value, 'code', None) == 'transition_dependency_unavailable'
     assert memory.current_transition_id == frozen_transition_id
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen) == (False, False)
 
 
 @pytest.mark.django_db
@@ -693,7 +693,7 @@ def test_revalidation_detects_selected_open_conflict_tag_change() -> None:
     assert rebuilt.entries[0].has_open_conflict is True
     assert rebuilt.manifest_hash != frozen.manifest_hash
     assert memory.current_transition_id == frozen_transition_id
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
@@ -760,7 +760,7 @@ def test_revalidation_detects_transition_of_previously_unselected_memory() -> No
     assert rebuilt.manifest_hash != frozen.manifest_hash
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
     assert selected.current_transition_id == selected_transition_id
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
@@ -794,7 +794,8 @@ def test_revalidation_ignores_unrelated_authorized_memory_added_after_freeze() -
     assert rebuilt.comparison_complete == frozen.comparison_complete
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count + 1
     assert rebuilt.manifest_hash != frozen.manifest_hash
-    assert module.revalidate_curation_shortlist(data, frozen) is True
+    assert rebuilt.comparison_complete is False
+    assert module.revalidate_curation_shortlist(data, frozen) == (True, False)
     assert module.shortlist_revalidation_hash(rebuilt) == module.shortlist_revalidation_hash(frozen)
 
 
@@ -834,7 +835,7 @@ def test_revalidation_fails_when_selected_entry_transition_advances() -> None:
     assert rebuilt.entries[0].current_transition_id != frozen.entries[0].current_transition_id
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
     assert module.shortlist_revalidation_hash(rebuilt) != module.shortlist_revalidation_hash(frozen)
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
@@ -862,7 +863,7 @@ def test_revalidation_fails_when_selected_entry_body_changes_without_a_transitio
     assert rebuilt.entries[0].current_transition_id == frozen.entries[0].current_transition_id
     assert rebuilt.entries[0].body_hash != frozen.entries[0].body_hash
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
@@ -903,11 +904,11 @@ def test_revalidation_fails_when_a_new_memory_displaces_a_shortlist_entry() -> N
 
     assert len(rebuilt.entries) == 4
     assert {entry.memory_id for entry in rebuilt.entries} != {entry.memory_id for entry in frozen.entries}
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert module.revalidate_curation_shortlist(data, frozen)[0] is False
 
 
 @pytest.mark.django_db
-def test_revalidation_fails_when_comparison_completeness_regresses() -> None:
+def test_revalidation_reports_completeness_regression_without_evicting_the_shortlist() -> None:
     module = _shortlist_module()
     scope, selected, _version, document, base_candidate, base_source = _promote('revalidate-completeness')
     _set_embedding(document, 0)
@@ -940,5 +941,20 @@ def test_revalidation_fails_when_comparison_completeness_regresses() -> None:
     assert rebuilt.entries == frozen.entries
     assert rebuilt.comparison_complete is False
     assert rebuilt.authorized_corpus_count == frozen.authorized_corpus_count
-    assert module.shortlist_revalidation_hash(rebuilt) != module.shortlist_revalidation_hash(frozen)
-    assert module.revalidate_curation_shortlist(data, frozen) is False
+    assert rebuilt.manifest_hash != frozen.manifest_hash
+    assert module.shortlist_revalidation_hash(rebuilt) == module.shortlist_revalidation_hash(frozen)
+    assert module.revalidate_curation_shortlist(data, frozen) == (True, False)
+
+
+def test_manifest_hash_still_covers_comparison_completeness() -> None:
+    module = _shortlist_module()
+
+    assert module._manifest_hash((), 0, True) != module._manifest_hash((), 0, False)
+
+
+def test_revalidation_hash_ignores_comparison_completeness() -> None:
+    module = _shortlist_module()
+    complete = module.CurationShortlist((), 'a' * 64, 3, True)
+    incomplete = module.CurationShortlist((), 'b' * 64, 3, False)
+
+    assert module.shortlist_revalidation_hash(complete) == module.shortlist_revalidation_hash(incomplete)

@@ -208,21 +208,25 @@ def _manifest_hash(
 
 def shortlist_revalidation_hash(shortlist: CurationShortlist) -> str:
     payload = {
-        'schema': 'curation_shortlist_revalidation/v1',
-        'comparison_complete': shortlist.comparison_complete,
+        'schema': 'curation_shortlist_revalidation/v2',
         'entries': [_entry_manifest(entry) for entry in shortlist.entries],
     }
 
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
-def revalidate_curation_shortlist(data: BuildCurationShortlistInput, shortlist: CurationShortlist) -> bool:
+def revalidate_curation_shortlist(
+    data: BuildCurationShortlistInput,
+    shortlist: CurationShortlist,
+) -> tuple[bool, bool]:
     try:
         rebuilt = BuildCurationShortlist.execute(data)
     except CurationShortlistError:
-        return False
+        return False, False
 
-    return shortlist_revalidation_hash(rebuilt) == shortlist_revalidation_hash(shortlist)
+    unchanged = shortlist_revalidation_hash(rebuilt) == shortlist_revalidation_hash(shortlist)
+
+    return unchanged, rebuilt.comparison_complete
 
 
 class BuildCurationShortlist:

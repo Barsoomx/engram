@@ -292,16 +292,17 @@ def disable_rollout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(tasks_module(), 'candidate_decision_enabled', lambda _work: False, raising=False)
 
 
-def _stub_revalidate(data: Any, shortlist: CurationShortlist) -> bool:
+def _stub_revalidate(data: Any, shortlist: CurationShortlist) -> tuple[bool, bool]:
     from engram.memory.curation_shortlist import _authorized_memories
 
     frozen_ids = [entry.memory_id for entry in shortlist.entries]
+    complete = shortlist.comparison_complete
     # Stands in for "a newly authorized memory would now rank into this shortlist": the real predicate
     # rebuilds the shortlist, which stubbed settle tests cannot do, so a title match models the hit.
     if _authorized_memories(data).exclude(id__in=frozen_ids).filter(title=data.title).exists():
-        return False
+        return False, complete
     if not shortlist.entries:
-        return True
+        return True, complete
     current = dict(
         Memory.objects.filter(
             id__in=[entry.memory_id for entry in shortlist.entries],
@@ -309,8 +310,9 @@ def _stub_revalidate(data: Any, shortlist: CurationShortlist) -> bool:
             project_id=data.project_id,
         ).values_list('id', 'current_transition_id')
     )
+    unchanged = all(current.get(entry.memory_id) == entry.current_transition_id for entry in shortlist.entries)
 
-    return all(current.get(entry.memory_id) == entry.current_transition_id for entry in shortlist.entries)
+    return unchanged, complete
 
 
 def install_decision_services(

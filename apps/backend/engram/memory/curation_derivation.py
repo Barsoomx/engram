@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -241,3 +241,16 @@ def derive_decision(
         )
 
     return None
+
+
+def decision_requires_comparison_complete(
+    facts: DerivationFacts,
+    relations: dict[UUID, str],
+    applicability: dict[UUID, str],
+) -> bool:
+    if not facts.comparison_complete:
+        return False
+    derived = derive_decision(facts, relations, applicability)
+    downgraded = derive_decision(replace(facts, comparison_complete=False), relations, applicability)
+
+    return downgraded != derived
