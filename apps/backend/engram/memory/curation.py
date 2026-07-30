@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
@@ -40,6 +41,10 @@ from engram.memory.candidate_decision_work import (
 )
 from engram.memory.candidate_parsing import strip_json_fence
 from engram.memory.conflict_links import clear_candidate_conflict_links
+from engram.memory.curation_derivation import (
+    build_derivation_facts,
+    decision_requires_comparison_complete,
+)
 from engram.memory.curation_judge import (
     CurationEvidenceContext,
     CurationJudgeError,
@@ -1034,6 +1039,22 @@ def _fault_boundary(_point: str) -> None:
     return None
 
 
+_COMPLETENESS_WAIT_ATTEMPTS = 3
+_COMPLETENESS_WAIT_SECONDS = 2.0
+
+
+def _wait_before_completeness_retry(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _requires_comparison_complete(judge_input: CurationJudgeInput, verdict: object) -> bool:
+    facts = build_derivation_facts(judge_input)
+    relations = {item.memory_version_id: item.relation for item in verdict.comparisons}
+    applicability = {item.memory_version_id: item.applicability for item in verdict.comparisons}
+
+    return decision_requires_comparison_complete(facts, relations, applicability)
+
+
 def _cached_candidate_embedding(candidate: MemoryCandidate) -> tuple[float, ...] | None:
     if not candidate.content_hash or candidate.decision_embedding_hash != candidate.content_hash:
         return None
@@ -1365,8 +1386,8 @@ class DecideMemoryCandidate:
         except CurationJudgeError as error:
             raise _operational(error.code, 'evidence context build failed') from error
 
+        judge_input = self._judge_input(work, candidate, view, scope, shortlist, evidence)
         try:
-            judge_input = self._judge_input(work, candidate, view, scope, shortlist, evidence)
             judge_result = judge_curation_candidate(judge_input)
         except (CurationJudgeError, ModelPolicyError, ProviderSecretError) as error:
             raise _operational(_judge_failure_code(error), 'curation judge is unavailable') from error
@@ -1374,6 +1395,7 @@ class DecideMemoryCandidate:
 
         verdict = judge_result.verdict
         self._validate_verdict(verdict, shortlist, judge_result)
+        requires_complete = _requires_comparison_complete(judge_input, verdict)
         target_version_id = verdict.target_memory_version_id
         if verdict.outcome == 'reject_candidate':
             self._settle_model_rejection(
@@ -1388,6 +1410,7 @@ class DecideMemoryCandidate:
                 shortlist=shortlist,
                 judge_result=judge_result,
                 target_memory_version_id=target_version_id,
+                requires_complete=requires_complete,
             )
 
             return
@@ -1395,12 +1418,14 @@ class DecideMemoryCandidate:
         memory_fence = None
         if target_version_id is not None:
             memory_fence = self._shortlist_memory_fence(target_version_id, shortlist)
+        if requires_complete:
+            self._await_comparison_complete(work, view, scope, embedding, shortlist)
 
         _fault_boundary('before_transition')
         with transaction.atomic():
             if memory_fence is None:
                 self._acquire_targetless_publication_lock(work.project_id)
-            self._revalidate_shortlist(work, view, scope, embedding, shortlist)
+            self._settle_revalidation(work, view, scope, embedding, shortlist, requires_complete)
             transition, conflict = self._apply_transition(work, candidate, claim, verdict, memory_fence, view, scope)
             self._write_decision(
                 work=work,
@@ -1434,6 +1459,7 @@ class DecideMemoryCandidate:
         shortlist: CurationShortlist,
         judge_result: CurationJudgeResult,
         target_memory_version_id: uuid.UUID | None,
+        requires_complete: bool,
     ) -> None:
         _fault_boundary('before_transition')
         with transaction.atomic():
@@ -1448,7 +1474,7 @@ class DecideMemoryCandidate:
                 )
 
                 return
-            self._revalidate_shortlist(work, view, scope, embedding, shortlist)
+            self._settle_revalidation(work, view, scope, embedding, shortlist, requires_complete)
             if locked.status == CandidateStatus.PROPOSED:
                 locked.status = CandidateStatus.REJECTED
                 locked.save(update_fields=['status', 'updated_at'])
@@ -1678,14 +1704,50 @@ class DecideMemoryCandidate:
         scope: EffectiveCandidateScope,
         embedding: tuple[float, ...],
         shortlist: CurationShortlist,
-    ) -> None:
+    ) -> bool:
         data = self._shortlist_input(work, view, scope, embedding)
         try:
-            unchanged = revalidate_curation_shortlist(data, shortlist)
+            unchanged, rebuilt_complete = revalidate_curation_shortlist(data, shortlist)
         except CurationShortlistError as error:
             raise _operational(error.code, 'shortlist revalidation failed') from error
         if not unchanged:
             raise _operational('stale_decision', 'authorized shortlist changed before settlement')
+
+        return rebuilt_complete
+
+    def _settle_revalidation(
+        self,
+        work: WorkflowWork,
+        view: SanitizedCandidateView,
+        scope: EffectiveCandidateScope,
+        embedding: tuple[float, ...],
+        shortlist: CurationShortlist,
+        requires_complete: bool,
+    ) -> None:
+        rebuilt_complete = self._revalidate_shortlist(work, view, scope, embedding, shortlist)
+        if requires_complete and not rebuilt_complete:
+            raise _operational('stale_decision', 'authorized corpus is no longer fully embedded')
+
+        return
+
+    def _await_comparison_complete(
+        self,
+        work: WorkflowWork,
+        view: SanitizedCandidateView,
+        scope: EffectiveCandidateScope,
+        embedding: tuple[float, ...],
+        shortlist: CurationShortlist,
+    ) -> None:
+        for attempt in range(_COMPLETENESS_WAIT_ATTEMPTS):
+            if self._revalidate_shortlist(work, view, scope, embedding, shortlist):
+                return
+            if attempt + 1 < _COMPLETENESS_WAIT_ATTEMPTS:
+                _wait_before_completeness_retry(_COMPLETENESS_WAIT_SECONDS)
+        logger.info(
+            'curation_completeness_wait_exhausted',
+            work_id=str(work.id),
+            attempts=_COMPLETENESS_WAIT_ATTEMPTS,
+        )
 
         return
 
