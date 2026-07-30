@@ -1661,7 +1661,7 @@ def test_merge_evidence_outcome_commits_merge_decision_atomically(monkeypatch: p
     candidate, work, run = orch.subject_candidate(
         scope, suffix='merge', title='Cache eviction approach', body='The hot cache tier evicts oldest entries first.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('merge_evidence', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -1698,7 +1698,7 @@ def test_revise_memory_outcome_commits_revision_decision_atomically(monkeypatch:
     candidate, work, run = orch.subject_candidate(
         scope, suffix='revise', title='Deployment rollback update', body='Rollback now drains connections first.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
     verdict = orch.stub_verdict('revise_memory', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -1735,7 +1735,7 @@ def test_supersede_memory_outcome_commits_supersession_decision_atomically(monke
     candidate, work, run = orch.subject_candidate(
         scope, suffix='supersede', title='Broker prefetch replacement', body='Prefetch is now set to one per worker.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
     verdict = orch.stub_verdict('supersede_memory', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -1773,7 +1773,7 @@ def test_open_conflict_outcome_commits_conflict_decision_atomically(monkeypatch:
     candidate, work, run = orch.subject_candidate(
         scope, suffix='conflict', title='Primary region choice', body='The primary region is now the eastern zone.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('open_conflict', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2068,7 +2068,7 @@ def test_target_version_advance_fences_stale_judgment(monkeypatch: pytest.Monkey
     candidate, work, run = orch.subject_candidate(
         scope, suffix='f23', title='Queue backpressure revision', body='Backpressure now trips at 80 percent depth.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
     verdict = orch.stub_verdict('revise_memory', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2116,7 +2116,7 @@ def test_cp4_fault_at_each_transition_boundary_rolls_back_work_completion(
     else:
         memory = orch.target_memory(scope, suffix=outcome, title=f'{outcome} target', body=_LONG_BODY)
         target_version = orch.current_version(memory)
-        shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+        shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
         evidence = orch.stub_evidence(candidate_tier=candidate_tier, target=target_version, candidate_newer=True)
     candidate, work, run = orch.subject_candidate(scope, suffix=outcome)
     verdict = orch.stub_verdict(outcome, target=target_version)
@@ -2182,7 +2182,7 @@ def test_concurrent_candidate_decisions_on_one_target_relist_the_loser(monkeypat
     winner_candidate, winner_work, winner_run = orch.subject_candidate(
         scope, suffix='winner', title='Retry ceiling revision B', body='The retry ceiling should drop to four.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
     verdict = orch.stub_verdict('revise_memory', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2290,7 +2290,7 @@ def test_genuine_conflict_predicate_opens_canonical_conflict(monkeypatch: pytest
     candidate, work, run = orch.subject_candidate(
         scope, suffix='genuine', title='Default timeout value', body='The default request timeout is ninety seconds.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('open_conflict', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2324,7 +2324,7 @@ def test_temporal_precedence_supersedes_instead_of_conflict(monkeypatch: pytest.
     candidate, work, run = orch.subject_candidate(
         scope, suffix='precedence', title='Feature flag default on', body='The feature flag now defaults to enabled.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='corroborated', target=target_version, candidate_newer=True)
     verdict = orch.stub_verdict('supersede_memory', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2351,7 +2351,7 @@ def test_different_applicability_is_not_a_conflict(monkeypatch: pytest.MonkeyPat
     candidate, work, run = orch.subject_candidate(
         scope, suffix='applicability', title='Production cache size', body='The production cache holds two gigabytes.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = CurationJudgeVerdict(
         schema_version=2,
@@ -2390,7 +2390,7 @@ def test_existing_open_conflict_pair_is_not_duplicated(monkeypatch: pytest.Monke
     candidate, work, run = orch.subject_candidate(
         scope, suffix='duplicate', title='Log retention window', body='Logs are retained for thirty days now.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('open_conflict', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2510,7 +2510,7 @@ def test_existing_open_conflict_pair_settles_idempotently_across_generations(mon
     candidate, work, run = orch.subject_candidate(
         scope, suffix='idempair', title='Primary region choice', body='The primary region is now the eastern zone.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('open_conflict', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2573,7 +2573,7 @@ def test_open_conflict_decision_references_opened_transition(monkeypatch: pytest
     candidate, work, run = orch.subject_candidate(
         scope, suffix='m9', title='Replica placement rule', body='Replicas now span three availability zones.'
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
     verdict = orch.stub_verdict('open_conflict', target=target_version)
     judge = orch.stub_judge_result(verdict, call, policy, shortlist)
@@ -2712,7 +2712,7 @@ def test_model_redundant_rejection_retries_when_shortlist_target_advances(
         title='Retry backoff policy duplicate',
         body='The same retry backoff policy is repeated here.',
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(
         candidate_tier='supported',
         target=target_version,
@@ -2842,7 +2842,7 @@ def test_redundant_rejection_revalidates_target_before_settlement(
         title='Retry backoff policy restatement',
         body='The retry policy uses the same bounded exponential backoff.',
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(
         candidate_tier='supported',
         target=target_version,
@@ -2949,14 +2949,14 @@ def test_concurrent_targetless_publications_serialize_and_relist_loser(
     real_revalidate = module.revalidate_curation_shortlist
     revalidated = threading.Barrier(2)
 
-    def synchronized_revalidate(data: object, frozen: object) -> bool:
-        unchanged = real_revalidate(data, frozen)
+    def synchronized_revalidate(data: object, frozen: object) -> tuple[bool, bool]:
+        result = real_revalidate(data, frozen)
         try:
             revalidated.wait(timeout=5)
         except threading.BrokenBarrierError:
             pass
 
-        return unchanged
+        return result
 
     monkeypatch.setattr(module, 'revalidate_curation_shortlist', synchronized_revalidate)
     start = threading.Barrier(2)
@@ -3168,7 +3168,7 @@ def test_late_evidence_does_not_record_transitionless_repeat_conflict(
         title='Retention policy',
         body='Logs are now retained for thirty days.',
     )
-    shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
     evidence = orch.stub_evidence(
         candidate_tier='supported',
         target=target_version,
@@ -3460,3 +3460,168 @@ def test_candidate_decision_judge_carries_the_work_failure_streak_as_its_attempt
 
     assert error is None
     assert [data.attempt for data in captured] == [2]
+
+
+def _install_revalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    entries_unchanged: bool,
+    completeness: tuple[bool, ...],
+) -> list[float]:
+    module = orch.curation_module()
+    remaining = list(completeness)
+    latest = {'complete': completeness[-1]}
+    sleeps: list[float] = []
+
+    def revalidate(*_args: object, **_kwargs: object) -> tuple[bool, bool]:
+        if remaining:
+            latest['complete'] = remaining.pop(0)
+
+        return entries_unchanged, latest['complete']
+
+    monkeypatch.setattr(module, 'revalidate_curation_shortlist', revalidate)
+    monkeypatch.setattr(module, '_wait_before_completeness_retry', sleeps.append)
+
+    return sleeps
+
+
+@pytest.mark.django_db
+def test_completeness_flip_does_not_evict_an_outcome_that_never_reads_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('complete-merge')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='complete-merge',
+        title='Retrieval ranking claim',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(scope, suffix='complete-merge')
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version)
+    judge = orch.stub_judge_result(orch.stub_verdict('merge_evidence', target=target_version), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    sleeps = _install_revalidation(monkeypatch, entries_unchanged=True, completeness=(False,))
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert sleeps == []
+    decisions = orch.curation_decisions_for(candidate)
+    assert [decision.outcome for decision in decisions] == [CurationOutcome.MERGE_EVIDENCE]
+
+
+@pytest.mark.django_db
+def test_publish_new_stales_when_the_corpus_stays_unembedded_through_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('complete-publish-stale')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='complete-publish-stale')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge = orch.stub_judge_result(orch.stub_verdict('publish_new'), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    sleeps = _install_revalidation(monkeypatch, entries_unchanged=True, completeness=(False,))
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert len(sleeps) == 2
+    assert orch.curation_decisions_for(candidate) == []
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROPOSED
+
+
+@pytest.mark.django_db
+def test_publish_new_settles_when_the_embedding_lands_during_the_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('complete-publish-wait')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='complete-publish-wait')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge = orch.stub_judge_result(orch.stub_verdict('publish_new'), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    sleeps = _install_revalidation(monkeypatch, entries_unchanged=True, completeness=(False, True))
+
+    _result, error = orch.run_decision(work, run)
+
+    assert error is None
+    assert len(sleeps) == 1
+    decisions = orch.curation_decisions_for(candidate)
+    assert [decision.outcome for decision in decisions] == [CurationOutcome.PUBLISH_NEW]
+    candidate.refresh_from_db()
+    assert candidate.status == CandidateStatus.PROMOTED
+
+
+@pytest.mark.django_db
+def test_entry_change_still_evicts_an_outcome_that_ignores_completeness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('complete-entry-change')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    memory = orch.target_memory(
+        scope,
+        suffix='complete-entry-change',
+        title='Retrieval ranking claim',
+        body=_LONG_BODY,
+    )
+    target_version = orch.current_version(memory)
+    candidate, work, run = orch.subject_candidate(scope, suffix='complete-entry-change')
+    shortlist = orch.stub_shortlist(replace(orch.shortlist_entry(memory), team_id=None))
+    evidence = orch.stub_evidence(candidate_tier='supported', target=target_version)
+    judge = orch.stub_judge_result(orch.stub_verdict('merge_evidence', target=target_version), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch, embedding=_EMBEDDING, shortlist=shortlist, evidence=evidence, judge_result=judge
+    )
+    sleeps = _install_revalidation(monkeypatch, entries_unchanged=False, completeness=(True,))
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert sleeps == []
+    assert orch.curation_decisions_for(candidate) == []
+
+
+@pytest.mark.django_db
+def test_verdict_parity_still_compares_the_full_comparison_manifest_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = orch.orchestrator_scope('complete-manifest')
+    policy = orch.curation_policy(scope)
+    call = orch.provider_call_record(scope, policy)
+    candidate, work, run = orch.subject_candidate(scope, suffix='complete-manifest')
+    shortlist = orch.stub_shortlist(comparison_complete=True, authorized_corpus_count=0)
+    evidence = orch.stub_evidence(candidate_tier='supported')
+    judge = orch.stub_judge_result(orch.stub_verdict('publish_new'), call, policy, shortlist)
+    orch.install_judged_decision(
+        monkeypatch,
+        embedding=_EMBEDDING,
+        shortlist=shortlist,
+        evidence=evidence,
+        judge_result=replace(judge, comparison_manifest_hash='f' * 64),
+    )
+    sleeps = _install_revalidation(monkeypatch, entries_unchanged=True, completeness=(True,))
+
+    _result, error = orch.run_decision(work, run)
+
+    assert isinstance(error, MemoryTransitionError)
+    assert error.code == 'stale_decision'
+    assert sleeps == []
+    assert orch.curation_decisions_for(candidate) == []

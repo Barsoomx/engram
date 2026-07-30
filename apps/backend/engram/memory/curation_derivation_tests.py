@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import pytest
@@ -13,6 +13,7 @@ from engram.memory.curation_derivation import (
     DerivedDecision,
     TargetFacts,
     build_derivation_facts,
+    decision_requires_comparison_complete,
     derive_decision,
     feasible_outcomes,
 )
@@ -646,3 +647,119 @@ def test_targetless_decision_reports_not_applicable_applicability() -> None:
     assert decision is not None
     assert decision.outcome == 'publish_new'
     assert decision.applicability == 'not_applicable'
+
+
+_COMPLETENESS_GATED = frozenset({'publish_new', 'supersede_memory', 'open_conflict'})
+
+
+def test_merge_evidence_does_not_require_comparison_complete() -> None:
+    data = _judge_input(
+        candidate_tier='supported',
+        candidate_at=_EQUAL,
+        complete=True,
+        specs=(_TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EARLIER),),
+    )
+    facts = build_derivation_facts(data)
+    relations = _relations(data, ('equivalent',))
+    applicability = _applicability(data, ('same',))
+    decision = derive_decision(facts, relations, applicability)
+
+    assert decision is not None
+    assert decision.outcome == 'merge_evidence'
+    assert decision_requires_comparison_complete(facts, relations, applicability) is False
+
+
+def test_publish_new_requires_comparison_complete() -> None:
+    data = _judge_input(candidate_tier='supported', candidate_at=_EQUAL, complete=True, specs=())
+    facts = build_derivation_facts(data)
+    decision = derive_decision(facts, {}, {})
+
+    assert decision is not None
+    assert decision.outcome == 'publish_new'
+    assert decision_requires_comparison_complete(facts, {}, {}) is True
+
+
+def test_supersede_memory_requires_comparison_complete() -> None:
+    data = _judge_input(
+        candidate_tier='corroborated',
+        candidate_at=_EQUAL,
+        complete=True,
+        specs=(_TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EARLIER),),
+    )
+    facts = build_derivation_facts(data)
+    relations = _relations(data, ('candidate_supersedes',))
+    applicability = _applicability(data, ('same',))
+    decision = derive_decision(facts, relations, applicability)
+
+    assert decision is not None
+    assert decision.outcome == 'supersede_memory'
+    assert decision_requires_comparison_complete(facts, relations, applicability) is True
+
+
+def test_open_conflict_requires_comparison_complete() -> None:
+    data = _judge_input(
+        candidate_tier='supported',
+        candidate_at=_EQUAL,
+        complete=True,
+        specs=(_TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EQUAL),),
+    )
+    facts = build_derivation_facts(data)
+    relations = _relations(data, ('mutually_incompatible',))
+    applicability = _applicability(data, ('same',))
+    decision = derive_decision(facts, relations, applicability)
+
+    assert decision is not None
+    assert decision.outcome == 'open_conflict'
+    assert decision_requires_comparison_complete(facts, relations, applicability) is True
+
+
+def test_revise_memory_does_not_require_comparison_complete() -> None:
+    data = _judge_input(
+        candidate_tier='corroborated',
+        candidate_at=_EQUAL,
+        complete=True,
+        specs=(_TargetSpec(tier='supported', same_visibility=True, has_open_conflict=False, target_at=_EARLIER),),
+    )
+    facts = build_derivation_facts(data)
+    relations = _relations(data, ('candidate_revises',))
+    applicability = _applicability(data, ('same',))
+    decision = derive_decision(facts, relations, applicability)
+
+    assert decision is not None
+    assert decision.outcome == 'revise_memory'
+    assert decision_requires_comparison_complete(facts, relations, applicability) is False
+
+
+def test_reject_candidate_never_requires_comparison_complete(
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
+) -> None:
+    for data, assignment, applicability in f_lattice:
+        facts = build_derivation_facts(data)
+        relations = _relations(data, assignment)
+        applicabilities = _applicability(data, applicability)
+        decision = derive_decision(facts, relations, applicabilities)
+        if decision is None or decision.outcome != 'reject_candidate':
+            continue
+        assert decision_requires_comparison_complete(facts, relations, applicabilities) is False
+
+
+def test_only_completeness_gated_outcomes_require_comparison_complete(
+    f_lattice: list[tuple[CurationJudgeInput, tuple[str, ...], tuple[str, ...]]],
+) -> None:
+    gated: set[str] = set()
+    for data, assignment, applicability in f_lattice:
+        facts = build_derivation_facts(data)
+        relations = _relations(data, assignment)
+        applicabilities = _applicability(data, applicability)
+        decision = derive_decision(facts, relations, applicabilities)
+        required = decision_requires_comparison_complete(facts, relations, applicabilities)
+        if not facts.comparison_complete:
+            assert required is False
+            continue
+        downgraded = derive_decision(replace(facts, comparison_complete=False), relations, applicabilities)
+        assert required is (downgraded != decision)
+        if required:
+            assert decision is not None
+            gated.add(decision.outcome)
+
+    assert gated == _COMPLETENESS_GATED
