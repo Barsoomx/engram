@@ -1174,35 +1174,17 @@ def generated_curation_decision_payload(prompt: str) -> str:
         envelope = json.loads(prompt)
     except (json.JSONDecodeError, TypeError):
         envelope = {}
-    candidate = envelope.get('candidate') if isinstance(envelope, dict) else {}
-    candidate_refs = candidate.get('evidence_refs') if isinstance(candidate, dict) else []
-    if not isinstance(candidate_refs, list):
-        candidate_refs = []
     raw_comparisons = envelope.get('comparisons') if isinstance(envelope, dict) else []
-    comparisons = []
-    for item in raw_comparisons if isinstance(raw_comparisons, list) else []:
-        if not isinstance(item, dict):
-            continue
-        target_refs = item.get('evidence_refs')
-        comparisons.append(
-            {
-                'memory_version_id': item.get('memory_version_id'),
-                'relation': 'unrelated',
-                'target_evidence_refs': target_refs if isinstance(target_refs, list) else [],
-            }
-        )
+    comparisons = [
+        {'index': item.get('index'), 'relation': 'unrelated', 'applicability': 'different'}
+        for item in (raw_comparisons if isinstance(raw_comparisons, list) else [])
+        if isinstance(item, dict)
+    ]
 
     return json.dumps(
         {
-            'schema_version': 1,
-            'outcome': 'publish_new',
-            'relation': 'unrelated',
-            'target_memory_version_id': None,
-            'candidate_evidence_refs': candidate_refs,
+            'schema_version': 2,
             'comparisons': comparisons,
-            'applicability': 'same',
-            'temporal_order': 'not_applicable',
-            'reason_code': 'distinct_claim',
             'reason': 'fake provider curation decision',
         }
     )
@@ -1218,7 +1200,7 @@ def fake_generated_content(data: ProviderCallInput, prompt: str) -> tuple[str, s
         return title, generated_distill_extract_payload(prompt)
     if data.response_kind == 'distill_reduce.v2':
         return title, generated_distill_reduce_payload(prompt)
-    if data.response_kind == 'curation_decision_v1':
+    if data.response_kind == 'curation_decision_v2':
         return title, generated_curation_decision_payload(prompt)
 
     return title, body
@@ -1239,7 +1221,7 @@ def default_base_url(provider: str) -> str:
 
 
 def deepseek_thinking_override(provider: str, task_type: str, response_kind: str) -> dict[str, object]:
-    if provider == 'deepseek' and response_kind == 'curation_decision_v1':
+    if provider == 'deepseek' and response_kind == 'curation_decision_v2':
         return {'thinking': {'type': 'enabled'}}
 
     if provider == 'deepseek' and task_type in ('curation', 'digest'):
@@ -1249,7 +1231,7 @@ def deepseek_thinking_override(provider: str, task_type: str, response_kind: str
 
 
 _STRUCTURED_RESPONSE_KINDS = frozenset(
-    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'}
+    {'candidates', 'curation_judgment', 'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v2'}
 )
 _JSON_OBJECT_DEFAULT_BY_PROVIDER = {'openai': True, 'deepseek': False}
 
@@ -1276,17 +1258,9 @@ _MAX_TOKENS_BY_KIND = {
     'curation_judgment': 1024,
     'distill_extract.v1': 8192,
     'distill_reduce.v2': 8192,
-    'curation_decision_v1': 16384,
+    'curation_decision_v2': 16384,
 }
-_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v1'})
-_CURATION_DECISION_OUTCOMES = (
-    'publish_new',
-    'merge_evidence',
-    'revise_memory',
-    'supersede_memory',
-    'reject_candidate',
-    'open_conflict',
-)
+_FIXED_MAX_TOKEN_KINDS = frozenset({'distill_extract.v1', 'distill_reduce.v2', 'curation_decision_v2'})
 _CURATION_DECISION_RELATIONS = (
     'unrelated',
     'compatible_distinct',
@@ -1297,70 +1271,26 @@ _CURATION_DECISION_RELATIONS = (
     'unsupported',
     'mutually_incompatible',
 )
-_CURATION_DECISION_REASON_CODES = (
-    'distinct_claim',
-    'equivalent_claim',
-    'same_subject_revision',
-    'ordered_replacement',
-    'redundant_claim',
-    'unsupported_claim',
-    'same_scope_contradiction',
-)
-_CURATION_DECISION_TEMPORAL_ORDERS = ('candidate_newer', 'target_newer', 'unordered', 'not_applicable')
 _CURATION_DECISION_SCHEMA_INSTRUCTIONS = (
     'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
     'The object must contain exactly these keys and no additional properties (recursively): '
-    'schema_version (integer, always 1); '
-    f'outcome (one of: {", ".join(_CURATION_DECISION_OUTCOMES)}); '
-    f'relation (one of: {", ".join(_CURATION_DECISION_RELATIONS)}); '
-    'target_memory_version_id (a shortlist memory_version_id string, or null); '
-    'candidate_evidence_refs (array of provided evidence reference tokens, unique, at most 16); '
-    'comparisons (array with exactly one object per shortlist entry, in the given order; each object has '
-    'memory_version_id, relation, and target_evidence_refs); '
-    'applicability (one of: same, different); '
-    f'temporal_order (one of: {", ".join(_CURATION_DECISION_TEMPORAL_ORDERS)}); '
-    f'reason_code (one of: {", ".join(_CURATION_DECISION_REASON_CODES)}); '
+    'schema_version (integer, always 2); '
+    'comparisons (array with exactly one object per input comparisons entry); '
     'reason (a short redacted explanation, at most 500 characters). '
-    'Only reference memory_version_id values and evidence tokens present in the input. '
-    'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
-    'must equal the top-level relation.'
-    ' Allowed outcome and relation combinations (any other combination is invalid): '
-    'publish_new with relation unrelated or compatible_distinct, target_memory_version_id null, '
-    'candidate evidence tier supported or corroborated and comparison_complete true; '
-    'merge_evidence with relation equivalent, a non-null target and both candidate and target evidence tiers '
-    'supported or corroborated; '
-    'revise_memory with relation candidate_revises, a non-null target, candidate evidence tier corroborated, '
-    'target evidence tier supported or corroborated and temporal_order candidate_newer used only when the '
-    'candidate evidence is clearly newer, which the system verifies; '
-    'supersede_memory with relation candidate_supersedes, a non-null target, candidate evidence tier '
-    'corroborated, target evidence tier supported or corroborated, temporal_order candidate_newer used only '
-    'when the candidate evidence is clearly newer, which the system verifies, and comparison_complete true; '
-    'reject_candidate with relation redundant, a non-null target and target evidence tier supported or '
-    'corroborated; '
-    'reject_candidate with relation unsupported, target null and the candidate having no supporting evidence, '
-    'evidence tier none; '
-    'open_conflict with relation mutually_incompatible, a non-null target, temporal_order unordered, both '
-    'candidate and target evidence tiers supported or corroborated, non-empty evidence refs on both sides, '
-    'comparison_complete true and applicability same. '
-    'The top-level relation describes the selected target; with a null target use unrelated, '
-    'compatible_distinct or unsupported. '
-    'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
-    'When comparison_complete is true, every shortlist comparison is unrelated or compatible_distinct and the '
-    'candidate evidence tier is supported or corroborated, choose publish_new with target null. '
-    'Cross-visibility rule: the shortlist may include targets at a wider visibility than the candidate '
-    '(for a team candidate, project-global targets have a different team_id). Never select such a '
-    'cross-visibility target as target_memory_version_id for merge_evidence, revise_memory, '
-    'supersede_memory, or open_conflict. When any target at any visibility is redundant with the candidate, '
-    'choose outcome=reject_candidate, relation=redundant against that target instead of publishing a duplicate. '
-    'When a same-visibility target (same team_id as the candidate) carries a mutating identity relation '
-    '(equivalent, candidate_revises, candidate_supersedes, mutually_incompatible), act on that '
-    'same-visibility target with its normal targeted outcome. '
-    'Only when no target is redundant and no same-visibility target carries a mutating identity relation, '
-    'fall back to outcome=publish_new, relation=compatible_distinct, reason_code=distinct_claim, '
-    'target_memory_version_id=null, and report the honest per-target relation (including '
-    'mutually_incompatible against a cross-visibility target) only inside the comparisons array. '
-    'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
-    'candidate evidence.'
+    'Each comparisons entry must contain exactly these keys and no additional properties: '
+    'index (the integer index of the input comparison it answers; use every input index exactly once, '
+    'order does not matter); '
+    f'relation (one of: {", ".join(_CURATION_DECISION_RELATIONS)}); '
+    'applicability (same when that entry and the candidate constrain the same subject in the same situation, '
+    'otherwise different). '
+    'Relation meanings, always read as the candidate relative to that one entry: unrelated when the claims '
+    'share no subject; compatible_distinct when they share a subject but state different facts that can both '
+    'hold; equivalent when they state the same fact; candidate_revises when the candidate restates the same '
+    'subject with an updated detail; candidate_supersedes when the candidate replaces the entry outright; '
+    'redundant when the entry already carries everything the candidate says; mutually_incompatible when both '
+    'cannot be true at once; unsupported when the candidate carries no durable claim at all. '
+    'Do not choose an outcome and do not rank the entries: the system derives the outcome from these '
+    'relations and from facts you cannot see.'
 )
 
 
@@ -1397,7 +1327,7 @@ _DISTILL_REDUCE_SCHEMA_INSTRUCTIONS = (
 
 
 def curation_schema_prompt_prefix(response_kind: str) -> str:
-    if response_kind == 'curation_decision_v1':
+    if response_kind == 'curation_decision_v2':
         return _CURATION_DECISION_SCHEMA_INSTRUCTIONS
 
     if response_kind == 'distill_extract.v1':
@@ -1524,23 +1454,14 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
             'additionalProperties': False,
         },
     },
-    'curation_decision_v1': {
+    'curation_decision_v2': {
         'name': 'emit_curation_decision',
-        'description': 'Return the strict curation decision verdict.',
+        'description': 'Return the strict curation comparison relations.',
         'input_schema': {
             'type': 'object',
             'additionalProperties': False,
             'properties': {
-                'schema_version': {'type': 'integer', 'enum': [1]},
-                'outcome': {'type': 'string', 'enum': list(_CURATION_DECISION_OUTCOMES)},
-                'relation': {'type': 'string', 'enum': list(_CURATION_DECISION_RELATIONS)},
-                'target_memory_version_id': {'type': ['string', 'null']},
-                'candidate_evidence_refs': {
-                    'type': 'array',
-                    'items': {'type': 'string'},
-                    'maxItems': 16,
-                    'uniqueItems': True,
-                },
+                'schema_version': {'type': 'integer', 'enum': [2]},
                 'comparisons': {
                     'type': 'array',
                     'maxItems': 12,
@@ -1548,33 +1469,18 @@ _ANTHROPIC_STRUCTURED_TOOLS: dict[str, dict[str, object]] = {
                         'type': 'object',
                         'additionalProperties': False,
                         'properties': {
-                            'memory_version_id': {'type': 'string'},
+                            'index': {'type': 'integer', 'minimum': 1},
                             'relation': {'type': 'string', 'enum': list(_CURATION_DECISION_RELATIONS)},
-                            'target_evidence_refs': {
-                                'type': 'array',
-                                'items': {'type': 'string'},
-                                'maxItems': 16,
-                                'uniqueItems': True,
-                            },
+                            'applicability': {'type': 'string', 'enum': ['same', 'different']},
                         },
-                        'required': ['memory_version_id', 'relation', 'target_evidence_refs'],
+                        'required': ['index', 'relation', 'applicability'],
                     },
                 },
-                'applicability': {'type': 'string', 'enum': ['same', 'different']},
-                'temporal_order': {'type': 'string', 'enum': list(_CURATION_DECISION_TEMPORAL_ORDERS)},
-                'reason_code': {'type': 'string', 'enum': list(_CURATION_DECISION_REASON_CODES)},
                 'reason': {'type': 'string', 'maxLength': 500},
             },
             'required': [
                 'schema_version',
-                'outcome',
-                'relation',
-                'target_memory_version_id',
-                'candidate_evidence_refs',
                 'comparisons',
-                'applicability',
-                'temporal_order',
-                'reason_code',
                 'reason',
             ],
         },

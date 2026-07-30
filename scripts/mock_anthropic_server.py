@@ -42,35 +42,23 @@ def curation_decision_content(prompt: str) -> str:
         envelope = {}
     if not isinstance(envelope, dict):
         envelope = {}
-    candidate = envelope.get('candidate')
-    candidate_refs = candidate.get('evidence_refs') if isinstance(candidate, dict) else []
-    if not isinstance(candidate_refs, list):
-        candidate_refs = []
     raw_comparisons = envelope.get('comparisons')
     comparisons = []
     for item in raw_comparisons if isinstance(raw_comparisons, list) else []:
         if not isinstance(item, dict):
             continue
-        target_refs = item.get('evidence_refs')
         comparisons.append(
             {
-                'memory_version_id': item.get('memory_version_id'),
+                'index': item.get('index'),
                 'relation': 'unrelated',
-                'target_evidence_refs': target_refs if isinstance(target_refs, list) else [],
+                'applicability': 'different',
             },
         )
 
     return json.dumps(
         {
-            'schema_version': 1,
-            'outcome': 'publish_new',
-            'relation': 'unrelated',
-            'target_memory_version_id': None,
-            'candidate_evidence_refs': candidate_refs,
+            'schema_version': 2,
             'comparisons': comparisons,
-            'applicability': 'same',
-            'temporal_order': 'not_applicable',
-            'reason_code': 'distinct_claim',
             'reason': 'mock provider curation decision',
         },
     )
@@ -78,7 +66,7 @@ def curation_decision_content(prompt: str) -> str:
 
 def generation_content(system_prompt: str, prompt: str) -> str:
     digest_suffix = hashlib.sha256(prompt.encode()).hexdigest()[:10]
-    if 'curation_judge_input.v1' in prompt:
+    if 'curation_judge_input.v2' in prompt:
         return curation_decision_content(prompt)
     if 'distill_extract.v1' in system_prompt:
         observation_ids = list(dict.fromkeys(_OBSERVATION_ID.findall(prompt)))

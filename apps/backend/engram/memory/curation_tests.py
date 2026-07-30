@@ -59,7 +59,7 @@ from engram.memory.curation import (
     parse_curation_reason,
     resolve_curator_llm_judge_enabled,
 )
-from engram.memory.curation_judge import CurationJudgeComparisonV1, CurationJudgeVerdictV1
+from engram.memory.curation_judge import CurationJudgeComparison, CurationJudgeVerdict
 from engram.memory.curation_test_support import (
     JudgeGatewayStub,
     create_curation_policy,
@@ -2353,13 +2353,12 @@ def test_different_applicability_is_not_a_conflict(monkeypatch: pytest.MonkeyPat
     )
     shortlist = orch.stub_shortlist(orch.shortlist_entry(memory))
     evidence = orch.stub_evidence(candidate_tier='supported', target=target_version, target_tier='supported')
-    verdict = CurationJudgeVerdictV1(
-        schema_version=1,
+    verdict = CurationJudgeVerdict(
+        schema_version=2,
         outcome='publish_new',
         relation='compatible_distinct',
         target_memory_version_id=None,
-        candidate_evidence_refs=('cref-1',),
-        comparisons=(CurationJudgeComparisonV1(target_version.id, 'compatible_distinct', ('tref-1',)),),
+        comparisons=(CurationJudgeComparison(target_version.id, 'compatible_distinct', 'different'),),
         applicability='different',
         temporal_order='not_applicable',
         reason_code='distinct_claim',
@@ -2624,13 +2623,12 @@ def test_stale_shortlist_target_transition_fences_verdict(monkeypatch: pytest.Mo
     assert candidate.status == CandidateStatus.PROPOSED
 
 
-def _reject_verdict() -> CurationJudgeVerdictV1:
-    return CurationJudgeVerdictV1(
-        schema_version=1,
+def _reject_verdict() -> CurationJudgeVerdict:
+    return CurationJudgeVerdict(
+        schema_version=2,
         outcome='reject_candidate',
         relation='unsupported',
         target_memory_version_id=None,
-        candidate_evidence_refs=(),
         comparisons=(),
         applicability='different',
         temporal_order='not_applicable',
@@ -2720,17 +2718,16 @@ def test_model_redundant_rejection_retries_when_shortlist_target_advances(
         target=target_version,
         target_tier='supported',
     )
-    verdict = CurationJudgeVerdictV1(
-        schema_version=1,
+    verdict = CurationJudgeVerdict(
+        schema_version=2,
         outcome='reject_candidate',
         relation='redundant',
         target_memory_version_id=target_version.id,
-        candidate_evidence_refs=('cref-1',),
         comparisons=(
-            CurationJudgeComparisonV1(
+            CurationJudgeComparison(
                 memory_version_id=target_version.id,
                 relation='redundant',
-                target_evidence_refs=('tref-1',),
+                applicability='same',
             ),
         ),
         applicability='same',
@@ -2851,17 +2848,16 @@ def test_redundant_rejection_revalidates_target_before_settlement(
         target=target_version,
         target_tier='supported',
     )
-    verdict = CurationJudgeVerdictV1(
-        schema_version=1,
+    verdict = CurationJudgeVerdict(
+        schema_version=2,
         outcome='reject_candidate',
         relation='redundant',
         target_memory_version_id=target_version.id,
-        candidate_evidence_refs=('cref-1',),
         comparisons=(
-            CurationJudgeComparisonV1(
+            CurationJudgeComparison(
                 target_version.id,
                 'redundant',
-                ('tref-1',),
+                'same',
             ),
         ),
         applicability='same',

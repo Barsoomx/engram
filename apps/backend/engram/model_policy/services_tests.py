@@ -400,8 +400,8 @@ def test_openai_curation_decision_prompt_carries_verdict_schema_instructions() -
             policy=policy,
             request_id='curation-schema-1',
             trace_id='curation-schema-1',
-            prompt='{"schema":"curation_judge_input.v1"}',
-            response_kind='curation_decision_v1',
+            prompt='{"schema":"curation_judge_input.v2"}',
+            response_kind='curation_decision_v2',
         ),
     )
 
@@ -409,10 +409,10 @@ def test_openai_curation_decision_prompt_carries_verdict_schema_instructions() -
     user_message = sent['messages'][-1]['content']
 
     assert 'exactly one JSON object' in user_message
-    assert 'candidate_evidence_refs' in user_message
-    assert 'supersede_memory' in user_message
-    assert 'temporal_order' in user_message
-    assert user_message.rstrip().endswith('{"schema":"curation_judge_input.v1"}')
+    assert 'index (the integer index of the input comparison' in user_message
+    assert 'applicability' in user_message
+    assert 'the system derives the outcome' in user_message
+    assert user_message.rstrip().endswith('{"schema":"curation_judge_input.v2"}')
 
 
 @pytest.mark.django_db
@@ -514,134 +514,54 @@ def test_distill_reduce_schema_prefix_states_parser_enforced_rules() -> None:
     assert curation_schema_prompt_prefix('distill_reduce.v1') == ''
 
 
-def test_curation_decision_prefix_lists_every_mutating_identity_relation() -> None:
-    from engram.memory.curation_derivation import _IDENTITY_RELATIONS
+def test_curation_decision_prefix_documents_every_relation_the_parser_accepts() -> None:
+    from engram.memory.curation_judge import _RELATIONS
 
-    instructions = curation_schema_prompt_prefix('curation_decision_v1')
-    marker = 'carries a mutating identity relation ('
-    start = instructions.index(marker) + len(marker)
-    end = instructions.index(')', start)
-    listed = {relation.strip() for relation in instructions[start:end].split(',')}
+    instructions = curation_schema_prompt_prefix('curation_decision_v2')
+    enumeration = instructions.split('relation (one of: ', 1)[1].split(')', 1)[0]
+    listed = {relation.strip() for relation in enumeration.split(',')}
 
-    assert listed == set(_IDENTITY_RELATIONS) - {'redundant'}
-
-
-def test_curation_decision_prefix_routes_cross_visibility_redundant_to_rejection() -> None:
-    instructions = curation_schema_prompt_prefix('curation_decision_v1')
-
-    assert 'redundant with the candidate, choose outcome=reject_candidate' in instructions
-    condition, separator, fallback = instructions.partition('fall back to')
-    assert separator == 'fall back to'
-    assert 'no target is redundant' in condition
-    assert 'redundant' not in fallback.split('comparisons array', 1)[0]
+    assert listed == set(_RELATIONS)
+    for relation in _RELATIONS:
+        assert f'{relation} when' in instructions
 
 
-def test_curation_decision_schema_prefix_states_allowed_combination_table() -> None:
-    instructions = curation_schema_prompt_prefix('curation_decision_v1')
+def test_curation_decision_prefix_never_names_an_outcome() -> None:
+    instructions = curation_schema_prompt_prefix('curation_decision_v2')
+
+    for outcome, _relation in _ALLOWED_COMBINATIONS:
+        assert outcome not in instructions
+
+
+def test_curation_decision_schema_prefix_is_the_frozen_v2_contract() -> None:
+    instructions = curation_schema_prompt_prefix('curation_decision_v2')
 
     assert instructions == (
         'Return exactly one JSON object and nothing else: no prose, no markdown code fences. '
         'The object must contain exactly these keys and no additional properties (recursively): '
-        'schema_version (integer, always 1); '
-        'outcome (one of: publish_new, merge_evidence, revise_memory, supersede_memory, reject_candidate, '
-        'open_conflict); '
+        'schema_version (integer, always 2); '
+        'comparisons (array with exactly one object per input comparisons entry); '
+        'reason (a short redacted explanation, at most 500 characters). '
+        'Each comparisons entry must contain exactly these keys and no additional properties: '
+        'index (the integer index of the input comparison it answers; use every input index exactly once, '
+        'order does not matter); '
         'relation (one of: unrelated, compatible_distinct, equivalent, candidate_revises, candidate_supersedes, '
         'redundant, unsupported, mutually_incompatible); '
-        'target_memory_version_id (a shortlist memory_version_id string, or null); '
-        'candidate_evidence_refs (array of provided evidence reference tokens, unique, at most 16); '
-        'comparisons (array with exactly one object per shortlist entry, in the given order; each object has '
-        'memory_version_id, relation, and target_evidence_refs); '
-        'applicability (one of: same, different); '
-        'temporal_order (one of: candidate_newer, target_newer, unordered, not_applicable); '
-        'reason_code (one of: distinct_claim, equivalent_claim, same_subject_revision, ordered_replacement, '
-        'redundant_claim, unsupported_claim, same_scope_contradiction); '
-        'reason (a short redacted explanation, at most 500 characters). '
-        'Only reference memory_version_id values and evidence tokens present in the input. '
-        'A non-null target_memory_version_id must be one of the shortlist entries, and its comparison relation '
-        'must equal the top-level relation.'
-        ' Allowed outcome and relation combinations (any other combination is invalid): '
-        'publish_new with relation unrelated or compatible_distinct, target_memory_version_id null, '
-        'candidate evidence tier supported or corroborated and comparison_complete true; '
-        'merge_evidence with relation equivalent, a non-null target and both candidate and target evidence tiers '
-        'supported or corroborated; '
-        'revise_memory with relation candidate_revises, a non-null target, candidate evidence tier corroborated, '
-        'target evidence tier supported or corroborated and temporal_order candidate_newer used only when the '
-        'candidate evidence is clearly newer, which the system verifies; '
-        'supersede_memory with relation candidate_supersedes, a non-null target, candidate evidence tier '
-        'corroborated, target evidence tier supported or corroborated, temporal_order candidate_newer used only '
-        'when the candidate evidence is clearly newer, which the system verifies, and comparison_complete true; '
-        'reject_candidate with relation redundant, a non-null target and target evidence tier supported or '
-        'corroborated; '
-        'reject_candidate with relation unsupported, target null and the candidate having no supporting evidence, '
-        'evidence tier none; '
-        'open_conflict with relation mutually_incompatible, a non-null target, temporal_order unordered, both '
-        'candidate and target evidence tiers supported or corroborated, non-empty evidence refs on both sides, '
-        'comparison_complete true and applicability same. '
-        'The top-level relation describes the selected target; with a null target use unrelated, '
-        'compatible_distinct or unsupported. '
-        'merge_evidence, revise_memory and supersede_memory additionally require applicability same. '
-        'When comparison_complete is true, every shortlist comparison is unrelated or compatible_distinct and the '
-        'candidate evidence tier is supported or corroborated, choose publish_new with target null. '
-        'Cross-visibility rule: the shortlist may include targets at a wider visibility than the candidate '
-        '(for a team candidate, project-global targets have a different team_id). Never select such a '
-        'cross-visibility target as target_memory_version_id for merge_evidence, revise_memory, '
-        'supersede_memory, or open_conflict. When any target at any visibility is redundant with the candidate, '
-        'choose outcome=reject_candidate, relation=redundant against that target instead of publishing a duplicate. '
-        'When a same-visibility target (same team_id as the candidate) carries a mutating identity relation '
-        '(equivalent, candidate_revises, candidate_supersedes, mutually_incompatible), act on that '
-        'same-visibility target with its normal targeted outcome. '
-        'Only when no target is redundant and no same-visibility target carries a mutating identity relation, '
-        'fall back to outcome=publish_new, relation=compatible_distinct, reason_code=distinct_claim, '
-        'target_memory_version_id=null, and report the honest per-target relation (including '
-        'mutually_incompatible against a cross-visibility target) only inside the comparisons array. '
-        'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
-        'candidate evidence.'
+        'applicability (same when that entry and the candidate constrain the same subject in the same situation, '
+        'otherwise different). '
+        'Relation meanings, always read as the candidate relative to that one entry: unrelated when the claims '
+        'share no subject; compatible_distinct when they share a subject but state different facts that can both '
+        'hold; equivalent when they state the same fact; candidate_revises when the candidate restates the same '
+        'subject with an updated detail; candidate_supersedes when the candidate replaces the entry outright; '
+        'redundant when the entry already carries everything the candidate says; mutually_incompatible when both '
+        'cannot be true at once; unsupported when the candidate carries no durable claim at all. '
+        'Do not choose an outcome and do not rank the entries: the system derives the outcome from these '
+        'relations and from facts you cannot see.'
     )
 
 
 def test_resolve_max_tokens_curation_decision_uses_reasoning_budget() -> None:
-    assert resolve_max_tokens(ModelPolicy(), 'curation_decision_v1') == 16384
-
-
-def test_curation_decision_instructions_align_with_allowed_combinations() -> None:
-    instructions = curation_schema_prompt_prefix('curation_decision_v1')
-    marker = 'combinations (any other combination is invalid): '
-
-    assert marker in instructions
-
-    enumeration = instructions.split(marker, 1)[1].split('. The top-level relation describes', 1)[0]
-    clauses = [clause.strip() for clause in enumeration.split(';')]
-    gate_tokens = {
-        ('publish_new', 'unrelated'): ('supported or corroborated', 'comparison_complete true'),
-        ('publish_new', 'compatible_distinct'): ('supported or corroborated', 'comparison_complete true'),
-        ('merge_evidence', 'equivalent'): ('candidate and target evidence tiers supported or corroborated',),
-        ('revise_memory', 'candidate_revises'): (
-            'candidate evidence tier corroborated',
-            'target evidence tier supported or corroborated',
-            'candidate_newer',
-        ),
-        ('supersede_memory', 'candidate_supersedes'): (
-            'candidate evidence tier corroborated',
-            'target evidence tier supported or corroborated',
-            'comparison_complete true',
-        ),
-        ('reject_candidate', 'redundant'): ('target evidence tier supported or corroborated',),
-        ('reject_candidate', 'unsupported'): ('no supporting evidence', 'evidence tier none'),
-        ('open_conflict', 'mutually_incompatible'): (
-            'supported or corroborated',
-            'evidence refs on both sides',
-            'comparison_complete true',
-            'applicability same',
-        ),
-    }
-    for outcome, relation in _ALLOWED_COMBINATIONS:
-        matches = [clause for clause in clauses if outcome in clause and relation in clause]
-
-        assert matches, (outcome, relation)
-
-        clause = matches[0]
-        for token in gate_tokens[(outcome, relation)]:
-            assert token in clause, (outcome, relation, token)
+    assert resolve_max_tokens(ModelPolicy(), 'curation_decision_v2') == 16384
 
 
 @pytest.mark.django_db
@@ -1059,7 +979,7 @@ def test_resolve_max_tokens_reduce_override_is_scoped() -> None:
     assert resolve_max_tokens(policy, 'distill_reduce.v2') == 5000
     assert resolve_max_tokens(ModelPolicy(provider='deepseek', metadata={}), 'distill_reduce.v2') == 8192
     assert resolve_max_tokens(policy, 'distill_extract.v1') == 8192
-    assert resolve_max_tokens(policy, 'curation_decision_v1') == 16384
+    assert resolve_max_tokens(policy, 'curation_decision_v2') == 16384
 
 
 def test_provider_completion_clamp_defaults_and_override() -> None:
@@ -1212,7 +1132,7 @@ def _call_with_kind(
 def test_resolve_model_without_override_returns_policy_model() -> None:
     policy = ModelPolicy(model='deepseek-v4-pro', metadata=_OVERRIDE_METADATA)
 
-    assert services.resolve_model(policy, 'curation_decision_v1') == 'deepseek-v4-pro'
+    assert services.resolve_model(policy, 'curation_decision_v2') == 'deepseek-v4-pro'
 
 
 def test_resolve_model_applies_response_kind_override() -> None:
@@ -1343,7 +1263,7 @@ def test_resolve_reasoning_effort_is_scoped_to_response_kind() -> None:
     unshaped_policy = ModelPolicy(provider='deepseek', metadata={})
 
     assert services.resolve_reasoning_effort(policy, 'distill_extract.v1', completion_cap=8192) == 'minimal'
-    assert services.resolve_reasoning_effort(policy, 'curation_decision_v1', completion_cap=16384) == ''
+    assert services.resolve_reasoning_effort(policy, 'curation_decision_v2', completion_cap=16384) == ''
     assert services.resolve_reasoning_effort(unshaped_policy, 'distill_extract.v1', completion_cap=8192) == ''
 
 
@@ -1388,11 +1308,11 @@ def test_request_shape_sends_reasoning_effort_only_for_configured_kind() -> None
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, metadata=_GPT5_REQUEST_SHAPE)
 
-    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1')
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v2')
 
     sent = json.loads(opener.requests[0].data.decode())
     assert 'reasoning_effort' not in sent
-    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v1')
+    assert sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v2')
 
 
 # ---------------------------------------------------------------------------
@@ -1439,7 +1359,7 @@ def test_request_shape_is_resolvable_per_response_kind() -> None:
         model='gpt-4o-mini',
         metadata={
             'model_overrides': {
-                'curation_decision_v1': {
+                'curation_decision_v2': {
                     'model': 'gpt-5-nano',
                     'request_shape': {
                         'completion_tokens_param': 'max_completion_tokens',
@@ -1451,9 +1371,9 @@ def test_request_shape_is_resolvable_per_response_kind() -> None:
         },
     )
 
-    assert services.resolve_completion_tokens_param(policy, 'curation_decision_v1') == 'max_completion_tokens'
-    assert services.resolve_temperature(policy, 'curation_decision_v1') is None
-    assert services.resolve_reasoning_effort(policy, 'curation_decision_v1', completion_cap=16384) == 'medium'
+    assert services.resolve_completion_tokens_param(policy, 'curation_decision_v2') == 'max_completion_tokens'
+    assert services.resolve_temperature(policy, 'curation_decision_v2') is None
+    assert services.resolve_reasoning_effort(policy, 'curation_decision_v2', completion_cap=16384) == 'medium'
     assert services.resolve_completion_tokens_param(policy, 'candidates') == 'max_tokens'
     assert services.resolve_temperature(policy, 'candidates') == 0.2
     assert services.resolve_reasoning_effort(policy, 'candidates', completion_cap=8192) == ''
@@ -1467,7 +1387,7 @@ def test_mixed_model_policy_shapes_each_kind_for_its_own_model() -> None:
         project,
         metadata={
             'model_overrides': {
-                'curation_decision_v1': {
+                'curation_decision_v2': {
                     'model': 'gpt-5-nano',
                     'request_shape': {
                         'completion_tokens_param': 'max_completion_tokens',
@@ -1481,13 +1401,13 @@ def test_mixed_model_policy_shapes_each_kind_for_its_own_model() -> None:
     policy.model = 'gpt-4o-mini'
     policy.save(update_fields=['model'])
 
-    _reasoning, reasoning_opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1')
+    _reasoning, reasoning_opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v2')
     _classic, classic_opener = _call_with_kind(policy, _openai_chat_body('Title\nBody'), 'single')
 
     reasoning_sent = json.loads(reasoning_opener.requests[0].data.decode())
     classic_sent = json.loads(classic_opener.requests[0].data.decode())
     assert reasoning_sent['model'] == 'gpt-5-nano'
-    assert reasoning_sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v1')
+    assert reasoning_sent['max_completion_tokens'] == effective_completion_cap(policy, 'curation_decision_v2')
     assert 'max_tokens' not in reasoning_sent
     assert 'temperature' not in reasoning_sent
     assert reasoning_sent['reasoning_effort'] == 'medium'
@@ -1565,7 +1485,7 @@ def test_gateway_requests_the_configured_tier_and_widens_the_socket(monkeypatch:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, metadata=_FLEX_SERVICE_TIER_METADATA)
 
-    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=0)
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v2', attempt=0)
 
     assert json.loads(opener.requests[0].data.decode())['service_tier'] == 'flex'
     assert opener.timeouts == [600]
@@ -1577,7 +1497,7 @@ def test_gateway_drops_the_queued_tier_once_the_attempt_budget_is_spent(monkeypa
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, metadata=_FLEX_SERVICE_TIER_METADATA)
 
-    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=2)
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v2', attempt=2)
 
     assert 'service_tier' not in json.loads(opener.requests[0].data.decode())
     assert opener.timeouts == [60]
@@ -1589,7 +1509,7 @@ def test_gateway_without_tier_metadata_keeps_the_standard_socket(monkeypatch: py
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project)
 
-    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v1', attempt=0)
+    _record, opener = _call_with_kind(policy, _openai_chat_body('{}'), 'curation_decision_v2', attempt=0)
 
     assert 'service_tier' not in json.loads(opener.requests[0].data.decode())
     assert opener.timeouts == [60]

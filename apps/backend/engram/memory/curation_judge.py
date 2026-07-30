@@ -72,20 +72,19 @@ class CurationJudgeInput:
 
 
 @dataclass(frozen=True, slots=True)
-class CurationJudgeComparisonV1:
+class CurationJudgeComparison:
     memory_version_id: uuid.UUID
     relation: str
-    target_evidence_refs: tuple[str, ...]
+    applicability: str
 
 
 @dataclass(frozen=True, slots=True)
-class CurationJudgeVerdictV1:
+class CurationJudgeVerdict:
     schema_version: int
     outcome: str
     relation: str
     target_memory_version_id: uuid.UUID | None
-    candidate_evidence_refs: tuple[str, ...]
-    comparisons: tuple[CurationJudgeComparisonV1, ...]
+    comparisons: tuple[CurationJudgeComparison, ...]
     applicability: str
     temporal_order: str
     reason_code: str
@@ -94,7 +93,7 @@ class CurationJudgeVerdictV1:
 
 @dataclass(frozen=True, slots=True)
 class CurationJudgeResult:
-    verdict: CurationJudgeVerdictV1
+    verdict: CurationJudgeVerdict
     provider_call_record_id: uuid.UUID
     policy_id: uuid.UUID
     policy_version: int
@@ -105,26 +104,15 @@ class CurationJudgeResult:
     comparison_complete: bool
 
 
+_SCHEMA_VERSION = 2
+_RESPONSE_KIND = 'curation_decision_v2'
 _LIFECYCLE_TYPES = frozenset({'session_start', 'session_end', 'session_lifecycle'})
 _GROUP_TOKEN_PREFIX = 'curation-evidence-group:v1:'
 _MAX_EVIDENCE_REFS = 16
 _MAX_CLAIM_SNAPSHOT_CHARS = 2000
 
-_TOP_KEYS = frozenset(
-    {
-        'schema_version',
-        'outcome',
-        'relation',
-        'target_memory_version_id',
-        'candidate_evidence_refs',
-        'comparisons',
-        'applicability',
-        'temporal_order',
-        'reason_code',
-        'reason',
-    }
-)
-_COMPARISON_KEYS = frozenset({'memory_version_id', 'relation', 'target_evidence_refs'})
+_TOP_KEYS = frozenset({'schema_version', 'comparisons', 'reason'})
+_COMPARISON_KEYS = frozenset({'index', 'relation', 'applicability'})
 _RELATIONS = frozenset(
     {
         'unrelated',
@@ -152,10 +140,10 @@ _SUPPORTED_TIERS = frozenset({'supported', 'corroborated'})
 _MUTATION_OUTCOMES = frozenset({'merge_evidence', 'open_conflict', 'revise_memory', 'supersede_memory'})
 
 _CURATION_JUDGE_SYSTEM_PROMPT = (
-    'You are the memory curation judge. The user message is a curation_judge_input.v1 JSON envelope, and the '
+    'You are the memory curation judge. The user message is a curation_judge_input.v2 JSON envelope, and the '
     'accompanying instructions define the exact output contract you must follow. '
-    'When no combination satisfies its requirements, choose the reject_candidate form that matches the '
-    'candidate evidence.'
+    'Report how the candidate relates to every listed comparison; the system derives the outcome from your '
+    'relations and from facts you cannot see.'
 )
 
 
@@ -334,53 +322,35 @@ def _is_enum(value: object, allowed: frozenset[str]) -> bool:
     return isinstance(value, str) and value in allowed
 
 
-def _parse_uuid(value: object) -> uuid.UUID:
-    if not isinstance(value, str):
+def _parse_index(value: object, count: int) -> int:
+    if type(value) is not int or not (1 <= value <= count):
         raise CurationJudgeError('judge_invalid_output')
-    try:
-        return uuid.UUID(value)
-    except (ValueError, AttributeError, TypeError) as error:
-        raise CurationJudgeError('judge_invalid_output') from error
 
-
-def _validate_refs(value: object, allowed: set[str]) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise CurationJudgeError('judge_invalid_output')
-    if len(value) > _MAX_EVIDENCE_REFS:
-        raise CurationJudgeError('judge_invalid_output')
-    if len(set(value)) != len(value):
-        raise CurationJudgeError('judge_invalid_output')
-    if any(item not in allowed for item in value):
-        raise CurationJudgeError('judge_reference_invalid')
-
-    return tuple(value)
+    return value
 
 
 def _validate_comparisons(
     value: object,
-    data: CurationJudgeInput,
     version_ids: tuple[uuid.UUID, ...],
-) -> tuple[CurationJudgeComparisonV1, ...]:
+) -> tuple[CurationJudgeComparison, ...]:
     if not isinstance(value, list):
         raise CurationJudgeError('judge_invalid_output')
 
-    parsed: list[tuple[uuid.UUID, str, object]] = []
+    parsed: dict[int, CurationJudgeComparison] = {}
     for item in value:
         if not isinstance(item, dict) or set(item) != _COMPARISON_KEYS:
             raise CurationJudgeError('judge_invalid_output')
-        if not _is_enum(item['relation'], _RELATIONS):
+        if not _is_enum(item['relation'], _RELATIONS) or not _is_enum(item['applicability'], _APPLICABILITY):
             raise CurationJudgeError('judge_invalid_output')
-        parsed.append((_parse_uuid(item['memory_version_id']), item['relation'], item['target_evidence_refs']))
+        index = _parse_index(item['index'], len(version_ids))
+        if index in parsed:
+            raise CurationJudgeError('judge_invalid_output')
+        parsed[index] = CurationJudgeComparison(version_ids[index - 1], item['relation'], item['applicability'])
 
-    if tuple(entry[0] for entry in parsed) != version_ids:
+    if len(parsed) != len(version_ids):
         raise CurationJudgeError('judge_invalid_output')
 
-    comparisons: list[CurationJudgeComparisonV1] = []
-    for version_id, relation, refs in parsed:
-        allowed = set(data.evidence.targets[version_id].refs) if version_id in data.evidence.targets else set()
-        comparisons.append(CurationJudgeComparisonV1(version_id, relation, _validate_refs(refs, allowed)))
-
-    return tuple(comparisons)
+    return tuple(parsed[index] for index in sorted(parsed))
 
 
 def _candidate_precedes(data: CurationJudgeInput, target_id: uuid.UUID | None) -> bool:
@@ -411,7 +381,7 @@ def _deterministic_precedence(data: CurationJudgeInput, target_id: uuid.UUID | N
     return candidate_at != target_at
 
 
-def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeInput) -> None:  # noqa: C901
+def _apply_evidence_policy(verdict: CurationJudgeVerdict, data: CurationJudgeInput) -> None:  # noqa: C901
     key = (verdict.outcome, verdict.relation)
     if key not in _ALLOWED_COMBINATIONS:
         raise CurationJudgeError('judge_invalid_output')
@@ -487,7 +457,7 @@ def _apply_evidence_policy(verdict: CurationJudgeVerdictV1, data: CurationJudgeI
         raise CurationJudgeError('judge_policy_denied')
 
 
-def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdictV1:
+def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> CurationJudgeVerdict:
     try:
         payload = json.loads(strip_json_fence(raw))
     except (json.JSONDecodeError, TypeError, ValueError) as error:
@@ -495,38 +465,30 @@ def parse_curation_judge_verdict(raw: str, data: CurationJudgeInput) -> Curation
 
     if not isinstance(payload, dict) or set(payload) != _TOP_KEYS:
         raise CurationJudgeError('judge_invalid_output')
-    if type(payload['schema_version']) is not int or payload['schema_version'] != 1:
-        raise CurationJudgeError('judge_invalid_output')
-    if not _is_enum(payload['applicability'], _APPLICABILITY):
+    if type(payload['schema_version']) is not int or payload['schema_version'] != _SCHEMA_VERSION:
         raise CurationJudgeError('judge_invalid_output')
 
     version_ids = tuple(entry.memory_version_id for entry in data.shortlist.entries)
-    if payload['target_memory_version_id'] is not None:
-        if _parse_uuid(payload['target_memory_version_id']) not in set(version_ids):
-            raise CurationJudgeError('judge_invalid_output')
-
-    candidate_refs = _validate_refs(payload['candidate_evidence_refs'], set(data.evidence.candidate.refs))
-    comparisons = _validate_comparisons(payload['comparisons'], data, version_ids)
+    comparisons = _validate_comparisons(payload['comparisons'], version_ids)
 
     reason = payload['reason']
     if not isinstance(reason, str) or not (1 <= len(reason) <= 500) or SECRET_STRING_RE.search(reason):
         raise CurationJudgeError('judge_invalid_output')
 
-    applicability = payload['applicability']
     facts = build_derivation_facts(data)
     relations = {item.memory_version_id: item.relation for item in comparisons}
+    applicability = {item.memory_version_id: item.applicability for item in comparisons}
     decision = derive_decision(facts, relations, applicability)
     if decision is None:
         raise CurationJudgeError('curation_infeasible')
 
-    verdict = CurationJudgeVerdictV1(
-        schema_version=1,
+    verdict = CurationJudgeVerdict(
+        schema_version=_SCHEMA_VERSION,
         outcome=decision.outcome,
         relation=decision.relation,
         target_memory_version_id=decision.target_memory_version_id,
-        candidate_evidence_refs=candidate_refs,
         comparisons=comparisons,
-        applicability=applicability,
+        applicability=decision.applicability,
         temporal_order=decision.temporal_order,
         reason_code=decision.reason_code,
         reason=reason,
@@ -577,20 +539,17 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
         },
         'content_hash': data.candidate.content_hash,
         'evidence_tier': data.evidence.candidate.tier,
-        'evidence_refs': list(data.evidence.candidate.refs),
     }
     comparisons = []
-    for entry in data.shortlist.entries:
+    for index, entry in enumerate(data.shortlist.entries, start=1):
         target = data.evidence.targets.get(entry.memory_version_id)
         comparisons.append(
             {
-                'memory_version_id': str(entry.memory_version_id),
-                'current_transition_id': str(entry.current_transition_id),
+                'index': index,
                 'visibility_scope': entry.visibility_scope,
                 'team_id': str(entry.team_id) if entry.team_id is not None else None,
                 'has_open_conflict': entry.has_open_conflict,
                 'evidence_tier': target.tier if target is not None else 'none',
-                'evidence_refs': list(target.refs) if target is not None else [],
                 'claim': {
                     'title': _bounded(entry.title),
                     'body': _bounded(entry.body),
@@ -600,7 +559,7 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
             }
         )
     envelope = {
-        'schema': 'curation_judge_input.v1',
+        'schema': 'curation_judge_input.v2',
         'candidate': candidate_block,
         'effective_scope': {
             'visibility_scope': data.effective_scope.visibility_scope,
@@ -620,7 +579,7 @@ def build_curation_judge_prompt(data: CurationJudgeInput) -> str:
 
 def _fallback_eligible(error: CurationJudgeError | ModelPolicyError) -> bool:
     if isinstance(error, CurationJudgeError):
-        return error.code in {'judge_invalid_output', 'judge_reference_invalid'}
+        return error.code == 'judge_invalid_output'
 
     status = error.http_status
     if status is None:
@@ -693,7 +652,7 @@ class JudgeCurationCandidate:
                 trace_id=data.trace_id,
                 prompt=prompt,
                 system_prompt=_CURATION_JUDGE_SYSTEM_PROMPT,
-                response_kind='curation_decision_v1',
+                response_kind=_RESPONSE_KIND,
                 attempt=data.attempt,
             )
         )

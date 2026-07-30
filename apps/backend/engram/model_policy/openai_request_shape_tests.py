@@ -76,7 +76,7 @@ def test_gpt5_metadata_matches_the_proven_wire_shape() -> None:
 def test_reasoning_effort_covers_every_production_response_kind() -> None:
     expected_kinds = {
         'candidates',
-        'curation_decision_v1',
+        'curation_decision_v2',
         'curation_judgment',
         'distill_extract.v1',
         'distill_reduce.v2',

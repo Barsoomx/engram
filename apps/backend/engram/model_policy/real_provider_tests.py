@@ -1041,7 +1041,7 @@ def test_openai_gateway_disables_thinking_but_omits_json_mode_for_deepseek_candi
 
 
 def test_deepseek_thinking_override_enables_for_curation_decision() -> None:
-    assert deepseek_thinking_override('deepseek', 'curation', 'curation_decision_v1') == {
+    assert deepseek_thinking_override('deepseek', 'curation', 'curation_decision_v2') == {
         'thinking': {'type': 'enabled'},
     }
 
@@ -1052,7 +1052,7 @@ def test_deepseek_thinking_override_disables_for_other_deepseek_curation_kinds()
 
 
 def test_deepseek_thinking_override_empty_for_other_providers_and_tasks() -> None:
-    assert deepseek_thinking_override('openai', 'curation', 'curation_decision_v1') == {}
+    assert deepseek_thinking_override('openai', 'curation', 'curation_decision_v2') == {}
     assert deepseek_thinking_override('deepseek', 'generation', 'candidates') == {}
 
 
@@ -1084,7 +1084,7 @@ def test_openai_gateway_enables_thinking_for_deepseek_curation_decision_only() -
             request_id='ds-decision-1',
             trace_id='ds-decision-1',
             prompt='prompt text',
-            response_kind='curation_decision_v1',
+            response_kind='curation_decision_v2',
         ),
     )
     candidates_gateway.call(
@@ -2091,7 +2091,7 @@ def test_openai_gateway_call_success_creates_single_recorded_record_no_error_rec
 
 
 @pytest.mark.django_db
-def test_openai_gateway_curation_decision_v1_uses_json_mode_and_fixed_budget() -> None:
+def test_openai_gateway_curation_decision_v2_uses_json_mode_and_fixed_budget() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(organization, project, task_type='curation')
     body = {
@@ -2128,7 +2128,7 @@ def test_openai_gateway_curation_decision_v1_uses_json_mode_and_fixed_budget() -
             request_id='curation-decision-openai-1',
             trace_id='curation-decision-openai-1',
             prompt='bounded judge envelope',
-            response_kind='curation_decision_v1',
+            response_kind='curation_decision_v2',
         ),
     )
 
@@ -2139,7 +2139,7 @@ def test_openai_gateway_curation_decision_v1_uses_json_mode_and_fixed_budget() -
 
 
 @pytest.mark.django_db
-def test_anthropic_gateway_curation_decision_v1_forces_closed_dedicated_tool() -> None:
+def test_anthropic_gateway_curation_decision_v2_forces_closed_dedicated_tool() -> None:
     organization, _team, project, _owner, _api_key = create_project_scope()
     policy = make_real_policy(
         organization,
@@ -2180,7 +2180,7 @@ def test_anthropic_gateway_curation_decision_v1_forces_closed_dedicated_tool() -
             request_id='curation-decision-anthropic-1',
             trace_id='curation-decision-anthropic-1',
             prompt='bounded judge envelope',
-            response_kind='curation_decision_v1',
+            response_kind='curation_decision_v2',
         ),
     )
 
@@ -2189,28 +2189,12 @@ def test_anthropic_gateway_curation_decision_v1_forces_closed_dedicated_tool() -
     assert sent_body['max_tokens'] == 16384
     assert sent_body['tool_choice'] == {'type': 'tool', 'name': 'emit_curation_decision'}
     schema = tool['input_schema']
-    expected_keys = {
-        'schema_version',
-        'outcome',
-        'relation',
-        'target_memory_version_id',
-        'candidate_evidence_refs',
-        'comparisons',
-        'applicability',
-        'temporal_order',
-        'reason_code',
-        'reason',
-    }
+    expected_keys = {'schema_version', 'comparisons', 'reason'}
     assert schema['additionalProperties'] is False
     assert set(schema['required']) == expected_keys
-    assert schema['properties']['candidate_evidence_refs']['maxItems'] == 16
     assert schema['properties']['comparisons']['maxItems'] == 12
     comparison_schema = schema['properties']['comparisons']['items']
     assert comparison_schema['additionalProperties'] is False
-    assert set(comparison_schema['required']) == {
-        'memory_version_id',
-        'relation',
-        'target_evidence_refs',
-    }
-    assert comparison_schema['properties']['target_evidence_refs']['maxItems'] == 16
+    assert set(comparison_schema['required']) == {'index', 'relation', 'applicability'}
+    assert comparison_schema['properties']['index']['minimum'] == 1
     assert json.loads(result.generated_body) == response['content'][0]['input']

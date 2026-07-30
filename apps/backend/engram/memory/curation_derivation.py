@@ -61,6 +61,7 @@ class DerivedDecision:
     relation: str
     target_memory_version_id: UUID | None
     temporal_order: str
+    applicability: str
     reason_code: str
     rung: int
     suppressed_identity_relations: tuple[tuple[UUID, str], ...]
@@ -160,13 +161,13 @@ def feasible_outcomes(facts: DerivationFacts) -> frozenset[str]:
 def _select_target(
     facts: DerivationFacts,
     relations: dict[UUID, str],
-    applicability: str,
+    applicability: dict[UUID, str],
 ) -> tuple[int, str, str, TargetFacts] | None:
     for rung, outcome, relation, eligible, requires_same in _LADDER:
-        if requires_same and applicability != 'same':
-            continue
         for target in facts.targets:
             if relations.get(target.memory_version_id) != relation:
+                continue
+            if requires_same and applicability.get(target.memory_version_id) != 'same':
                 continue
             if eligible(facts, target):
                 return rung, outcome, relation, target
@@ -196,7 +197,7 @@ def _suppressed(
 def derive_decision(
     facts: DerivationFacts,
     relations: dict[UUID, str],
-    applicability: str,
+    applicability: dict[UUID, str],
 ) -> DerivedDecision | None:
     selected = _select_target(facts, relations, applicability)
     if selected is not None:
@@ -207,6 +208,7 @@ def derive_decision(
             relation=relation,
             target_memory_version_id=target.memory_version_id,
             temporal_order=target.temporal_order,
+            applicability=applicability.get(target.memory_version_id, 'not_applicable'),
             reason_code=_REASON_CODES[(outcome, relation)],
             rung=rung,
             suppressed_identity_relations=_suppressed(facts, relations, target.memory_version_id),
@@ -220,6 +222,7 @@ def derive_decision(
             relation=relation,
             target_memory_version_id=None,
             temporal_order='not_applicable',
+            applicability='not_applicable',
             reason_code=_REASON_CODES[('publish_new', relation)],
             rung=6,
             suppressed_identity_relations=_suppressed(facts, relations, None),
@@ -231,6 +234,7 @@ def derive_decision(
             relation='unsupported',
             target_memory_version_id=None,
             temporal_order='not_applicable',
+            applicability='not_applicable',
             reason_code=_REASON_CODES[('reject_candidate', 'unsupported')],
             rung=7,
             suppressed_identity_relations=_suppressed(facts, relations, None),

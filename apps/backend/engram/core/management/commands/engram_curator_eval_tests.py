@@ -38,7 +38,6 @@ def test_threshold_miss_exits_nonzero(tmp_path: Path) -> None:
     target = next(
         case for case in cases if case['bucket'] == 'equivalent_merge' and case['scope_control'] == 'in_scope'
     )
-    entry = target['input']['shortlist']['entries'][0]
     lines: list[str] = []
     for case in cases:
         if case['gate'] != 'semantic' or case['fixture_verdict'] is None or case['bucket'] == 'provider_fault':
@@ -46,21 +45,8 @@ def test_threshold_miss_exits_nonzero(tmp_path: Path) -> None:
         verdict = case['fixture_verdict']
         if case['case_id'] == target['case_id']:
             verdict = {
-                'schema_version': 1,
-                'outcome': 'open_conflict',
-                'relation': 'mutually_incompatible',
-                'target_memory_version_id': entry['memory_version_id'],
-                'candidate_evidence_refs': list(target['input']['candidate']['evidence_refs']),
-                'comparisons': [
-                    {
-                        'memory_version_id': entry['memory_version_id'],
-                        'relation': 'mutually_incompatible',
-                        'target_evidence_refs': list(entry['evidence_refs']),
-                    }
-                ],
-                'applicability': 'same',
-                'temporal_order': 'unordered',
-                'reason_code': 'same_scope_contradiction',
+                'schema_version': 2,
+                'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
                 'reason': 'injected incompatible verdict',
             }
         lines.append(json.dumps({'case_id': case['case_id'], 'verdict': verdict}))

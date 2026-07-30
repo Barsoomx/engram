@@ -121,7 +121,7 @@ def test_openai_chat_policies_ship_the_reasoning_request_shape() -> None:
             shape = _task_model(PRESET_BY_KEY[key], task_type)['metadata']['request_shape']
             assert shape['completion_tokens_param'] == 'max_completion_tokens'
             assert shape['temperature'] is None
-            assert shape['reasoning_effort']['curation_decision_v1'] == 'minimal'
+            assert shape['reasoning_effort']['curation_decision_v2'] == 'minimal'
 
 
 def test_only_the_flex_preset_requests_the_flex_tier() -> None:

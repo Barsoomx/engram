@@ -15,7 +15,7 @@ FLEX_ATTEMPT_BUDGET = 2
 # medium 832). Raising it is a per-policy metadata edit.
 REASONING_EFFORT_BY_RESPONSE_KIND: dict[str, str] = {
     'candidates': 'minimal',
-    'curation_decision_v1': 'minimal',
+    'curation_decision_v2': 'minimal',
     'curation_judgment': 'minimal',
     'distill_extract.v1': 'minimal',
     'distill_reduce.v2': 'minimal',

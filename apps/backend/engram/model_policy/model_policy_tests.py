@@ -2742,7 +2742,7 @@ def test_model_policy_list_includes_health_fields_and_avoids_per_policy_queries(
 
 
 @pytest.mark.django_db
-def test_fake_provider_curation_decision_v1_emits_deterministic_strict_json() -> None:
+def test_fake_provider_curation_decision_v2_emits_deterministic_strict_json() -> None:
     organization, team, project, _owner, _api_key = create_project_scope()
     secret = ProviderSecret.objects.create(
         organization=organization,
@@ -2779,10 +2779,7 @@ def test_fake_provider_curation_decision_v1_emits_deterministic_strict_json() ->
             'evidence_refs': ['candidate-ref-1', 'candidate-ref-2'],
             'claim': {'title': 'candidate', 'body': 'bounded body'},
         },
-        'comparisons': [
-            {'memory_version_id': str(uuid.uuid4()), 'evidence_refs': ['target-ref-1']},
-            {'memory_version_id': str(uuid.uuid4()), 'evidence_refs': ['target-ref-2']},
-        ],
+        'comparisons': [{'index': 1}, {'index': 2}],
     }
     data = ProviderCallInput(
         organization_id=organization.id,
@@ -2792,7 +2789,7 @@ def test_fake_provider_curation_decision_v1_emits_deterministic_strict_json() ->
         request_id='curation-decision-fake-1',
         trace_id='curation-decision-fake-1',
         prompt=json.dumps(envelope, sort_keys=True),
-        response_kind='curation_decision_v1',
+        response_kind='curation_decision_v2',
     )
 
     first = FakeProviderGateway().call(data)
@@ -2800,32 +2797,9 @@ def test_fake_provider_curation_decision_v1_emits_deterministic_strict_json() ->
     payload = json.loads(first.generated_body)
 
     assert first.generated_body == replay.generated_body
-    assert set(payload) == {
-        'schema_version',
-        'outcome',
-        'relation',
-        'target_memory_version_id',
-        'candidate_evidence_refs',
-        'comparisons',
-        'applicability',
-        'temporal_order',
-        'reason_code',
-        'reason',
-    }
-    assert payload['schema_version'] == 1
-    assert payload['outcome'] in {
-        'publish_new',
-        'merge_evidence',
-        'revise_memory',
-        'supersede_memory',
-        'reject_candidate',
-        'open_conflict',
-    }
-    assert payload['candidate_evidence_refs'] == envelope['candidate']['evidence_refs']
-    assert [item['memory_version_id'] for item in payload['comparisons']] == [
-        item['memory_version_id'] for item in envelope['comparisons']
-    ]
-    assert [item['target_evidence_refs'] for item in payload['comparisons']] == [
-        item['evidence_refs'] for item in envelope['comparisons']
-    ]
+    assert set(payload) == {'schema_version', 'comparisons', 'reason'}
+    assert payload['schema_version'] == 2
+    assert [item['index'] for item in payload['comparisons']] == [item['index'] for item in envelope['comparisons']]
+    assert {item['relation'] for item in payload['comparisons']} == {'unrelated'}
+    assert {item['applicability'] for item in payload['comparisons']} == {'different'}
     assert ProviderCallRecord.objects.filter(request_id='curation-decision-fake-1').count() == 2

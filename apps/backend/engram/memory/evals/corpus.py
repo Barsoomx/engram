@@ -135,37 +135,16 @@ def _input(
     }
 
 
-def _verdict(
-    *,
-    outcome: str,
-    relation: str,
-    target: str | None,
-    candidate_refs: list[str],
-    comparisons: list[dict[str, object]],
-    applicability: str = 'same',
-    temporal_order: str = 'unordered',
-    reason_code: str = 'distinct_claim',
-) -> dict[str, object]:
+def _verdict(comparisons: list[dict[str, object]]) -> dict[str, object]:
     return {
-        'schema_version': 1,
-        'outcome': outcome,
-        'relation': relation,
-        'target_memory_version_id': target,
-        'candidate_evidence_refs': candidate_refs,
+        'schema_version': 2,
         'comparisons': comparisons,
-        'applicability': applicability,
-        'temporal_order': temporal_order,
-        'reason_code': reason_code,
         'reason': _REASON,
     }
 
 
-def _comparison(entry: dict[str, object], relation: str, refs: list[str]) -> dict[str, object]:
-    return {
-        'memory_version_id': str(entry['memory_version_id']),
-        'relation': relation,
-        'target_evidence_refs': refs,
-    }
+def _comparison(index: int, relation: str, applicability: str = 'same') -> dict[str, object]:
+    return {'index': index, 'relation': relation, 'applicability': applicability}
 
 
 def _case(
@@ -390,16 +369,9 @@ def _publish_case(
             refs=[f'{case_id}-t1'],
         )
         entries.append(entry)
-        comparisons.append(_comparison(entry, 'compatible_distinct', []))
+        comparisons.append(_comparison(1, 'compatible_distinct'))
     case_input = _input(case_id, candidate, _scope(), _shortlist(case_id, entries))
-    verdict = _verdict(
-        outcome='publish_new',
-        relation='compatible_distinct' if with_neighbor else 'unrelated',
-        target=None,
-        candidate_refs=[f'{case_id}-c1'],
-        comparisons=comparisons,
-        reason_code='distinct_claim',
-    )
+    verdict = _verdict(comparisons)
 
     return _case(
         case_id,
@@ -479,16 +451,7 @@ def _target_case(
     )
     shortlist = _shortlist(case_id, [entry], complete=complete)
     case_input = _input(case_id, candidate, _scope(), shortlist)
-    verdict = _verdict(
-        outcome=outcome,
-        relation=relation,
-        target=str(entry['memory_version_id']),
-        candidate_refs=candidate_refs,
-        comparisons=[_comparison(entry, relation, target_refs)],
-        applicability=applicability,
-        temporal_order=temporal_order,
-        reason_code=reason_code,
-    )
+    verdict = _verdict([_comparison(1, relation, applicability)])
 
     return _case(
         case_id,
@@ -616,15 +579,7 @@ def _unsupported_supersession_cases() -> list[dict[str, object]]:
         latest=_EARLIER,
     )
     case_input = _input(case_id, candidate, _scope(), _shortlist(case_id, [entry]))
-    verdict = _verdict(
-        outcome='supersede_memory',
-        relation='candidate_supersedes',
-        target=str(entry['memory_version_id']),
-        candidate_refs=[],
-        comparisons=[_comparison(entry, 'candidate_supersedes', [f'{case_id}-t1'])],
-        temporal_order='candidate_newer',
-        reason_code='ordered_replacement',
-    )
+    verdict = _verdict([_comparison(1, 'candidate_supersedes')])
 
     return [
         _case(
@@ -668,7 +623,7 @@ def _ladder_entry(
         latest=latest,
     )
 
-    return entry, _comparison(entry, relation, refs)
+    return entry, _comparison(index + 1, relation)
 
 
 def _ladder_case(
@@ -680,11 +635,6 @@ def _ladder_case(
     candidate_latest: str | None,
     scope: dict[str, object],
     pairs: list[tuple[dict[str, object], dict[str, object]]],
-    model_outcome: str,
-    model_relation: str,
-    model_target: str | None,
-    model_temporal_order: str,
-    model_reason_code: str,
     derived_outcome: str,
     expected_targets: list[str],
     open_conflict_valid: bool = False,
@@ -702,15 +652,7 @@ def _ladder_case(
     entries = [pair[0] for pair in pairs]
     comparisons = [pair[1] for pair in pairs]
     case_input = _input(case_id, candidate, scope, _shortlist(case_id, entries))
-    verdict = _verdict(
-        outcome=model_outcome,
-        relation=model_relation,
-        target=model_target,
-        candidate_refs=candidate_refs,
-        comparisons=comparisons,
-        temporal_order=model_temporal_order,
-        reason_code=model_reason_code,
-    )
+    verdict = _verdict(comparisons)
 
     return _case(
         case_id,
@@ -757,11 +699,6 @@ def _rung_order_case() -> dict[str, object]:
         candidate_latest=_EQUAL,
         scope=_scope(),
         pairs=[redundant, equivalent],
-        model_outcome='reject_candidate',
-        model_relation='redundant',
-        model_target=str(redundant[0]['memory_version_id']),
-        model_temporal_order='not_applicable',
-        model_reason_code='redundant_claim',
         derived_outcome='merge_evidence',
         expected_targets=[str(equivalent[0]['memory_version_id'])],
     )
@@ -796,11 +733,6 @@ def _conflict_outranks_merge_case() -> dict[str, object]:
         candidate_latest=_EQUAL,
         scope=_scope(),
         pairs=[incompatible, equivalent],
-        model_outcome='merge_evidence',
-        model_relation='equivalent',
-        model_target=str(equivalent[0]['memory_version_id']),
-        model_temporal_order='unordered',
-        model_reason_code='equivalent_claim',
         derived_outcome='open_conflict',
         expected_targets=[str(incompatible[0]['memory_version_id'])],
         open_conflict_valid=True,
@@ -838,11 +770,6 @@ def _cross_visibility_identity_case() -> dict[str, object]:
         candidate_latest=_EQUAL,
         scope=_scope(),
         pairs=[cross, neighbor],
-        model_outcome='merge_evidence',
-        model_relation='equivalent',
-        model_target=str(cross[0]['memory_version_id']),
-        model_temporal_order='unordered',
-        model_reason_code='equivalent_claim',
         derived_outcome='publish_new',
         expected_targets=[],
         out_of_scope_target=str(cross[0]['memory_version_id']),
@@ -878,11 +805,6 @@ def _tie_breaks_on_shortlist_order_case() -> dict[str, object]:
         candidate_latest=_EQUAL,
         scope=_scope(),
         pairs=[first, second],
-        model_outcome='merge_evidence',
-        model_relation='equivalent',
-        model_target=str(second[0]['memory_version_id']),
-        model_temporal_order='unordered',
-        model_reason_code='equivalent_claim',
         derived_outcome='merge_evidence',
         expected_targets=[str(first[0]['memory_version_id'])],
     )
@@ -917,11 +839,6 @@ def _unsupported_duplicate_case() -> dict[str, object]:
         candidate_latest=_EQUAL,
         scope=_scope(),
         pairs=[unsupported, unrelated],
-        model_outcome='reject_candidate',
-        model_relation='redundant',
-        model_target=str(unsupported[0]['memory_version_id']),
-        model_temporal_order='not_applicable',
-        model_reason_code='redundant_claim',
         derived_outcome='publish_new',
         expected_targets=[],
     )
@@ -940,11 +857,11 @@ def _multi_target_ladder_cases() -> list[dict[str, object]]:
 def _fault_cases() -> list[dict[str, object]]:
     cases: list[dict[str, object]] = []
     templates = [
-        ('fault-json', '```json\n{invalid json without close'),
-        ('fault-schema', {'schema_version': 1, 'outcome': 'publish_new'}),
-        ('fault-target', 'invented_target'),
-        ('fault-evidence', 'invented_evidence'),
-        ('fault-comparisons', 'unmanifested_comparison'),
+        ('fault-json', 'malformed_json'),
+        ('fault-schema', 'legacy_schema'),
+        ('fault-index-out-of-range', 'index_out_of_range'),
+        ('fault-index-duplicate', 'duplicate_index'),
+        ('fault-comparisons', 'missing_comparison'),
     ]
     for index, (prefix, marker) in enumerate(templates):
         case_id = f'{prefix}-{index:03d}'
@@ -968,41 +885,16 @@ def _fault_cases() -> list[dict[str, object]]:
         shortlist = _shortlist(case_id, [entry])
         case_input = _input(case_id, candidate, _scope(), shortlist)
         fixture_verdict: object
-        if marker == '```json\n{invalid json without close':
-            fixture_verdict = marker
-        elif isinstance(marker, dict):
-            fixture_verdict = marker
-        elif marker == 'invented_target':
-            fixture_verdict = _verdict(
-                outcome='merge_evidence',
-                relation='equivalent',
-                target=str(_uid(f'{case_id}:phantom')),
-                candidate_refs=_refs(case_id, 'c', 2),
-                comparisons=[_comparison(entry, 'equivalent', [f'{case_id}-t1'])],
-            )
-        elif marker == 'invented_evidence':
-            fixture_verdict = _verdict(
-                outcome='merge_evidence',
-                relation='equivalent',
-                target=str(entry['memory_version_id']),
-                candidate_refs=[f'{case_id}-phantom-ref'],
-                comparisons=[_comparison(entry, 'equivalent', [f'{case_id}-t1'])],
-            )
+        if marker == 'malformed_json':
+            fixture_verdict = '```json\n{invalid json without close'
+        elif marker == 'legacy_schema':
+            fixture_verdict = {'schema_version': 1, 'outcome': 'publish_new'}
+        elif marker == 'index_out_of_range':
+            fixture_verdict = _verdict([_comparison(2, 'equivalent')])
+        elif marker == 'duplicate_index':
+            fixture_verdict = _verdict([_comparison(1, 'equivalent'), _comparison(1, 'unrelated')])
         else:
-            fixture_verdict = _verdict(
-                outcome='merge_evidence',
-                relation='equivalent',
-                target=str(entry['memory_version_id']),
-                candidate_refs=_refs(case_id, 'c', 2),
-                comparisons=[
-                    {
-                        'memory_version_id': str(_uid(f'{case_id}:phantom')),
-                        'relation': 'equivalent',
-                        'target_evidence_refs': [],
-                    }
-                ],
-                reason_code='equivalent_claim',
-            )
+            fixture_verdict = _verdict([])
         cases.append(
             _case(
                 case_id,
