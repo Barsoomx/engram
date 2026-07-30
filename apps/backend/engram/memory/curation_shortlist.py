@@ -178,6 +178,21 @@ def _validate_embedding(embedding: tuple[float, ...] | None) -> tuple[float, ...
     return values
 
 
+def _entry_manifest(entry: CurationShortlistEntry) -> dict[str, object]:
+    return {
+        'memory_id': str(entry.memory_id),
+        'memory_version_id': str(entry.memory_version_id),
+        'current_transition_id': str(entry.current_transition_id),
+        'scope_key': f'{entry.visibility_scope}:{entry.team_id or ""}',
+        'exact_overlap': entry.exact_overlap,
+        'vector_distance': None if entry.vector_distance is None else f'{entry.vector_distance:.12f}',
+        'lexical_rank': None if entry.lexical_rank is None else f'{entry.lexical_rank:.12f}',
+        'trigram_similarity': None if entry.trigram_similarity is None else f'{entry.trigram_similarity:.12f}',
+        'has_open_conflict': entry.has_open_conflict,
+        'body_hash': entry.body_hash,
+    }
+
+
 def _manifest_hash(
     entries: tuple[CurationShortlistEntry, ...],
     authorized_corpus_count: int,
@@ -186,24 +201,18 @@ def _manifest_hash(
     payload = {
         'authorized_corpus_count': authorized_corpus_count,
         'comparison_complete': comparison_complete,
-        'entries': [
-            {
-                'memory_id': str(entry.memory_id),
-                'memory_version_id': str(entry.memory_version_id),
-                'current_transition_id': str(entry.current_transition_id),
-                'scope_key': f'{entry.visibility_scope}:{entry.team_id or ""}',
-                'exact_overlap': entry.exact_overlap,
-                'vector_distance': None if entry.vector_distance is None else f'{entry.vector_distance:.12f}',
-                'lexical_rank': None if entry.lexical_rank is None else f'{entry.lexical_rank:.12f}',
-                'trigram_similarity': (
-                    None if entry.trigram_similarity is None else f'{entry.trigram_similarity:.12f}'
-                ),
-                'has_open_conflict': entry.has_open_conflict,
-                'body_hash': entry.body_hash,
-            }
-            for entry in entries
-        ],
+        'entries': [_entry_manifest(entry) for entry in entries],
     }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def shortlist_revalidation_hash(shortlist: CurationShortlist) -> str:
+    payload = {
+        'schema': 'curation_shortlist_revalidation/v1',
+        'comparison_complete': shortlist.comparison_complete,
+        'entries': [_entry_manifest(entry) for entry in shortlist.entries],
+    }
+
     return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
 
 
@@ -213,7 +222,7 @@ def revalidate_curation_shortlist(data: BuildCurationShortlistInput, shortlist: 
     except CurationShortlistError:
         return False
 
-    return rebuilt.manifest_hash == shortlist.manifest_hash
+    return shortlist_revalidation_hash(rebuilt) == shortlist_revalidation_hash(shortlist)
 
 
 class BuildCurationShortlist:
