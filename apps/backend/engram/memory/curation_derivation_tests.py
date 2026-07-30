@@ -343,7 +343,7 @@ def test_empty_feasible_set_forbids_every_relation_assignment(
 ) -> None:
     checked = 0
     seen: set[int] = set()
-    for data, _assignment, _applicability in f_lattice:
+    for data, _assignment, _values in f_lattice:
         if id(data) in seen:
             continue
         seen.add(id(data))
@@ -352,8 +352,9 @@ def test_empty_feasible_set_forbids_every_relation_assignment(
             continue
         checked += 1
         for assignment in itertools.product(_RELATIONS, repeat=len(facts.targets)):
-            for applicability in _APPLICABILITIES:
-                assert derive_decision(facts, _relations(data, assignment), _applicability(data, applicability)) is None
+            for values in itertools.product(_APPLICABILITIES, repeat=len(facts.targets)):
+                relations = _relations(data, assignment)
+                assert derive_decision(facts, relations, _applicability(data, values)) is None
 
     assert checked > 0
 

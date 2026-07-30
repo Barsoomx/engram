@@ -106,23 +106,9 @@ def test_bad_provider_forbidden_transition_fails_gate(f_cases: list[dict[str, ob
     target = next(
         case for case in f_cases if case['bucket'] == 'equivalent_merge' and case['scope_control'] == 'in_scope'
     )
-    entry = target['input']['shortlist']['entries'][0]
     responses[str(target['case_id'])] = {
-        'schema_version': 1,
-        'outcome': 'open_conflict',
-        'relation': 'mutually_incompatible',
-        'target_memory_version_id': entry['memory_version_id'],
-        'candidate_evidence_refs': list(target['input']['candidate']['evidence_refs']),
-        'comparisons': [
-            {
-                'memory_version_id': entry['memory_version_id'],
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': list(entry['evidence_refs']),
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'unordered',
-        'reason_code': 'same_scope_contradiction',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
         'reason': 'injected incompatible verdict',
     }
 

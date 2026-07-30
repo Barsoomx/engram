@@ -29,8 +29,8 @@ from engram.memory import c53_orchestrator_test_support as orch
 from engram.memory.curation_judge import (
     ClaimEvidence,
     CurationEvidenceContext,
-    CurationJudgeComparisonV1,
-    CurationJudgeVerdictV1,
+    CurationJudgeComparison,
+    CurationJudgeVerdict,
 )
 from engram.memory.memory_propose_service import ProposeMemory, ProposeMemoryInput
 from engram.model_policy.models import ModelPolicy, ProviderCallRecord, ProviderSecret
@@ -211,13 +211,12 @@ def test_agent_proposal_reject_redundant_settles_rejected(monkeypatch: pytest.Mo
         body='The production deploy pipeline requires a manual approval step before release.',
     )
     shortlist = orch.stub_shortlist(orch.shortlist_entry(target))
-    verdict = CurationJudgeVerdictV1(
-        schema_version=1,
+    verdict = CurationJudgeVerdict(
+        schema_version=2,
         outcome='reject_candidate',
         relation='redundant',
         target_memory_version_id=target_version.id,
-        candidate_evidence_refs=('cref-1',),
-        comparisons=(CurationJudgeComparisonV1(target_version.id, 'redundant', ('tref-1',)),),
+        comparisons=(CurationJudgeComparison(target_version.id, 'redundant', 'same'),),
         applicability='same',
         temporal_order='not_applicable',
         reason_code='redundant_claim',
@@ -302,21 +301,8 @@ def test_agent_proposal_cross_visibility_conflict_claim_never_mutates_the_target
     )
 
     conflict_payload = {
-        'schema_version': 1,
-        'outcome': 'open_conflict',
-        'relation': 'mutually_incompatible',
-        'target_memory_version_id': str(target_version.id),
-        'candidate_evidence_refs': ['cref-1'],
-        'comparisons': [
-            {
-                'memory_version_id': str(target_version.id),
-                'relation': 'mutually_incompatible',
-                'target_evidence_refs': ['tref-1'],
-            }
-        ],
-        'applicability': 'same',
-        'temporal_order': 'unordered',
-        'reason_code': 'same_scope_contradiction',
+        'schema_version': 2,
+        'comparisons': [{'index': 1, 'relation': 'mutually_incompatible', 'applicability': 'same'}],
         'reason': 'rule-ignoring cross-visibility conflict',
     }
     orch.enable_rollout(monkeypatch)

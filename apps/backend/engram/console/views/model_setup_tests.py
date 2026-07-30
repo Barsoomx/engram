@@ -658,7 +658,7 @@ def test_apply_openai_all_persists_the_reasoning_request_shape(
     assert curation.model == 'gpt-5-mini'
     assert curation.metadata['request_shape']['completion_tokens_param'] == 'max_completion_tokens'
     assert curation.metadata['request_shape']['temperature'] is None
-    assert curation.metadata['request_shape']['reasoning_effort']['curation_decision_v1'] == 'minimal'
+    assert curation.metadata['request_shape']['reasoning_effort']['curation_decision_v2'] == 'minimal'
     assert 'service_tier' not in curation.metadata
 
     embedding = ModelPolicy.objects.get(organization=f_setup_org, task_type='embedding', active=True)

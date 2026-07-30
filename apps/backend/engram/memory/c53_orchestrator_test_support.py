@@ -27,9 +27,9 @@ from engram.memory.candidate_decision_work import ensure_candidate_decision_work
 from engram.memory.curation_judge import (
     ClaimEvidence,
     CurationEvidenceContext,
-    CurationJudgeComparisonV1,
+    CurationJudgeComparison,
     CurationJudgeResult,
-    CurationJudgeVerdictV1,
+    CurationJudgeVerdict,
 )
 from engram.memory.curation_shortlist import CurationShortlist, CurationShortlistEntry
 from engram.memory.distillation_provenance import session_candidate_content_hash
@@ -230,7 +230,7 @@ def stub_evidence(
 
 
 _OUTCOME_TABLE = {
-    'publish_new': ('unrelated', 'distinct_claim', 'different', 'not_applicable'),
+    'publish_new': ('unrelated', 'distinct_claim', 'not_applicable', 'not_applicable'),
     'merge_evidence': ('equivalent', 'equivalent_claim', 'same', 'not_applicable'),
     'revise_memory': ('candidate_revises', 'same_subject_revision', 'same', 'candidate_newer'),
     'supersede_memory': ('candidate_supersedes', 'ordered_replacement', 'same', 'candidate_newer'),
@@ -238,30 +238,29 @@ _OUTCOME_TABLE = {
 }
 
 
-def stub_verdict(outcome: str, *, target: MemoryVersion | None = None) -> CurationJudgeVerdictV1:
+def stub_verdict(outcome: str, *, target: MemoryVersion | None = None) -> CurationJudgeVerdict:
     relation, reason_code, applicability, temporal = _OUTCOME_TABLE[outcome]
-    comparisons: tuple[CurationJudgeComparisonV1, ...] = ()
+    comparisons: tuple[CurationJudgeComparison, ...] = ()
     target_id = None
     if target is not None:
         target_id = target.id
-        comparisons = (CurationJudgeComparisonV1(target.id, relation, ('tref-1',)),)
+        comparisons = (CurationJudgeComparison(target.id, relation, applicability),)
 
-    return CurationJudgeVerdictV1(
-        schema_version=1,
+    return CurationJudgeVerdict(
+        schema_version=2,
         outcome=outcome,
         relation=relation,
         target_memory_version_id=target_id,
-        candidate_evidence_refs=('cref-1',),
         comparisons=comparisons,
         applicability=applicability,
         temporal_order=temporal,
         reason_code=reason_code,
-        reason='decision under contract v1',
+        reason='decision under contract v2',
     )
 
 
 def stub_judge_result(
-    verdict: CurationJudgeVerdictV1,
+    verdict: CurationJudgeVerdict,
     call_record: ProviderCallRecord,
     policy: ModelPolicy,
     shortlist: CurationShortlist,
